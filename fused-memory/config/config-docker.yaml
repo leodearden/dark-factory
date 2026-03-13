@@ -1,0 +1,50 @@
+# Fused Memory — Docker Compose configuration
+# Services use Docker Compose service names as hostnames
+
+server:
+  transport: "http"
+  host: "0.0.0.0"
+  port: 8000
+
+llm:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  max_tokens: 4096
+
+  providers:
+    openai:
+      api_key: ${OPENAI_API_KEY}
+      api_url: ${OPENAI_API_URL:https://api.openai.com/v1}
+
+    anthropic:
+      api_key: ${ANTHROPIC_API_KEY}
+      api_url: ${ANTHROPIC_API_URL:https://api.anthropic.com}
+
+embedder:
+  provider: "openai"
+  model: "text-embedding-3-small"
+  dimensions: 1536
+
+  providers:
+    openai:
+      api_key: ${OPENAI_API_KEY}
+      api_url: ${OPENAI_API_URL:https://api.openai.com/v1}
+
+graphiti:
+  provider: "falkordb"
+  falkordb:
+    uri: "redis://falkordb:6379"
+    password: ${FALKORDB_PASSWORD:}
+    database: "default_db"
+
+mem0:
+  qdrant_url: "http://qdrant:6333"
+  collection_prefix: "fused"
+
+routing:
+  confidence_threshold: 0.7
+  use_heuristics: true
+  llm_fallback: true
+
+queue:
+  semaphore_limit: ${SEMAPHORE_LIMIT:10}

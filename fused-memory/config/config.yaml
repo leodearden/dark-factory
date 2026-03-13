@@ -1,0 +1,50 @@
+# Fused Memory MCP Server Configuration
+# Supports ${VAR_NAME} and ${VAR_NAME:default_value} environment variable expansion
+
+server:
+  transport: "http"
+  host: "0.0.0.0"
+  port: 8000
+
+llm:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  max_tokens: 4096
+
+  providers:
+    openai:
+      api_key: ${OPENAI_API_KEY}
+      api_url: ${OPENAI_API_URL:https://api.openai.com/v1}
+
+    anthropic:
+      api_key: ${ANTHROPIC_API_KEY}
+      api_url: ${ANTHROPIC_API_URL:https://api.anthropic.com}
+
+embedder:
+  provider: "openai"
+  model: "text-embedding-3-small"
+  dimensions: 1536
+
+  providers:
+    openai:
+      api_key: ${OPENAI_API_KEY}
+      api_url: ${OPENAI_API_URL:https://api.openai.com/v1}
+
+graphiti:
+  provider: "falkordb"
+  falkordb:
+    uri: ${FALKORDB_URI:redis://localhost:6379}
+    password: ${FALKORDB_PASSWORD:}
+    database: ${FALKORDB_DATABASE:default_db}
+
+mem0:
+  qdrant_url: ${QDRANT_URL:http://localhost:6333}
+  collection_prefix: "fused"
+
+routing:
+  confidence_threshold: 0.7
+  use_heuristics: true
+  llm_fallback: true
+
+queue:
+  semaphore_limit: ${SEMAPHORE_LIMIT:10}
