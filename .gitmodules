@@ -1,0 +1,9 @@
+[submodule "graphiti"]
+	path = graphiti
+	url = https://github.com/getzep/graphiti.git
+[submodule "mem0"]
+	path = mem0
+	url = https://github.com/mem0ai/mem0.git
+[submodule "taskmaster-ai"]
+	path = taskmaster-ai
+	url = https://github.com/eyaltoledano/claude-task-master.git
