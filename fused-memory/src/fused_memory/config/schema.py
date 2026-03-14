@@ -157,6 +157,51 @@ class QueueConfig(BaseModel):
     semaphore_limit: int = Field(default=10)
 
 
+# --- Taskmaster ---
+
+class TaskmasterConfig(BaseModel):
+    """Connection to Taskmaster MCP server."""
+
+    transport: str = Field(default='stdio', description='stdio or http')
+    command: str = Field(default='node')
+    args: list[str] = Field(default_factory=lambda: ['mcp-server/server.js'])
+    cwd: str = Field(default='')
+    http_url: str = Field(default='')
+    project_root: str = Field(default='.')
+    tool_mode: str = Field(default='standard')
+
+
+# --- Reconciliation ---
+
+class ReconciliationConfig(BaseModel):
+    """Sleep mode reconciliation settings."""
+
+    enabled: bool = Field(default=True)
+    data_dir: str = Field(default='./data/reconciliation')
+
+    # Buffer triggers
+    buffer_size_threshold: int = Field(default=10)
+    max_staleness_seconds: int = Field(default=1800)
+
+    # Agent settings
+    agent_llm_provider: str = Field(default='anthropic')
+    agent_llm_model: str = Field(default='claude-sonnet-4-20250514')
+    agent_max_tokens: int = Field(default=8192)
+    agent_max_steps: int = Field(default=50)
+
+    # Judge settings
+    judge_enabled: bool = Field(default=True)
+    judge_llm_provider: str = Field(default='anthropic')
+    judge_llm_model: str = Field(default='claude-sonnet-4-20250514')
+
+    # Explore agent
+    explore_codebase_root: str = Field(default='.')
+
+    # Safety
+    max_mutations_per_stage: int = Field(default=50)
+    halt_on_judge_serious: bool = Field(default=True)
+
+
 # --- Top-level ---
 
 class FusedMemoryConfig(BaseSettings):
@@ -169,6 +214,8 @@ class FusedMemoryConfig(BaseSettings):
     mem0: Mem0BackendConfig = Field(default_factory=Mem0BackendConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     queue: QueueConfig = Field(default_factory=QueueConfig)
+    taskmaster: TaskmasterConfig | None = Field(default=None)
+    reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
 
     model_config = SettingsConfigDict(
         env_prefix='',

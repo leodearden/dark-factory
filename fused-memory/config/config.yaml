@@ -48,3 +48,21 @@ routing:
 
 queue:
   semaphore_limit: ${SEMAPHORE_LIMIT:10}
+
+taskmaster:
+  transport: "stdio"
+  command: "node"
+  args: ["${TASKMASTER_DIR:../taskmaster-ai}/mcp-server/server.js"]
+  project_root: "${PROJECT_ROOT:.}"
+  tool_mode: "standard"
+
+reconciliation:
+  enabled: true
+  data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
+  buffer_size_threshold: 10
+  max_staleness_seconds: 1800
+  agent_llm_provider: "anthropic"
+  agent_llm_model: "claude-sonnet-4-20250514"
+  agent_max_steps: 50
+  judge_enabled: true
+  explore_codebase_root: "${PROJECT_ROOT:.}"

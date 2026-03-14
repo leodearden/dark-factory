@@ -1,17 +1,23 @@
 """FastMCP tool definitions for the Fused Memory server."""
 
+from __future__ import annotations
+
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import FastMCP
 
 from fused_memory.services.memory_service import MemoryService
 
+if TYPE_CHECKING:
+    from fused_memory.middleware.task_interceptor import TaskInterceptor
+
 logger = logging.getLogger(__name__)
 
 FUSED_MEMORY_INSTRUCTIONS = """\
 Fused Memory is a unified memory system that combines Graphiti (temporal knowledge graph)
-and Mem0 (vector memory store) behind a single interface.
+and Mem0 (vector memory store) behind a single interface. It also provides proxied access
+to Taskmaster AI for task management, with automatic reconciliation between memory and tasks.
 
 It organizes memories into six categories:
 1. Entities & Relations — facts about things and how they connect (Graphiti)
@@ -30,13 +36,23 @@ Read operations:
 - get_entity: Direct entity lookup in the knowledge graph
 - get_episodes: Retrieve raw episode history
 
+Task operations (when Taskmaster is connected):
+- get_tasks / get_task: Read task tree
+- set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
+- add_task / update_task / add_subtask / remove_task: Task CRUD
+- add_dependency / remove_dependency: Dependency management
+- expand_task / parse_prd: Bulk task generation
+
 Management:
 - delete_memory / delete_episode: Remove specific memories
-- get_status: Health check for both backends
+- get_status: Health check for all backends
 """
 
 
-def create_mcp_server(memory_service: MemoryService) -> FastMCP:
+def create_mcp_server(
+    memory_service: MemoryService,
+    task_interceptor: TaskInterceptor | None = None,
+) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
@@ -267,5 +283,306 @@ def create_mcp_server(memory_service: MemoryService) -> FastMCP:
         except Exception as e:
             logger.error(f'get_status error: {e}')
             return {'error': str(e)}
+
+    # ------------------------------------------------------------------
+    # Task proxy tools (when Taskmaster is connected)
+    # ------------------------------------------------------------------
+
+    if task_interceptor:
+
+        @mcp.tool()
+        async def get_tasks(
+            project_root: str,
+            tag: str | None = None,
+        ) -> dict[str, Any]:
+            """List all tasks in the project.
+
+            Args:
+                project_root: Absolute path to project root
+                tag: Tag context (optional)
+            """
+            try:
+                return await task_interceptor.get_tasks(project_root=project_root, tag=tag)
+            except Exception as e:
+                logger.error(f'get_tasks error: {e}')
+                return {'error': str(e)}
+
+        @mcp.tool()
+        async def get_task(
+            id: str,
+            project_root: str,
+            tag: str | None = None,
+        ) -> dict[str, Any]:
+            """Get a single task by ID.
+
+            Args:
+                id: Task ID (e.g., "15", "15.2")
+                project_root: Absolute path to project root
+                tag: Tag context (optional)
+            """
+            try:
+                return await task_interceptor.get_task(
+                    task_id=id, project_root=project_root, tag=tag
+                )
+            except Exception as e:
+                logger.error(f'get_task error: {e}')
+                return {'error': str(e)}
+
+        @mcp.tool()
+        async def set_task_status(
+            id: str,
+            status: str,
+            project_root: str,
+            tag: str | None = None,
+        ) -> dict[str, Any]:
+            """Update task status. Triggers targeted reconciliation for
+            done/blocked/cancelled/deferred transitions.
+
+            Args:
+                id: Task ID (comma-separated for multiple)
+                status: pending, done, in-progress, review, deferred, or cancelled
+                project_root: Absolute path to project root
+                tag: Tag context (optional)
+            """
+            try:
+                return await task_interceptor.set_task_status(
+                    task_id=id, status=status, project_root=project_root, tag=tag
+                )
+            except Exception as e:
+                logger.error(f'set_task_status error: {e}')
+                return {'error': str(e)}
+
+        @mcp.tool()
+        async def add_task(
+            project_root: str,
+            prompt: str | None = None,
+            title: str | None = None,
+            description: str | None = None,
+            details: str | None = None,
+            dependencies: str | None = None,
+            priority: str | None = None,
+            tag: str | None = None,
+        ) -> dict[str, Any]:
+            """Add a new task to the project.
+
+            Args:
+                project_root: Absolute path to project root
+                prompt: Task description for AI generation
+                title: Manual task title
+                description: Manual task description
+                details: Manual task details
+                dependencies: Comma-separated dependency task IDs
+                priority: high, medium, or low
+                tag: Tag context (optional)
+            """
+            try:
+                return await task_interceptor.add_task(
+                    project_root=project_root,
+                    prompt=prompt,
+                    title=title,
+                    description=description,
+                    details=details,
+                    dependencies=dependencies,
+                    priority=priority,
+                    tag=tag,
+                )
+            except Exception as e:
+                logger.error(f'add_task error: {e}')
+                return {'error': str(e)}
+
+        @mcp.tool()
+        async def update_task(
+            id: str,
+            project_root: str,
+            prompt: str | None = None,
+            metadata: str | None = None,
+            append: bool = False,
+            tag: str | None = None,
+        ) -> dict[str, Any]:
+            """Update an existing task.
+
+            Args:
+                id: Task ID to update
+                project_root: Absolute path to project root
+                prompt: New information to incorporate
+                metadata: JSON metadata to merge
+                append: Append instead of full update
+                tag: Tag context (optional)
+            """
+            try:
+                return await task_interceptor.update_task(
+                    task_id=id,
+                    project_root=project_root,
+                    prompt=prompt,
+                    metadata=metadata,
+                    append=append,
+                    tag=tag,
+                )
+            except Exception as e:
+                logger.error(f'update_task error: {e}')
+                return {'error': str(e)}
+
+        @mcp.tool()
+        async def add_subtask(
+            id: str,
+            project_root: str,
+            title: str | None = None,
+            description: str | None = None,
+            details: str | None = None,
+            tag: str | None = None,
+        ) -> dict[str, Any]:
+            """Add a subtask to an existing task.
+
+            Args:
+                id: Parent task ID
+                project_root: Absolute path to project root
+                title: Subtask title
+                description: Subtask description
+                details: Subtask details
+                tag: Tag context (optional)
+            """
+            try:
+                return await task_interceptor.add_subtask(
+                    parent_id=id,
+                    project_root=project_root,
+                    title=title,
+                    description=description,
+                    details=details,
+                    tag=tag,
+                )
+            except Exception as e:
+                logger.error(f'add_subtask error: {e}')
+                return {'error': str(e)}
+
+        @mcp.tool()
+        async def remove_task(
+            id: str,
+            project_root: str,
+            tag: str | None = None,
+        ) -> dict[str, Any]:
+            """Remove a task or subtask.
+
+            Args:
+                id: Task/subtask ID to remove (comma-separated for multiple)
+                project_root: Absolute path to project root
+                tag: Tag context (optional)
+            """
+            try:
+                return await task_interceptor.remove_task(
+                    task_id=id, project_root=project_root, tag=tag
+                )
+            except Exception as e:
+                logger.error(f'remove_task error: {e}')
+                return {'error': str(e)}
+
+        @mcp.tool()
+        async def add_dependency(
+            id: str,
+            depends_on: str,
+            project_root: str,
+            tag: str | None = None,
+        ) -> dict[str, Any]:
+            """Add a dependency between tasks.
+
+            Args:
+                id: Task ID that will depend on another
+                depends_on: Task ID that becomes a dependency
+                project_root: Absolute path to project root
+                tag: Tag context (optional)
+            """
+            try:
+                return await task_interceptor.add_dependency(
+                    task_id=id,
+                    depends_on=depends_on,
+                    project_root=project_root,
+                    tag=tag,
+                )
+            except Exception as e:
+                logger.error(f'add_dependency error: {e}')
+                return {'error': str(e)}
+
+        @mcp.tool()
+        async def remove_dependency(
+            id: str,
+            depends_on: str,
+            project_root: str,
+            tag: str | None = None,
+        ) -> dict[str, Any]:
+            """Remove a dependency between tasks.
+
+            Args:
+                id: Task ID to remove dependency from
+                depends_on: Dependency task ID to remove
+                project_root: Absolute path to project root
+                tag: Tag context (optional)
+            """
+            try:
+                return await task_interceptor.remove_dependency(
+                    task_id=id,
+                    depends_on=depends_on,
+                    project_root=project_root,
+                    tag=tag,
+                )
+            except Exception as e:
+                logger.error(f'remove_dependency error: {e}')
+                return {'error': str(e)}
+
+        @mcp.tool()
+        async def expand_task(
+            id: str,
+            project_root: str,
+            num: str | None = None,
+            prompt: str | None = None,
+            force: bool = False,
+            tag: str | None = None,
+        ) -> dict[str, Any]:
+            """Expand a task into subtasks. Triggers bulk reconciliation.
+
+            Args:
+                id: Task ID to expand
+                project_root: Absolute path to project root
+                num: Number of subtasks to generate
+                prompt: Additional context for generation
+                force: Force expansion even if subtasks exist
+                tag: Tag context (optional)
+            """
+            try:
+                return await task_interceptor.expand_task(
+                    task_id=id,
+                    project_root=project_root,
+                    num=num,
+                    prompt=prompt,
+                    force=force,
+                    tag=tag,
+                )
+            except Exception as e:
+                logger.error(f'expand_task error: {e}')
+                return {'error': str(e)}
+
+        @mcp.tool()
+        async def parse_prd(
+            input: str,
+            project_root: str,
+            num_tasks: str | None = None,
+            tag: str | None = None,
+        ) -> dict[str, Any]:
+            """Parse a PRD document to generate tasks. Triggers bulk reconciliation.
+
+            Args:
+                input: Path to PRD file (.txt, .md, etc.)
+                project_root: Absolute path to project root
+                num_tasks: Approximate number of tasks to generate
+                tag: Tag context (optional)
+            """
+            try:
+                return await task_interceptor.parse_prd(
+                    input_path=input,
+                    project_root=project_root,
+                    num_tasks=num_tasks,
+                    tag=tag,
+                )
+            except Exception as e:
+                logger.error(f'parse_prd error: {e}')
+                return {'error': str(e)}
 
     return mcp
