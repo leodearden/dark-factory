@@ -66,12 +66,67 @@ async def run_server():
     logger.info(f'  Mem0/Qdrant: {config.mem0.qdrant_url}')
     logger.info(f'  Transport: {config.server.transport}')
 
-    # Initialize service
+    # Initialize memory service
     memory_service = MemoryService(config)
     await memory_service.initialize()
 
-    # Create MCP server
-    mcp = create_mcp_server(memory_service)
+    # Initialize Taskmaster backend
+    taskmaster = None
+    task_interceptor = None
+    if config.taskmaster:
+        from fused_memory.backends.taskmaster_client import TaskmasterBackend
+
+        taskmaster = TaskmasterBackend(config.taskmaster)
+        try:
+            await taskmaster.initialize()
+            logger.info(f'  Taskmaster: connected via {config.taskmaster.transport}')
+        except Exception as e:
+            logger.warning(f'  Taskmaster: failed to connect ({e}), continuing without tasks')
+            taskmaster = None
+
+    # Initialize reconciliation system
+    reconciliation_harness = None
+    if config.reconciliation and config.reconciliation.enabled:
+        from fused_memory.middleware.task_interceptor import TaskInterceptor
+        from fused_memory.reconciliation.event_buffer import EventBuffer
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.journal import ReconciliationJournal
+        from fused_memory.reconciliation.targeted import TargetedReconciler
+
+        journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
+        await journal.initialize()
+
+        event_buffer = EventBuffer(
+            buffer_size_threshold=config.reconciliation.buffer_size_threshold,
+            max_staleness_seconds=config.reconciliation.max_staleness_seconds,
+        )
+
+        # Wire event emission into memory_service
+        memory_service.set_event_buffer(event_buffer)
+
+        # Targeted reconciler (needs memory_service + taskmaster + journal)
+        targeted = None
+        if taskmaster:
+            targeted = TargetedReconciler(memory_service, taskmaster, journal, config)
+            task_interceptor = TaskInterceptor(taskmaster, targeted, event_buffer)
+
+        # Full reconciliation harness (background loop)
+        reconciliation_harness = ReconciliationHarness(
+            memory_service, taskmaster, journal, event_buffer, config
+        )
+        asyncio.create_task(reconciliation_harness.run_loop())
+        logger.info('  Reconciliation: enabled (background loop started)')
+    else:
+        # If reconciliation is disabled but taskmaster is connected, still proxy tasks
+        if taskmaster:
+            from fused_memory.middleware.task_interceptor import TaskInterceptor
+            from fused_memory.reconciliation.event_buffer import EventBuffer
+
+            event_buffer = EventBuffer()
+            task_interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+
+    # Create MCP server with both memory and task tools
+    mcp = create_mcp_server(memory_service, task_interceptor)
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.port
 

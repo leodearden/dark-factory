@@ -1,0 +1,140 @@
+"""Tests for task interceptor middleware."""
+
+import uuid
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.reconciliation.event_buffer import EventBuffer
+
+
+@pytest.fixture
+def taskmaster():
+    tm = AsyncMock()
+    tm.get_task = AsyncMock(return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'})
+    tm.set_task_status = AsyncMock(return_value={'success': True})
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+    tm.add_task = AsyncMock(return_value={'id': '2', 'title': 'New Task'})
+    tm.update_task = AsyncMock(return_value={'success': True})
+    tm.add_subtask = AsyncMock(return_value={'id': '1.1'})
+    tm.remove_task = AsyncMock(return_value={'success': True})
+    tm.add_dependency = AsyncMock(return_value={'success': True})
+    tm.remove_dependency = AsyncMock(return_value={'success': True})
+    tm.expand_task = AsyncMock(return_value={'subtasks': [{'id': '1.1'}, {'id': '1.2'}]})
+    tm.parse_prd = AsyncMock(return_value={'tasks': [{'id': '1'}, {'id': '2'}]})
+    return tm
+
+
+@pytest.fixture
+def reconciler():
+    r = AsyncMock()
+    r.reconcile_task = AsyncMock(return_value={'actions': [{'type': 'knowledge_captured'}]})
+    r.reconcile_bulk_tasks = AsyncMock(return_value={'actions': []})
+    return r
+
+
+@pytest.fixture
+def event_buffer():
+    return EventBuffer(buffer_size_threshold=100)
+
+
+@pytest.fixture
+def interceptor(taskmaster, reconciler, event_buffer):
+    return TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_non_trigger(interceptor, taskmaster, reconciler, event_buffer):
+    """Non-triggering status change: emits event, no reconciliation."""
+    result = await interceptor.set_task_status('1', 'in-progress', '/project')
+    assert result == {'success': True}
+    taskmaster.set_task_status.assert_called_once()
+    reconciler.reconcile_task.assert_not_called()
+    # Event should be buffered
+    stats = event_buffer.get_buffer_stats('/project')
+    assert stats['size'] == 1
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_done_triggers_reconciliation(interceptor, reconciler, event_buffer):
+    """Done status triggers targeted reconciliation."""
+    result = await interceptor.set_task_status('1', 'done', '/project')
+    assert 'reconciliation' in result
+    reconciler.reconcile_task.assert_called_once_with(
+        task_id='1',
+        transition='done',
+        project_id='/project',
+        task_before={'id': '1', 'status': 'pending', 'title': 'Test Task'},
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_blocked_triggers(interceptor, reconciler):
+    result = await interceptor.set_task_status('1', 'blocked', '/project')
+    assert 'reconciliation' in result
+    reconciler.reconcile_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_cancelled_triggers(interceptor, reconciler):
+    result = await interceptor.set_task_status('1', 'cancelled', '/project')
+    assert 'reconciliation' in result
+
+
+@pytest.mark.asyncio
+async def test_read_operations_no_events(interceptor, taskmaster, event_buffer):
+    """Pure reads don't emit events."""
+    await interceptor.get_tasks('/project')
+    await interceptor.get_task('1', '/project')
+    stats = event_buffer.get_buffer_stats('/project')
+    assert stats['size'] == 0
+
+
+@pytest.mark.asyncio
+async def test_add_task_emits_event(interceptor, event_buffer):
+    await interceptor.add_task('/project', prompt='Test')
+    stats = event_buffer.get_buffer_stats('/project')
+    assert stats['size'] == 1
+
+
+@pytest.mark.asyncio
+async def test_expand_task_triggers_bulk_reconciliation(interceptor, reconciler, event_buffer):
+    result = await interceptor.expand_task('1', '/project')
+    assert 'reconciliation' in result
+    reconciler.reconcile_bulk_tasks.assert_called_once()
+    stats = event_buffer.get_buffer_stats('/project')
+    assert stats['size'] == 1
+
+
+@pytest.mark.asyncio
+async def test_parse_prd_triggers_bulk_reconciliation(interceptor, reconciler, event_buffer):
+    result = await interceptor.parse_prd('prd.md', '/project')
+    assert 'reconciliation' in result
+    reconciler.reconcile_bulk_tasks.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_no_reconciler_still_proxies(taskmaster, event_buffer):
+    """Without a reconciler, interceptor still proxies to taskmaster."""
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+    result = await interceptor.set_task_status('1', 'done', '/project')
+    assert result == {'success': True}
+    # No reconciliation key
+    assert 'reconciliation' not in result
+
+
+@pytest.mark.asyncio
+async def test_remove_task_emits_event(interceptor, event_buffer):
+    await interceptor.remove_task('1', '/project')
+    stats = event_buffer.get_buffer_stats('/project')
+    assert stats['size'] == 1
+
+
+@pytest.mark.asyncio
+async def test_dependency_operations_emit_events(interceptor, event_buffer):
+    await interceptor.add_dependency('2', '1', '/project')
+    await interceptor.remove_dependency('2', '1', '/project')
+    stats = event_buffer.get_buffer_stats('/project')
+    assert stats['size'] == 2

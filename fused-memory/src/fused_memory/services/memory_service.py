@@ -1,11 +1,13 @@
 """Core orchestration layer — owns backends, classifier, router, queue."""
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import logging
 import uuid as uuid_mod
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any
 
 from graphiti_core.nodes import EpisodeType
 
@@ -24,10 +26,18 @@ from fused_memory.models.memory import (
     MemoryResult,
     ReadRouteResult,
 )
+from fused_memory.models.reconciliation import (
+    EventSource,
+    EventType,
+    ReconciliationEvent,
+)
 from fused_memory.models.scope import Scope
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services.queue_service import QueueService
+
+if TYPE_CHECKING:
+    from fused_memory.reconciliation.event_buffer import EventBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +52,15 @@ class MemoryService:
         self.classifier = WriteClassifier(config)
         self.router = ReadRouter(config)
         self.queue = QueueService()
+        self._event_buffer: EventBuffer | None = None
+
+    def set_event_buffer(self, buffer: EventBuffer) -> None:
+        """Wire the reconciliation event buffer into the service."""
+        self._event_buffer = buffer
+
+    async def _emit_event(self, event: ReconciliationEvent) -> None:
+        if self._event_buffer:
+            await self._event_buffer.push(event)
 
     async def initialize(self) -> None:
         """Initialize backends and wire up the queue."""
@@ -89,6 +108,15 @@ class MemoryService:
             uuid=episode_id,
             post_process_callback=_post_process,
         )
+
+        await self._emit_event(ReconciliationEvent(
+            id=str(uuid_mod.uuid4()),
+            type=EventType.episode_added,
+            source=EventSource.agent,
+            project_id=project_id,
+            timestamp=datetime.now(timezone.utc),
+            payload={'episode_id': episode_id, 'content_preview': content[:200]},
+        ))
 
         return AddEpisodeResponse(
             episode_id=episode_id,
@@ -186,6 +214,19 @@ class MemoryService:
                 stores_written.append(SourceStore.mem0)
             except Exception as e:
                 logger.error(f'Mem0 write failed: {e}')
+
+        await self._emit_event(ReconciliationEvent(
+            id=str(uuid_mod.uuid4()),
+            type=EventType.memory_added,
+            source=EventSource.agent,
+            project_id=project_id,
+            timestamp=datetime.now(timezone.utc),
+            payload={
+                'memory_ids': memory_ids,
+                'category': resolved_category.value,
+                'content_preview': content[:200],
+            },
+        ))
 
         return AddMemoryResponse(
             memory_ids=memory_ids,
@@ -405,10 +446,21 @@ class MemoryService:
 
         if source == SourceStore.graphiti:
             await self.graphiti.remove_episode(memory_id)
-            return {'status': 'deleted', 'store': 'graphiti', 'id': memory_id}
+            result = {'status': 'deleted', 'store': 'graphiti', 'id': memory_id}
         else:
-            result = await self.mem0.delete(memory_id, scope)
-            return {'status': 'deleted', 'store': 'mem0', 'id': memory_id, **result}
+            del_result = await self.mem0.delete(memory_id, scope)
+            result = {'status': 'deleted', 'store': 'mem0', 'id': memory_id, **del_result}
+
+        await self._emit_event(ReconciliationEvent(
+            id=str(uuid_mod.uuid4()),
+            type=EventType.memory_deleted,
+            source=EventSource.agent,
+            project_id=project_id,
+            timestamp=datetime.now(timezone.utc),
+            payload={'memory_id': memory_id, 'store': store},
+        ))
+
+        return result
 
     async def delete_episode(
         self,
