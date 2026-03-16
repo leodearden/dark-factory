@@ -189,19 +189,25 @@ class MemoryService:
         # Graphiti: lightweight episode (source="text")
         if write_graphiti:
             try:
-                ep_id = str(uuid_mod.uuid4())
-                await self.graphiti.add_episode(
-                    name=f'memory_{ep_id[:8]}',
+                result = await self.graphiti.add_episode(
+                    name=f'memory_{resolved_category.value}',
                     content=content,
                     source=EpisodeType.text,
                     group_id=scope.graphiti_group_id,
                     source_description=f'add_memory:{resolved_category.value}',
-                    uuid=ep_id,
                 )
-                memory_ids.append(ep_id)
+                # Extract episode UUID from result if available
+                ep_uuid = getattr(result, 'episode_uuid', None)
+                if ep_uuid:
+                    memory_ids.append(str(ep_uuid))
                 stores_written.append(SourceStore.graphiti)
             except Exception as e:
                 logger.error(f'Graphiti write failed: {e}')
+                _graphiti_error = f'{type(e).__name__}: {e}'
+            else:
+                _graphiti_error = None
+        else:
+            _graphiti_error = None
 
         # Mem0: direct write
         if write_mem0:
@@ -228,11 +234,15 @@ class MemoryService:
             },
         ))
 
+        msg = f'Memory stored in {[s.value for s in stores_written]}'
+        if _graphiti_error:
+            msg += f' [graphiti_error: {_graphiti_error}]'
+
         return AddMemoryResponse(
             memory_ids=memory_ids,
             stores_written=stores_written,
             category=resolved_category,
-            message=f'Memory stored in {[s.value for s in stores_written]}',
+            message=msg,
         )
 
     # ------------------------------------------------------------------

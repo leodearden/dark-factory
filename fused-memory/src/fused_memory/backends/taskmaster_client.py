@@ -37,13 +37,34 @@ class TaskmasterBackend:
                 env=env,
             )
             self._stdio_ctx = stdio_client(server_params)
-            read_stream, write_stream = await self._stdio_ctx.__aenter__()
-            self._session_ctx = ClientSession(read_stream, write_stream)
-            self._session = await self._session_ctx.__aenter__()
-            await self._session.initialize()
+            try:
+                read_stream, write_stream = await self._stdio_ctx.__aenter__()
+                self._session_ctx = ClientSession(read_stream, write_stream)
+                self._session = await self._session_ctx.__aenter__()
+                await self._session.initialize()
+            except Exception:
+                # Clean up partially opened contexts to prevent dangling cancel scopes
+                await self._cleanup_contexts()
+                raise
             logger.info('Taskmaster MCP client connected via stdio')
         else:
             raise ValueError(f'Unsupported Taskmaster transport: {self.config.transport}')
+
+    async def _cleanup_contexts(self) -> None:
+        """Best-effort cleanup of partially opened async contexts."""
+        if self._session_ctx:
+            try:
+                await self._session_ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._session_ctx = None
+        if self._stdio_ctx:
+            try:
+                await self._stdio_ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._stdio_ctx = None
+        self._session = None
 
     async def close(self) -> None:
         """Shut down client session and server process."""

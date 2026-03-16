@@ -46,6 +46,22 @@ Task operations (when Taskmaster is connected):
 Management:
 - delete_memory / delete_episode: Remove specific memories
 - get_status: Health check for all backends
+
+Reconciliation:
+- Task status transitions (done/blocked/cancelled/deferred) trigger targeted reconciliation
+  automatically — memory_hints may be attached, completion knowledge written, dependent tasks flagged.
+- Bulk operations (expand_task, parse_prd) trigger cross-referencing between new tasks and
+  existing knowledge.
+- A background pipeline runs periodically for full-cycle reconciliation (consolidation,
+  cross-store integrity, task-knowledge sync).
+
+Conventions:
+- Always include project_id on every call (scopes data isolation).
+- Include agent_id for attribution (e.g. "claude-interactive", "claude-task-7").
+- Prefer add_memory over add_episode for discrete, pre-distilled facts (lower cost: 0-3 vs 5-15 LLM calls).
+- Tasks may carry memory_hints in metadata — structured pointers (search queries + entity names)
+  that help future agents prefetch relevant context. Execute hint queries via search, look up
+  hint entities via get_entity.
 """
 
 
@@ -185,11 +201,14 @@ def create_mcp_server(
         name: str,
         project_id: str,
     ) -> dict[str, Any]:
-        """Look up an entity in the knowledge graph. Returns the entity node(s),
-        their edges, and connected entities.
+        """Look up an entity in the knowledge graph by name (fuzzy matched).
+
+        Returns entity nodes (with names, summaries, labels), their edges as
+        relationship facts, and connected entities. Use this for direct entity
+        lookup when you know the name; use search() for broader semantic queries.
 
         Args:
-            name: Entity name (fuzzy matched)
+            name: Entity name (fuzzy matched — partial or approximate names work)
             project_id: Project scope (required)
         """
         try:
@@ -203,8 +222,10 @@ def create_mcp_server(
         project_id: str,
         last_n: int = 10,
     ) -> dict[str, Any]:
-        """Retrieve raw episodes from the knowledge graph. Useful for reviewing
-        interaction history or tracing provenance.
+        """Retrieve raw episodes from the knowledge graph. Episodes are the original
+        ingested content chunks — each represents one add_episode call with its
+        timestamp, source type, and content. Useful for reviewing interaction history,
+        tracing provenance of extracted facts, or auditing what was ingested.
 
         Args:
             project_id: Project scope (required)
@@ -229,7 +250,13 @@ def create_mcp_server(
         store: str,
         project_id: str,
     ) -> dict[str, Any]:
-        """Delete a specific memory from a store.
+        """Delete a specific memory from a store. IRREVERSIBLE.
+
+        For Mem0: removes the vector entry directly.
+        For Graphiti: removes the episode (use delete_episode for cascade control).
+
+        The memory_id and store values come from search results (each result
+        includes its id and source_store).
 
         Args:
             memory_id: The memory ID (from search results)
@@ -250,12 +277,16 @@ def create_mcp_server(
         project_id: str,
         cascade: bool = True,
     ) -> dict[str, Any]:
-        """Delete a Graphiti episode.
+        """Delete a Graphiti episode. IRREVERSIBLE.
+
+        When cascade=true (default): also removes entities and edges that were
+        exclusively sourced from this episode. Entities/edges shared with other
+        episodes are preserved.
 
         Args:
             episode_id: Graphiti episode UUID
             project_id: Project scope (required)
-            cascade: Also delete exclusive facts (default: true)
+            cascade: Also delete exclusive entities/edges (default: true)
         """
         try:
             return await memory_service.delete_episode(
@@ -338,6 +369,9 @@ def create_mcp_server(
             """Update task status. Triggers targeted reconciliation for
             done/blocked/cancelled/deferred transitions.
 
+            Reconciliation may: attach memory_hints to the task, write completion
+            knowledge to memory stores, or flag dependent tasks that need attention.
+
             Args:
                 id: Task ID (comma-separated for multiple)
                 status: pending, done, in-progress, review, deferred, or cancelled
@@ -364,6 +398,10 @@ def create_mcp_server(
             tag: str | None = None,
         ) -> dict[str, Any]:
             """Add a new task to the project.
+
+            Consider including memory_hints in the description or details so future
+            agents can prefetch relevant context (e.g. entity names to look up,
+            search queries to run).
 
             Args:
                 project_root: Absolute path to project root

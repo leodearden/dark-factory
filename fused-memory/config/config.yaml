@@ -52,7 +52,7 @@ queue:
 taskmaster:
   transport: "stdio"
   command: "node"
-  args: ["${TASKMASTER_DIR:../taskmaster-ai}/mcp-server/server.js"]
+  args: ["${TASKMASTER_DIR:../taskmaster-ai}/dist/mcp-server.js"]
   project_root: "${PROJECT_ROOT:.}"
   tool_mode: "standard"
 
