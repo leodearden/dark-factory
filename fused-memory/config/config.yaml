@@ -47,7 +47,12 @@ routing:
   llm_fallback: true
 
 queue:
-  semaphore_limit: ${SEMAPHORE_LIMIT:10}
+  semaphore_limit: ${SEMAPHORE_LIMIT:20}
+  workers_per_group: ${QUEUE_WORKERS_PER_GROUP:3}
+  max_attempts: ${QUEUE_MAX_ATTEMPTS:5}
+  retry_base_seconds: ${QUEUE_RETRY_BASE:5}
+  write_timeout_seconds: ${QUEUE_WRITE_TIMEOUT:120}
+  data_dir: "${QUEUE_DATA_DIR:./data/queue}"
 
 taskmaster:
   transport: "stdio"

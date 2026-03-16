@@ -2,11 +2,20 @@
 
 import pytest
 
-from fused_memory.config.schema import FusedMemoryConfig, LLMConfig, LLMProvidersConfig, OpenAIProviderConfig, EmbedderConfig, EmbedderProvidersConfig, RoutingConfig
+from fused_memory.config.schema import (
+    EmbedderConfig,
+    EmbedderProvidersConfig,
+    FusedMemoryConfig,
+    LLMConfig,
+    LLMProvidersConfig,
+    OpenAIProviderConfig,
+    QueueConfig,
+    RoutingConfig,
+)
 
 
 @pytest.fixture
-def mock_config() -> FusedMemoryConfig:
+def mock_config(tmp_path) -> FusedMemoryConfig:
     """A FusedMemoryConfig that doesn't require real API keys or services."""
     return FusedMemoryConfig(
         llm=LLMConfig(
@@ -27,5 +36,13 @@ def mock_config() -> FusedMemoryConfig:
             use_heuristics=True,
             llm_fallback=False,
             confidence_threshold=0.7,
+        ),
+        queue=QueueConfig(
+            semaphore_limit=5,
+            workers_per_group=2,
+            max_attempts=3,
+            retry_base_seconds=0.05,
+            write_timeout_seconds=2.0,
+            data_dir=str(tmp_path / 'queue'),
         ),
     )

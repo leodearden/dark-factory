@@ -1,4 +1,4 @@
-"""Core orchestration layer — owns backends, classifier, router, queue."""
+"""Core orchestration layer — owns backends, classifier, router, durable queue."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ from fused_memory.models.reconciliation import (
 from fused_memory.models.scope import Scope
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
-from fused_memory.services.queue_service import QueueService
+from fused_memory.services.durable_queue import DurableWriteQueue
 
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -51,7 +51,7 @@ class MemoryService:
         self.mem0 = Mem0Backend(config)
         self.classifier = WriteClassifier(config)
         self.router = ReadRouter(config)
-        self.queue = QueueService()
+        self.durable_queue: DurableWriteQueue | None = None
         self._event_buffer: EventBuffer | None = None
 
     def set_event_buffer(self, buffer: EventBuffer) -> None:
@@ -63,13 +63,64 @@ class MemoryService:
             await self._event_buffer.push(event)
 
     async def initialize(self) -> None:
-        """Initialize backends and wire up the queue."""
+        """Initialize backends and the durable write queue."""
         await self.graphiti.initialize()
-        await self.queue.initialize(self.graphiti)
+
+        qcfg = self.config.queue
+        self.durable_queue = DurableWriteQueue(
+            data_dir=qcfg.data_dir,
+            execute_write=self._execute_graphiti_write,
+            workers_per_group=qcfg.workers_per_group,
+            semaphore_limit=qcfg.semaphore_limit,
+            max_attempts=qcfg.max_attempts,
+            retry_base_seconds=qcfg.retry_base_seconds,
+            write_timeout_seconds=qcfg.write_timeout_seconds,
+        )
+        self.durable_queue.register_callback(
+            'dual_write_episode', self._dual_write_callback
+        )
+        await self.durable_queue.initialize()
+
         logger.info('MemoryService initialized')
 
     async def close(self) -> None:
+        if self.durable_queue:
+            await self.durable_queue.close()
         await self.graphiti.close()
+
+    # ------------------------------------------------------------------
+    # Durable queue: execute write dispatcher
+    # ------------------------------------------------------------------
+
+    async def _execute_graphiti_write(
+        self, operation: str, payload: dict[str, Any]
+    ) -> Any:
+        """Dispatch a queued write to the Graphiti backend."""
+        source_str = payload.get('source', 'text')
+        try:
+            episode_type = EpisodeType[source_str]
+        except (KeyError, AttributeError):
+            episode_type = EpisodeType.text
+
+        return await self.graphiti.add_episode(
+            name=payload.get('name', ''),
+            content=payload['content'],
+            source=episode_type,
+            group_id=payload['group_id'],
+            source_description=payload.get('source_description', ''),
+            uuid=payload.get('uuid'),
+        )
+
+    async def _dual_write_callback(
+        self, callback_type: str, result: Any, payload: dict[str, Any]
+    ) -> None:
+        """Post-process callback: classify extracted edges and dual-write to Mem0."""
+        scope = Scope(
+            project_id=payload.get('project_id', 'main'),
+            agent_id=payload.get('agent_id'),
+            session_id=payload.get('session_id'),
+        )
+        await self._dual_write_from_episode(result, scope)
 
     # ------------------------------------------------------------------
     # Write: add_episode
@@ -85,28 +136,34 @@ class MemoryService:
         reference_time: datetime | None = None,
         source_description: str = '',
     ) -> AddEpisodeResponse:
-        """Full ingestion pipeline — queue episode, return immediately."""
+        """Full ingestion pipeline — durably enqueue episode, return immediately."""
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         episode_id = str(uuid_mod.uuid4())
 
-        # Parse source type
+        # Parse source type name for storage
         try:
-            episode_type = EpisodeType[source.lower()]
+            source_name = EpisodeType[source.lower()].name
         except (KeyError, AttributeError):
-            episode_type = EpisodeType.text
+            source_name = 'text'
 
-        async def _post_process(result: Any) -> None:
-            """After Graphiti extraction: classify edges and dual-write to Mem0."""
-            await self._dual_write_from_episode(result, scope)
+        assert self.durable_queue is not None
 
-        await self.queue.add_episode(
+        await self.durable_queue.enqueue(
             group_id=scope.graphiti_group_id,
-            name=f'episode_{episode_id[:8]}',
-            content=content,
-            source_description=source_description,
-            source=episode_type,
-            uuid=episode_id,
-            post_process_callback=_post_process,
+            operation='add_episode',
+            payload={
+                'name': f'episode_{episode_id[:8]}',
+                'content': content,
+                'source': source_name,
+                'group_id': scope.graphiti_group_id,
+                'source_description': source_description,
+                'uuid': episode_id,
+                # Scope fields for callback reconstruction
+                'project_id': project_id,
+                'agent_id': agent_id,
+                'session_id': session_id,
+            },
+            callback_type='dual_write_episode',
         )
 
         await self._emit_event(ReconciliationEvent(
@@ -186,30 +243,30 @@ class MemoryService:
             resolved_category in MEM0_PRIMARY or dual_write
         )
 
-        # Graphiti: lightweight episode (source="text")
+        _graphiti_error = None
+
+        # Graphiti: enqueue via durable queue (async, but durably persisted)
         if write_graphiti:
             try:
-                result = await self.graphiti.add_episode(
-                    name=f'memory_{resolved_category.value}',
-                    content=content,
-                    source=EpisodeType.text,
+                assert self.durable_queue is not None
+                await self.durable_queue.enqueue(
                     group_id=scope.graphiti_group_id,
-                    source_description=f'add_memory:{resolved_category.value}',
+                    operation='add_memory_graphiti',
+                    payload={
+                        'name': f'memory_{resolved_category.value}',
+                        'content': content,
+                        'source': 'text',
+                        'group_id': scope.graphiti_group_id,
+                        'source_description': f'add_memory:{resolved_category.value}',
+                    },
                 )
-                # Extract episode UUID from result if available
-                ep_uuid = getattr(result, 'episode_uuid', None)
-                if ep_uuid:
-                    memory_ids.append(str(ep_uuid))
+                # Durably persisted to SQLite — report as written
                 stores_written.append(SourceStore.graphiti)
             except Exception as e:
-                logger.error(f'Graphiti write failed: {e}')
+                logger.error(f'Graphiti enqueue failed: {e}')
                 _graphiti_error = f'{type(e).__name__}: {e}'
-            else:
-                _graphiti_error = None
-        else:
-            _graphiti_error = None
 
-        # Mem0: direct write
+        # Mem0: direct write (fast, no queue needed)
         if write_mem0:
             try:
                 result = await self.mem0.add(content=content, scope=scope, metadata=meta)
@@ -244,6 +301,50 @@ class MemoryService:
             category=resolved_category,
             message=msg,
         )
+
+    # ------------------------------------------------------------------
+    # Replay: re-ingest Mem0 memories into Graphiti
+    # ------------------------------------------------------------------
+
+    async def replay_from_store(
+        self,
+        source_project_id: str,
+        target_project_id: str | None = None,
+    ) -> int:
+        """Fetch all memories from Mem0 and enqueue each for Graphiti write.
+
+        Returns the count of items queued.
+        """
+        target = target_project_id or source_project_id
+        scope = Scope(project_id=source_project_id)
+        all_mems = await self.mem0.get_all(scope, limit=1000)
+        memories = all_mems.get('results', [])
+        if not memories:
+            return 0
+
+        assert self.durable_queue is not None
+        batch = []
+        for mem in memories:
+            content = mem.get('memory', '')
+            if not content:
+                continue
+            meta = mem.get('metadata', {}) or {}
+            category = meta.get('category', 'observations_and_summaries')
+            batch.append({
+                'group_id': target,
+                'operation': 'add_memory_graphiti',
+                'payload': {
+                    'name': f'replay_{category}',
+                    'content': content,
+                    'source': 'text',
+                    'group_id': target,
+                    'source_description': f'replay_from_mem0:{category}',
+                },
+            })
+
+        if batch:
+            await self.durable_queue.enqueue_batch(batch)
+        return len(batch)
 
     # ------------------------------------------------------------------
     # Read: search
@@ -514,6 +615,13 @@ class MemoryService:
                 status['mem0'] = {'connected': True, 'memory_count': 'unknown (no project_id)'}
         except Exception as e:
             status['mem0'] = {'connected': False, 'error': str(e)}
+
+        # Queue stats
+        if self.durable_queue:
+            try:
+                status['queue'] = await self.durable_queue.get_stats()
+            except Exception as e:
+                status['queue'] = {'error': str(e)}
 
         return status
 

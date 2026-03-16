@@ -152,9 +152,14 @@ class RoutingConfig(BaseModel):
 # --- Queue ---
 
 class QueueConfig(BaseModel):
-    """Episode queue configuration."""
+    """Durable write queue configuration."""
 
-    semaphore_limit: int = Field(default=10)
+    semaphore_limit: int = Field(default=20)
+    workers_per_group: int = Field(default=3)
+    max_attempts: int = Field(default=5)
+    retry_base_seconds: float = Field(default=5.0)
+    write_timeout_seconds: float = Field(default=120.0)
+    data_dir: str = Field(default='./data/queue')
 
 
 # --- Taskmaster ---

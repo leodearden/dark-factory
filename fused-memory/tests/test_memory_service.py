@@ -27,6 +27,14 @@ def service(mock_config):
     svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
     svc.mem0.get_all = AsyncMock(return_value={'results': []})
     svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+
+    # Mock durable queue
+    svc.durable_queue = MagicMock()
+    svc.durable_queue.enqueue = AsyncMock(return_value=1)
+    svc.durable_queue.enqueue_batch = AsyncMock(return_value=[1, 2, 3])
+    svc.durable_queue.get_stats = AsyncMock(return_value={'counts': {}, 'oldest_pending_age_seconds': None})
+    svc.durable_queue.replay_dead = AsyncMock(return_value=0)
+    svc.durable_queue.close = AsyncMock()
     return svc
 
 
@@ -46,7 +54,7 @@ class TestScope:
 
 class TestAddMemory:
     @pytest.mark.asyncio
-    async def test_graphiti_primary_category(self, service):
+    async def test_graphiti_primary_enqueued(self, service):
         result = await service.add_memory(
             content='The auth service depends on Redis',
             category='entities_and_relations',
@@ -54,6 +62,9 @@ class TestAddMemory:
         )
         assert SourceStore.graphiti in result.stores_written
         assert result.category == MemoryCategory.entities_and_relations
+        # Graphiti write goes through durable queue, not directly
+        service.durable_queue.enqueue.assert_called_once()
+        service.graphiti.add_episode.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_mem0_primary_category(self, service):
@@ -64,6 +75,9 @@ class TestAddMemory:
         )
         assert SourceStore.mem0 in result.stores_written
         assert result.category == MemoryCategory.preferences_and_norms
+        # Mem0 written directly, no queue
+        service.mem0.add.assert_called_once()
+        service.durable_queue.enqueue.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_dual_write(self, service):
@@ -75,6 +89,8 @@ class TestAddMemory:
         )
         assert SourceStore.graphiti in result.stores_written
         assert SourceStore.mem0 in result.stores_written
+        service.durable_queue.enqueue.assert_called_once()
+        service.mem0.add.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_auto_classification(self, service):
@@ -84,6 +100,39 @@ class TestAddMemory:
         )
         # Should auto-classify — with heuristic-only config, entities_and_relations
         assert result.category is not None
+
+
+class TestAddEpisode:
+    @pytest.mark.asyncio
+    async def test_episode_enqueued(self, service):
+        result = await service.add_episode(
+            content='User discussed auth changes',
+            project_id='test',
+        )
+        assert result.status == 'queued'
+        assert result.episode_id is not None
+        service.durable_queue.enqueue.assert_called_once()
+        call_kwargs = service.durable_queue.enqueue.call_args[1]
+        assert call_kwargs['callback_type'] == 'dual_write_episode'
+        assert call_kwargs['payload']['project_id'] == 'test'
+
+
+class TestReplayFromStore:
+    @pytest.mark.asyncio
+    async def test_replay_enqueues_mem0_memories(self, service):
+        service.mem0.get_all = AsyncMock(return_value={
+            'results': [
+                {'memory': 'fact one', 'metadata': {'category': 'temporal_facts'}},
+                {'memory': 'fact two', 'metadata': {'category': 'entities_and_relations'}},
+                {'memory': '', 'metadata': {}},  # empty — should be skipped
+            ]
+        })
+        count = await service.replay_from_store(source_project_id='reify')
+        assert count == 2  # empty one skipped
+        service.durable_queue.enqueue_batch.assert_called_once()
+        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        assert len(batch) == 2
+        assert batch[0]['group_id'] == 'reify'
 
 
 class TestSearch:

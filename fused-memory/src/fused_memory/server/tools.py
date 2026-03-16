@@ -74,6 +74,17 @@ def create_mcp_server(
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
 
     # ------------------------------------------------------------------
+    # Health endpoint (used by orchestrator's McpLifecycle._wait_for_health)
+    # ------------------------------------------------------------------
+
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health_check(request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok"})
+
+    # ------------------------------------------------------------------
     # Write tools
     # ------------------------------------------------------------------
 
@@ -313,6 +324,69 @@ def create_mcp_server(
             return await memory_service.get_status(project_id=project_id)
         except Exception as e:
             logger.error(f'get_status error: {e}')
+            return {'error': str(e)}
+
+    # ------------------------------------------------------------------
+    # Queue management tools
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    async def replay_to_graphiti(
+        project_id: str,
+        source_store: str = 'mem0',
+    ) -> dict[str, Any]:
+        """Replay memories from Mem0 into Graphiti via the durable write queue.
+
+        Use this to backfill the knowledge graph from Mem0 after Graphiti write
+        failures, or to migrate memories into the graph. Items are processed
+        through the queue with retry and dead-lettering.
+
+        Args:
+            project_id: Project whose memories to replay
+            source_store: Source store to replay from (currently only "mem0")
+        """
+        try:
+            count = await memory_service.replay_from_store(
+                source_project_id=project_id,
+            )
+            return {'status': 'queued', 'items_queued': count, 'project_id': project_id}
+        except Exception as e:
+            logger.error(f'replay_to_graphiti error: {e}')
+            return {'error': str(e)}
+
+    @mcp.tool()
+    async def get_queue_stats() -> dict[str, Any]:
+        """Get durable write queue statistics — pending, retry, dead, completed
+        counts and oldest pending item age. Use to monitor queue health.
+        """
+        try:
+            if memory_service.durable_queue is None:
+                return {'error': 'Queue not initialized'}
+            return await memory_service.durable_queue.get_stats()
+        except Exception as e:
+            logger.error(f'get_queue_stats error: {e}')
+            return {'error': str(e)}
+
+    @mcp.tool()
+    async def replay_dead_letters(
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Reset dead-lettered queue items back to pending for retry.
+
+        Dead-lettered items are writes that exhausted all retry attempts.
+        This resets them so workers can try again (e.g. after fixing the
+        underlying issue).
+
+        Args:
+            project_id: Scope to a specific project (optional — all if omitted)
+        """
+        try:
+            if memory_service.durable_queue is None:
+                return {'error': 'Queue not initialized'}
+            count = await memory_service.durable_queue.replay_dead(group_id=project_id)
+            return {'status': 'replayed', 'items_reset': count}
+        except Exception as e:
+            logger.error(f'replay_dead_letters error: {e}')
             return {'error': str(e)}
 
     # ------------------------------------------------------------------
