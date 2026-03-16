@@ -1,5 +1,7 @@
 """Shared test fixtures."""
 
+from dataclasses import dataclass, field
+
 import pytest
 
 from fused_memory.config.schema import (
@@ -12,6 +14,20 @@ from fused_memory.config.schema import (
     QueueConfig,
     RoutingConfig,
 )
+
+
+@dataclass
+class MockEdge:
+    """Simulates a Graphiti entity edge returned from add_episode."""
+
+    fact: str
+
+
+@dataclass
+class MockAddEpisodeResult:
+    """Simulates the AddEpisodeResults returned by Graphiti's add_episode."""
+
+    entity_edges: list[MockEdge] = field(default_factory=list)
 
 
 @pytest.fixture
