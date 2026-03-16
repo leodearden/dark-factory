@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,19 +77,26 @@ async def invoke_agent(
     cmd.extend(['--', prompt])
 
     logger.info(f'Invoking agent: model={model} cwd={cwd} budget=${max_budget_usd}')
-    logger.debug(f'Command: {" ".join(cmd[:10])}...')
+    logger.info(f'Command: {" ".join(cmd[:15])}...')
 
     try:
+        # Strip ANTHROPIC_API_KEY so `claude` falls back to the Max
+        # subscription (OAuth) instead of billing against the API key.
+        env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(cwd),
+            env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await proc.communicate()
 
         if stderr:
-            logger.debug(f'Agent stderr: {stderr.decode()[-500:]}')
+            logger.info(f'Agent stderr (last 1000): {stderr.decode()[-1000:]}')
+        logger.info(f'Agent exit code: {proc.returncode}')
+        logger.info(f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout.decode()[:500]}')
 
         raw = stdout.decode()
         if not raw.strip():
