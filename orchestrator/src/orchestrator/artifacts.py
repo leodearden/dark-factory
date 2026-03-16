@@ -1,0 +1,168 @@
+"""Manages the .task/ directory structure in each worktree."""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+PLAN_SCHEMA_VERSION = 1
+
+
+@dataclass
+class ReviewAggregation:
+    """Aggregated review results from all reviewers."""
+
+    has_blocking_issues: bool
+    blocking_issues: list[dict]
+    suggestions: list[dict]
+    reviews: dict[str, dict]
+
+    def format_for_replan(self) -> str:
+        """Format blocking issues for the architect to address."""
+        lines = ['# Review Feedback — Blocking Issues\n']
+        for issue in self.blocking_issues:
+            reviewer = issue.get('reviewer', 'unknown')
+            location = issue.get('location', '')
+            category = issue.get('category', '')
+            description = issue.get('description', '')
+            fix = issue.get('suggested_fix', '')
+            lines.append(f'## [{reviewer}] {category}')
+            if location:
+                lines.append(f'**Location:** {location}')
+            lines.append(f'**Issue:** {description}')
+            if fix:
+                lines.append(f'**Suggested fix:** {fix}')
+            lines.append('')
+        return '\n'.join(lines)
+
+
+class TaskArtifacts:
+    """Manages .task/ directory in a worktree."""
+
+    def __init__(self, worktree: Path):
+        self.root = worktree / '.task'
+
+    def init(self, task_id: str, task_title: str, task_description: str) -> None:
+        """Create .task/ with initial metadata.json."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / 'reviews').mkdir(exist_ok=True)
+
+        metadata = {
+            'task_id': task_id,
+            'title': task_title,
+            'description': task_description,
+            'created_at': datetime.now(UTC).isoformat(),
+        }
+        self._write_json(self.root / 'metadata.json', metadata)
+
+    def write_plan(self, plan: dict) -> None:
+        """Write .task/plan.json — the structured plan."""
+        plan['_schema_version'] = PLAN_SCHEMA_VERSION
+        self._write_json(self.root / 'plan.json', plan)
+
+    def read_plan(self) -> dict:
+        """Read current plan state."""
+        plan_path = self.root / 'plan.json'
+        if not plan_path.exists():
+            return {}
+        return json.loads(plan_path.read_text())
+
+    def update_step_status(
+        self, step_id: str, status: str, commit: str | None = None
+    ) -> None:
+        """Update ONLY status and commit fields in plan.json. Structure is immutable."""
+        plan = self.read_plan()
+
+        for collection in ('prerequisites', 'steps'):
+            for item in plan.get(collection, []):
+                if item.get('id') == step_id:
+                    item['status'] = status
+                    if commit is not None:
+                        item['commit'] = commit
+                    self._write_json(self.root / 'plan.json', plan)
+                    return
+
+        logger.warning(f'Step {step_id} not found in plan')
+
+    def get_pending_steps(self) -> list[dict]:
+        """Return all steps with status 'pending', in order."""
+        plan = self.read_plan()
+        pending = []
+        for collection in ('prerequisites', 'steps'):
+            for item in plan.get(collection, []):
+                if item.get('status') == 'pending':
+                    pending.append(item)
+        return pending
+
+    def get_completed_steps(self) -> list[dict]:
+        """Return all steps with status 'done'."""
+        plan = self.read_plan()
+        completed = []
+        for collection in ('prerequisites', 'steps'):
+            for item in plan.get(collection, []):
+                if item.get('status') == 'done':
+                    completed.append(item)
+        return completed
+
+    def append_iteration_log(self, entry: dict) -> None:
+        """Append to .task/iterations.jsonl — one JSON object per line."""
+        entry['timestamp'] = datetime.now(UTC).isoformat()
+        log_path = self.root / 'iterations.jsonl'
+        with open(log_path, 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+
+    def read_iteration_log(self) -> list[dict]:
+        """Read all iteration log entries."""
+        log_path = self.root / 'iterations.jsonl'
+        if not log_path.exists():
+            return []
+        entries = []
+        for line in log_path.read_text().splitlines():
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+        return entries
+
+    def write_review(self, reviewer_name: str, review: dict) -> None:
+        """Write .task/reviews/{name}.json."""
+        review_path = self.root / 'reviews' / f'{reviewer_name}.json'
+        self._write_json(review_path, review)
+
+    def read_reviews(self) -> dict[str, dict]:
+        """Read all reviews."""
+        reviews_dir = self.root / 'reviews'
+        if not reviews_dir.exists():
+            return {}
+        reviews = {}
+        for path in reviews_dir.glob('*.json'):
+            reviews[path.stem] = json.loads(path.read_text())
+        return reviews
+
+    def aggregate_reviews(self) -> ReviewAggregation:
+        """Parse all reviews, separate blocking from suggestions."""
+        reviews = self.read_reviews()
+        blocking = []
+        suggestions = []
+
+        for reviewer_name, review in reviews.items():
+            for issue in review.get('issues', []):
+                enriched = {**issue, 'reviewer': reviewer_name}
+                if issue.get('severity') == 'blocking':
+                    blocking.append(enriched)
+                else:
+                    suggestions.append(enriched)
+
+        return ReviewAggregation(
+            has_blocking_issues=len(blocking) > 0,
+            blocking_issues=blocking,
+            suggestions=suggestions,
+            reviews=reviews,
+        )
+
+    def _write_json(self, path: Path, data: dict) -> None:
+        path.write_text(json.dumps(data, indent=2) + '\n')
