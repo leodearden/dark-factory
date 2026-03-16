@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -11,6 +12,7 @@ from pathlib import Path
 import httpx
 
 from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.agents.invoke import invoke_agent
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle
@@ -80,6 +82,10 @@ class Harness:
             # 2. Parse PRD into tasks
             logger.info(f'Parsing PRD: {prd_path}')
             await self._populate_tasks(prd_path)
+
+            # 2b. Tag tasks with code modules for concurrency locking
+            logger.info('Tagging tasks with code modules...')
+            await self._tag_task_modules()
 
             tasks = await self.scheduler.get_tasks()
             self.report.total_tasks = len([t for t in tasks if t.get('status') == 'pending'])
@@ -173,6 +179,105 @@ class Harness:
                 logger.info(f'PRD parsed: {result.get("result", {}).get("content", [{}])[0].get("text", "")[:200]}')
         except Exception as e:
             raise RuntimeError(f'Failed to parse PRD: {e}') from e
+
+    async def _tag_task_modules(self) -> None:
+        """Invoke a Claude agent to tag each task with the code modules it touches.
+
+        Uses structured output to get a JSON mapping of task_id → [modules],
+        then persists via scheduler.update_task().
+        """
+        tasks = await self.scheduler.get_tasks()
+
+        # Filter to tasks that don't already have modules in metadata
+        untagged = []
+        for t in tasks:
+            metadata = t.get('metadata') or {}
+            modules = metadata.get('modules', [])
+            if not modules:
+                untagged.append(t)
+
+        if not untagged:
+            logger.info('All tasks already have module tags — skipping')
+            return
+
+        # Get top-level directory listing for context
+        try:
+            entries = sorted(p.name for p in self.config.project_root.iterdir() if p.is_dir() and not p.name.startswith('.'))
+        except OSError:
+            entries = []
+
+        task_summaries = []
+        for t in untagged:
+            task_summaries.append({
+                'id': str(t.get('id', '')),
+                'title': t.get('title', ''),
+                'description': t.get('description', ''),
+            })
+
+        schema = {
+            'type': 'object',
+            'properties': {
+                'tasks': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'id': {'type': 'string'},
+                            'modules': {'type': 'array', 'items': {'type': 'string'}},
+                        },
+                        'required': ['id', 'modules'],
+                    },
+                },
+            },
+            'required': ['tasks'],
+        }
+
+        prompt = f"""\
+Given these tasks and this codebase structure, assign each task a list of
+code modules (top-level directories) it will need to modify. Be specific —
+use directory-level granularity (e.g. "src/backends", "src/server", "tests").
+
+# Codebase top-level directories
+{json.dumps(entries)}
+
+# Tasks to tag
+{json.dumps(task_summaries, indent=2)}
+
+Output JSON matching the schema. Every task must appear in the output.
+"""
+
+        result = await invoke_agent(
+            prompt=prompt,
+            system_prompt='You are a code module classifier. Given task descriptions and a codebase structure, determine which code modules each task will modify. Be precise and conservative.',
+            cwd=self.config.project_root,
+            model=self.config.models.module_tagger,
+            max_turns=self.config.max_turns.module_tagger,
+            max_budget_usd=self.config.budgets.module_tagger,
+            output_schema=schema,
+        )
+
+        if not result.success:
+            logger.warning(f'Module tagger agent failed: {result.output[:200]}')
+            return
+
+        # Parse the structured output
+        mapping = result.structured_output
+        if not mapping:
+            try:
+                mapping = json.loads(result.output)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning('Module tagger produced no parseable output')
+                return
+
+        tagged_count = 0
+        for entry in mapping.get('tasks', []):
+            task_id = str(entry.get('id', ''))
+            modules = entry.get('modules', [])
+            if task_id and modules:
+                await self.scheduler.update_task(task_id, json.dumps({'modules': modules}))
+                tagged_count += 1
+
+        logger.info(f'Tagged {tagged_count}/{len(untagged)} tasks with module metadata')
 
     async def _run_slot(
         self, assignment, sem: asyncio.Semaphore

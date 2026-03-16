@@ -72,6 +72,7 @@ class ModelsConfig(BaseModel):
     debugger: str = Field(default='opus')
     reviewer: str = Field(default='sonnet')
     merger: str = Field(default='opus')
+    module_tagger: str = Field(default='sonnet')
 
 
 class BudgetsConfig(BaseModel):
@@ -82,6 +83,7 @@ class BudgetsConfig(BaseModel):
     debugger: float = Field(default=5.0)
     reviewer: float = Field(default=2.0)
     merger: float = Field(default=5.0)
+    module_tagger: float = Field(default=2.0)
 
 
 class TurnsConfig(BaseModel):
@@ -92,6 +94,7 @@ class TurnsConfig(BaseModel):
     debugger: int = Field(default=50)
     reviewer: int = Field(default=30)
     merger: int = Field(default=50)
+    module_tagger: int = Field(default=30)
 
 
 class FusedMemoryConfig(BaseModel):
