@@ -172,6 +172,7 @@ class MemoryService:
             project_id=project_id,
             timestamp=datetime.now(timezone.utc),
             payload={'episode_id': episode_id, 'content_preview': content[:200]},
+            agent_id=agent_id,
         ))
 
         return AddEpisodeResponse(
@@ -288,6 +289,7 @@ class MemoryService:
                 'category': resolved_category.value,
                 'content_preview': content[:200],
             },
+            agent_id=agent_id,
         ))
 
         msg = f'Memory stored in {[s.value for s in stores_written]}'

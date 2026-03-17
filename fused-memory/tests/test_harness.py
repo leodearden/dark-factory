@@ -27,9 +27,12 @@ async def journal(tmp_path):
     await j.close()
 
 
-@pytest.fixture
-def event_buffer():
-    return EventBuffer(buffer_size_threshold=2, max_staleness_seconds=3600)
+@pytest_asyncio.fixture
+async def event_buffer(tmp_path):
+    buf = EventBuffer(db_path=tmp_path / 'harness_eb.db', buffer_size_threshold=2, max_staleness_seconds=3600)
+    await buf.initialize()
+    yield buf
+    await buf.close()
 
 
 @pytest.fixture
@@ -76,7 +79,7 @@ async def test_drain_clears_buffer(event_buffer):
     assert len(events) == 2
 
     # Should be empty now
-    assert event_buffer.get_buffer_stats('test-project')['size'] == 0
+    assert (await event_buffer.get_buffer_stats('test-project'))['size'] == 0
 
 
 @pytest.mark.asyncio

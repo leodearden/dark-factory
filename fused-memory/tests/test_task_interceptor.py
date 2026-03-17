@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -35,9 +36,12 @@ def reconciler():
     return r
 
 
-@pytest.fixture
-def event_buffer():
-    return EventBuffer(buffer_size_threshold=100)
+@pytest_asyncio.fixture
+async def event_buffer(tmp_path):
+    buf = EventBuffer(db_path=tmp_path / 'interceptor_eb.db', buffer_size_threshold=100)
+    await buf.initialize()
+    yield buf
+    await buf.close()
 
 
 @pytest.fixture
@@ -53,7 +57,7 @@ async def test_set_task_status_non_trigger(interceptor, taskmaster, reconciler, 
     taskmaster.set_task_status.assert_called_once()
     reconciler.reconcile_task.assert_not_called()
     # Event should be buffered
-    stats = event_buffer.get_buffer_stats('/project')
+    stats = await event_buffer.get_buffer_stats('/project')
     assert stats['size'] == 1
 
 
@@ -88,14 +92,14 @@ async def test_read_operations_no_events(interceptor, taskmaster, event_buffer):
     """Pure reads don't emit events."""
     await interceptor.get_tasks('/project')
     await interceptor.get_task('1', '/project')
-    stats = event_buffer.get_buffer_stats('/project')
+    stats = await event_buffer.get_buffer_stats('/project')
     assert stats['size'] == 0
 
 
 @pytest.mark.asyncio
 async def test_add_task_emits_event(interceptor, event_buffer):
     await interceptor.add_task('/project', prompt='Test')
-    stats = event_buffer.get_buffer_stats('/project')
+    stats = await event_buffer.get_buffer_stats('/project')
     assert stats['size'] == 1
 
 
@@ -104,7 +108,7 @@ async def test_expand_task_triggers_bulk_reconciliation(interceptor, reconciler,
     result = await interceptor.expand_task('1', '/project')
     assert 'reconciliation' in result
     reconciler.reconcile_bulk_tasks.assert_called_once()
-    stats = event_buffer.get_buffer_stats('/project')
+    stats = await event_buffer.get_buffer_stats('/project')
     assert stats['size'] == 1
 
 
@@ -128,7 +132,7 @@ async def test_no_reconciler_still_proxies(taskmaster, event_buffer):
 @pytest.mark.asyncio
 async def test_remove_task_emits_event(interceptor, event_buffer):
     await interceptor.remove_task('1', '/project')
-    stats = event_buffer.get_buffer_stats('/project')
+    stats = await event_buffer.get_buffer_stats('/project')
     assert stats['size'] == 1
 
 
@@ -136,5 +140,5 @@ async def test_remove_task_emits_event(interceptor, event_buffer):
 async def test_dependency_operations_emit_events(interceptor, event_buffer):
     await interceptor.add_dependency('2', '1', '/project')
     await interceptor.remove_dependency('2', '1', '/project')
-    stats = event_buffer.get_buffer_stats('/project')
+    stats = await event_buffer.get_buffer_stats('/project')
     assert stats['size'] == 2

@@ -97,10 +97,18 @@ async def run_server():
         journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await journal.initialize()
 
+        db_path = Path(config.reconciliation.data_dir) / 'reconciliation.db'
         event_buffer = EventBuffer(
+            db_path=db_path,
             buffer_size_threshold=config.reconciliation.buffer_size_threshold,
             max_staleness_seconds=config.reconciliation.max_staleness_seconds,
+            conditional_trigger_ratio=config.reconciliation.conditional_trigger_ratio,
+            burst_window_seconds=config.reconciliation.burst_window_seconds,
+            burst_cooldown_seconds=config.reconciliation.burst_cooldown_seconds,
+            stale_lock_seconds=config.reconciliation.stale_lock_seconds,
+            queue_stats_fn=memory_service.durable_queue.get_stats,
         )
+        await event_buffer.initialize()
 
         # Wire event emission into memory_service
         memory_service.set_event_buffer(event_buffer)
@@ -123,7 +131,8 @@ async def run_server():
             from fused_memory.middleware.task_interceptor import TaskInterceptor
             from fused_memory.reconciliation.event_buffer import EventBuffer
 
-            event_buffer = EventBuffer()
+            event_buffer = EventBuffer(db_path=None)
+            await event_buffer.initialize()
             task_interceptor = TaskInterceptor(taskmaster, None, event_buffer)
 
     # Create MCP server with both memory and task tools

@@ -44,6 +44,7 @@ class ReconciliationEvent(BaseModel):
     project_id: str
     timestamp: datetime
     payload: dict = Field(default_factory=dict)
+    agent_id: str | None = None
 
 
 class JournalEntry(BaseModel):

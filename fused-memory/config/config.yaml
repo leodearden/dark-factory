@@ -67,6 +67,10 @@ reconciliation:
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
   buffer_size_threshold: 500
   max_staleness_seconds: 14400
+  conditional_trigger_ratio: 0.33
+  burst_window_seconds: 30
+  burst_cooldown_seconds: 150
+  stale_lock_seconds: 7200
   agent_llm_provider: "claude_cli"
   agent_llm_model: "sonnet"
   agent_max_steps: 50

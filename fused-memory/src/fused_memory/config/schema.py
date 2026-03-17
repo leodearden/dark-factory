@@ -203,6 +203,12 @@ class ReconciliationConfig(BaseModel):
     # Explore agent
     explore_codebase_root: str = Field(default='.')
 
+    # Quiescence / burst detection
+    conditional_trigger_ratio: float = Field(default=0.33)
+    burst_window_seconds: float = Field(default=30.0)
+    burst_cooldown_seconds: float = Field(default=150.0)
+    stale_lock_seconds: float = Field(default=7200.0)
+
     # Safety
     max_mutations_per_stage: int = Field(default=50)
     halt_on_judge_serious: bool = Field(default=True)
