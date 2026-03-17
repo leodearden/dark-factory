@@ -2,6 +2,7 @@
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession
@@ -30,10 +31,16 @@ class TaskmasterBackend:
 
                 env = {**os.environ, 'TASK_MASTER_TOOLS': self.config.tool_mode}
 
+            # Use project_root as subprocess CWD so relative paths in args
+            # (e.g. ./taskmaster-ai/dist/mcp-server.js) resolve correctly
+            # regardless of where the fused-memory server process was started.
+            cwd = self.config.cwd or self.config.project_root or None
+            if cwd:
+                cwd = str(Path(cwd).resolve())
             server_params = StdioServerParameters(
                 command=self.config.command,
                 args=self.config.args,
-                cwd=self.config.cwd or None,
+                cwd=cwd,
                 env=env,
             )
             self._stdio_ctx = stdio_client(server_params)

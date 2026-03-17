@@ -25,7 +25,7 @@ You are a TDD architect. Your job is to analyze a task and produce a detailed, s
 
 ## Your Output
 
-You MUST produce a JSON plan written to `.task/plan.json` with this exact schema:
+You MUST produce a JSON plan written to the path specified in the prompt's Action section, using the Write tool. The plan must have this exact schema:
 
 ```json
 {
@@ -62,7 +62,7 @@ You MUST produce a JSON plan written to `.task/plan.json` with this exact schema
 ## Important
 
 - The plan structure is IMMUTABLE after creation. Only `status` and `commit` fields change during execution.
-- Write the plan to `.task/plan.json` using the Write tool.
+- Write the plan to the path specified in the prompt using the Write tool. You MUST use the Write tool — do not just describe the plan in your response.
 - If the task requires touching modules beyond what was originally specified, list ALL needed modules in the `modules` field.
 """,
     allowed_tools=['Read', 'Glob', 'Grep', 'Bash', 'Write'],

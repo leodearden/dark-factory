@@ -93,13 +93,14 @@ class TaskWorkflow:
             # Set task in-progress
             await self.scheduler.set_task_status(self.task_id, 'in-progress')
 
-            # Create worktree
-            self.worktree = await self.git_ops.create_worktree(branch_name)
+            # Create worktree (captures base commit for stable diffs)
+            self.worktree, base_commit = await self.git_ops.create_worktree(branch_name)
             self.artifacts = TaskArtifacts(self.worktree)
             self.artifacts.init(
                 self.task_id,
                 self.task.get('title', ''),
                 self.task.get('description', ''),
+                base_commit=base_commit,
             )
 
             # PLAN
@@ -151,7 +152,7 @@ class TaskWorkflow:
 
     async def _plan(self) -> WorkflowOutcome:
         """Invoke the architect to produce a plan."""
-        prompt = await self.briefing.build_architect_prompt(self.task)
+        prompt = await self.briefing.build_architect_prompt(self.task, worktree=self.worktree)
         result = await self._invoke(ARCHITECT, prompt, self.worktree)
 
         if not result.success:
@@ -279,7 +280,11 @@ class TaskWorkflow:
 
     async def _review(self):
         """Run all 5 reviewers in parallel, aggregate results."""
-        diff = await self.git_ops.get_diff_from_main(self.worktree)
+        base_commit = self.artifacts.read_base_commit()
+        if base_commit:
+            diff = await self.git_ops.get_diff_from_base(self.worktree, base_commit)
+        else:
+            diff = await self.git_ops.get_diff_from_main(self.worktree)
 
         # Launch all reviewers concurrently
         review_tasks = []
@@ -435,7 +440,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             max_budget_usd=budget,
             allowed_tools=role.allowed_tools or None,
             disallowed_tools=role.disallowed_tools or None,
-            mcp_config=self.mcp.mcp_config_json(),
+            mcp_config=None,  # Disabled: agents use codebase tools, not MCP memory
             output_schema=output_schema,
         )
 

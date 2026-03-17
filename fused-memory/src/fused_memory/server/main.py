@@ -80,6 +80,7 @@ async def run_server():
         try:
             await taskmaster.initialize()
             logger.info(f'  Taskmaster: connected via {config.taskmaster.transport}')
+            memory_service.taskmaster_connected = True
         except Exception as e:
             logger.warning(f'  Taskmaster: failed to connect ({e}), continuing without tasks')
             taskmaster = None

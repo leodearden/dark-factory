@@ -45,38 +45,47 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 @pytest.mark.asyncio
 class TestWorktreeLifecycle:
     async def test_create_worktree(self, git_ops: GitOps):
-        worktree = await git_ops.create_worktree('feature-1')
+        worktree, base_sha = await git_ops.create_worktree('feature-1')
         assert worktree.exists()
         assert (worktree / 'README.md').exists()
+        assert len(base_sha) == 40
 
     async def test_commit_in_worktree(self, git_ops: GitOps):
-        worktree = await git_ops.create_worktree('feature-2')
+        worktree, _ = await git_ops.create_worktree('feature-2')
         (worktree / 'new_file.py').write_text('print("hello")\n')
         sha = await git_ops.commit(worktree, 'Add new file')
         assert sha is not None
         assert len(sha) == 40
 
     async def test_commit_nothing(self, git_ops: GitOps):
-        worktree = await git_ops.create_worktree('feature-3')
+        worktree, _ = await git_ops.create_worktree('feature-3')
         sha = await git_ops.commit(worktree, 'Nothing')
         assert sha is None
 
     async def test_diff_from_main(self, git_ops: GitOps):
-        worktree = await git_ops.create_worktree('feature-4')
+        worktree, _ = await git_ops.create_worktree('feature-4')
         (worktree / 'change.py').write_text('x = 1\n')
         await git_ops.commit(worktree, 'Add change')
         diff = await git_ops.get_diff_from_main(worktree)
         assert 'change.py' in diff
         assert 'x = 1' in diff
 
+    async def test_diff_from_base(self, git_ops: GitOps):
+        worktree, base_sha = await git_ops.create_worktree('feature-4b')
+        (worktree / 'base_change.py').write_text('y = 2\n')
+        await git_ops.commit(worktree, 'Add base change')
+        diff = await git_ops.get_diff_from_base(worktree, base_sha)
+        assert 'base_change.py' in diff
+        assert 'y = 2' in diff
+
     async def test_cleanup_worktree(self, git_ops: GitOps):
-        worktree = await git_ops.create_worktree('feature-5')
+        worktree, _ = await git_ops.create_worktree('feature-5')
         assert worktree.exists()
         await git_ops.cleanup_worktree(worktree, 'feature-5')
         assert not worktree.exists()
 
     async def test_merge_to_main(self, git_ops: GitOps):
-        worktree = await git_ops.create_worktree('feature-6')
+        worktree, _ = await git_ops.create_worktree('feature-6')
         (worktree / 'merged.py').write_text('merged = True\n')
         await git_ops.commit(worktree, 'Add merged file')
 
@@ -86,7 +95,7 @@ class TestWorktreeLifecycle:
         assert (git_ops.project_root / 'merged.py').exists()
 
     async def test_get_current_branch(self, git_ops: GitOps):
-        worktree = await git_ops.create_worktree('feature-7')
+        worktree, _ = await git_ops.create_worktree('feature-7')
         branch = await git_ops.get_current_branch(worktree)
         assert branch == 'task/feature-7'
 
@@ -95,8 +104,8 @@ class TestWorktreeLifecycle:
 class TestMergeConflicts:
     async def test_conflict_detection(self, git_ops: GitOps):
         # Create BOTH branches before merging either (both fork from same main)
-        wt_a = await git_ops.create_worktree('branch-a')
-        wt_b = await git_ops.create_worktree('branch-b')
+        wt_a, _ = await git_ops.create_worktree('branch-a')
+        wt_b, _ = await git_ops.create_worktree('branch-b')
 
         # Both modify same file differently
         (wt_a / 'shared.py').write_text('value = "A"\n')

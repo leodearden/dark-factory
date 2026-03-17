@@ -53,6 +53,7 @@ class MemoryService:
         self.router = ReadRouter(config)
         self.durable_queue: DurableWriteQueue | None = None
         self._event_buffer: EventBuffer | None = None
+        self.taskmaster_connected: bool = False
 
     def set_event_buffer(self, buffer: EventBuffer) -> None:
         """Wire the reconciliation event buffer into the service."""
@@ -108,7 +109,6 @@ class MemoryService:
             source=episode_type,
             group_id=payload['group_id'],
             source_description=payload.get('source_description', ''),
-            uuid=payload.get('uuid'),
         )
 
     async def _dual_write_callback(
@@ -157,7 +157,6 @@ class MemoryService:
                 'source': source_name,
                 'group_id': scope.graphiti_group_id,
                 'source_description': source_description,
-                'uuid': episode_id,
                 # Scope fields for callback reconstruction
                 'project_id': project_id,
                 'agent_id': agent_id,
@@ -622,6 +621,9 @@ class MemoryService:
                 status['queue'] = await self.durable_queue.get_stats()
             except Exception as e:
                 status['queue'] = {'error': str(e)}
+
+        # Taskmaster status
+        status['taskmaster'] = {'connected': self.taskmaster_connected}
 
         return status
 
