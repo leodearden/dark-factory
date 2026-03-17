@@ -157,6 +157,7 @@ class AgentStub:
         mcp_config: dict | None = None,
         output_schema: dict | None = None,
         permission_mode: str = 'bypassPermissions',
+        sandbox_modules: list[str] | None = None,
     ) -> AgentResult:
         """Determine role from system_prompt content, perform side effects."""
         role = self._detect_role(system_prompt)
