@@ -40,12 +40,14 @@ class WorkflowState(enum.Enum):
     MERGE = 'merge'
     DONE = 'done'
     BLOCKED = 'blocked'
+    ESCALATED = 'escalated'
 
 
 class WorkflowOutcome(enum.Enum):
     DONE = 'done'
     BLOCKED = 'blocked'
     REQUEUED = 'requeued'
+    ESCALATED = 'escalated'
 
 
 @dataclass
@@ -69,6 +71,8 @@ class TaskWorkflow:
         scheduler: Scheduler,
         briefing: BriefingAssembler,
         mcp: McpLifecycle,
+        escalation_queue=None,
+        escalation_event: asyncio.Event | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -85,6 +89,10 @@ class TaskWorkflow:
         self.artifacts: TaskArtifacts | None = None
         self.plan: dict = {}
         self.metrics = WorkflowMetrics()
+
+        # Escalation support
+        self.escalation_queue = escalation_queue
+        self._escalation_event = escalation_event
 
     async def run(self) -> WorkflowOutcome:
         """Execute the full state machine."""
@@ -111,10 +119,32 @@ class TaskWorkflow:
             if plan_outcome == WorkflowOutcome.BLOCKED:
                 return await self._mark_blocked('Planning failed')
 
-            # EXECUTE + VERIFY + REVIEW loop
-            outcome = await self._execute_verify_review_loop()
-            if outcome != WorkflowOutcome.DONE:
-                return outcome
+            # EXECUTE + VERIFY + REVIEW loop (with escalation retry)
+            while True:
+                outcome = await self._execute_verify_review_loop()
+                if outcome == WorkflowOutcome.ESCALATED:
+                    self.state = WorkflowState.ESCALATED
+                    logger.info(f'Task {self.task_id}: waiting for escalation resolution')
+                    resolution = await self._wait_for_resolution()
+                    # Check if any escalation was dismissed (terminate)
+                    dismissed = [
+                        e for e in self.escalation_queue.get_by_task(self.task_id)
+                        if e.status == 'dismissed'
+                    ]
+                    if dismissed:
+                        return await self._mark_blocked('Task terminated via escalation')
+                    # Resume with resolution context
+                    logger.info(f'Task {self.task_id}: resuming after escalation resolution')
+                    resume_prompt = await self.briefing.build_resume_prompt(
+                        self.task, self.plan,
+                        '\n'.join(e.summary for e in self._check_escalations()),
+                        resolution, self.worktree,
+                    )
+                    await self._invoke(IMPLEMENTER, resume_prompt, self.worktree)
+                    continue
+                if outcome != WorkflowOutcome.DONE:
+                    return outcome
+                break
 
             # MERGE
             self.state = WorkflowState.MERGE
@@ -161,6 +191,7 @@ class TaskWorkflow:
 
         # Read the plan the architect wrote
         self.plan = self.artifacts.read_plan()
+
         if not self.plan:
             logger.error(f'Task {self.task_id}: architect produced no plan.json')
             return WorkflowOutcome.BLOCKED
@@ -193,12 +224,16 @@ class TaskWorkflow:
             # EXECUTE
             self.state = WorkflowState.EXECUTE
             exec_outcome = await self._execute_iterations()
+            if exec_outcome == WorkflowOutcome.ESCALATED:
+                return WorkflowOutcome.ESCALATED
             if exec_outcome == WorkflowOutcome.BLOCKED:
                 return await self._mark_blocked('Execution iterations exhausted')
 
             # VERIFY + DEBUGFIX loop
             self.state = WorkflowState.VERIFY
             verify_outcome = await self._verify_debugfix_loop()
+            if verify_outcome == WorkflowOutcome.ESCALATED:
+                return WorkflowOutcome.ESCALATED
             if verify_outcome == WorkflowOutcome.BLOCKED:
                 return await self._mark_blocked('Verification attempts exhausted')
 
@@ -239,6 +274,11 @@ class TaskWorkflow:
 
             self.metrics.execute_iterations += 1
 
+            # Check for escalations
+            blocking = [e for e in self._check_escalations() if e.severity == 'blocking']
+            if blocking:
+                return WorkflowOutcome.ESCALATED
+
             # Re-read plan to see progress
             self.plan = self.artifacts.read_plan()
 
@@ -274,6 +314,11 @@ class TaskWorkflow:
                 result.failure_report(), self.plan
             )
             debug_result = await self._invoke(DEBUGGER, prompt, self.worktree)
+
+            # Check for escalations from debugger
+            blocking = [e for e in self._check_escalations() if e.severity == 'blocking']
+            if blocking:
+                return WorkflowOutcome.ESCALATED
 
             if not debug_result.success:
                 logger.warning(f'Task {self.task_id}: debugger failed')
@@ -431,6 +476,19 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             budget = budgets.reviewer
             max_turns_val = turns.reviewer
 
+        # Determine sandbox modules based on role
+        sandbox_modules = None
+        if self.config.sandbox.enabled and role.name in ('implementer', 'debugger'):
+            sandbox_modules = self.modules
+
+        # Build MCP config with escalation server if available
+        mcp_config = None
+        if self.escalation_queue and role.name in ('architect', 'implementer', 'debugger', 'merger'):
+            esc = self.config.escalation
+            mcp_config = self.mcp.mcp_config_json(
+                escalation_url=f'http://{esc.host}:{esc.port}/mcp'
+            )
+
         result = await invoke_agent(
             prompt=prompt,
             system_prompt=role.system_prompt,
@@ -440,8 +498,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             max_budget_usd=budget,
             allowed_tools=role.allowed_tools or None,
             disallowed_tools=role.disallowed_tools or None,
-            mcp_config=None,  # Disabled: agents use codebase tools, not MCP memory
+            mcp_config=mcp_config,
             output_schema=output_schema,
+            sandbox_modules=sandbox_modules,
         )
 
         # Track metrics
@@ -456,6 +515,32 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
 
         return result
+
+    def _check_escalations(self):
+        """Check for pending escalations for this task."""
+        if not self.escalation_queue:
+            return []
+        return self.escalation_queue.get_by_task(self.task_id, status='pending')
+
+    async def _wait_for_resolution(self) -> str:
+        """Wait for all pending escalations to be resolved."""
+        if self._escalation_event is None:
+            self._escalation_event = asyncio.Event()
+
+        # Poll until all pending escalations for this task are resolved
+        while True:
+            pending = self._check_escalations()
+            if not pending:
+                break
+            self._escalation_event.clear()
+            await self._escalation_event.wait()
+
+        # Collect resolutions
+        resolved = [
+            e for e in self.escalation_queue.get_by_task(self.task_id)
+            if e.status == 'resolved' and e.resolution
+        ]
+        return '\n'.join(e.resolution for e in resolved)
 
     async def _mark_blocked(self, reason: str) -> WorkflowOutcome:
         """Mark task as blocked."""

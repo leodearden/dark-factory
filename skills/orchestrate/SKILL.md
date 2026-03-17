@@ -23,6 +23,7 @@ The user will be in one of these situations. Read the request and jump to the ma
 | "Do task X" / "Run task 7" / "Execute the tasks" | [Execute Tasks](#execute-tasks) |
 | "What's the status?" / "How are the tasks going?" | [Check Status](#check-status) |
 | "Task X is blocked" / "Something failed" | [Resolve Blocks](#resolve-blocks) |
+| "An agent escalated" / escalation notification | [Handle Escalations](#handle-escalations) |
 | Tasks already exist in Taskmaster, user wants to execute them | [Execute Tasks](#execute-tasks) (skip decomposition) |
 | Docker/services aren't running, connection errors | Read `references/infrastructure.md` |
 
@@ -133,6 +134,8 @@ uv run --project orchestrator orchestrator run --prd <path-to-prd>
 
 The orchestrator manages its own fused-memory HTTP server lifecycle — it starts the server before work begins and stops it when done. You don't need to start it manually.
 
+The orchestrator also starts an **escalation MCP server** on port 8100. Agents use this to escalate issues. The interactive session connects to the same server to resolve escalations.
+
 ### What happens during a run
 
 The orchestrator will:
@@ -141,7 +144,9 @@ The orchestrator will:
 3. Tag tasks with code modules if not already tagged
 4. Execute up to 3 tasks concurrently (configurable), each following:
    **PLAN** (architect) → **EXECUTE** (implementer, TDD) → **VERIFY** (pytest/ruff/pyright) → **REVIEW** (5 specialist reviewers) → **MERGE** (to main)
-5. Print a summary report with per-task outcomes and costs
+5. If an agent encounters a problem outside its scope, it **escalates** rather than retrying.
+   Escalations are pushed to the handler session via a background watcher. See [Handle Escalations](#handle-escalations).
+6. Print a summary report with per-task outcomes and costs
 
 Each task gets its own git worktree and branch (`task/<id>`). Merges use `--no-ff` to preserve history.
 
@@ -245,6 +250,79 @@ add_memory(
 
 ---
 
+## Handle Escalations
+
+During an orchestrator run, agents can escalate issues they can't solve at their scope. Unlike blocks (which are detected post-run), escalations are **pushed in real-time** — you'll be notified as they happen.
+
+### Setting up the escalation watcher
+
+After launching the orchestrator, start the watcher in the background:
+
+```bash
+uv run --project escalation python -m escalation.watcher \
+  --queue-dir /home/leo/src/dark-factory/data/escalations &
+```
+
+This watches for new escalations. When one arrives, the background task completes and you'll be notified with the escalation content. After handling it, re-arm the watcher:
+
+```bash
+uv run --project escalation python -m escalation.watcher \
+  --queue-dir /home/leo/src/dark-factory/data/escalations &
+```
+
+### Reading an escalation
+
+Each escalation includes:
+- **task_id** — which task's agent escalated
+- **severity** — `blocking` (task paused, waiting for you) or `info` (FYI, agent continued)
+- **category** — `scope_violation`, `design_concern`, `cleanup_needed`, `dependency_discovered`, `risk_identified`, `infra_issue`
+- **summary** / **detail** — what the agent found
+- **suggested_action** — what the agent thinks should happen
+
+### Resolving an escalation
+
+Once you understand the issue, resolve it via the escalation MCP tools:
+
+```
+resolve_issue(
+  escalation_id="<id from the notification>",
+  resolution="<your resolution — this text is injected into the agent's briefing when the task resumes>",
+  terminate=false
+)
+```
+
+The `resolution` text should be actionable instructions for the re-invoked agent. Examples:
+- "Scope expanded: you now have write access to `crates/reify-compiler`. Update the trait impl in `src/lib.rs` to match the new type signature."
+- "This is a known limitation in M2 scope. Skip the duplicate-ID check — it will be addressed in task 14."
+- "The test infrastructure issue is fixed on main. Rebase your branch with `git rebase main`."
+
+Set `terminate=true` if the task should be abandoned rather than resumed.
+
+### Listing pending escalations
+
+To see all unresolved escalations (e.g., if you missed a notification):
+
+```
+get_pending_escalations()
+```
+
+Or filtered to a specific task:
+
+```
+get_pending_escalations(task_id="7")
+```
+
+### Common escalation patterns
+
+| Category | Typical cause | Resolution approach |
+|----------|--------------|-------------------|
+| `scope_violation` | Agent hit bwrap sandbox boundary | Evaluate if scope expansion is warranted. If yes, update the task's modules via `update_task` and resolve with expanded scope instructions. If no, guide the agent to an alternative approach. |
+| `design_concern` | Agent found a design issue outside task scope | Assess severity. Create a follow-up task if needed, resolve with "proceed, this is tracked in task N". |
+| `dependency_discovered` | Task depends on code from an unfinished task | Check if the dependency task is in progress. If so, resolve with "wait" or requeue. If not, may need to add a dependency. |
+| `infra_issue` | Test framework, build tool, or environment problem | Fix the infrastructure issue, then resolve with instructions for the agent. |
+
+---
+
 ## Resume Existing Tasks
 
 If tasks already exist from a prior session, first assess their state before re-running.
@@ -285,5 +363,9 @@ The default config lives at `orchestrator/config.yaml`. Key knobs:
 | `budgets.implementer` | $10 | Max spend per implementer invocation |
 | `test_command` | pytest | Verification test runner |
 | `lint_command` | ruff check | Verification linter |
+| `lock_depth` | 2 | Module path depth for lock normalization |
+| `escalation.port` | 8100 | Escalation MCP server port |
+| `escalation.queue_dir` | data/escalations | Escalation queue directory |
+| `sandbox.enabled` | true | Enable bwrap filesystem sandbox |
 
 Override via YAML file (`--config`) or environment variables (`ORCH_MAX_CONCURRENT_TASKS=5`, `ORCH_MODELS__ARCHITECT=sonnet`).

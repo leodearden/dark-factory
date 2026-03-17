@@ -112,6 +112,20 @@ class FusedMemoryConfig(BaseModel):
     )
 
 
+class SandboxConfig(BaseModel):
+    """Bubblewrap filesystem sandbox configuration."""
+
+    enabled: bool = Field(default=True)
+
+
+class EscalationConfig(BaseModel):
+    """Escalation MCP server configuration."""
+
+    queue_dir: str = Field(default='data/escalations')
+    port: int = Field(default=8100)
+    host: str = Field(default='127.0.0.1')
+
+
 class GitConfig(BaseModel):
     """Git operations configuration."""
 
@@ -130,6 +144,7 @@ class OrchestratorConfig(BaseSettings):
     # Concurrency
     max_concurrent_tasks: int = Field(default=3)
     max_per_module: int = Field(default=1)
+    lock_depth: int = Field(default=2)
     module_overrides: dict[str, int] = Field(default_factory=dict)
 
     # Iteration limits
@@ -149,6 +164,12 @@ class OrchestratorConfig(BaseSettings):
 
     # Fused memory
     fused_memory: FusedMemoryConfig = Field(default_factory=FusedMemoryConfig)
+
+    # Sandbox
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+
+    # Escalation
+    escalation: EscalationConfig = Field(default_factory=EscalationConfig)
 
     # Git
     git: GitConfig = Field(default_factory=GitConfig)

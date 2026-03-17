@@ -17,6 +17,32 @@ class AgentRole:
 # --- Read-only tools for analysis roles ---
 _READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
 
+# --- Escalation tools available to roles that can escalate ---
+_ESCALATION_TOOLS = [
+    'mcp__escalation__escalate_info',
+    'mcp__escalation__escalate_blocker',
+]
+
+_ESCALATION_INSTRUCTIONS = """
+## Escalation
+
+If you encounter a problem you cannot solve at your scope, you can escalate:
+
+- **`escalate_info(...)`** — Non-blocking observation. Report it and continue working.
+- **`escalate_blocker(...)`** — Blocking problem. Report it, then commit any in-progress
+  work, log your iteration, and STOP. Do NOT retry — the handler will resolve the issue
+  and you will be re-invoked.
+
+Categories: scope_violation, design_concern, cleanup_needed, dependency_discovered,
+risk_identified, infra_issue.
+
+Use escalation when:
+- You need write access to files outside your module scope
+- A test failure's root cause is in code you can't modify
+- A design decision requires broader context than this task provides
+- The verify/debug loop won't converge due to an external dependency
+"""
+
 
 ARCHITECT = AgentRole(
     name='architect',
@@ -64,8 +90,8 @@ You MUST produce a JSON plan written to the path specified in the prompt's Actio
 - The plan structure is IMMUTABLE after creation. Only `status` and `commit` fields change during execution.
 - Write the plan to the path specified in the prompt using the Write tool. You MUST use the Write tool — do not just describe the plan in your response.
 - If the task requires touching modules beyond what was originally specified, list ALL needed modules in the `modules` field.
-""",
-    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', 'Write'],
+""" + _ESCALATION_INSTRUCTIONS,
+    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', 'Write', *_ESCALATION_TOOLS],
     disallowed_tools=['Edit'],
     default_model='opus',
     default_budget=5.0,
@@ -97,13 +123,23 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
    {"iteration": N, "agent": "implementer", "steps_attempted": ["step-1"], "steps_completed": ["step-1"], "commit": "sha", "summary": "..."}
    ```
 
+## Scope Boundary
+
+Your write access is restricted to the modules assigned to this task. If you attempt
+to modify files outside these directories, you will get a permission error. This is
+intentional — it prevents cross-task interference during concurrent execution.
+
+If you genuinely need to modify files outside your assigned modules, this indicates
+the task's scope needs expansion. Use the escalate_blocker tool to request scope
+expansion rather than trying to work around the restriction.
+
 ## Important
 
 - Run tests frequently to verify your work.
 - If you encounter an unexpected issue that the plan doesn't account for, note it in your iteration log summary and stop. Do NOT modify the plan.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
-""",
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep'],
+""" + _ESCALATION_INSTRUCTIONS,
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS],
     default_model='opus',
     default_budget=10.0,
     default_max_turns=80,
@@ -130,12 +166,22 @@ You will be given:
 4. **Commit your fixes** with a descriptive message like "fix: resolve type error in X" or "fix: correct test assertion for Y".
 5. **Update iteration log** after fixes.
 
+## Scope Boundary
+
+Your write access is restricted to the modules assigned to this task. If you attempt
+to modify files outside these directories, you will get a permission error. This is
+intentional — it prevents cross-task interference during concurrent execution.
+
+If you genuinely need to modify files outside your assigned modules, this indicates
+the task's scope needs expansion. Use the escalate_blocker tool to request scope
+expansion rather than trying to work around the restriction.
+
 ## Important
 
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
-""",
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep'],
+""" + _ESCALATION_INSTRUCTIONS,
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS],
     default_model='opus',
     default_budget=5.0,
     default_max_turns=50,
@@ -176,8 +222,14 @@ You MUST output ONLY valid JSON matching this schema:
 ## Rules
 
 1. **Be specific.** Every issue must have a file location and concrete description.
-2. **Blocking vs suggestion.** Use `blocking` ONLY for issues that would cause bugs, break correctness, or violate critical invariants. Style preferences, minor naming, and optional improvements are `suggestion`.
-3. **No false positives.** If you're unsure whether something is an issue, make it a suggestion, not blocking.
+2. **Blocking means broken.** Use `blocking` ONLY for issues that will cause runtime errors,
+   data corruption, security vulnerabilities, or API contract violations **within the scope
+   of this task**. Do not block on:
+   - Design concerns that are valid but outside this task's scope
+   - Edge cases that cannot occur given the task's stated constraints
+   - Missing features that belong in a follow-up task
+   - Style, naming, or structural preferences
+3. **When in doubt, suggest.** If you're unsure whether something is blocking, it's a suggestion.
 4. **Read the codebase** to understand context before judging patterns or naming.
 5. **Output pure JSON only.** No markdown fences, no explanatory text outside the JSON.
 
@@ -245,8 +297,8 @@ You will be given:
 
 - Read both sides of every conflict carefully.
 - If the conflict involves architectural changes where both sides restructured the same code differently, mark as BLOCKED — don't attempt a creative merge.
-""",
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep'],
+""" + _ESCALATION_INSTRUCTIONS,
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS],
     default_model='opus',
     default_budget=5.0,
     default_max_turns=50,

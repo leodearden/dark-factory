@@ -36,6 +36,7 @@ async def invoke_agent(
     mcp_config: dict | None = None,
     output_schema: dict | None = None,
     permission_mode: str = 'bypassPermissions',
+    sandbox_modules: list[str] | None = None,
 ) -> AgentResult:
     """Invoke a Claude Code instance via CLI and return structured result.
 
@@ -75,6 +76,11 @@ async def invoke_agent(
 
     # Prompt goes last
     cmd.extend(['--', prompt])
+
+    # Wrap command in bwrap sandbox if modules are specified
+    if sandbox_modules is not None:
+        from orchestrator.agents.sandbox import build_bwrap_command
+        cmd = build_bwrap_command(cmd, cwd, sandbox_modules)
 
     logger.info(f'Invoking agent: model={model} cwd={cwd} budget=${max_budget_usd}')
     logger.info(f'Command: {" ".join(cmd[:15])}...')

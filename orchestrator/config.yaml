@@ -4,6 +4,7 @@
 # Concurrency
 max_concurrent_tasks: 3
 max_per_module: 1
+lock_depth: 2
 module_overrides:
   tests: 2
 
@@ -45,17 +46,26 @@ type_check_command: "pyright"
 fused_memory:
   url: "http://localhost:8000"
   project_id: "dark_factory"
-  config_path: "../fused-memory/config/config.yaml"
+  config_path: "fused-memory/config/config.yaml"
   server_command:
     - "uv"
     - "run"
     - "--project"
-    - "../fused-memory"
+    - "fused-memory"
     - "python"
     - "-m"
     - "fused_memory.server.main"
     - "--transport"
     - "http"
+
+# Sandbox
+sandbox:
+  enabled: true
+
+# Escalation
+escalation:
+  queue_dir: "data/escalations"
+  port: 8100
 
 # Git
 git:

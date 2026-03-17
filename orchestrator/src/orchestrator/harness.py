@@ -15,9 +15,16 @@ from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.mcp_lifecycle import McpLifecycle
+from orchestrator.mcp_lifecycle import McpLifecycle, mcp_call
 from orchestrator.scheduler import Scheduler
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+
+try:
+    from escalation.queue import EscalationQueue
+    from escalation.server import create_server
+    HAS_ESCALATION = True
+except ImportError:
+    HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +46,7 @@ class HarnessReport:
     total_tasks: int = 0
     completed: int = 0
     blocked: int = 0
+    escalated: int = 0
     total_cost_usd: float = 0.0
     task_reports: list[TaskReport] = field(default_factory=list)
 
@@ -46,6 +54,7 @@ class HarnessReport:
         lines = [
             f'Orchestrator run complete: {self.completed}/{self.total_tasks} tasks done',
             f'  Blocked: {self.blocked}',
+            f'  Escalated: {self.escalated}',
             f'  Total cost: ${self.total_cost_usd:.2f}',
             f'  Duration: {self.started_at} → {self.completed_at}',
             '',
@@ -70,6 +79,11 @@ class Harness:
         self.briefing = BriefingAssembler(config)
         self.report = HarnessReport()
 
+        # Escalation support
+        self._escalation_queue: EscalationQueue | None = None
+        self._escalation_events: dict[str, asyncio.Event] = {}
+        self._escalation_task: asyncio.Task | None = None
+
     async def run(self, prd_path: Path, dry_run: bool = False) -> HarnessReport:
         """Execute the full orchestration pipeline."""
         self.report.started_at = datetime.now(UTC).isoformat()
@@ -77,6 +91,9 @@ class Harness:
         # 1. Start fused-memory HTTP server
         logger.info('Starting fused-memory HTTP server...')
         await self.mcp.start()
+
+        # 1b. Start escalation server
+        await self._start_escalation_server()
 
         try:
             # 2. Parse PRD into tasks
@@ -145,11 +162,15 @@ class Harness:
             self.report.blocked = sum(
                 1 for r in task_reports if r.outcome == WorkflowOutcome.BLOCKED
             )
+            self.report.escalated = sum(
+                1 for r in task_reports if r.outcome == WorkflowOutcome.ESCALATED
+            )
             self.report.total_cost_usd = sum(r.cost_usd for r in task_reports)
 
         finally:
             # 4. Shutdown
             self.report.completed_at = datetime.now(UTC).isoformat()
+            await self._stop_escalation_server()
             await self.mcp.stop()
 
         logger.info(self.report.summary())
@@ -158,25 +179,21 @@ class Harness:
     async def _populate_tasks(self, prd_path: Path) -> None:
         """Use taskmaster parse_prd to decompose PRD into tasks."""
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f'{self.mcp.url}/mcp/',
-                    json={
-                        'jsonrpc': '2.0',
-                        'id': 1,
-                        'method': 'tools/call',
-                        'params': {
-                            'name': 'parse_prd',
-                            'arguments': {
-                                'input': str(prd_path.resolve()),
-                                'project_root': str(self.config.project_root),
-                            },
-                        },
+            result = await mcp_call(
+                f'{self.mcp.url}/mcp',
+                'tools/call',
+                {
+                    'name': 'parse_prd',
+                    'arguments': {
+                        'input': str(prd_path.resolve()),
+                        'project_root': str(self.config.project_root),
                     },
-                    timeout=120,  # PRD parsing can be slow
-                )
-                result = resp.json()
-                logger.info(f'PRD parsed: {result.get("result", {}).get("content", [{}])[0].get("text", "")[:200]}')
+                },
+                timeout=120,  # PRD parsing can be slow
+            )
+            content = result.get('result', {}).get('content', [{}])
+            text = content[0].get('text', '') if content else ''
+            logger.info(f'PRD parsed: {text[:200]}')
         except Exception as e:
             raise RuntimeError(f'Failed to parse PRD: {e}') from e
 
@@ -288,6 +305,12 @@ Output JSON matching the schema. Every task must appear in the output.
                 f'Starting workflow for task {assignment.task_id}: '
                 f'{assignment.task.get("title", "")}'
             )
+            # Create escalation event for this task
+            esc_event = None
+            if self._escalation_queue:
+                esc_event = asyncio.Event()
+                self._escalation_events[assignment.task_id] = esc_event
+
             workflow = TaskWorkflow(
                 assignment=assignment,
                 config=self.config,
@@ -295,6 +318,8 @@ Output JSON matching the schema. Every task must appear in the output.
                 scheduler=self.scheduler,
                 briefing=self.briefing,
                 mcp=self.mcp,
+                escalation_queue=self._escalation_queue,
+                escalation_event=esc_event,
             )
             outcome = await workflow.run()
 
@@ -314,5 +339,51 @@ Output JSON matching the schema. Every task must appear in the output.
                 outcome=WorkflowOutcome.BLOCKED,
             )
         finally:
+            self._escalation_events.pop(assignment.task_id, None)
             self.scheduler.release(assignment.task_id)
             sem.release()
+
+    async def _start_escalation_server(self) -> None:
+        """Start the escalation MCP server as a background asyncio task."""
+        if not HAS_ESCALATION:
+            logger.info('Escalation package not installed — skipping escalation server')
+            return
+
+        queue_dir = Path(self.config.escalation.queue_dir)
+        if not queue_dir.is_absolute():
+            queue_dir = self.config.project_root / queue_dir
+        self._escalation_queue = EscalationQueue(queue_dir)
+        self._escalation_queue.set_notify_callback(self._on_escalation)
+
+        mcp_server = create_server(self._escalation_queue)
+        host = self.config.escalation.host
+        port = self.config.escalation.port
+
+        async def _serve():
+            try:
+                await mcp_server.run_http_async(host=host, port=port)
+            except Exception as e:
+                logger.error(f'Escalation server error: {e}')
+
+        self._escalation_task = asyncio.create_task(_serve(), name='escalation-server')
+        logger.info(f'Escalation MCP server starting on {host}:{port}')
+        # Give the server a moment to bind
+        await asyncio.sleep(0.5)
+
+    async def _stop_escalation_server(self) -> None:
+        """Stop the escalation server."""
+        if self._escalation_task is not None:
+            self._escalation_task.cancel()
+            try:
+                await self._escalation_task
+            except asyncio.CancelledError:
+                pass
+            self._escalation_task = None
+            logger.info('Escalation server stopped')
+
+    def _on_escalation(self, escalation) -> None:
+        """Callback when a blocking escalation is submitted — wake the waiting workflow."""
+        if escalation.severity == 'blocking':
+            event = self._escalation_events.get(escalation.task_id)
+            if event:
+                event.set()

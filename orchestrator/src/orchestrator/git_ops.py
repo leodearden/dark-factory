@@ -43,9 +43,13 @@ class GitOps:
 
         Returns (worktree_path, base_commit_sha) so the base commit is
         captured at creation time and not affected by later main movement.
+
+        If the worktree/branch already exist (e.g., from a requeued task),
+        reuses them instead of failing.
         """
         worktree_path = self.worktree_base / branch_name
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        full_branch = f'{self.config.branch_prefix}{branch_name}'
 
         # Capture main's current SHA before creating worktree
         _, base_sha, _ = await _run(
@@ -53,8 +57,21 @@ class GitOps:
             cwd=self.project_root,
         )
 
+        # If worktree already exists, reuse it (common after requeue)
+        if worktree_path.exists():
+            logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
+            return worktree_path, base_sha
+
+        # If branch exists but worktree doesn't (stale from a previous run), clean up
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', full_branch],
+            cwd=self.project_root,
+        )
+        if rc == 0:
+            logger.info(f'Cleaning up stale branch {full_branch} before creating worktree')
+            await _run(['git', 'branch', '-D', full_branch], cwd=self.project_root)
+
         # Create worktree with new branch from main
-        full_branch = f'{self.config.branch_prefix}{branch_name}'
         rc, out, err = await _run(
             ['git', 'worktree', 'add', '-b', full_branch, str(worktree_path), self.config.main_branch],
             cwd=self.project_root,
@@ -68,7 +85,7 @@ class GitOps:
     async def commit(self, worktree: Path, message: str) -> str | None:
         """Stage all changes and commit. Returns sha or None if nothing to commit."""
         # Stage all
-        await _run(['git', 'add', '-A'], cwd=worktree)
+        await _run(['git', 'add', '-A', '--', '.', ':!.task', ':!.claude'], cwd=worktree)
 
         # Check for changes
         rc, _, _ = await _run(['git', 'diff', '--cached', '--quiet'], cwd=worktree)

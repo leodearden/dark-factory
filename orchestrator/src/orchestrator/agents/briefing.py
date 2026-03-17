@@ -183,6 +183,36 @@ Review the diff according to your specialization. Explore the codebase as needed
 5. If you cannot confidently resolve, output "BLOCKED: <reason>" and stop.
 """
 
+    async def build_resume_prompt(
+        self,
+        task: dict,
+        plan: dict,
+        escalation_summary: str,
+        resolution: str,
+        worktree: Path | None = None,
+    ) -> str:
+        """Build prompt for resuming after an escalation resolution."""
+        context = await self._get_memory_context(task.get('id'))
+
+        return f"""\
+{context}
+
+# Resuming After Escalation
+
+This task was paused because an agent escalated a blocking issue.
+
+## The Issue
+{escalation_summary}
+
+## Handler's Resolution
+{resolution}
+
+## Action
+Resume the task applying the handler's resolution. The prior agent's work
+is preserved in the worktree. Read .task/plan.json and .task/iterations.jsonl
+to understand current progress, then continue from where the previous agent left off.
+"""
+
     async def _get_memory_context(self, task_id: str | None = None) -> str:
         """Call fused-memory search for project context."""
         sections = []
