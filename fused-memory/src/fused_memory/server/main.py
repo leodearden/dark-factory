@@ -42,7 +42,7 @@ async def run_server():
     parser = argparse.ArgumentParser(description='Fused Memory MCP Server')
     default_config = Path(__file__).resolve().parents[3] / 'config' / 'config.yaml'
     parser.add_argument(
-        '--config', type=Path, default=default_config,
+        '--config', type=Path, default=None,
         help='Path to YAML configuration file',
     )
     parser.add_argument(
@@ -51,9 +51,12 @@ async def run_server():
     )
     args = parser.parse_args()
 
-    # Set CONFIG_PATH for the settings source
+    # Set CONFIG_PATH for the settings source — prefer explicit --config,
+    # then existing CONFIG_PATH env var, then the built-in default.
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
+    elif 'CONFIG_PATH' not in os.environ:
+        os.environ['CONFIG_PATH'] = str(default_config)
 
     config = FusedMemoryConfig()
     if args.transport:
