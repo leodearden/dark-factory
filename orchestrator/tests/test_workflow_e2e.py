@@ -61,7 +61,7 @@ def config(git_repo: Path) -> OrchestratorConfig:
             main_branch='main',
             branch_prefix='task/',
             remote='origin',
-            worktree_dir='../worktrees',
+            worktree_dir='.worktrees',
         ),
     )
 

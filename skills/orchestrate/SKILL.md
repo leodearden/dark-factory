@@ -114,7 +114,7 @@ Before launching, verify:
    ```
    If either is down, read `references/infrastructure.md` for startup instructions.
 
-2. **Environment** — `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` must be set. The orchestrator inherits them from the shell.
+2. **Environment** — `OPENAI_API_KEY` must be set (used for embeddings). The orchestrator's Claude agents authenticate via OAuth (Max subscription), not an API key — `ANTHROPIC_API_KEY` is **not** required.
 
 3. **Tasks exist** — verify with `get_tasks`. If the task tree is empty, go to [Decompose PRD](#decompose-prd) first.
 
@@ -197,7 +197,7 @@ Tasks block at specific workflow stages. The approach depends on where it got st
 1. Check status to find blocked tasks
 2. Look at the task's worktree for artifacts — the orchestrator preserves worktrees for blocked tasks (cleaned up only on success):
    ```bash
-   ls /home/leo/src/dark-factory/../worktrees/
+   ls /home/leo/src/dark-factory/.worktrees/
    ```
 3. Inside a blocked task's worktree, check `.task/` for diagnostics:
    - `.task/plan.json` — the TDD plan (shows which steps completed)
@@ -216,7 +216,7 @@ Tasks block at specific workflow stages. The approach depends on where it got st
 
 ### Manual resolution workflow
 
-1. **Navigate to the worktree**: `cd /home/leo/src/dark-factory/../worktrees/<task-id>`
+1. **Navigate to the worktree**: `cd /home/leo/src/dark-factory/.worktrees/<task-id>`
 2. **Diagnose**: read `.task/plan.json`, check test output, review `git log`
 3. **Fix**: make changes directly in the worktree
 4. **Verify**: run `pytest`, `ruff check`, `pyright`
@@ -231,7 +231,7 @@ Tasks block at specific workflow stages. The approach depends on where it got st
    ```
 7. **Clean up worktree**:
    ```bash
-   git worktree remove ../worktrees/<task-id>
+   git worktree remove .worktrees/<task-id>
    git branch -d task/<task-id>
    ```
 

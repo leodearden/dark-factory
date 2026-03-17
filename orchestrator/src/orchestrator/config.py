@@ -132,7 +132,7 @@ class GitConfig(BaseModel):
     main_branch: str = Field(default='main')
     branch_prefix: str = Field(default='task/')
     remote: str = Field(default='origin')
-    worktree_dir: str = Field(default='../worktrees')
+    worktree_dir: str = Field(default='.worktrees')
 
 
 # --- Top-level ---

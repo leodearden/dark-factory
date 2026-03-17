@@ -72,7 +72,7 @@ git:
   main_branch: "main"
   branch_prefix: "task/"
   remote: "origin"
-  worktree_dir: "../worktrees"
+  worktree_dir: ".worktrees"
 
 # Project root (absolute path)
 project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"

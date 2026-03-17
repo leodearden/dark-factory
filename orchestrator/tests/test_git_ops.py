@@ -33,7 +33,7 @@ def git_config() -> GitConfig:
         main_branch='main',
         branch_prefix='task/',
         remote='origin',
-        worktree_dir='../worktrees',
+        worktree_dir='.worktrees',
     )
 
 
