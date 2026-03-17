@@ -9,6 +9,10 @@ The orchestrator implements tasks as concurrent TDD workflows — planning, codi
 
 Task decomposition happens here, in the interactive session, where you have full codebase context. The orchestrator handles concurrent execution. This separation exists because taskmaster's `parse_prd` uses a weaker model without codebase access, which produces decent but incomplete decompositions (missed integration tasks, wrong dependency graphs, no awareness of what's already implemented). Decomposing interactively produces better tasks with less cleanup.
 
+## Important: do not implement tasks directly
+
+This skill is about driving the **orchestrator** — not about implementing tasks yourself in this session. When the user says "do task 7" or "run the tasks", they mean launch the orchestrator to execute them via its TDD workflow pipeline (worktrees, architect/implementer agents, verification, review, merge). Never implement task code directly in the interactive session unless the user explicitly asks you to bypass the orchestrator.
+
 ## Determine what the user wants
 
 The user will be in one of these situations. Read the request and jump to the matching section:
@@ -16,6 +20,7 @@ The user will be in one of these situations. Read the request and jump to the ma
 | Situation | Go to |
 |-----------|-------|
 | "Implement this PRD" / hands you a .md file | [Decompose PRD](#decompose-prd), then [Execute Tasks](#execute-tasks) |
+| "Do task X" / "Run task 7" / "Execute the tasks" | [Execute Tasks](#execute-tasks) |
 | "What's the status?" / "How are the tasks going?" | [Check Status](#check-status) |
 | "Task X is blocked" / "Something failed" | [Resolve Blocks](#resolve-blocks) |
 | Tasks already exist in Taskmaster, user wants to execute them | [Execute Tasks](#execute-tasks) (skip decomposition) |
