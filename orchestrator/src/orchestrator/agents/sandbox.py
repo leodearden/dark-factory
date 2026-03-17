@@ -2,8 +2,55 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import shutil
+import subprocess
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+_bwrap_available: bool | None = None
+
+
+def is_bwrap_available() -> bool:
+    """Probe whether bwrap can create sandboxes on this system.
+
+    Result is cached for the lifetime of the process.
+    """
+    global _bwrap_available
+    if _bwrap_available is not None:
+        return _bwrap_available
+
+    if not shutil.which('bwrap'):
+        logger.warning('bwrap not found in PATH — sandboxing disabled')
+        _bwrap_available = False
+        return False
+
+    try:
+        result = subprocess.run(
+            ['bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc',
+             '--', '/bin/true'],
+            capture_output=True, timeout=5,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors='replace').strip()
+            logger.warning('bwrap probe failed (rc=%d): %s — sandboxing disabled',
+                           result.returncode, stderr)
+            _bwrap_available = False
+        else:
+            _bwrap_available = True
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning('bwrap probe error: %s — sandboxing disabled', exc)
+        _bwrap_available = False
+
+    return _bwrap_available
+
+
+def _reset_probe() -> None:
+    """Reset the cached probe result (for tests)."""
+    global _bwrap_available
+    _bwrap_available = None
 
 
 def build_bwrap_command(

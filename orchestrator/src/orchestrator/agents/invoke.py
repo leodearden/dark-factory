@@ -79,8 +79,11 @@ async def invoke_agent(
 
     # Wrap command in bwrap sandbox if modules are specified
     if sandbox_modules is not None:
-        from orchestrator.agents.sandbox import build_bwrap_command
-        cmd = build_bwrap_command(cmd, cwd, sandbox_modules)
+        from orchestrator.agents.sandbox import build_bwrap_command, is_bwrap_available
+        if is_bwrap_available():
+            cmd = build_bwrap_command(cmd, cwd, sandbox_modules)
+        else:
+            logger.warning('Sandbox requested but bwrap unavailable — running unsandboxed')
 
     logger.info(f'Invoking agent: model={model} cwd={cwd} budget=${max_budget_usd}')
     logger.info(f'Command: {" ".join(cmd[:15])}...')
