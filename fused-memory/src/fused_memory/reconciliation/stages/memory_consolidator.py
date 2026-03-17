@@ -75,7 +75,7 @@ class MemoryConsolidator(BaseStage):
         prior_reports: list[StageReport],
     ) -> str:
         # 1. Episodes since last reconciliation
-        episodes = await self.memory.get_episodes(project_id=self.project_id, last_n=100)
+        episodes = await self.memory.get_episodes(project_id=self.project_id, last_n=500)
         new_episodes = episodes
         if watermark.last_episode_timestamp:
             wm_str = str(watermark.last_episode_timestamp)
@@ -88,7 +88,7 @@ class MemoryConsolidator(BaseStage):
         from fused_memory.models.scope import Scope
         scope = Scope(project_id=self.project_id)
         try:
-            all_memories = await self.memory.mem0.get_all(scope, limit=500)
+            all_memories = await self.memory.mem0.get_all(scope, limit=1000)
             mem0_memories = all_memories.get('results', [])
         except Exception:
             mem0_memories = []
@@ -110,10 +110,10 @@ class MemoryConsolidator(BaseStage):
 {event_summary}
 
 ### New Episodes Since Last Reconciliation ({len(new_episodes)})
-{_format_episodes(new_episodes[:50])}
+{_format_episodes(new_episodes[:200])}
 
 ### Recent Mem0 Memories ({len(mem0_memories)})
-{_format_memories(mem0_memories[:50])}
+{_format_memories(mem0_memories[:200])}
 
 ### Store Status
 {json.dumps(status, indent=2, default=str)}
@@ -136,10 +136,8 @@ def _format_events(events: list[ReconciliationEvent]) -> str:
     if not events:
         return 'No events.'
     lines = []
-    for e in events[:30]:
+    for e in events:
         lines.append(f'- [{e.type.value}] {e.timestamp.isoformat()}: {json.dumps(e.payload)}')
-    if len(events) > 30:
-        lines.append(f'... and {len(events) - 30} more events')
     return '\n'.join(lines)
 
 
@@ -148,7 +146,7 @@ def _format_episodes(episodes: list[dict]) -> str:
         return 'No new episodes.'
     lines = []
     for ep in episodes:
-        content = (ep.get('content') or '')[:200]
+        content = (ep.get('content') or '')[:500]
         lines.append(f'- [{ep.get("uuid", "?")}] {ep.get("created_at", "?")}: {content}')
     return '\n'.join(lines)
 
@@ -158,7 +156,7 @@ def _format_memories(memories: list[dict]) -> str:
         return 'No memories.'
     lines = []
     for m in memories:
-        content = (m.get('memory') or '')[:200]
+        content = (m.get('memory') or '')[:500]
         meta = m.get('metadata', {}) or {}
         cat = meta.get('category', '?')
         lines.append(f'- [{m.get("id", "?")}] ({cat}): {content}')

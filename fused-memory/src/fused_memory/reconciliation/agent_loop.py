@@ -14,6 +14,26 @@ from fused_memory.models.reconciliation import JournalEntry
 
 logger = logging.getLogger(__name__)
 
+CLAUDE_CLI_RESPONSE_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'thinking': {'type': 'string'},
+        'tool_calls': {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'id': {'type': 'string'},
+                    'name': {'type': 'string'},
+                    'input': {'type': 'object'},
+                },
+                'required': ['id', 'name', 'input'],
+            },
+        },
+    },
+    'required': ['thinking', 'tool_calls'],
+}
+
 
 class CircuitBreakerError(Exception):
     """Raised when mutation count exceeds the per-stage limit."""
@@ -57,6 +77,7 @@ class AgentLoop:
         self._mutation_count: int = 0
         self.llm_call_count: int = 0
         self.token_count: int = 0
+        self._cli_session_id: str | None = None
 
     async def run(self, initial_payload: str) -> tuple[dict, list[JournalEntry]]:
         """Execute agent loop. Returns (terminal_tool_args, journal_entries)."""
@@ -72,6 +93,7 @@ class AgentLoop:
             # Check for terminal tool in tool_use blocks
             tool_use_blocks = [b for b in response.content if b.type == 'tool_use']
             text_blocks = [b for b in response.content if b.type == 'text']
+            reasoning_text = '\n'.join(b.text for b in text_blocks).strip()
 
             if not tool_use_blocks:
                 # No tool calls — agent stopped
@@ -92,7 +114,7 @@ class AgentLoop:
                     break
 
                 try:
-                    result = await self._execute_tool(block)
+                    result = await self._execute_tool(block, reasoning=reasoning_text)
                     tool_results.append({
                         'type': 'tool_result',
                         'tool_use_id': block.id,
@@ -118,7 +140,7 @@ class AgentLoop:
 
         return {'warning': 'max_steps_reached'}, self._journal_entries
 
-    async def _execute_tool(self, tool_block: Any) -> Any:
+    async def _execute_tool(self, tool_block: Any, reasoning: str = '') -> Any:
         """Execute a tool call, journal if mutation."""
         tool_name = tool_block.name
         tool_args = tool_block.input or {}
@@ -152,7 +174,7 @@ class AgentLoop:
                     target_system=tool.target_system,
                     before_state=before_state,
                     after_state=_safe_serialize(result),
-                    reasoning='',
+                    reasoning=reasoning,
                     evidence=[],
                 )
             )
@@ -179,6 +201,8 @@ class AgentLoop:
             return response
         elif provider == 'openai':
             return await self._call_openai(messages, tool_schemas)
+        elif provider == 'claude_cli':
+            return await self._call_claude_cli(messages, tool_schemas)
         else:
             raise ValueError(f'Unsupported agent LLM provider: {provider}')
 
@@ -244,6 +268,121 @@ class AgentLoop:
         # Convert OpenAI response to Anthropic-like structure
         return _OpenAIResponseAdapter(response)
 
+    def _build_cli_system_prompt(self, tool_schemas: list[dict]) -> str:
+        """Build system prompt that includes tool schemas for CLI-based tool dispatch."""
+        tools_section = []
+        for t in tool_schemas:
+            tools_section.append(
+                f"### {t['name']}\n"
+                f"{t['description']}\n"
+                f"Parameters: {json.dumps(t['input_schema'], indent=2)}"
+            )
+        return (
+            f"{self.system_prompt}\n\n"
+            "## Available Tools\n"
+            "Respond with a JSON object matching the provided schema.\n"
+            "Use the tool_calls array to invoke tools. Each tool call needs:\n"
+            '- "id": a unique string identifier\n'
+            '- "name": the tool name from the list below\n'
+            '- "input": an object matching the tool\'s parameters\n\n'
+            "Use the \"thinking\" field to explain your reasoning before making tool calls.\n"
+            "If you have no more tool calls to make, return an empty tool_calls array.\n\n"
+            + "\n\n".join(tools_section)
+        )
+
+    @staticmethod
+    def _serialize_tool_results(tool_results: list[dict]) -> str:
+        """Format tool results as text for the next CLI turn."""
+        parts = []
+        for tr in tool_results:
+            if isinstance(tr, dict) and tr.get('type') == 'tool_result':
+                status = 'ERROR' if tr.get('is_error') else 'OK'
+                parts.append(
+                    f"[Tool Result: {tr['tool_use_id']}] ({status})\n{tr['content']}"
+                )
+        return '\n\n'.join(parts)
+
+    async def _call_claude_cli(self, messages: list[dict], tool_schemas: list[dict]) -> Any:
+        """Call Claude via CLI subprocess with --resume for multi-turn."""
+        import asyncio as _asyncio
+
+        is_first_call = self._cli_session_id is None
+        if is_first_call:
+            self._cli_session_id = str(uuid_mod.uuid4())
+
+        cmd = [
+            'claude', '--print', '--output-format', 'json',
+            '--model', self.config.agent_llm_model,
+            '--json-schema', json.dumps(CLAUDE_CLI_RESPONSE_SCHEMA),
+            '--permission-mode', 'bypassPermissions',
+            '--tools', '',
+        ]
+
+        if is_first_call:
+            cmd.extend(['--system-prompt', self._build_cli_system_prompt(tool_schemas)])
+            cmd.extend(['--session-id', self._cli_session_id])
+            prompt = messages[-1]['content']  # Initial payload string
+        else:
+            cmd.extend(['--resume', self._cli_session_id])
+            prompt = self._serialize_tool_results(messages[-1]['content'])
+
+        cmd.extend(['--', prompt])
+
+        try:
+            proc = await _asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                'Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code'
+            )
+
+        try:
+            stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=120)
+        except _asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError('Claude CLI timed out after 120 seconds')
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f'Claude CLI exited with code {proc.returncode}: '
+                f'{stderr.decode()[-500:]}'
+            )
+
+        raw = stdout.decode()
+        if not raw.strip():
+            raise RuntimeError('Claude CLI produced no output')
+
+        result = json.loads(raw)
+
+        # Update session_id from result if available
+        if result.get('session_id'):
+            self._cli_session_id = result['session_id']
+
+        # Extract structured output
+        structured = result.get('structured_output')
+        if isinstance(structured, str):
+            structured = json.loads(structured)
+        if not structured:
+            result_text = result.get('result', '')
+            if result_text:
+                try:
+                    structured = json.loads(result_text)
+                except (json.JSONDecodeError, TypeError):
+                    structured = {'thinking': result_text, 'tool_calls': []}
+            else:
+                structured = {'thinking': '', 'tool_calls': []}
+
+        self.llm_call_count += 1
+        self.token_count += (
+            int(result.get('num_input_tokens', 0))
+            + int(result.get('num_output_tokens', 0))
+        )
+
+        return _CLIResponseAdapter(structured)
+
 
 class _OpenAIResponseAdapter:
     """Adapts OpenAI response to look like Anthropic Messages response."""
@@ -265,6 +404,33 @@ class _OpenAIResponseAdapter:
                         input=json.loads(tc.function.arguments),
                     )
                 )
+
+
+class _CLIResponseAdapter:
+    """Adapts Claude CLI structured output to look like Anthropic Messages response."""
+
+    def __init__(self, structured_output: dict):
+        self.content = []
+        self.usage = _CLIUsage()
+
+        thinking = structured_output.get('thinking', '')
+        if thinking:
+            self.content.append(_TextBlock(thinking))
+
+        for tc in structured_output.get('tool_calls', []):
+            self.content.append(
+                _ToolUseBlock(
+                    id=tc.get('id', str(uuid_mod.uuid4())),
+                    name=tc['name'],
+                    input=tc.get('input', {}),
+                )
+            )
+
+
+@dataclass
+class _CLIUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 @dataclass

@@ -1,5 +1,6 @@
 """Tests for the agent loop."""
 
+import asyncio
 import json
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -8,9 +9,13 @@ import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.reconciliation.agent_loop import (
+    CLAUDE_CLI_RESPONSE_SCHEMA,
     AgentLoop,
     CircuitBreakerError,
     ToolDefinition,
+    _CLIResponseAdapter,
+    _TextBlock,
+    _ToolUseBlock,
 )
 
 
@@ -295,3 +300,241 @@ async def test_no_tool_calls_ends_loop():
     result, entries = await agent.run('test')
     assert result.get('warning') == 'no_tool_calls'
     assert 'I am done thinking.' in result.get('text', '')
+
+
+# --- Claude CLI provider tests ---
+
+
+def _make_cli_config(**overrides) -> ReconciliationConfig:
+    defaults = {
+        'agent_max_steps': 10,
+        'agent_max_tokens': 4096,
+        'max_mutations_per_stage': 5,
+        'agent_llm_provider': 'claude_cli',
+        'agent_llm_model': 'sonnet',
+    }
+    defaults.update(overrides)
+    return ReconciliationConfig(**defaults)
+
+
+def _cli_result_json(structured_output: dict, session_id: str = 'sess-1') -> bytes:
+    """Build a fake CLI JSON response."""
+    return json.dumps({
+        'result': '',
+        'session_id': session_id,
+        'num_input_tokens': 1000,
+        'num_output_tokens': 200,
+        'structured_output': structured_output,
+    }).encode()
+
+
+@pytest.mark.asyncio
+async def test_claude_cli_provider_first_call():
+    """First CLI call uses --session-id and --system-prompt with tool schemas."""
+    config = _make_cli_config()
+
+    tools = {
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete',
+            parameters={'type': 'object', 'properties': {'report': {'type': 'object'}}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='Test system prompt',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+
+    cli_output = _cli_result_json({
+        'thinking': 'All done.',
+        'tool_calls': [{'id': 'tc1', 'name': 'stage_complete', 'input': {'report': {}}}],
+    })
+
+    captured_cmd = []
+
+    async def fake_subprocess(*args, **kwargs):
+        captured_cmd.extend(args)
+        proc = MagicMock()
+        proc.returncode = 0
+
+        async def communicate():
+            return cli_output, b''
+        proc.communicate = communicate
+        return proc
+
+    with patch('asyncio.create_subprocess_exec', side_effect=fake_subprocess):
+        result, entries = await agent.run('initial payload')
+
+    assert result == {'report': {}}
+    cmd = captured_cmd
+    assert 'claude' in cmd[0]
+    assert '--session-id' in cmd
+    assert '--system-prompt' in cmd
+    # System prompt should include tool schemas
+    sp_idx = cmd.index('--system-prompt') + 1
+    assert 'stage_complete' in cmd[sp_idx]
+    assert '--tools' in cmd
+    # Prompt is last after --
+    assert cmd[-1] == 'initial payload'
+
+
+@pytest.mark.asyncio
+async def test_claude_cli_provider_resume():
+    """Second CLI call uses --resume instead of --session-id."""
+    config = _make_cli_config(agent_max_steps=5)
+
+    async def my_tool(**kwargs):
+        return {'ok': True}
+
+    tools = {
+        'my_tool': ToolDefinition(
+            name='my_tool',
+            description='Test tool',
+            parameters={'type': 'object', 'properties': {}},
+            function=my_tool,
+        ),
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete',
+            parameters={'type': 'object', 'properties': {}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='Test',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+
+    call_count = 0
+    captured_cmds = []
+
+    async def fake_subprocess(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        captured_cmds.append(list(args))
+        proc = MagicMock()
+        proc.returncode = 0
+
+        if call_count == 1:
+            output = _cli_result_json({
+                'thinking': 'Calling tool.',
+                'tool_calls': [{'id': 'tc1', 'name': 'my_tool', 'input': {}}],
+            })
+        else:
+            output = _cli_result_json({
+                'thinking': 'Done.',
+                'tool_calls': [{'id': 'tc2', 'name': 'stage_complete', 'input': {}}],
+            })
+
+        async def communicate():
+            return output, b''
+        proc.communicate = communicate
+        return proc
+
+    with patch('asyncio.create_subprocess_exec', side_effect=fake_subprocess):
+        result, entries = await agent.run('payload')
+
+    assert call_count == 2
+    # First call has --session-id
+    assert '--session-id' in captured_cmds[0]
+    assert '--resume' not in captured_cmds[0]
+    # Second call has --resume
+    assert '--resume' in captured_cmds[1]
+    assert '--session-id' not in captured_cmds[1]
+
+
+@pytest.mark.asyncio
+async def test_claude_cli_response_adapter():
+    """_CLIResponseAdapter produces correct _TextBlock/_ToolUseBlock."""
+    structured = {
+        'thinking': 'I should consolidate memories.',
+        'tool_calls': [
+            {'id': 'tc1', 'name': 'search_memory', 'input': {'query': 'test'}},
+            {'id': 'tc2', 'name': 'delete_memory', 'input': {'id': 'mem-1'}},
+        ],
+    }
+
+    adapter = _CLIResponseAdapter(structured)
+
+    text_blocks = [b for b in adapter.content if b.type == 'text']
+    tool_blocks = [b for b in adapter.content if b.type == 'tool_use']
+
+    assert len(text_blocks) == 1
+    assert text_blocks[0].text == 'I should consolidate memories.'
+    assert len(tool_blocks) == 2
+    assert tool_blocks[0].name == 'search_memory'
+    assert tool_blocks[0].input == {'query': 'test'}
+    assert tool_blocks[1].name == 'delete_memory'
+    assert tool_blocks[1].id == 'tc2'
+
+
+@pytest.mark.asyncio
+async def test_claude_cli_response_adapter_no_thinking():
+    """_CLIResponseAdapter handles empty thinking."""
+    structured = {
+        'thinking': '',
+        'tool_calls': [{'id': 'tc1', 'name': 'stage_complete', 'input': {}}],
+    }
+    adapter = _CLIResponseAdapter(structured)
+    text_blocks = [b for b in adapter.content if b.type == 'text']
+    tool_blocks = [b for b in adapter.content if b.type == 'tool_use']
+    assert len(text_blocks) == 0
+    assert len(tool_blocks) == 1
+
+
+@pytest.mark.asyncio
+async def test_claude_cli_tool_results_serialization():
+    """_serialize_tool_results formats tool results as text."""
+    tool_results = [
+        {
+            'type': 'tool_result',
+            'tool_use_id': 'tc1',
+            'content': '{"id": "mem-1"}',
+        },
+        {
+            'type': 'tool_result',
+            'tool_use_id': 'tc2',
+            'content': '{"error": "not found"}',
+            'is_error': True,
+        },
+    ]
+
+    text = AgentLoop._serialize_tool_results(tool_results)
+
+    assert '[Tool Result: tc1] (OK)' in text
+    assert '{"id": "mem-1"}' in text
+    assert '[Tool Result: tc2] (ERROR)' in text
+    assert '{"error": "not found"}' in text
+
+
+@pytest.mark.asyncio
+async def test_claude_cli_not_installed():
+    """Clear error when Claude CLI is not installed."""
+    config = _make_cli_config()
+
+    tools = {
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete',
+            parameters={'type': 'object', 'properties': {}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='Test',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+
+    with patch('asyncio.create_subprocess_exec', side_effect=FileNotFoundError):
+        with pytest.raises(RuntimeError, match='Claude CLI not found'):
+            await agent.run('test')

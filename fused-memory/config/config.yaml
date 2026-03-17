@@ -47,8 +47,9 @@ routing:
   llm_fallback: true
 
 queue:
-  semaphore_limit: ${SEMAPHORE_LIMIT:20}
-  workers_per_group: ${QUEUE_WORKERS_PER_GROUP:3}
+  semaphore_limit: ${SEMAPHORE_LIMIT:3}
+  workers_per_group: ${QUEUE_WORKERS_PER_GROUP:1}
+  graphiti_max_coroutines: ${GRAPHITI_MAX_COROUTINES:5}
   max_attempts: ${QUEUE_MAX_ATTEMPTS:5}
   retry_base_seconds: ${QUEUE_RETRY_BASE:5}
   write_timeout_seconds: ${QUEUE_WRITE_TIMEOUT:120}
@@ -57,17 +58,19 @@ queue:
 taskmaster:
   transport: "stdio"
   command: "node"
-  args: ["${TASKMASTER_DIR:../taskmaster-ai}/dist/mcp-server.js"]
+  args: ["${TASKMASTER_DIR:./taskmaster-ai}/dist/mcp-server.js"]
   project_root: "${PROJECT_ROOT:.}"
   tool_mode: "standard"
 
 reconciliation:
   enabled: true
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
-  buffer_size_threshold: 10
-  max_staleness_seconds: 1800
-  agent_llm_provider: "anthropic"
-  agent_llm_model: "claude-sonnet-4-20250514"
+  buffer_size_threshold: 500
+  max_staleness_seconds: 14400
+  agent_llm_provider: "claude_cli"
+  agent_llm_model: "sonnet"
   agent_max_steps: 50
   judge_enabled: true
+  judge_llm_provider: "claude_cli"
+  judge_llm_model: "sonnet"
   explore_codebase_root: "${PROJECT_ROOT:.}"

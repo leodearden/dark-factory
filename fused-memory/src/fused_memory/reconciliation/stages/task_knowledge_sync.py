@@ -100,10 +100,10 @@ class TaskKnowledgeSync(BaseStage):
 {_format_flagged(stage1_report.items_flagged if stage1_report else [])}
 
 ### Active Task Tree ({len(active_tasks)} active, {len(done_tasks)} done, {len(all_tasks)} total)
-{_format_tasks(active_tasks[:30])}
+{_format_tasks(active_tasks[:50])}
 
 ### Recently Completed Tasks
-{_format_tasks(done_tasks[:20])}
+{_format_tasks(done_tasks[:30])}
 
 ## Your Task
 Reconcile task state against memory:
@@ -222,10 +222,10 @@ def _format_flagged(items: list[dict]) -> str:
     if not items:
         return 'No flagged items.'
     lines = []
-    for item in items[:20]:
+    for item in items[:50]:
         lines.append(f'- {json.dumps(item, default=str)}')
-    if len(items) > 20:
-        lines.append(f'... and {len(items) - 20} more')
+    if len(items) > 50:
+        lines.append(f'... and {len(items) - 50} more')
     return '\n'.join(lines)
 
 

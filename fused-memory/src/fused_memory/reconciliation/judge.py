@@ -130,9 +130,11 @@ Review this run and provide your verdict as JSON.
 
     async def _call_llm(self, prompt: str) -> str:
         """Single LLM call (not an agent loop)."""
-        import anthropic
+        if self.config.judge_llm_provider == 'claude_cli':
+            return await self._call_judge_cli(prompt)
+        elif self.config.judge_llm_provider == 'anthropic':
+            import anthropic
 
-        if self.config.judge_llm_provider == 'anthropic':
             client = anthropic.AsyncAnthropic()
             response = await client.messages.create(
                 model=self.config.judge_llm_model,
@@ -153,6 +155,49 @@ Review this run and provide your verdict as JSON.
                 ],
             )
             return response.choices[0].message.content or ''
+
+    async def _call_judge_cli(self, prompt: str) -> str:
+        """Single-shot Claude CLI call for judge evaluation."""
+        import asyncio as _asyncio
+
+        cmd = [
+            'claude', '--print', '--output-format', 'json',
+            '--model', self.config.judge_llm_model,
+            '--system-prompt', JUDGE_SYSTEM_PROMPT,
+            '--permission-mode', 'bypassPermissions',
+            '--tools', '',
+            '--', prompt,
+        ]
+
+        try:
+            proc = await _asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                'Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code'
+            )
+
+        try:
+            stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=120)
+        except _asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError('Claude CLI timed out after 120 seconds')
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f'Claude CLI exited with code {proc.returncode}: '
+                f'{stderr.decode()[-500:]}'
+            )
+
+        raw = stdout.decode()
+        if not raw.strip():
+            return ''
+
+        result = json.loads(raw)
+        return result.get('result', '')
 
     def _parse_verdict(self, response_text: str, run_id: str) -> JudgeVerdict:
         """Parse judge response into JudgeVerdict."""

@@ -154,8 +154,9 @@ class RoutingConfig(BaseModel):
 class QueueConfig(BaseModel):
     """Durable write queue configuration."""
 
-    semaphore_limit: int = Field(default=20)
-    workers_per_group: int = Field(default=3)
+    semaphore_limit: int = Field(default=3)
+    workers_per_group: int = Field(default=1)
+    graphiti_max_coroutines: int = Field(default=5)
     max_attempts: int = Field(default=5)
     retry_base_seconds: float = Field(default=5.0)
     write_timeout_seconds: float = Field(default=120.0)
@@ -189,15 +190,15 @@ class ReconciliationConfig(BaseModel):
     max_staleness_seconds: int = Field(default=1800)
 
     # Agent settings
-    agent_llm_provider: str = Field(default='anthropic')
-    agent_llm_model: str = Field(default='claude-sonnet-4-20250514')
+    agent_llm_provider: str = Field(default='claude_cli')
+    agent_llm_model: str = Field(default='sonnet')
     agent_max_tokens: int = Field(default=8192)
     agent_max_steps: int = Field(default=50)
 
     # Judge settings
     judge_enabled: bool = Field(default=True)
-    judge_llm_provider: str = Field(default='anthropic')
-    judge_llm_model: str = Field(default='claude-sonnet-4-20250514')
+    judge_llm_provider: str = Field(default='claude_cli')
+    judge_llm_model: str = Field(default='sonnet')
 
     # Explore agent
     explore_codebase_root: str = Field(default='.')
