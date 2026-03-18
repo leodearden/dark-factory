@@ -98,12 +98,14 @@ async def get_buffer_stats(db_path: Path) -> dict:
             async with db.execute(
                 "SELECT COUNT(*) FROM event_buffer WHERE status = 'buffered'",
             ) as cursor:
-                (count,) = await cursor.fetchone()
+                row = await cursor.fetchone()
+                count = row[0] if row else 0
 
             async with db.execute(
                 "SELECT MIN(timestamp) FROM event_buffer WHERE status = 'buffered'",
             ) as cursor:
-                (oldest_ts,) = await cursor.fetchone()
+                row = await cursor.fetchone()
+                oldest_ts = row[0] if row else None
     except (FileNotFoundError, sqlite3.OperationalError):
         return dict(_BUFFER_STATS_DEFAULT)
 

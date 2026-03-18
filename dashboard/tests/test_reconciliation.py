@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 
 class TestGetRecentRuns:
     """Tests for get_recent_runs."""
@@ -72,8 +74,6 @@ class TestGetRecentRuns:
         runs = await get_recent_runs(missing_db_path)
         assert runs == []
 
-
-import pytest
 
 
 class TestGetWatermarks:

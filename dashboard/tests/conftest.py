@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from starlette.testclient import TestClient
@@ -112,7 +112,7 @@ def reconciliation_db(tmp_path):
     conn = sqlite3.connect(str(db_path))
     conn.executescript(RECONCILIATION_SCHEMA)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     # Watermark row
     conn.execute(
