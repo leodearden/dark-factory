@@ -78,3 +78,11 @@ class TestConftestFixtures:
         resp = client.get('/api/health')
         assert resp.status_code == 200
         assert resp.json() == {'status': 'ok'}
+
+
+class TestStaticFiles:
+    def test_static_css_served(self, client):
+        """Static CSS file should be served at /static/style.css."""
+        resp = client.get('/static/style.css')
+        assert resp.status_code == 200
+        assert 'text/css' in resp.headers['content-type']
