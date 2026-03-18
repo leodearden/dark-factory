@@ -117,3 +117,37 @@ class TestGetWatermarks:
 
         result = await get_watermarks(missing_db_path, project_id='dark_factory')
         assert result == {}
+
+
+class TestGetBufferStats:
+    """Tests for get_buffer_stats."""
+
+    async def test_happy_path_returns_count_and_age(self, reconciliation_db):
+        """Returns dict with buffered_count and oldest_event_age_seconds."""
+        from dashboard.data.reconciliation import get_buffer_stats
+
+        result = await get_buffer_stats(reconciliation_db)
+
+        assert isinstance(result, dict)
+        assert set(result.keys()) == {'buffered_count', 'oldest_event_age_seconds'}
+        # Fixture inserts 3 buffered events
+        assert result['buffered_count'] == 3
+        # Oldest event is 60 minutes old — age should be roughly 3600 seconds
+        assert result['oldest_event_age_seconds'] is not None
+        assert result['oldest_event_age_seconds'] >= 3500  # at least ~58 min
+
+    async def test_empty_table(self, empty_reconciliation_db):
+        """Returns zero count and None age when no buffered events."""
+        from dashboard.data.reconciliation import get_buffer_stats
+
+        result = await get_buffer_stats(empty_reconciliation_db)
+
+        assert result == {'buffered_count': 0, 'oldest_event_age_seconds': None}
+
+    async def test_missing_db_file(self, missing_db_path):
+        """Returns default dict when database file does not exist."""
+        from dashboard.data.reconciliation import get_buffer_stats
+
+        result = await get_buffer_stats(missing_db_path)
+
+        assert result == {'buffered_count': 0, 'oldest_event_age_seconds': None}
