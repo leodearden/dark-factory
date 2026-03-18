@@ -168,7 +168,8 @@ class TaskWorkflow:
                     f'Post-merge verification failed: {post_merge.summary}'
                 )
 
-            # SUCCESS
+            # SUCCESS — write completion knowledge before status change (ordering guarantee)
+            await self._write_completion_to_memory()
             self.state = WorkflowState.DONE
             await self.scheduler.set_task_status(self.task_id, 'done')
             logger.info(
@@ -476,16 +477,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         models = self.config.models
         budgets = self.config.budgets
         turns = self.config.max_turns
+        effort_cfg = self.config.effort
+        backends_cfg = self.config.backends
 
-        model = getattr(models, role.name.split('_')[0], role.default_model)
-        budget = getattr(budgets, role.name.split('_')[0], role.default_budget)
-        max_turns_val = getattr(turns, role.name.split('_')[0], role.default_max_turns)
+        role_key = role.name.split('_')[0]
+
+        model = getattr(models, role_key, role.default_model)
+        budget = getattr(budgets, role_key, role.default_budget)
+        max_turns_val = getattr(turns, role_key, role.default_max_turns)
+        effort_val = getattr(effort_cfg, role_key, 'high')
+        backend_val = getattr(backends_cfg, role_key, 'claude')
 
         # Use reviewer config for all reviewer variants
         if role.name.startswith('reviewer'):
             model = models.reviewer
             budget = budgets.reviewer
             max_turns_val = turns.reviewer
+            effort_val = effort_cfg.reviewer
+            backend_val = backends_cfg.reviewer
 
         # Determine sandbox modules based on role
         sandbox_modules = None
@@ -516,10 +525,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 mcp_config=mcp_config,
                 output_schema=output_schema,
                 sandbox_modules=sandbox_modules,
+                effort=effort_val,
+                backend=backend_val,
             )
 
             # Check for cap hit — if detected, loop back to before_invoke which blocks
-            if self.usage_gate and self.usage_gate.detect_cap_hit(result.stderr, result.output):
+            if self.usage_gate and self.usage_gate.detect_cap_hit(result.stderr, result.output, backend_val):
                 logger.warning(
                     f'Task {self.task_id} [{role.name}]: usage cap hit, waiting for reset'
                 )
@@ -575,6 +586,58 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         await self.scheduler.set_task_status(self.task_id, 'blocked')
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
         return WorkflowOutcome.BLOCKED
+
+    async def _write_completion_to_memory(self) -> None:
+        """Write task completion summary so dependent tasks find it in briefings."""
+        parts = [f"Completed: {self.task.get('title', '')}"]
+
+        desc = self.task.get('description', '')
+        if desc:
+            parts.append(f"Description: {desc}")
+
+        analysis = self.plan.get('analysis', '')
+        if analysis:
+            parts.append(f"Analysis: {analysis}")
+
+        decisions = self.plan.get('design_decisions', [])
+        if decisions:
+            decision_text = '; '.join(
+                d.get('decision', '') for d in decisions[:3]
+            )
+            parts.append(f"Key decisions: {decision_text}")
+
+        steps = self.plan.get('steps', [])
+        done_count = sum(1 for s in steps if s.get('status') == 'done')
+        parts.append(f"Steps completed: {done_count}/{len(steps)}")
+
+        if self.modules:
+            parts.append(f"Modules: {', '.join(self.modules)}")
+
+        content = '\n'.join(parts)
+
+        try:
+            import httpx as httpx_mod
+            async with httpx_mod.AsyncClient() as client:
+                await client.post(
+                    f'{self.mcp.url}/mcp/',
+                    json={
+                        'jsonrpc': '2.0',
+                        'id': 1,
+                        'method': 'tools/call',
+                        'params': {
+                            'name': 'add_memory',
+                            'arguments': {
+                                'content': content,
+                                'category': 'observations_and_summaries',
+                                'project_id': self.config.fused_memory.project_id,
+                                'agent_id': f'orchestrator-task-{self.task_id}',
+                            },
+                        },
+                    },
+                    timeout=10,
+                )
+        except Exception as e:
+            logger.warning(f'Failed to write completion to memory: {e}')
 
     async def _write_decisions_to_memory(self) -> None:
         """Write plan design decisions to fused-memory."""

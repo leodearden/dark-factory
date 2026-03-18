@@ -75,6 +75,7 @@ class MemoryService:
             semaphore_limit=qcfg.semaphore_limit,
             max_attempts=qcfg.max_attempts,
             retry_base_seconds=qcfg.retry_base_seconds,
+            retry_max_delay_seconds=qcfg.retry_max_delay_seconds,
             write_timeout_seconds=qcfg.write_timeout_seconds,
         )
         self.durable_queue.register_callback(
@@ -368,24 +369,44 @@ class MemoryService:
         stores_override = [SourceStore(s) for s in stores] if stores else None
         route: ReadRouteResult = await self.router.route(query, stores_override)
 
-        # Fan out to stores in parallel
-        tasks: dict[SourceStore, asyncio.Task] = {}
+        # Fan out to stores in parallel with timeout
+        search_timeout = self.config.queue.search_timeout_seconds
+        store_list: list[SourceStore] = []
+        task_list: list[asyncio.Task] = []
+
         if SourceStore.graphiti in route.stores:
-            tasks[SourceStore.graphiti] = asyncio.create_task(
+            store_list.append(SourceStore.graphiti)
+            task_list.append(asyncio.create_task(
                 self._search_graphiti(query, scope, limit)
-            )
+            ))
         if SourceStore.mem0 in route.stores:
-            tasks[SourceStore.mem0] = asyncio.create_task(
+            store_list.append(SourceStore.mem0)
+            task_list.append(asyncio.create_task(
                 self._search_mem0(query, scope, limit)
-            )
+            ))
 
         results: list[MemoryResult] = []
-        for store, task in tasks.items():
-            try:
-                store_results = await task
-                results.extend(store_results)
-            except Exception as e:
-                logger.error(f'Search failed for {store.value}: {e}')
+        if task_list:
+            done, pending = await asyncio.wait(
+                task_list, timeout=search_timeout, return_when=asyncio.ALL_COMPLETED
+            )
+            for t in pending:
+                t.cancel()
+
+            timed_out_stores = [
+                store_list[i] for i, t in enumerate(task_list) if t in pending
+            ]
+            if timed_out_stores:
+                logger.warning(
+                    f'Search timed out for stores: {[s.value for s in timed_out_stores]}'
+                )
+
+            for t in done:
+                try:
+                    store_results = t.result()
+                    results.extend(store_results)
+                except Exception as e:
+                    logger.error(f'Search store failed: {e}')
 
         # Sort: primary store results first, then by relevance score
         def sort_key(r: MemoryResult) -> tuple[int, float]:

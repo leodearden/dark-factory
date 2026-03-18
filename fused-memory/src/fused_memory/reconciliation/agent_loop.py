@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid as uuid_mod
@@ -163,7 +164,14 @@ class AgentLoop:
                 except Exception:
                     before_state = None
 
-        result = await tool.function(**tool_args)
+        try:
+            result = await asyncio.wait_for(
+                tool.function(**tool_args),
+                timeout=self.config.tool_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f'Tool {tool_name} timed out after {self.config.tool_timeout_seconds}s')
+            result = {'error': f'Tool {tool_name} timed out after {self.config.tool_timeout_seconds}s'}
 
         if tool.is_mutation:
             self._journal_entries.append(
@@ -340,10 +348,10 @@ class AgentLoop:
             )
 
         try:
-            stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=120)
+            stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=180)
         except _asyncio.TimeoutError:
             proc.kill()
-            raise RuntimeError('Claude CLI timed out after 120 seconds')
+            raise RuntimeError('Claude CLI timed out after 180 seconds')
 
         if proc.returncode != 0:
             raise RuntimeError(

@@ -1,5 +1,6 @@
 """Intercepts task state transitions for targeted reconciliation."""
 
+import asyncio
 import logging
 import uuid as uuid_mod
 from datetime import datetime, timezone
@@ -47,6 +48,15 @@ class TaskInterceptor:
             payload=payload,
         )
 
+    @staticmethod
+    def _on_reconciliation_done(task: asyncio.Task) -> None:
+        """Callback for fire-and-forget reconciliation tasks."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            logger.error(f'Background reconciliation failed: {exc}')
+
     # ── Status transitions (with targeted reconciliation) ──────────────
 
     async def set_task_status(
@@ -56,7 +66,7 @@ class TaskInterceptor:
         project_root: str,
         tag: str | None = None,
     ) -> dict:
-        """Proxy to Taskmaster, then run targeted reconciliation if triggered."""
+        """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered."""
         # 1. Get before-state
         before = await self.taskmaster.get_task(task_id, project_root, tag)
 
@@ -72,27 +82,19 @@ class TaskInterceptor:
         )
         await self.buffer.push(event)
 
-        # 4. Targeted reconciliation for trigger statuses
+        # 4. Targeted reconciliation for trigger statuses (fire-and-forget)
         if status in self.STATUS_TRIGGERS and self.reconciler:
-            try:
-                recon_result = await self.reconciler.reconcile_task(
+            task = asyncio.create_task(
+                self.reconciler.reconcile_task(
                     task_id=task_id,
                     transition=status,
                     project_id=project_root,
                     task_before=before,
-                )
-                result['reconciliation'] = recon_result
-                logger.info(
-                    'reconciliation.targeted_completed',
-                    extra={
-                        'task_id': task_id,
-                        'transition': status,
-                        'project_id': project_root,
-                    },
-                )
-            except Exception as e:
-                logger.error(f'Targeted reconciliation failed for task {task_id}: {e}')
-                result['reconciliation_error'] = str(e)
+                ),
+                name=f'targeted-recon-{task_id}-{status}',
+            )
+            task.add_done_callback(self._on_reconciliation_done)
+            result['reconciliation'] = {'status': 'async', 'task_id': task_id}
 
         return result
 
@@ -118,14 +120,14 @@ class TaskInterceptor:
         await self.buffer.push(event)
 
         if self.reconciler:
-            try:
-                recon_result = await self.reconciler.reconcile_bulk_tasks(
+            task = asyncio.create_task(
+                self.reconciler.reconcile_bulk_tasks(
                     parent_task_id=task_id, project_id=project_root
-                )
-                result['reconciliation'] = recon_result
-            except Exception as e:
-                logger.error(f'Bulk reconciliation failed for expand_task {task_id}: {e}')
-                result['reconciliation_error'] = str(e)
+                ),
+                name=f'bulk-recon-expand-{task_id}',
+            )
+            task.add_done_callback(self._on_reconciliation_done)
+            result['reconciliation'] = {'status': 'async', 'task_id': task_id}
 
         return result
 
@@ -147,14 +149,14 @@ class TaskInterceptor:
         await self.buffer.push(event)
 
         if self.reconciler:
-            try:
-                recon_result = await self.reconciler.reconcile_bulk_tasks(
+            task = asyncio.create_task(
+                self.reconciler.reconcile_bulk_tasks(
                     parent_task_id=None, project_id=project_root
-                )
-                result['reconciliation'] = recon_result
-            except Exception as e:
-                logger.error(f'Bulk reconciliation failed for parse_prd: {e}')
-                result['reconciliation_error'] = str(e)
+                ),
+                name='bulk-recon-parse-prd',
+            )
+            task.add_done_callback(self._on_reconciliation_done)
+            result['reconciliation'] = {'status': 'async', 'operation': 'parse_prd'}
 
         return result
 

@@ -159,7 +159,11 @@ class QueueConfig(BaseModel):
     graphiti_max_coroutines: int = Field(default=5)
     max_attempts: int = Field(default=5)
     retry_base_seconds: float = Field(default=5.0)
+    retry_max_delay_seconds: float = Field(default=300.0)
     write_timeout_seconds: float = Field(default=120.0)
+    backend_read_timeout_seconds: float = Field(default=30.0)
+    backend_write_timeout_seconds: float = Field(default=120.0)
+    search_timeout_seconds: float = Field(default=15.0)
     data_dir: str = Field(default='./data/queue')
 
 
@@ -208,6 +212,11 @@ class ReconciliationConfig(BaseModel):
     burst_window_seconds: float = Field(default=30.0)
     burst_cooldown_seconds: float = Field(default=150.0)
     stale_lock_seconds: float = Field(default=7200.0)
+
+    # Timeouts
+    tool_timeout_seconds: float = Field(default=30.0)
+    stage_timeout_seconds: int = Field(default=600)
+    cycle_timeout_seconds: int = Field(default=1800)
 
     # Safety
     max_mutations_per_stage: int = Field(default=50)

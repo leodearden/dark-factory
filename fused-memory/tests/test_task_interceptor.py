@@ -1,5 +1,6 @@
 """Tests for task interceptor middleware."""
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -62,10 +63,14 @@ async def test_set_task_status_non_trigger(interceptor, taskmaster, reconciler, 
 
 
 @pytest.mark.asyncio
-async def test_set_task_status_done_triggers_reconciliation(interceptor, reconciler, event_buffer):
-    """Done status triggers targeted reconciliation."""
+async def test_set_task_status_done_triggers_async_reconciliation(interceptor, reconciler, event_buffer):
+    """Done status triggers async targeted reconciliation."""
     result = await interceptor.set_task_status('1', 'done', '/project')
     assert 'reconciliation' in result
+    assert result['reconciliation']['status'] == 'async'
+    assert result['reconciliation']['task_id'] == '1'
+    # Let the event loop tick so the background task runs
+    await asyncio.sleep(0)
     reconciler.reconcile_task.assert_called_once_with(
         task_id='1',
         transition='done',
@@ -78,6 +83,8 @@ async def test_set_task_status_done_triggers_reconciliation(interceptor, reconci
 async def test_set_task_status_blocked_triggers(interceptor, reconciler):
     result = await interceptor.set_task_status('1', 'blocked', '/project')
     assert 'reconciliation' in result
+    assert result['reconciliation']['status'] == 'async'
+    await asyncio.sleep(0)
     reconciler.reconcile_task.assert_called_once()
 
 
@@ -85,6 +92,7 @@ async def test_set_task_status_blocked_triggers(interceptor, reconciler):
 async def test_set_task_status_cancelled_triggers(interceptor, reconciler):
     result = await interceptor.set_task_status('1', 'cancelled', '/project')
     assert 'reconciliation' in result
+    assert result['reconciliation']['status'] == 'async'
 
 
 @pytest.mark.asyncio
@@ -104,18 +112,22 @@ async def test_add_task_emits_event(interceptor, event_buffer):
 
 
 @pytest.mark.asyncio
-async def test_expand_task_triggers_bulk_reconciliation(interceptor, reconciler, event_buffer):
+async def test_expand_task_triggers_async_bulk_reconciliation(interceptor, reconciler, event_buffer):
     result = await interceptor.expand_task('1', '/project')
     assert 'reconciliation' in result
+    assert result['reconciliation']['status'] == 'async'
+    await asyncio.sleep(0)
     reconciler.reconcile_bulk_tasks.assert_called_once()
     stats = await event_buffer.get_buffer_stats('/project')
     assert stats['size'] == 1
 
 
 @pytest.mark.asyncio
-async def test_parse_prd_triggers_bulk_reconciliation(interceptor, reconciler, event_buffer):
+async def test_parse_prd_triggers_async_bulk_reconciliation(interceptor, reconciler, event_buffer):
     result = await interceptor.parse_prd('prd.md', '/project')
     assert 'reconciliation' in result
+    assert result['reconciliation']['status'] == 'async'
+    await asyncio.sleep(0)
     reconciler.reconcile_bulk_tasks.assert_called_once()
 
 
@@ -142,3 +154,15 @@ async def test_dependency_operations_emit_events(interceptor, event_buffer):
     await interceptor.remove_dependency('2', '1', '/project')
     stats = await event_buffer.get_buffer_stats('/project')
     assert stats['size'] == 2
+
+
+@pytest.mark.asyncio
+async def test_async_reconciliation_error_logged(interceptor, reconciler, event_buffer):
+    """Background reconciliation failure should not propagate to caller."""
+    reconciler.reconcile_task = AsyncMock(side_effect=RuntimeError('boom'))
+    result = await interceptor.set_task_status('1', 'done', '/project')
+    assert result['reconciliation']['status'] == 'async'
+    # Let the background task run and fail
+    await asyncio.sleep(0)
+    # The caller still got a result — error is logged, not raised
+    assert 'success' in result

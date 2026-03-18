@@ -97,6 +97,29 @@ class TargetedReconciler:
         title = task.get('title', '')
         description = task.get('description', '')
 
+        # 0. Fast-path: write completion fact immediately (no search/verify needed)
+        try:
+            content = f"Task '{title}' completed."
+            if description:
+                content += f" {description}"
+            details = task.get('details', '')
+            if details:
+                content += f"\nDetails: {details[:500]}"
+
+            await self.memory.add_memory(
+                content=content,
+                category='observations_and_summaries',
+                project_id=project_id,
+                metadata={
+                    'source': 'targeted_reconciliation',
+                    'task_id': task_id,
+                    'transition': 'done',
+                },
+            )
+            result['actions'].append({'type': 'knowledge_captured_fast'})
+        except Exception as e:
+            logger.warning(f'Fast-path write failed for task {task_id}: {e}')
+
         # 1. Search for existing knowledge about this task
         related = await self.memory.search(
             query=f'{title} {description}',

@@ -86,7 +86,15 @@ class ReconciliationHarness:
                                 self._heartbeat_loop(project_id)
                             )
                             try:
-                                await self.run_full_cycle(project_id, reason)
+                                await asyncio.wait_for(
+                                    self.run_full_cycle(project_id, reason),
+                                    timeout=self.config.cycle_timeout_seconds,
+                                )
+                            except asyncio.TimeoutError:
+                                logger.error(
+                                    f'Full cycle timed out after {self.config.cycle_timeout_seconds}s '
+                                    f'for {project_id}'
+                                )
                             finally:
                                 heartbeat_task.cancel()
                                 with suppress(asyncio.CancelledError):
