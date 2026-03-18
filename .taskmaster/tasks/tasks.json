@@ -1,0 +1,187 @@
+{
+  "master": {
+    "tasks": [
+      {
+        "id": "11",
+        "title": "Bug: Architect agent intermittently fails to write plan.json",
+        "description": "The architect agent claims \"plan written to .task/plan.json\" in its output text but the file doesn't actually exist. Observed ~50% failure rate across orchestrator runs against the reify project. The orchestrator correctly detects this (artifacts.read_plan() returns empty) and blocks the task, but the wasted cost is significant ($1-2 per failed attempt). Workaround: reset task to pending and re-run. Root cause likely in how the agent uses the Write tool vs describing the plan in text output.",
+        "details": "Observed during reify M1 orchestrator runs (2026-03-16). Task 1 failed in run 1, succeeded in run 2. Task 3 failed in run 3. The architect system prompt includes Write in --allowed-tools and instructs \"Write the plan to .task/plan.json using the Write tool.\" The agent returns success with turns=15-32 and describes the plan in its result text, but the file is absent on disk. Possible causes: (1) agent describes the plan instead of calling Write, (2) Write tool call fails silently, (3) cwd mismatch between agent and worktree.",
+        "testStrategy": "",
+        "status": "done",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": [],
+        "updatedAt": "2026-03-18T06:54:14.059Z"
+      },
+      {
+        "id": "12",
+        "title": "Bug: Verify step fails with `source: not found` on dash-based systems",
+        "description": "verify.py uses asyncio.create_subprocess_shell() which invokes /bin/sh. On systems where /bin/sh is dash (e.g. Ubuntu), the `source` builtin doesn't exist \u2014 only `.` works. Verification commands like `source ~/.cargo/env && cargo test` fail with `/bin/sh: 1: source: not found`, causing tasks to exhaust verify attempts and block even when the code is correct.",
+        "details": "Fix options: (1) Use `. ` instead of `source` in config commands (user-side workaround, already applied to reify config). (2) Pass executable='/bin/bash' to create_subprocess_shell in verify.py. (3) Document that verify commands must be POSIX-compatible. Option 2 is the proper fix since it doesn't burden config authors with shell compatibility knowledge.",
+        "testStrategy": "",
+        "status": "done",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": [],
+        "updatedAt": "2026-03-18T06:54:14.060Z"
+      },
+      {
+        "id": "13",
+        "title": "Bug: Reviewers receive empty diff, rubber-stamp PASS",
+        "description": "During the review stage, `git diff main...HEAD` sometimes returns an empty diff. All 5 reviewers then report \"PASS \u2014 empty diff, no issues\" which defeats the purpose of review. Observed on task 4 (reify-geometry) during reify M1 run.",
+        "details": "Likely cause: the merge-base calculation `main...HEAD` returns nothing when the worktree branch has already been fast-forwarded or when main has moved. The review happens after verification passes, but if the worktree was rebased or the diff reference is stale, the diff is empty. Fix: compute the diff at worktree creation time (store the base commit in .task/metadata.json) and use that as the diff base, e.g. `git diff <base-sha>...HEAD`.",
+        "testStrategy": "",
+        "status": "done",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-03-18T06:54:14.070Z"
+      },
+      {
+        "id": "14",
+        "title": "Bug: git add -A in worktrees commits .task/ artifacts",
+        "description": "The orchestrator's git_ops.commit() runs `git add -A` which stages .task/plan.json, .task/iterations.jsonl, and .task/reviews/*.json. These internal orchestrator artifacts get committed to the task branch and merged to main. Workaround: add `.task/` to project .gitignore. Proper fix: exclude .task/ in git_ops.commit() or use a more targeted staging approach.",
+        "details": "In git_ops.py line 61: `await _run(['git', 'add', '-A'], cwd=worktree)`. Fix options: (1) Add .task/ to a .gitignore that's created in the worktree during TaskArtifacts.init(). (2) Change git add -A to explicit file staging. (3) Run `git reset HEAD .task/` after `git add -A`. Option 1 is simplest \u2014 have artifacts.init() write a .task/.gitignore containing `*`.",
+        "testStrategy": "",
+        "status": "done",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-03-18T06:54:14.073Z"
+      },
+      {
+        "id": "15",
+        "title": "Bug: Fused-memory task tools missing from Claude Code due to config path",
+        "description": "When Claude Code connects to fused-memory via stdio, the default config (fused-memory/config/config.yaml) resolves the Taskmaster path as ./taskmaster-ai relative to the fused-memory directory, but taskmaster-ai lives at dark-factory/taskmaster-ai. Taskmaster init silently fails, causing all 11 task proxy tools to not be registered. The server logs a warning but the client has no way to know task tools are absent vs nonexistent.",
+        "details": "The fix has two parts: (1) Project .mcp.json files should set CONFIG_PATH to a project-specific config with absolute Taskmaster paths, or set TASKMASTER_DIR env var. (2) The server should surface Taskmaster connection status to clients \u2014 e.g. include `taskmaster_connected: false` in get_status output, or mention it in the server instructions/capabilities so clients can detect the gap. Currently the failure is completely silent from the client's perspective.",
+        "testStrategy": "",
+        "status": "done",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": [],
+        "updatedAt": "2026-03-18T06:54:14.075Z"
+      },
+      {
+        "id": "16",
+        "title": "Project scaffold, config, and app skeleton",
+        "description": "Create the dashboard project structure under dashboard/ with all foundational files needed by subsequent tasks.",
+        "details": "Create the following files:\n\n1. `dashboard/pyproject.toml` \u2014 hatchling build, dependencies: fastapi>=0.115, uvicorn[standard]>=0.34, jinja2>=3.1, httpx>=0.28, aiosqlite>=0.21. Dev extras: pytest>=8, pytest-asyncio>=0.25, httpx.\n\n2. `dashboard/src/dashboard/__init__.py` \u2014 empty.\n\n3. `dashboard/src/dashboard/config.py` \u2014 DashboardConfig dataclass with fields: host=\"127.0.0.1\", port=8080, project_root=Path(\"/home/leo/src/dark-factory\"), fused_memory_url=\"http://localhost:8000\", fused_memory_project_id=\"dark_factory\". Properties for derived paths: reconciliation_db (project_root/\"fused-memory\"/\"data\"/\"reconciliation\"/\"reconciliation.db\"), write_queue_db (project_root/\"fused-memory\"/\"data\"/\"queue\"/\"write_queue.db\"), tasks_json (project_root/\".taskmaster\"/\"tasks\"/\"tasks.json\"), worktrees_dir (project_root/\".worktrees\"). Support env var overrides prefixed DASHBOARD_ (e.g. DASHBOARD_PORT).\n\n4. `dashboard/src/dashboard/app.py` \u2014 FastAPI app with: Jinja2Templates pointing to templates dir, StaticFiles mount at /static, lifespan context manager (creates httpx.AsyncClient stored in app.state), GET /api/health returning {\"status\": \"ok\"}. Do NOT add other routes yet \u2014 those come in tasks 5-8.\n\n5. `dashboard/src/dashboard/data/__init__.py` \u2014 empty.\n\n6. `dashboard/src/dashboard/templates/base.html` \u2014 Jinja2 base template. Dark theme (bg-gray-900, text-gray-100). Head includes: Tailwind CSS CDN (script tag), htmx CDN (script tag), Alpine.js CDN (script tag), link to /static/style.css. Body has a container div with {% block content %}{% endblock %}. Header with \"Dark Factory\" title.\n\n7. `dashboard/src/dashboard/static/style.css` \u2014 minimal custom styles if needed beyond Tailwind utilities.\n\n8. `dashboard/tests/__init__.py` \u2014 empty.\n\n9. `dashboard/tests/conftest.py` \u2014 shared pytest fixtures: a fixture that creates a DashboardConfig with temp paths, a fixture for FastAPI TestClient.\n\nTest strategy: Run `cd dashboard && uv sync && uv run pytest tests/ -x` \u2014 verify project installs cleanly and conftest fixtures work. Write a minimal test in conftest or a test_scaffold.py that imports dashboard.config and dashboard.app and asserts the health endpoint returns 200.",
+        "testStrategy": "",
+        "status": "done",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": [],
+        "updatedAt": "2026-03-18T07:05:44.066Z"
+      },
+      {
+        "id": "17",
+        "title": "Memory data module",
+        "description": "Create data/memory.py \u2014 the data access layer for memory health metrics from the fused-memory MCP HTTP server.",
+        "details": "Create `dashboard/src/dashboard/data/memory.py` with:\n\n1. `async def mcp_tool_call(client: httpx.AsyncClient, base_url: str, tool_name: str, arguments: dict) -> dict` \u2014 POST JSON-RPC to `{base_url}/mcp` with body `{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/call\", \"params\": {\"name\": tool_name, \"arguments\": arguments}}`. Parse response: extract `result.content[0].text`, json.loads it, return dict. Timeout: 10s.\n\n2. `async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) -> dict` \u2014 call MCP tool `get_status` with `{\"project_id\": config.fused_memory_project_id}`. Returns dict with keys: graphiti (connected, node_count), mem0 (connected, memory_count), queue (counts dict, oldest_pending_age_seconds), taskmaster (connected). On httpx.ConnectError or httpx.TimeoutException, return `{\"offline\": True, \"error\": str(e)}`.\n\n3. `async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) -> dict` \u2014 call MCP tool `get_queue_stats` with `{}`. Returns dict with counts (pending, in_flight, retry, completed, dead) and oldest_pending_age_seconds. Same error handling as above.\n\nCreate `dashboard/tests/test_memory.py` with tests:\n- Test successful get_memory_status: mock httpx to return a valid MCP response, verify parsed output matches expected structure.\n- Test successful get_queue_stats: same pattern.\n- Test offline fallback: mock httpx to raise ConnectError, verify returns {\"offline\": True, ...}.\n- Test malformed response: mock httpx to return unexpected JSON, verify graceful handling (returns empty dict or raises clear error).\n\nUse httpx's MockTransport or pytest-httpx for mocking.",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [
+          "16"
+        ],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-03-18T06:56:24.412Z"
+      },
+      {
+        "id": "18",
+        "title": "Reconciliation data module",
+        "description": "Create data/reconciliation.py \u2014 async SQLite queries for reconciliation metrics from reconciliation.db (read-only).",
+        "details": "Create `dashboard/src/dashboard/data/reconciliation.py` with:\n\nAll functions open the database read-only: `aiosqlite.connect(f\"file:{db_path}?mode=ro\", uri=True)`.\nAll functions accept a `db_path: Path` parameter and handle FileNotFoundError by returning empty defaults.\n\n1. `async def get_recent_runs(db_path: Path, limit: int = 5) -> list[dict]` \u2014 query: `SELECT id, run_type, trigger_reason, started_at, completed_at, events_processed, status FROM runs ORDER BY started_at DESC LIMIT ?`. Return list of dicts. Calculate duration_seconds from completed_at - started_at for each run (both are ISO 8601 strings).\n\n2. `async def get_watermarks(db_path: Path, project_id: str = \"dark_factory\") -> dict` \u2014 query: `SELECT * FROM watermarks WHERE project_id = ?`. Return dict with last_full_run_completed, last_episode_timestamp, last_memory_timestamp, last_task_change_timestamp. Return empty dict if no row.\n\n3. `async def get_buffer_stats(db_path: Path) -> dict` \u2014 queries: `SELECT COUNT(*) FROM event_buffer WHERE status = 'buffered'` and `SELECT MIN(timestamp) FROM event_buffer WHERE status = 'buffered'`. Return `{\"buffered_count\": int, \"oldest_event_age_seconds\": float|None}`. Calculate age from oldest timestamp vs now.\n\n4. `async def get_burst_state(db_path: Path) -> list[dict]` \u2014 query: `SELECT agent_id, state, last_write_at, burst_started_at FROM burst_state`. Return list of dicts.\n\n5. `async def get_latest_verdict(db_path: Path) -> dict | None` \u2014 query: `SELECT run_id, severity, action_taken, reviewed_at FROM judge_verdicts ORDER BY reviewed_at DESC LIMIT 1`. Return dict or None.\n\nCreate `dashboard/tests/test_reconciliation.py`:\n- Fixture: create an in-memory SQLite db, execute CREATE TABLE statements matching the reconciliation.db schema (watermarks, runs, event_buffer, burst_state, judge_verdicts tables \u2014 see PRD for exact schemas), insert sample rows.\n- Test each query function against the fixture DB.\n- Test missing database file returns empty defaults.\n- Test empty tables return empty lists/dicts/None.\n\nSQLite schemas for the fixture (from the actual codebase):\n- `CREATE TABLE watermarks (project_id TEXT PRIMARY KEY, last_full_run_id TEXT, last_full_run_completed TEXT, last_episode_timestamp TEXT, last_memory_timestamp TEXT, last_task_change_timestamp TEXT)`\n- `CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, run_type TEXT NOT NULL, trigger_reason TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, events_processed INTEGER DEFAULT 0, stage_reports TEXT DEFAULT '{}', status TEXT DEFAULT 'running')`\n- `CREATE TABLE event_buffer (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, event_type TEXT NOT NULL, event_source TEXT NOT NULL, agent_id TEXT, timestamp TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'buffered')`\n- `CREATE TABLE burst_state (agent_id TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'idle', last_write_at TEXT NOT NULL, burst_started_at TEXT)`\n- `CREATE TABLE judge_verdicts (run_id TEXT PRIMARY KEY, reviewed_at TEXT NOT NULL, severity TEXT NOT NULL, findings TEXT DEFAULT '[]', action_taken TEXT DEFAULT 'none')`",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [
+          "16"
+        ],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-03-18T06:56:24.423Z"
+      },
+      {
+        "id": "19",
+        "title": "Orchestrator discovery module",
+        "description": "Create data/orchestrator.py \u2014 process scanning, task tree parsing, and worktree artifact reading for orchestrator status.",
+        "details": "Create `dashboard/src/dashboard/data/orchestrator.py` with:\n\n1. `def find_running_orchestrators() -> list[dict]` \u2014 run `subprocess.run([\"ps\", \"aux\"], capture_output=True, text=True)`. For each line containing \"orchestrator\" and \"--prd\", extract PID (field 1), start time (fields 8-9), and PRD path (regex `--prd\\s+(\\S+)`). Return list of `{\"pid\": int, \"prd\": str, \"running\": True, \"started\": str}`. Filter out the grep/ps process itself.\n\n2. `def load_task_tree(tasks_json_path: Path) -> list[dict]` \u2014 read and parse `.taskmaster/tasks/tasks.json`. Extract `data[\"master\"][\"tasks\"]` (or `data[\"tasks\"]` \u2014 handle both formats). Return list of task dicts with keys: id, title, status, priority, dependencies, and metadata (if present, includes modules). Handle FileNotFoundError \u2192 return []. Handle malformed JSON \u2192 log warning, return [].\n\n3. `def read_task_artifacts(worktree_path: Path) -> dict` \u2014 Read orchestrator artifacts from a worktree's `.task/` directory:\n   - `.task/metadata.json`: parse for task_id, title, base_commit, created_at\n   - `.task/plan.json`: parse steps array, count done vs total \u2192 derive phase (PLAN if no plan, EXECUTE/VERIFY/REVIEW/MERGE based on step progress, DONE if all done)\n   - `.task/iterations.jsonl`: count lines (don't parse each line)\n   - `.task/reviews/*.json`: glob, parse each, count PASS vs ISSUES_FOUND \u2192 return summary like \"3/5 PASS\"\n   All wrapped in try/except, return None/0/\"\u2014\" for missing files.\n   Returns: `{\"metadata\": dict|None, \"phase\": str, \"plan_progress\": {\"done\": int, \"total\": int}, \"iteration_count\": int, \"review_summary\": str}`.\n\n4. `def discover_orchestrators(config: DashboardConfig) -> list[dict]` \u2014 combine process scan + worktree scan:\n   - Get running orchestrators from find_running_orchestrators()\n   - Get task tree from load_task_tree(config.tasks_json)\n   - Scan config.worktrees_dir for subdirectories, read artifacts from each\n   - For each running orchestrator: attach the task tree and per-task artifacts\n   - Compute summary stats: total, done, in_progress, blocked, pending counts\n   - Return list of orchestrator dicts with all combined data\n\nCreate `dashboard/tests/test_orchestrator.py`:\n- Test find_running_orchestrators: mock subprocess.run to return canned ps output with orchestrator lines. Verify PID and PRD extraction.\n- Test load_task_tree: create a temp tasks.json with sample data. Verify parsing. Test missing file. Test malformed JSON.\n- Test read_task_artifacts: create temp dir with .task/ subdirectory containing sample metadata.json, plan.json (with mix of done/pending steps), iterations.jsonl (3 lines), reviews/reviewer-1.json (PASS), reviews/reviewer-2.json (ISSUES_FOUND). Verify all fields parsed correctly.\n- Test discover_orchestrators: mock process scan, create temp worktrees dir with one worktree containing artifacts. Verify combined output.",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [
+          "16"
+        ],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-03-18T06:56:24.425Z"
+      },
+      {
+        "id": "20",
+        "title": "Memory health cards partial and route",
+        "description": "Create the memory health cards HTML partial template and its FastAPI route, wiring data from the memory data module.",
+        "details": "Create `dashboard/src/dashboard/templates/partials/memory.html`:\n\nFour cards in a horizontal flex row (flex, gap-4). Each card: bg-gray-800, rounded-lg, p-6, shadow.\n\n1. **Graphiti card**: Status dot (green if connected, red if not \u2014 use a 3x3 rounded-full div with bg-green-500/bg-red-500). \"Graphiti\" label (text-sm text-gray-400). Node count as large number (text-3xl font-bold text-white). Subtitle \"knowledge graph nodes\" (text-xs text-gray-500).\n\n2. **Mem0 card**: Same pattern. Memory count. Subtitle \"vector memories\".\n\n3. **Taskmaster card**: Same dot pattern. \"Taskmaster\" label. Text \"Connected\" or \"Disconnected\" (instead of a number).\n\n4. **Write Queue card**: Tri-state dot: green if all counts are 0, yellow if pending > 0, red if dead > 0. \"Write Queue\" label. Show three metrics inline: \"N pending \u00b7 N retry \u00b7 N dead\" with dead count in red text if > 0. If oldest_pending_age_seconds is not None and > 60, show \"oldest: Xm ago\" in yellow text.\n\nIf the data has `offline: True`, show a single full-width card: \"Fused Memory Server Offline\" with red styling and the error message.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/memory` async route: get httpx client from request.app.state, call get_memory_status() and get_queue_stats() from dashboard.data.memory, render templates/partials/memory.html with the data as template context, return HTMLResponse.\n- Import the data functions at the top of app.py.\n\nTest strategy: verify the route returns 200 with text/html content-type. Test with mock data module returning both online and offline states. Check that the HTML contains expected elements (e.g., \"Graphiti\", \"Mem0\", node count value).",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [
+          "17"
+        ],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-03-18T06:56:24.426Z"
+      },
+      {
+        "id": "21",
+        "title": "Reconciliation panel partial and route",
+        "description": "Create the reconciliation panel HTML partial template and its FastAPI route, wiring data from the reconciliation data module.",
+        "details": "Create `dashboard/src/dashboard/templates/partials/recon.html`:\n\nTwo-column grid layout (grid grid-cols-2 gap-6). Dark themed cards (bg-gray-800 rounded-lg p-6).\n\n**Left column \u2014 Current State:**\n\n- **Event Buffer** section: Show \"N events buffered\". If oldest_event_age_seconds is not None, show \"oldest: Xm Xs ago\". Use yellow text if age > 300s.\n\n- **Burst State** table: columns agent_id, state. State \"bursting\" in orange badge, \"idle\" in gray badge. Show \"No agents\" if empty.\n\n- **Watermarks** section: Show each timestamp as relative time (implement a Jinja2 filter `timeago` that converts ISO 8601 to \"Xm ago\" / \"Xh ago\" / \"Xd ago\" relative to now). Fields: Last full run, Last episode, Last memory, Last task change. Use text-gray-400 for labels, text-white for values.\n\n- **Latest Verdict**: Severity badge \u2014 bg-green-600 for \"ok\", bg-yellow-600 for \"minor\", bg-orange-600 for \"moderate\", bg-red-600 for \"serious\". Show action_taken next to it. Show \"No verdicts yet\" if None.\n\n**Right column \u2014 Recent Runs (last 5):**\n\nTable with columns: Trigger, Type, Status, Events, Duration, When.\n- Status badges: bg-green-600=completed, bg-blue-600=running, bg-red-600=failed, bg-orange-600=rolled_back, bg-purple-600=circuit_breaker.\n- Duration: show in seconds or \"\u2014\" if still running.\n- When: relative time (timeago filter).\n- Show \"No reconciliation runs yet\" if empty.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/recon` async route: call all 5 reconciliation query functions (get_recent_runs, get_watermarks, get_buffer_stats, get_burst_state, get_latest_verdict) with config.reconciliation_db and render the partial.\n- Register the `timeago` Jinja2 filter on the templates environment.\n\nThe `timeago` filter: accept an ISO 8601 string, parse with datetime.fromisoformat, compute delta from now (UTC), return human string like \"3m ago\", \"2h ago\", \"1d ago\". Handle None \u2192 return \"never\".\n\nTest strategy: verify route returns 200. Test with mock reconciliation data. Check HTML contains expected badges and table structure.",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [
+          "18"
+        ],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-03-18T06:56:24.427Z"
+      },
+      {
+        "id": "22",
+        "title": "Orchestrator list and task detail partials and routes",
+        "description": "Create the orchestrator list and task detail HTML partial templates and their FastAPI routes, wiring data from the orchestrator discovery module.",
+        "details": "Create `dashboard/src/dashboard/templates/partials/orchestrators.html`:\n\n**Header**: \"Orchestrators\" (text-xl font-bold) + count of running instances as badge (bg-blue-600 rounded-full px-2 text-sm).\n\n**Per-orchestrator card** (bg-gray-800 rounded-lg p-6 mb-4):\n- **Header line**: PID with green \"running\" badge (bg-green-600 text-xs rounded px-2 py-0.5) or gray \"completed\" badge. PRD filename (extracted from path, text-gray-400).\n- **Progress bar**: Full-width bar (h-3 rounded-full bg-gray-700 overflow-hidden). Colored segments inside as flex children: green (done), blue (in-progress), yellow (pending), red (blocked). Width proportional to count/total.\n- **Stats row**: Flex with gap, each stat: count + label. \"N done \u00b7 N in-progress \u00b7 N blocked \u00b7 N pending\" with matching colors.\n- **Expand button**: \"Show tasks\" / \"Hide tasks\" toggle using Alpine.js `@click=\"open = !open\"` and `x-show=\"open\"`. Wrap card in `<div x-data=\"{ open: false }\">`.\n\nCreate `dashboard/src/dashboard/templates/partials/tasks.html`:\n\n**Task table** (inside the expandable section, rendered per orchestrator):\n- Table with classes: w-full text-sm text-left text-gray-300.\n- Header row: ID, Title, Status, Phase, Iterations, Reviews, Modules (bg-gray-700 text-gray-400 text-xs uppercase).\n- Data rows: \n  - **Status** as badge: bg-green-600=done, bg-blue-600=in-progress, bg-yellow-600=pending, bg-red-600=blocked, bg-gray-600=cancelled/deferred.\n  - **Phase**: short label (PLAN/EXEC/VERIFY/REVIEW/MERGE/DONE/\u2014) with muted color.\n  - **Iterations**: number or \"\u2014\".\n  - **Reviews**: e.g. \"3/5 PASS\" or \"\u2014\".\n  - **Modules**: comma-joined, text-xs text-gray-500, truncated with `truncate max-w-[200px]`.\n\nIf no orchestrators found, show a centered message: \"No orchestrators detected\" with gray text.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/orchestrators` async route: call discover_orchestrators(config), render orchestrators.html with the orchestrator list. The tasks.html partial is included inline within orchestrators.html (use Jinja2 include or render tasks directly in the template loop).\n\nTest strategy: verify route returns 200. Test with mock discover_orchestrators returning both empty list and a list with one running + one completed orchestrator. Check HTML contains progress bar, stats, task table elements.",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [
+          "19"
+        ],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-03-18T06:56:24.431Z"
+      },
+      {
+        "id": "23",
+        "title": "Full page assembly, entry point, and integration tests",
+        "description": "Create index.html combining all partials with htmx polling, add __main__.py entry point, and write integration tests for all routes.",
+        "details": "Create `dashboard/src/dashboard/templates/index.html`:\n\nExtends base.html. Content block contains 4 sections stacked vertically (space-y-8 max-w-7xl mx-auto p-6):\n\n1. **Memory Health** section: `<div hx-get=\"/partials/memory\" hx-trigger=\"load, every 10s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n2. **Reconciliation** section: `<div hx-get=\"/partials/recon\" hx-trigger=\"load, every 15s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n3. **Orchestrators** section: `<div hx-get=\"/partials/orchestrators\" hx-trigger=\"load, every 10s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n4. **Footer**: Small text \"Dark Factory Dashboard\" with current time (updated via Alpine.js `x-text` with a setInterval, or just static).\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /` route: render index.html (no data needed \u2014 partials load themselves via htmx).\n\nCreate `dashboard/src/dashboard/__main__.py`:\n```python\n\"\"\"Entry point: python -m dashboard.app\"\"\"\nimport uvicorn\nfrom dashboard.config import DashboardConfig\n\nconfig = DashboardConfig()\nuvicorn.run(\"dashboard.app:app\", host=config.host, port=config.port, reload=True)\n```\n\nCreate `dashboard/tests/test_app.py` \u2014 integration tests using FastAPI TestClient:\n\n1. **Test GET /** \u2014 returns 200, content-type text/html, body contains \"Dark Factory\", contains hx-get=\"/partials/memory\", hx-get=\"/partials/recon\", hx-get=\"/partials/orchestrators\".\n\n2. **Test GET /partials/memory** \u2014 mock dashboard.data.memory functions to return sample data. Returns 200, text/html, contains \"Graphiti\", \"Mem0\", \"Taskmaster\", \"Write Queue\".\n\n3. **Test GET /partials/memory offline** \u2014 mock to return {\"offline\": True}. Returns 200, contains \"Offline\".\n\n4. **Test GET /partials/recon** \u2014 mock dashboard.data.reconciliation functions. Returns 200, contains expected table elements.\n\n5. **Test GET /partials/recon no data** \u2014 mock to return empty defaults. Returns 200, contains \"No reconciliation runs\".\n\n6. **Test GET /partials/orchestrators** \u2014 mock dashboard.data.orchestrator.discover_orchestrators to return a sample orchestrator with tasks. Returns 200, contains progress bar elements, task table.\n\n7. **Test GET /partials/orchestrators empty** \u2014 mock to return []. Returns 200, contains \"No orchestrators detected\".\n\n8. **Test GET /api/health** \u2014 returns 200, application/json, body is {\"status\": \"ok\"}.\n\nUse `unittest.mock.patch` or `monkeypatch` to mock the data modules. Import the app and create TestClient in a fixture.\n\nTest strategy: `cd dashboard && uv run pytest tests/ -x -v`. All 8+ tests should pass. Also manually verify by running `cd dashboard && uv run python -m dashboard.app` and opening http://127.0.0.1:8080 in a browser.",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [
+          "20",
+          "21",
+          "22"
+        ],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-03-18T06:56:24.432Z"
+      }
+    ],
+    "metadata": {
+      "version": "1.0.0",
+      "lastModified": "2026-03-18T07:05:44.066Z",
+      "taskCount": 13,
+      "completedCount": 5,
+      "tags": [
+        "master"
+      ]
+    }
+  }
+}

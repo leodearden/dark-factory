@@ -1,11 +1,11 @@
 """Tests for bwrap sandbox probe and fallback."""
 
-from unittest.mock import AsyncMock, patch, MagicMock
 import subprocess
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from orchestrator.agents.sandbox import is_bwrap_available, _reset_probe
+from orchestrator.agents.sandbox import _reset_probe, is_bwrap_available
 
 
 @pytest.fixture(autouse=True)
@@ -50,7 +50,7 @@ class TestIsBwrapAvailable:
             assert is_bwrap_available() is False
 
     def test_caches_result(self):
-        with patch('orchestrator.agents.sandbox.shutil.which', return_value='/usr/bin/bwrap') as mock_which, \
+        with patch('orchestrator.agents.sandbox.shutil.which', return_value='/usr/bin/bwrap'), \
              patch('orchestrator.agents.sandbox.subprocess.run') as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=[], returncode=0, stderr=b'',
@@ -72,7 +72,7 @@ class TestInvokeAgentSandboxFallback:
             mock_exec.return_value = mock_proc
 
             from orchestrator.agents.invoke import invoke_agent
-            result = await invoke_agent(
+            await invoke_agent(
                 prompt='test',
                 system_prompt='sys',
                 cwd=tmp_path,

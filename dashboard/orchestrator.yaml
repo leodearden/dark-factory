@@ -1,0 +1,78 @@
+# Dashboard orchestrator configuration
+# Ports on xxx2 range to avoid collisions with reify (xxx0) and autopilot-video (xxx1)
+
+# Concurrency
+max_concurrent_tasks: 3
+max_per_module: 1
+lock_depth: 2
+module_overrides:
+  tests: 2
+
+# Iteration limits
+max_execute_iterations: 10
+max_verify_attempts: 5
+max_review_cycles: 2
+
+# Models per role
+models:
+  architect: "opus"
+  implementer: "opus"
+  debugger: "opus"
+  reviewer: "sonnet"
+  merger: "opus"
+
+# Budget per invocation (USD)
+budgets:
+  architect: 5.0
+  implementer: 10.0
+  debugger: 5.0
+  reviewer: 2.0
+  merger: 5.0
+
+# Turn limits per invocation
+max_turns:
+  architect: 50
+  implementer: 80
+  debugger: 50
+  reviewer: 30
+  merger: 50
+
+# Verification commands
+test_command: "pytest dashboard/tests/"
+lint_command: "ruff check dashboard/"
+type_check_command: "pyright dashboard/src/"
+
+# Fused memory HTTP server — port 8002
+fused_memory:
+  url: "http://localhost:8002"
+  project_id: "dark_factory"
+  config_path: "dashboard/fused-memory-config.yaml"
+  server_command:
+    - "uv"
+    - "run"
+    - "--project"
+    - "fused-memory"
+    - "python"
+    - "-m"
+    - "fused_memory.server.main"
+    - "--transport"
+    - "http"
+
+# Sandbox — disabled due to Bun segfault inside bwrap on this kernel (6.17)
+sandbox:
+  enabled: false
+
+# Escalation — port 8102
+escalation:
+  queue_dir: "data/escalations"
+  port: 8102
+
+# Git
+git:
+  main_branch: "main"
+  branch_prefix: "task/"
+  remote: "origin"
+  worktree_dir: ".worktrees"
+
+# Project root (absolute path)
+project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"
