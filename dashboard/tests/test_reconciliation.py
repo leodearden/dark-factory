@@ -151,3 +151,41 @@ class TestGetBufferStats:
         result = await get_buffer_stats(missing_db_path)
 
         assert result == {'buffered_count': 0, 'oldest_event_age_seconds': None}
+
+
+class TestGetBurstState:
+    """Tests for get_burst_state."""
+
+    async def test_happy_path_returns_burst_state_list(self, reconciliation_db):
+        """Returns list of dicts with correct fields for all agents."""
+        from dashboard.data.reconciliation import get_burst_state
+
+        result = await get_burst_state(reconciliation_db)
+
+        assert isinstance(result, list)
+        assert len(result) == 2
+
+        expected_fields = {'agent_id', 'state', 'last_write_at', 'burst_started_at'}
+        for entry in result:
+            assert set(entry.keys()) == expected_fields
+
+        # Check agent data matches fixture
+        by_agent = {e['agent_id']: e for e in result}
+        assert by_agent['agent-1']['state'] == 'bursting'
+        assert by_agent['agent-1']['burst_started_at'] is not None
+        assert by_agent['agent-2']['state'] == 'idle'
+        assert by_agent['agent-2']['burst_started_at'] is None
+
+    async def test_empty_table(self, empty_reconciliation_db):
+        """Returns empty list when burst_state table has no data."""
+        from dashboard.data.reconciliation import get_burst_state
+
+        result = await get_burst_state(empty_reconciliation_db)
+        assert result == []
+
+    async def test_missing_db_file(self, missing_db_path):
+        """Returns empty list when database file does not exist."""
+        from dashboard.data.reconciliation import get_burst_state
+
+        result = await get_burst_state(missing_db_path)
+        assert result == []
