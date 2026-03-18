@@ -48,3 +48,15 @@ class TestConfigEnvOverrides:
         cfg = DashboardConfig.from_env()
         assert cfg.reconciliation_db == Path('/tmp/test/fused-memory/data/reconciliation/reconciliation.db')
         assert cfg.worktrees_dir == Path('/tmp/test/.worktrees')
+
+
+class TestHealthEndpoint:
+    def test_health_endpoint(self):
+        from starlette.testclient import TestClient
+
+        from dashboard.app import app
+
+        with TestClient(app) as client:
+            resp = client.get('/api/health')
+            assert resp.status_code == 200
+            assert resp.json() == {'status': 'ok'}
