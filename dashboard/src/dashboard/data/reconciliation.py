@@ -115,3 +115,30 @@ async def get_buffer_stats(db_path: Path) -> dict:
         age = (datetime.now(UTC) - oldest_dt).total_seconds()
 
     return {'buffered_count': count, 'oldest_event_age_seconds': age}
+
+
+async def get_burst_state(db_path: Path) -> list[dict]:
+    """Return current burst state for all agents.
+
+    Each dict contains: agent_id, state, last_write_at, burst_started_at.
+    """
+    try:
+        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                'SELECT agent_id, state, last_write_at, burst_started_at'
+                ' FROM burst_state',
+            ) as cursor:
+                rows = await cursor.fetchall()
+    except (FileNotFoundError, sqlite3.OperationalError):
+        return []
+
+    return [
+        {
+            'agent_id': row['agent_id'],
+            'state': row['state'],
+            'last_write_at': row['last_write_at'],
+            'burst_started_at': row['burst_started_at'],
+        }
+        for row in rows
+    ]
