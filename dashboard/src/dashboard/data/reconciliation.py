@@ -142,3 +142,30 @@ async def get_burst_state(db_path: Path) -> list[dict]:
         }
         for row in rows
     ]
+
+
+async def get_latest_verdict(db_path: Path) -> dict | None:
+    """Return the most recent judge verdict, or None if none exist.
+
+    Returns dict with: run_id, severity, action_taken, reviewed_at.
+    """
+    try:
+        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                'SELECT run_id, severity, action_taken, reviewed_at'
+                ' FROM judge_verdicts ORDER BY reviewed_at DESC LIMIT 1',
+            ) as cursor:
+                row = await cursor.fetchone()
+    except (FileNotFoundError, sqlite3.OperationalError):
+        return None
+
+    if row is None:
+        return None
+
+    return {
+        'run_id': row['run_id'],
+        'severity': row['severity'],
+        'action_taken': row['action_taken'],
+        'reviewed_at': row['reviewed_at'],
+    }
