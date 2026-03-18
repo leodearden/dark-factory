@@ -74,3 +74,46 @@ class TestGetRecentRuns:
 
 
 import pytest
+
+
+class TestGetWatermarks:
+    """Tests for get_watermarks."""
+
+    async def test_happy_path_returns_watermark_dict(self, reconciliation_db):
+        """Returns dict with watermark fields for existing project_id."""
+        from dashboard.data.reconciliation import get_watermarks
+
+        result = await get_watermarks(reconciliation_db, project_id='dark_factory')
+
+        assert isinstance(result, dict)
+        expected_keys = {
+            'last_full_run_completed',
+            'last_episode_timestamp',
+            'last_memory_timestamp',
+            'last_task_change_timestamp',
+        }
+        assert set(result.keys()) == expected_keys
+        # All values should be non-None strings (timestamps were set in fixture)
+        for key in expected_keys:
+            assert result[key] is not None
+
+    async def test_nonexistent_project_id(self, reconciliation_db):
+        """Returns empty dict for a project_id not in the table."""
+        from dashboard.data.reconciliation import get_watermarks
+
+        result = await get_watermarks(reconciliation_db, project_id='nonexistent')
+        assert result == {}
+
+    async def test_empty_table(self, empty_reconciliation_db):
+        """Returns empty dict when watermarks table has no data."""
+        from dashboard.data.reconciliation import get_watermarks
+
+        result = await get_watermarks(empty_reconciliation_db, project_id='dark_factory')
+        assert result == {}
+
+    async def test_missing_db_file(self, missing_db_path):
+        """Returns empty dict when database file does not exist."""
+        from dashboard.data.reconciliation import get_watermarks
+
+        result = await get_watermarks(missing_db_path, project_id='dark_factory')
+        assert result == {}
