@@ -189,3 +189,35 @@ class TestGetBurstState:
 
         result = await get_burst_state(missing_db_path)
         assert result == []
+
+
+class TestGetLatestVerdict:
+    """Tests for get_latest_verdict."""
+
+    async def test_happy_path_returns_verdict_dict(self, reconciliation_db):
+        """Returns dict with verdict fields for the most recent verdict."""
+        from dashboard.data.reconciliation import get_latest_verdict
+
+        result = await get_latest_verdict(reconciliation_db)
+
+        assert result is not None
+        assert isinstance(result, dict)
+        expected_keys = {'run_id', 'severity', 'action_taken', 'reviewed_at'}
+        assert set(result.keys()) == expected_keys
+        assert result['run_id'] == 'run-001'
+        assert result['severity'] == 'low'
+        assert result['action_taken'] == 'logged'
+
+    async def test_empty_table(self, empty_reconciliation_db):
+        """Returns None when judge_verdicts table has no data."""
+        from dashboard.data.reconciliation import get_latest_verdict
+
+        result = await get_latest_verdict(empty_reconciliation_db)
+        assert result is None
+
+    async def test_missing_db_file(self, missing_db_path):
+        """Returns None when database file does not exist."""
+        from dashboard.data.reconciliation import get_latest_verdict
+
+        result = await get_latest_verdict(missing_db_path)
+        assert result is None
