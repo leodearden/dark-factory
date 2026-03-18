@@ -19,7 +19,10 @@ class TestConfigDefaults:
 
         cfg = DashboardConfig()
         root = cfg.project_root
-        assert cfg.reconciliation_db == root / 'fused-memory' / 'data' / 'reconciliation' / 'reconciliation.db'
+        assert (
+            cfg.reconciliation_db
+            == root / 'fused-memory' / 'data' / 'reconciliation' / 'reconciliation.db'
+        )
         assert cfg.write_queue_db == root / 'fused-memory' / 'data' / 'queue' / 'write_queue.db'
         assert cfg.tasks_json == root / '.taskmaster' / 'tasks' / 'tasks.json'
         assert cfg.worktrees_dir == root / '.worktrees'
@@ -46,7 +49,9 @@ class TestConfigEnvOverrides:
 
         monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', '/tmp/test')
         cfg = DashboardConfig.from_env()
-        assert cfg.reconciliation_db == Path('/tmp/test/fused-memory/data/reconciliation/reconciliation.db')
+        assert cfg.reconciliation_db == Path(
+            '/tmp/test/fused-memory/data/reconciliation/reconciliation.db'
+        )
         assert cfg.worktrees_dir == Path('/tmp/test/.worktrees')
 
 
@@ -65,7 +70,9 @@ class TestHealthEndpoint:
 class TestConftestFixtures:
     def test_config_fixture_uses_tmp_path(self, dashboard_config):
         """The dashboard_config fixture should use a temp directory as project_root."""
-        assert '/tmp' in str(dashboard_config.project_root) or 'tmp' in str(dashboard_config.project_root)
+        assert '/tmp' in str(dashboard_config.project_root) or 'tmp' in str(
+            dashboard_config.project_root
+        )
         assert dashboard_config.project_root.exists()
 
     def test_config_fixture_derived_paths(self, dashboard_config):
