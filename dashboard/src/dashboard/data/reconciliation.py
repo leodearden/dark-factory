@@ -53,3 +53,33 @@ async def get_recent_runs(db_path: Path, *, limit: int = 10) -> list[dict]:
             }
         )
     return results
+
+
+async def get_watermarks(db_path: Path, *, project_id: str = 'dark_factory') -> dict:
+    """Return watermark timestamps for a given project.
+
+    Returns a dict with keys: last_full_run_completed, last_episode_timestamp,
+    last_memory_timestamp, last_task_change_timestamp. Returns {} if not found.
+    """
+    try:
+        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                'SELECT last_full_run_completed, last_episode_timestamp,'
+                ' last_memory_timestamp, last_task_change_timestamp'
+                ' FROM watermarks WHERE project_id = ?',
+                (project_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+    except (FileNotFoundError, sqlite3.OperationalError):
+        return {}
+
+    if row is None:
+        return {}
+
+    return {
+        'last_full_run_completed': row['last_full_run_completed'],
+        'last_episode_timestamp': row['last_episode_timestamp'],
+        'last_memory_timestamp': row['last_memory_timestamp'],
+        'last_task_change_timestamp': row['last_task_change_timestamp'],
+    }
