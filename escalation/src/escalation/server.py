@@ -16,6 +16,7 @@ CATEGORIES = [
     'dependency_discovered',
     'risk_identified',
     'infra_issue',
+    'task_failure',
 ]
 
 

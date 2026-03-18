@@ -77,6 +77,7 @@ class TaskWorkflow:
         escalation_queue=None,
         escalation_event: asyncio.Event | None = None,
         usage_gate: UsageGate | None = None,
+        initial_plan: dict | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -90,8 +91,10 @@ class TaskWorkflow:
         self.task_id = assignment.task_id
         self.modules = list(assignment.modules)
         self.worktree: Path | None = None
+        self._worktree_external = False  # True when worktree was pre-created (eval mode)
         self.artifacts: TaskArtifacts | None = None
         self.plan: dict = {}
+        self.initial_plan = initial_plan
         self.metrics = WorkflowMetrics()
 
         # Escalation support
@@ -109,7 +112,19 @@ class TaskWorkflow:
             await self.scheduler.set_task_status(self.task_id, 'in-progress')
 
             # Create worktree (captures base commit for stable diffs)
-            self.worktree, base_commit = await self.git_ops.create_worktree(branch_name)
+            # If worktree is already set (e.g. eval mode), skip creation
+            if self.worktree is None:
+                self.worktree, base_commit = await self.git_ops.create_worktree(branch_name)
+            else:
+                # Eval mode: worktree was pre-created, skip creation and cleanup
+                self._worktree_external = True
+                proc = await asyncio.create_subprocess_exec(
+                    'git', 'rev-parse', 'HEAD',
+                    cwd=str(self.worktree),
+                    stdout=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                base_commit = stdout.decode().strip()
             self.artifacts = TaskArtifacts(self.worktree)
             self.artifacts.init(
                 self.task_id,
@@ -118,13 +133,21 @@ class TaskWorkflow:
                 base_commit=base_commit,
             )
 
-            # PLAN
-            self.state = WorkflowState.PLAN
-            plan_outcome = await self._plan()
-            if plan_outcome == WorkflowOutcome.REQUEUED:
-                return WorkflowOutcome.REQUEUED
-            if plan_outcome == WorkflowOutcome.BLOCKED:
-                return await self._mark_blocked('Planning failed')
+            # PLAN (skip if initial_plan was provided — eval mode)
+            if self.initial_plan:
+                self.artifacts.write_plan(self.initial_plan)
+                self.plan = self.initial_plan
+                logger.info(
+                    f'Task {self.task_id}: using provided plan '
+                    f'({len(self.plan.get("steps", []))} steps)'
+                )
+            else:
+                self.state = WorkflowState.PLAN
+                plan_outcome = await self._plan()
+                if plan_outcome == WorkflowOutcome.REQUEUED:
+                    return WorkflowOutcome.REQUEUED
+                if plan_outcome == WorkflowOutcome.BLOCKED:
+                    return await self._mark_blocked('Planning failed')
 
             # EXECUTE + VERIFY + REVIEW loop (with escalation retry)
             while True:
@@ -189,7 +212,8 @@ class TaskWorkflow:
 
         finally:
             # Cleanup worktree (only if done — keep for debugging if blocked)
-            if self.state == WorkflowState.DONE and self.worktree:
+            # Skip cleanup for externally-managed worktrees (eval mode)
+            if self.state == WorkflowState.DONE and self.worktree and not self._worktree_external:
                 await self.git_ops.cleanup_worktree(self.worktree, branch_name)
 
     async def _plan(self) -> WorkflowOutcome:
@@ -581,10 +605,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         return '\n'.join(e.resolution for e in resolved)
 
     async def _mark_blocked(self, reason: str) -> WorkflowOutcome:
-        """Mark task as blocked."""
+        """Mark task as blocked and create an escalation entry."""
         self.state = WorkflowState.BLOCKED
         await self.scheduler.set_task_status(self.task_id, 'blocked')
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
+
+        if self.escalation_queue:
+            from escalation.models import Escalation
+
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role='orchestrator',
+                severity='blocking',
+                category='task_failure',
+                summary=reason[:200],
+                detail=reason,
+                suggested_action='investigate_and_retry',
+                worktree=str(self.worktree) if self.worktree else None,
+                workflow_state=self.state.value,
+            )
+            self.escalation_queue.submit(esc)
+
         return WorkflowOutcome.BLOCKED
 
     async def _write_completion_to_memory(self) -> None:

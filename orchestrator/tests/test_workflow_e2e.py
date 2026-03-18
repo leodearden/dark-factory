@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from escalation.queue import EscalationQueue
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
@@ -158,6 +159,8 @@ class AgentStub:
         output_schema: dict | None = None,
         permission_mode: str = 'bypassPermissions',
         sandbox_modules: list[str] | None = None,
+        effort: str | None = None,
+        backend: str = 'claude',
     ) -> AgentResult:
         """Determine role from system_prompt content, perform side effects."""
         role = self._detect_role(system_prompt)
@@ -302,7 +305,7 @@ class FakeMcp:
     def url(self) -> str:
         return 'http://localhost:9999'
 
-    def mcp_config_json(self) -> dict:
+    def mcp_config_json(self, **kwargs) -> dict:
         return {'mcpServers': {}}
 
 
@@ -906,3 +909,138 @@ class TestArtifactsIntegrity:
         assert len(iteration_log) >= 1
         assert iteration_log[0]['agent'] == 'implementer'
         assert len(iteration_log[0]['steps_completed']) > 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: Task Failure Escalation
+# ---------------------------------------------------------------------------
+
+
+def _build_workflow_with_escalation(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    assignment: TaskAssignment,
+    agent_stub: AgentStub,
+    tmp_path: Path,
+) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
+    """Wire up a TaskWorkflow with an EscalationQueue attached."""
+    scheduler = FakeScheduler()
+    queue_dir = tmp_path / 'escalation_queue'
+    queue = EscalationQueue(queue_dir)
+    workflow = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=scheduler,
+        briefing=FakeBriefing(),
+        mcp=FakeMcp(),
+        escalation_queue=queue,
+    )
+    return workflow, scheduler, queue
+
+
+@pytest.mark.asyncio
+class TestTaskFailureEscalation:
+    """Blocked tasks create escalation entries in the queue."""
+
+    async def test_blocked_task_creates_escalation(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """When a task is blocked, an escalation with category='task_failure' is created."""
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=False, test_output='FAILED', lint_output='',
+                type_output='', summary='tests failed',
+            )),
+        )
+
+        # Use strict verify limits so it blocks quickly
+        config_strict = OrchestratorConfig(
+            project_root=config.project_root,
+            max_verify_attempts=1,
+            git=config.git,
+        )
+        workflow.config = config_strict
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        # Check escalation was created
+        escalations = queue.get_by_task('42')
+        assert len(escalations) == 1
+        esc = escalations[0]
+        assert esc.category == 'task_failure'
+        assert esc.severity == 'blocking'
+        assert esc.agent_role == 'orchestrator'
+        assert esc.task_id == '42'
+        assert esc.status == 'pending'
+
+    async def test_escalation_has_correct_fields(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """Escalation carries workflow_state, worktree, and reason in summary/detail."""
+
+        class FailingArchitectStub(AgentStub):
+            async def _architect(self, cwd: Path) -> AgentResult:
+                return AgentResult(success=False, output='Cannot plan', cost_usd=0.10)
+
+        stub = FailingArchitectStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='ok',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        escalations = queue.get_by_task('42')
+        assert len(escalations) == 1
+        esc = escalations[0]
+        assert esc.workflow_state == 'blocked'
+        assert esc.suggested_action == 'investigate_and_retry'
+        assert 'Planning failed' in esc.summary
+
+    async def test_no_escalation_without_queue(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Without an escalation_queue, _mark_blocked still works (no crash)."""
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=False, test_output='FAILED', lint_output='',
+                type_output='', summary='tests failed',
+            )),
+        )
+
+        config_strict = OrchestratorConfig(
+            project_root=config.project_root,
+            max_verify_attempts=1,
+            git=config.git,
+        )
+        workflow.config = config_strict
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.statuses['42'][-1] == 'blocked'
