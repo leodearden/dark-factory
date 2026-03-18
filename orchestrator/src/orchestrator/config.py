@@ -126,6 +126,17 @@ class EscalationConfig(BaseModel):
     host: str = Field(default='127.0.0.1')
 
 
+class UsageCapConfig(BaseModel):
+    """Usage cap detection and handling."""
+
+    enabled: bool = Field(default=True)
+    session_budget_usd: float | None = Field(default=None)
+    pause_threshold: float = Field(default=0.96)
+    wait_for_reset: bool = Field(default=True)
+    probe_interval_secs: int = Field(default=300)
+    max_probe_interval_secs: int = Field(default=1800)
+
+
 class GitConfig(BaseModel):
     """Git operations configuration."""
 
@@ -173,6 +184,9 @@ class OrchestratorConfig(BaseSettings):
 
     # Git
     git: GitConfig = Field(default_factory=GitConfig)
+
+    # Usage cap handling
+    usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)
 
     # Project
     project_root: Path = Field(default=Path('.'))

@@ -26,8 +26,11 @@ from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.verify import run_verification
 
+from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
+
 if TYPE_CHECKING:
     from orchestrator.mcp_lifecycle import McpLifecycle
+    from orchestrator.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +76,7 @@ class TaskWorkflow:
         mcp: McpLifecycle,
         escalation_queue=None,
         escalation_event: asyncio.Event | None = None,
+        usage_gate: UsageGate | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -93,6 +97,9 @@ class TaskWorkflow:
         # Escalation support
         self.escalation_queue = escalation_queue
         self._escalation_event = escalation_event
+
+        # Usage cap gate
+        self.usage_gate = usage_gate
 
     async def run(self) -> WorkflowOutcome:
         """Execute the full state machine."""
@@ -170,6 +177,10 @@ class TaskWorkflow:
                 f'invocations={self.metrics.agent_invocations}'
             )
             return WorkflowOutcome.DONE
+
+        except _SessionBudgetExhausted:
+            logger.warning(f'Task {self.task_id}: session budget exhausted')
+            return await self._mark_blocked('Session budget exhausted')
 
         except Exception as e:
             logger.exception(f'Task {self.task_id} workflow error: {e}')
@@ -489,24 +500,40 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 escalation_url=f'http://{esc.host}:{esc.port}/mcp'
             )
 
-        result = await invoke_agent(
-            prompt=prompt,
-            system_prompt=role.system_prompt,
-            cwd=cwd,
-            model=model,
-            max_turns=max_turns_val,
-            max_budget_usd=budget,
-            allowed_tools=role.allowed_tools or None,
-            disallowed_tools=role.disallowed_tools or None,
-            mcp_config=mcp_config,
-            output_schema=output_schema,
-            sandbox_modules=sandbox_modules,
-        )
+        while True:
+            if self.usage_gate:
+                await self.usage_gate.before_invoke()
+
+            result = await invoke_agent(
+                prompt=prompt,
+                system_prompt=role.system_prompt,
+                cwd=cwd,
+                model=model,
+                max_turns=max_turns_val,
+                max_budget_usd=budget,
+                allowed_tools=role.allowed_tools or None,
+                disallowed_tools=role.disallowed_tools or None,
+                mcp_config=mcp_config,
+                output_schema=output_schema,
+                sandbox_modules=sandbox_modules,
+            )
+
+            # Check for cap hit — if detected, loop back to before_invoke which blocks
+            if self.usage_gate and self.usage_gate.detect_cap_hit(result.stderr, result.output):
+                logger.warning(
+                    f'Task {self.task_id} [{role.name}]: usage cap hit, waiting for reset'
+                )
+                continue
+
+            break
 
         # Track metrics
         self.metrics.total_cost_usd += result.cost_usd
         self.metrics.total_duration_ms += result.duration_ms
         self.metrics.agent_invocations += 1
+
+        if self.usage_gate:
+            self.usage_gate.on_agent_complete(result.cost_usd)
 
         logger.info(
             f'Task {self.task_id} [{role.name}]: '

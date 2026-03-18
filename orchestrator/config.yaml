@@ -74,5 +74,14 @@ git:
   remote: "origin"
   worktree_dir: ".worktrees"
 
+# Usage cap handling
+usage_cap:
+  enabled: true
+  # session_budget_usd: 50.0    # uncomment to limit per-run spend
+  pause_threshold: 0.96          # pause if startup check shows >96% utilization
+  wait_for_reset: true           # wait and auto-resume vs exit
+  probe_interval_secs: 300       # 5 min initial probe interval
+  max_probe_interval_secs: 1800  # 30 min max backoff
+
 # Project root (absolute path)
 project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"

@@ -22,6 +22,7 @@ class AgentResult:
     session_id: str = ''
     structured_output: Any = None
     subtype: str = ''
+    stderr: str = ''
 
 
 async def invoke_agent(
@@ -102,8 +103,9 @@ async def invoke_agent(
         )
         stdout, stderr = await proc.communicate()
 
-        if stderr:
-            logger.info(f'Agent stderr (last 1000): {stderr.decode()[-1000:]}')
+        stderr_text = stderr.decode()[-2000:] if stderr else ''
+        if stderr_text:
+            logger.info(f'Agent stderr (last 1000): {stderr_text[-1000:]}')
         logger.info(f'Agent exit code: {proc.returncode}')
         logger.info(f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout.decode()[:500]}')
 
@@ -113,6 +115,7 @@ async def invoke_agent(
                 success=False,
                 output='Agent produced no output',
                 subtype='error_empty_output',
+                stderr=stderr_text,
             )
 
         # Parse JSON result
@@ -124,6 +127,7 @@ async def invoke_agent(
                 success=proc.returncode == 0,
                 output=raw,
                 subtype='text_output',
+                stderr=stderr_text,
             )
 
         # Extract fields from SDK result message
@@ -159,6 +163,7 @@ async def invoke_agent(
             session_id=session_id,
             structured_output=structured,
             subtype=subtype,
+            stderr=stderr_text,
         )
 
     finally:

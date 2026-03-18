@@ -17,6 +17,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle, mcp_call
 from orchestrator.scheduler import Scheduler
+from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 try:
@@ -49,6 +50,8 @@ class HarnessReport:
     escalated: int = 0
     total_cost_usd: float = 0.0
     task_reports: list[TaskReport] = field(default_factory=list)
+    paused_for_cap: bool = False
+    cap_pause_duration_secs: float = 0.0
 
     def summary(self) -> str:
         lines = [
@@ -57,9 +60,13 @@ class HarnessReport:
             f'  Escalated: {self.escalated}',
             f'  Total cost: ${self.total_cost_usd:.2f}',
             f'  Duration: {self.started_at} → {self.completed_at}',
+        ]
+        if self.paused_for_cap:
+            lines.append(f'  Cap pause: {self.cap_pause_duration_secs:.0f}s total')
+        lines.extend([
             '',
             'Per-task results:',
-        ]
+        ])
         for r in self.task_reports:
             lines.append(
                 f'  {r.task_id}: {r.outcome.value} '
@@ -79,6 +86,11 @@ class Harness:
         self.briefing = BriefingAssembler(config)
         self.report = HarnessReport()
 
+        # Usage cap gate
+        self.usage_gate: UsageGate | None = (
+            UsageGate(config.usage_cap) if config.usage_cap.enabled else None
+        )
+
         # Escalation support
         self._escalation_queue: EscalationQueue | None = None
         self._escalation_events: dict[str, asyncio.Event] = {}
@@ -96,6 +108,19 @@ class Harness:
         await self._start_escalation_server()
 
         try:
+            # 1c. Usage cap startup check
+            if self.usage_gate:
+                logger.info('Checking usage cap status...')
+                await self.usage_gate.check_at_startup()
+                if self.usage_gate.is_paused:
+                    logger.warning(f'Usage cap already hit: {self.usage_gate.paused_reason}')
+                    if not self.config.usage_cap.wait_for_reset:
+                        raise RuntimeError(
+                            f'Usage cap hit at startup: {self.usage_gate.paused_reason}'
+                        )
+                    # wait_for_reset=True: probe loop is already running,
+                    # workflows will block in before_invoke until gate reopens
+
             # 2. Parse PRD into tasks
             logger.info(f'Parsing PRD: {prd_path}')
             await self._populate_tasks(prd_path)
@@ -170,6 +195,11 @@ class Harness:
         finally:
             # 4. Shutdown
             self.report.completed_at = datetime.now(UTC).isoformat()
+            if self.usage_gate:
+                if self.usage_gate.total_pause_secs > 0:
+                    self.report.paused_for_cap = True
+                    self.report.cap_pause_duration_secs = self.usage_gate.total_pause_secs
+                await self.usage_gate.shutdown()
             await self._stop_escalation_server()
             await self.mcp.stop()
 
@@ -263,6 +293,9 @@ use directory-level granularity (e.g. "src/backends", "src/server", "tests").
 Output JSON matching the schema. Every task must appear in the output.
 """
 
+        if self.usage_gate:
+            await self.usage_gate.before_invoke()
+
         result = await invoke_agent(
             prompt=prompt,
             system_prompt='You are a code module classifier. Given task descriptions and a codebase structure, determine which code modules each task will modify. Be precise and conservative.',
@@ -272,6 +305,11 @@ Output JSON matching the schema. Every task must appear in the output.
             max_budget_usd=self.config.budgets.module_tagger,
             output_schema=schema,
         )
+
+        if self.usage_gate:
+            if self.usage_gate.detect_cap_hit(result.stderr, result.output):
+                raise RuntimeError('Usage cap hit during module tagging — cannot proceed')
+            self.usage_gate.on_agent_complete(result.cost_usd)
 
         if not result.success:
             logger.warning(f'Module tagger agent failed: {result.output[:200]}')
@@ -320,6 +358,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 mcp=self.mcp,
                 escalation_queue=self._escalation_queue,
                 escalation_event=esc_event,
+                usage_gate=self.usage_gate,
             )
             outcome = await workflow.run()
 
