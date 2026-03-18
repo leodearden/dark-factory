@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import random
 import time
 from pathlib import Path
 from typing import Any, Callable, Coroutine
@@ -82,7 +81,6 @@ class DurableWriteQueue:
         semaphore_limit: int = 20,
         max_attempts: int = 5,
         retry_base_seconds: float = 5.0,
-        retry_max_delay_seconds: float = 300.0,
         write_timeout_seconds: float = 120.0,
     ):
         self._data_dir = Path(data_dir)
@@ -90,7 +88,6 @@ class DurableWriteQueue:
         self._workers_per_group = workers_per_group
         self._max_attempts = max_attempts
         self._retry_base_seconds = retry_base_seconds
-        self._retry_max_delay_seconds = retry_max_delay_seconds
         self._write_timeout_seconds = write_timeout_seconds
 
         self._semaphore = asyncio.Semaphore(semaphore_limit)
@@ -309,11 +306,7 @@ class DurableWriteQueue:
                 item.id, new_attempts, error_msg,
             )
         else:
-            delay = min(
-                self._retry_base_seconds * (2 ** (new_attempts - 1))
-                + random.uniform(0, self._retry_base_seconds),
-                self._retry_max_delay_seconds,
-            )
+            delay = self._retry_base_seconds * (2 ** (new_attempts - 1))
             next_retry = time.time() + delay
             await self._db.execute(
                 "UPDATE write_queue SET status = 'retry', attempts = ?, "

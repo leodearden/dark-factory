@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -105,17 +104,7 @@ class BaseStage:
         )
 
         started = datetime.now(timezone.utc)
-        try:
-            result, journal_entries = await asyncio.wait_for(
-                agent.run(payload),
-                timeout=self.config.stage_timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            logger.error(
-                f'Stage {self.stage_id.value} timed out after {self.config.stage_timeout_seconds}s'
-            )
-            result = {'warning': 'stage_timeout'}
-            journal_entries = agent._journal_entries
+        result, journal_entries = await agent.run(payload)
         completed = datetime.now(timezone.utc)
 
         # Persist journal entries

@@ -1,6 +1,5 @@
 """Thin async wrapper around the Graphiti client."""
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -26,8 +25,6 @@ class GraphitiBackend:
         self.config = config
         self.client: Graphiti | None = None
         self._driver: FalkorDriver | None = None
-        self._read_timeout: float = config.queue.backend_read_timeout_seconds
-        self._write_timeout: float = config.queue.backend_write_timeout_seconds
 
     async def initialize(self) -> None:
         """Create FalkorDriver + Graphiti client from unified config."""
@@ -95,7 +92,7 @@ class GraphitiBackend:
             graph_driver=self._driver,
             llm_client=llm_client,
             embedder=embedder_client,
-            max_coroutines=cfg.queue.graphiti_max_coroutines,
+            max_coroutines=cfg.queue.semaphore_limit,
         )
 
         await self.client.build_indices_and_constraints()
@@ -120,19 +117,17 @@ class GraphitiBackend:
         """Add an episode to Graphiti and return the result."""
         client = self._require_client()
         ref_time = reference_time or datetime.now(timezone.utc)
-        return await asyncio.wait_for(
-            client.add_episode(
-                name=name,
-                episode_body=content,
-                source=source,
-                group_id=group_id,
-                source_description=source_description,
-                reference_time=ref_time,
-                entity_types=entity_types,
-                uuid=uuid,
-            ),
-            timeout=self._write_timeout,
+        result = await client.add_episode(
+            name=name,
+            episode_body=content,
+            source=source,
+            group_id=group_id,
+            source_description=source_description,
+            reference_time=ref_time,
+            entity_types=entity_types,
+            uuid=uuid,
         )
+        return result
 
     async def search(
         self,
@@ -143,19 +138,12 @@ class GraphitiBackend:
     ) -> list[Any]:
         """Search for entity edges (facts)."""
         client = self._require_client()
-        try:
-            return await asyncio.wait_for(
-                client.search(
-                    query=query,
-                    group_ids=group_ids or [],
-                    num_results=num_results,
-                    center_node_uuid=center_node_uuid,
-                ),
-                timeout=self._read_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f'Graphiti search timed out after {self._read_timeout}s')
-            return []
+        return await client.search(
+            query=query,
+            group_ids=group_ids or [],
+            num_results=num_results,
+            center_node_uuid=center_node_uuid,
+        )
 
     async def search_nodes(
         self,
@@ -167,19 +155,12 @@ class GraphitiBackend:
         client = self._require_client()
         from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
 
-        try:
-            results = await asyncio.wait_for(
-                client.search_(
-                    query=query,
-                    config=NODE_HYBRID_SEARCH_RRF,
-                    group_ids=group_ids or [],
-                ),
-                timeout=self._read_timeout,
-            )
-            return (results.nodes or [])[:max_nodes]
-        except asyncio.TimeoutError:
-            logger.warning(f'Graphiti search_nodes timed out after {self._read_timeout}s')
-            return []
+        results = await client.search_(
+            query=query,
+            config=NODE_HYBRID_SEARCH_RRF,
+            group_ids=group_ids or [],
+        )
+        return (results.nodes or [])[:max_nodes]
 
     async def retrieve_episodes(
         self,
@@ -189,34 +170,21 @@ class GraphitiBackend:
     ) -> list[Any]:
         """Retrieve recent episodes by group."""
         client = self._require_client()
-        try:
-            episodes = await asyncio.wait_for(
-                EpisodicNode.get_by_group_ids(
-                    client.driver, group_ids, limit=last_n
-                ),
-                timeout=self._read_timeout,
-            )
-            return episodes or []
-        except asyncio.TimeoutError:
-            logger.warning(f'Graphiti retrieve_episodes timed out after {self._read_timeout}s')
-            return []
+        episodes = await EpisodicNode.get_by_group_ids(
+            client.driver, group_ids, limit=last_n
+        )
+        return episodes or []
 
     async def remove_episode(self, episode_uuid: str) -> None:
         """Delete an episode by UUID."""
         client = self._require_client()
         node = await EpisodicNode.get_by_uuid(client.driver, episode_uuid)
-        await asyncio.wait_for(
-            node.delete(client.driver),
-            timeout=self._write_timeout,
-        )
+        await node.delete(client.driver)
 
     async def build_communities(self, group_ids: list[str] | None = None) -> None:
         """Build community summaries."""
         client = self._require_client()
-        await asyncio.wait_for(
-            client.build_communities(group_ids=group_ids),
-            timeout=self._write_timeout,
-        )
+        await client.build_communities(group_ids=group_ids)
 
     async def close(self) -> None:
         """Shut down the driver."""

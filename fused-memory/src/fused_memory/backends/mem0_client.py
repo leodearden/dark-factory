@@ -1,6 +1,5 @@
 """Per-project Mem0 AsyncMemory instance manager."""
 
-import asyncio
 import logging
 from typing import Any
 
@@ -18,8 +17,6 @@ class Mem0Backend:
     def __init__(self, config: FusedMemoryConfig):
         self.config = config
         self._instances: dict[str, AsyncMemory] = {}
-        self._read_timeout: float = config.queue.backend_read_timeout_seconds
-        self._write_timeout: float = config.queue.backend_write_timeout_seconds
 
     def _build_config_dict(self, collection_name: str) -> dict[str, Any]:
         """Build a Mem0 config dict from the unified config."""
@@ -88,16 +85,14 @@ class Mem0Backend:
     ) -> dict[str, Any]:
         """Add a memory to Mem0."""
         instance = await self._get_instance(scope)
-        return await asyncio.wait_for(
-            instance.add(
-                messages=content,
-                user_id=scope.mem0_user_id,
-                agent_id=scope.agent_id,
-                run_id=scope.session_id,
-                metadata=metadata,
-            ),
-            timeout=self._write_timeout,
+        result = await instance.add(
+            messages=content,
+            user_id=scope.mem0_user_id,
+            agent_id=scope.agent_id,
+            run_id=scope.session_id,
+            metadata=metadata,
         )
+        return result
 
     async def search(
         self,
@@ -107,20 +102,14 @@ class Mem0Backend:
     ) -> dict[str, Any]:
         """Search memories in Mem0."""
         instance = await self._get_instance(scope)
-        try:
-            return await asyncio.wait_for(
-                instance.search(
-                    query=query,
-                    user_id=scope.mem0_user_id,
-                    agent_id=scope.agent_id,
-                    run_id=scope.session_id,
-                    limit=limit,
-                ),
-                timeout=self._read_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f'Mem0 search timed out after {self._read_timeout}s')
-            return {}
+        result = await instance.search(
+            query=query,
+            user_id=scope.mem0_user_id,
+            agent_id=scope.agent_id,
+            run_id=scope.session_id,
+            limit=limit,
+        )
+        return result
 
     async def get_all(
         self,
@@ -129,44 +118,25 @@ class Mem0Backend:
     ) -> dict[str, Any]:
         """Get all memories for a scope."""
         instance = await self._get_instance(scope)
-        try:
-            return await asyncio.wait_for(
-                instance.get_all(
-                    user_id=scope.mem0_user_id,
-                    agent_id=scope.agent_id,
-                    run_id=scope.session_id,
-                    limit=limit,
-                ),
-                timeout=self._read_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f'Mem0 get_all timed out after {self._read_timeout}s')
-            return {}
+        result = await instance.get_all(
+            user_id=scope.mem0_user_id,
+            agent_id=scope.agent_id,
+            run_id=scope.session_id,
+            limit=limit,
+        )
+        return result
 
     async def get(self, memory_id: str, scope: Scope) -> dict[str, Any] | None:
         """Get a single memory by ID."""
         instance = await self._get_instance(scope)
-        try:
-            return await asyncio.wait_for(
-                instance.get(memory_id),
-                timeout=self._read_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f'Mem0 get timed out after {self._read_timeout}s')
-            return None
+        return await instance.get(memory_id)
 
     async def update(self, memory_id: str, data: str, scope: Scope) -> dict[str, Any]:
         """Update a memory."""
         instance = await self._get_instance(scope)
-        return await asyncio.wait_for(
-            instance.update(memory_id, data),
-            timeout=self._write_timeout,
-        )
+        return await instance.update(memory_id, data)
 
     async def delete(self, memory_id: str, scope: Scope) -> dict[str, Any]:
         """Delete a memory."""
         instance = await self._get_instance(scope)
-        return await asyncio.wait_for(
-            instance.delete(memory_id),
-            timeout=self._write_timeout,
-        )
+        return await instance.delete(memory_id)

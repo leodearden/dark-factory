@@ -27,26 +27,12 @@ class TestInit:
         assert (artifacts.root / 'metadata.json').exists()
         assert (artifacts.root / 'reviews').is_dir()
 
-    def test_creates_gitignore(self, artifacts: TaskArtifacts):
-        gitignore = artifacts.root / '.gitignore'
-        assert gitignore.exists()
-        assert gitignore.read_text() == '*\n'
-
     def test_metadata_contents(self, artifacts: TaskArtifacts):
         metadata = json.loads((artifacts.root / 'metadata.json').read_text())
         assert metadata['task_id'] == 'task-1'
         assert metadata['title'] == 'Test Task'
         assert metadata['description'] == 'A test task description'
         assert 'created_at' in metadata
-
-    def test_base_commit_stored(self, worktree: Path):
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree)
-        ta.init('task-2', 'Test', 'Desc', base_commit='abc123def456')
-        assert ta.read_base_commit() == 'abc123def456'
-
-    def test_base_commit_absent_when_not_provided(self, artifacts: TaskArtifacts):
-        assert artifacts.read_base_commit() is None
 
 
 class TestPlan:

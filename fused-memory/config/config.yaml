@@ -52,11 +52,7 @@ queue:
   graphiti_max_coroutines: ${GRAPHITI_MAX_COROUTINES:5}
   max_attempts: ${QUEUE_MAX_ATTEMPTS:5}
   retry_base_seconds: ${QUEUE_RETRY_BASE:5}
-  retry_max_delay_seconds: ${QUEUE_RETRY_MAX_DELAY:300}
   write_timeout_seconds: ${QUEUE_WRITE_TIMEOUT:120}
-  backend_read_timeout_seconds: ${BACKEND_READ_TIMEOUT:30}
-  backend_write_timeout_seconds: ${BACKEND_WRITE_TIMEOUT:120}
-  search_timeout_seconds: ${SEARCH_TIMEOUT:15}
   data_dir: "${QUEUE_DATA_DIR:./data/queue}"
 
 taskmaster:
@@ -71,16 +67,9 @@ reconciliation:
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
   buffer_size_threshold: 500
   max_staleness_seconds: 14400
-  conditional_trigger_ratio: 0.33
-  burst_window_seconds: 30
-  burst_cooldown_seconds: 150
-  stale_lock_seconds: 7200
   agent_llm_provider: "claude_cli"
   agent_llm_model: "sonnet"
   agent_max_steps: 50
-  tool_timeout_seconds: ${RECON_TOOL_TIMEOUT:30}
-  stage_timeout_seconds: ${RECON_STAGE_TIMEOUT:600}
-  cycle_timeout_seconds: ${RECON_CYCLE_TIMEOUT:1800}
   judge_enabled: true
   judge_llm_provider: "claude_cli"
   judge_llm_model: "sonnet"

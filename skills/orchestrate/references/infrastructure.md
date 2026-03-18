@@ -40,7 +40,7 @@ curl -sf http://localhost:6333/readyz
 | `Connection refused :6333` | Qdrant not running | `cd fused-memory/docker && docker compose up -d qdrant` |
 | `Connection refused :8000` | fused-memory server not running | The orchestrator starts this automatically. If running tools manually: `cd /home/leo/src/dark-factory && uv run --project fused-memory python -m fused_memory.server.main --transport http` |
 | `OPENAI_API_KEY not set` | Missing env var | Export it: `export OPENAI_API_KEY=sk-...` (needed for embeddings) |
-| `ANTHROPIC_API_KEY not set` | Stale check — no longer required | Orchestrator agents use OAuth (Max subscription). If fused-memory's Graphiti extraction needs Anthropic models, set it in `fused-memory/config/config.yaml`, but this is not required for orchestrator runs. |
+| `ANTHROPIC_API_KEY not set` | Missing env var | Export it: `export ANTHROPIC_API_KEY=sk-ant-...` (needed for agent invocations) |
 | Docker containers exit immediately | Port conflict or stale volume | `docker compose down -v && docker compose up -d` |
 | `uv: command not found` | uv not installed | `curl -LsSf https://astral.sh/uv/install.sh | sh` |
 
@@ -65,32 +65,6 @@ uv run --project fused-memory python -m fused_memory.server.main --transport htt
 ```
 
 This starts the HTTP server on port 8000. Health check: `curl http://localhost:8000/health`
-
-## Bubblewrap (bwrap) Sandbox
-
-The orchestrator sandboxes implementer/debugger agents with bubblewrap. On Ubuntu 24.10+ / Linux 6.17+ with `apparmor_restrict_unprivileged_userns=1`, bwrap needs an AppArmor profile granting the `userns` permission.
-
-### Setup
-
-```bash
-sudo ./orchestrator/scripts/setup-bwrap.sh
-```
-
-### Verify
-
-```bash
-bwrap --ro-bind / / --dev /dev --proc /proc -- /bin/true && echo OK
-```
-
-### Common issues
-
-| Problem | Cause | Fix |
-|---------|-------|-----|
-| `setting up uid map: Permission denied` | AppArmor blocks unprivileged user namespaces | Run `setup-bwrap.sh` to install the profile |
-| `bwrap: command not found` | bubblewrap not installed | `sudo apt install bubblewrap` |
-| Warning: "bwrap unavailable — running unsandboxed" | Probe failed, agents run without sandbox | Run `setup-bwrap.sh`, then restart orchestrator |
-
-If bwrap can't be fixed (e.g., container environments), the orchestrator degrades gracefully — agents run unsandboxed with a logged warning.
 
 ## Full Reset
 

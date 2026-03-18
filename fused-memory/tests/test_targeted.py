@@ -65,21 +65,6 @@ def reconciler(mock_memory_service, mock_taskmaster, journal, config):
 
 
 @pytest.mark.asyncio
-async def test_on_task_done_fast_path_write(reconciler, mock_memory_service):
-    """Done transition writes completion fact immediately before search/verify."""
-    task_before = {'id': '1', 'title': 'Add tests', 'status': 'in-progress', 'description': 'Test suite'}
-    result = await reconciler.reconcile_task(
-        task_id='1', transition='done', project_id='test-project', task_before=task_before
-    )
-    # First call should be the fast-path write (before any search)
-    calls = mock_memory_service.add_memory.call_args_list
-    assert len(calls) >= 1
-    first_call = calls[0]
-    assert 'observations_and_summaries' in str(first_call)
-    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
-
-
-@pytest.mark.asyncio
 async def test_on_task_done_sparse_knowledge(reconciler, mock_memory_service):
     """When task is done and knowledge is sparse, should verify and write."""
     task_before = {'id': '1', 'title': 'Add tests', 'status': 'in-progress', 'description': 'Test suite'}
@@ -89,8 +74,7 @@ async def test_on_task_done_sparse_knowledge(reconciler, mock_memory_service):
     )
 
     assert any(a['type'] == 'knowledge_captured' for a in result.get('actions', []))
-    # Fast-path write + verification write = at least 2 calls
-    assert mock_memory_service.add_memory.call_count >= 2
+    mock_memory_service.add_memory.assert_called_once()
 
 
 @pytest.mark.asyncio

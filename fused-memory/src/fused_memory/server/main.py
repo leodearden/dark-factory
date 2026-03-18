@@ -42,7 +42,7 @@ async def run_server():
     parser = argparse.ArgumentParser(description='Fused Memory MCP Server')
     default_config = Path(__file__).resolve().parents[3] / 'config' / 'config.yaml'
     parser.add_argument(
-        '--config', type=Path, default=None,
+        '--config', type=Path, default=default_config,
         help='Path to YAML configuration file',
     )
     parser.add_argument(
@@ -51,12 +51,9 @@ async def run_server():
     )
     args = parser.parse_args()
 
-    # Set CONFIG_PATH for the settings source — prefer explicit --config,
-    # then existing CONFIG_PATH env var, then the built-in default.
+    # Set CONFIG_PATH for the settings source
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
-    elif 'CONFIG_PATH' not in os.environ:
-        os.environ['CONFIG_PATH'] = str(default_config)
 
     config = FusedMemoryConfig()
     if args.transport:
@@ -83,7 +80,6 @@ async def run_server():
         try:
             await taskmaster.initialize()
             logger.info(f'  Taskmaster: connected via {config.taskmaster.transport}')
-            memory_service.taskmaster_connected = True
         except Exception as e:
             logger.warning(f'  Taskmaster: failed to connect ({e}), continuing without tasks')
             taskmaster = None
@@ -100,18 +96,10 @@ async def run_server():
         journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await journal.initialize()
 
-        db_path = Path(config.reconciliation.data_dir) / 'reconciliation.db'
         event_buffer = EventBuffer(
-            db_path=db_path,
             buffer_size_threshold=config.reconciliation.buffer_size_threshold,
             max_staleness_seconds=config.reconciliation.max_staleness_seconds,
-            conditional_trigger_ratio=config.reconciliation.conditional_trigger_ratio,
-            burst_window_seconds=config.reconciliation.burst_window_seconds,
-            burst_cooldown_seconds=config.reconciliation.burst_cooldown_seconds,
-            stale_lock_seconds=config.reconciliation.stale_lock_seconds,
-            queue_stats_fn=memory_service.durable_queue.get_stats,
         )
-        await event_buffer.initialize()
 
         # Wire event emission into memory_service
         memory_service.set_event_buffer(event_buffer)
@@ -134,8 +122,7 @@ async def run_server():
             from fused_memory.middleware.task_interceptor import TaskInterceptor
             from fused_memory.reconciliation.event_buffer import EventBuffer
 
-            event_buffer = EventBuffer(db_path=None)
-            await event_buffer.initialize()
+            event_buffer = EventBuffer()
             task_interceptor = TaskInterceptor(taskmaster, None, event_buffer)
 
     # Create MCP server with both memory and task tools

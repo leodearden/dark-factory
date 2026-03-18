@@ -47,19 +47,10 @@ class TaskArtifacts:
     def __init__(self, worktree: Path):
         self.root = worktree / '.task'
 
-    def init(
-        self,
-        task_id: str,
-        task_title: str,
-        task_description: str,
-        base_commit: str | None = None,
-    ) -> None:
-        """Create .task/ with initial metadata.json and .gitignore."""
+    def init(self, task_id: str, task_title: str, task_description: str) -> None:
+        """Create .task/ with initial metadata.json."""
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / 'reviews').mkdir(exist_ok=True)
-
-        # Exclude all orchestrator artifacts from git
-        (self.root / '.gitignore').write_text('*\n')
 
         metadata = {
             'task_id': task_id,
@@ -67,17 +58,7 @@ class TaskArtifacts:
             'description': task_description,
             'created_at': datetime.now(UTC).isoformat(),
         }
-        if base_commit:
-            metadata['base_commit'] = base_commit
         self._write_json(self.root / 'metadata.json', metadata)
-
-    def read_base_commit(self) -> str | None:
-        """Read the base commit SHA stored at init time."""
-        meta_path = self.root / 'metadata.json'
-        if not meta_path.exists():
-            return None
-        metadata = json.loads(meta_path.read_text())
-        return metadata.get('base_commit')
 
     def write_plan(self, plan: dict) -> None:
         """Write .task/plan.json — the structured plan."""

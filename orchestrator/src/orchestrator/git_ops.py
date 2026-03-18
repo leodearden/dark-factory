@@ -38,40 +38,13 @@ class GitOps:
         self.project_root = project_root
         self.worktree_base = (project_root / config.worktree_dir).resolve()
 
-    async def create_worktree(self, branch_name: str) -> tuple[Path, str]:
-        """Create a git worktree for a task branch, based off main.
-
-        Returns (worktree_path, base_commit_sha) so the base commit is
-        captured at creation time and not affected by later main movement.
-
-        If the worktree/branch already exist (e.g., from a requeued task),
-        reuses them instead of failing.
-        """
+    async def create_worktree(self, branch_name: str) -> Path:
+        """Create a git worktree for a task branch, based off main."""
         worktree_path = self.worktree_base / branch_name
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
-        full_branch = f'{self.config.branch_prefix}{branch_name}'
-
-        # Capture main's current SHA before creating worktree
-        _, base_sha, _ = await _run(
-            ['git', 'rev-parse', self.config.main_branch],
-            cwd=self.project_root,
-        )
-
-        # If worktree already exists, reuse it (common after requeue)
-        if worktree_path.exists():
-            logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
-            return worktree_path, base_sha
-
-        # If branch exists but worktree doesn't (stale from a previous run), clean up
-        rc, _, _ = await _run(
-            ['git', 'rev-parse', '--verify', full_branch],
-            cwd=self.project_root,
-        )
-        if rc == 0:
-            logger.info(f'Cleaning up stale branch {full_branch} before creating worktree')
-            await _run(['git', 'branch', '-D', full_branch], cwd=self.project_root)
 
         # Create worktree with new branch from main
+        full_branch = f'{self.config.branch_prefix}{branch_name}'
         rc, out, err = await _run(
             ['git', 'worktree', 'add', '-b', full_branch, str(worktree_path), self.config.main_branch],
             cwd=self.project_root,
@@ -79,13 +52,13 @@ class GitOps:
         if rc != 0:
             raise RuntimeError(f'Failed to create worktree: {err}')
 
-        logger.info(f'Created worktree at {worktree_path} on branch {full_branch} (base={base_sha[:8]})')
-        return worktree_path, base_sha
+        logger.info(f'Created worktree at {worktree_path} on branch {full_branch}')
+        return worktree_path
 
     async def commit(self, worktree: Path, message: str) -> str | None:
         """Stage all changes and commit. Returns sha or None if nothing to commit."""
         # Stage all
-        await _run(['git', 'add', '-A', '--', '.', ':!.task', ':!.claude'], cwd=worktree)
+        await _run(['git', 'add', '-A'], cwd=worktree)
 
         # Check for changes
         rc, _, _ = await _run(['git', 'diff', '--cached', '--quiet'], cwd=worktree)
@@ -101,21 +74,9 @@ class GitOps:
         return sha
 
     async def get_diff_from_main(self, worktree: Path) -> str:
-        """Get diff of worktree branch vs main (dynamic — may be empty if main moved)."""
+        """Get diff of worktree branch vs main."""
         _, diff, _ = await _run(
             ['git', 'diff', f'{self.config.main_branch}...HEAD'],
-            cwd=worktree,
-        )
-        return diff
-
-    async def get_diff_from_base(self, worktree: Path, base_commit: str) -> str:
-        """Get diff of worktree HEAD vs a fixed base commit.
-
-        Use this instead of get_diff_from_main when main may have advanced
-        since the worktree was created (e.g. during review stage).
-        """
-        _, diff, _ = await _run(
-            ['git', 'diff', f'{base_commit}...HEAD'],
             cwd=worktree,
         )
         return diff
