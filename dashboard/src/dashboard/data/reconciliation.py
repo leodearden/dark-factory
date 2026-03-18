@@ -7,7 +7,7 @@ and returns structured data. Missing database files return empty defaults.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
@@ -83,3 +83,35 @@ async def get_watermarks(db_path: Path, *, project_id: str = 'dark_factory') -> 
         'last_memory_timestamp': row['last_memory_timestamp'],
         'last_task_change_timestamp': row['last_task_change_timestamp'],
     }
+
+
+_BUFFER_STATS_DEFAULT = {'buffered_count': 0, 'oldest_event_age_seconds': None}
+
+
+async def get_buffer_stats(db_path: Path) -> dict:
+    """Return event buffer statistics: count and oldest event age.
+
+    Returns dict with buffered_count (int) and oldest_event_age_seconds (float|None).
+    """
+    try:
+        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM event_buffer WHERE status = 'buffered'",
+            ) as cursor:
+                (count,) = await cursor.fetchone()
+
+            async with db.execute(
+                "SELECT MIN(timestamp) FROM event_buffer WHERE status = 'buffered'",
+            ) as cursor:
+                (oldest_ts,) = await cursor.fetchone()
+    except (FileNotFoundError, sqlite3.OperationalError):
+        return dict(_BUFFER_STATS_DEFAULT)
+
+    age = None
+    if oldest_ts is not None:
+        oldest_dt = datetime.fromisoformat(oldest_ts)
+        if oldest_dt.tzinfo is None:
+            oldest_dt = oldest_dt.replace(tzinfo=UTC)
+        age = (datetime.now(UTC) - oldest_dt).total_seconds()
+
+    return {'buffered_count': count, 'oldest_event_age_seconds': age}
