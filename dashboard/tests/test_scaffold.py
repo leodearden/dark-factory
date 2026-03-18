@@ -60,3 +60,21 @@ class TestHealthEndpoint:
             resp = client.get('/api/health')
             assert resp.status_code == 200
             assert resp.json() == {'status': 'ok'}
+
+
+class TestConftestFixtures:
+    def test_config_fixture_uses_tmp_path(self, dashboard_config):
+        """The dashboard_config fixture should use a temp directory as project_root."""
+        assert '/tmp' in str(dashboard_config.project_root) or 'tmp' in str(dashboard_config.project_root)
+        assert dashboard_config.project_root.exists()
+
+    def test_config_fixture_derived_paths(self, dashboard_config):
+        """Derived paths should be based on the temp project_root."""
+        assert dashboard_config.reconciliation_db.is_relative_to(dashboard_config.project_root)
+        assert dashboard_config.worktrees_dir.is_relative_to(dashboard_config.project_root)
+
+    def test_client_fixture(self, client):
+        """The client fixture should return a working TestClient."""
+        resp = client.get('/api/health')
+        assert resp.status_code == 200
+        assert resp.json() == {'status': 'ok'}
