@@ -27,7 +27,7 @@
       "type": "test",
       "description": "Write additional tests for _run_cmd edge cases: (1) test that timeout handling still works correctly with the bash executable, (2) test that run_verification passes results through correctly. Verify all tests in orchestrator/tests/test_verify.py pass.",
       "status": "done",
-      "commit": null
+      "commit": "b8c5e0b"
     }
   ],
   "design_decisions": [
