@@ -116,6 +116,52 @@ class TestAddEpisode:
         assert call_kwargs['callback_type'] == 'dual_write_episode'
         assert call_kwargs['payload']['project_id'] == 'test'
 
+    @pytest.mark.asyncio
+    async def test_enqueue_payload_contains_uuid(self, service):
+        """The enqueue payload must include 'uuid' matching the returned episode_id."""
+        result = await service.add_episode(
+            content='User discussed auth changes',
+            project_id='test',
+        )
+        call_kwargs = service.durable_queue.enqueue.call_args[1]
+        payload = call_kwargs['payload']
+        assert 'uuid' in payload, "Payload must include 'uuid' field"
+        assert payload['uuid'] == result.episode_id
+
+
+class TestExecuteGraphitiWrite:
+    @pytest.mark.asyncio
+    async def test_uuid_passed_to_graphiti_backend(self, service):
+        """_execute_graphiti_write must forward uuid from payload to graphiti.add_episode."""
+        test_uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        payload = {
+            'uuid': test_uuid,
+            'name': 'episode_aaaaaaaa',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+        service.graphiti.add_episode.assert_called_once()
+        call_kwargs = service.graphiti.add_episode.call_args[1]
+        assert call_kwargs.get('uuid') == test_uuid
+
+    @pytest.mark.asyncio
+    async def test_missing_uuid_passes_none(self, service):
+        """Legacy payloads without uuid should pass uuid=None without error."""
+        payload = {
+            'name': 'episode_legacy',
+            'content': 'legacy content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+        service.graphiti.add_episode.assert_called_once()
+        call_kwargs = service.graphiti.add_episode.call_args[1]
+        assert call_kwargs.get('uuid') is None
+
 
 class TestReplayFromStore:
     @pytest.mark.asyncio

@@ -84,6 +84,25 @@ class TestIntegrationFlow:
         assert total == 0
 
     @pytest.mark.asyncio
+    async def test_add_episode_uuid_survives_full_flow(self, integrated_service):
+        """add_episode uuid passes through queue serialization to graphiti.add_episode."""
+        svc = integrated_service
+        svc.graphiti.add_episode.return_value = None
+
+        result = await svc.add_episode(
+            content='User discussed auth changes',
+            project_id='test',
+        )
+        assert result.episode_id is not None
+
+        # Wait for worker to process
+        await asyncio.sleep(1.5)
+
+        svc.graphiti.add_episode.assert_called_once()
+        call_kwargs = svc.graphiti.add_episode.call_args[1]
+        assert call_kwargs.get('uuid') == result.episode_id
+
+    @pytest.mark.asyncio
     async def test_add_episode_processed_with_callback(self, integrated_service):
         """add_episode -> enqueued with dual_write_episode callback -> graphiti called -> mem0 called for edges."""
         svc = integrated_service
