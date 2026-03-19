@@ -74,3 +74,20 @@ async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) 
         )
     except (httpx.ConnectError, httpx.TimeoutException) as e:
         return {'offline': True, 'error': str(e)}
+
+
+async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
+    """Fetch write queue statistics from the fused-memory MCP server.
+
+    Returns the queue stats dict on success, or {offline: True, error: str} on
+    connection/timeout failure.
+    """
+    try:
+        return await mcp_tool_call(
+            client,
+            config.fused_memory_url,
+            'get_queue_stats',
+            {},
+        )
+    except (httpx.ConnectError, httpx.TimeoutException) as e:
+        return {'offline': True, 'error': str(e)}
