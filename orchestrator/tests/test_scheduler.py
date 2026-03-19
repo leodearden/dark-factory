@@ -2,9 +2,10 @@
 
 
 import pytest
+from unittest.mock import AsyncMock
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.scheduler import ModuleLockTable, files_to_modules, normalize_lock
+from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules, normalize_lock
 
 
 @pytest.fixture
@@ -292,3 +293,63 @@ class TestModuleLockWithModuleConfig:
         assert lt.try_acquire('t1', ['dashboard'])
         assert lt.try_acquire('t2', ['dashboard'])
         assert not lt.try_acquire('t3', ['dashboard'])
+
+
+class TestAcquireNextNoDuplicates:
+    """acquire_next() must not return the same task twice while its locks are held."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_skips_already_dispatched(self, scheduler: Scheduler):
+        """Second acquire_next() for an already-held task returns None."""
+        task = {
+            'id': '1',
+            'title': 'Task one',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'modules': ['backend']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        first = await scheduler.acquire_next()
+        assert first is not None
+        assert first.task_id == '1'
+
+        second = await scheduler.acquire_next()
+        assert second is None
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_returns_different_tasks_sequentially(
+        self, scheduler: Scheduler
+    ):
+        """With two non-conflicting tasks, returns A then B then None."""
+        task_a = {
+            'id': '1',
+            'title': 'Task A',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'modules': ['backend']},
+        }
+        task_b = {
+            'id': '2',
+            'title': 'Task B',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'modules': ['frontend']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        first = await scheduler.acquire_next()
+        assert first is not None
+        first_id = first.task_id
+
+        second = await scheduler.acquire_next()
+        assert second is not None
+        assert second.task_id != first_id
+
+        third = await scheduler.acquire_next()
+        assert third is None
