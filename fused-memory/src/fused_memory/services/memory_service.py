@@ -420,7 +420,16 @@ class MemoryService:
         # Filter by categories if requested
         if categories:
             cat_set = {MemoryCategory(c) for c in categories}
-            results = [r for r in results if r.category in cat_set]
+            graphiti_overlap = cat_set & GRAPHITI_PRIMARY
+            results = [
+                r for r in results
+                if r.category in cat_set
+                or (
+                    r.source_store == SourceStore.graphiti
+                    and r.category is None
+                    and graphiti_overlap
+                )
+            ]
 
         return results[:limit]
 
