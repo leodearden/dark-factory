@@ -29,10 +29,10 @@
   <!-- Taskmaster card -->
   <div class="bg-gray-800 rounded-lg p-6 shadow flex-1">
     <div class="flex items-center gap-2 mb-3">
-      <div class="w-3 h-3 rounded-full bg-green-500"></div>
+      <div class="w-3 h-3 rounded-full {% if status.taskmaster is defined and status.taskmaster.connected|default(false) %}bg-green-500{% else %}bg-red-500{% endif %}"></div>
       <span class="text-sm text-gray-400">Taskmaster</span>
     </div>
-    <div class="text-3xl font-bold text-white">Connected</div>
+    <div class="text-3xl font-bold text-white">{% if status.taskmaster is defined and status.taskmaster.connected|default(false) %}Connected{% else %}Disconnected{% endif %}</div>
   </div>
 
   <!-- Write Queue card -->
