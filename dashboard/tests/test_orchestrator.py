@@ -381,6 +381,52 @@ class TestReadTaskArtifacts:
         assert result['modules'] == []
 
 
+class TestExtractTaskId:
+    """Tests for _extract_task_id — normalises worktree directory names to numeric task IDs."""
+
+    def test_strips_task_prefix(self):
+        """'task-7' returns '7'."""
+        from dashboard.data.orchestrator import _extract_task_id
+
+        assert _extract_task_id('task-7') == '7'
+
+    def test_plain_numeric_unchanged(self):
+        """Plain numeric string '33' returns '33' unchanged."""
+        from dashboard.data.orchestrator import _extract_task_id
+
+        assert _extract_task_id('33') == '33'
+
+    def test_multi_digit_task_prefix(self):
+        """'task-123' returns '123'."""
+        from dashboard.data.orchestrator import _extract_task_id
+
+        assert _extract_task_id('task-123') == '123'
+
+    def test_task_prefix_only_returns_none(self):
+        """'task-' with empty suffix returns None (invalid)."""
+        from dashboard.data.orchestrator import _extract_task_id
+
+        assert _extract_task_id('task-') is None
+
+    def test_empty_string_returns_none(self):
+        """Empty string returns None."""
+        from dashboard.data.orchestrator import _extract_task_id
+
+        assert _extract_task_id('') is None
+
+    def test_non_task_dir_returns_none(self):
+        """'random-dir' returns None (non-task directory excluded)."""
+        from dashboard.data.orchestrator import _extract_task_id
+
+        assert _extract_task_id('random-dir') is None
+
+    def test_non_numeric_suffix_returns_none(self):
+        """'task-abc' returns None (non-numeric suffix excluded)."""
+        from dashboard.data.orchestrator import _extract_task_id
+
+        assert _extract_task_id('task-abc') is None
+
+
 class TestDiscoverOrchestrators:
     """Tests for discover_orchestrators — combines process, task tree, and artifact data."""
 
@@ -461,3 +507,58 @@ class TestDiscoverOrchestrators:
         assert result[0]['tasks'] == []
         assert result[0]['worktrees'] == {}
         assert result[0]['summary'] == {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0}
+
+    def test_worktree_keyed_by_task_id_not_dirname(self, tmp_path):
+        """Worktree dir named 'task-7' is keyed by '7' (not 'task-7') in discover_orchestrators output."""
+        import json
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        # Create worktree directory using 'task-7' naming convention
+        wt_dir = tmp_path / '.worktrees' / 'task-7'
+        wt_dir.mkdir(parents=True)
+        task_dir = wt_dir / '.task'
+        task_dir.mkdir()
+        steps = [{'id': 'step-1', 'status': 'done'}, {'id': 'step-2', 'status': 'pending'}]
+        (task_dir / 'plan.json').write_text(json.dumps({'steps': steps}))
+
+        mock_procs = [{'pid': 9000, 'prd': '/prd.md', 'running': True, 'started': 'Mar19'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        worktrees = result[0]['worktrees']
+        # Key must be '7' not 'task-7'
+        assert '7' in worktrees
+        assert 'task-7' not in worktrees
+        assert worktrees['7']['phase'] == 'EXECUTE'
+
+    def test_non_task_worktree_dirs_excluded(self, tmp_path):
+        """Non-task directories (e.g. 'tmp-backup') are excluded; plain and 'task-' numeric dirs included."""
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+        worktrees_dir = tmp_path / '.worktrees'
+        worktrees_dir.mkdir()
+
+        # Create 'task-3', '5', and 'tmp-backup' under .worktrees/
+        for name in ('task-3', '5', 'tmp-backup'):
+            d = worktrees_dir / name
+            d.mkdir()
+
+        mock_procs = [{'pid': 1111, 'prd': '/prd.md', 'running': True, 'started': 'Mar19'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        worktrees = result[0]['worktrees']
+        assert '3' in worktrees
+        assert '5' in worktrees
+        assert 'tmp-backup' not in worktrees
+        assert 'task-3' not in worktrees
