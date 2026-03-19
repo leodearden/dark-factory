@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
-
-import httpx
+from pathlib import Path
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.mcp_lifecycle import mcp_call
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +21,19 @@ class BriefingAssembler:
         self.project_id = config.fused_memory.project_id
 
     async def build_architect_prompt(
-        self, task: dict, context: str | None = None
+        self, task: dict, worktree: Path | None = None, context: str | None = None
     ) -> str:
         """Build prompt for the architect agent."""
         if context is None:
             context = await self._get_memory_context(task.get('id'))
 
         task_block = self._format_task(task)
+
+        # Use absolute path so the agent's Write tool targets the correct location
+        if worktree:
+            plan_path = str(worktree / '.task' / 'plan.json')
+        else:
+            plan_path = '.task/plan.json'
 
         return f"""\
 {context}
@@ -39,9 +45,9 @@ class BriefingAssembler:
 # Action
 
 1. Explore the codebase thoroughly — read relevant files, understand existing patterns and utilities.
-2. Produce a TDD implementation plan as `.task/plan.json`.
+2. Produce a TDD implementation plan.
 3. Ensure the `modules` field accurately lists ALL code directories this task will touch.
-4. Write the plan using the Write tool to `.task/plan.json`.
+4. Write the plan using the Write tool to `{plan_path}`.
 """
 
     async def build_implementer_prompt(
@@ -92,7 +98,7 @@ class BriefingAssembler:
 
 # Action
 
-Execute the next pending steps in TDD order. Commit after each step. Update plan.json status fields. Stop at a logical boundary and log your iteration.
+Execute the next pending steps in TDD order. Commit after each step. Update plan.json status fields. Stop at a logical boundary.
 """
 
     async def build_debugger_prompt(
@@ -122,7 +128,6 @@ Execute the next pending steps in TDD order. Commit after each step. Update plan
 2. Make minimal, targeted fixes.
 3. Run the verification commands to confirm fixes.
 4. Commit your fixes.
-5. Log your work in `.task/iterations.jsonl`.
 """
 
     async def build_reviewer_prompt(
@@ -177,40 +182,63 @@ Review the diff according to your specialization. Explore the codebase as needed
 5. If you cannot confidently resolve, output "BLOCKED: <reason>" and stop.
 """
 
+    async def build_resume_prompt(
+        self,
+        task: dict,
+        plan: dict,
+        escalation_summary: str,
+        resolution: str,
+        worktree: Path | None = None,
+    ) -> str:
+        """Build prompt for resuming after an escalation resolution."""
+        context = await self._get_memory_context(task.get('id'))
+
+        return f"""\
+{context}
+
+# Resuming After Escalation
+
+This task was paused because an agent escalated a blocking issue.
+
+## The Issue
+{escalation_summary}
+
+## Handler's Resolution
+{resolution}
+
+## Action
+Resume the task applying the handler's resolution. The prior agent's work
+is preserved in the worktree. Read .task/plan.json and .task/iterations.jsonl
+to understand current progress, then continue from where the previous agent left off.
+"""
+
     async def _get_memory_context(self, task_id: str | None = None) -> str:
         """Call fused-memory search for project context."""
         sections = []
 
         try:
-            async with httpx.AsyncClient() as client:
-                # Project overview
-                overview = await self._mcp_search(
-                    client, 'project overview architecture goals'
-                )
-                if overview:
-                    sections.append(f'## Project Context\n\n{overview}')
+            # Project overview
+            overview = await self._mcp_search('project overview architecture goals')
+            if overview:
+                sections.append(f'## Project Context\n\n{overview}')
 
-                # Conventions
-                conventions = await self._mcp_search(
-                    client, 'coding conventions and project norms'
-                )
-                if conventions:
-                    sections.append(f'## Conventions\n\n{conventions}')
+            # Conventions
+            conventions = await self._mcp_search('coding conventions and project norms')
+            if conventions:
+                sections.append(f'## Conventions\n\n{conventions}')
 
-                # Recent decisions
-                decisions = await self._mcp_search(
-                    client, 'recent decisions and rationale'
-                )
-                if decisions:
-                    sections.append(f'## Recent Decisions\n\n{decisions}')
+            # Recent decisions
+            decisions = await self._mcp_search('recent decisions and rationale')
+            if decisions:
+                sections.append(f'## Recent Decisions\n\n{decisions}')
 
-                # Task-specific context
-                if task_id:
-                    task_ctx = await self._mcp_search(
-                        client, f'task {task_id} context and related decisions'
-                    )
-                    if task_ctx:
-                        sections.append(f'## Task Context\n\n{task_ctx}')
+            # Task-specific context
+            if task_id:
+                task_ctx = await self._mcp_search(
+                    f'task {task_id} context and related decisions'
+                )
+                if task_ctx:
+                    sections.append(f'## Task Context\n\n{task_ctx}')
 
         except Exception as e:
             logger.warning(f'Failed to fetch memory context: {e}')
@@ -221,31 +249,22 @@ Review the diff according to your specialization. Explore the codebase as needed
 
         return '# Context\n\n' + '\n\n---\n\n'.join(sections)
 
-    async def _mcp_search(self, client: httpx.AsyncClient, query: str) -> str | None:
+    async def _mcp_search(self, query: str) -> str | None:
         """Search fused-memory via its MCP HTTP endpoint."""
         try:
-            # Use the MCP JSON-RPC protocol over streamable HTTP
-            resp = await client.post(
-                f'{self.memory_url}/mcp/',
-                json={
-                    'jsonrpc': '2.0',
-                    'id': 1,
-                    'method': 'tools/call',
-                    'params': {
-                        'name': 'search',
-                        'arguments': {
-                            'query': query,
-                            'project_id': self.project_id,
-                            'limit': 5,
-                        },
+            result = await mcp_call(
+                f'{self.memory_url}/mcp',
+                'tools/call',
+                {
+                    'name': 'search',
+                    'arguments': {
+                        'query': query,
+                        'project_id': self.project_id,
+                        'limit': 5,
                     },
                 },
                 timeout=10,
             )
-            if resp.status_code != 200:
-                return None
-
-            result = resp.json()
             content = result.get('result', {}).get('content', [])
             texts = []
             for block in content:

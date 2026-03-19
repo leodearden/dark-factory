@@ -47,10 +47,19 @@ class TaskArtifacts:
     def __init__(self, worktree: Path):
         self.root = worktree / '.task'
 
-    def init(self, task_id: str, task_title: str, task_description: str) -> None:
-        """Create .task/ with initial metadata.json."""
+    def init(
+        self,
+        task_id: str,
+        task_title: str,
+        task_description: str,
+        base_commit: str | None = None,
+    ) -> None:
+        """Create .task/ with initial metadata.json and .gitignore."""
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / 'reviews').mkdir(exist_ok=True)
+
+        # Exclude all orchestrator artifacts from git
+        (self.root / '.gitignore').write_text('*\n')
 
         metadata = {
             'task_id': task_id,
@@ -58,7 +67,17 @@ class TaskArtifacts:
             'description': task_description,
             'created_at': datetime.now(UTC).isoformat(),
         }
+        if base_commit:
+            metadata['base_commit'] = base_commit
         self._write_json(self.root / 'metadata.json', metadata)
+
+    def read_base_commit(self) -> str | None:
+        """Read the base commit SHA stored at init time."""
+        meta_path = self.root / 'metadata.json'
+        if not meta_path.exists():
+            return None
+        metadata = json.loads(meta_path.read_text())
+        return metadata.get('base_commit')
 
     def write_plan(self, plan: dict) -> None:
         """Write .task/plan.json — the structured plan."""
@@ -116,17 +135,27 @@ class TaskArtifacts:
         with open(log_path, 'a') as f:
             f.write(json.dumps(entry) + '\n')
 
-    def read_iteration_log(self) -> list[dict]:
-        """Read all iteration log entries."""
+    def read_iteration_log(self) -> tuple[list[dict], list[str]]:
+        """Read all iteration log entries, skipping corrupted lines.
+
+        Returns (entries, corrupted) where corrupted contains raw lines that
+        failed JSON parsing.
+        """
         log_path = self.root / 'iterations.jsonl'
         if not log_path.exists():
-            return []
+            return [], []
         entries = []
+        corrupted = []
         for line in log_path.read_text().splitlines():
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 entries.append(json.loads(line))
-        return entries
+            except json.JSONDecodeError:
+                logger.warning('Skipping corrupted iteration log line: %s', line[:120])
+                corrupted.append(line)
+        return entries, corrupted
 
     def write_review(self, reviewer_name: str, review: dict) -> None:
         """Write .task/reviews/{name}.json."""

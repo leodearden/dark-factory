@@ -253,15 +253,6 @@ class AgentStub:
             artifacts.update_step_status(step_id, 'done', commit=sha)
             completed_ids.append(step_id)
 
-        # Write iteration log
-        artifacts.append_iteration_log({
-            'iteration': self._impl_iteration,
-            'agent': 'implementer',
-            'steps_attempted': completed_ids,
-            'steps_completed': completed_ids,
-            'summary': f'Completed {len(completed_ids)} steps',
-        })
-
         return AgentResult(
             success=True, output=f'Completed {completed_ids}', cost_usd=1.00
         )
@@ -899,7 +890,7 @@ class TestArtifactsIntegrity:
         async def capture_then_cleanup(worktree, branch):
             nonlocal iteration_log
             artifacts = TaskArtifacts(worktree)
-            iteration_log = artifacts.read_iteration_log()
+            iteration_log, _ = artifacts.read_iteration_log()
             await original_cleanup(worktree, branch)
 
         git_ops.cleanup_worktree = capture_then_cleanup
@@ -908,6 +899,7 @@ class TestArtifactsIntegrity:
 
         assert len(iteration_log) >= 1
         assert iteration_log[0]['agent'] == 'implementer'
+        assert iteration_log[0]['source'] == 'orchestrator'
         assert len(iteration_log[0]['steps_completed']) > 0
 
 
@@ -1044,3 +1036,53 @@ class TestTaskFailureEscalation:
 
         assert outcome == WorkflowOutcome.BLOCKED
         assert scheduler.statuses['42'][-1] == 'blocked'
+
+
+# ---------------------------------------------------------------------------
+# Tests: Corrupted Iteration Log Escalation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCorruptedIterationLogEscalation:
+    """Corrupted iteration log lines trigger info-severity escalation."""
+
+    async def test_corrupted_iteration_log_escalates(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """Workflow completes DONE despite corruption; info escalation created."""
+
+        class CorruptingAgentStub(AgentStub):
+            async def _architect(self, cwd: Path) -> AgentResult:
+                result = await super()._architect(cwd)
+                # Inject a corrupted iteration log line so the orchestrator
+                # finds it when it reads the log before the first implementer call
+                log_path = cwd / '.task' / 'iterations.jsonl'
+                log_path.write_text(r'{"bad\!escape": true}' + '\n')
+                return result
+
+        stub = CorruptingAgentStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+
+        # Check that an info-severity escalation was created for the corruption
+        escalations = queue.get_by_task('42')
+        info_escs = [e for e in escalations if e.severity == 'info']
+        assert len(info_escs) >= 1
+        esc = info_escs[0]
+        assert esc.category == 'infra_issue'
+        assert 'corrupted' in esc.summary.lower()

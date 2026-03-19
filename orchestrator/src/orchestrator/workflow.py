@@ -304,7 +304,17 @@ class TaskWorkflow:
                 return WorkflowOutcome.BLOCKED
 
             self.plan = self.artifacts.read_plan()
-            iteration_log = self.artifacts.read_iteration_log()
+            iteration_log, corrupted = self.artifacts.read_iteration_log()
+            if corrupted:
+                self._escalate_corruption(corrupted)
+
+            # Snapshot completed steps before invocation
+            completed_before = {
+                s['id']
+                for col in ('prerequisites', 'steps')
+                for s in self.plan.get(col, [])
+                if s.get('status') == 'done'
+            }
 
             prompt = await self.briefing.build_implementer_prompt(self.plan, iteration_log)
             result = await self._invoke(IMPLEMENTER, prompt, self.worktree)
@@ -318,6 +328,37 @@ class TaskWorkflow:
 
             # Re-read plan to see progress
             self.plan = self.artifacts.read_plan()
+
+            # Compute newly completed steps and write iteration log
+            completed_after = {
+                s['id']
+                for col in ('prerequisites', 'steps')
+                for s in self.plan.get(col, [])
+                if s.get('status') == 'done'
+            }
+            newly_completed = sorted(completed_after - completed_before)
+            head_commit = await self._get_head_commit()
+
+            if newly_completed:
+                step_descs = [
+                    s.get('description', s['id'])
+                    for col in ('prerequisites', 'steps')
+                    for s in self.plan.get(col, [])
+                    if s['id'] in newly_completed
+                ]
+                summary = '; '.join(step_descs)
+            else:
+                summary = 'No new steps completed'
+
+            self.artifacts.append_iteration_log({
+                'iteration': self.metrics.execute_iterations,
+                'agent': 'implementer',
+                'steps_attempted': newly_completed,
+                'steps_completed': newly_completed,
+                'commit': head_commit,
+                'summary': summary,
+                'source': 'orchestrator',
+            })
 
             if not result.success:
                 logger.warning(
@@ -351,6 +392,18 @@ class TaskWorkflow:
                 result.failure_report(), self.plan
             )
             debug_result = await self._invoke(DEBUGGER, prompt, self.worktree)
+
+            # Write debugger iteration log entry
+            head_commit = await self._get_head_commit()
+            self.artifacts.append_iteration_log({
+                'iteration': verify_attempt,
+                'agent': 'debugger',
+                'steps_attempted': [],
+                'steps_completed': [],
+                'commit': head_commit,
+                'summary': f'Debug fix for: {result.summary[:100]}',
+                'source': 'orchestrator',
+            })
 
             # Check for escalations from debugger
             blocking = [e for e in self._check_escalations() if e.severity == 'blocking']
@@ -604,6 +657,44 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if e.status == 'resolved' and e.resolution
         ]
         return '\n'.join(e.resolution for e in resolved)
+
+    async def _get_head_commit(self) -> str:
+        """Return the HEAD commit SHA for the current worktree."""
+        proc = await asyncio.create_subprocess_exec(
+            'git', 'rev-parse', 'HEAD',
+            cwd=str(self.worktree),
+            stdout=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        return stdout.decode().strip()
+
+    def _escalate_corruption(self, corrupted: list[str]) -> None:
+        """Submit an info-severity escalation for corrupted iteration log lines."""
+        if not self.escalation_queue:
+            logger.warning(
+                'Task %s: %d corrupted iteration log lines (no escalation queue)',
+                self.task_id, len(corrupted),
+            )
+            return
+
+        from escalation.models import Escalation
+
+        detail = f'{len(corrupted)} corrupted line(s):\n' + '\n'.join(
+            line[:200] for line in corrupted[:10]
+        )
+        esc = Escalation(
+            id=self.escalation_queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role='orchestrator',
+            severity='info',
+            category='infra_issue',
+            summary=f'{len(corrupted)} corrupted iteration log line(s)',
+            detail=detail,
+            suggested_action='investigate_log_corruption',
+            worktree=str(self.worktree) if self.worktree else None,
+            workflow_state=self.state.value,
+        )
+        self.escalation_queue.submit(esc)
 
     async def _mark_blocked(self, reason: str) -> WorkflowOutcome:
         """Mark task as blocked and create an escalation entry."""

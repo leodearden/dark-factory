@@ -27,12 +27,26 @@ class TestInit:
         assert (artifacts.root / 'metadata.json').exists()
         assert (artifacts.root / 'reviews').is_dir()
 
+    def test_creates_gitignore(self, artifacts: TaskArtifacts):
+        gitignore = artifacts.root / '.gitignore'
+        assert gitignore.exists()
+        assert gitignore.read_text() == '*\n'
+
     def test_metadata_contents(self, artifacts: TaskArtifacts):
         metadata = json.loads((artifacts.root / 'metadata.json').read_text())
         assert metadata['task_id'] == 'task-1'
         assert metadata['title'] == 'Test Task'
         assert metadata['description'] == 'A test task description'
         assert 'created_at' in metadata
+
+    def test_base_commit_stored(self, worktree: Path):
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.init('task-2', 'Test', 'Desc', base_commit='abc123def456')
+        assert ta.read_base_commit() == 'abc123def456'
+
+    def test_base_commit_absent_when_not_provided(self, artifacts: TaskArtifacts):
+        assert artifacts.read_base_commit() is None
 
 
 class TestPlan:
@@ -124,11 +138,43 @@ class TestIterationLog:
             'summary': 'Second iteration',
         })
 
-        log = artifacts.read_iteration_log()
+        log, corrupted = artifacts.read_iteration_log()
         assert len(log) == 2
+        assert corrupted == []
         assert log[0]['iteration'] == 1
         assert log[1]['iteration'] == 2
         assert 'timestamp' in log[0]
+
+    def test_read_skips_corrupted_lines(self, artifacts: TaskArtifacts):
+        """Good/bad/good lines → 2 entries, 1 corrupted."""
+        log_path = artifacts.root / 'iterations.jsonl'
+        lines = [
+            json.dumps({'iteration': 1, 'agent': 'implementer', 'summary': 'ok'}),
+            r'{"iteration": 2, "summary": "has bad escape \!"}',
+            json.dumps({'iteration': 3, 'agent': 'implementer', 'summary': 'also ok'}),
+        ]
+        log_path.write_text('\n'.join(lines) + '\n')
+
+        entries, corrupted = artifacts.read_iteration_log()
+        assert len(entries) == 2
+        assert entries[0]['iteration'] == 1
+        assert entries[1]['iteration'] == 3
+        assert len(corrupted) == 1
+        assert r'\!' in corrupted[0]
+
+    def test_read_all_corrupted(self, artifacts: TaskArtifacts):
+        """All bad lines → empty entries, all lines in corrupted."""
+        log_path = artifacts.root / 'iterations.jsonl'
+        bad_lines = [
+            r'not json at all',
+            r'{"truncated": true',
+            r'{bad \escape}',
+        ]
+        log_path.write_text('\n'.join(bad_lines) + '\n')
+
+        entries, corrupted = artifacts.read_iteration_log()
+        assert entries == []
+        assert len(corrupted) == 3
 
 
 class TestReviews:
