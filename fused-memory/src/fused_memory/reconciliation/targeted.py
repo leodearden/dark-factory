@@ -40,8 +40,12 @@ class TargetedReconciler:
         transition: str,
         project_id: str,
         task_before: dict,
+        project_root: str = '',
     ) -> dict:
         """Run targeted reconciliation for a single task state transition."""
+        # Use project_root for taskmaster ops; fall back to project_id for backwards compat
+        if not project_root:
+            project_root = project_id
         run_id = str(uuid_mod.uuid4())
         start = datetime.now(UTC)
 
@@ -67,7 +71,7 @@ class TargetedReconciler:
             if handler is None:
                 result = {'task_id': task_id, 'actions': [], 'note': f'No handler for {transition}'}
             else:
-                result = await handler(task_id, project_id, task_before, run_id)
+                result = await handler(task_id, project_id, project_root, task_before, run_id)
 
             elapsed = (datetime.now(UTC) - start).total_seconds()
             await self.journal.complete_run(run_id, 'completed')
@@ -88,7 +92,7 @@ class TargetedReconciler:
             return {'error': str(e), 'task_id': task_id}
 
     async def _on_task_done(
-        self, task_id: str, project_id: str, task_before: dict, run_id: str
+        self, task_id: str, project_id: str, project_root: str, task_before: dict, run_id: str
     ) -> dict:
         """Task completed. Verify knowledge capture, note dependent unblocks."""
         task = _extract_task(task_before)
@@ -155,7 +159,7 @@ class TargetedReconciler:
 
         # 3. Check dependent tasks — are they unblocked?
         try:
-            all_tasks_data = await self.taskmaster.get_tasks(project_root=project_id)
+            all_tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
             all_tasks = all_tasks_data.get('tasks', [])
             if isinstance(all_tasks, list):
                 for t in all_tasks:
@@ -183,7 +187,7 @@ class TargetedReconciler:
         return result
 
     async def _on_task_blocked(
-        self, task_id: str, project_id: str, task_before: dict, run_id: str
+        self, task_id: str, project_id: str, project_root: str, task_before: dict, run_id: str
     ) -> dict:
         """Task blocked. Search for relevant knowledge, attach as hints."""
         task = _extract_task(task_before)
@@ -210,7 +214,7 @@ class TargetedReconciler:
                 await self.taskmaster.update_task(
                     task_id=task_id,
                     metadata=json.dumps({'memory_hints': hints.model_dump()}),
-                    project_root=project_id,
+                    project_root=project_root,
                 )
                 result['actions'].append({
                     'type': 'hints_attached',
@@ -222,7 +226,7 @@ class TargetedReconciler:
         return result
 
     async def _on_task_cancelled(
-        self, task_id: str, project_id: str, task_before: dict, run_id: str
+        self, task_id: str, project_id: str, project_root: str, task_before: dict, run_id: str
     ) -> dict:
         """Task cancelled. Flag subtasks and dependents for review."""
         task = _extract_task(task_before)
@@ -244,7 +248,7 @@ class TargetedReconciler:
 
         # Check for tasks that depend on this one
         try:
-            all_tasks_data = await self.taskmaster.get_tasks(project_root=project_id)
+            all_tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
             all_tasks = all_tasks_data.get('tasks', [])
             if isinstance(all_tasks, list):
                 for t in all_tasks:
@@ -263,21 +267,24 @@ class TargetedReconciler:
         return result
 
     async def _on_task_deferred(
-        self, task_id: str, project_id: str, task_before: dict, run_id: str
+        self, task_id: str, project_id: str, project_root: str, task_before: dict, run_id: str
     ) -> dict:
         """Task deferred. Similar to blocked — attach relevant knowledge hints."""
-        return await self._on_task_blocked(task_id, project_id, task_before, run_id)
+        return await self._on_task_blocked(task_id, project_id, project_root, task_before, run_id)
 
     async def reconcile_bulk_tasks(
         self,
         parent_task_id: str | None,
         project_id: str,
+        project_root: str = '',
     ) -> dict:
         """Reconcile after expand_task or parse_prd — cross-reference against knowledge."""
+        if not project_root:
+            project_root = project_id
         result: dict = {'parent_task_id': parent_task_id, 'actions': []}
 
         try:
-            all_tasks_data = await self.taskmaster.get_tasks(project_root=project_id)
+            all_tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
             all_tasks = all_tasks_data.get('tasks', [])
             if not isinstance(all_tasks, list):
                 return result
@@ -321,7 +328,7 @@ class TargetedReconciler:
                             await self.taskmaster.update_task(
                                 task_id=str(tid),
                                 metadata=json.dumps({'memory_hints': hints.model_dump()}),
-                                project_root=project_id,
+                                project_root=project_root,
                             )
                             result['actions'].append({
                                 'type': 'hints_attached',
