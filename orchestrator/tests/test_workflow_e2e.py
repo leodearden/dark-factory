@@ -161,6 +161,7 @@ class AgentStub:
         sandbox_modules: list[str] | None = None,
         effort: str | None = None,
         backend: str = 'claude',
+        oauth_token: str | None = None,
     ) -> AgentResult:
         """Determine role from system_prompt content, perform side effects."""
         role = self._detect_role(system_prompt)

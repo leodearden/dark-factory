@@ -569,6 +569,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             f'Merger could not resolve conflicts: {merger_result.output[:200]}'
         )
 
+    def _select_model_for_role(self, role: AgentRole, base_model: str) -> str:
+        """Override model for implementer/debugger based on task complexity."""
+        if role.name not in ('implementer', 'debugger'):
+            return base_model
+
+        # Check for Rust modules (crates/ prefix is the convention)
+        rust_modules = [m for m in self.modules if m.startswith('crates/')]
+        if len(rust_modules) < 3:
+            return base_model
+
+        # Check step count if plan is available (always true for implementer/debugger)
+        if self.plan:
+            step_count = len(self.plan.get('steps', []))
+            if step_count >= 15:
+                logger.info(
+                    'Task %s: upgrading %s to opus (%d Rust modules, %d steps)',
+                    self.task_id, role.name, len(rust_modules), step_count,
+                )
+                return 'opus'
+
+        return base_model
+
     async def _invoke(
         self,
         role: AgentRole,
@@ -587,6 +609,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         role_key = role.name.split('_')[0]
 
         model = getattr(models, role_key, role.default_model)
+        model = self._select_model_for_role(role, model)
         budget = getattr(budgets, role_key, role.default_budget)
         max_turns_val = getattr(turns, role_key, role.default_max_turns)
         effort_val = getattr(effort_cfg, role_key, 'high')

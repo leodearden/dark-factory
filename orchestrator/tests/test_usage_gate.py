@@ -8,8 +8,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from orchestrator.config import UsageCapConfig
+from orchestrator.config import AccountConfig, UsageCapConfig
 from orchestrator.usage_gate import (
+    AccountState,
     SessionBudgetExhausted,
     UsageGate,
     _extract_cap_message,
@@ -286,3 +287,246 @@ class TestResumeProbeLoop:
             await gate._resume_probe_loop()
 
         assert not gate.is_paused
+
+
+# --- Multi-account failover ---
+
+
+def _make_multi_gate(wait_for_reset: bool = False) -> UsageGate:
+    """Create a UsageGate with 2 mock accounts (tokens pre-injected)."""
+    config = UsageCapConfig(
+        wait_for_reset=wait_for_reset,
+        accounts=[
+            AccountConfig(name='max-a', oauth_token_env='CLAUDE_OAUTH_A'),
+            AccountConfig(name='max-b', oauth_token_env='CLAUDE_OAUTH_B'),
+        ],
+    )
+    gate = UsageGate.__new__(UsageGate)
+    gate._config = config
+    gate._open = asyncio.Event()
+    gate._open.set()
+    gate._lock = asyncio.Lock()
+    gate._cumulative_cost = 0.0
+    gate._resets_at = None
+    gate._paused_reason = ''
+    gate._resume_task = None
+    gate._pause_started_at = None
+    gate._total_pause_secs = 0.0
+    # Manually inject account states (bypass env var lookup)
+    gate._accounts = [
+        AccountState(name='max-a', token='token-a'),
+        AccountState(name='max-b', token='token-b'),
+    ]
+    return gate
+
+
+class TestMultiAccountBeforeInvoke:
+    @pytest.mark.asyncio
+    async def test_returns_first_available_token(self):
+        gate = _make_multi_gate()
+        token = await gate.before_invoke()
+        assert token == 'token-a'
+
+    @pytest.mark.asyncio
+    async def test_returns_second_when_first_capped(self):
+        gate = _make_multi_gate()
+        gate._accounts[0].capped = True
+        token = await gate.before_invoke()
+        assert token == 'token-b'
+
+    @pytest.mark.asyncio
+    async def test_blocks_when_all_capped_then_resumes(self):
+        gate = _make_multi_gate()
+        gate._accounts[0].capped = True
+        gate._accounts[1].capped = True
+
+        async def uncap_after_delay():
+            await asyncio.sleep(0.05)
+            gate._accounts[1].capped = False
+            gate._open.set()
+
+        asyncio.create_task(uncap_after_delay())
+        token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
+        assert token == 'token-b'
+
+    @pytest.mark.asyncio
+    async def test_session_budget_checked_before_account_selection(self):
+        gate = _make_multi_gate()
+        gate._config = UsageCapConfig(
+            session_budget_usd=10.0,
+            accounts=[
+                AccountConfig(name='max-a', oauth_token_env='CLAUDE_OAUTH_A'),
+            ],
+        )
+        gate._cumulative_cost = 10.0
+        with pytest.raises(SessionBudgetExhausted):
+            await gate.before_invoke()
+
+
+class TestMultiAccountDetectCapHit:
+    def test_marks_correct_account_capped(self):
+        gate = _make_multi_gate()
+        hit = gate.detect_cap_hit(
+            "You've hit your usage limit", '', 'claude', oauth_token='token-a',
+        )
+        assert hit is True
+        assert gate._accounts[0].capped is True
+        assert gate._accounts[1].capped is False
+        # Global gate still open (account B available)
+        assert gate._open.is_set()
+
+    def test_closes_global_gate_when_all_capped(self):
+        gate = _make_multi_gate()
+        gate._accounts[1].capped = True  # pre-cap account B
+        hit = gate.detect_cap_hit(
+            "You've hit your usage limit", '', 'claude', oauth_token='token-a',
+        )
+        assert hit is True
+        assert gate._accounts[0].capped is True
+        # Global gate closed — all capped
+        assert not gate._open.is_set()
+
+    def test_unknown_token_falls_back_to_global_pause(self):
+        gate = _make_multi_gate()
+        hit = gate.detect_cap_hit(
+            "You've hit your usage limit", '', 'claude', oauth_token='unknown-token',
+        )
+        assert hit is True
+        # Falls through to global gate close
+        assert not gate._open.is_set()
+
+
+class TestMultiAccountIsPaused:
+    def test_not_paused_when_one_account_available(self):
+        gate = _make_multi_gate()
+        gate._accounts[0].capped = True
+        assert not gate.is_paused
+
+    def test_paused_when_all_accounts_capped(self):
+        gate = _make_multi_gate()
+        gate._accounts[0].capped = True
+        gate._accounts[1].capped = True
+        assert gate.is_paused
+
+
+class TestMultiAccountActiveAccountName:
+    def test_returns_first_uncapped(self):
+        gate = _make_multi_gate()
+        assert gate.active_account_name == 'max-a'
+
+    def test_returns_second_when_first_capped(self):
+        gate = _make_multi_gate()
+        gate._accounts[0].capped = True
+        assert gate.active_account_name == 'max-b'
+
+    def test_returns_none_when_all_capped(self):
+        gate = _make_multi_gate()
+        gate._accounts[0].capped = True
+        gate._accounts[1].capped = True
+        assert gate.active_account_name is None
+
+
+class TestMultiAccountStartupCheck:
+    @pytest.mark.asyncio
+    async def test_marks_capped_account_at_startup(self):
+        gate = _make_multi_gate()
+        call_count = 0
+
+        async def mock_query(token=None):
+            nonlocal call_count
+            call_count += 1
+            if token == 'token-a':
+                return {'five_hour': {'utilization': 0.99, 'resets_at': None}}
+            return {'five_hour': {'utilization': 0.3}}
+
+        with patch.object(gate, '_query_usage_api', side_effect=mock_query):
+            await gate.check_at_startup()
+
+        assert gate._accounts[0].capped is True
+        assert gate._accounts[1].capped is False
+        assert not gate.is_paused  # account B still available
+
+    @pytest.mark.asyncio
+    async def test_pauses_when_all_capped_at_startup(self):
+        gate = _make_multi_gate()
+
+        async def mock_query(token=None):
+            return {'five_hour': {'utilization': 0.99, 'resets_at': None}}
+
+        with patch.object(gate, '_query_usage_api', side_effect=mock_query):
+            await gate.check_at_startup()
+
+        assert gate._accounts[0].capped is True
+        assert gate._accounts[1].capped is True
+        assert gate.is_paused
+
+
+class TestMultiAccountResumeProbe:
+    @pytest.mark.asyncio
+    async def test_account_resume_reopens_gate(self):
+        gate = _make_multi_gate()
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+
+        async def mock_query(token=None):
+            return {'five_hour': {'utilization': 0.3}}
+
+        with patch.object(gate, '_query_usage_api', side_effect=mock_query):
+            await gate._account_resume_probe_loop(acct)
+
+        assert acct.capped is False
+        assert gate._open.is_set()
+
+    @pytest.mark.asyncio
+    async def test_account_resume_optimistic_on_api_failure(self):
+        gate = _make_multi_gate()
+        acct = gate._accounts[0]
+        acct.capped = True
+
+        async def mock_query(token=None):
+            return None
+
+        with patch.object(gate, '_query_usage_api', side_effect=mock_query):
+            await gate._account_resume_probe_loop(acct)
+
+        assert acct.capped is False
+
+
+class TestMultiAccountShutdown:
+    @pytest.mark.asyncio
+    async def test_cancels_all_account_resume_tasks(self):
+        gate = _make_multi_gate()
+
+        async def never_return():
+            await asyncio.sleep(3600)
+
+        for acct in gate._accounts:
+            acct.resume_task = asyncio.create_task(never_return())
+
+        await gate.shutdown()
+
+        for acct in gate._accounts:
+            assert acct.resume_task is None
+
+
+class TestMultiAccountBackwardsCompat:
+    """Verify that no accounts configured = legacy single-account behavior."""
+
+    @pytest.mark.asyncio
+    async def test_before_invoke_returns_none(self, gate):
+        """Legacy mode: before_invoke returns None (no token override)."""
+        token = await gate.before_invoke()
+        assert token is None
+
+    def test_is_paused_uses_global_gate(self, gate):
+        assert not gate.is_paused
+        gate._open.clear()
+        assert gate.is_paused
+
+    def test_detect_cap_hit_closes_global_gate(self, gate):
+        gate.detect_cap_hit("You've hit your usage limit", '')
+        assert not gate._open.is_set()
+
+    def test_active_account_name_none(self, gate):
+        assert gate.active_account_name is None

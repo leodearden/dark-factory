@@ -59,10 +59,13 @@ async def invoke_agent(
     sandbox_modules: list[str] | None = None,
     effort: str | None = None,
     backend: str = 'claude',
+    oauth_token: str | None = None,
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
 
     Dispatches to the appropriate backend (claude, codex, gemini).
+    *oauth_token*, when set, overrides the Claude CLI's default credentials
+    via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
     """
     if backend == 'claude':
         return await _invoke_claude(
@@ -71,7 +74,7 @@ async def invoke_agent(
             allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
             mcp_config=mcp_config, output_schema=output_schema,
             permission_mode=permission_mode, sandbox_modules=sandbox_modules,
-            effort=effort,
+            effort=effort, oauth_token=oauth_token,
         )
     elif backend == 'codex':
         return await _invoke_codex(
@@ -107,6 +110,7 @@ async def _invoke_claude(
     permission_mode: str,
     sandbox_modules: list[str] | None,
     effort: str | None,
+    oauth_token: str | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     cmd = ['claude', '--print', '--output-format', 'json']
@@ -145,6 +149,9 @@ async def _invoke_claude(
 
     # Strip ANTHROPIC_API_KEY so `claude` falls back to OAuth
     env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+    # Multi-account failover: inject per-invocation OAuth token
+    if oauth_token:
+        env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
 
     try:
         result = await _run_subprocess(cmd, cwd, env, 'claude', model, max_budget_usd)
