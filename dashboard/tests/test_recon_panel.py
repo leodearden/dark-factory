@@ -6,8 +6,6 @@ from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
-import pytest
-
 
 class TestTimeagoFilter:
     """Tests for the timeago Jinja2 filter function."""
