@@ -66,6 +66,29 @@ class TestMcpToolCall:
             with pytest.raises(ValueError, match='non-200'):
                 await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
 
+    async def test_posts_to_correct_url_path(self):
+        """mcp_tool_call posts to '{base_url}/mcp' (no trailing slash)."""
+        from dashboard.data.memory import mcp_tool_call
+
+        captured_path: list[str] = []
+        expected = {'ok': True}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_path.append(request.url.path)
+            return _make_mcp_response(expected)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await mcp_tool_call(
+                client, 'http://localhost:8000', 'get_status', {}
+            )
+
+        assert result == expected
+        assert len(captured_path) == 1, 'handler should be called exactly once'
+        assert captured_path[0] == '/mcp', (
+            f'Expected path /mcp (no trailing slash), got {captured_path[0]!r}'
+        )
+
 
 # --- Helpers for higher-level function tests ---
 
