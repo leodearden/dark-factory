@@ -239,6 +239,29 @@ class TestReconRoute:
             html = client.get('/partials/recon').text
         assert 'grid grid-cols-1 lg:grid-cols-2' in html
 
+    def test_runs_table_overflow_container(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'overflow-x-auto' in html
+
+    def test_trigger_formatted_in_html(self, client):
+        runs_with_colon = [
+            {
+                'id': 'run-002',
+                'run_type': 'full',
+                'trigger_reason': 'max_staleness:2026-03-19T08:00:00+00:00',
+                'started_at': '2026-03-19T08:00:00+00:00',
+                'completed_at': '2026-03-19T08:05:00+00:00',
+                'events_processed': 3,
+                'status': 'completed',
+                'duration_seconds': 300.0,
+            }
+        ]
+        with _patch_recon_data(runs=runs_with_colon):
+            html = client.get('/partials/recon').text
+        assert 'staleness' in html
+        assert 'title="max_staleness:2026-03-19T08:00:00+00:00"' in html
+
 
 # --- Empty data constants ---
 
