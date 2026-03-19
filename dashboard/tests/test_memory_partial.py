@@ -177,3 +177,44 @@ class TestMemoryPartialDots:
             html = client.get('/partials/memory').text
             # All 4 cards should have green dots when everything is connected
             assert html.count('bg-green-500') >= 3
+
+
+class TestWriteQueueCard:
+    def test_queue_dot_green_all_zero(self, client):
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+            # All dots should be green (4 cards, all connected, all zero counts)
+            assert html.count('bg-green-500') == 4
+
+    def test_queue_dot_yellow_pending(self, client):
+        queue = {'counts': {'pending': 3, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'bg-yellow-500' in html
+
+    def test_queue_dot_red_dead(self, client):
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 2}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'bg-red-500' in html
+
+    def test_queue_metrics_inline(self, client):
+        queue = {'counts': {'pending': 3, 'retry': 1, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+            assert '3 pending' in html
+            assert '1 retry' in html
+            assert '0 dead' in html
