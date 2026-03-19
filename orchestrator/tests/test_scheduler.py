@@ -353,3 +353,29 @@ class TestAcquireNextNoDuplicates:
 
         third = await scheduler.acquire_next()
         assert third is None
+
+    @pytest.mark.asyncio
+    async def test_release_clears_dispatched_allowing_redispatch(
+        self, scheduler: Scheduler
+    ):
+        """After release(), the same task can be dispatched again."""
+        task = {
+            'id': '1',
+            'title': 'Task one',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'modules': ['backend']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        first = await scheduler.acquire_next()
+        assert first is not None
+        assert first.task_id == '1'
+
+        # Release — should clear _dispatched so task can be re-dispatched
+        scheduler.release('1')
+
+        # Same task is still pending (mock unchanged) — should be dispatchable again
+        second = await scheduler.acquire_next()
+        assert second is not None
+        assert second.task_id == '1'
