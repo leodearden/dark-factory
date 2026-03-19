@@ -163,7 +163,7 @@
         "description": "Create index.html combining all partials with htmx polling, add __main__.py entry point, and write integration tests for all routes.",
         "details": "Create `dashboard/src/dashboard/templates/index.html`:\n\nExtends base.html. Content block contains 4 sections stacked vertically (space-y-8 max-w-7xl mx-auto p-6):\n\n1. **Memory Health** section: `<div hx-get=\"/partials/memory\" hx-trigger=\"load, every 10s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n2. **Reconciliation** section: `<div hx-get=\"/partials/recon\" hx-trigger=\"load, every 15s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n3. **Orchestrators** section: `<div hx-get=\"/partials/orchestrators\" hx-trigger=\"load, every 10s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n4. **Footer**: Small text \"Dark Factory Dashboard\" with current time (updated via Alpine.js `x-text` with a setInterval, or just static).\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /` route: render index.html (no data needed \u2014 partials load themselves via htmx).\n\nCreate `dashboard/src/dashboard/__main__.py`:\n```python\n\"\"\"Entry point: python -m dashboard.app\"\"\"\nimport uvicorn\nfrom dashboard.config import DashboardConfig\n\nconfig = DashboardConfig()\nuvicorn.run(\"dashboard.app:app\", host=config.host, port=config.port, reload=True)\n```\n\nCreate `dashboard/tests/test_app.py` \u2014 integration tests using FastAPI TestClient:\n\n1. **Test GET /** \u2014 returns 200, content-type text/html, body contains \"Dark Factory\", contains hx-get=\"/partials/memory\", hx-get=\"/partials/recon\", hx-get=\"/partials/orchestrators\".\n\n2. **Test GET /partials/memory** \u2014 mock dashboard.data.memory functions to return sample data. Returns 200, text/html, contains \"Graphiti\", \"Mem0\", \"Taskmaster\", \"Write Queue\".\n\n3. **Test GET /partials/memory offline** \u2014 mock to return {\"offline\": True}. Returns 200, contains \"Offline\".\n\n4. **Test GET /partials/recon** \u2014 mock dashboard.data.reconciliation functions. Returns 200, contains expected table elements.\n\n5. **Test GET /partials/recon no data** \u2014 mock to return empty defaults. Returns 200, contains \"No reconciliation runs\".\n\n6. **Test GET /partials/orchestrators** \u2014 mock dashboard.data.orchestrator.discover_orchestrators to return a sample orchestrator with tasks. Returns 200, contains progress bar elements, task table.\n\n7. **Test GET /partials/orchestrators empty** \u2014 mock to return []. Returns 200, contains \"No orchestrators detected\".\n\n8. **Test GET /api/health** \u2014 returns 200, application/json, body is {\"status\": \"ok\"}.\n\nUse `unittest.mock.patch` or `monkeypatch` to mock the data modules. Import the app and create TestClient in a fixture.\n\nTest strategy: `cd dashboard && uv run pytest tests/ -x -v`. All 8+ tests should pass. Also manually verify by running `cd dashboard && uv run python -m dashboard.app` and opening http://127.0.0.1:8080 in a browser.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [
           "20",
           "21",
@@ -171,7 +171,7 @@
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-18T06:56:24.432Z"
+        "updatedAt": "2026-03-19T09:28:27.034Z"
       },
       {
         "id": "24",
@@ -254,9 +254,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-19T08:50:12.235Z",
+      "lastModified": "2026-03-19T09:28:27.034Z",
       "taskCount": 17,
-      "completedCount": 11,
+      "completedCount": 13,
       "tags": [
         "master"
       ]
