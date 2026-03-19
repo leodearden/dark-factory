@@ -223,3 +223,52 @@ class TestTaskTable:
             html = client.get('/partials/orchestrators').text
         # Tasks 2, 4, 5 have no worktree entries — should show em-dash
         assert '\u2014' in html or '&mdash;' in html
+
+
+MOCK_ORCHESTRATOR_COMPLETED = {
+    'pid': 5678,
+    'prd': '/other/memory.md',
+    'running': False,
+    'started': 'Mar17',
+    'tasks': [],
+    'worktrees': {},
+    'summary': {
+        'total': 0,
+        'done': 0,
+        'in_progress': 0,
+        'blocked': 0,
+        'pending': 0,
+    },
+}
+
+
+class TestOrchestratorRouteMultiple:
+    """Tests for GET /partials/orchestrators with multiple orchestrators."""
+
+    def test_count_badge_shows_two(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING, MOCK_ORCHESTRATOR_COMPLETED]):
+            html = client.get('/partials/orchestrators').text
+        assert '>2<' in html
+
+    def test_both_pids(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING, MOCK_ORCHESTRATOR_COMPLETED]):
+            html = client.get('/partials/orchestrators').text
+        assert '1234' in html
+        assert '5678' in html
+
+    def test_completed_badge(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING, MOCK_ORCHESTRATOR_COMPLETED]):
+            html = client.get('/partials/orchestrators').text
+        assert 'completed' in html
+
+    def test_zero_total_no_error(self, client):
+        """Orchestrator with zero tasks doesn't cause division-by-zero."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING, MOCK_ORCHESTRATOR_COMPLETED]):
+            resp = client.get('/partials/orchestrators')
+        assert resp.status_code == 200
+
+    def test_prd_filenames(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING, MOCK_ORCHESTRATOR_COMPLETED]):
+            html = client.get('/partials/orchestrators').text
+        assert 'dashboard.md' in html
+        assert 'memory.md' in html
