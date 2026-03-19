@@ -1,6 +1,7 @@
 """Tests for Taskmaster MCP client backend."""
 
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -190,3 +191,70 @@ async def test_call_tool_non_json_response(client):
 
     data = await c.call_tool('some_tool', {})
     assert data == {'text': 'Not JSON'}
+
+
+# ── connected property and ensure_connected tests ──────────────────
+
+
+def test_connected_false_before_init(config):
+    """connected is False on a fresh instance with no session."""
+    c = TaskmasterBackend(config)
+    assert c.connected is False
+
+
+def test_connected_true_with_session(client):
+    """connected is True when _session is set."""
+    c, _ = client
+    assert c.connected is True
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_noop_when_connected(client):
+    """ensure_connected returns immediately when already connected."""
+    c, session = client
+    await c.ensure_connected()
+    # initialize should NOT have been called (session was already set)
+    assert c._session is session
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_triggers_reconnect(config):
+    """ensure_connected calls initialize() when disconnected and cooldown elapsed."""
+    c = TaskmasterBackend(config)
+    assert c.connected is False
+
+    mock_session = AsyncMock()
+    # Patch initialize to just set the session
+    async def fake_init():
+        c._session = mock_session
+
+    c.initialize = fake_init
+    await c.ensure_connected()
+    assert c.connected is True
+    assert c._session is mock_session
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_cooldown_raises(config):
+    """ensure_connected raises RuntimeError when cooldown hasn't elapsed."""
+    c = TaskmasterBackend(config, reconnect_cooldown_seconds=60.0)
+    # Simulate a recent failed reconnect attempt
+    c._last_reconnect_attempt = time.monotonic()
+
+    with pytest.raises(RuntimeError, match='cooldown'):
+        await c.ensure_connected()
+
+
+@pytest.mark.asyncio
+async def test_call_tool_broken_pipe_resets_session(client):
+    """BrokenPipeError from session.call_tool resets _session to None."""
+    c, session = client
+    session.call_tool = AsyncMock(side_effect=BrokenPipeError('pipe gone'))
+    # Stub out _cleanup_contexts so it just clears _session
+    c._cleanup_contexts = AsyncMock(side_effect=lambda: setattr(c, '_session', None))
+
+    with pytest.raises(BrokenPipeError):
+        await c.call_tool('get_tasks', {})
+
+    c._cleanup_contexts.assert_called_once()
+    assert c._session is None

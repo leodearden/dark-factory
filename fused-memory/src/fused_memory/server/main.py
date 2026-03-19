@@ -89,8 +89,7 @@ async def run_server():
             logger.info(f'  Taskmaster: connected via {config.taskmaster.transport}')
             memory_service.taskmaster_connected = True
         except Exception as e:
-            logger.warning(f'  Taskmaster: failed to connect ({e}), continuing without tasks')
-            taskmaster = None
+            logger.warning(f'  Taskmaster: failed to connect ({e}), will retry on next tool call')
 
     # Initialize reconciliation system
     reconciliation_harness = None
@@ -122,9 +121,10 @@ async def run_server():
 
         # Targeted reconciler (needs memory_service + taskmaster + journal)
         targeted = None
-        if taskmaster:
+        if taskmaster and taskmaster.connected:
             targeted = TargetedReconciler(memory_service, taskmaster, journal, config)
-            task_interceptor = TaskInterceptor(taskmaster, targeted, event_buffer)
+
+        task_interceptor = TaskInterceptor(taskmaster, targeted, event_buffer)
 
         # Full reconciliation harness (background loop)
         reconciliation_harness = ReconciliationHarness(
@@ -133,14 +133,13 @@ async def run_server():
         asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
     else:
-        # If reconciliation is disabled but taskmaster is connected, still proxy tasks
-        if taskmaster:
-            from fused_memory.middleware.task_interceptor import TaskInterceptor
-            from fused_memory.reconciliation.event_buffer import EventBuffer
+        # Always create task_interceptor for tool registration
+        from fused_memory.middleware.task_interceptor import TaskInterceptor
+        from fused_memory.reconciliation.event_buffer import EventBuffer
 
-            event_buffer = EventBuffer(db_path=None)
-            await event_buffer.initialize()
-            task_interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+        event_buffer = EventBuffer(db_path=None)
+        await event_buffer.initialize()
+        task_interceptor = TaskInterceptor(taskmaster, None, event_buffer)
 
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(memory_service, task_interceptor)

@@ -29,13 +29,20 @@ class TaskInterceptor:
 
     def __init__(
         self,
-        taskmaster: TaskmasterBackend,
+        taskmaster: TaskmasterBackend | None,
         targeted_reconciler: 'TargetedReconciler | None',
         event_buffer: EventBuffer,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
         self.buffer = event_buffer
+
+    async def _ensure_taskmaster(self) -> TaskmasterBackend:
+        """Return a connected TaskmasterBackend, or raise with a structured error."""
+        if self.taskmaster is None:
+            raise RuntimeError('Taskmaster is not configured.')
+        await self.taskmaster.ensure_connected()
+        return self.taskmaster
 
     def _make_event(
         self, event_type: EventType, project_root: str, payload: dict
@@ -69,11 +76,12 @@ class TaskInterceptor:
         tag: str | None = None,
     ) -> dict:
         """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered."""
+        tm = await self._ensure_taskmaster()
         # 1. Get before-state
-        before = await self.taskmaster.get_task(task_id, project_root, tag)
+        before = await tm.get_task(task_id, project_root, tag)
 
         # 2. Execute status change
-        result = await self.taskmaster.set_task_status(task_id, status, project_root, tag)
+        result = await tm.set_task_status(task_id, status, project_root, tag)
 
         # 3. Emit event
         old_status = _extract_status(before)
@@ -112,7 +120,8 @@ class TaskInterceptor:
         force: bool = False,
         tag: str | None = None,
     ) -> dict:
-        result = await self.taskmaster.expand_task(
+        tm = await self._ensure_taskmaster()
+        result = await tm.expand_task(
             task_id, project_root, num=num, prompt=prompt, force=force, tag=tag
         )
         event = self._make_event(
@@ -143,7 +152,8 @@ class TaskInterceptor:
         num_tasks: str | None = None,
         tag: str | None = None,
     ) -> dict:
-        result = await self.taskmaster.parse_prd(
+        tm = await self._ensure_taskmaster()
+        result = await tm.parse_prd(
             input_path, project_root, num_tasks=num_tasks, tag=tag
         )
         event = self._make_event(
@@ -170,7 +180,8 @@ class TaskInterceptor:
     # ── Write pass-throughs (emit event, no targeted reconciliation) ───
 
     async def add_task(self, project_root: str, **kwargs: Any) -> dict:
-        result = await self.taskmaster.add_task(project_root=project_root, **kwargs)
+        tm = await self._ensure_taskmaster()
+        result = await tm.add_task(project_root=project_root, **kwargs)
         event = self._make_event(
             EventType.task_created,
             project_root,
@@ -182,7 +193,8 @@ class TaskInterceptor:
     async def update_task(
         self, task_id: str, project_root: str, **kwargs: Any
     ) -> dict:
-        result = await self.taskmaster.update_task(
+        tm = await self._ensure_taskmaster()
+        result = await tm.update_task(
             task_id=task_id, project_root=project_root, **kwargs
         )
         event = self._make_event(
@@ -196,7 +208,8 @@ class TaskInterceptor:
     async def add_subtask(
         self, parent_id: str, project_root: str, **kwargs: Any
     ) -> dict:
-        result = await self.taskmaster.add_subtask(
+        tm = await self._ensure_taskmaster()
+        result = await tm.add_subtask(
             parent_id=parent_id, project_root=project_root, **kwargs
         )
         event = self._make_event(
@@ -210,7 +223,8 @@ class TaskInterceptor:
     async def remove_task(
         self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict:
-        result = await self.taskmaster.remove_task(task_id, project_root, tag)
+        tm = await self._ensure_taskmaster()
+        result = await tm.remove_task(task_id, project_root, tag)
         event = self._make_event(
             EventType.task_deleted,
             project_root,
@@ -226,7 +240,8 @@ class TaskInterceptor:
         project_root: str,
         tag: str | None = None,
     ) -> dict:
-        result = await self.taskmaster.add_dependency(
+        tm = await self._ensure_taskmaster()
+        result = await tm.add_dependency(
             task_id, depends_on, project_root, tag
         )
         event = self._make_event(
@@ -244,7 +259,8 @@ class TaskInterceptor:
         project_root: str,
         tag: str | None = None,
     ) -> dict:
-        result = await self.taskmaster.remove_dependency(
+        tm = await self._ensure_taskmaster()
+        result = await tm.remove_dependency(
             task_id, depends_on, project_root, tag
         )
         event = self._make_event(
@@ -260,12 +276,14 @@ class TaskInterceptor:
     async def get_tasks(
         self, project_root: str, tag: str | None = None
     ) -> dict:
-        return await self.taskmaster.get_tasks(project_root, tag)
+        tm = await self._ensure_taskmaster()
+        return await tm.get_tasks(project_root, tag)
 
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict:
-        return await self.taskmaster.get_task(task_id, project_root, tag)
+        tm = await self._ensure_taskmaster()
+        return await tm.get_task(task_id, project_root, tag)
 
 
 def _extract_status(task_data: dict) -> str:

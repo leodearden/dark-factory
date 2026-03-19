@@ -96,3 +96,31 @@ async def test_update_task_metadata_none_passed_through(
     task_interceptor.update_task.assert_called_once()
     _, kwargs = task_interceptor.update_task.call_args
     assert kwargs['metadata'] is None
+
+
+# ------------------------------------------------------------------
+# Defensive tool registration (always registered, even without Taskmaster)
+# ------------------------------------------------------------------
+
+
+def test_task_tools_registered_without_interceptor():
+    """Task tools are registered even when no task_interceptor is provided."""
+    mock_service = AsyncMock()
+    server = create_mcp_server(mock_service)  # No task_interceptor
+    tool_names = [t.name for t in server._tool_manager.list_tools()]
+    for name in ['get_tasks', 'get_task', 'set_task_status', 'add_task',
+                 'update_task', 'add_subtask', 'remove_task', 'add_dependency',
+                 'remove_dependency', 'expand_task', 'parse_prd']:
+        assert name in tool_names, f'{name} should be registered'
+
+
+@pytest.mark.asyncio
+async def test_task_tool_error_without_taskmaster():
+    """Calling a task tool with no-taskmaster interceptor returns structured error."""
+    mock_service = AsyncMock()
+    server = create_mcp_server(mock_service)  # No task_interceptor → fallback
+    result = await server._tool_manager.call_tool(
+        'get_tasks', {'project_root': '/project'},
+    )
+    assert 'error' in result
+    assert 'not configured' in result['error'].lower()

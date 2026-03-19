@@ -233,3 +233,39 @@ async def test_event_roundtrip_preserves_both_ids(taskmaster, event_buffer):
     # Buffer is now empty
     stats = await event_buffer.get_buffer_stats('dark_factory')
     assert stats['size'] == 0
+
+
+# ── Tests for None / disconnected taskmaster ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_none_taskmaster_raises_structured_error(event_buffer):
+    """TaskInterceptor(None, None, buf) → get_tasks() raises RuntimeError."""
+    interceptor = TaskInterceptor(None, None, event_buffer)
+    with pytest.raises(RuntimeError, match='not configured'):
+        await interceptor.get_tasks('/project')
+
+
+@pytest.mark.asyncio
+async def test_disconnected_taskmaster_calls_ensure_connected(event_buffer):
+    """ensure_connected is called before proxying to taskmaster."""
+    tm = AsyncMock()
+    tm.ensure_connected = AsyncMock()
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+    interceptor = TaskInterceptor(tm, None, event_buffer)
+
+    await interceptor.get_tasks('/project')
+    tm.ensure_connected.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_ensure_taskmaster_error_propagates(event_buffer):
+    """When ensure_connected raises, the method propagates the error."""
+    tm = AsyncMock()
+    tm.ensure_connected = AsyncMock(
+        side_effect=RuntimeError('Taskmaster reconnection failed: spawn error')
+    )
+    interceptor = TaskInterceptor(tm, None, event_buffer)
+
+    with pytest.raises(RuntimeError, match='reconnection failed'):
+        await interceptor.get_tasks('/project')

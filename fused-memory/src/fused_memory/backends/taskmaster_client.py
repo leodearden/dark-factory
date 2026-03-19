@@ -1,8 +1,10 @@
 """MCP client proxy to Taskmaster AI server."""
 
+import asyncio
 import contextlib
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,11 +20,44 @@ logger = logging.getLogger(__name__)
 class TaskmasterBackend:
     """Connects to Taskmaster's MCP server and proxies tool calls."""
 
-    def __init__(self, config: TaskmasterConfig):
+    def __init__(self, config: TaskmasterConfig, reconnect_cooldown_seconds: float = 30.0):
         self.config = config
+        self.reconnect_cooldown_seconds = reconnect_cooldown_seconds
         self._session: ClientSession | None = None
         self._stdio_ctx = None
         self._session_ctx = None
+        self._last_reconnect_attempt: float = 0.0
+        self._reconnect_lock = asyncio.Lock()
+
+    @property
+    def connected(self) -> bool:
+        """Whether the client has an active session."""
+        return self._session is not None
+
+    async def ensure_connected(self) -> None:
+        """Reconnect to Taskmaster if not connected, respecting cooldown."""
+        if self._session is not None:
+            return
+
+        async with self._reconnect_lock:
+            # Re-check inside lock (another coroutine may have reconnected)
+            if self._session is not None:
+                return
+
+            now = time.monotonic()
+            elapsed = now - self._last_reconnect_attempt
+            if self._last_reconnect_attempt > 0 and elapsed < self.reconnect_cooldown_seconds:
+                remaining = self.reconnect_cooldown_seconds - elapsed
+                raise RuntimeError(
+                    f'Taskmaster reconnection on cooldown ({remaining:.0f}s remaining)'
+                )
+
+            self._last_reconnect_attempt = now
+            try:
+                await self.initialize()
+                logger.info('Taskmaster reconnected successfully')
+            except Exception as exc:
+                raise RuntimeError(f'Taskmaster reconnection failed: {exc}') from exc
 
     async def initialize(self) -> None:
         """Start Taskmaster MCP server process and establish client session."""
@@ -92,7 +127,11 @@ class TaskmasterBackend:
     async def call_tool(self, name: str, arguments: dict) -> Any:
         """Call a Taskmaster MCP tool and return the parsed result."""
         session = self._require_session()
-        result = await session.call_tool(name, arguments)
+        try:
+            result = await session.call_tool(name, arguments)
+        except (BrokenPipeError, ConnectionError, EOFError, OSError):
+            await self._cleanup_contexts()
+            raise
         # MCP tool results come as content blocks
         if result.content:
             text_parts = [
