@@ -206,7 +206,14 @@ class UsageGate:
                     logger.debug(f'Using account {acct.name}')
                     return acct.token
 
-            # All capped — wait on global gate (reopened when any account resumes)
+            # All capped — do a fresh API check before blocking.
+            # Background probes may be sleeping through exponential backoff,
+            # but one account may have already reset.
+            refreshed = await self._refresh_capped_accounts()
+            if refreshed:
+                continue  # re-check accounts with updated flags
+
+            # Still all capped after fresh check — wait on global gate
             logger.info('All accounts capped — waiting for any to reopen')
             self._open.clear()
             await self._open.wait()
@@ -318,6 +325,48 @@ class UsageGate:
                 )
         except RuntimeError:
             pass
+
+    async def _refresh_capped_accounts(self) -> bool:
+        """Query the usage API for all capped accounts. Return True if any uncapped."""
+        any_uncapped = False
+        for acct in self._accounts:
+            if not acct.capped:
+                continue
+            usage = await self._query_usage_api(token=acct.token)
+            if usage is None:
+                # API unavailable — optimistically uncap
+                logger.warning(
+                    f'Account {acct.name}: usage API unavailable during '
+                    f'refresh — resuming optimistically'
+                )
+                acct.capped = False
+                acct.pause_started_at = None
+                any_uncapped = True
+                continue
+
+            still_capped = False
+            for tier_name, tier_data in usage.items():
+                if not isinstance(tier_data, dict):
+                    continue
+                utilization = tier_data.get('utilization', 0)
+                if utilization >= self._config.pause_threshold:
+                    still_capped = True
+                    break
+
+            if not still_capped:
+                logger.info(f'Account {acct.name}: cap cleared on fresh check')
+                acct.capped = False
+                if acct.pause_started_at:
+                    pause_duration = (
+                        datetime.now(UTC) - acct.pause_started_at
+                    ).total_seconds()
+                    self._total_pause_secs += pause_duration
+                acct.pause_started_at = None
+                any_uncapped = True
+
+        if any_uncapped:
+            self._open.set()
+        return any_uncapped
 
     def on_agent_complete(self, cost: float) -> None:
         """Accumulate cost for session budget tracking."""

@@ -340,14 +340,41 @@ class TestMultiAccountBeforeInvoke:
         gate._accounts[0].capped = True
         gate._accounts[1].capped = True
 
+        # Mock API to keep returning capped so _refresh_capped_accounts
+        # doesn't short-circuit the test.
+        async def mock_query(token=None):
+            return {'five_hour': {'utilization': 0.99}}
+
         async def uncap_after_delay():
             await asyncio.sleep(0.05)
             gate._accounts[1].capped = False
             gate._open.set()
 
-        asyncio.create_task(uncap_after_delay())
-        token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
+        with patch.object(gate, '_query_usage_api', side_effect=mock_query):
+            asyncio.create_task(uncap_after_delay())
+            token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
         assert token == 'token-b'
+
+    @pytest.mark.asyncio
+    async def test_refresh_uncaps_account_before_blocking(self):
+        """When all accounts are flagged as capped but one has actually reset,
+        before_invoke should detect the reset via a fresh API check and
+        return the uncapped account's token without blocking."""
+        gate = _make_multi_gate()
+        gate._accounts[0].capped = True   # A flagged capped (stale)
+        gate._accounts[1].capped = True   # B flagged capped
+
+        async def mock_query(token=None):
+            if token == 'token-a':
+                return {'five_hour': {'utilization': 0.3}}  # A has reset
+            return {'five_hour': {'utilization': 0.99}}     # B still capped
+
+        with patch.object(gate, '_query_usage_api', side_effect=mock_query):
+            token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
+
+        assert token == 'token-a'
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[1].capped is True
 
     @pytest.mark.asyncio
     async def test_session_budget_checked_before_account_selection(self):

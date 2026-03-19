@@ -311,27 +311,39 @@ The `modules` field should list directory-level groupings (e.g. "src/backends",
 Output JSON matching the schema. Every task must appear in the output.
 """
 
-        oauth_token = None
-        if self.usage_gate:
-            oauth_token = await self.usage_gate.before_invoke()
+        while True:
+            oauth_token = None
+            if self.usage_gate:
+                oauth_token = await self.usage_gate.before_invoke()
 
-        result = await invoke_agent(
-            prompt=prompt,
-            system_prompt='You are a code module classifier. Given task descriptions and a codebase structure, determine which code modules each task will modify. Be precise and conservative.',
-            cwd=self.config.project_root,
-            model=self.config.models.module_tagger,
-            max_turns=self.config.max_turns.module_tagger,
-            max_budget_usd=self.config.budgets.module_tagger,
-            output_schema=schema,
-            oauth_token=oauth_token,
-        )
+            result = await invoke_agent(
+                prompt=prompt,
+                system_prompt='You are a code module classifier. Given task descriptions and a codebase structure, determine which code modules each task will modify. Be precise and conservative.',
+                cwd=self.config.project_root,
+                model=self.config.models.module_tagger,
+                max_turns=self.config.max_turns.module_tagger,
+                max_budget_usd=self.config.budgets.module_tagger,
+                output_schema=schema,
+                oauth_token=oauth_token,
+            )
 
-        if self.usage_gate:
-            if self.usage_gate.detect_cap_hit(
+            if self.usage_gate and self.usage_gate.detect_cap_hit(
                 result.stderr, result.output, oauth_token=oauth_token,
             ):
-                raise RuntimeError('Usage cap hit during module tagging — cannot proceed')
-            self.usage_gate.on_agent_complete(result.cost_usd)
+                acct_name = self.usage_gate.active_account_name
+                if acct_name:
+                    logger.warning(
+                        f'Module tagging: cap hit, switching to account {acct_name}'
+                    )
+                else:
+                    logger.warning(
+                        'Module tagging: cap hit on all accounts, waiting for reset'
+                    )
+                continue
+
+            if self.usage_gate:
+                self.usage_gate.on_agent_complete(result.cost_usd)
+            break
 
         if not result.success:
             logger.warning(f'Module tagger agent failed: {result.output[:200]}')

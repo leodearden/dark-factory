@@ -673,9 +673,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if self.usage_gate and self.usage_gate.detect_cap_hit(
                 result.stderr, result.output, backend_val, oauth_token=oauth_token,
             ):
-                logger.warning(
-                    f'Task {self.task_id} [{role.name}]: usage cap hit, waiting for reset'
-                )
+                acct_name = self.usage_gate.active_account_name
+                if acct_name:
+                    logger.warning(
+                        f'Task {self.task_id} [{role.name}]: usage cap hit, '
+                        f'switching to account {acct_name}'
+                    )
+                else:
+                    logger.warning(
+                        f'Task {self.task_id} [{role.name}]: usage cap hit on '
+                        f'all accounts, will check for reset'
+                    )
                 continue
 
             break
