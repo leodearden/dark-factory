@@ -17,10 +17,23 @@ from fused_memory.config.schema import (
 
 
 @dataclass
+class MockNode:
+    """Simulates a Graphiti entity node (source/target of an edge)."""
+
+    name: str
+
+
+@dataclass
 class MockEdge:
-    """Simulates a Graphiti entity edge returned from add_episode."""
+    """Simulates a Graphiti entity edge returned from add_episode or search."""
 
     fact: str
+    uuid: str = ''
+    source_node: MockNode | None = None
+    target_node: MockNode | None = None
+    episodes: list[str] = field(default_factory=list)
+    valid_at: str | None = None
+    invalid_at: str | None = None
 
 
 @dataclass
