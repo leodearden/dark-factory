@@ -254,3 +254,85 @@ class TestReadTaskArtifacts:
         assert result['phase'] == 'PLAN'
         assert result['plan_progress'] == {'done': 0, 'total': 0}
         assert result['metadata'] == metadata
+
+
+class TestDiscoverOrchestrators:
+    """Tests for discover_orchestrators — combines process, task tree, and artifact data."""
+
+    def test_combines_process_and_worktree_data(self, tmp_path):
+        """Running orchestrator is enriched with task tree and worktree artifact data."""
+        import json
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        # Create tasks.json with 5 tasks of varying statuses
+        tasks_dir = tmp_path / '.taskmaster' / 'tasks'
+        tasks_dir.mkdir(parents=True)
+        tasks = [
+            {'id': '1', 'title': 'Setup', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+            {'id': '2', 'title': 'Build', 'status': 'done', 'priority': 'high', 'dependencies': ['1'], 'metadata': {}},
+            {'id': '3', 'title': 'Test', 'status': 'in-progress', 'priority': 'medium', 'dependencies': ['2'], 'metadata': {}},
+            {'id': '4', 'title': 'Review', 'status': 'blocked', 'priority': 'medium', 'dependencies': ['3'], 'metadata': {}},
+            {'id': '5', 'title': 'Deploy', 'status': 'pending', 'priority': 'low', 'dependencies': ['4'], 'metadata': {}},
+        ]
+        (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
+
+        # Create a worktree with .task/ artifacts
+        wt_dir = tmp_path / '.worktrees' / '7'
+        wt_dir.mkdir(parents=True)
+        task_dir = wt_dir / '.task'
+        task_dir.mkdir()
+        (task_dir / 'metadata.json').write_text(json.dumps({'task_id': '7', 'title': 'Widget'}))
+        steps = [{'id': 'step-1', 'status': 'done'}, {'id': 'step-2', 'status': 'pending'}]
+        (task_dir / 'plan.json').write_text(json.dumps({'steps': steps}))
+
+        # Mock one running orchestrator
+        mock_procs = [{'pid': 1234, 'prd': '/home/leo/prd.md', 'running': True, 'started': 'Mar18'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        entry = result[0]
+        assert entry['pid'] == 1234
+        assert entry['prd'] == '/home/leo/prd.md'
+        assert entry['running'] is True
+        assert len(entry['tasks']) == 5
+        assert '7' in entry['worktrees']
+        assert entry['worktrees']['7']['phase'] == 'EXECUTE'
+        assert entry['summary'] == {'total': 5, 'done': 2, 'in_progress': 1, 'blocked': 1, 'pending': 1}
+
+    def test_no_running_orchestrators(self, tmp_path):
+        """Empty process list returns empty result."""
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=[]):
+            result = discover_orchestrators(config)
+
+        assert result == []
+
+    def test_missing_tasks_json(self, tmp_path):
+        """Orchestrator returned even when tasks.json is missing (empty task list)."""
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        mock_procs = [{'pid': 5678, 'prd': '/prd.md', 'running': True, 'started': '10:30'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        assert result[0]['tasks'] == []
+        assert result[0]['worktrees'] == {}
+        assert result[0]['summary'] == {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0}
