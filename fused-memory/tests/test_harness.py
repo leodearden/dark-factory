@@ -112,3 +112,83 @@ async def test_journal_run_lifecycle(journal):
 
     loaded = await journal.get_run(run.id)
     assert loaded.status == 'completed'
+
+
+# ── Tests for harness extracting project_root from events (step-9) ────
+
+
+def _make_event_with_root(
+    project_id: str = 'dark_factory',
+    project_root: str = '/home/leo/src/dark-factory',
+) -> ReconciliationEvent:
+    return ReconciliationEvent(
+        id=str(uuid.uuid4()),
+        type=EventType.task_status_changed,
+        source=EventSource.agent,
+        project_id=project_id,
+        timestamp=datetime.now(UTC),
+        payload={'_project_root': project_root, 'task_id': '1'},
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_cycle_extracts_project_root_from_events(journal, event_buffer, mock_memory_service):
+    """Harness should set both stage.project_id and stage.project_root from drained events."""
+    from unittest.mock import AsyncMock
+
+    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+    from fused_memory.models.reconciliation import StageReport
+
+    config = FusedMemoryConfig(
+        reconciliation=ReconciliationConfig(
+            enabled=True,
+            explore_codebase_root='/tmp/test',
+            agent_llm_provider='anthropic',
+            agent_llm_model='claude-sonnet-4-20250514',
+        )
+    )
+
+    # Push events with _project_root in payload
+    await event_buffer.push(_make_event_with_root())
+    await event_buffer.push(_make_event_with_root())
+
+    from fused_memory.reconciliation.harness import ReconciliationHarness
+
+    harness = ReconciliationHarness(
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        journal=journal,
+        event_buffer=event_buffer,
+        config=config,
+    )
+
+    # Mock each stage's run method and capture the stage state
+    captured_stages = []
+    for stage in harness.stages:
+        original_stage = stage
+
+        async def mock_run(events, watermark, prior_reports, run_id, _s=original_stage):
+            # Capture state at call time
+            captured_stages.append({
+                'project_id': _s.project_id,
+                'project_root': _s.project_root,
+            })
+            return StageReport(
+                stage=_s.stage_id,
+                started_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+                actions_taken=[],
+                items_flagged=[],
+                stats={},
+                llm_calls=0,
+                tokens_used=0,
+            )
+
+        stage.run = mock_run
+
+    await harness.run_full_cycle('dark_factory', 'buffer_size:2')
+
+    assert len(captured_stages) == 3
+    for stage_state in captured_stages:
+        assert stage_state['project_id'] == 'dark_factory'
+        assert stage_state['project_root'] == '/home/leo/src/dark-factory'

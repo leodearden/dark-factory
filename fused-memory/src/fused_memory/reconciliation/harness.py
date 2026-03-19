@@ -152,12 +152,21 @@ class ReconciliationHarness:
             },
         )
 
+        # Extract project_root from event payloads (first event with _project_root key)
+        project_root = project_id  # fallback for backwards compatibility
+        for ev in events:
+            pr = ev.payload.get('_project_root')
+            if pr:
+                project_root = pr
+                break
+
         current_stage_name: str | None = None
         try:
             reports = []
             for stage in self.stages:
                 current_stage_name = stage.stage_id.value
                 stage.project_id = project_id
+                stage.project_root = project_root
                 report = await stage.run(events, watermark, reports, run_id)
                 reports.append(report)
                 run.stage_reports[stage.stage_id.value] = report

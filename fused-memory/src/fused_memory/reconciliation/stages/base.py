@@ -41,6 +41,7 @@ class BaseStage:
         self.journal = journal
         self.config = config
         self.project_id: str = ''
+        self.project_root: str = ''
 
     def get_tools(self) -> dict[str, ToolDefinition]:
         """Override in subclass — return tools available to this stage."""
@@ -293,10 +294,10 @@ class BaseStage:
             return {}
         tools: dict[str, ToolDefinition] = {}
         taskmaster = self.taskmaster
-        project_id = self.project_id
+        project_root = self.project_root or self.project_id
 
         async def get_tasks():
-            return await taskmaster.get_tasks(project_root=project_id)
+            return await taskmaster.get_tasks(project_root=project_root)
 
         tools['get_tasks'] = ToolDefinition(
             name='get_tasks',
@@ -306,7 +307,7 @@ class BaseStage:
         )
 
         async def get_task(id: str):
-            return await taskmaster.get_task(task_id=id, project_root=project_id)
+            return await taskmaster.get_task(task_id=id, project_root=project_root)
 
         tools['get_task'] = ToolDefinition(
             name='get_task',
@@ -329,11 +330,11 @@ class BaseStage:
             return {}
         tools: dict[str, ToolDefinition] = {}
         taskmaster = self.taskmaster
-        project_id = self.project_id
+        project_root = self.project_root or self.project_id
 
         async def set_task_status(id: str, status: str):
             return await taskmaster.set_task_status(
-                task_id=id, status=status, project_root=project_id
+                task_id=id, status=status, project_root=project_root
             )
 
         tools['set_task_status'] = ToolDefinition(
@@ -357,7 +358,7 @@ class BaseStage:
 
         async def task_add_task(prompt: str | None = None, title: str | None = None):
             return await taskmaster.add_task(
-                prompt=prompt, title=title, project_root=project_id
+                prompt=prompt, title=title, project_root=project_root
             )
 
         tools['add_task'] = ToolDefinition(
@@ -377,7 +378,7 @@ class BaseStage:
 
         async def task_update_task(id: str, prompt: str | None = None, metadata: str | None = None):
             return await taskmaster.update_task(
-                task_id=id, prompt=prompt, metadata=metadata, project_root=project_id
+                task_id=id, prompt=prompt, metadata=metadata, project_root=project_root
             )
 
         tools['update_task'] = ToolDefinition(
@@ -401,7 +402,7 @@ class BaseStage:
             parent_id: str, title: str | None = None, description: str | None = None
         ):
             return await taskmaster.add_subtask(
-                parent_id=parent_id, title=title, description=description, project_root=project_id
+                parent_id=parent_id, title=title, description=description, project_root=project_root
             )
 
         tools['add_subtask'] = ToolDefinition(
@@ -422,7 +423,7 @@ class BaseStage:
         )
 
         async def task_remove_task(id: str):
-            return await taskmaster.remove_task(task_id=id, project_root=project_id)
+            return await taskmaster.remove_task(task_id=id, project_root=project_root)
 
         tools['remove_task'] = ToolDefinition(
             name='remove_task',
@@ -441,7 +442,7 @@ class BaseStage:
 
         async def add_dependency(id: str, depends_on: str):
             return await taskmaster.add_dependency(
-                task_id=id, depends_on=depends_on, project_root=project_id
+                task_id=id, depends_on=depends_on, project_root=project_root
             )
 
         tools['add_dependency'] = ToolDefinition(
@@ -462,7 +463,7 @@ class BaseStage:
 
         async def remove_dependency(id: str, depends_on: str):
             return await taskmaster.remove_dependency(
-                task_id=id, depends_on=depends_on, project_root=project_id
+                task_id=id, depends_on=depends_on, project_root=project_root
             )
 
         tools['remove_dependency'] = ToolDefinition(
@@ -487,7 +488,7 @@ class BaseStage:
             return await taskmaster.update_task(
                 task_id=task_id,
                 metadata=json_mod.dumps({'memory_hints': hints}),
-                project_root=project_id,
+                project_root=project_root,
             )
 
         tools['attach_memory_hints'] = ToolDefinition(
