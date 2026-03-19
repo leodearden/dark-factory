@@ -197,6 +197,12 @@ class TestReconRoute:
             html = client.get('/partials/recon').text
         assert 'grid grid-cols-2' in html
 
+    def test_recon_heading_present(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert '<h2' in html
+        assert 'Reconciliation' in html
+
 
 # --- Empty data constants ---
 
