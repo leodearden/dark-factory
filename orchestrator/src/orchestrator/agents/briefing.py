@@ -30,10 +30,7 @@ class BriefingAssembler:
         task_block = self._format_task(task)
 
         # Use absolute path so the agent's Write tool targets the correct location
-        if worktree:
-            plan_path = str(worktree / '.task' / 'plan.json')
-        else:
-            plan_path = '.task/plan.json'
+        plan_path = str(worktree / '.task' / 'plan.json') if worktree else '.task/plan.json'
 
         return f"""\
 {context}

@@ -157,7 +157,7 @@ async def run_eval(
     assignment = TaskAssignment(
         task_id=task_id,
         task=task_def,
-        modules=set(modules),
+        modules=list(modules),
     )
 
     # 4. Set up workflow dependencies

@@ -11,7 +11,7 @@ from itertools import combinations
 from pathlib import Path
 from typing import Any
 
-from orchestrator.agents.invoke import AgentResult, invoke_agent
+from orchestrator.agents.invoke import invoke_agent
 
 from .snapshots import get_diff
 
@@ -115,10 +115,7 @@ Output JSON: {{"winner": "A" or "B" or "tie", "confidence": 0.0-1.0, "reasoning"
 
     # Parse verdict
     try:
-        if result.structured_output:
-            verdict = result.structured_output
-        else:
-            verdict = json.loads(result.output)
+        verdict = result.structured_output or json.loads(result.output)
     except (json.JSONDecodeError, TypeError):
         logger.warning(f'Judge produced unparseable output: {result.output[:200]}')
         verdict = {'winner': 'tie', 'confidence': 0.0, 'reasoning': 'Judge output parse failure'}

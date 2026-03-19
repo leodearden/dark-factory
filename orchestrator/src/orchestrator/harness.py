@@ -516,10 +516,10 @@ Output JSON matching the schema. Every task must appear in the output.
         queue_dir = Path(self.config.escalation.queue_dir)
         if not queue_dir.is_absolute():
             queue_dir = self.config.project_root / queue_dir
-        self._escalation_queue = EscalationQueue(queue_dir)
+        self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-undefined]
         self._escalation_queue.set_notify_callback(self._on_escalation)
 
-        mcp_server = create_server(self._escalation_queue)
+        mcp_server = create_server(self._escalation_queue)  # type: ignore[possibly-undefined]
         host = self.config.escalation.host
         port = self.config.escalation.port
 

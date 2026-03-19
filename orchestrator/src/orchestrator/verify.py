@@ -32,6 +32,7 @@ class VerifyResult:
 
 async def _run_cmd(cmd: str, cwd: Path, timeout: float = 300) -> tuple[int, str]:
     """Run a shell command, return (returncode, combined output)."""
+    proc = None
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -41,9 +42,10 @@ async def _run_cmd(cmd: str, cwd: Path, timeout: float = 300) -> tuple[int, str]
             executable='/bin/bash',
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        return proc.returncode, stdout.decode()
+        return proc.returncode if proc.returncode is not None else 1, stdout.decode()
     except TimeoutError:
-        proc.kill()
+        if proc is not None:
+            proc.kill()
         return 1, f'Command timed out after {timeout}s: {cmd}'
     except Exception as e:
         return 1, f'Command failed: {e}'
