@@ -600,3 +600,23 @@ class TestDiscoverOrchestrators:
         assert '5' in worktrees
         assert 'tmp-backup' not in worktrees
         assert 'task-3' not in worktrees
+
+    def test_single_process_produces_pids_list(self, tmp_path):
+        """Single running orchestrator produces entry with 'pids' list and no 'pid' key."""
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        mock_procs = [{'pid': 1234, 'prd': '/home/leo/prd.md', 'running': True, 'started': 'Mar18'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        entry = result[0]
+        assert 'pids' in entry
+        assert isinstance(entry['pids'], list)
+        assert entry['pids'] == [1234]
+        assert 'pid' not in entry
