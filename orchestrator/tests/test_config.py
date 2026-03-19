@@ -76,6 +76,14 @@ class TestYamlLoading:
         config = load_config(None)
         assert config.max_concurrent_tasks == 7
 
+    def test_load_config_warns_when_no_config_found(self, tmp_path: Path, monkeypatch, caplog):
+        # Empty dir with no config files and no ORCH_CONFIG_PATH
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            load_config(None)
+        assert any('No config file found' in r.message for r in caplog.records)
+
     def test_load_from_yaml(self, tmp_path: Path):
         config_data = {
             'max_concurrent_tasks': 5,
