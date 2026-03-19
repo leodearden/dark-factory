@@ -381,3 +381,29 @@ class TestMainModule:
                 port=9090,
                 reload=True,
             )
+
+
+class TestAriaLivePollingsections:
+    """Tests that all three auto-polling sections have aria-live='polite'."""
+
+    def test_memory_section_has_aria_live_polite(self, client):
+        html = client.get('/').text
+        memory_idx = html.index('hx-get="/partials/memory"')
+        section_html = html[memory_idx - 300:memory_idx + 100]
+        assert 'aria-live="polite"' in section_html
+
+    def test_recon_section_has_aria_live_polite(self, client):
+        html = client.get('/').text
+        recon_idx = html.index('hx-get="/partials/recon"')
+        section_html = html[recon_idx - 300:recon_idx + 100]
+        assert 'aria-live="polite"' in section_html
+
+    def test_orchestrators_section_has_aria_live_polite(self, client):
+        html = client.get('/').text
+        orch_idx = html.index('hx-get="/partials/orchestrators"')
+        section_html = html[orch_idx - 300:orch_idx + 100]
+        assert 'aria-live="polite"' in section_html
+
+    def test_all_three_sections_have_aria_live(self, client):
+        html = client.get('/').text
+        assert html.count('aria-live="polite"') >= 3
