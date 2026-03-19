@@ -300,6 +300,34 @@ class TestSearch:
         assert SourceStore.mem0 in source_stores
         assert len(results) == 1
 
+    @pytest.mark.asyncio
+    async def test_search_graphiti_results_get_inferred_category_when_single_primary(
+        self, service
+    ):
+        """When exactly one GRAPHITI_PRIMARY category is in the filter,
+        Graphiti results should have that category assigned (not left as None)."""
+        from tests.conftest import MockEdge, MockNode
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Auth service depends on Redis',
+                uuid='edge-uuid-1',
+                source_node=MockNode(name='Auth Service'),
+                target_node=MockNode(name='Redis'),
+            ),
+        ])
+        service.mem0.search = AsyncMock(return_value={'results': []})
+
+        results = await service.search(
+            query='Redis',
+            project_id='test',
+            categories=['entities_and_relations'],
+        )
+        assert len(results) == 1
+        assert results[0].source_store == SourceStore.graphiti
+        # Should have the inferred category, not None
+        assert results[0].category == MemoryCategory.entities_and_relations
+
 
 class TestDeleteMemory:
     @pytest.mark.asyncio
