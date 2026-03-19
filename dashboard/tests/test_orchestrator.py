@@ -382,7 +382,7 @@ class TestReadTaskArtifacts:
 
 
 class TestExtractTaskId:
-    """Tests for _extract_task_id — strips 'task-' prefix from worktree directory names."""
+    """Tests for _extract_task_id — normalises worktree directory names to numeric task IDs."""
 
     def test_strips_task_prefix(self):
         """'task-7' returns '7'."""
@@ -390,23 +390,41 @@ class TestExtractTaskId:
 
         assert _extract_task_id('task-7') == '7'
 
-    def test_plain_id_unchanged(self):
-        """Plain '7' returns '7' unchanged."""
+    def test_plain_numeric_unchanged(self):
+        """Plain numeric string '33' returns '33' unchanged."""
         from dashboard.data.orchestrator import _extract_task_id
 
-        assert _extract_task_id('7') == '7'
+        assert _extract_task_id('33') == '33'
 
-    def test_task_prefix_only_returns_empty(self):
-        """'task-' with no suffix returns empty string."""
+    def test_multi_digit_task_prefix(self):
+        """'task-123' returns '123'."""
         from dashboard.data.orchestrator import _extract_task_id
 
-        assert _extract_task_id('task-') == ''
+        assert _extract_task_id('task-123') == '123'
 
-    def test_non_numeric_suffix(self):
-        """'task-abc' returns 'abc'."""
+    def test_task_prefix_only_returns_none(self):
+        """'task-' with empty suffix returns None (invalid)."""
         from dashboard.data.orchestrator import _extract_task_id
 
-        assert _extract_task_id('task-abc') == 'abc'
+        assert _extract_task_id('task-') is None
+
+    def test_empty_string_returns_none(self):
+        """Empty string returns None."""
+        from dashboard.data.orchestrator import _extract_task_id
+
+        assert _extract_task_id('') is None
+
+    def test_non_task_dir_returns_none(self):
+        """'random-dir' returns None (non-task directory excluded)."""
+        from dashboard.data.orchestrator import _extract_task_id
+
+        assert _extract_task_id('random-dir') is None
+
+    def test_non_numeric_suffix_returns_none(self):
+        """'task-abc' returns None (non-numeric suffix excluded)."""
+        from dashboard.data.orchestrator import _extract_task_id
+
+        assert _extract_task_id('task-abc') is None
 
 
 class TestDiscoverOrchestrators:
