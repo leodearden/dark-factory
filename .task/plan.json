@@ -1,119 +1,154 @@
 {
-  "task_id": "40",
-  "title": "Add ARIA labels to status indicator dots and auto-updating sections",
+  "task_id": "41",
+  "title": "Extract duplicated badge color logic into Jinja2 macros",
   "files": [
+    "dashboard/src/dashboard/templates/macros/badges.html",
+    "dashboard/tests/test_badge_macros.py",
+    "dashboard/src/dashboard/templates/partials/tasks.html",
+    "dashboard/src/dashboard/templates/partials/orchestrators.html",
     "dashboard/src/dashboard/templates/partials/recon.html",
-    "dashboard/src/dashboard/templates/index.html",
-    "dashboard/tests/test_recon_panel.py",
-    "dashboard/tests/test_app.py"
+    "dashboard/src/dashboard/templates/partials/memory.html"
   ],
   "modules": [
+    "dashboard/src/dashboard/templates/macros",
     "dashboard/src/dashboard/templates/partials",
-    "dashboard/src/dashboard/templates",
     "dashboard/tests"
   ],
-  "analysis": "After thorough codebase exploration, memory.html is ALREADY FULLY IMPLEMENTED: all 4 status dots have role='status' and dynamic aria-label (Graphiti/Mem0/Taskmaster connected/disconnected, Write Queue healthy/pending/dead letters), and test_memory_partial.py has TestMemoryDotAriaLabels with 11 passing tests. Two files still need changes:\n\n1. **recon.html** \u2014 Three groups of status badges lack aria-label:\n   - Burst state badges (lines 38, 40): <span> with 'bursting'/'idle' text, colored bg-orange-600/bg-gray-600\n   - Verdict severity badges (lines 82-91): ok/minor/moderate/serious spans, colored green/yellow/orange/red\n   - Run status badges (lines 125-135): completed/running/failed/rolled_back/circuit_breaker spans\n   All are inline text badges within tables/cards \u2014 they have visible text but no aria-label for semantic context.\n\n2. **index.html** \u2014 Three HTMX-polled <section> elements (memory at line 6, recon at line 19, orchestrators at line 32) use hx-trigger='every Ns' + hx-swap='morph:innerHTML'. No aria-live attribute means screen readers won't announce content updates.\n\nTest infrastructure: pytest with Starlette TestClient, mocked async data functions. test_recon_panel.py has _patch_recon_data() helper (lines 148-180) and MOCK_BURST_STATE/MOCK_VERDICT/MOCK_RUNS constants. test_app.py has TestHtmxTimeout (lines 334-356) with section-extraction pattern for index.html assertions.",
-  "prerequisites": [],
+  "analysis": "Badge color logic is duplicated ~20 times across 4 partial templates. Each uses long if/elif chains mapping status/severity strings to Tailwind bg-color classes. Five semantic badge domains exist: task status (tasks.html — 5 branches, NO aria-labels), orchestrator status (orchestrators.html — boolean-derived running/completed, WITH aria-labels), burst state (recon.html — bursting/idle, WITH aria-labels), verdict severity (recon.html — 5 branches, WITH aria-labels), run status (recon.html — 6 branches, WITH aria-labels). Memory.html has 3 duplicated indicator dots (binary connected/disconnected) plus 1 tri-state queue dot.\n\nSemantic conflict: 'running' maps to bg-green-600 in orchestrators (meaning 'alive/healthy') but bg-blue-600 in recon runs (meaning 'in progress'). Resolved via optional color override parameter on status_badge.\n\nNOT extracted: (a) Write Queue 3-state health dot — 3 colors + 3 distinct aria-labels, doesn't fit boolean indicator_dot. (b) Progress bar div segments in orchestrators.html — structural HTML differs (div + width style). (c) Count badge pill in orchestrators.html — different styling.\n\nExisting test coverage: 42+ integration tests across test_orchestrator_panel.py, test_recon_panel.py, test_memory_partial.py validate badge colors, aria-labels, and text. These serve as the regression safety net. Zero modifications to existing tests required.\n\nJinja2Templates directory is configured as _pkg_dir/'templates' (app.py line 28), so '{% from \"macros/badges.html\" import ... %}' resolves automatically with no app.py changes.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Create the macros/ directory under templates/ (mkdir -p dashboard/src/dashboard/templates/macros)",
+      "status": "pending",
+      "commit": null,
+      "tests": []
+    }
+  ],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing tests in test_recon_panel.py: new TestReconBurstBadgeAria class with 3 tests. (1) test_bursting_badge_has_aria_label \u2014 using MOCK_BURST_STATE (agent-1 bursting, agent-2 idle), assert 'aria-label=\"agent-1 bursting\"' in rendered HTML. (2) test_idle_badge_has_aria_label \u2014 assert 'aria-label=\"agent-2 idle\"'. (3) test_no_burst_aria_when_empty \u2014 with burst_state=[], assert no burst badge aria-labels appear. Reuse _patch_recon_data helper.",
-      "status": "done",
-      "commit": "9da7900"
+      "description": "Write failing unit tests for status_badge macro in dashboard/tests/test_badge_macros.py. Create a jinja2_env fixture that imports dashboard.app.templates.env. Test class TestStatusBadge renders via env.from_string('{% from \"macros/badges.html\" import status_badge %}{{ status_badge(...) }}'). Tests: (1) test_done_green — 'done' produces bg-green-600; (2) test_in_progress_blue — 'in-progress' produces bg-blue-600; (3) test_pending_yellow — 'pending' produces bg-yellow-600; (4) test_blocked_red — 'blocked' produces bg-red-600; (5) test_running_blue — 'running' produces bg-blue-600; (6) test_completed_green — 'completed' produces bg-green-600; (7) test_failed_red — 'failed' produces bg-red-600; (8) test_bursting_orange — 'bursting' produces bg-orange-600; (9) test_circuit_breaker_purple — 'circuit_breaker' produces bg-purple-600; (10) test_unknown_fallback_gray — 'xyz' produces bg-gray-600; (11) test_renders_status_text — badge contains status as visible text; (12) test_no_aria_label_by_default — aria_label not in output when called as status_badge(status); (13) test_aria_label_with_prefix — status_badge('done', aria_label='Run status') produces aria-label=\"Run status: done\"; (14) test_color_override — status_badge('running', color='bg-green-600') uses green not blue; (15) test_badge_span_classes — output contains 'inline-block px-2 py-0.5 text-xs font-medium rounded' and 'text-white'.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Add aria-label to burst state badge spans in recon.html. Line 38 bursting span: add aria-label=\"{{ agent.agent_id }} bursting\". Line 40 idle span: add aria-label=\"{{ agent.agent_id }} idle\".",
-      "status": "done",
-      "commit": "8f10050"
+      "description": "Create badges.html in macros/ with status_badge(status, aria_label=None, color=None) macro. Color map dict: done/completed->bg-green-600, in-progress/running->bg-blue-600, pending->bg-yellow-600, blocked/failed->bg-red-600, cancelled/deferred/idle->bg-gray-600, bursting/rolled_back->bg-orange-600, circuit_breaker->bg-purple-600. Uses 'color if color else colors.get(status, \"bg-gray-600\")' for the bg class. Conditionally renders aria-label only if aria_label is not None: {% if aria_label %}aria-label=\"{{ aria_label }}: {{ status }}\"{% endif %}. Renders <span> with standard badge classes.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write failing tests in test_recon_panel.py: new TestReconVerdictBadgeAria class with 4 tests. (1) test_ok_verdict_has_aria_label \u2014 with verdict severity='ok', assert 'aria-label=\"Verdict: ok\"' in HTML. (2) test_minor_verdict_has_aria_label \u2014 verdict severity='minor'. (3) test_serious_verdict_has_aria_label \u2014 verdict severity='serious'. (4) test_no_verdict_aria_when_none \u2014 verdict=None, assert no verdict aria-label. Reuse _patch_recon_data with verdict overrides.",
-      "status": "done",
-      "commit": "cbdd4be"
+      "description": "Write failing unit tests for severity_badge macro in test_badge_macros.py. TestSeverityBadge class: (1) test_ok_green — 'ok' produces bg-green-600; (2) test_minor_yellow — 'minor' produces bg-yellow-600; (3) test_moderate_orange — 'moderate' produces bg-orange-600; (4) test_serious_red — 'serious' produces bg-red-600; (5) test_unknown_fallback_gray — 'xyz' produces bg-gray-600; (6) test_renders_severity_text — output contains severity string; (7) test_no_aria_label_by_default — no aria-label when called as severity_badge(severity); (8) test_aria_label_with_prefix — severity_badge('ok', 'Verdict severity') produces aria-label=\"Verdict severity: ok\".",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Add aria-label to verdict severity badge spans in recon.html. Lines 82, 84, 86, 88, 90: add aria-label=\"Verdict: {{ verdict.severity }}\" to each severity span. The prefix 'Verdict:' disambiguates since raw text like 'ok' is meaningless without context.",
-      "status": "done",
-      "commit": "8f10050"
+      "description": "Add severity_badge(severity, aria_label=None) macro to badges.html. Color map: ok->bg-green-600, minor->bg-yellow-600, moderate->bg-orange-600, serious->bg-red-600. Fallback: bg-gray-600. Same <span> structure and conditional aria-label pattern as status_badge.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write failing tests in test_recon_panel.py: new TestReconRunStatusBadgeAria class with 4 tests. (1) test_completed_run_has_aria_label \u2014 assert 'aria-label=\"Run completed\"'. (2) test_running_run_has_aria_label \u2014 run with status='running'. (3) test_failed_run_has_aria_label \u2014 run with status='failed'. (4) test_no_run_aria_when_empty \u2014 runs=[], no run status aria-labels. Reuse _patch_recon_data with runs overrides.",
-      "status": "done",
-      "commit": "cbdd4be"
+      "description": "Write failing unit tests for indicator_dot macro in test_badge_macros.py. TestIndicatorDot class: (1) test_connected_green — connected=true produces bg-green-500; (2) test_disconnected_red — connected=false produces bg-red-500; (3) test_connected_aria_label — indicator_dot(true, 'Graphiti') produces aria-label=\"Graphiti connected\"; (4) test_disconnected_aria_label — indicator_dot(false, 'Mem0') produces aria-label=\"Mem0 disconnected\"; (5) test_role_status — output contains role=\"status\"; (6) test_dot_classes — output contains 'w-3 h-3 rounded-full'; (7) test_renders_div — output uses <div> not <span>.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Add aria-label to run status badge spans in recon.html. Lines 125, 127, 129, 131, 133, 135: add aria-label=\"Run {{ run.status }}\" to each status span. The 'Run' prefix provides table context.",
-      "status": "done",
-      "commit": "8f10050"
+      "description": "Add indicator_dot(connected, label) macro to badges.html. Renders <div class=\"w-3 h-3 rounded-full {% if connected %}bg-green-500{% else %}bg-red-500{% endif %}\" role=\"status\" aria-label=\"{{ label }} {% if connected %}connected{% else %}disconnected{% endif %}\"></div>.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-7",
       "type": "test",
-      "description": "Write failing tests in test_app.py: new TestAriaLivePolling class with 4 tests. (1) test_memory_section_has_aria_live \u2014 fetch '/', locate 'hx-get=\"/partials/memory\"' section, assert 'aria-live=\"polite\"' in surrounding HTML. (2) test_recon_section_has_aria_live \u2014 same for /partials/recon. (3) test_orchestrators_section_has_aria_live \u2014 same for /partials/orchestrators. (4) test_three_aria_live_regions \u2014 assert html.count('aria-live=\"polite\"') == 3. Follow TestHtmxTimeout section-extraction pattern (find hx-get index, extract html[idx-200:idx+500]).",
-      "status": "done",
-      "commit": "60ff2c4"
+      "description": "Write failing structural tests in test_badge_macros.py verifying templates import macros after refactoring. TestTemplateMacroImports class reads template files directly via pathlib. (1) test_tasks_imports_status_badge — tasks.html contains \"from 'macros/badges.html' import status_badge\"; (2) test_orchestrators_imports_status_badge — orchestrators.html contains same import; (3) test_recon_imports_badges — recon.html contains import of both status_badge and severity_badge; (4) test_memory_imports_indicator_dot — memory.html contains import of indicator_dot. All 4 fail before refactoring.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-8",
       "type": "impl",
-      "description": "Add aria-live='polite' attribute to each of the three <section> elements in index.html. Line 6 memory section: <section aria-live=\"polite\" hx-get=... >. Line 19 recon section: same. Line 32 orchestrators section: same.",
-      "status": "done",
-      "commit": "f1f3487"
+      "description": "Refactor tasks.html: add {% from 'macros/badges.html' import status_badge %} at top. Replace 12-line if/elif/else badge block (lines 20-31) with {{ status_badge(task.status) }}. No aria_label passed — tasks.html badges currently lack aria-labels. Run test_orchestrator_panel.py (tasks.html is {% include %}'d by orchestrators.html) to verify all existing tests pass. Step-7 test_tasks_imports_status_badge now passes.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-9",
+      "type": "impl",
+      "description": "Refactor orchestrators.html: add {% from 'macros/badges.html' import status_badge %} at top. Replace running/completed if/else block (lines 12-16) with {{ status_badge('running' if orch.running else 'completed', aria_label='Orchestrator status', color='bg-green-600' if orch.running else 'bg-gray-600') }}. Color override preserves existing green=running, gray=completed behavior. Progress bar stays inline. Run test_orchestrator_panel.py to verify all tests pass including TestOrchestratorBadgeAriaLabels. Step-7 test_orchestrators_imports_status_badge now passes.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Refactor recon.html: add {% from 'macros/badges.html' import status_badge, severity_badge %} at top. (1) Burst state (lines 37-41): replace if/else with {{ status_badge(agent.state, aria_label='Burst state') }}. (2) Verdict severity (lines 81-91): replace 10-line if/elif chain with {{ severity_badge(verdict.severity, aria_label='Verdict severity') }}. (3) Run status (lines 124-136): replace 12-line if/elif chain with {{ status_badge(run.status, aria_label='Run status') }}. Run test_recon_panel.py to verify all tests pass including TestReconBadgeAriaLabels (11 tests). Step-7 test_recon_imports_badges now passes.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-11",
+      "type": "impl",
+      "description": "Refactor memory.html: add {% from 'macros/badges.html' import indicator_dot %} at top. (1) Graphiti dot (line 13): replace inline div with {{ indicator_dot(status.graphiti.connected|default(false), 'Graphiti') }}. (2) Mem0 dot (line 23): replace with {{ indicator_dot(status.mem0.connected|default(false), 'Mem0') }}. (3) Taskmaster dot (line 33): replace with {{ indicator_dot(status.taskmaster is defined and status.taskmaster.connected|default(false), 'Taskmaster') }}. Leave Write Queue 3-state dot inline. Run test_memory_partial.py to verify all tests pass including TestMemoryDotAriaLabels (11 tests). Step-7 test_memory_imports_indicator_dot now passes.",
+      "status": "pending",
+      "commit": null
     }
   ],
   "design_decisions": [
     {
-      "decision": "Skip memory.html \u2014 already fully implemented with tests",
-      "rationale": "memory.html already has role='status' and dynamic aria-label on all 4 status dots (lines 13, 23, 33, 46). test_memory_partial.py has TestMemoryDotAriaLabels (lines 376-499) with 11 passing tests covering connected/disconnected for Graphiti/Mem0/Taskmaster and healthy/pending/dead-letters for Write Queue. No work needed."
+      "decision": "status_badge and severity_badge use optional aria_label parameter (default None = no attribute)",
+      "rationale": "tasks.html badges currently have no aria-labels while orchestrators.html and recon.html badges do. Making aria_label optional (None omits the attribute entirely) preserves exact current behavior for each template. This is a pure refactoring with zero behavioral changes."
     },
     {
-      "decision": "Use compound aria-labels with prefixes for recon badges: 'agent-id state', 'Verdict: severity', 'Run status'",
-      "rationale": "Burst badges include agent_id because the badge is in a table row where agent_id is in a sibling cell \u2014 screen readers navigating non-linearly need full context. Verdict badges use 'Verdict:' prefix because raw text 'ok' or 'minor' is ambiguous. Run badges use 'Run' prefix because 'completed' alone doesn't convey what completed."
+      "decision": "status_badge accepts optional color override parameter to resolve semantic conflicts",
+      "rationale": "'running' means 'alive/healthy' in orchestrators (green) but 'in-progress' in recon runs (blue). Rather than maintaining multiple color maps, a simple color override at the call site keeps the common case clean while handling the one collision explicitly: status_badge('running', color='bg-green-600' if orch.running else ...). Existing tests assert bg-green-600 for running orchestrators, so this preserves exact behavior."
     },
     {
-      "decision": "Do not add role='status' to recon badges",
-      "rationale": "Memory dots are empty <div> elements invisible to screen readers without role='status'. Recon badges are <span> elements with visible text. Adding role='status' would create live regions that re-announce on every 15-second htmx poll, overwhelming screen reader users. aria-label alone provides identification."
+      "decision": "Single comprehensive color map in status_badge covering all badge domains",
+      "rationale": "Burst states (bursting/idle), run statuses (rolled_back/circuit_breaker), orchestrator statuses, and task statuses all use identical badge HTML structure. A unified 13-entry map with gray fallback eliminates domain-specific badge macros. Only severity_badge warrants a separate macro because verdict severities have a distinct graduated color scale (ok/minor/moderate/serious)."
     },
     {
-      "decision": "Place aria-live='polite' on <section> elements, not inner content",
-      "rationale": "The <section> is the htmx swap target (hx-swap='morph:innerHTML'). Its content is replaced every 10-15 seconds. aria-live on the section means screen readers detect changes after each swap. Using 'polite' (not 'assertive') avoids interrupting the user during routine polling."
+      "decision": "Leave Write Queue 3-state indicator dot inline in memory.html",
+      "rationale": "Write Queue uses 3 states (dead->bg-red-500, pending->bg-yellow-500, healthy->bg-green-500) with 3 distinct aria-labels. This doesn't fit the binary indicator_dot(connected, label) signature. A specialized tri-state macro for a single use case would add complexity without reducing duplication."
     },
     {
-      "decision": "Test ARIA attributes via HTML string assertions, not DOM parsing",
-      "rationale": "All 400+ existing assertions use string-in-HTML checks. Introducing BeautifulSoup/lxml would add a foreign dependency. Exact string assertions like 'aria-label=\"Verdict: ok\"' are precise, fast, and consistent with codebase conventions."
+      "decision": "Leave progress bar segment colors in orchestrators.html as inline HTML",
+      "rationale": "Progress bar segments are <div> elements with dynamic width-percentage styles, structurally different from badge <span> elements. They share color values with badges but have no duplicated HTML pattern to consolidate."
+    },
+    {
+      "decision": "Test macros in isolation via app's Jinja2 environment with env.from_string()",
+      "rationale": "Reuses the same Jinja2 environment and FileSystemLoader as the app. Fast unit-level tests render macros directly without HTTP routes or mock data. The 42+ existing integration tests then guard against regressions during template refactoring (steps 8-11)."
     }
   ],
   "reuse": [
     {
-      "what": "_patch_recon_data() helper and MOCK_* constants",
-      "where": "dashboard/tests/test_recon_panel.py lines 101-180",
-      "how": "All new recon tests reuse _patch_recon_data() with targeted overrides. MOCK_BURST_STATE (agent-1 bursting, agent-2 idle), MOCK_VERDICT (severity='ok'), MOCK_RUNS (status='completed') provide default data. Override-specific values for testing other severities/statuses (e.g., _patch_recon_data(verdict={'severity': 'serious', ...}))."
+      "what": "Existing integration tests as regression safety net (42+ tests across 3 files)",
+      "where": "test_orchestrator_panel.py (TestOrchestratorBadgeAriaLabels 4 tests, TestTaskTable 2 badge tests, TestOrchestratorRouteBasics badge assertions), test_recon_panel.py (TestReconBadgeAriaLabels 11 tests, TestReconRoute badge color tests), test_memory_partial.py (TestMemoryPartialDots 7 tests, TestMemoryDotAriaLabels 11 tests)",
+      "how": "These tests assert exact CSS class strings (bg-green-600, bg-red-500, etc.) and exact aria-label attributes in rendered HTML. After replacing inline badge logic with macro calls in steps 8-11, all must pass with zero modifications, proving the refactoring preserves identical output."
     },
     {
-      "what": "TestHtmxTimeout section-extraction pattern",
-      "where": "dashboard/tests/test_app.py lines 334-356",
-      "how": "TestAriaLivePolling uses the identical technique: html.index('hx-get=\"/partials/X\"'), extract html[idx-200:idx+500], assert attribute in window. Proven approach for testing per-section attributes in index.html without DOM parsing."
+      "what": "Jinja2Templates environment auto-resolves macros/ subdirectory path",
+      "where": "dashboard/src/dashboard/app.py line 28 — Jinja2Templates(directory=str(_pkg_dir / 'templates'))",
+      "how": "Since macros/ is a subdirectory of the configured templates directory, {% from 'macros/badges.html' import ... %} resolves automatically. No app.py changes or additional template path configuration needed."
     },
     {
-      "what": "TestMemoryDotAriaLabels as reference pattern",
-      "where": "dashboard/tests/test_memory_partial.py lines 376-499",
-      "how": "Proven pattern: one test per label value, assert exact 'aria-label=\"X\"' string in rendered HTML. Recon badge tests follow the same structure with recon-specific mock data and patches."
+      "what": "Shared badge HTML structure pattern across all templates",
+      "where": "All 4 partial templates — 20 instances of identical span structure",
+      "how": "Every status/severity badge uses: <span class=\"inline-block px-2 py-0.5 text-xs font-medium rounded {color} text-white\" [aria-label]>{text}</span>. Every indicator dot uses: <div class=\"w-3 h-3 rounded-full {color}\" role=\"status\" aria-label=\"...\"></div>. Macros encapsulate these two structures."
     },
     {
-      "what": "conftest.py client fixture",
-      "where": "dashboard/tests/conftest.py lines 96-102",
-      "how": "All new test classes use the shared 'client' fixture providing Starlette TestClient with proper FastAPI app lifecycle."
+      "what": "conftest.py client fixture and mock data helpers",
+      "where": "dashboard/tests/conftest.py (client fixture), test_orchestrator_panel.py (_patch_orchestrator_data), test_recon_panel.py (_patch_recon_data, MOCK_* constants), test_memory_partial.py (_ONLINE_STATUS)",
+      "how": "Existing integration tests and helpers remain unchanged. New macro unit tests use direct Jinja2 rendering (no route mocking needed)."
     }
   ]
 }
