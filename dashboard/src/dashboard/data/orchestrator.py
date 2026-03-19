@@ -218,7 +218,7 @@ def discover_orchestrators(config: DashboardConfig) -> list[dict]:
             if subdir.is_dir():
                 artifacts = read_task_artifacts(subdir)
                 metadata = artifacts.get('metadata')
-                if metadata and metadata.get('task_id') is not None:
+                if isinstance(metadata, dict) and metadata.get('task_id') is not None:
                     key = str(metadata['task_id'])
                 else:
                     key = subdir.name
