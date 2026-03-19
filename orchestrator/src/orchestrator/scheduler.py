@@ -284,6 +284,8 @@ class Scheduler:
         for task in candidates:
             modules = self._get_modules(task)
             task_id = str(task.get('id', ''))
+            if self.lock_table.is_held(task_id):
+                continue
             if self.lock_table.try_acquire(task_id, modules):
                 return TaskAssignment(task_id=task_id, task=task, modules=modules)
 
