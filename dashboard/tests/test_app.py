@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
 
@@ -101,3 +102,94 @@ class TestMemoryPartialIntegration:
             assert resp.status_code == 200
             html = resp.text
             assert 'Offline' in html
+
+
+def _patch_recon_data(
+    buffer_stats=None,
+    burst_state=None,
+    watermarks=None,
+    verdict=None,
+    runs=None,
+):
+    """Return an ExitStack that patches all 5 recon data functions."""
+    defaults = {
+        'buffer_stats': buffer_stats if buffer_stats is not None else {
+            'buffered_count': 3, 'oldest_event_age_seconds': 600.0,
+        },
+        'burst_state': burst_state if burst_state is not None else [
+            {
+                'agent_id': 'agent-1',
+                'state': 'bursting',
+                'last_write_at': '2026-03-19T00:00:00+00:00',
+                'burst_started_at': '2026-03-19T00:00:00+00:00',
+            },
+        ],
+        'watermarks': watermarks if watermarks is not None else {
+            'last_full_run_completed': '2026-03-19T10:00:00+00:00',
+        },
+        'verdict': verdict,
+        'runs': runs if runs is not None else [
+            {
+                'id': 'run-001',
+                'run_type': 'full',
+                'trigger_reason': 'staleness_timer',
+                'started_at': '2026-03-19T08:00:00+00:00',
+                'completed_at': '2026-03-19T08:05:00+00:00',
+                'events_processed': 7,
+                'status': 'completed',
+                'duration_seconds': 300.0,
+            },
+        ],
+    }
+    stack = ExitStack()
+    stack.enter_context(patch(
+        'dashboard.app.get_buffer_stats',
+        new_callable=AsyncMock,
+        return_value=defaults['buffer_stats'],
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_burst_state',
+        new_callable=AsyncMock,
+        return_value=defaults['burst_state'],
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_watermarks',
+        new_callable=AsyncMock,
+        return_value=defaults['watermarks'],
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_latest_verdict',
+        new_callable=AsyncMock,
+        return_value=defaults['verdict'],
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_recent_runs',
+        new_callable=AsyncMock,
+        return_value=defaults['runs'],
+    ))
+    return stack
+
+
+class TestReconPartialIntegration:
+    """Integration tests for GET /partials/recon."""
+
+    def test_recon_with_data(self, client):
+        with _patch_recon_data():
+            resp = client.get('/partials/recon')
+            assert resp.status_code == 200
+            assert 'text/html' in resp.headers['content-type']
+            html = resp.text
+            assert 'staleness_timer' in html
+            assert 'completed' in html
+
+    def test_recon_empty(self, client):
+        with _patch_recon_data(
+            buffer_stats={'buffered_count': 0, 'oldest_event_age_seconds': None},
+            burst_state=[],
+            watermarks={},
+            runs=[],
+        ):
+            resp = client.get('/partials/recon')
+            assert resp.status_code == 200
+            html = resp.text
+            assert 'No reconciliation runs' in html
