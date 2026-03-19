@@ -193,3 +193,52 @@ class TestReconPartialIntegration:
             assert resp.status_code == 200
             html = resp.text
             assert 'No reconciliation runs' in html
+
+
+_MOCK_ORCHESTRATOR = {
+    'pid': 1234,
+    'prd': '/home/leo/src/dark-factory/prd/dashboard.md',
+    'running': True,
+    'started': 'Mar18',
+    'tasks': [
+        {'id': 1, 'title': 'Setup infra', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+        {'id': 2, 'title': 'Build API', 'status': 'in-progress', 'priority': 'medium', 'dependencies': [1], 'metadata': {}},
+    ],
+    'worktrees': {
+        '1': {
+            'phase': 'DONE',
+            'plan_progress': {'done': 3, 'total': 3},
+            'iteration_count': 2,
+            'review_summary': '2/2 passed',
+            'modules': ['infra/'],
+        },
+    },
+    'summary': {
+        'total': 2,
+        'done': 1,
+        'in_progress': 1,
+        'blocked': 0,
+        'pending': 0,
+    },
+}
+
+
+class TestOrchestratorsPartialIntegration:
+    """Integration tests for GET /partials/orchestrators."""
+
+    def test_orchestrators_with_data(self, client):
+        with patch('dashboard.app.discover_orchestrators', return_value=[_MOCK_ORCHESTRATOR]):
+            resp = client.get('/partials/orchestrators')
+            assert resp.status_code == 200
+            assert 'text/html' in resp.headers['content-type']
+            html = resp.text
+            assert '1234' in html
+            assert 'dashboard.md' in html
+            assert '1 done' in html
+
+    def test_orchestrators_empty(self, client):
+        with patch('dashboard.app.discover_orchestrators', return_value=[]):
+            resp = client.get('/partials/orchestrators')
+            assert resp.status_code == 200
+            html = resp.text
+            assert 'No orchestrators detected' in html
