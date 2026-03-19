@@ -1,8 +1,6 @@
 """Tests for targeted reconciliation."""
 
-import uuid
-from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -65,6 +63,21 @@ def reconciler(mock_memory_service, mock_taskmaster, journal, config):
 
 
 @pytest.mark.asyncio
+async def test_on_task_done_fast_path_write(reconciler, mock_memory_service):
+    """Done transition writes completion fact immediately before search/verify."""
+    task_before = {'id': '1', 'title': 'Add tests', 'status': 'in-progress', 'description': 'Test suite'}
+    result = await reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project', task_before=task_before
+    )
+    # First call should be the fast-path write (before any search)
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    assert 'observations_and_summaries' in str(first_call)
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
 async def test_on_task_done_sparse_knowledge(reconciler, mock_memory_service):
     """When task is done and knowledge is sparse, should verify and write."""
     task_before = {'id': '1', 'title': 'Add tests', 'status': 'in-progress', 'description': 'Test suite'}
@@ -74,7 +87,8 @@ async def test_on_task_done_sparse_knowledge(reconciler, mock_memory_service):
     )
 
     assert any(a['type'] == 'knowledge_captured' for a in result.get('actions', []))
-    mock_memory_service.add_memory.assert_called_once()
+    # Fast-path write + verification write = at least 2 calls
+    assert mock_memory_service.add_memory.call_count >= 2
 
 
 @pytest.mark.asyncio
@@ -86,7 +100,7 @@ async def test_on_task_done_rich_knowledge(reconciler, mock_memory_service):
         MemoryResult(id='3', content='test3', source_store='graphiti'),
     ])
 
-    result = await reconciler.reconcile_task(
+    await reconciler.reconcile_task(
         task_id='1', transition='done', project_id='test-project',
         task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
     )

@@ -7,7 +7,7 @@ of a post_process_callback parameter for dual-write routing after extraction.
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
@@ -109,7 +109,7 @@ class QueueService:
                     source=source,
                     group_id=group_id,
                     source_description=source_description,
-                    reference_time=datetime.now(timezone.utc),
+                    reference_time=datetime.now(UTC),
                     uuid=uuid,
                 )
 

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from fused_memory.config.schema import ReconciliationConfig
@@ -103,9 +104,19 @@ class BaseStage:
             terminal_tool='stage_complete',
         )
 
-        started = datetime.now(timezone.utc)
-        result, journal_entries = await agent.run(payload)
-        completed = datetime.now(timezone.utc)
+        started = datetime.now(UTC)
+        try:
+            result, journal_entries = await asyncio.wait_for(
+                agent.run(payload),
+                timeout=self.config.stage_timeout_seconds,
+            )
+        except TimeoutError:
+            logger.error(
+                f'Stage {self.stage_id.value} timed out after {self.config.stage_timeout_seconds}s'
+            )
+            result = {'warning': 'stage_timeout'}
+            journal_entries = agent._journal_entries
+        completed = datetime.now(UTC)
 
         # Persist journal entries
         for entry in journal_entries:

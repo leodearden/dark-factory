@@ -1,8 +1,7 @@
 """Tests for reconciliation journal (SQLite persistence)."""
 
 import uuid
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import UTC, datetime
 
 import pytest
 import pytest_asyncio
@@ -36,7 +35,7 @@ async def test_watermark_default(journal):
 
 @pytest.mark.asyncio
 async def test_watermark_roundtrip(journal):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     wm = Watermark(
         project_id='test-project',
         last_full_run_id='run-123',
@@ -58,7 +57,7 @@ async def test_run_lifecycle(journal):
         project_id='test-project',
         run_type='full',
         trigger_reason='buffer_size:10',
-        started_at=datetime.now(timezone.utc),
+        started_at=datetime.now(UTC),
         events_processed=10,
         status='running',
     )
@@ -87,7 +86,7 @@ async def test_journal_entries(journal):
         id=str(uuid.uuid4()),
         run_id=run_id,
         stage=StageId.memory_consolidator,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
         operation='delete_memory',
         target_system='mem0',
         before_state={'id': '123', 'content': 'old'},
@@ -113,14 +112,14 @@ async def test_judge_verdict(journal):
         project_id='test-project',
         run_type='full',
         trigger_reason='test',
-        started_at=datetime.now(timezone.utc),
+        started_at=datetime.now(UTC),
         status='completed',
     )
     await journal.start_run(run)
 
     verdict = JudgeVerdict(
         run_id=run_id,
-        reviewed_at=datetime.now(timezone.utc),
+        reviewed_at=datetime.now(UTC),
         severity='ok',
         findings=[],
         action_taken='none',
@@ -140,7 +139,7 @@ async def test_recent_runs(journal):
             project_id='test-project',
             run_type='full',
             trigger_reason=f'test_{i}',
-            started_at=datetime.now(timezone.utc),
+            started_at=datetime.now(UTC),
             status='running',
         )
         await journal.start_run(run)
@@ -152,7 +151,7 @@ async def test_recent_runs(journal):
 @pytest.mark.asyncio
 async def test_stats(journal):
     run_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     run = ReconciliationRun(
         id=run_id,
         project_id='test-project',
@@ -179,7 +178,7 @@ async def test_get_nonexistent_run(journal):
 @pytest.mark.asyncio
 async def test_stage_reports_roundtrip(journal):
     run_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     run = ReconciliationRun(
         id=run_id,
         project_id='test-project',

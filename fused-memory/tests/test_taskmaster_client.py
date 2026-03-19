@@ -4,6 +4,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from mcp.types import TextContent
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.config.schema import TaskmasterConfig
@@ -31,8 +32,7 @@ def client(config):
 def _mock_tool_result(data: dict):
     """Create a mock MCP tool result."""
     result = MagicMock()
-    text_block = MagicMock()
-    text_block.text = json.dumps(data)
+    text_block = TextContent(type='text', text=json.dumps(data))
     result.content = [text_block]
     return result
 
@@ -146,8 +146,7 @@ async def test_call_tool_non_json_response(client):
     """Non-JSON response should be wrapped."""
     c, session = client
     result = MagicMock()
-    text_block = MagicMock()
-    text_block.text = 'Not JSON'
+    text_block = TextContent(type='text', text='Not JSON')
     result.content = [text_block]
     session.call_tool = AsyncMock(return_value=result)
 

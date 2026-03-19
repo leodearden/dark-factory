@@ -3,7 +3,6 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import VerificationResult
@@ -127,7 +126,7 @@ class CodebaseVerifier:
                     rel = line.replace(str(codebase_root) + '/', '', 1)
                     results.append(rel)
                 return {'pattern': pattern, 'results': results}
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return {'pattern': pattern, 'results': [], 'error': 'timeout'}
             except Exception as e:
                 return {'error': str(e)}

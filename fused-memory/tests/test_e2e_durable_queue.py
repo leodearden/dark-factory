@@ -417,7 +417,7 @@ class TestConcurrencyStress:
 
         # Check that there's backpressure — some items should still be pending
         stats_mid = await svc.durable_queue.get_stats()
-        pending = stats_mid['counts'].get('pending', 0) + stats_mid['counts'].get('in_flight', 0)
+        _ = stats_mid['counts'].get('pending', 0) + stats_mid['counts'].get('in_flight', 0)
         # At least some should be pending since 50 items * 100ms > instant
         # (This may be 0 if workers are very fast, so we just check eventual completion)
 
@@ -442,7 +442,7 @@ class TestConcurrencyStress:
         async def selective_fail(operation, payload):
             nonlocal call_index
             async with lock:
-                idx = call_index
+                _ = call_index
                 call_index += 1
             # Items with index 0-based, every 5th one has 'fail' in content
             if payload.get('should_fail'):

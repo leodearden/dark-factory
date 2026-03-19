@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
@@ -64,6 +64,34 @@ CREATE TABLE IF NOT EXISTS judge_verdicts (
     action_taken TEXT DEFAULT 'none'
 );
 CREATE INDEX IF NOT EXISTS idx_verdicts_reviewed ON judge_verdicts(reviewed_at);
+
+CREATE TABLE IF NOT EXISTS event_buffer (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_source TEXT NOT NULL,
+    agent_id TEXT,
+    timestamp TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'buffered'
+);
+CREATE INDEX IF NOT EXISTS idx_eb_project_status ON event_buffer(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_eb_agent_timestamp ON event_buffer(agent_id, timestamp)
+    WHERE agent_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS reconciliation_locks (
+    project_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS burst_state (
+    agent_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL DEFAULT 'idle',
+    last_write_at TEXT NOT NULL,
+    burst_started_at TEXT
+);
 """
 
 
@@ -162,7 +190,7 @@ class ReconciliationJournal:
         db = self._require_db()
         await db.execute(
             'UPDATE runs SET status = ?, completed_at = ? WHERE id = ?',
-            (status, datetime.now(timezone.utc).isoformat(), run_id),
+            (status, datetime.now(UTC).isoformat(), run_id),
         )
         await db.commit()
 

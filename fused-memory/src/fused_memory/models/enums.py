@@ -1,9 +1,9 @@
 """Enumerations for the fused memory system."""
 
-from enum import Enum
+from enum import StrEnum
 
 
-class MemoryCategory(str, Enum):
+class MemoryCategory(StrEnum):
     """Six taxonomy categories from DESIGN.md."""
 
     entities_and_relations = 'entities_and_relations'
@@ -14,14 +14,14 @@ class MemoryCategory(str, Enum):
     observations_and_summaries = 'observations_and_summaries'
 
 
-class SourceStore(str, Enum):
+class SourceStore(StrEnum):
     """Which backend store a memory lives in."""
 
     graphiti = 'graphiti'
     mem0 = 'mem0'
 
 
-class QueryType(str, Enum):
+class QueryType(StrEnum):
     """Read-router query classification."""
 
     entity_lookup = 'entity_lookup'

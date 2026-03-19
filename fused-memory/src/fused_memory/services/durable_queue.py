@@ -7,11 +7,14 @@ exponential backoff, dead-lettering, and per-group worker pools.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import random
 import time
+from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import Any
 
 import aiosqlite
 
@@ -81,6 +84,7 @@ class DurableWriteQueue:
         semaphore_limit: int = 20,
         max_attempts: int = 5,
         retry_base_seconds: float = 5.0,
+        retry_max_delay_seconds: float = 300.0,
         write_timeout_seconds: float = 120.0,
     ):
         self._data_dir = Path(data_dir)
@@ -88,6 +92,7 @@ class DurableWriteQueue:
         self._workers_per_group = workers_per_group
         self._max_attempts = max_attempts
         self._retry_base_seconds = retry_base_seconds
+        self._retry_max_delay_seconds = retry_max_delay_seconds
         self._write_timeout_seconds = write_timeout_seconds
 
         self._semaphore = asyncio.Semaphore(semaphore_limit)
@@ -224,11 +229,9 @@ class DurableWriteQueue:
             item = await self._claim_next(group_id)
             if item is None:
                 event.clear()
-                try:
-                    # Short poll interval so retries with backoff are picked up promptly
+                # Short poll interval so retries with backoff are picked up promptly
+                with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(event.wait(), timeout=0.5)
-                except asyncio.TimeoutError:
-                    pass
                 continue
             await self._process_item(item)
 
@@ -306,7 +309,11 @@ class DurableWriteQueue:
                 item.id, new_attempts, error_msg,
             )
         else:
-            delay = self._retry_base_seconds * (2 ** (new_attempts - 1))
+            delay = min(
+                self._retry_base_seconds * (2 ** (new_attempts - 1))
+                + random.uniform(0, self._retry_base_seconds),
+                self._retry_max_delay_seconds,
+            )
             next_retry = time.time() + delay
             await self._db.execute(
                 "UPDATE write_queue SET status = 'retry', attempts = ?, "

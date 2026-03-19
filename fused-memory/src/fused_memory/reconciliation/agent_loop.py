@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid as uuid_mod
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Callable
+from datetime import UTC, datetime
+from typing import Any
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import JournalEntry
@@ -87,7 +89,7 @@ class AgentLoop:
 
         tool_schemas = [t.to_anthropic_schema() for t in self.tools.values()]
 
-        for step in range(self.config.agent_max_steps):
+        for _step in range(self.config.agent_max_steps):
             response = await self._call_llm(messages, tool_schemas)
 
             # Check for terminal tool in tool_use blocks
@@ -163,13 +165,20 @@ class AgentLoop:
                 except Exception:
                     before_state = None
 
-        result = await tool.function(**tool_args)
+        try:
+            result = await asyncio.wait_for(
+                tool.function(**tool_args),
+                timeout=self.config.tool_timeout_seconds,
+            )
+        except TimeoutError:
+            logger.warning(f'Tool {tool_name} timed out after {self.config.tool_timeout_seconds}s')
+            result = {'error': f'Tool {tool_name} timed out after {self.config.tool_timeout_seconds}s'}
 
         if tool.is_mutation:
             self._journal_entries.append(
                 JournalEntry(
                     id=str(uuid_mod.uuid4()),
-                    timestamp=datetime.now(timezone.utc),
+                    timestamp=datetime.now(UTC),
                     operation=tool_name,
                     target_system=tool.target_system,
                     before_state=before_state,
@@ -334,16 +343,16 @@ class AgentLoop:
                 stdout=_asyncio.subprocess.PIPE,
                 stderr=_asyncio.subprocess.PIPE,
             )
-        except FileNotFoundError:
+        except FileNotFoundError as exc:
             raise RuntimeError(
                 'Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code'
-            )
+            ) from exc
 
         try:
-            stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=120)
-        except _asyncio.TimeoutError:
+            stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=180)
+        except TimeoutError as exc:
             proc.kill()
-            raise RuntimeError('Claude CLI timed out after 120 seconds')
+            raise RuntimeError('Claude CLI timed out after 180 seconds') from exc
 
         if proc.returncode != 0:
             raise RuntimeError(

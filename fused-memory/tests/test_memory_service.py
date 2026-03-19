@@ -1,6 +1,6 @@
 """Tests for the memory service — unit tests with mocked backends."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

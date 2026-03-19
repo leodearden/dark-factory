@@ -1,21 +1,17 @@
 """Tests for the agent loop."""
 
-import asyncio
 import json
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.reconciliation.agent_loop import (
-    CLAUDE_CLI_RESPONSE_SCHEMA,
     AgentLoop,
     CircuitBreakerError,
     ToolDefinition,
     _CLIResponseAdapter,
-    _TextBlock,
-    _ToolUseBlock,
 )
 
 
@@ -535,6 +531,6 @@ async def test_claude_cli_not_installed():
         terminal_tool='stage_complete',
     )
 
-    with patch('asyncio.create_subprocess_exec', side_effect=FileNotFoundError):
-        with pytest.raises(RuntimeError, match='Claude CLI not found'):
-            await agent.run('test')
+    with patch('asyncio.create_subprocess_exec', side_effect=FileNotFoundError), \
+         pytest.raises(RuntimeError, match='Claude CLI not found'):
+        await agent.run('test')

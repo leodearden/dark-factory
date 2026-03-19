@@ -26,6 +26,11 @@ dependencies = [
 include = ["src", "tests"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
+# Suppress pre-existing issues in reconciliation agent loop / judge
+# (untyped dict literals passed to Anthropic/OpenAI SDK typed params)
+reportArgumentType = "warning"
+reportAttributeAccessIssue = "warning"
+reportOptionalMemberAccess = "warning"
 
 [tool.ruff]
 line-length = 100

@@ -134,7 +134,7 @@ class TestMemoryHints:
             'queries': ['reconciliation pipeline'],
             'entities': [],
         }
-        briefing = await builder.build_briefing(
+        await builder.build_briefing(
             project_id='test',
             memory_hints=hints,
             include_task_tree=False,

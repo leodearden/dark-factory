@@ -1,11 +1,14 @@
 """MCP client proxy to Taskmaster AI server."""
 
+import contextlib
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.types import TextContent
 
 from fused_memory.config.schema import TaskmasterConfig
 
@@ -30,10 +33,16 @@ class TaskmasterBackend:
 
                 env = {**os.environ, 'TASK_MASTER_TOOLS': self.config.tool_mode}
 
+            # Use project_root as subprocess CWD so relative paths in args
+            # (e.g. ./taskmaster-ai/dist/mcp-server.js) resolve correctly
+            # regardless of where the fused-memory server process was started.
+            cwd = self.config.cwd or self.config.project_root or None
+            if cwd:
+                cwd = str(Path(cwd).resolve())
             server_params = StdioServerParameters(
                 command=self.config.command,
                 args=self.config.args,
-                cwd=self.config.cwd or None,
+                cwd=cwd,
                 env=env,
             )
             self._stdio_ctx = stdio_client(server_params)
@@ -53,16 +62,12 @@ class TaskmasterBackend:
     async def _cleanup_contexts(self) -> None:
         """Best-effort cleanup of partially opened async contexts."""
         if self._session_ctx:
-            try:
+            with contextlib.suppress(Exception):
                 await self._session_ctx.__aexit__(None, None, None)
-            except Exception:
-                pass
             self._session_ctx = None
         if self._stdio_ctx:
-            try:
+            with contextlib.suppress(Exception):
                 await self._stdio_ctx.__aexit__(None, None, None)
-            except Exception:
-                pass
             self._stdio_ctx = None
         self._session = None
 
@@ -87,7 +92,7 @@ class TaskmasterBackend:
         # MCP tool results come as content blocks
         if result.content:
             text_parts = [
-                block.text for block in result.content if hasattr(block, 'text')
+                block.text for block in result.content if isinstance(block, TextContent)
             ]
             combined = '\n'.join(text_parts)
             try:

@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+import traceback
+from contextlib import suppress
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
@@ -72,20 +74,55 @@ class ReconciliationHarness:
     async def run_loop(self) -> None:
         """Background loop — check trigger conditions, run pipeline when needed."""
         logger.info('Reconciliation harness background loop started')
+        loop_count = 0
         while True:
             try:
-                for project_id in self.buffer.get_active_projects():
+                for project_id in await self.buffer.get_active_projects():
                     should, reason = await self.buffer.should_trigger(project_id)
                     if should:
                         acquired = await self.buffer.mark_run_active(project_id)
                         if acquired:
+                            heartbeat_task = asyncio.create_task(
+                                self._heartbeat_loop(project_id)
+                            )
                             try:
-                                await self.run_full_cycle(project_id, reason)
+                                await asyncio.wait_for(
+                                    self.run_full_cycle(project_id, reason),
+                                    timeout=self.config.cycle_timeout_seconds,
+                                )
+                            except TimeoutError:
+                                logger.error(
+                                    f'Full cycle timed out after {self.config.cycle_timeout_seconds}s '
+                                    f'for {project_id}'
+                                )
                             finally:
+                                heartbeat_task.cancel()
+                                with suppress(asyncio.CancelledError):
+                                    await heartbeat_task
                                 await self.buffer.mark_run_complete(project_id)
+
+                # Periodic cleanup of drained events (~every 50s / 10 iterations)
+                loop_count += 1
+                if loop_count % 10 == 0:
+                    try:
+                        deleted = await self.buffer.cleanup_drained()
+                        if deleted:
+                            logger.debug(f'Cleaned up {deleted} drained events')
+                    except Exception as e:
+                        logger.warning(f'Drained event cleanup failed: {e}')
+
             except Exception as e:
                 logger.error(f'Reconciliation loop error: {e}')
             await asyncio.sleep(5)
+
+    async def _heartbeat_loop(self, project_id: str) -> None:
+        """Keep the reconciliation lock alive while a run is in progress."""
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await self.buffer.heartbeat(project_id)
+            except Exception as e:
+                logger.warning(f'Heartbeat failed for {project_id}: {e}')
 
     async def run_full_cycle(self, project_id: str, trigger_reason: str) -> ReconciliationRun:
         """Execute the three-stage pipeline for a project."""
@@ -98,7 +135,7 @@ class ReconciliationHarness:
             project_id=project_id,
             run_type='full',
             trigger_reason=trigger_reason,
-            started_at=datetime.now(timezone.utc),
+            started_at=datetime.now(UTC),
             events_processed=len(events),
             status='running',
         )
@@ -115,9 +152,11 @@ class ReconciliationHarness:
             },
         )
 
+        current_stage_name: str | None = None
         try:
             reports = []
             for stage in self.stages:
+                current_stage_name = stage.stage_id.value
                 stage.project_id = project_id
                 report = await stage.run(events, watermark, reports, run_id)
                 reports.append(report)
@@ -125,13 +164,12 @@ class ReconciliationHarness:
 
             # Update watermark
             watermark.last_full_run_id = run_id
-            watermark.last_full_run_completed = datetime.now(timezone.utc)
+            watermark.last_full_run_completed = datetime.now(UTC)
             await self.journal.update_watermark(watermark)
 
-            run.completed_at = datetime.now(timezone.utc)
+            run.completed_at = datetime.now(UTC)
             run.status = 'completed'
             await self.journal.complete_run(run_id, 'completed')
-            await self.journal.update_run_stage_reports(run_id, run.stage_reports)
 
             # Async judge review
             if self.judge:
@@ -149,11 +187,25 @@ class ReconciliationHarness:
 
         except CircuitBreakerError as e:
             run.status = 'circuit_breaker'
+            run.stage_reports['_error'] = {
+                'error_type': 'CircuitBreakerError',
+                'error_message': str(e),
+                'failed_stage': current_stage_name,
+                'traceback': traceback.format_exc(),
+            }
             await self.journal.complete_run(run_id, 'circuit_breaker')
             logger.error(f'Reconciliation circuit breaker: {e}')
             raise
         except Exception as e:
             run.status = 'failed'
+            run.stage_reports['_error'] = {
+                'error_type': type(e).__name__,
+                'error_message': str(e),
+                'failed_stage': current_stage_name,
+                'traceback': traceback.format_exc(),
+            }
             await self.journal.complete_run(run_id, 'failed')
             logger.error(f'Reconciliation failed: {e}')
             raise
+        finally:
+            await self.journal.update_run_stage_reports(run_id, run.stage_reports)

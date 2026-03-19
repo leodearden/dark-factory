@@ -1,19 +1,16 @@
 """Tests for reconciliation harness (pipeline orchestration)."""
 
 import uuid
-from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 
-from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
-    StageId,
-    StageReport,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -27,9 +24,12 @@ async def journal(tmp_path):
     await j.close()
 
 
-@pytest.fixture
-def event_buffer():
-    return EventBuffer(buffer_size_threshold=2, max_staleness_seconds=3600)
+@pytest_asyncio.fixture
+async def event_buffer(tmp_path):
+    buf = EventBuffer(db_path=tmp_path / 'harness_eb.db', buffer_size_threshold=2, max_staleness_seconds=3600)
+    await buf.initialize()
+    yield buf
+    await buf.close()
 
 
 @pytest.fixture
@@ -50,7 +50,7 @@ def _make_event(project_id: str = 'test-project') -> ReconciliationEvent:
         type=EventType.episode_added,
         source=EventSource.agent,
         project_id=project_id,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
         payload={},
     )
 
@@ -76,7 +76,7 @@ async def test_drain_clears_buffer(event_buffer):
     assert len(events) == 2
 
     # Should be empty now
-    assert event_buffer.get_buffer_stats('test-project')['size'] == 0
+    assert (await event_buffer.get_buffer_stats('test-project'))['size'] == 0
 
 
 @pytest.mark.asyncio
@@ -100,7 +100,7 @@ async def test_journal_run_lifecycle(journal):
         project_id='test-project',
         run_type='full',
         trigger_reason='buffer_size:3',
-        started_at=datetime.now(timezone.utc),
+        started_at=datetime.now(UTC),
         events_processed=3,
         status='running',
     )
