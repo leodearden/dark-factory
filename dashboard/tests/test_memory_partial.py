@@ -218,3 +218,52 @@ class TestWriteQueueCard:
             assert '3 pending' in html
             assert '1 retry' in html
             assert '0 dead' in html
+
+
+class TestWriteQueueConditionalStyling:
+    def test_dead_count_red_text(self, client):
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 2}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'text-red-' in html
+
+    def test_dead_zero_no_red_text(self, client):
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'text-red-400' not in html
+
+    def test_oldest_age_shown_over_60(self, client):
+        queue = {'counts': {'pending': 1, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': 120}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'oldest:' in html
+            assert '2m ago' in html
+            assert 'text-yellow-' in html
+
+    def test_oldest_age_hidden_under_60(self, client):
+        queue = {'counts': {'pending': 1, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': 30}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'oldest:' not in html
+
+    def test_oldest_age_hidden_none(self, client):
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'oldest:' not in html
