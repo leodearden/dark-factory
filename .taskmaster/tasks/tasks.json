@@ -121,13 +121,13 @@
         "description": "Create the memory health cards HTML partial template and its FastAPI route, wiring data from the memory data module.",
         "details": "Create `dashboard/src/dashboard/templates/partials/memory.html`:\n\nFour cards in a horizontal flex row (flex, gap-4). Each card: bg-gray-800, rounded-lg, p-6, shadow.\n\n1. **Graphiti card**: Status dot (green if connected, red if not \u2014 use a 3x3 rounded-full div with bg-green-500/bg-red-500). \"Graphiti\" label (text-sm text-gray-400). Node count as large number (text-3xl font-bold text-white). Subtitle \"knowledge graph nodes\" (text-xs text-gray-500).\n\n2. **Mem0 card**: Same pattern. Memory count. Subtitle \"vector memories\".\n\n3. **Taskmaster card**: Same dot pattern. \"Taskmaster\" label. Text \"Connected\" or \"Disconnected\" (instead of a number).\n\n4. **Write Queue card**: Tri-state dot: green if all counts are 0, yellow if pending > 0, red if dead > 0. \"Write Queue\" label. Show three metrics inline: \"N pending \u00b7 N retry \u00b7 N dead\" with dead count in red text if > 0. If oldest_pending_age_seconds is not None and > 60, show \"oldest: Xm ago\" in yellow text.\n\nIf the data has `offline: True`, show a single full-width card: \"Fused Memory Server Offline\" with red styling and the error message.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/memory` async route: get httpx client from request.app.state, call get_memory_status() and get_queue_stats() from dashboard.data.memory, render templates/partials/memory.html with the data as template context, return HTMLResponse.\n- Import the data functions at the top of app.py.\n\nTest strategy: verify the route returns 200 with text/html content-type. Test with mock data module returning both online and offline states. Check that the HTML contains expected elements (e.g., \"Graphiti\", \"Mem0\", node count value).",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [
           "17"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-19T07:46:43.370Z"
+        "updatedAt": "2026-03-19T08:19:56.055Z"
       },
       {
         "id": "21",
@@ -155,7 +155,7 @@
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-18T06:56:24.431Z"
+        "updatedAt": "2026-03-19T08:17:15.591Z"
       },
       {
         "id": "23",
@@ -254,9 +254,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-19T07:46:43.370Z",
+      "lastModified": "2026-03-19T08:19:56.055Z",
       "taskCount": 17,
-      "completedCount": 9,
+      "completedCount": 10,
       "tags": [
         "master"
       ]
