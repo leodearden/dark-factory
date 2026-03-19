@@ -100,12 +100,12 @@ usage_cap:
   wait_for_reset: true           # wait and auto-resume vs exit
   probe_interval_secs: 300       # 5 min initial probe interval
   max_probe_interval_secs: 1800  # 30 min max backoff
-  # Multi-account failover — uncomment and set env vars to enable
-  # accounts:
-  #   - name: max-a
-  #     oauth_token_env: CLAUDE_OAUTH_TOKEN_A
-  #   - name: max-b
-  #     oauth_token_env: CLAUDE_OAUTH_TOKEN_B
+  # Multi-account failover
+  accounts:
+    - name: max-a
+      oauth_token_env: CLAUDE_OAUTH_TOKEN_A
+    - name: max-b
+      oauth_token_env: CLAUDE_OAUTH_TOKEN_B
 
 # Project root (absolute path)
 project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"

@@ -7,8 +7,11 @@ import sys
 from pathlib import Path
 
 import click
+from dotenv import load_dotenv
 
 from orchestrator.config import load_config
+
+load_dotenv()  # loads .env into os.environ (e.g. CLAUDE_OAUTH_TOKEN_A/B)
 
 LOG_FORMAT = '%(asctime)s %(levelname)-8s [%(name)s] %(message)s'
 DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
@@ -183,12 +186,15 @@ def _run_judge_cmd():
     for r in results:
         by_task.setdefault(r.task_id, []).append(r)
 
-    # Filter to passing results only
+    # Filter to passing results with existing worktrees
     passing: dict[str, list] = {}
     for task_id, task_results in by_task.items():
-        p = [r for r in task_results if r.metrics.get('tests_pass', False)]
+        p = [r for r in task_results
+             if r.metrics.get('tests_pass', False)
+             and Path(r.worktree_path).exists()]
         if len(p) >= 2:
             passing[task_id] = p
+            click.echo(f'  {task_id}: {len(p)} contenders with worktrees')
 
     if not passing:
         click.echo('Need at least 2 passing results per task for judge comparison', err=True)
