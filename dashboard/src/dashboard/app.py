@@ -50,6 +50,36 @@ def timeago(value: str | None) -> str:
 
 templates.env.filters['timeago'] = timeago
 
+_TRIGGER_TYPE_MAP = {
+    'max_staleness': 'staleness',
+    'buffer_size': 'buffer',
+}
+
+
+def format_trigger(value: str | None) -> str:
+    """Format a trigger_reason string for human-friendly display.
+
+    Examples:
+        None          → ''
+        'manual'      → 'manual'
+        'quiescent:6' → 'quiescent (6)'
+        'buffer_size:10' → 'buffer (10)'
+        'max_staleness:<ISO>' → 'staleness (<relative>)'
+        'foo:bar'     → 'foo (bar)'
+    """
+    if value is None:
+        return ''
+    if ':' not in value:
+        return value
+    trigger_type, _, trigger_value = value.partition(':')
+    display_type = _TRIGGER_TYPE_MAP.get(trigger_type, trigger_type)
+    if trigger_type == 'max_staleness':
+        trigger_value = timeago(trigger_value)
+    return f'{display_type} ({trigger_value})'
+
+
+templates.env.filters['format_trigger'] = format_trigger
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
