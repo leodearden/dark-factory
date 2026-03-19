@@ -38,7 +38,7 @@
   <!-- Write Queue card -->
   <div class="bg-gray-800 rounded-lg p-6 shadow flex-1">
     <div class="flex items-center gap-2 mb-3">
-      <div class="w-3 h-3 rounded-full bg-green-500"></div>
+      <div class="w-3 h-3 rounded-full {% if queue.counts.dead|default(0) > 0 %}bg-red-500{% elif queue.counts.pending|default(0) > 0 %}bg-yellow-500{% else %}bg-green-500{% endif %}"></div>
       <span class="text-sm text-gray-400">Write Queue</span>
     </div>
     <div class="text-sm text-gray-300">
