@@ -263,6 +263,43 @@ class TestSearch:
         )
         assert SourceStore.mem0 in source_stores
 
+    @pytest.mark.asyncio
+    async def test_search_category_filter_excludes_graphiti_when_only_mem0_primary_requested(
+        self, service
+    ):
+        """When filtering by only MEM0_PRIMARY categories (e.g. preferences_and_norms),
+        Graphiti results (category=None) should be correctly excluded."""
+        from tests.conftest import MockEdge, MockNode
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Auth service depends on Redis',
+                uuid='edge-uuid-1',
+                source_node=MockNode(name='Auth Service'),
+                target_node=MockNode(name='Redis'),
+            ),
+        ])
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm1',
+                    'memory': 'Always use black for formatting',
+                    'score': 0.9,
+                    'metadata': {'category': 'preferences_and_norms'},
+                },
+            ]
+        })
+        results = await service.search(
+            query='formatting preferences',
+            project_id='test',
+            categories=['preferences_and_norms'],
+        )
+        source_stores = {r.source_store for r in results}
+        # Only Mem0 results should remain; Graphiti results must be excluded
+        assert SourceStore.graphiti not in source_stores
+        assert SourceStore.mem0 in source_stores
+        assert len(results) == 1
+
 
 class TestDeleteMemory:
     @pytest.mark.asyncio
