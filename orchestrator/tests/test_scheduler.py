@@ -4,7 +4,7 @@
 import pytest
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.scheduler import ModuleLockTable, files_to_modules, normalize_lock
+from orchestrator.scheduler import ModuleLockTable, files_to_modules
 
 
 @pytest.fixture
