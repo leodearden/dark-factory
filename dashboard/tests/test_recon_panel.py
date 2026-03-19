@@ -40,3 +40,9 @@ class TestTimeagoFilter:
         from dashboard.app import timeago
 
         assert timeago('') == 'never'
+
+    def test_filter_registered_on_jinja2_env(self):
+        from dashboard.app import templates, timeago
+
+        assert 'timeago' in templates.env.filters
+        assert templates.env.filters['timeago'] is timeago
