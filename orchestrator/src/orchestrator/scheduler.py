@@ -153,6 +153,7 @@ class Scheduler:
     def __init__(self, config: OrchestratorConfig):
         self.config = config
         self.lock_table = ModuleLockTable(config)
+        self._dispatched: set[str] = set()
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
 
@@ -251,6 +252,8 @@ class Scheduler:
         for t in tasks:
             if t.get('status') != 'pending':
                 continue
+            if str(t.get('id', '')) in self._dispatched:
+                continue
             deps = t.get('dependencies', [])
             deps_done = all(
                 status_map.get(str(d.get('id', d) if isinstance(d, dict) else d)) == 'done'
@@ -284,9 +287,8 @@ class Scheduler:
         for task in candidates:
             modules = self._get_modules(task)
             task_id = str(task.get('id', ''))
-            if self.lock_table.is_held(task_id):
-                continue
             if self.lock_table.try_acquire(task_id, modules):
+                self._dispatched.add(task_id)
                 return TaskAssignment(task_id=task_id, task=task, modules=modules)
 
         return None
