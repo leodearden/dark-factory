@@ -80,6 +80,48 @@ class TestFindRunningOrchestrators:
 
         assert result == []
 
+    def test_malformed_pid_skips_line(self):
+        """A line with a non-integer PID field is silently skipped; valid lines still parsed."""
+        import subprocess
+        from unittest.mock import patch
+
+        from dashboard.data.orchestrator import find_running_orchestrators
+
+        ps_output = (
+            "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n"
+            "leo       N/A   0.5  1.2 123456  7890 ?        Sl   Mar18   0:05 python -m orchestrator --prd /home/leo/bad.md\n"
+            "leo       4321  0.3  0.8 234567  4567 ?        Sl   10:30   0:02 python -m orchestrator --prd /home/leo/good.md\n"
+        )
+        mock_result = subprocess.CompletedProcess(args=['ps', 'aux'], returncode=0, stdout=ps_output, stderr='')
+
+        with patch('dashboard.data.orchestrator.subprocess.run', return_value=mock_result):
+            result = find_running_orchestrators()
+
+        assert len(result) == 1
+        assert result[0]['pid'] == 4321
+        assert result[0]['prd'] == '/home/leo/good.md'
+
+    def test_truncated_ps_line_skips(self):
+        """A truncated line that passes filters but has insufficient fields is skipped."""
+        import subprocess
+        from unittest.mock import patch
+
+        from dashboard.data.orchestrator import find_running_orchestrators
+
+        ps_output = (
+            "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n"
+            "leo 999 orchestrator --prd\n"
+            "leo       8888  0.3  0.8 234567  4567 ?        Sl   10:30   0:02 python -m orchestrator --prd /home/leo/ok.md\n"
+        )
+        mock_result = subprocess.CompletedProcess(args=['ps', 'aux'], returncode=0, stdout=ps_output, stderr='')
+
+        with patch('dashboard.data.orchestrator.subprocess.run', return_value=mock_result):
+            result = find_running_orchestrators()
+
+        assert len(result) == 1
+        assert result[0]['pid'] == 8888
+        assert result[0]['prd'] == '/home/leo/ok.md'
+
 
 class TestLoadTaskTree:
     """Tests for load_task_tree — parses tasks.json into a list of task dicts."""
