@@ -66,8 +66,8 @@
       "id": "step-8",
       "type": "impl",
       "description": "Verify and fix template empty state handling. Ensure all Jinja2 conditionals are correct: {% if burst_state %}...{% else %}No agents{% endif %}, {% if verdict %}...{% else %}No verdicts yet{% endif %}, {% if runs %}...{% else %}No reconciliation runs yet{% endif %}, {% if watermarks %}...{% else %} show 'never' for all 4 fields {% endif %}. These should mostly be covered by step-6 implementation but this step ensures the empty-state tests from step-7 pass. Run full test suite to confirm all tests green.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "4b339b9"
     }
   ],
   "design_decisions": [
