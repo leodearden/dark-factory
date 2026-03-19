@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -515,7 +516,7 @@ def create_mcp_server(
             id: str,
             project_root: str,
             prompt: str | None = None,
-            metadata: str | None = None,
+            metadata: str | dict | None = None,
             append: bool = False,
             tag: str | None = None,
         ) -> dict[str, Any]:
@@ -525,11 +526,13 @@ def create_mcp_server(
                 id: Task ID to update
                 project_root: Absolute path to project root
                 prompt: New information to incorporate
-                metadata: JSON metadata to merge
+                metadata: JSON metadata to merge (object or JSON string)
                 append: Append instead of full update
                 tag: Tag context (optional)
             """
             try:
+                if isinstance(metadata, dict):
+                    metadata = json.dumps(metadata)
                 return await task_interceptor.update_task(
                     task_id=id,
                     project_root=project_root,
