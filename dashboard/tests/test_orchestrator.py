@@ -488,3 +488,28 @@ class TestDiscoverOrchestrators:
         # Key should be '7' from metadata.task_id, NOT 'task-7' from directory name
         assert '7' in worktrees, f"Expected key '7' from metadata.task_id, got keys: {list(worktrees.keys())}"
         assert 'task-7' not in worktrees
+
+    def test_worktree_falls_back_to_dir_name_without_metadata(self, tmp_path):
+        """Worktree dict uses directory name as key when no .task/ metadata is present."""
+        import json
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        # Create worktree directory named '9' with no .task/ subdirectory
+        wt_dir = tmp_path / '.worktrees' / '9'
+        wt_dir.mkdir(parents=True)
+        # No .task/ directory — metadata will be None
+
+        mock_procs = [{'pid': 9999, 'prd': '/prd.md', 'running': True, 'started': 'Mar18'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        worktrees = result[0]['worktrees']
+        # Key should fall back to '9' (directory name) since no metadata.json exists
+        assert '9' in worktrees, f"Expected fallback key '9' from dir name, got keys: {list(worktrees.keys())}"
+        assert worktrees['9']['metadata'] is None
