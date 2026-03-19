@@ -539,7 +539,6 @@ class TestDiscoverOrchestrators:
 
     def test_non_task_worktree_dirs_excluded(self, tmp_path):
         """Non-task directories (e.g. 'tmp-backup') are excluded; plain and 'task-' numeric dirs included."""
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
