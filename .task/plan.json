@@ -2,7 +2,7 @@
   "task_id": "19",
   "title": "Orchestrator discovery module",
   "modules": ["dashboard/src/dashboard/data", "dashboard/tests"],
-  "analysis": "Create dashboard/src/dashboard/data/orchestrator.py — a synchronous data module for discovering running orchestrator processes, parsing the task tree, reading per-worktree .task/ artifacts, and combining them into a unified view. Unlike the memory.py (async httpx) and reconciliation.py (async aiosqlite) modules, this module is synchronous since it reads files and calls subprocess.run. Following the established pattern: functions return structured dicts with graceful fallbacks (empty lists/dicts/None) for missing data, class-based tests with descriptive docstrings, and imports at function level in tests. The module has four public functions with clear responsibilities: process scanning, task tree parsing, artifact reading, and orchestrator discovery (composition). Tests use tmp_path fixtures for file-based tests and unittest.mock.patch for subprocess mocking.",
+  "analysis": "Create dashboard/src/dashboard/data/orchestrator.py — a synchronous data module for discovering running orchestrator processes, parsing the task tree, reading per-worktree .task/ artifacts, and combining them into a unified view. Unlike the memory.py (async httpx) and reconciliation.py (async aiosqlite) modules, this module is synchronous since it reads files and calls subprocess.run. Following the established pattern: functions return structured dicts with graceful fallbacks (empty lists/dicts/None) for missing data, class-based tests with descriptive docstrings, and imports at function level in tests. The module has four public functions with clear responsibilities: process scanning, task tree parsing, artifact reading, and orchestrator discovery (composition). Tests use tmp_path fixtures for file-based tests and unittest.mock.patch for subprocess mocking.\n\n**Post-review update:** Two robustness issues identified: (1) `int(fields[1])` in the ps-line parse loop of find_running_orchestrators is not guarded against ValueError/IndexError — a malformed ps line can crash the entire scan. (2) `for task in raw_tasks` in load_task_tree raises TypeError when raw_tasks is None (e.g., `\"tasks\": null` in JSON). Both need defensive guards with tests.",
   "prerequisites": [],
   "steps": [
     {
@@ -36,14 +36,14 @@
     {
       "id": "step-5",
       "type": "test",
-      "description": "Add TestReadTaskArtifacts class to test_orchestrator.py. Tests: (1) test_full_artifacts — create a temp worktree dir with .task/metadata.json (task_id, title, base_commit, created_at), .task/plan.json with steps array (3 done, 2 pending out of 5 total), .task/iterations.jsonl (3 lines of text), .task/reviews/reviewer-1.json (verdict: PASS), .task/reviews/reviewer-2.json (verdict: ISSUES_FOUND). Verify returned dict has metadata (parsed dict), phase ('EXECUTE'), plan_progress ({'done': 3, 'total': 5}), iteration_count (3), review_summary ('1/2 passed'); (2) test_empty_worktree — pass a temp dir with no .task/ subdir, verify returns dict with metadata=None, phase='PLAN', plan_progress={'done': 0, 'total': 0}, iteration_count=0, review_summary='\u2014'; (3) test_plan_all_done — create .task/ with plan.json where all steps are done, verify phase is 'DONE'; (4) test_no_plan_file — create .task/ with only metadata.json, verify phase is 'PLAN' and plan_progress is {done: 0, total: 0}.",
+      "description": "Add TestReadTaskArtifacts class to test_orchestrator.py. Tests: (1) test_full_artifacts — create a temp worktree dir with .task/metadata.json (task_id, title, base_commit, created_at), .task/plan.json with steps array (3 done, 2 pending out of 5 total), .task/iterations.jsonl (3 lines of text), .task/reviews/reviewer-1.json (verdict: PASS), .task/reviews/reviewer-2.json (verdict: ISSUES_FOUND). Verify returned dict has metadata (parsed dict), phase ('EXECUTE'), plan_progress ({'done': 3, 'total': 5}), iteration_count (3), review_summary ('1/2 passed'); (2) test_empty_worktree — pass a temp dir with no .task/ subdir, verify returns dict with metadata=None, phase='PLAN', plan_progress={'done': 0, 'total': 0}, iteration_count=0, review_summary='—'; (3) test_plan_all_done — create .task/ with plan.json where all steps are done, verify phase is 'DONE'; (4) test_no_plan_file — create .task/ with only metadata.json, verify phase is 'PLAN' and plan_progress is {done: 0, total: 0}.",
       "status": "done",
       "commit": "026a307"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Add read_task_artifacts(worktree_path: Path) -> dict to orchestrator.py. Define task_dir = worktree_path / '.task'. Read metadata.json via try/except (FileNotFoundError, json.JSONDecodeError \u2192 None). Read plan.json: extract steps array, count done (status=='done') vs total. Derive phase: no plan \u2192 'PLAN'; all steps done \u2192 'DONE'; otherwise 'EXECUTE'. Count lines in iterations.jsonl (open, sum(1 for _ in f), handle FileNotFoundError \u2192 0). Glob .task/reviews/*.json, parse each for 'verdict' field, count PASS vs total \u2192 format as 'N/M passed' or '\u2014' if no reviews. Return {'metadata': dict|None, 'phase': str, 'plan_progress': {'done': int, 'total': int}, 'iteration_count': int, 'review_summary': str}.",
+      "description": "Add read_task_artifacts(worktree_path: Path) -> dict to orchestrator.py. Define task_dir = worktree_path / '.task'. Read metadata.json via try/except (FileNotFoundError, json.JSONDecodeError → None). Read plan.json: extract steps array, count done (status=='done') vs total. Derive phase: no plan → 'PLAN'; all steps done → 'DONE'; otherwise 'EXECUTE'. Count lines in iterations.jsonl (open, sum(1 for _ in f), handle FileNotFoundError → 0). Glob .task/reviews/*.json, parse each for 'verdict' field, count PASS vs total → format as 'N/M passed' or '—' if no reviews. Return {'metadata': dict|None, 'phase': str, 'plan_progress': {'done': int, 'total': int}, 'iteration_count': int, 'review_summary': str}.",
       "status": "done",
       "commit": "1ae301f"
     },
@@ -57,15 +57,43 @@
     {
       "id": "step-8",
       "type": "impl",
-      "description": "Add discover_orchestrators(config: DashboardConfig) -> list[dict] to orchestrator.py. Call find_running_orchestrators(). Call load_task_tree(config.tasks_json). Scan config.worktrees_dir for subdirectories (handle missing dir). For each subdir, call read_task_artifacts. For each running orchestrator: attach tasks list, worktrees dict (worktree_name \u2192 artifact data), and compute summary stats from tasks (count by status: total, done, in_progress, blocked, pending). Return list of orchestrator dicts with all combined data. Handle edge cases: worktrees_dir doesn't exist \u2192 empty worktrees dict.",
+      "description": "Add discover_orchestrators(config: DashboardConfig) -> list[dict] to orchestrator.py. Call find_running_orchestrators(). Call load_task_tree(config.tasks_json). Scan config.worktrees_dir for subdirectories (handle missing dir). For each subdir, call read_task_artifacts. For each running orchestrator: attach tasks list, worktrees dict (worktree_name → artifact data), and compute summary stats from tasks (count by status: total, done, in_progress, blocked, pending). Return list of orchestrator dicts with all combined data. Handle edge cases: worktrees_dir doesn't exist → empty worktrees dict.",
       "status": "done",
       "commit": "07db845"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Add robustness tests to TestFindRunningOrchestrators for reviewer_robustness/unhandled_exception_in_loop fix. Tests: (1) test_malformed_pid_skips_line — mock ps output where one orchestrator line has a non-integer PID field (e.g., 'N/A' or garbage text in field[1]) alongside a valid orchestrator line, verify the valid line is still parsed and the bad line is silently skipped (returns list with 1 entry, not a crash); (2) test_truncated_ps_line_skips — mock ps output with an extremely short/truncated line that passes the 'orchestrator' and '--prd' filters but has fewer than expected fields, verify it is skipped and other valid lines are still returned. Both tests confirm that one bad ps line does not abort the entire scan.",
+      "status": "done",
+      "commit": "4204eb7"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Fix find_running_orchestrators in orchestrator.py: wrap the per-line parsing block (from `fields = line.split()` through the `orchestrators.append(...)`) in a `try/except (ValueError, IndexError)` that logs a warning with the offending line and `continue`s to the next line. This ensures that a non-integer PID, truncated output, or any other per-line parse error skips that line gracefully without aborting the entire scan. The existing `len(fields) < 11` guard stays but the try/except adds a second safety net around `int(fields[1])` and field access.",
+      "status": "done",
+      "commit": "d314974"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Add robustness tests to TestLoadTaskTree for reviewer_robustness/unhandled_exception fix. Tests: (1) test_null_tasks_in_master_format — write tasks.json with `{\"master\": {\"tasks\": null}}`, verify returns [] (not TypeError); (2) test_null_tasks_in_flat_format — write tasks.json with `{\"tasks\": null}`, verify returns []; (3) test_tasks_not_a_list — write tasks.json with `{\"tasks\": \"oops\"}` (string instead of list), verify returns []. All three confirm that non-list values for the tasks array are handled gracefully with a warning log and empty list return.",
+      "status": "done",
+      "commit": "c458ba4"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Fix load_task_tree in orchestrator.py: after extracting raw_tasks (line ~98), add a guard `if not isinstance(raw_tasks, list): logger.warning('tasks is not a list in %s', tasks_json_path); return []` before the `for task in raw_tasks` loop. This prevents TypeError when raw_tasks is None and handles other non-iterable values (str, int, etc.) that could appear in corrupted/partial JSON files.",
+      "status": "done",
+      "commit": "edd77e0"
     }
   ],
   "design_decisions": [
     {
       "decision": "Synchronous functions (not async) for orchestrator module",
-      "rationale": "Unlike memory.py (httpx async HTTP) and reconciliation.py (aiosqlite async), this module only reads local files and calls subprocess.run \u2014 all inherently synchronous. Using sync avoids unnecessary async complexity. The FastAPI route can call these from an async endpoint via run_in_executor if needed."
+      "rationale": "Unlike memory.py (httpx async HTTP) and reconciliation.py (aiosqlite async), this module only reads local files and calls subprocess.run — all inherently synchronous. Using sync avoids unnecessary async complexity. The FastAPI route can call these from an async endpoint via run_in_executor if needed."
     },
     {
       "decision": "Use unittest.mock.patch for subprocess.run mocking instead of dependency injection",
@@ -73,11 +101,11 @@
     },
     {
       "decision": "Simplified phase derivation: PLAN, EXECUTE, or DONE",
-      "rationale": "The task description mentions VERIFY/REVIEW/MERGE phases but these cannot be reliably determined from plan.json step progress alone \u2014 they depend on orchestrator workflow state. Using three clear states (no plan \u2192 PLAN, some steps done \u2192 EXECUTE, all done \u2192 DONE) is accurate and avoids false signals. The actual phase can be refined in a future iteration if the orchestrator exposes phase metadata."
+      "rationale": "The task description mentions VERIFY/REVIEW/MERGE phases but these cannot be reliably determined from plan.json step progress alone — they depend on orchestrator workflow state. Using three clear states (no plan → PLAN, some steps done → EXECUTE, all done → DONE) is accurate and avoids false signals. The actual phase can be refined in a future iteration if the orchestrator exposes phase metadata."
     },
     {
-      "decision": "Return '\u2014' (em-dash) for missing review summary, not empty string",
-      "rationale": "Consistent with dashboard display convention \u2014 an em-dash signals 'not applicable / no data' more clearly than an empty string in the template rendering."
+      "decision": "Return '—' (em-dash) for missing review summary, not empty string",
+      "rationale": "Consistent with dashboard display convention — an em-dash signals 'not applicable / no data' more clearly than an empty string in the template rendering."
     },
     {
       "decision": "Count iterations.jsonl lines without parsing each line",
@@ -86,6 +114,14 @@
     {
       "decision": "discover_orchestrators returns empty list when no processes running",
       "rationale": "The orchestrator view is process-centric: each running orchestrator gets enriched with task/artifact data. If nothing is running, there's nothing to display. Task tree and worktree data are attached to running orchestrators, not returned standalone."
+    },
+    {
+      "decision": "Per-line try/except in find_running_orchestrators parse loop",
+      "rationale": "Review identified that int(fields[1]) is outside any try/except. Rather than only guarding the int() call, wrapping the entire per-line block (split, int, regex, append) in try/except (ValueError, IndexError) is more robust — it catches any field-access or conversion issue from unexpected ps output formats across platforms."
+    },
+    {
+      "decision": "isinstance(raw_tasks, list) guard before iteration in load_task_tree",
+      "rationale": "Review identified that 'for task in raw_tasks' crashes with TypeError if raw_tasks is None (from \"tasks\": null in JSON). An isinstance check is preferable to try/except TypeError because it makes the intent explicit — we require a list — and handles all non-list types (None, str, int, dict) uniformly."
     }
   ],
   "reuse": [
@@ -102,7 +138,7 @@
     {
       "what": "Test class structure and pattern from test_memory.py / test_reconciliation.py",
       "where": "dashboard/tests/test_memory.py, dashboard/tests/test_reconciliation.py",
-      "how": "Follow the same conventions: class-based test grouping (TestClassName), async-compatible test methods (though this module uses sync), function-level imports, descriptive docstrings on every test, and graceful error handling verification (missing files \u2192 empty defaults)."
+      "how": "Follow the same conventions: class-based test grouping (TestClassName), async-compatible test methods (though this module uses sync), function-level imports, descriptive docstrings on every test, and graceful error handling verification (missing files → empty defaults)."
     },
     {
       "what": "Module docstring and import patterns",
