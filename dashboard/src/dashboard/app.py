@@ -6,11 +6,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from dashboard.config import DashboardConfig
+from dashboard.data.memory import get_memory_status, get_queue_stats
 
 _pkg_dir = Path(__file__).parent
 
@@ -33,3 +34,14 @@ app.mount('/static', StaticFiles(directory=str(_pkg_dir / 'static')), name='stat
 @app.get('/api/health')
 async def health():
     return {'status': 'ok'}
+
+
+@app.get('/partials/memory')
+async def memory_partial(request: Request):
+    http_client = request.app.state.http_client
+    config = request.app.state.config
+    status = await get_memory_status(http_client, config)
+    queue = await get_queue_stats(http_client, config)
+    return templates.TemplateResponse(
+        request, 'partials/memory.html', context={'status': status, 'queue': queue}
+    )
