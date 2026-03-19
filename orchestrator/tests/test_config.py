@@ -1,8 +1,10 @@
 """Tests for configuration loading."""
 
+import logging
 import os
 from pathlib import Path
 
+import pytest
 import yaml
 
 from orchestrator.config import (
@@ -54,6 +56,15 @@ class TestDefaults:
 
 
 class TestYamlLoading:
+    def test_load_config_warns_when_no_config_file(self, tmp_path: Path, caplog):
+        nonexistent = tmp_path / 'nonexistent.yaml'
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            load_config(nonexistent)
+        assert any(
+            'No config file' in r.message or 'using defaults' in r.message.lower()
+            for r in caplog.records
+        )
+
     def test_load_from_yaml(self, tmp_path: Path):
         config_data = {
             'max_concurrent_tasks': 5,
