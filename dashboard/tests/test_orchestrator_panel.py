@@ -1,0 +1,63 @@
+"""Tests for the orchestrator panel route and template rendering."""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+# --- Mock data for route tests ---
+
+MOCK_ORCHESTRATOR_RUNNING = {
+    'pid': 1234,
+    'prd': '/home/leo/src/dark-factory/prd/dashboard.md',
+    'running': True,
+    'started': 'Mar18',
+    'tasks': [
+        {'id': 1, 'title': 'Setup infra', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+        {'id': 2, 'title': 'Build auth', 'status': 'done', 'priority': 'high', 'dependencies': [1], 'metadata': {}},
+        {'id': 3, 'title': 'Build API', 'status': 'in-progress', 'priority': 'medium', 'dependencies': [2], 'metadata': {}},
+        {'id': 4, 'title': 'Review PR', 'status': 'blocked', 'priority': 'medium', 'dependencies': [3], 'metadata': {}},
+        {'id': 5, 'title': 'Deploy', 'status': 'pending', 'priority': 'low', 'dependencies': [4], 'metadata': {}},
+    ],
+    'worktrees': {
+        '1': {
+            'phase': 'DONE',
+            'plan_progress': {'done': 3, 'total': 3},
+            'iteration_count': 2,
+            'review_summary': '2/2 passed',
+            'modules': ['infra/'],
+        },
+        '3': {
+            'phase': 'EXECUTE',
+            'plan_progress': {'done': 1, 'total': 4},
+            'iteration_count': 5,
+            'review_summary': '3/5 passed',
+            'modules': ['auth/', 'api/'],
+        },
+    },
+    'summary': {
+        'total': 5,
+        'done': 2,
+        'in_progress': 1,
+        'blocked': 1,
+        'pending': 1,
+    },
+}
+
+
+def _patch_orchestrator_data(return_value):
+    """Patch discover_orchestrators at its app.py import location."""
+    return patch('dashboard.app.discover_orchestrators', return_value=return_value)
+
+
+class TestOrchestratorRouteBasics:
+    """Tests for GET /partials/orchestrators with populated data."""
+
+    def test_returns_200(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            resp = client.get('/partials/orchestrators')
+        assert resp.status_code == 200
+
+    def test_content_type_html(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            resp = client.get('/partials/orchestrators')
+        assert 'text/html' in resp.headers['content-type']
