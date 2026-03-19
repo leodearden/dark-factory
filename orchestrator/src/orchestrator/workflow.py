@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from orchestrator.agents.invoke import AgentResult, invoke_agent
+from orchestrator.agents.invoke import AgentResult, invoke_with_cap_retry
 from orchestrator.agents.roles import (
     ALL_REVIEWERS,
     ARCHITECT,
@@ -695,55 +695,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 escalation_url=f'http://{esc.host}:{esc.port}/mcp'
             )
 
-        while True:
-            oauth_token = None
-            if self.usage_gate:
-                oauth_token = await self.usage_gate.before_invoke()
-
-            result = await invoke_agent(
-                prompt=prompt,
-                system_prompt=role.system_prompt,
-                cwd=cwd,
-                model=model,
-                max_turns=max_turns_val,
-                max_budget_usd=budget,
-                allowed_tools=role.allowed_tools or None,
-                disallowed_tools=role.disallowed_tools or None,
-                mcp_config=mcp_config,
-                output_schema=output_schema,
-                sandbox_modules=sandbox_modules,
-                effort=effort_val,
-                backend=backend_val,
-                oauth_token=oauth_token,
-            )
-
-            # Check for cap hit — if detected, loop back to before_invoke which picks
-            # the next available account (multi-account) or blocks (single-account)
-            if self.usage_gate and self.usage_gate.detect_cap_hit(
-                result.stderr, result.output, backend_val, oauth_token=oauth_token,
-            ):
-                acct_name = self.usage_gate.active_account_name
-                if acct_name:
-                    logger.warning(
-                        f'Task {self.task_id} [{role.name}]: usage cap hit, '
-                        f'switching to account {acct_name}'
-                    )
-                else:
-                    logger.warning(
-                        f'Task {self.task_id} [{role.name}]: usage cap hit on '
-                        f'all accounts, will check for reset'
-                    )
-                continue
-
-            break
+        result = await invoke_with_cap_retry(
+            usage_gate=self.usage_gate,
+            label=f'Task {self.task_id} [{role.name}]',
+            prompt=prompt,
+            system_prompt=role.system_prompt,
+            cwd=cwd,
+            model=model,
+            max_turns=max_turns_val,
+            max_budget_usd=budget,
+            allowed_tools=role.allowed_tools or None,
+            disallowed_tools=role.disallowed_tools or None,
+            mcp_config=mcp_config,
+            output_schema=output_schema,
+            sandbox_modules=sandbox_modules,
+            effort=effort_val,
+            backend=backend_val,
+        )
 
         # Track metrics
         self.metrics.total_cost_usd += result.cost_usd
         self.metrics.total_duration_ms += result.duration_ms
         self.metrics.agent_invocations += 1
-
-        if self.usage_gate:
-            self.usage_gate.on_agent_complete(result.cost_usd)
 
         logger.info(
             f'Task {self.task_id} [{role.name}]: '

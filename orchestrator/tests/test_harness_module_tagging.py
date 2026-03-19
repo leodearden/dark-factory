@@ -70,7 +70,7 @@ async def test_tag_task_modules_calls_update_for_untagged(harness, config):
         structured_output=AGENT_MODULE_RESPONSE,
     )
 
-    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)) as mock_invoke:
+    with patch('orchestrator.agents.invoke.invoke_agent', AsyncMock(return_value=agent_result)) as mock_invoke:
         await harness._tag_task_modules()
 
         # Agent should be called once with all untagged tasks
@@ -110,7 +110,7 @@ async def test_tag_task_modules_skips_when_all_tagged(harness):
     harness.scheduler.get_tasks = AsyncMock(return_value=all_tagged)
     harness.scheduler.update_task = AsyncMock()
 
-    with patch('orchestrator.harness.invoke_agent', AsyncMock()) as mock_invoke:
+    with patch('orchestrator.agents.invoke.invoke_agent', AsyncMock()) as mock_invoke:
         await harness._tag_task_modules()
         mock_invoke.assert_not_called()
 
@@ -125,7 +125,7 @@ async def test_tag_task_modules_handles_agent_failure(harness):
 
     agent_result = AgentResult(success=False, output='Agent error')
 
-    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+    with patch('orchestrator.agents.invoke.invoke_agent', AsyncMock(return_value=agent_result)):
         await harness._tag_task_modules()
 
     harness.scheduler.update_task.assert_not_called()
@@ -143,7 +143,7 @@ async def test_tag_task_modules_handles_bad_json(harness):
         structured_output=None,
     )
 
-    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+    with patch('orchestrator.agents.invoke.invoke_agent', AsyncMock(return_value=agent_result)):
         await harness._tag_task_modules()
 
     harness.scheduler.update_task.assert_not_called()
@@ -161,7 +161,7 @@ async def test_tag_task_modules_uses_correct_config(harness, config):
         structured_output={'tasks': []},
     )
 
-    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)) as mock_invoke:
+    with patch('orchestrator.agents.invoke.invoke_agent', AsyncMock(return_value=agent_result)) as mock_invoke:
         await harness._tag_task_modules()
 
         call_kwargs = mock_invoke.call_args.kwargs

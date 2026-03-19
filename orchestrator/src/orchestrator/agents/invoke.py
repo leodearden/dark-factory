@@ -1,5 +1,7 @@
 """Multi-backend agent invocation: Claude Code, Codex, and Gemini CLIs."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -8,7 +10,10 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from shared.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +95,44 @@ async def invoke_agent(
         )
     else:
         raise ValueError(f'Unknown backend: {backend!r}')
+
+
+async def invoke_with_cap_retry(
+    usage_gate: UsageGate | None,
+    label: str,
+    **invoke_kwargs,
+) -> AgentResult:
+    """Invoke an agent, retrying on usage-cap hits with account failover.
+
+    *label* identifies the caller in log messages (e.g. "Module tagging",
+    "Task 7 [implementer]").
+
+    All keyword arguments are forwarded to ``invoke_agent()``.
+    """
+    backend = invoke_kwargs.get('backend', 'claude')
+
+    while True:
+        oauth_token = None
+        if usage_gate:
+            oauth_token = await usage_gate.before_invoke()
+
+        result = await invoke_agent(**invoke_kwargs, oauth_token=oauth_token)
+
+        if usage_gate and usage_gate.detect_cap_hit(
+            result.stderr, result.output, backend, oauth_token=oauth_token,
+        ):
+            acct_name = usage_gate.active_account_name
+            if acct_name:
+                logger.warning(f'{label}: cap hit, switching to account {acct_name}')
+            else:
+                logger.warning(f'{label}: cap hit on all accounts, waiting for reset')
+            continue
+
+        if usage_gate:
+            usage_gate.on_agent_complete(result.cost_usd)
+        break
+
+    return result
 
 
 # ---------------------------------------------------------------------------
