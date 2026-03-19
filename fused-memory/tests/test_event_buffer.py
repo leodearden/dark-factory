@@ -375,7 +375,7 @@ async def test_quiescent_when_queue_truly_empty(tmp_path):
 
         should, reason = await buf.should_trigger('test-project')
         assert should
-        assert 'quiescent:165' == reason
+        assert reason == 'quiescent:165'
     finally:
         await buf.close()
 
@@ -399,7 +399,7 @@ async def test_quiescent_when_queue_all_completed(tmp_path):
 
         should, reason = await buf.should_trigger('test-project')
         assert should
-        assert 'quiescent:165' == reason
+        assert reason == 'quiescent:165'
     finally:
         await buf.close()
 
