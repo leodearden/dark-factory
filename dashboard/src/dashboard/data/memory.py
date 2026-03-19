@@ -8,8 +8,11 @@ not in the generic mcp_tool_call transport.
 from __future__ import annotations
 
 import json
+import logging
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from dashboard.config import DashboardConfig
 
@@ -50,6 +53,7 @@ async def mcp_tool_call(
     try:
         data = resp.json()
     except (json.JSONDecodeError, ValueError):
+        logger.warning('MCP response parse error', exc_info=True)
         return {}
     content = data.get('result', {}).get('content', [])
     if not content:
@@ -63,6 +67,7 @@ async def mcp_tool_call(
     try:
         return json.loads(text)
     except (json.JSONDecodeError, TypeError):
+        logger.warning('MCP response parse error', exc_info=True)
         return {}
 
 
