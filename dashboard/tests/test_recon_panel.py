@@ -7,6 +7,48 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 
+class TestFormatTriggerFilter:
+    """Tests for the format_trigger Jinja2 filter function."""
+
+    def test_none_returns_empty_string(self):
+        from dashboard.app import format_trigger
+
+        assert format_trigger(None) == ''
+
+    def test_no_colon_returns_value_unchanged(self):
+        from dashboard.app import format_trigger
+
+        assert format_trigger('manual') == 'manual'
+
+    def test_quiescent_with_value(self):
+        from dashboard.app import format_trigger
+
+        assert format_trigger('quiescent:6') == 'quiescent (6)'
+
+    def test_buffer_size_maps_to_buffer(self):
+        from dashboard.app import format_trigger
+
+        assert format_trigger('buffer_size:10') == 'buffer (10)'
+
+    def test_max_staleness_maps_to_staleness_with_relative_time(self):
+        from dashboard.app import format_trigger
+
+        ts = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        result = format_trigger(f'max_staleness:{ts}')
+        assert result == 'staleness (1h ago)'
+
+    def test_unknown_type_uses_generic_format(self):
+        from dashboard.app import format_trigger
+
+        assert format_trigger('foo:bar') == 'foo (bar)'
+
+    def test_filter_registered_on_jinja2_env(self):
+        from dashboard.app import format_trigger, templates
+
+        assert 'format_trigger' in templates.env.filters
+        assert templates.env.filters['format_trigger'] is format_trigger
+
+
 class TestTimeagoFilter:
     """Tests for the timeago Jinja2 filter function."""
 
