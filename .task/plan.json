@@ -1,154 +1,139 @@
 {
-  "task_id": "41",
-  "title": "Extract duplicated badge color logic into Jinja2 macros",
+  "task_id": "35",
+  "title": "Deduplicate identical orchestrator cards when sharing task tree",
   "files": [
-    "dashboard/src/dashboard/templates/macros/badges.html",
-    "dashboard/tests/test_badge_macros.py",
-    "dashboard/src/dashboard/templates/partials/tasks.html",
+    "dashboard/src/dashboard/data/orchestrator.py",
     "dashboard/src/dashboard/templates/partials/orchestrators.html",
-    "dashboard/src/dashboard/templates/partials/recon.html",
-    "dashboard/src/dashboard/templates/partials/memory.html"
+    "dashboard/tests/test_orchestrator.py",
+    "dashboard/tests/test_orchestrator_panel.py"
   ],
   "modules": [
-    "dashboard/src/dashboard/templates/macros",
+    "dashboard/src/dashboard/data",
     "dashboard/src/dashboard/templates/partials",
     "dashboard/tests"
   ],
-  "analysis": "Badge color logic is duplicated ~20 times across 4 partial templates. Each uses long if/elif chains mapping status/severity strings to Tailwind bg-color classes. Five semantic badge domains exist: task status (tasks.html — 5 branches, NO aria-labels), orchestrator status (orchestrators.html — boolean-derived running/completed, WITH aria-labels), burst state (recon.html — bursting/idle, WITH aria-labels), verdict severity (recon.html — 5 branches, WITH aria-labels), run status (recon.html — 6 branches, WITH aria-labels). Memory.html has 3 duplicated indicator dots (binary connected/disconnected) plus 1 tri-state queue dot.\n\nSemantic conflict: 'running' maps to bg-green-600 in orchestrators (meaning 'alive/healthy') but bg-blue-600 in recon runs (meaning 'in progress'). Resolved via optional color override parameter on status_badge.\n\nNOT extracted: (a) Write Queue 3-state health dot — 3 colors + 3 distinct aria-labels, doesn't fit boolean indicator_dot. (b) Progress bar div segments in orchestrators.html — structural HTML differs (div + width style). (c) Count badge pill in orchestrators.html — different styling.\n\nExisting test coverage: 42+ integration tests across test_orchestrator_panel.py, test_recon_panel.py, test_memory_partial.py validate badge colors, aria-labels, and text. These serve as the regression safety net. Zero modifications to existing tests required.\n\nJinja2Templates directory is configured as _pkg_dir/'templates' (app.py line 28), so '{% from \"macros/badges.html\" import ... %}' resolves automatically with no app.py changes.",
-  "prerequisites": [
-    {
-      "id": "pre-1",
-      "description": "Create the macros/ directory under templates/ (mkdir -p dashboard/src/dashboard/templates/macros)",
-      "status": "done",
-      "commit": "acbb7ae",
-      "tests": []
-    }
-  ],
+  "analysis": "The bug: discover_orchestrators() loads the task tree once and attaches the identical tasks/worktrees/summary to every process entry. When two orchestrator processes run against the same PRD, the dashboard renders two visually identical cards — same progress bar, same task list, same stats — differing only by PID. This is confusing.\n\nRoot cause in orchestrator.py lines 249-256: the function iterates over all processes and blindly spreads each proc dict (**proc) into the result, attaching the shared task tree to each. There is no grouping by PRD.\n\nFix approach (Option 3 from task description): Group processes by PRD path in discover_orchestrators(), merging PIDs into a 'pids' list. Produce one entry per unique PRD. The template then conditionally renders 'PID 1234' (singular) or 'PIDs 1234, 5678' (plural).\n\nKey observations:\n- find_running_orchestrators() returns dicts with 'pid' (int), 'prd' (str), 'running' (bool), 'started' (str)\n- discover_orchestrators() spreads proc dict via **proc into result entries\n- Template references orch.pid (singular) on line 12\n- MOCK_ORCHESTRATOR_RUNNING/COMPLETED in test_orchestrator_panel.py use 'pid' key\n- 4 existing TestDiscoverOrchestrators tests assert entry['pid']\n- find_running_orchestrators() stays unchanged — it correctly reports raw per-process data\n- Grouping is a pure data transformation in discover_orchestrators()\n- 'running' for a group should be True if ANY constituent process is running (OR semantics)\n- 'started' is display-only from ps — use first entry's value",
+  "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing unit tests for status_badge macro in dashboard/tests/test_badge_macros.py. Create a jinja2_env fixture that imports dashboard.app.templates.env. Test class TestStatusBadge renders via env.from_string('{% from \"macros/badges.html\" import status_badge %}{{ status_badge(...) }}'). Tests: (1) test_done_green — 'done' produces bg-green-600; (2) test_in_progress_blue — 'in-progress' produces bg-blue-600; (3) test_pending_yellow — 'pending' produces bg-yellow-600; (4) test_blocked_red — 'blocked' produces bg-red-600; (5) test_running_blue — 'running' produces bg-blue-600; (6) test_completed_green — 'completed' produces bg-green-600; (7) test_failed_red — 'failed' produces bg-red-600; (8) test_bursting_orange — 'bursting' produces bg-orange-600; (9) test_circuit_breaker_purple — 'circuit_breaker' produces bg-purple-600; (10) test_unknown_fallback_gray — 'xyz' produces bg-gray-600; (11) test_renders_status_text — badge contains status as visible text; (12) test_no_aria_label_by_default — aria_label not in output when called as status_badge(status); (13) test_aria_label_with_prefix — status_badge('done', aria_label='Run status') produces aria-label=\"Run status: done\"; (14) test_color_override — status_badge('running', color='bg-green-600') uses green not blue; (15) test_badge_span_classes — output contains 'inline-block px-2 py-0.5 text-xs font-medium rounded' and 'text-white'.",
+      "description": "Write test test_single_process_produces_pids_list in TestDiscoverOrchestrators: mock one running orchestrator, call discover_orchestrators, assert result[0] has 'pids' key containing [1234], and assert 'pid' key is absent from result[0].",
       "status": "done",
-      "commit": "5c0e2f5"
+      "commit": "370db08"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Create badges.html in macros/ with status_badge(status, aria_label=None, color=None) macro. Color map dict: done/completed->bg-green-600, in-progress/running->bg-blue-600, pending->bg-yellow-600, blocked/failed->bg-red-600, cancelled/deferred/idle->bg-gray-600, bursting/rolled_back->bg-orange-600, circuit_breaker->bg-purple-600. Uses 'color if color else colors.get(status, \"bg-gray-600\")' for the bg class. Conditionally renders aria-label only if aria_label is not None: {% if aria_label %}aria-label=\"{{ aria_label }}: {{ status }}\"{% endif %}. Renders <span> with standard badge classes.",
+      "description": "Refactor discover_orchestrators() to group processes by PRD: use groups = {} / groups.setdefault(proc['prd'], []).append(proc). Iterate over groups instead of individual processes. For each unique PRD, emit one entry with 'pids': [p['pid'] for p in group], 'prd': prd, 'running': any(p['running'] for p in group), 'started': group[0]['started'], plus shared tasks/worktrees/summary. Also update the 4 existing TestDiscoverOrchestrators tests to use entry['pids'] instead of entry['pid']: test_combines_process_and_worktree_data, test_missing_tasks_json, test_worktree_keyed_by_task_id_not_dirname, test_non_task_worktree_dirs_excluded.",
       "status": "done",
-      "commit": "acbb7ae"
+      "commit": "bc045ad"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write failing unit tests for severity_badge macro in test_badge_macros.py. TestSeverityBadge class: (1) test_ok_green — 'ok' produces bg-green-600; (2) test_minor_yellow — 'minor' produces bg-yellow-600; (3) test_moderate_orange — 'moderate' produces bg-orange-600; (4) test_serious_red — 'serious' produces bg-red-600; (5) test_unknown_fallback_gray — 'xyz' produces bg-gray-600; (6) test_renders_severity_text — output contains severity string; (7) test_no_aria_label_by_default — no aria-label when called as severity_badge(severity); (8) test_aria_label_with_prefix — severity_badge('ok', 'Verdict severity') produces aria-label=\"Verdict severity: ok\".",
+      "description": "Write test test_same_prd_grouped_into_single_entry in TestDiscoverOrchestrators: mock find_running_orchestrators returning two processes with the same PRD path but different PIDs (1234 and 5678, both prd='/home/leo/prd.md'). Create tasks.json and a worktree. Assert len(result)==1. Assert result[0]['pids']==[1234, 5678]. Assert tasks/worktrees/summary present once.",
       "status": "done",
-      "commit": "5c0e2f5"
+      "commit": "69db19b"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Add severity_badge(severity, aria_label=None) macro to badges.html. Color map: ok->bg-green-600, minor->bg-yellow-600, moderate->bg-orange-600, serious->bg-red-600. Fallback: bg-gray-600. Same <span> structure and conditional aria-label pattern as status_badge.",
+      "description": "Verify step-3 test passes with existing grouping logic from step-2. No new production code expected — setdefault grouping already handles same-PRD merging. Fix if needed.",
       "status": "done",
-      "commit": "acbb7ae"
+      "commit": "69db19b"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write failing unit tests for indicator_dot macro in test_badge_macros.py. TestIndicatorDot class: (1) test_connected_green — connected=true produces bg-green-500; (2) test_disconnected_red — connected=false produces bg-red-500; (3) test_connected_aria_label — indicator_dot(true, 'Graphiti') produces aria-label=\"Graphiti connected\"; (4) test_disconnected_aria_label — indicator_dot(false, 'Mem0') produces aria-label=\"Mem0 disconnected\"; (5) test_role_status — output contains role=\"status\"; (6) test_dot_classes — output contains 'w-3 h-3 rounded-full'; (7) test_renders_div — output uses <div> not <span>.",
+      "description": "Write test test_different_prds_produce_separate_entries: mock two processes with different PRD paths (/prd1.md and /prd2.md). Assert len(result)==2, each with pids list of length 1. Write test test_grouped_running_true_when_any_running: two procs same PRD, one running=True one running=False, assert entry['running']==True. Write test test_grouped_running_false_when_all_stopped: two procs same PRD both running=False, assert entry['running']==False.",
       "status": "done",
-      "commit": "5c0e2f5"
+      "commit": "2c30a4e"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Add indicator_dot(connected, label) macro to badges.html. Renders <div class=\"w-3 h-3 rounded-full {% if connected %}bg-green-500{% else %}bg-red-500{% endif %}\" role=\"status\" aria-label=\"{{ label }} {% if connected %}connected{% else %}disconnected{% endif %}\"></div>.",
+      "description": "Verify step-5 tests pass with existing logic. The any() call for running and dict key grouping should cover all cases. Fix if needed.",
       "status": "done",
-      "commit": "acbb7ae"
+      "commit": "2c30a4e"
     },
     {
       "id": "step-7",
       "type": "test",
-      "description": "Write failing structural tests in test_badge_macros.py verifying templates import macros after refactoring. TestTemplateMacroImports class reads template files directly via pathlib. (1) test_tasks_imports_status_badge — tasks.html contains \"from 'macros/badges.html' import status_badge\"; (2) test_orchestrators_imports_status_badge — orchestrators.html contains same import; (3) test_recon_imports_badges — recon.html contains import of both status_badge and severity_badge; (4) test_memory_imports_indicator_dot — memory.html contains import of indicator_dot. All 4 fail before refactoring.",
+      "description": "Update test_orchestrator_panel.py mock data: change MOCK_ORCHESTRATOR_RUNNING from 'pid': 1234 to 'pids': [1234], and MOCK_ORCHESTRATOR_COMPLETED from 'pid': 5678 to 'pids': [5678]. Add new test class TestOrchestratorMultiPid with MOCK_ORCHESTRATOR_MULTI_PID constant (pids: [1234, 5678], same PRD, same tasks/worktrees/summary as RUNNING). Tests: (1) test_multi_pid_header_shows_pids_plural — 'PIDs' in html + both '1234' and '5678'; (2) test_single_pid_header_shows_pid_singular — 'PID ' in html for single-PID entry; (3) test_count_badge_shows_one_for_grouped — count badge '1' for single grouped entry with multiple PIDs; (4) test_multi_pid_comma_separated — pids=[111, 222, 333] renders '111, 222, 333'.",
       "status": "done",
-      "commit": "5c0e2f5"
+      "commit": "51bedbc"
     },
     {
       "id": "step-8",
       "type": "impl",
-      "description": "Refactor tasks.html: add {% from 'macros/badges.html' import status_badge %} at top. Replace 12-line if/elif/else badge block (lines 20-31) with {{ status_badge(task.status) }}. No aria_label passed — tasks.html badges currently lack aria-labels. Run test_orchestrator_panel.py (tasks.html is {% include %}'d by orchestrators.html) to verify all existing tests pass. Step-7 test_tasks_imports_status_badge now passes.",
+      "description": "Update orchestrators.html template line 12: replace '<span ...>PID {{ orch.pid }}</span>' with conditional: {% if orch.pids|length > 1 %}<span ...>PIDs {{ orch.pids|join(', ') }}</span>{% else %}<span ...>PID {{ orch.pids[0] }}</span>{% endif %}. Verify ALL panel tests pass including new multi-PID tests and all existing tests with updated mock data.",
       "status": "done",
-      "commit": "47cf151"
+      "commit": "ea5c085"
     },
     {
       "id": "step-9",
-      "type": "impl",
-      "description": "Refactor orchestrators.html: add {% from 'macros/badges.html' import status_badge %} at top. Replace running/completed if/else block (lines 12-16) with {{ status_badge('running' if orch.running else 'completed', aria_label='Orchestrator status', color='bg-green-600' if orch.running else 'bg-gray-600') }}. Color override preserves existing green=running, gray=completed behavior. Progress bar stays inline. Run test_orchestrator_panel.py to verify all tests pass including TestOrchestratorBadgeAriaLabels. Step-7 test_orchestrators_imports_status_badge now passes.",
+      "type": "test",
+      "description": "Run full test suite (pytest dashboard/tests/) to verify no regressions. Check that existing tests in test_app.py, test_badge_macros.py, and other test files still pass. Fix any issues.",
       "status": "done",
-      "commit": "2b72593"
-    },
-    {
-      "id": "step-10",
-      "type": "impl",
-      "description": "Refactor recon.html: add {% from 'macros/badges.html' import status_badge, severity_badge %} at top. (1) Burst state (lines 37-41): replace if/else with {{ status_badge(agent.state, aria_label='Burst state') }}. (2) Verdict severity (lines 81-91): replace 10-line if/elif chain with {{ severity_badge(verdict.severity, aria_label='Verdict severity') }}. (3) Run status (lines 124-136): replace 12-line if/elif chain with {{ status_badge(run.status, aria_label='Run status') }}. Run test_recon_panel.py to verify all tests pass including TestReconBadgeAriaLabels (11 tests). Step-7 test_recon_imports_badges now passes.",
-      "status": "done",
-      "commit": "01c94cc"
-    },
-    {
-      "id": "step-11",
-      "type": "impl",
-      "description": "Refactor memory.html: add {% from 'macros/badges.html' import indicator_dot %} at top. (1) Graphiti dot (line 13): replace inline div with {{ indicator_dot(status.graphiti.connected|default(false), 'Graphiti') }}. (2) Mem0 dot (line 23): replace with {{ indicator_dot(status.mem0.connected|default(false), 'Mem0') }}. (3) Taskmaster dot (line 33): replace with {{ indicator_dot(status.taskmaster is defined and status.taskmaster.connected|default(false), 'Taskmaster') }}. Leave Write Queue 3-state dot inline. Run test_memory_partial.py to verify all tests pass including TestMemoryDotAriaLabels (11 tests). Step-7 test_memory_imports_indicator_dot now passes.",
-      "status": "done",
-      "commit": "0835e8d"
+      "commit": "51bedbc"
     }
   ],
   "design_decisions": [
     {
-      "decision": "status_badge and severity_badge use optional aria_label parameter (default None = no attribute)",
-      "rationale": "tasks.html badges currently have no aria-labels while orchestrators.html and recon.html badges do. Making aria_label optional (None omits the attribute entirely) preserves exact current behavior for each template. This is a pure refactoring with zero behavioral changes."
+      "decision": "Use 'pids' (list[int]) instead of keeping 'pid' (int) alongside",
+      "rationale": "Clean break over backward compatibility. The only consumer is the orchestrators.html template (also modified in this task), so there is no external API contract to maintain. A list is the natural representation whether there's 1 or N processes. Keeping both 'pid' and 'pids' would invite confusion about which to use."
     },
     {
-      "decision": "status_badge accepts optional color override parameter to resolve semantic conflicts",
-      "rationale": "'running' means 'alive/healthy' in orchestrators (green) but 'in-progress' in recon runs (blue). Rather than maintaining multiple color maps, a simple color override at the call site keeps the common case clean while handling the one collision explicitly: status_badge('running', color='bg-green-600' if orch.running else ...). Existing tests assert bg-green-600 for running orchestrators, so this preserves exact behavior."
+      "decision": "Group by exact PRD path string",
+      "rationale": "Simplest correct matching. PRD paths come from the same ps aux regex parsing, so identical processes will have byte-identical path strings. Path normalization (resolve, expanduser) adds complexity without benefit since orchestrator invocations use consistent paths."
     },
     {
-      "decision": "Single comprehensive color map in status_badge covering all badge domains",
-      "rationale": "Burst states (bursting/idle), run statuses (rolled_back/circuit_breaker), orchestrator statuses, and task statuses all use identical badge HTML structure. A unified 13-entry map with gray fallback eliminates domain-specific badge macros. Only severity_badge warrants a separate macro because verdict severities have a distinct graduated color scale (ok/minor/moderate/serious)."
+      "decision": "Set grouped 'running' to any(p['running'] for p in group)",
+      "rationale": "If any process in the group is still running, the orchestration is active. This is the most informative signal for the dashboard user. The status badge should show green/running as long as at least one process is alive."
     },
     {
-      "decision": "Leave Write Queue 3-state indicator dot inline in memory.html",
-      "rationale": "Write Queue uses 3 states (dead->bg-red-500, pending->bg-yellow-500, healthy->bg-green-500) with 3 distinct aria-labels. This doesn't fit the binary indicator_dot(connected, label) signature. A specialized tri-state macro for a single use case would add complexity without reducing duplication."
+      "decision": "Keep 'started' as first process's value, not min/max",
+      "rationale": "The template does not currently render 'started'. Lexicographic comparison of ps time formats (e.g. 'Mar18' vs '10:30') is unreliable across different ps output conventions. Using group[0]['started'] is simple and sufficient."
     },
     {
-      "decision": "Leave progress bar segment colors in orchestrators.html as inline HTML",
-      "rationale": "Progress bar segments are <div> elements with dynamic width-percentage styles, structurally different from badge <span> elements. They share color values with badges but have no duplicated HTML pattern to consolidate."
+      "decision": "Inline grouping in discover_orchestrators() rather than a separate _group_by_prd() helper",
+      "rationale": "The grouping logic is 5-6 lines (setdefault + list iteration + any()). Extracting a helper would add a function boundary, docstring, and test class for trivial logic. The discover_orchestrators tests already cover the grouping behavior end-to-end. If the logic grows, it can be extracted later."
     },
     {
-      "decision": "Test macros in isolation via app's Jinja2 environment with env.from_string()",
-      "rationale": "Reuses the same Jinja2 environment and FileSystemLoader as the app. Fast unit-level tests render macros directly without HTTP routes or mock data. The 42+ existing integration tests then guard against regressions during template refactoring (steps 8-11)."
+      "decision": "find_running_orchestrators() stays unchanged",
+      "rationale": "Separation of concerns: find_running_orchestrators() reports raw per-process data faithfully. discover_orchestrators() is the aggregation/enrichment layer where grouping belongs. This keeps the process-scanning function simple and independently testable."
+    },
+    {
+      "decision": "Singular/plural PID label via Jinja2 conditional on pids|length",
+      "rationale": "'PID 1234' reads naturally for single process; 'PIDs 1234, 5678' clearly communicates shared work. The |join filter handles any number of PIDs. No new macros or filters needed — reuses existing Jinja2 patterns in the template."
     }
   ],
   "reuse": [
     {
-      "what": "Existing integration tests as regression safety net (42+ tests across 3 files)",
-      "where": "test_orchestrator_panel.py (TestOrchestratorBadgeAriaLabels 4 tests, TestTaskTable 2 badge tests, TestOrchestratorRouteBasics badge assertions), test_recon_panel.py (TestReconBadgeAriaLabels 11 tests, TestReconRoute badge color tests), test_memory_partial.py (TestMemoryPartialDots 7 tests, TestMemoryDotAriaLabels 11 tests)",
-      "how": "These tests assert exact CSS class strings (bg-green-600, bg-red-500, etc.) and exact aria-label attributes in rendered HTML. After replacing inline badge logic with macro calls in steps 8-11, all must pass with zero modifications, proving the refactoring preserves identical output."
+      "what": "Existing find_running_orchestrators() function",
+      "where": "dashboard/src/dashboard/data/orchestrator.py lines 40-87",
+      "how": "Unchanged — still returns per-process dicts. Grouping is applied to its output in discover_orchestrators()."
     },
     {
-      "what": "Jinja2Templates environment auto-resolves macros/ subdirectory path",
-      "where": "dashboard/src/dashboard/app.py line 28 — Jinja2Templates(directory=str(_pkg_dir / 'templates'))",
-      "how": "Since macros/ is a subdirectory of the configured templates directory, {% from 'macros/badges.html' import ... %} resolves automatically. No app.py changes or additional template path configuration needed."
+      "what": "_patch_orchestrator_data() test helper",
+      "where": "dashboard/tests/test_orchestrator_panel.py lines 47-49",
+      "how": "Reused unchanged for all panel tests — patches discover_orchestrators at app.py import location. Mock data just needs 'pids' instead of 'pid'."
     },
     {
-      "what": "Shared badge HTML structure pattern across all templates",
-      "where": "All 4 partial templates — 20 instances of identical span structure",
-      "how": "Every status/severity badge uses: <span class=\"inline-block px-2 py-0.5 text-xs font-medium rounded {color} text-white\" [aria-label]>{text}</span>. Every indicator dot uses: <div class=\"w-3 h-3 rounded-full {color}\" role=\"status\" aria-label=\"...\"></div>. Macros encapsulate these two structures."
+      "what": "status_badge macro from badges.html",
+      "where": "dashboard/src/dashboard/templates/macros/badges.html",
+      "how": "No changes needed — badge rendering for running/completed status is independent of PID grouping."
     },
     {
-      "what": "conftest.py client fixture and mock data helpers",
-      "where": "dashboard/tests/conftest.py (client fixture), test_orchestrator_panel.py (_patch_orchestrator_data), test_recon_panel.py (_patch_recon_data, MOCK_* constants), test_memory_partial.py (_ONLINE_STATUS)",
-      "how": "Existing integration tests and helpers remain unchanged. New macro unit tests use direct Jinja2 rendering (no route mocking needed)."
+      "what": "TestDiscoverOrchestrators test patterns",
+      "where": "dashboard/tests/test_orchestrator.py lines 468-603",
+      "how": "New tests follow the same pattern: tmp_path fixtures, mock find_running_orchestrators, call discover_orchestrators(config), assert result structure. Only change: assertions use entry['pids'] (list) instead of entry['pid'] (int)."
+    },
+    {
+      "what": "Jinja2 |length and |join filter patterns",
+      "where": "dashboard/src/dashboard/templates/partials/orchestrators.html line 6",
+      "how": "Template already uses |length for count badge. PID display uses the same |length for conditional and adds |join for comma-separated rendering."
     }
   ]
 }
