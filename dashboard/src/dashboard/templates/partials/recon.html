@@ -1,4 +1,4 @@
-<div class="grid grid-cols-2 gap-6">
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
   <!-- Left column: Status cards -->
   <div class="space-y-6">
 
@@ -102,6 +102,7 @@
   <div class="bg-gray-800 rounded-lg p-6">
     <h3 class="text-lg font-semibold text-gray-100 mb-4">Recent Runs</h3>
     {% if runs %}
+      <div class="overflow-x-auto">
       <table class="w-full text-sm">
         <thead>
           <tr class="text-gray-400 border-b border-gray-700">
@@ -116,7 +117,7 @@
         <tbody>
           {% for run in runs %}
             <tr class="border-b border-gray-700">
-              <td class="py-2 text-gray-100">{{ run.trigger_reason }}</td>
+              <td class="py-2 text-gray-100"><span title="{{ run.trigger_reason }}">{{ run.trigger_reason | format_trigger }}</span></td>
               <td class="py-2 text-gray-100">{{ run.run_type }}</td>
               <td class="py-2">
                 {% if run.status == 'completed' %}
@@ -146,6 +147,7 @@
           {% endfor %}
         </tbody>
       </table>
+      </div>
     {% else %}
       <p class="text-gray-400">No reconciliation runs yet</p>
     {% endif %}
