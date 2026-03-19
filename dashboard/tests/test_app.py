@@ -356,6 +356,25 @@ class TestHtmxTimeout:
         assert '"timeout": 8000' in section_html or '"timeout":8000' in section_html
 
 
+class TestFavicon:
+    """Tests that the page includes an SVG favicon link tag."""
+
+    def test_favicon_link_present(self, client):
+        html = client.get('/').text
+        assert '<link rel="icon"' in html
+
+    def test_favicon_is_svg(self, client):
+        html = client.get('/').text
+        # The favicon href should reference an SVG (data URI or .svg file)
+        import re
+        match = re.search(r'<link rel="icon"[^>]+href="([^"]*)"', html)
+        assert match is not None, 'No favicon link tag with href found'
+        href = match.group(1)
+        assert 'image/svg+xml' in href or href.endswith('.svg'), (
+            f'Favicon href does not reference an SVG: {href}'
+        )
+
+
 class TestSriIntegrity:
     """Tests that CDN script tags have SRI integrity hashes and crossorigin attributes."""
 
