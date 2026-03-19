@@ -291,5 +291,13 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
     if config_path:
         os.environ['ORCH_CONFIG_PATH'] = str(config_path)
     config = OrchestratorConfig()
+    # Warn if no config file was actually loaded
+    effective_path = Path(os.environ.get('ORCH_CONFIG_PATH', 'config.yaml'))
+    if not effective_path.exists():
+        logger.warning(
+            'No config file found at %s — using defaults. '
+            'Pass --config or set ORCH_CONFIG_PATH.',
+            effective_path,
+        )
     config._module_configs = _discover_module_configs(config.project_root)
     return config
