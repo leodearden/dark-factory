@@ -45,6 +45,8 @@ def timeago(value: str | None) -> str:
         return f'{total_minutes // 1440}d ago'
     if total_minutes >= 60:
         return f'{total_minutes // 60}h ago'
+    if total_minutes == 0:
+        return 'just now'
     return f'{total_minutes}m ago'
 
 

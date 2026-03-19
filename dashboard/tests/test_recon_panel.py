@@ -85,6 +85,12 @@ class TestTimeagoFilter:
 
         assert timeago('') == 'never'
 
+    def test_just_now_for_zero_minutes(self):
+        from dashboard.app import timeago
+
+        ts = (datetime.now(UTC) - timedelta(seconds=5)).isoformat()
+        assert timeago(ts) == 'just now'
+
     def test_filter_registered_on_jinja2_env(self):
         from dashboard.app import templates, timeago
 
@@ -261,6 +267,12 @@ class TestReconRoute:
             html = client.get('/partials/recon').text
         assert 'staleness' in html
         assert 'title="max_staleness:2026-03-19T08:00:00+00:00"' in html
+
+    def test_recon_heading_present(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert '<h2' in html
+        assert 'Reconciliation' in html
 
 
 # --- Empty data constants ---
