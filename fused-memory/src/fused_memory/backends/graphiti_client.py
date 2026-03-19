@@ -13,6 +13,7 @@ from graphiti_core.embedder import OpenAIEmbedder
 from graphiti_core.embedder.openai import OpenAIEmbedderConfig
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
+from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.config.schema import FusedMemoryConfig
@@ -208,6 +209,15 @@ class GraphitiBackend:
         node = await EpisodicNode.get_by_uuid(client.driver, episode_uuid)
         await asyncio.wait_for(
             node.delete(client.driver),
+            timeout=self._write_timeout,
+        )
+
+    async def remove_edge(self, edge_uuid: str) -> None:
+        """Delete an entity edge (fact) by UUID."""
+        client = self._require_client()
+        edge = await EntityEdge.get_by_uuid(client.driver, edge_uuid)
+        await asyncio.wait_for(
+            edge.delete(client.driver),
             timeout=self._write_timeout,
         )
 
