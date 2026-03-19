@@ -192,3 +192,98 @@ async def test_reconcile_task_failure_handling(reconciler, journal):
 
     # Should still return a result (no unhandled exception)
     assert 'task_id' in result
+
+
+# ── Tests for project_id / project_root separation (step-5) ──────────
+
+
+@pytest.mark.asyncio
+async def test_done_memory_ops_use_project_id(reconciler, mock_memory_service):
+    """Memory calls (add_memory, search) should use logical project_id, not filesystem path."""
+    result = await reconciler.reconcile_task(
+        task_id='1',
+        transition='done',
+        project_id='dark_factory',
+        project_root='/home/leo/src/dark-factory',
+        task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
+    )
+
+    # All add_memory calls should use the logical project_id
+    for call in mock_memory_service.add_memory.call_args_list:
+        assert call.kwargs.get('project_id') == 'dark_factory', (
+            f'add_memory called with wrong project_id: {call}'
+        )
+    # search should use logical project_id
+    for call in mock_memory_service.search.call_args_list:
+        assert call.kwargs.get('project_id') == 'dark_factory', (
+            f'search called with wrong project_id: {call}'
+        )
+
+
+@pytest.mark.asyncio
+async def test_done_task_ops_use_project_root(reconciler, mock_taskmaster):
+    """Taskmaster calls (get_tasks) should use filesystem project_root, not logical id."""
+    result = await reconciler.reconcile_task(
+        task_id='1',
+        transition='done',
+        project_id='dark_factory',
+        project_root='/home/leo/src/dark-factory',
+        task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
+    )
+
+    # get_tasks should use the filesystem path
+    mock_taskmaster.get_tasks.assert_called_once_with(
+        project_root='/home/leo/src/dark-factory'
+    )
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_update_uses_project_root(reconciler, mock_memory_service, mock_taskmaster):
+    """Hints attachment via taskmaster.update_task should use project_root."""
+    mock_memory_service.search = AsyncMock(return_value=[
+        MemoryResult(id='1', content='info', source_store='mem0', entities=['EntityA']),
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='1',
+        transition='blocked',
+        project_id='dark_factory',
+        project_root='/home/leo/src/dark-factory',
+        task_before={'id': '1', 'title': 'Blocked', 'status': 'in-progress'},
+    )
+
+    # update_task for hints should use filesystem path
+    mock_taskmaster.update_task.assert_called_once()
+    call_kwargs = mock_taskmaster.update_task.call_args.kwargs
+    assert call_kwargs['project_root'] == '/home/leo/src/dark-factory'
+
+
+@pytest.mark.asyncio
+async def test_bulk_reconcile_separates_ids(reconciler, mock_memory_service, mock_taskmaster):
+    """reconcile_bulk_tasks uses project_id for memory.search and project_root for taskmaster calls."""
+    mock_taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {'id': '1', 'title': 'Task 1', 'status': 'pending', 'dependencies': []},
+        ]
+    })
+    mock_memory_service.search = AsyncMock(return_value=[
+        MemoryResult(id='m1', content='info', source_store='mem0', entities=['E1']),
+    ])
+
+    result = await reconciler.reconcile_bulk_tasks(
+        parent_task_id=None,
+        project_id='dark_factory',
+        project_root='/home/leo/src/dark-factory',
+    )
+
+    # taskmaster.get_tasks should use filesystem path
+    mock_taskmaster.get_tasks.assert_called_once_with(
+        project_root='/home/leo/src/dark-factory'
+    )
+    # memory.search should use logical project_id
+    for call in mock_memory_service.search.call_args_list:
+        assert call.kwargs.get('project_id') == 'dark_factory'
+    # update_task for hints should use filesystem path
+    if mock_taskmaster.update_task.called:
+        call_kwargs = mock_taskmaster.update_task.call_args.kwargs
+        assert call_kwargs['project_root'] == '/home/leo/src/dark-factory'
