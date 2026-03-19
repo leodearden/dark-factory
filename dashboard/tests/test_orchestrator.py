@@ -512,3 +512,30 @@ class TestDiscoverOrchestrators:
         # Key should fall back to '9' (directory name) since no metadata.json exists
         assert '9' in worktrees, f"Expected fallback key '9' from dir name, got keys: {list(worktrees.keys())}"
         assert worktrees['9']['metadata'] is None
+
+    def test_worktree_non_dict_metadata_falls_back_to_dir_name(self, tmp_path):
+        """Non-dict JSON metadata (e.g. array) must not crash discover_orchestrators."""
+        import json
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        # Create worktree directory named '11' with metadata.json containing a JSON array
+        wt_dir = tmp_path / '.worktrees' / '11'
+        wt_dir.mkdir(parents=True)
+        task_dir = wt_dir / '.task'
+        task_dir.mkdir()
+        (task_dir / 'metadata.json').write_text(json.dumps([1, 2, 3]))
+
+        mock_procs = [{'pid': 1111, 'prd': '/prd.md', 'running': True, 'started': 'Mar19'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            # Must NOT raise AttributeError even though metadata is a list, not a dict
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        worktrees = result[0]['worktrees']
+        # Falls back to directory name '11' since non-dict metadata has no task_id
+        assert '11' in worktrees, f"Expected fallback key '11' from dir name, got keys: {list(worktrees.keys())}"
