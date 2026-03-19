@@ -7,6 +7,8 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from shared.usage_gate import UsageGate
+
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.reconciliation import (
@@ -24,7 +26,6 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 )
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
-from shared.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
 

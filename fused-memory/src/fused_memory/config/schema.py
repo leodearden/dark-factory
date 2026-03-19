@@ -7,12 +7,12 @@ from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field
-from shared.config_models import UsageCapConfig
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
+from shared.config_models import UsageCapConfig
 
 
 class YamlSettingsSource(PydanticBaseSettingsSource):

@@ -1,0 +1,10 @@
+# Fused-memory orchestrator configuration
+# Scopes verification to fused-memory's own venv so pyright/ruff/pytest
+# use the module's pyproject.toml config and don't resolve orchestrator
+# from the main project's editable install.
+
+# Verification commands — run from the fused-memory/ subdirectory so
+# pyright/ruff pick up the local pyproject.toml configuration.
+test_command: "uv run --project fused-memory --directory fused-memory pytest tests/ --tb=short -q"
+lint_command: "uv run --project fused-memory --directory fused-memory ruff check src/ tests/"
+type_check_command: "uv run --project fused-memory --directory fused-memory pyright src/ tests/"
