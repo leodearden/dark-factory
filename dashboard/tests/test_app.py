@@ -356,6 +356,82 @@ class TestHtmxTimeout:
         assert '"timeout": 8000' in section_html or '"timeout":8000' in section_html
 
 
+class TestFavicon:
+    """Tests that the page includes an SVG favicon link tag."""
+
+    def test_favicon_link_present(self, client):
+        html = client.get('/').text
+        assert '<link rel="icon"' in html
+
+    def test_favicon_is_svg(self, client):
+        html = client.get('/').text
+        # The favicon href should reference an SVG (data URI or .svg file)
+        import re
+        match = re.search(r'<link rel="icon"[^>]+href="([^"]*)"', html)
+        assert match is not None, 'No favicon link tag with href found'
+        href = match.group(1)
+        assert 'image/svg+xml' in href or href.endswith('.svg'), (
+            f'Favicon href does not reference an SVG: {href}'
+        )
+
+
+class TestSriIntegrity:
+    """Tests that CDN script tags have SRI integrity hashes and crossorigin attributes."""
+
+    def test_htmx_has_integrity(self, client):
+        html = client.get('/').text
+        htmx_idx = html.index('unpkg.com/htmx.org@2.0.4')
+        tag_html = html[htmx_idx - 50:htmx_idx + 300]
+        assert 'integrity="sha384-' in tag_html
+
+    def test_idiomorph_has_integrity(self, client):
+        html = client.get('/').text
+        idio_idx = html.index('unpkg.com/idiomorph@0.3.0')
+        tag_html = html[idio_idx - 50:idio_idx + 300]
+        assert 'integrity="sha384-' in tag_html
+
+    def test_alpine_has_integrity(self, client):
+        html = client.get('/').text
+        alpine_idx = html.index('alpinejs@3.14.8')
+        tag_html = html[alpine_idx - 50:alpine_idx + 300]
+        assert 'integrity="sha384-' in tag_html
+
+    def test_all_cdn_scripts_have_crossorigin(self, client):
+        html = client.get('/').text
+        for url_fragment in [
+            'unpkg.com/htmx.org@2.0.4',
+            'unpkg.com/idiomorph@0.3.0',
+            'alpinejs@3.14.8',
+        ]:
+            idx = html.index(url_fragment)
+            tag_html = html[idx - 50:idx + 300]
+            assert 'crossorigin="anonymous"' in tag_html, (
+                f'Missing crossorigin=anonymous near {url_fragment}'
+            )
+
+    def test_no_cdn_script_without_integrity(self, client):
+        import re
+        html = client.get('/').text
+        # Find all external script src tags (https://)
+        script_tags = re.findall(r'<script[^>]+src="https://[^"]*"[^>]*>', html)
+        # Filter out Tailwind CDN (dynamic JIT, not a static asset)
+        checkable = [t for t in script_tags if 'tailwind' not in t]
+        for tag in checkable:
+            assert 'integrity=' in tag, f'Missing integrity on tag: {tag}'
+
+
+class TestCdnVersionPinning:
+    """Tests that Alpine.js CDN URL uses a pinned version, not a wildcard."""
+
+    def test_alpine_no_wildcard_version(self, client):
+        html = client.get('/').text
+        assert '@3.x.x' not in html
+
+    def test_alpine_pinned_to_3_14_8(self, client):
+        html = client.get('/').text
+        assert 'alpinejs@3.14.8' in html
+
+
 class TestMainModule:
     """Tests for python -m dashboard entry point."""
 
