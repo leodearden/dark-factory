@@ -69,3 +69,59 @@ class TestMcpToolCall:
                 await mcp_tool_call(
                     client, 'http://localhost:8000', 'get_status', {}
                 )
+
+
+# --- Helpers for higher-level function tests ---
+
+_STATUS_PAYLOAD = {
+    'graphiti': {'connected': True, 'node_count': 42},
+    'mem0': {'connected': True, 'memory_count': 5},
+    'queue': {'counts': {'pending': 1, 'completed': 8}, 'oldest_pending_age_seconds': 1.2},
+}
+
+
+class TestGetMemoryStatus:
+    """Tests for get_memory_status."""
+
+    async def test_successful_status(self, dashboard_config):
+        """Returns the parsed status dict from a successful MCP response."""
+        from dashboard.data.memory import get_memory_status
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _make_mcp_response(_STATUS_PAYLOAD)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await get_memory_status(client, dashboard_config)
+
+        assert result == _STATUS_PAYLOAD
+        assert result['graphiti']['node_count'] == 42
+        assert result['mem0']['memory_count'] == 5
+
+    async def test_connect_error_returns_offline(self, dashboard_config):
+        """ConnectError returns {offline: True, error: ...}."""
+        from dashboard.data.memory import get_memory_status
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError('connection refused')
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await get_memory_status(client, dashboard_config)
+
+        assert result['offline'] is True
+        assert 'error' in result
+
+    async def test_timeout_returns_offline(self, dashboard_config):
+        """TimeoutException returns {offline: True, error: ...}."""
+        from dashboard.data.memory import get_memory_status
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.TimeoutException('timed out')
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await get_memory_status(client, dashboard_config)
+
+        assert result['offline'] is True
+        assert 'error' in result
