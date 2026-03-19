@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import httpx
 import pytest
@@ -327,3 +328,50 @@ class TestMalformedResponse:
             result = await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
 
         assert result == {}
+
+
+class TestMcpToolCallLogging:
+    """Tests that mcp_tool_call emits WARNING-level logs on parse failures."""
+
+    async def test_non_json_body_logs_warning(self, caplog):
+        """HTTP 200 with non-JSON body triggers resp.json() failure and logs a WARNING."""
+        from dashboard.data.memory import mcp_tool_call
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text='<html>Bad Gateway</html>')
+
+        transport = httpx.MockTransport(handler)
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.memory'):
+            async with httpx.AsyncClient(transport=transport) as client:
+                result = await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
+
+        assert result == {}
+        assert any(
+            r.levelno == logging.WARNING and 'dashboard.data.memory' in r.name
+            for r in caplog.records
+        ), f'Expected WARNING log from dashboard.data.memory, got: {caplog.records}'
+
+    async def test_invalid_inner_json_logs_warning(self, caplog):
+        """Valid outer JSON but inner text is not JSON triggers json.loads failure and logs a WARNING."""
+        from dashboard.data.memory import mcp_tool_call
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = {
+                'jsonrpc': '2.0',
+                'id': 1,
+                'result': {
+                    'content': [{'type': 'text', 'text': 'not valid json!!!'}],
+                },
+            }
+            return httpx.Response(200, json=body)
+
+        transport = httpx.MockTransport(handler)
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.memory'):
+            async with httpx.AsyncClient(transport=transport) as client:
+                result = await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
+
+        assert result == {}
+        assert any(
+            r.levelno == logging.WARNING and 'dashboard.data.memory' in r.name
+            for r in caplog.records
+        ), f'Expected WARNING log from dashboard.data.memory, got: {caplog.records}'
