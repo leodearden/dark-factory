@@ -395,7 +395,7 @@ class BaseStage:
                 'properties': {
                     'id': {'type': 'string'},
                     'prompt': {'type': 'string'},
-                    'metadata': {'type': 'string', 'description': 'JSON metadata to merge'},
+                    'metadata': {'type': ['string', 'object'], 'description': 'JSON metadata to merge (object or JSON string)'},
                 },
                 'required': ['id'],
             },
