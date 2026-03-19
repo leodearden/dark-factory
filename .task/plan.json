@@ -1,139 +1,106 @@
 {
-  "task_id": "35",
-  "title": "Deduplicate identical orchestrator cards when sharing task tree",
+  "task_id": "38",
+  "title": "Narrow broad exception handlers and add logging for silent failures",
   "files": [
     "dashboard/src/dashboard/data/orchestrator.py",
-    "dashboard/src/dashboard/templates/partials/orchestrators.html",
+    "dashboard/src/dashboard/data/memory.py",
+    "dashboard/src/dashboard/data/reconciliation.py",
     "dashboard/tests/test_orchestrator.py",
-    "dashboard/tests/test_orchestrator_panel.py"
+    "dashboard/tests/test_memory.py",
+    "dashboard/tests/test_reconciliation.py"
   ],
   "modules": [
     "dashboard/src/dashboard/data",
-    "dashboard/src/dashboard/templates/partials",
     "dashboard/tests"
   ],
-  "analysis": "The bug: discover_orchestrators() loads the task tree once and attaches the identical tasks/worktrees/summary to every process entry. When two orchestrator processes run against the same PRD, the dashboard renders two visually identical cards — same progress bar, same task list, same stats — differing only by PID. This is confusing.\n\nRoot cause in orchestrator.py lines 249-256: the function iterates over all processes and blindly spreads each proc dict (**proc) into the result, attaching the shared task tree to each. There is no grouping by PRD.\n\nFix approach (Option 3 from task description): Group processes by PRD path in discover_orchestrators(), merging PIDs into a 'pids' list. Produce one entry per unique PRD. The template then conditionally renders 'PID 1234' (singular) or 'PIDs 1234, 5678' (plural).\n\nKey observations:\n- find_running_orchestrators() returns dicts with 'pid' (int), 'prd' (str), 'running' (bool), 'started' (str)\n- discover_orchestrators() spreads proc dict via **proc into result entries\n- Template references orch.pid (singular) on line 12\n- MOCK_ORCHESTRATOR_RUNNING/COMPLETED in test_orchestrator_panel.py use 'pid' key\n- 4 existing TestDiscoverOrchestrators tests assert entry['pid']\n- find_running_orchestrators() stays unchanged — it correctly reports raw per-process data\n- Grouping is a pure data transformation in discover_orchestrators()\n- 'running' for a group should be True if ANY constituent process is running (OR semantics)\n- 'started' is display-only from ps — use first entry's value",
+  "analysis": "All three code changes and their corresponding tests are ALREADY IMPLEMENTED and merged to main. The worktree inherits the completed state. Specifically: (1) orchestrator.py line 52 already has `except (OSError, subprocess.TimeoutExpired):` with logger.warning on line 53 — was bare `except Exception:`. (2) memory.py lines 55-57 and 69-71 already have `logger.warning('MCP response parse error', exc_info=True)` before returning {}. (3) reconciliation.py already has `logger.debug(...)` with exc_info=True in all 5 except blocks (lines 36, 79, 115, 142, 170). Tests exist: orchestrator has test_unexpected_exception_propagates (verifies narrowing by proving RuntimeError propagates), test_subprocess_failure (OSError returns []), test_subprocess_timeout_caught (TimeoutExpired returns []); memory has TestMcpToolCallLogging with caplog WARNING assertions for both parse paths; reconciliation has TestExceptionLogging with caplog DEBUG assertions for missing DB and OperationalError. The executor should verify all tests pass and mark the task done.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write test test_single_process_produces_pids_list in TestDiscoverOrchestrators: mock one running orchestrator, call discover_orchestrators, assert result[0] has 'pids' key containing [1234], and assert 'pid' key is absent from result[0].",
+      "description": "Verify orchestrator exception-narrowing tests exist and pass in test_orchestrator.py: (1) test_subprocess_failure — OSError from subprocess.run is caught, returns []. (2) test_subprocess_timeout_caught — subprocess.TimeoutExpired is caught, returns []. (3) test_unexpected_exception_propagates — RuntimeError from subprocess.run is NOT caught, proves the except clause is narrowed to (OSError, subprocess.TimeoutExpired) and does not swallow unexpected errors. Run: pytest dashboard/tests/test_orchestrator.py::TestFindRunningOrchestrators -v",
       "status": "done",
-      "commit": "370db08"
+      "commit": "a4d64cd"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Refactor discover_orchestrators() to group processes by PRD: use groups = {} / groups.setdefault(proc['prd'], []).append(proc). Iterate over groups instead of individual processes. For each unique PRD, emit one entry with 'pids': [p['pid'] for p in group], 'prd': prd, 'running': any(p['running'] for p in group), 'started': group[0]['started'], plus shared tasks/worktrees/summary. Also update the 4 existing TestDiscoverOrchestrators tests to use entry['pids'] instead of entry['pid']: test_combines_process_and_worktree_data, test_missing_tasks_json, test_worktree_keyed_by_task_id_not_dirname, test_non_task_worktree_dirs_excluded.",
+      "description": "Verify orchestrator.py find_running_orchestrators() has narrowed exception handler: line 52 must be `except (OSError, subprocess.TimeoutExpired):` and line 53 must have `logger.warning('Failed to run ps aux', exc_info=True)`. Also verify logger = logging.getLogger(__name__) exists at module level. All already implemented — no code change needed.",
       "status": "done",
-      "commit": "bc045ad"
+      "commit": "a4d64cd"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write test test_same_prd_grouped_into_single_entry in TestDiscoverOrchestrators: mock find_running_orchestrators returning two processes with the same PRD path but different PIDs (1234 and 5678, both prd='/home/leo/prd.md'). Create tasks.json and a worktree. Assert len(result)==1. Assert result[0]['pids']==[1234, 5678]. Assert tasks/worktrees/summary present once.",
+      "description": "Verify memory logging tests exist and pass in test_memory.py: (1) TestMcpToolCallLogging::test_non_json_body_logs_warning — HTTP 200 with HTML body triggers resp.json() failure, caplog asserts WARNING from dashboard.data.memory. (2) TestMcpToolCallLogging::test_invalid_inner_json_logs_warning — valid outer JSON but invalid inner text triggers json.loads failure, caplog asserts WARNING from dashboard.data.memory. Run: pytest dashboard/tests/test_memory.py::TestMcpToolCallLogging -v",
       "status": "done",
-      "commit": "69db19b"
+      "commit": "a4d64cd"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Verify step-3 test passes with existing grouping logic from step-2. No new production code expected — setdefault grouping already handles same-PRD merging. Fix if needed.",
+      "description": "Verify memory.py mcp_tool_call() has WARNING logging on both parse paths: (1) lines 55-57 — except (json.JSONDecodeError, ValueError) after resp.json() logs warning and returns {}. (2) lines 69-71 — except (json.JSONDecodeError, TypeError) after json.loads(text) logs warning and returns {}. Both use `logger.warning('MCP response parse error', exc_info=True)`. All already implemented — no code change needed.",
       "status": "done",
-      "commit": "69db19b"
+      "commit": "a4d64cd"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write test test_different_prds_produce_separate_entries: mock two processes with different PRD paths (/prd1.md and /prd2.md). Assert len(result)==2, each with pids list of length 1. Write test test_grouped_running_true_when_any_running: two procs same PRD, one running=True one running=False, assert entry['running']==True. Write test test_grouped_running_false_when_all_stopped: two procs same PRD both running=False, assert entry['running']==False.",
+      "description": "Verify reconciliation logging tests exist and pass in test_reconciliation.py: (1) TestExceptionLogging::test_missing_db_logs_debug — get_recent_runs with non-existent DB path, caplog asserts DEBUG from dashboard.data.reconciliation. (2) TestExceptionLogging::test_operational_error_logs_debug — get_watermarks with empty (no-tables) DB, caplog asserts DEBUG from dashboard.data.reconciliation on OperationalError. Run: pytest dashboard/tests/test_reconciliation.py::TestExceptionLogging -v",
       "status": "done",
-      "commit": "2c30a4e"
+      "commit": "a4d64cd"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Verify step-5 tests pass with existing logic. The any() call for running and dict key grouping should cover all cases. Fix if needed.",
+      "description": "Verify reconciliation.py has DEBUG logging in all 5 except blocks: get_recent_runs (line 36), get_watermarks (line 79), get_buffer_stats (line 115), get_burst_state (line 142), get_latest_verdict (line 170). Each uses `logger.debug('<func_name>: DB unavailable at %s', db_path, exc_info=True)`. Also verify logger = logging.getLogger(__name__) exists at module level. All already implemented — no code change needed.",
       "status": "done",
-      "commit": "2c30a4e"
-    },
-    {
-      "id": "step-7",
-      "type": "test",
-      "description": "Update test_orchestrator_panel.py mock data: change MOCK_ORCHESTRATOR_RUNNING from 'pid': 1234 to 'pids': [1234], and MOCK_ORCHESTRATOR_COMPLETED from 'pid': 5678 to 'pids': [5678]. Add new test class TestOrchestratorMultiPid with MOCK_ORCHESTRATOR_MULTI_PID constant (pids: [1234, 5678], same PRD, same tasks/worktrees/summary as RUNNING). Tests: (1) test_multi_pid_header_shows_pids_plural — 'PIDs' in html + both '1234' and '5678'; (2) test_single_pid_header_shows_pid_singular — 'PID ' in html for single-PID entry; (3) test_count_badge_shows_one_for_grouped — count badge '1' for single grouped entry with multiple PIDs; (4) test_multi_pid_comma_separated — pids=[111, 222, 333] renders '111, 222, 333'.",
-      "status": "done",
-      "commit": "51bedbc"
-    },
-    {
-      "id": "step-8",
-      "type": "impl",
-      "description": "Update orchestrators.html template line 12: replace '<span ...>PID {{ orch.pid }}</span>' with conditional: {% if orch.pids|length > 1 %}<span ...>PIDs {{ orch.pids|join(', ') }}</span>{% else %}<span ...>PID {{ orch.pids[0] }}</span>{% endif %}. Verify ALL panel tests pass including new multi-PID tests and all existing tests with updated mock data.",
-      "status": "done",
-      "commit": "ea5c085"
-    },
-    {
-      "id": "step-9",
-      "type": "test",
-      "description": "Run full test suite (pytest dashboard/tests/) to verify no regressions. Check that existing tests in test_app.py, test_badge_macros.py, and other test files still pass. Fix any issues.",
-      "status": "done",
-      "commit": "51bedbc"
+      "commit": "a4d64cd"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Use 'pids' (list[int]) instead of keeping 'pid' (int) alongside",
-      "rationale": "Clean break over backward compatibility. The only consumer is the orchestrators.html template (also modified in this task), so there is no external API contract to maintain. A list is the natural representation whether there's 1 or N processes. Keeping both 'pid' and 'pids' would invite confusion about which to use."
+      "decision": "All code changes and tests are already merged to main — plan is verification-only",
+      "rationale": "Memory context confirms 'Tasks 35, 38, 40, 41 are currently pending in Taskmaster but confirmed implemented and merged'. The worktree was created from main which already contains all changes. The executor should verify tests pass and mark the task done."
     },
     {
-      "decision": "Group by exact PRD path string",
-      "rationale": "Simplest correct matching. PRD paths come from the same ps aux regex parsing, so identical processes will have byte-identical path strings. Path normalization (resolve, expanduser) adds complexity without benefit since orchestrator invocations use consistent paths."
+      "decision": "Orchestrator uses (OSError, subprocess.TimeoutExpired) not broader exception",
+      "rationale": "Bare `except Exception:` also catches KeyboardInterrupt (via BaseException subclass path in some contexts), SystemExit, and programming bugs (RuntimeError, TypeError, AttributeError). Narrowing to specific subprocess failure modes ensures real bugs propagate visibly. Test test_unexpected_exception_propagates proves RuntimeError is no longer swallowed."
     },
     {
-      "decision": "Set grouped 'running' to any(p['running'] for p in group)",
-      "rationale": "If any process in the group is still running, the orchestration is active. This is the most informative signal for the dashboard user. The status badge should show green/running as long as at least one process is alive."
+      "decision": "Memory parse errors log at WARNING, reconciliation DB errors log at DEBUG",
+      "rationale": "MCP parse errors indicate server-side issues or proxy misconfiguration worth investigating (WARNING). Missing/locked SQLite DB is expected during startup or when reconciliation hasn't run yet (DEBUG) — would be noise at WARNING level."
     },
     {
-      "decision": "Keep 'started' as first process's value, not min/max",
-      "rationale": "The template does not currently render 'started'. Lexicographic comparison of ps time formats (e.g. 'Mar18' vs '10:30') is unreliable across different ps output conventions. Using group[0]['started'] is simple and sufficient."
+      "decision": "All logging uses exc_info=True",
+      "rationale": "Attaches the full traceback to the log record, making it possible to diagnose root cause from logs alone without reproducing the error. This is critical for production debugging — the original problem this task was filed to solve."
     },
     {
-      "decision": "Inline grouping in discover_orchestrators() rather than a separate _group_by_prd() helper",
-      "rationale": "The grouping logic is 5-6 lines (setdefault + list iteration + any()). Extracting a helper would add a function boundary, docstring, and test class for trivial logic. The discover_orchestrators tests already cover the grouping behavior end-to-end. If the logic grows, it can be extracted later."
-    },
-    {
-      "decision": "find_running_orchestrators() stays unchanged",
-      "rationale": "Separation of concerns: find_running_orchestrators() reports raw per-process data faithfully. discover_orchestrators() is the aggregation/enrichment layer where grouping belongs. This keeps the process-scanning function simple and independently testable."
-    },
-    {
-      "decision": "Singular/plural PID label via Jinja2 conditional on pids|length",
-      "rationale": "'PID 1234' reads naturally for single process; 'PIDs 1234, 5678' clearly communicates shared work. The |join filter handles any number of PIDs. No new macros or filters needed — reuses existing Jinja2 patterns in the template."
+      "decision": "Behavior unchanged — still return defaults on error",
+      "rationale": "The task explicitly requires 'not change behavior (still return defaults) but make failures visible in logs'. Functions continue to return [], {}, or None on error. The only change is that errors are now logged instead of silently swallowed."
     }
   ],
   "reuse": [
     {
-      "what": "Existing find_running_orchestrators() function",
-      "where": "dashboard/src/dashboard/data/orchestrator.py lines 40-87",
-      "how": "Unchanged — still returns per-process dicts. Grouping is applied to its output in discover_orchestrators()."
+      "what": "pytest caplog fixture",
+      "where": "test_memory.py (TestMcpToolCallLogging), test_reconciliation.py (TestExceptionLogging)",
+      "how": "Used with `caplog.at_level(logging.WARNING/DEBUG, logger='...')` to capture and assert log records from specific loggers. Checks both level (levelno) and logger name."
     },
     {
-      "what": "_patch_orchestrator_data() test helper",
-      "where": "dashboard/tests/test_orchestrator_panel.py lines 47-49",
-      "how": "Reused unchanged for all panel tests — patches discover_orchestrators at app.py import location. Mock data just needs 'pids' instead of 'pid'."
+      "what": "httpx.MockTransport",
+      "where": "test_memory.py",
+      "how": "Provides deterministic HTTP responses without network I/O, including simulating non-JSON bodies (HTML from reverse proxy) that trigger parse failures."
     },
     {
-      "what": "status_badge macro from badges.html",
-      "where": "dashboard/src/dashboard/templates/macros/badges.html",
-      "how": "No changes needed — badge rendering for running/completed status is independent of PID grouping."
+      "what": "conftest.py missing_db_path fixture",
+      "where": "test_reconciliation.py (TestExceptionLogging::test_missing_db_logs_debug)",
+      "how": "Returns path to non-existent DB file, triggering FileNotFoundError in aiosqlite.connect with URI mode."
     },
     {
-      "what": "TestDiscoverOrchestrators test patterns",
-      "where": "dashboard/tests/test_orchestrator.py lines 468-603",
-      "how": "New tests follow the same pattern: tmp_path fixtures, mock find_running_orchestrators, call discover_orchestrators(config), assert result structure. Only change: assertions use entry['pids'] (list) instead of entry['pid'] (int)."
-    },
-    {
-      "what": "Jinja2 |length and |join filter patterns",
-      "where": "dashboard/src/dashboard/templates/partials/orchestrators.html line 6",
-      "how": "Template already uses |length for count badge. PID display uses the same |length for conditional and adds |join for comma-separated rendering."
+      "what": "Existing module-level logger pattern",
+      "where": "All three data modules",
+      "how": "All three files already had `import logging` and `logger = logging.getLogger(__name__)` at module level. The logging calls just needed to be added to the except blocks."
     }
   ]
 }
