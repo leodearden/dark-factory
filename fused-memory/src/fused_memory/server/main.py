@@ -11,9 +11,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.server.tools import create_mcp_server
-from fused_memory.services.memory_service import MemoryService
+from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
+from fused_memory.server.tools import create_mcp_server  # noqa: E402
+from fused_memory.services.memory_service import MemoryService  # noqa: E402
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'

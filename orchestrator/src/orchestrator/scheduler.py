@@ -96,6 +96,10 @@ class ModuleLockTable:
 
     # --- Public API ---
 
+    def is_held(self, task_id: str) -> bool:
+        """Return True if task_id currently holds any module locks."""
+        return task_id in self._held
+
     def try_acquire(self, task_id: str, modules: list[str]) -> bool:
         """Non-blocking attempt to acquire all module locks.
 
@@ -149,6 +153,7 @@ class Scheduler:
     def __init__(self, config: OrchestratorConfig):
         self.config = config
         self.lock_table = ModuleLockTable(config)
+        self._dispatched: set[str] = set()
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
 
@@ -247,6 +252,8 @@ class Scheduler:
         for t in tasks:
             if t.get('status') != 'pending':
                 continue
+            if str(t.get('id', '')) in self._dispatched:
+                continue
             deps = t.get('dependencies', [])
             deps_done = all(
                 status_map.get(str(d.get('id', d) if isinstance(d, dict) else d)) == 'done'
@@ -281,6 +288,7 @@ class Scheduler:
             modules = self._get_modules(task)
             task_id = str(task.get('id', ''))
             if self.lock_table.try_acquire(task_id, modules):
+                self._dispatched.add(task_id)
                 return TaskAssignment(task_id=task_id, task=task, modules=modules)
 
         return None
@@ -324,7 +332,8 @@ class Scheduler:
         return False
 
     def release(self, task_id: str) -> None:
-        """Release all module locks for a task."""
+        """Release all module locks for a task and clear dispatch guard."""
+        self._dispatched.discard(task_id)
         self.lock_table.release(task_id)
 
     def _get_modules(self, task: dict) -> list[str]:

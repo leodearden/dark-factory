@@ -1,10 +1,12 @@
 """Tests for scheduler module lock logic."""
 
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.scheduler import ModuleLockTable, files_to_modules
+from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules
 
 
 @pytest.fixture
@@ -76,6 +78,18 @@ class TestModuleLockTable:
     def test_release_nonexistent_task(self, lock_table: ModuleLockTable):
         # Should not raise
         lock_table.release('nonexistent')
+
+    def test_is_held_false_for_unknown(self, lock_table: ModuleLockTable):
+        assert lock_table.is_held('nonexistent') is False
+
+    def test_is_held_true_after_acquire(self, lock_table: ModuleLockTable):
+        lock_table.try_acquire('task-1', ['backend'])
+        assert lock_table.is_held('task-1') is True
+
+    def test_is_held_false_after_release(self, lock_table: ModuleLockTable):
+        lock_table.try_acquire('task-1', ['backend'])
+        lock_table.release('task-1')
+        assert lock_table.is_held('task-1') is False
 
 
 class TestHierarchicalLocking:
@@ -280,3 +294,171 @@ class TestModuleLockWithModuleConfig:
         assert lt.try_acquire('t1', ['dashboard'])
         assert lt.try_acquire('t2', ['dashboard'])
         assert not lt.try_acquire('t3', ['dashboard'])
+
+
+class TestAcquireNextNoDuplicates:
+    """acquire_next() must not return the same task twice while its locks are held."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_skips_already_dispatched(self, scheduler: Scheduler):
+        """Second acquire_next() for an already-held task returns None."""
+        task = {
+            'id': '1',
+            'title': 'Task one',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'modules': ['backend']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        first = await scheduler.acquire_next()
+        assert first is not None
+        assert first.task_id == '1'
+
+        second = await scheduler.acquire_next()
+        assert second is None
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_returns_different_tasks_sequentially(
+        self, scheduler: Scheduler
+    ):
+        """With two non-conflicting tasks, returns A then B then None."""
+        task_a = {
+            'id': '1',
+            'title': 'Task A',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'modules': ['backend']},
+        }
+        task_b = {
+            'id': '2',
+            'title': 'Task B',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'modules': ['frontend']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        first = await scheduler.acquire_next()
+        assert first is not None
+        first_id = first.task_id
+
+        second = await scheduler.acquire_next()
+        assert second is not None
+        assert second.task_id != first_id
+
+        third = await scheduler.acquire_next()
+        assert third is None
+
+    @pytest.mark.asyncio
+    async def test_release_clears_dispatched_allowing_redispatch(
+        self, scheduler: Scheduler
+    ):
+        """After release(), the same task can be dispatched again."""
+        task = {
+            'id': '1',
+            'title': 'Task one',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'modules': ['backend']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        first = await scheduler.acquire_next()
+        assert first is not None
+        assert first.task_id == '1'
+
+        # Release — should clear _dispatched so task can be re-dispatched
+        scheduler.release('1')
+
+        # Same task is still pending (mock unchanged) — should be dispatchable again
+        second = await scheduler.acquire_next()
+        assert second is not None
+        assert second.task_id == '1'
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_dispatches_different_tasks_concurrently(
+        self, scheduler: Scheduler
+    ):
+        """Three non-conflicting tasks can each be dispatched in turn; fourth returns None."""
+        tasks = [
+            {
+                'id': '1',
+                'title': 'Backend task',
+                'status': 'pending',
+                'dependencies': [],
+                'metadata': {'modules': ['backend']},
+            },
+            {
+                'id': '2',
+                'title': 'Frontend task',
+                'status': 'pending',
+                'dependencies': [],
+                'metadata': {'modules': ['frontend']},
+            },
+            {
+                'id': '3',
+                'title': 'Infra task',
+                'status': 'pending',
+                'dependencies': [],
+                'metadata': {'modules': ['infra']},
+            },
+        ]
+        scheduler.get_tasks = AsyncMock(return_value=tasks)
+
+        first = await scheduler.acquire_next()
+        second = await scheduler.acquire_next()
+        third = await scheduler.acquire_next()
+
+        ids = {a.task_id for a in [first, second, third] if a is not None}
+        assert ids == {'1', '2', '3'}, f'Expected 3 distinct tasks, got: {ids}'
+
+        fourth = await scheduler.acquire_next()
+        assert fourth is None
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_lock_conflict_plus_dispatch_guard(
+        self, scheduler: Scheduler
+    ):
+        """Two tasks on the same module: dispatch A, B blocked; release A, B dispatches."""
+        task_a = {
+            'id': 'A',
+            'title': 'Task A',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'modules': ['backend']},
+        }
+        task_b = {
+            'id': 'B',
+            'title': 'Task B',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'modules': ['backend']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        # First dispatch — task A (or B) acquires the module lock
+        first = await scheduler.acquire_next()
+        assert first is not None
+        dispatched_id = first.task_id
+        other_id = 'B' if dispatched_id == 'A' else 'A'
+
+        # Both guards (dispatch set + module lock) block re-dispatch of same task
+        # AND lock blocks dispatch of the other task on same module
+        second = await scheduler.acquire_next()
+        assert second is None, 'Both tasks should be blocked: one dispatched, other locked'
+
+        # Release the dispatched task — clears _dispatched AND module lock
+        scheduler.release(dispatched_id)
+
+        # Now the module is free: a task can be dispatched again.
+        # (dispatched_id's mock status is still pending, so it or other_id may win;
+        # what matters is that the lock+dispatch guard no longer blocks everything.)
+        third = await scheduler.acquire_next()
+        assert third is not None, 'After release(), a task should be dispatchable'
+        _ = other_id  # acknowledged; exact winner depends on sort order
