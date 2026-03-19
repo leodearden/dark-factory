@@ -43,6 +43,12 @@ class TestTimeagoFilter:
 
         assert timeago('') == 'never'
 
+    def test_just_now_for_zero_minutes(self):
+        from dashboard.app import timeago
+
+        ts = (datetime.now(UTC) - timedelta(seconds=5)).isoformat()
+        assert timeago(ts) == 'just now'
+
     def test_filter_registered_on_jinja2_env(self):
         from dashboard.app import templates, timeago
 
