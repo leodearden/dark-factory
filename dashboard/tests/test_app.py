@@ -299,6 +299,63 @@ class TestOrchestratorsPartialIntegration:
             assert 'No orchestrators detected' in html
 
 
+class TestHtmxErrorHandling:
+    """Tests for global HTMX error handler script in base.html."""
+
+    def test_script_has_response_error_listener(self, client):
+        html = client.get('/').text
+        assert 'htmx:responseError' in html
+
+    def test_script_has_timeout_listener(self, client):
+        html = client.get('/').text
+        assert 'htmx:timeout' in html
+
+    def test_script_has_send_error_listener(self, client):
+        html = client.get('/').text
+        assert 'htmx:sendError' in html
+
+    def test_error_card_has_red_bg_class(self, client):
+        html = client.get('/').text
+        assert 'bg-red-900/30' in html
+
+    def test_error_card_has_red_border_class(self, client):
+        html = client.get('/').text
+        assert 'border-red-800' in html
+
+    def test_error_card_has_red_text_class(self, client):
+        html = client.get('/').text
+        assert 'text-red-300' in html
+
+    def test_error_card_has_retrying_message(self, client):
+        html = client.get('/').text
+        assert 'retrying' in html
+
+
+class TestHtmxTimeout:
+    """Tests that polling sections have correct hx-request timeout attributes."""
+
+    def test_memory_section_has_timeout_8000(self, client):
+        html = client.get('/').text
+        # memory section uses 10s poll interval → 8s timeout
+        memory_idx = html.index('hx-get="/partials/memory"')
+        section_html = html[memory_idx - 200:memory_idx + 500]
+        assert '"timeout": 8000' in section_html or '"timeout":8000' in section_html
+
+    def test_recon_section_has_timeout_12000(self, client):
+        html = client.get('/').text
+        # recon section uses 15s poll interval → 12s timeout
+        recon_idx = html.index('hx-get="/partials/recon"')
+        section_html = html[recon_idx - 200:recon_idx + 500]
+        assert '"timeout": 12000' in section_html or '"timeout":12000' in section_html
+
+    def test_orchestrators_section_has_timeout_8000(self, client):
+        html = client.get('/').text
+        # orchestrators section uses 10s poll interval → 8s timeout
+        orch_idx = html.index('hx-get="/partials/orchestrators"')
+        section_html = html[orch_idx - 200:orch_idx + 500]
+        assert '"timeout": 8000' in section_html or '"timeout":8000' in section_html
+
+
 class TestMainModule:
     """Tests for python -m dashboard entry point."""
 
