@@ -44,7 +44,8 @@ Task operations (when Taskmaster is connected):
 - expand_task / parse_prd: Bulk task generation
 
 Management:
-- delete_memory / delete_episode: Remove specific memories
+- delete_memory: Remove a specific memory (edges for Graphiti, vector entries for Mem0)
+- delete_episode: Remove a Graphiti episode (with optional cascade)
 - get_status: Health check for all backends
 
 Reconciliation:
@@ -183,6 +184,11 @@ def create_mcp_server(
         - Preference/procedural queries → Mem0 primary
         - Broad queries → both stores
 
+        Graphiti results represent entity edges (facts) with edge UUIDs as IDs.
+        When category filtering is active and targets exactly one Graphiti-primary
+        category, that category is inferred on Graphiti results (which otherwise
+        lack category metadata).
+
         Args:
             query: Natural language query
             project_id: Project scope (required)
@@ -264,10 +270,12 @@ def create_mcp_server(
         """Delete a specific memory from a store. IRREVERSIBLE.
 
         For Mem0: removes the vector entry directly.
-        For Graphiti: removes the episode (use delete_episode for cascade control).
+        For Graphiti: removes the edge (fact) found by search. Use delete_episode
+        to remove an episode and its exclusively-sourced entities/edges.
 
-        The memory_id and store values come from search results (each result
-        includes its id and source_store).
+        The memory_id and store values come from search results — each result
+        includes its id (edge UUID for Graphiti, memory UUID for Mem0) and
+        source_store.
 
         Args:
             memory_id: The memory ID (from search results)
