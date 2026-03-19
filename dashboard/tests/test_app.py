@@ -29,3 +29,19 @@ class TestIndex:
     def test_get_root_htmx_orchestrators(self, client):
         html = client.get('/').text
         assert 'hx-get="/partials/orchestrators"' in html
+
+
+class TestHealthIntegration:
+    """Tests for GET /api/health."""
+
+    def test_health_returns_200(self, client):
+        resp = client.get('/api/health')
+        assert resp.status_code == 200
+
+    def test_health_content_type_json(self, client):
+        resp = client.get('/api/health')
+        assert 'application/json' in resp.headers['content-type']
+
+    def test_health_body(self, client):
+        resp = client.get('/api/health')
+        assert resp.json() == {'status': 'ok'}
