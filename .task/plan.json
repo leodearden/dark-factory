@@ -1,139 +1,116 @@
 {
-  "task_id": "35",
-  "title": "Deduplicate identical orchestrator cards when sharing task tree",
+  "task_id": "42",
+  "title": "Bug: Harness starts duplicate workflow for each task",
   "files": [
-    "dashboard/src/dashboard/data/orchestrator.py",
-    "dashboard/src/dashboard/templates/partials/orchestrators.html",
-    "dashboard/tests/test_orchestrator.py",
-    "dashboard/tests/test_orchestrator_panel.py"
+    "orchestrator/src/orchestrator/scheduler.py",
+    "orchestrator/tests/test_scheduler.py"
   ],
   "modules": [
-    "dashboard/src/dashboard/data",
-    "dashboard/src/dashboard/templates/partials",
-    "dashboard/tests"
+    "orchestrator/src/orchestrator",
+    "orchestrator/tests"
   ],
-  "analysis": "The bug: discover_orchestrators() loads the task tree once and attaches the identical tasks/worktrees/summary to every process entry. When two orchestrator processes run against the same PRD, the dashboard renders two visually identical cards — same progress bar, same task list, same stats — differing only by PID. This is confusing.\n\nRoot cause in orchestrator.py lines 249-256: the function iterates over all processes and blindly spreads each proc dict (**proc) into the result, attaching the shared task tree to each. There is no grouping by PRD.\n\nFix approach (Option 3 from task description): Group processes by PRD path in discover_orchestrators(), merging PIDs into a 'pids' list. Produce one entry per unique PRD. The template then conditionally renders 'PID 1234' (singular) or 'PIDs 1234, 5678' (plural).\n\nKey observations:\n- find_running_orchestrators() returns dicts with 'pid' (int), 'prd' (str), 'running' (bool), 'started' (str)\n- discover_orchestrators() spreads proc dict via **proc into result entries\n- Template references orch.pid (singular) on line 12\n- MOCK_ORCHESTRATOR_RUNNING/COMPLETED in test_orchestrator_panel.py use 'pid' key\n- 4 existing TestDiscoverOrchestrators tests assert entry['pid']\n- find_running_orchestrators() stays unchanged — it correctly reports raw per-process data\n- Grouping is a pure data transformation in discover_orchestrators()\n- 'running' for a group should be True if ANY constituent process is running (OR semantics)\n- 'started' is display-only from ps — use first entry's value",
+  "analysis": "## Root Cause\n\nIn harness.py, the main `while True` loop (lines 149-174) calls `scheduler.acquire_next()`, gets a TaskAssignment, creates an `asyncio.Task` via `asyncio.create_task(_run_slot(...))`, then immediately loops back to call `acquire_next()` again without awaiting the workflow.\n\nAt this point, the dispatched task's status is still 'pending' in the external MCP/taskmaster store because `workflow.run()` — which calls `set_task_status('in-progress')` on workflow.py line 115 — hasn't executed yet (it's in a just-created, unstarted asyncio task).\n\nWhen `acquire_next()` runs again, it fetches tasks via MCP and the task still shows status='pending'. The task passes candidate filtering (pending, deps done). Then `lock_table.try_acquire(task_id, modules)` succeeds because it uses `exclude_task=task_id` when counting conflicts (scheduler.py line 112), and `self._held[task_id] = set(normalized)` on line 115 silently overwrites the existing entry. So the same task passes all checks and is returned again, creating a duplicate workflow.\n\nThe second workflow races the first. When the first completes and cleans up the worktree, the second crashes trying to write review files to a deleted directory (ENOENT), producing false blocking escalations.\n\n## Fix Design\n\nAdd a `_dispatched: set[str]` to the `Scheduler` class:\n1. `acquire_next()` filters out task IDs already in `_dispatched` from candidates\n2. On successful acquisition, adds `task_id` to `_dispatched` before returning the assignment\n3. `release()` removes from `_dispatched` — already called in _run_slot's `finally` block (harness.py line 508)\n\nThis is entirely in-memory (no MCP race), co-located with existing lock management, and integrates with the existing `release()` cleanup lifecycle. No changes needed to harness.py or workflow.py.\n\n## Why a separate set instead of using lock_table.is_held()?\n\nWhile the lock table already tracks which tasks hold locks, conflating 'dispatched' with 'holds locks' is fragile. handle_blast_radius_expansion() releases locks mid-workflow (scheduler.py line 323) before _run_slot.finally calls release() — using is_held() would create a brief window where re-dispatch is possible. A dedicated _dispatched set cleanly separates the concerns and remains set until the workflow slot fully completes.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write test test_single_process_produces_pids_list in TestDiscoverOrchestrators: mock one running orchestrator, call discover_orchestrators, assert result[0] has 'pids' key containing [1234], and assert 'pid' key is absent from result[0].",
+      "description": "Write failing test `test_acquire_next_skips_already_dispatched_task` in a new `TestSchedulerAcquireNext` class in test_scheduler.py. Mock `Scheduler.get_tasks` as AsyncMock returning one pending task (id='1', status='pending', no deps, metadata with modules=['backend']). Call `acquire_next()` → expect TaskAssignment for task '1'. Call `acquire_next()` again → expect None. This test fails because current code has no dispatch tracking and returns the same task twice.",
       "status": "done",
-      "commit": "370db08"
+      "commit": "e53c830"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Refactor discover_orchestrators() to group processes by PRD: use groups = {} / groups.setdefault(proc['prd'], []).append(proc). Iterate over groups instead of individual processes. For each unique PRD, emit one entry with 'pids': [p['pid'] for p in group], 'prd': prd, 'running': any(p['running'] for p in group), 'started': group[0]['started'], plus shared tasks/worktrees/summary. Also update the 4 existing TestDiscoverOrchestrators tests to use entry['pids'] instead of entry['pid']: test_combines_process_and_worktree_data, test_missing_tasks_json, test_worktree_keyed_by_task_id_not_dirname, test_non_task_worktree_dirs_excluded.",
+      "description": "Add `self._dispatched: set[str] = set()` to `Scheduler.__init__`. In `acquire_next()`, add `if tid in self._dispatched: continue` in the candidate filtering loop (after the `status != 'pending'` check, line ~248). Before returning a successful TaskAssignment, add `self._dispatched.add(task_id)` (after line ~283). This makes step-1 pass.",
       "status": "done",
-      "commit": "bc045ad"
+      "commit": "04eeb6e"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write test test_same_prd_grouped_into_single_entry in TestDiscoverOrchestrators: mock find_running_orchestrators returning two processes with the same PRD path but different PIDs (1234 and 5678, both prd='/home/leo/prd.md'). Create tasks.json and a worktree. Assert len(result)==1. Assert result[0]['pids']==[1234, 5678]. Assert tasks/worktrees/summary present once.",
+      "description": "Write failing test `test_release_clears_dispatched_allowing_redispatch`. Dispatch a task via `acquire_next()`, then call `release(task_id)`, then call `acquire_next()` again with the same mock data (task still pending). Expect the task to be returned again. Fails because `release()` doesn't yet clear `_dispatched`.",
       "status": "done",
-      "commit": "69db19b"
+      "commit": "30e615a"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Verify step-3 test passes with existing grouping logic from step-2. No new production code expected — setdefault grouping already handles same-PRD merging. Fix if needed.",
+      "description": "In `Scheduler.release()`, add `self._dispatched.discard(task_id)` before calling `self.lock_table.release(task_id)`. This makes step-3 pass.",
       "status": "done",
-      "commit": "69db19b"
+      "commit": "5abeb2f"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write test test_different_prds_produce_separate_entries: mock two processes with different PRD paths (/prd1.md and /prd2.md). Assert len(result)==2, each with pids list of length 1. Write test test_grouped_running_true_when_any_running: two procs same PRD, one running=True one running=False, assert entry['running']==True. Write test test_grouped_running_false_when_all_stopped: two procs same PRD both running=False, assert entry['running']==False.",
+      "description": "Write test `test_acquire_next_dispatches_different_tasks_concurrently`. Mock `get_tasks` to return 3 pending tasks on different modules (backend, frontend, infra), all with deps satisfied. Call `acquire_next()` three times → expect three distinct TaskAssignments with different task IDs. Call a fourth time → expect None. Verifies dispatch tracking doesn't prevent dispatching *different* tasks.",
       "status": "done",
-      "commit": "2c30a4e"
+      "commit": "0a1e935"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Verify step-5 tests pass with existing logic. The any() call for running and dict key grouping should cover all cases. Fix if needed.",
+      "description": "No implementation change expected — step-5 should pass with the code from steps 2+4. If it doesn't, debug and fix. This step validates correctness of dispatch tracking with concurrent independent tasks.",
       "status": "done",
-      "commit": "2c30a4e"
+      "commit": "0a1e935"
     },
     {
       "id": "step-7",
       "type": "test",
-      "description": "Update test_orchestrator_panel.py mock data: change MOCK_ORCHESTRATOR_RUNNING from 'pid': 1234 to 'pids': [1234], and MOCK_ORCHESTRATOR_COMPLETED from 'pid': 5678 to 'pids': [5678]. Add new test class TestOrchestratorMultiPid with MOCK_ORCHESTRATOR_MULTI_PID constant (pids: [1234, 5678], same PRD, same tasks/worktrees/summary as RUNNING). Tests: (1) test_multi_pid_header_shows_pids_plural — 'PIDs' in html + both '1234' and '5678'; (2) test_single_pid_header_shows_pid_singular — 'PID ' in html for single-PID entry; (3) test_count_badge_shows_one_for_grouped — count badge '1' for single grouped entry with multiple PIDs; (4) test_multi_pid_comma_separated — pids=[111, 222, 333] renders '111, 222, 333'.",
+      "description": "Write test `test_acquire_next_lock_conflict_plus_dispatch_guard`. Two pending tasks on the same module (max_per_module=1). First `acquire_next()` dispatches task A (acquires lock + dispatch). Second call should return None — task B is blocked by A's module lock AND task A is dispatched. Verifies the two guards (dispatch set + lock table) work together. Then release task A and call `acquire_next()` again → expect task B to be returned.",
       "status": "done",
-      "commit": "51bedbc"
+      "commit": "1f6ce9b"
     },
     {
       "id": "step-8",
       "type": "impl",
-      "description": "Update orchestrators.html template line 12: replace '<span ...>PID {{ orch.pid }}</span>' with conditional: {% if orch.pids|length > 1 %}<span ...>PIDs {{ orch.pids|join(', ') }}</span>{% else %}<span ...>PID {{ orch.pids[0] }}</span>{% endif %}. Verify ALL panel tests pass including new multi-PID tests and all existing tests with updated mock data.",
+      "description": "No implementation change expected — step-7 should pass. Validates the interaction between dispatch tracking and module locking reinforces correctness through the full dispatch→release→re-dispatch lifecycle.",
       "status": "done",
-      "commit": "ea5c085"
-    },
-    {
-      "id": "step-9",
-      "type": "test",
-      "description": "Run full test suite (pytest dashboard/tests/) to verify no regressions. Check that existing tests in test_app.py, test_badge_macros.py, and other test files still pass. Fix any issues.",
-      "status": "done",
-      "commit": "51bedbc"
+      "commit": "1f6ce9b"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Use 'pids' (list[int]) instead of keeping 'pid' (int) alongside",
-      "rationale": "Clean break over backward compatibility. The only consumer is the orchestrators.html template (also modified in this task), so there is no external API contract to maintain. A list is the natural representation whether there's 1 or N processes. Keeping both 'pid' and 'pids' would invite confusion about which to use."
+      "decision": "Fix in Scheduler with a dedicated _dispatched set, not in Harness or via lock_table.is_held()",
+      "rationale": "The scheduler owns task selection — it's the natural place for dispatch dedup. A separate _dispatched set is semantically cleaner than checking lock_table.is_held() because handle_blast_radius_expansion() can release locks mid-workflow while the task is still running. The _dispatched set remains set until release() is called in _run_slot's finally block, providing correct protection through the full workflow lifecycle."
     },
     {
-      "decision": "Group by exact PRD path string",
-      "rationale": "Simplest correct matching. PRD paths come from the same ps aux regex parsing, so identical processes will have byte-identical path strings. Path normalization (resolve, expanduser) adds complexity without benefit since orchestrator invocations use consistent paths."
+      "decision": "Use in-memory set rather than immediate MCP status update",
+      "rationale": "An MCP call to set status='in-progress' in acquire_next() would itself be async and could race. The in-memory set is synchronous within the event loop, guaranteeing no duplicates. The actual status transition still happens in workflow.run() as before."
     },
     {
-      "decision": "Set grouped 'running' to any(p['running'] for p in group)",
-      "rationale": "If any process in the group is still running, the orchestration is active. This is the most informative signal for the dashboard user. The status badge should show green/running as long as at least one process is alive."
+      "decision": "Clear dispatched state in release() rather than adding a separate cleanup method",
+      "rationale": "The harness already calls scheduler.release() in _run_slot's finally block (harness.py line 508). Piggy-backing on this existing lifecycle avoids requiring callers to remember a new cleanup step. It also means crash-recovery (which resets in-progress tasks to pending) works correctly on the next run — the Scheduler is fresh, _dispatched starts empty."
     },
     {
-      "decision": "Keep 'started' as first process's value, not min/max",
-      "rationale": "The template does not currently render 'started'. Lexicographic comparison of ps time formats (e.g. 'Mar18' vs '10:30') is unreliable across different ps output conventions. Using group[0]['started'] is simple and sufficient."
+      "decision": "Do NOT change try_acquire to reject re-entrant calls for same task_id",
+      "rationale": "try_acquire's re-entrant behavior (overwriting _held[task_id]) supports blast-radius expansion where a task legitimately re-acquires locks with a different module set. Changing try_acquire would break that feature. The guard belongs in acquire_next(), the consumer."
     },
     {
-      "decision": "Inline grouping in discover_orchestrators() rather than a separate _group_by_prd() helper",
-      "rationale": "The grouping logic is 5-6 lines (setdefault + list iteration + any()). Extracting a helper would add a function boundary, docstring, and test class for trivial logic. The discover_orchestrators tests already cover the grouping behavior end-to-end. If the logic grows, it can be extracted later."
-    },
-    {
-      "decision": "find_running_orchestrators() stays unchanged",
-      "rationale": "Separation of concerns: find_running_orchestrators() reports raw per-process data faithfully. discover_orchestrators() is the aggregation/enrichment layer where grouping belongs. This keeps the process-scanning function simple and independently testable."
-    },
-    {
-      "decision": "Singular/plural PID label via Jinja2 conditional on pids|length",
-      "rationale": "'PID 1234' reads naturally for single process; 'PIDs 1234, 5678' clearly communicates shared work. The |join filter handles any number of PIDs. No new macros or filters needed — reuses existing Jinja2 patterns in the template."
+      "decision": "Filter dispatched tasks early in candidate loop (after status check, before dep check)",
+      "rationale": "Short-circuits the expensive dependency resolution for tasks we already know are dispatched. Placing it right after the status=='pending' check is the earliest possible point."
     }
   ],
   "reuse": [
     {
-      "what": "Existing find_running_orchestrators() function",
-      "where": "dashboard/src/dashboard/data/orchestrator.py lines 40-87",
-      "how": "Unchanged — still returns per-process dicts. Grouping is applied to its output in discover_orchestrators()."
+      "what": "Scheduler.release() lifecycle already called by _run_slot",
+      "where": "harness.py _run_slot finally block (line 508)",
+      "how": "Already calls scheduler.release(task_id) on workflow completion — dispatched state will be automatically cleared through this existing path. No changes needed to harness.py."
     },
     {
-      "what": "_patch_orchestrator_data() test helper",
-      "where": "dashboard/tests/test_orchestrator_panel.py lines 47-49",
-      "how": "Reused unchanged for all panel tests — patches discover_orchestrators at app.py import location. Mock data just needs 'pids' instead of 'pid'."
+      "what": "OrchestratorConfig fixture pattern from test_scheduler.py",
+      "where": "orchestrator/tests/test_scheduler.py lines 11-15",
+      "how": "Reuse the existing config fixture for constructing Scheduler instances. Extend with fused_memory URL for the mocked Scheduler."
     },
     {
-      "what": "status_badge macro from badges.html",
-      "where": "dashboard/src/dashboard/templates/macros/badges.html",
-      "how": "No changes needed — badge rendering for running/completed status is independent of PID grouping."
+      "what": "AsyncMock patterns from test_crash_recovery.py and test_harness_module_tagging.py",
+      "where": "orchestrator/tests/test_crash_recovery.py line 38, test_harness_module_tagging.py line 64",
+      "how": "Use unittest.mock.AsyncMock to mock Scheduler.get_tasks, matching the established pattern for testing async MCP-dependent code."
     },
     {
-      "what": "TestDiscoverOrchestrators test patterns",
-      "where": "dashboard/tests/test_orchestrator.py lines 468-603",
-      "how": "New tests follow the same pattern: tmp_path fixtures, mock find_running_orchestrators, call discover_orchestrators(config), assert result structure. Only change: assertions use entry['pids'] (list) instead of entry['pid'] (int)."
-    },
-    {
-      "what": "Jinja2 |length and |join filter patterns",
-      "where": "dashboard/src/dashboard/templates/partials/orchestrators.html line 6",
-      "how": "Template already uses |length for count badge. PID display uses the same |length for conditional and adds |join for comma-separated rendering."
+      "what": "Test class grouping pattern from test_scheduler.py",
+      "where": "orchestrator/tests/test_scheduler.py (TestModuleLockTable, TestHierarchicalLocking, etc.)",
+      "how": "Add a new TestSchedulerAcquireNext class following the same organizational pattern."
     }
   ]
 }
