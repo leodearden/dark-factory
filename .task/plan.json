@@ -1,148 +1,118 @@
 {
-  "task_id": "17",
-  "title": "Memory data module",
-  "modules": [
-    "dashboard/src/dashboard/data",
-    "dashboard/tests"
-  ],
-  "analysis": "Create dashboard/src/dashboard/data/memory.py \u2014 a data access layer for memory health metrics from the fused-memory MCP HTTP server. The module follows the same pattern as the existing reconciliation.py data module (async functions returning dicts, graceful error handling), but instead of querying SQLite it makes HTTP JSON-RPC calls to the fused-memory MCP endpoint. The orchestrator's briefing.py already demonstrates the exact MCP call pattern: POST to {base_url}/mcp/ with JSON-RPC body, parse result.content[0].text. We need three functions: (1) mcp_tool_call \u2014 generic low-level JSON-RPC caller, (2) get_memory_status \u2014 calls get_status tool, (3) get_queue_stats \u2014 calls get_queue_stats tool. Tests will use httpx.MockTransport to intercept HTTP calls, following the project's existing async test patterns (pytest-asyncio auto mode, class-based test organization). The MCP response envelope wraps tool output as {\"result\": {\"content\": [{\"type\": \"text\", \"text\": \"<json-encoded-dict>\"}]}}.",
+  "task_id": "19",
+  "title": "Orchestrator discovery module",
+  "modules": ["dashboard/src/dashboard/data", "dashboard/tests"],
+  "analysis": "Create dashboard/src/dashboard/data/orchestrator.py — a synchronous data module for discovering running orchestrator processes, parsing the task tree, reading per-worktree .task/ artifacts, and combining them into a unified view. Unlike the memory.py (async httpx) and reconciliation.py (async aiosqlite) modules, this module is synchronous since it reads files and calls subprocess.run. Following the established pattern: functions return structured dicts with graceful fallbacks (empty lists/dicts/None) for missing data, class-based tests with descriptive docstrings, and imports at function level in tests. The module has four public functions with clear responsibilities: process scanning, task tree parsing, artifact reading, and orchestrator discovery (composition). Tests use tmp_path fixtures for file-based tests and unittest.mock.patch for subprocess mocking.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write test_memory.py with TestMcpToolCall class: test_successful_call mocks httpx transport to return a valid MCP JSON-RPC response, asserts mcp_tool_call returns the parsed inner dict. test_timeout mocks transport to raise httpx.TimeoutException, asserts the exception propagates. test_non_200_status mocks a 500 response, verifies error handling.",
+      "description": "Write test_orchestrator.py with TestFindRunningOrchestrators class. Create tests: (1) test_parses_orchestrator_lines — mock subprocess.run to return canned ps aux output containing two orchestrator lines with --prd flags, verify returns list of two dicts with correct pid (int), prd (str), running (True), started (str); (2) test_filters_out_grep_process — mock ps output includes a 'grep orchestrator' line, verify it is excluded; (3) test_no_orchestrators_running — mock ps output with no orchestrator lines, verify returns empty list; (4) test_subprocess_failure — mock subprocess.run raising an exception, verify returns empty list. Use unittest.mock.patch to mock 'subprocess.run'.",
       "status": "done",
-      "commit": "a07c983"
+      "commit": "2988c2c"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Create dashboard/src/dashboard/data/memory.py with the mcp_tool_call function: POST JSON-RPC to {base_url}/mcp with body {jsonrpc: 2.0, id: 1, method: tools/call, params: {name, arguments}}, timeout 10s. Parse response: extract result.content[0].text, json.loads it, return dict. Raise ValueError on non-200 or missing content.",
+      "description": "Create dashboard/src/dashboard/data/orchestrator.py with find_running_orchestrators(). Import subprocess, re, logging, Path. Run subprocess.run(['ps', 'aux'], capture_output=True, text=True). For each line containing 'orchestrator' and '--prd': skip if line also contains 'grep' or matches the ps process itself. Split fields, extract PID (field[1]), start time (fields[8:10] joined), and PRD path via re.search(r'--prd\\s+(\\S+)', line). Return list of {'pid': int, 'prd': str, 'running': True, 'started': str}. Wrap in try/except for subprocess errors, return [] on failure. Add module docstring following the pattern from memory.py.",
       "status": "done",
-      "commit": "c3ca942"
+      "commit": "477edf3"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write TestGetMemoryStatus class: test_successful_status mocks transport returning a valid MCP response wrapping {graphiti: {connected: true, node_count: 42}, mem0: {connected: true, memory_count: 5}, queue: {counts: {...}, oldest_pending_age_seconds: 1.2}}. Asserts returned dict matches expected structure. test_connect_error mocks httpx.ConnectError, asserts returns {offline: True, error: str}. test_timeout mocks httpx.TimeoutException, asserts returns {offline: True, error: str}.",
+      "description": "Add TestLoadTaskTree class to test_orchestrator.py. Tests: (1) test_parses_master_format — write a temp tasks.json with {'master': {'tasks': [...]}} containing 3 sample tasks with id, title, status, priority, dependencies, metadata fields, verify all parsed correctly; (2) test_parses_flat_format — write tasks.json with {'tasks': [...]} (no master wrapper), verify same result; (3) test_file_not_found — pass non-existent path, verify returns []; (4) test_malformed_json — write invalid JSON to file, verify returns [] and logs warning; (5) test_extracts_expected_keys — verify each returned task dict has keys: id, title, status, priority, dependencies, metadata.",
       "status": "done",
-      "commit": "d6e79dc"
+      "commit": "098b55d"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Implement get_memory_status: calls mcp_tool_call with tool_name='get_status' and arguments={project_id: config.fused_memory_project_id}. Wraps call in try/except for httpx.ConnectError and httpx.TimeoutException, returning {offline: True, error: str(e)} on failure.",
+      "description": "Add load_task_tree(tasks_json_path: Path) -> list[dict] to orchestrator.py. Read and json.loads the file. Try data['master']['tasks'] first, fall back to data['tasks']. For each task, extract id, title, status, priority, dependencies (default []), and metadata (default {}). Handle FileNotFoundError → return []. Handle json.JSONDecodeError and KeyError → log warning via logger, return []. Return list of task dicts.",
       "status": "done",
-      "commit": "1c1a379"
+      "commit": "9f20153"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write TestGetQueueStats class: test_successful_stats mocks transport returning valid MCP response wrapping {counts: {pending: 3, in_flight: 1, retry: 0, completed: 10, dead: 0}, oldest_pending_age_seconds: 5.5}. Asserts returned dict matches. test_connect_error and test_timeout verify offline fallback dict.",
+      "description": "Add TestReadTaskArtifacts class to test_orchestrator.py. Tests: (1) test_full_artifacts — create a temp worktree dir with .task/metadata.json (task_id, title, base_commit, created_at), .task/plan.json with steps array (3 done, 2 pending out of 5 total), .task/iterations.jsonl (3 lines of text), .task/reviews/reviewer-1.json (verdict: PASS), .task/reviews/reviewer-2.json (verdict: ISSUES_FOUND). Verify returned dict has metadata (parsed dict), phase ('EXECUTE'), plan_progress ({'done': 3, 'total': 5}), iteration_count (3), review_summary ('1/2 passed'); (2) test_empty_worktree — pass a temp dir with no .task/ subdir, verify returns dict with metadata=None, phase='PLAN', plan_progress={'done': 0, 'total': 0}, iteration_count=0, review_summary='\u2014'; (3) test_plan_all_done — create .task/ with plan.json where all steps are done, verify phase is 'DONE'; (4) test_no_plan_file — create .task/ with only metadata.json, verify phase is 'PLAN' and plan_progress is {done: 0, total: 0}.",
       "status": "done",
-      "commit": "79a94d9"
+      "commit": "026a307"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Implement get_queue_stats: calls mcp_tool_call with tool_name='get_queue_stats' and arguments={}. Same ConnectError/TimeoutException fallback pattern as get_memory_status.",
+      "description": "Add read_task_artifacts(worktree_path: Path) -> dict to orchestrator.py. Define task_dir = worktree_path / '.task'. Read metadata.json via try/except (FileNotFoundError, json.JSONDecodeError \u2192 None). Read plan.json: extract steps array, count done (status=='done') vs total. Derive phase: no plan \u2192 'PLAN'; all steps done \u2192 'DONE'; otherwise 'EXECUTE'. Count lines in iterations.jsonl (open, sum(1 for _ in f), handle FileNotFoundError \u2192 0). Glob .task/reviews/*.json, parse each for 'verdict' field, count PASS vs total \u2192 format as 'N/M passed' or '\u2014' if no reviews. Return {'metadata': dict|None, 'phase': str, 'plan_progress': {'done': int, 'total': int}, 'iteration_count': int, 'review_summary': str}.",
       "status": "done",
-      "commit": "a948e8d"
+      "commit": "1ae301f"
     },
     {
       "id": "step-7",
       "type": "test",
-      "description": "Write TestMalformedResponse class: test_missing_content_key mocks response with valid JSON but no result.content path, verifies graceful handling (returns empty dict or raises clear ValueError). test_invalid_inner_json mocks response where text field contains non-JSON string, verifies graceful handling. test_empty_content_array mocks response with result.content as empty list.",
+      "description": "Add TestDiscoverOrchestrators class to test_orchestrator.py. Tests: (1) test_combines_process_and_worktree_data — mock find_running_orchestrators to return one orchestrator dict, create tmp_path with .taskmaster/tasks/tasks.json containing 5 sample tasks (2 done, 1 in-progress, 1 blocked, 1 pending), create a worktree subdir (e.g., tmp_path/.worktrees/7/) with .task/metadata.json and .task/plan.json. Use dashboard_config fixture (project_root=tmp_path). Call discover_orchestrators(config). Verify result is a list with one entry containing: the running process info, a 'tasks' key with parsed task tree, a 'worktrees' key with artifact data, and a 'summary' key with counts {total: 5, done: 2, in_progress: 1, blocked: 1, pending: 1}; (2) test_no_running_orchestrators — mock empty process list, verify returns empty list; (3) test_missing_tasks_json — use dashboard_config fixture where tasks.json doesn't exist, mock one running process, verify orchestrator still returned with empty task list.",
       "status": "done",
-      "commit": "e6a8378"
+      "commit": "5c44746"
     },
     {
       "id": "step-8",
       "type": "impl",
-      "description": "Harden mcp_tool_call to handle malformed responses: add defensive checks for missing result/content keys and invalid JSON in text field. Return empty dict or raise ValueError with descriptive message as appropriate. Run full test suite to confirm all tests pass.",
+      "description": "Add discover_orchestrators(config: DashboardConfig) -> list[dict] to orchestrator.py. Call find_running_orchestrators(). Call load_task_tree(config.tasks_json). Scan config.worktrees_dir for subdirectories (handle missing dir). For each subdir, call read_task_artifacts. For each running orchestrator: attach tasks list, worktrees dict (worktree_name \u2192 artifact data), and compute summary stats from tasks (count by status: total, done, in_progress, blocked, pending). Return list of orchestrator dicts with all combined data. Handle edge cases: worktrees_dir doesn't exist \u2192 empty worktrees dict.",
       "status": "done",
-      "commit": "28fc0ac"
-    },
-    {
-      "id": "step-9",
-      "type": "test",
-      "description": "Write failing tests for three blocking review issues. (1) Add test_non_200_response_returns_offline to TestGetMemoryStatus: mock transport returns HTTP 500, assert get_memory_status returns {offline: True, error: str} (not an uncaught ValueError). This covers the untested failure mode where mcp_tool_call raises ValueError on non-200 and the get_* function must catch it. (2) Add test_non_200_response_returns_offline to TestGetQueueStats: same pattern — mock 500 response, assert get_queue_stats returns {offline: True, error: str}. (3) Add test_non_json_body_returns_empty_dict to TestMcpToolCall: mock transport returns HTTP 200 with non-JSON body (e.g. HTML string '<html>Bad Gateway</html>'), assert mcp_tool_call returns {} instead of raising json.JSONDecodeError from resp.json(). All three tests should FAIL against the current implementation, proving the gaps identified by reviewers.",
-      "status": "done",
-      "commit": "bc25e2a"
-    },
-    {
-      "id": "step-10",
-      "type": "impl",
-      "description": "Fix all three blocking issues in dashboard/src/dashboard/data/memory.py. (1) In get_memory_status, widen the except clause on line 78 to include ValueError: `except (httpx.ConnectError, httpx.TimeoutException, ValueError) as e:` — so a non-200 response from the MCP server produces the {offline: True, error: ...} fallback instead of propagating. (2) In get_queue_stats, apply the same fix on line 95: `except (httpx.ConnectError, httpx.TimeoutException, ValueError) as e:`. (3) In mcp_tool_call, wrap the resp.json() call on line 50 in try/except: `try: data = resp.json() except (json.JSONDecodeError, ValueError): return {}` — so a 200 response with non-JSON body (e.g. HTML from reverse proxy) returns empty dict instead of crashing. Update the docstring for get_memory_status and get_queue_stats to document that ValueError (from non-200 MCP responses) is also caught. Run the full test suite to confirm all tests pass including the new ones from step-9.",
-      "status": "done",
-      "commit": "523f24c"
+      "commit": "07db845"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Use httpx.MockTransport for test mocking instead of pytest-httpx",
-      "rationale": "MockTransport is built into httpx (already a dependency), requires no extra package, and matches the project's minimalist dependency approach. It gives full control over response bodies and can simulate exceptions by raising in the handler."
+      "decision": "Synchronous functions (not async) for orchestrator module",
+      "rationale": "Unlike memory.py (httpx async HTTP) and reconciliation.py (aiosqlite async), this module only reads local files and calls subprocess.run \u2014 all inherently synchronous. Using sync avoids unnecessary async complexity. The FastAPI route can call these from an async endpoint via run_in_executor if needed."
     },
     {
-      "decision": "mcp_tool_call is a standalone function, not a method on a class",
-      "rationale": "Matches the existing reconciliation.py pattern where each function is a standalone async function. The client and base_url are passed as arguments, keeping the function stateless and easy to test."
+      "decision": "Use unittest.mock.patch for subprocess.run mocking instead of dependency injection",
+      "rationale": "Follows the simplest approach for process scanning. The function signature stays clean (no injected subprocess module), and mock.patch is the standard Python pattern for mocking subprocess calls in tests."
     },
     {
-      "decision": "Parse MCP response envelope inline in mcp_tool_call rather than in each caller",
-      "rationale": "The JSON-RPC envelope structure (result.content[0].text \u2192 json.loads) is the same for every tool call. Centralizing parsing in mcp_tool_call avoids duplication and makes the higher-level functions (get_memory_status, get_queue_stats) cleaner."
+      "decision": "Simplified phase derivation: PLAN, EXECUTE, or DONE",
+      "rationale": "The task description mentions VERIFY/REVIEW/MERGE phases but these cannot be reliably determined from plan.json step progress alone \u2014 they depend on orchestrator workflow state. Using three clear states (no plan \u2192 PLAN, some steps done \u2192 EXECUTE, all done \u2192 DONE) is accurate and avoids false signals. The actual phase can be refined in a future iteration if the orchestrator exposes phase metadata."
     },
     {
-      "decision": "Error handling catches httpx.ConnectError and httpx.TimeoutException at the get_* function level, not in mcp_tool_call",
-      "rationale": "mcp_tool_call is a generic transport function that should let network errors propagate. The higher-level functions know the right fallback shape ({offline: True, error: ...}) for their consumers. This separation keeps mcp_tool_call reusable for future tools that may want different error handling."
+      "decision": "Return '\u2014' (em-dash) for missing review summary, not empty string",
+      "rationale": "Consistent with dashboard display convention \u2014 an em-dash signals 'not applicable / no data' more clearly than an empty string in the template rendering."
     },
     {
-      "decision": "Malformed MCP responses return empty dict from mcp_tool_call",
-      "rationale": "Per task spec: 'returns empty dict or raises clear error'. An empty dict is safest for dashboard rendering \u2014 the template can check for missing keys and show placeholder text rather than crashing."
+      "decision": "Count iterations.jsonl lines without parsing each line",
+      "rationale": "Per the task specification. Line counting is O(n) with minimal memory. Full JSON parsing of each line is unnecessary for a count and would add error handling complexity."
     },
     {
-      "decision": "POST to {base_url}/mcp (no trailing slash)",
-      "rationale": "The task spec says POST to {base_url}/mcp. The orchestrator's briefing.py uses /mcp/ with trailing slash. We'll use the trailing-slash variant to match the existing working pattern in the codebase, since FastMCP mounts with trailing slash."
-    },
-    {
-      "decision": "ValueError from mcp_tool_call (non-200 status) is caught at the get_* level alongside httpx network errors",
-      "rationale": "Review identified that a running-but-broken MCP server returning 500/503 is a realistic failure mode. The ValueError raised by mcp_tool_call for non-200 responses must produce the same {offline: True, error: ...} fallback as connection/timeout errors. This keeps the contract documented in the docstrings honest: all server-unreachable-or-broken scenarios return the offline fallback dict. mcp_tool_call itself continues to raise ValueError (not catch it) so future callers with different error handling needs can still intercept it."
-    },
-    {
-      "decision": "resp.json() parse failure returns empty dict from mcp_tool_call, consistent with other malformed response handling",
-      "rationale": "A 200 response with non-JSON body (e.g., HTML from a reverse proxy or WAF) is a malformed response, same category as missing content keys or invalid inner JSON \u2014 all of which already return {}. Consistent treatment: any response that can't be parsed into a valid tool result yields empty dict, letting the caller (get_* functions) decide whether to treat an empty result as noteworthy."
+      "decision": "discover_orchestrators returns empty list when no processes running",
+      "rationale": "The orchestrator view is process-centric: each running orchestrator gets enriched with task/artifact data. If nothing is running, there's nothing to display. Task tree and worktree data are attached to running orchestrators, not returned standalone."
     }
   ],
   "reuse": [
     {
-      "what": "MCP JSON-RPC call pattern",
-      "where": "orchestrator/src/orchestrator/agents/briefing.py lines 228-254",
-      "how": "Reuse the exact same JSON-RPC envelope structure: POST to {url}/mcp/, body with jsonrpc/id/method/params, parse result.content[0].text. The new mcp_tool_call function generalizes this pattern."
-    },
-    {
-      "what": "DashboardConfig dataclass",
+      "what": "DashboardConfig.tasks_json and worktrees_dir properties",
       "where": "dashboard/src/dashboard/config.py",
-      "how": "Import and use config.fused_memory_url and config.fused_memory_project_id for MCP endpoint URL and project scoping."
+      "how": "Use config.tasks_json for load_task_tree path and config.worktrees_dir for worktree scanning in discover_orchestrators. No config changes needed."
     },
     {
-      "what": "Test fixture pattern \u2014 dashboard_config with tmp_path",
-      "where": "dashboard/tests/conftest.py line 88-93",
-      "how": "Reuse existing dashboard_config fixture for tests that need a config object. The fixture already sets up a DashboardConfig with tmp_path-based project_root."
+      "what": "conftest.py dashboard_config fixture",
+      "where": "dashboard/tests/conftest.py",
+      "how": "Reuse the tmp_path-based DashboardConfig fixture for discover_orchestrators tests. The fixture already provides a config with a temp project_root, so config.tasks_json and config.worktrees_dir automatically point to temp directories."
     },
     {
-      "what": "Test organization pattern \u2014 class-based with async methods",
-      "where": "dashboard/tests/test_reconciliation.py",
-      "how": "Follow the same TestClassName pattern with async test methods, one class per function under test, testing happy path, error cases, and edge cases."
+      "what": "Test class structure and pattern from test_memory.py / test_reconciliation.py",
+      "where": "dashboard/tests/test_memory.py, dashboard/tests/test_reconciliation.py",
+      "how": "Follow the same conventions: class-based test grouping (TestClassName), async-compatible test methods (though this module uses sync), function-level imports, descriptive docstrings on every test, and graceful error handling verification (missing files \u2192 empty defaults)."
     },
     {
-      "what": "httpx.AsyncClient from app lifespan",
-      "where": "dashboard/src/dashboard/app.py line 21",
-      "how": "The FastAPI app already creates an httpx.AsyncClient in its lifespan. The memory.py functions accept client as a parameter, so routes can pass app.state.http_client."
+      "what": "Module docstring and import patterns",
+      "where": "dashboard/src/dashboard/data/memory.py, reconciliation.py",
+      "how": "Follow the same top-of-file pattern: from __future__ import annotations, module docstring explaining the module's purpose, grouped imports (stdlib, third-party, local)."
     },
     {
-      "what": "Module docstring and import conventions",
-      "where": "dashboard/src/dashboard/data/reconciliation.py",
-      "how": "Follow same style: from __future__ import annotations, descriptive module docstring, return dicts not dataclasses."
+      "what": ".task/ artifact schema from orchestrator/src/orchestrator/artifacts.py",
+      "where": "orchestrator/src/orchestrator/artifacts.py",
+      "how": "The TaskArtifacts class defines the exact schema for metadata.json, plan.json steps, iterations.jsonl entries, and reviews/*.json files. Use this as the source of truth for field names and structure when parsing artifacts in read_task_artifacts."
     }
   ]
 }
