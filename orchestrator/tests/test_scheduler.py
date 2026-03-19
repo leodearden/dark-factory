@@ -77,6 +77,18 @@ class TestModuleLockTable:
         # Should not raise
         lock_table.release('nonexistent')
 
+    def test_is_held_false_for_unknown(self, lock_table: ModuleLockTable):
+        assert lock_table.is_held('nonexistent') is False
+
+    def test_is_held_true_after_acquire(self, lock_table: ModuleLockTable):
+        lock_table.try_acquire('task-1', ['backend'])
+        assert lock_table.is_held('task-1') is True
+
+    def test_is_held_false_after_release(self, lock_table: ModuleLockTable):
+        lock_table.try_acquire('task-1', ['backend'])
+        lock_table.release('task-1')
+        assert lock_table.is_held('task-1') is False
+
 
 class TestHierarchicalLocking:
     """Test that parent/child modules conflict but siblings don't."""
