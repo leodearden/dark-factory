@@ -381,6 +381,34 @@ class TestReadTaskArtifacts:
         assert result['modules'] == []
 
 
+class TestExtractTaskId:
+    """Tests for _extract_task_id — strips 'task-' prefix from worktree directory names."""
+
+    def test_strips_task_prefix(self):
+        """'task-7' returns '7'."""
+        from dashboard.data.orchestrator import _extract_task_id
+
+        assert _extract_task_id('task-7') == '7'
+
+    def test_plain_id_unchanged(self):
+        """Plain '7' returns '7' unchanged."""
+        from dashboard.data.orchestrator import _extract_task_id
+
+        assert _extract_task_id('7') == '7'
+
+    def test_task_prefix_only_returns_empty(self):
+        """'task-' with no suffix returns empty string."""
+        from dashboard.data.orchestrator import _extract_task_id
+
+        assert _extract_task_id('task-') == ''
+
+    def test_non_numeric_suffix(self):
+        """'task-abc' returns 'abc'."""
+        from dashboard.data.orchestrator import _extract_task_id
+
+        assert _extract_task_id('task-abc') == 'abc'
+
+
 class TestDiscoverOrchestrators:
     """Tests for discover_orchestrators — combines process, task tree, and artifact data."""
 
