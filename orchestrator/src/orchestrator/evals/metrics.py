@@ -23,6 +23,7 @@ class EvalMetrics:
     lint_clean: bool = False
     typecheck_clean: bool = False
     plan_completion_pct: float = 0.0
+    plan_steps: int = 0
 
     # Efficiency
     cost_usd: float = 0.0
@@ -45,17 +46,20 @@ class EvalMetrics:
 
 
 def compute_composite(m: EvalMetrics) -> float:
-    """Quality-weighted score. Higher is better.
+    """Quality-weighted score normalised by task complexity.
 
     - Fails tests → score 0
-    - Otherwise: quality factor (penalized by blocking issues and debug cycles)
-      times plan completion percentage
+    - blocking_rate = blocking_issues / plan_steps (larger tasks tolerate more issues)
+    - debug_cycles get a light penalty (the system self-correcting is good)
+    - Final score = quality × plan_completion_pct
     """
     if not m.tests_pass:
         return 0.0
-    quality = 1.0 - (m.review_blocking_issues * 0.2) - (m.debug_cycles * 0.1)
+    steps = max(m.plan_steps, 1)
+    blocking_rate = m.review_blocking_issues / steps
+    quality = 1.0 - (blocking_rate * 2.0) - (m.debug_cycles * 0.05)
     quality = max(quality, 0.0)
-    return quality * m.plan_completion_pct
+    return round(quality * m.plan_completion_pct, 4)
 
 
 async def collect_metrics(
@@ -90,6 +94,7 @@ async def collect_metrics(
         lint_clean=(not verify.lint_output) if verify else False,
         typecheck_clean=(not verify.type_output) if verify else False,
         plan_completion_pct=plan_completion,
+        plan_steps=total_steps,
         cost_usd=wf_metrics.total_cost_usd,
         wall_clock_ms=wf_metrics.total_duration_ms,
         turns_used=0,  # aggregated per-agent, not tracked at workflow level

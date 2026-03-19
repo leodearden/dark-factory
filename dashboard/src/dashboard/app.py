@@ -100,9 +100,8 @@ async def partials_recon(request: Request):
     )
 
     return templates.TemplateResponse(
-        'partials/recon.html',
-        {
-            'request': request,
+        request, 'partials/recon.html',
+        context={
             'buffer_stats': buffer_stats,
             'burst_state': burst_state,
             'watermarks': watermarks,

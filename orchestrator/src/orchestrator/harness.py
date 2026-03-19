@@ -235,9 +235,12 @@ class Harness:
         """
         tasks = await self.scheduler.get_tasks()
 
-        # Filter to tasks that don't already have modules in metadata
+        # Filter to pending tasks that don't already have modules in metadata
+        # (done/cancelled tasks don't need module tags — they won't be executed)
         untagged = []
         for t in tasks:
+            if t.get('status') not in ('pending', 'in-progress'):
+                continue
             metadata = t.get('metadata') or {}
             modules = metadata.get('modules', [])
             if not modules:

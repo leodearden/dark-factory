@@ -16,7 +16,11 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.0",
     "pyyaml>=6.0",
+    "escalation",
 ]
+
+[tool.uv.sources]
+escalation = { path = "../escalation", editable = true }
 
 [project.scripts]
 orchestrator = "orchestrator.cli:main"

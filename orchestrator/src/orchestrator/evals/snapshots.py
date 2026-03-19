@@ -90,5 +90,22 @@ async def cleanup_eval_worktree(
 
 
 async def get_diff(worktree_path: Path) -> str:
-    """Get the full diff of changes made in a worktree (vs HEAD at creation)."""
+    """Get the full diff of changes in a worktree vs its base commit.
+
+    Reads base_commit from .task/metadata.json (set at worktree creation).
+    Falls back to uncommitted diff if metadata not available.
+    """
+    import json as _json
+
+    metadata_file = worktree_path / '.task' / 'metadata.json'
+    if metadata_file.exists():
+        try:
+            meta = _json.loads(metadata_file.read_text())
+            base = meta.get('base_commit')
+            if base:
+                return await _run(
+                    ['git', 'diff', f'{base}..HEAD'], cwd=worktree_path,
+                )
+        except Exception:
+            pass
     return await _run(['git', 'diff', 'HEAD'], cwd=worktree_path)

@@ -12,7 +12,7 @@ cd fused-memory/docker && docker-compose up -d
 cd fused-memory && uv sync
 
 # Required env vars (inherit from shell):
-# OPENAI_API_KEY, ANTHROPIC_API_KEY
+# OPENAI_API_KEY  (for embeddings; ANTHROPIC_API_KEY is NOT needed — agents use OAuth)
 ```
 
 ## Memory Usage
