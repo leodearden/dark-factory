@@ -12,9 +12,9 @@ import logging
 
 import httpx
 
-logger = logging.getLogger(__name__)
-
 from dashboard.config import DashboardConfig
+
+logger = logging.getLogger(__name__)
 
 
 async def mcp_tool_call(

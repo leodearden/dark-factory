@@ -89,17 +89,15 @@ class TestFindRunningOrchestrators:
         errors like RuntimeError should NOT be swallowed — they indicate bugs and
         should be visible to callers.
         """
-        import subprocess
         from unittest.mock import patch
 
         from dashboard.data.orchestrator import find_running_orchestrators
 
-        with pytest.raises(RuntimeError, match='unexpected'):
-            with patch(
-                'dashboard.data.orchestrator.subprocess.run',
-                side_effect=RuntimeError('unexpected'),
-            ):
-                find_running_orchestrators()
+        with pytest.raises(RuntimeError, match='unexpected'), patch(
+            'dashboard.data.orchestrator.subprocess.run',
+            side_effect=RuntimeError('unexpected'),
+        ):
+            find_running_orchestrators()
 
     def test_subprocess_timeout_caught(self):
         """subprocess.run raising TimeoutExpired is caught and returns empty list.
