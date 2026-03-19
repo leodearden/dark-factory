@@ -139,14 +139,16 @@ def read_task_artifacts(worktree_path: Path) -> dict:
     with contextlib.suppress(FileNotFoundError, json.JSONDecodeError):
         metadata = json.loads((task_dir / 'metadata.json').read_text())
 
-    # Plan progress and phase
+    # Plan progress, phase, and modules
     done_count = 0
     total_count = 0
+    modules: list[str] = []
     try:
         plan_data = json.loads((task_dir / 'plan.json').read_text())
         steps = plan_data.get('steps', [])
         total_count = len(steps)
         done_count = sum(1 for s in steps if s.get('status') == 'done')
+        modules = plan_data.get('modules', [])
     except (FileNotFoundError, json.JSONDecodeError, AttributeError, TypeError):
         pass
 
@@ -188,6 +190,7 @@ def read_task_artifacts(worktree_path: Path) -> dict:
         'plan_progress': {'done': done_count, 'total': total_count},
         'iteration_count': iteration_count,
         'review_summary': review_summary,
+        'modules': modules,
     }
 
 

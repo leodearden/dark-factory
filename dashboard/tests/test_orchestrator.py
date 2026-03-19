@@ -264,13 +264,13 @@ class TestReadTaskArtifacts:
         metadata = {'task_id': '7', 'title': 'Build widget', 'base_commit': 'abc123', 'created_at': '2026-03-18T10:00:00'}
         (task_dir / 'metadata.json').write_text(json.dumps(metadata))
 
-        # plan.json with 3 done, 2 pending out of 5 total
+        # plan.json with 3 done, 2 pending out of 5 total + modules
         steps = [
             {'id': f'step-{i}', 'status': 'done'} for i in range(1, 4)
         ] + [
             {'id': f'step-{i}', 'status': 'pending'} for i in range(4, 6)
         ]
-        (task_dir / 'plan.json').write_text(json.dumps({'steps': steps}))
+        (task_dir / 'plan.json').write_text(json.dumps({'steps': steps, 'modules': ['dashboard']}))
 
         # iterations.jsonl with 3 lines
         with open(task_dir / 'iterations.jsonl', 'w') as f:
@@ -288,6 +288,7 @@ class TestReadTaskArtifacts:
         assert result['plan_progress'] == {'done': 3, 'total': 5}
         assert result['iteration_count'] == 3
         assert result['review_summary'] == '1/2 passed'
+        assert result['modules'] == ['dashboard']
 
     def test_empty_worktree(self, tmp_path):
         """Worktree with no .task/ subdir returns defaults."""
@@ -335,6 +336,49 @@ class TestReadTaskArtifacts:
         assert result['phase'] == 'PLAN'
         assert result['plan_progress'] == {'done': 0, 'total': 0}
         assert result['metadata'] == metadata
+
+    def test_modules_extracted_from_plan(self, tmp_path):
+        """Modules list is extracted from plan.json top-level 'modules' key."""
+        import json
+
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+
+        plan_data = {
+            'modules': ['auth/', 'api/'],
+            'steps': [{'id': 'step-1', 'status': 'pending'}],
+        }
+        (task_dir / 'plan.json').write_text(json.dumps(plan_data))
+
+        result = read_task_artifacts(tmp_path)
+
+        assert result['modules'] == ['auth/', 'api/']
+
+    def test_modules_default_empty_when_missing(self, tmp_path):
+        """When plan.json has no 'modules' key, modules defaults to empty list."""
+        import json
+
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+
+        plan_data = {'steps': [{'id': 'step-1', 'status': 'done'}]}
+        (task_dir / 'plan.json').write_text(json.dumps(plan_data))
+
+        result = read_task_artifacts(tmp_path)
+
+        assert result['modules'] == []
+
+    def test_modules_default_empty_no_plan(self, tmp_path):
+        """When plan.json doesn't exist, modules defaults to empty list."""
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        result = read_task_artifacts(tmp_path)
+
+        assert result['modules'] == []
 
 
 class TestDiscoverOrchestrators:
