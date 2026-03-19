@@ -32,3 +32,72 @@ class TestMemoryPartialOnline:
             resp = client.get('/partials/memory')
             assert resp.status_code == 200
             assert 'text/html' in resp.headers['content-type']
+
+    def test_online_contains_card_labels(self, client):
+        with (
+            patch(
+                'dashboard.data.memory.get_memory_status',
+                new_callable=AsyncMock,
+                return_value=_ONLINE_STATUS,
+            ),
+            patch(
+                'dashboard.data.memory.get_queue_stats',
+                new_callable=AsyncMock,
+                return_value=_ONLINE_QUEUE,
+            ),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'Graphiti' in html
+            assert 'Mem0' in html
+            assert 'Taskmaster' in html
+            assert 'Write Queue' in html
+
+    def test_online_graphiti_count(self, client):
+        with (
+            patch(
+                'dashboard.data.memory.get_memory_status',
+                new_callable=AsyncMock,
+                return_value=_ONLINE_STATUS,
+            ),
+            patch(
+                'dashboard.data.memory.get_queue_stats',
+                new_callable=AsyncMock,
+                return_value=_ONLINE_QUEUE,
+            ),
+        ):
+            html = client.get('/partials/memory').text
+            assert '42' in html
+            assert 'knowledge graph nodes' in html
+
+    def test_online_mem0_count(self, client):
+        with (
+            patch(
+                'dashboard.data.memory.get_memory_status',
+                new_callable=AsyncMock,
+                return_value=_ONLINE_STATUS,
+            ),
+            patch(
+                'dashboard.data.memory.get_queue_stats',
+                new_callable=AsyncMock,
+                return_value=_ONLINE_QUEUE,
+            ),
+        ):
+            html = client.get('/partials/memory').text
+            assert '128' in html
+            assert 'vector memories' in html
+
+    def test_online_taskmaster_connected(self, client):
+        with (
+            patch(
+                'dashboard.data.memory.get_memory_status',
+                new_callable=AsyncMock,
+                return_value=_ONLINE_STATUS,
+            ),
+            patch(
+                'dashboard.data.memory.get_queue_stats',
+                new_callable=AsyncMock,
+                return_value=_ONLINE_QUEUE,
+            ),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'Connected' in html
