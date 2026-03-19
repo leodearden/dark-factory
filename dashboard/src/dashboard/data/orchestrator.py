@@ -61,3 +61,47 @@ def find_running_orchestrators() -> list[dict]:
         })
 
     return orchestrators
+
+
+def load_task_tree(tasks_json_path: Path) -> list[dict]:
+    """Parse a Taskmaster tasks.json file into a list of task dicts.
+
+    Supports both ``{'master': {'tasks': [...]}}`` and ``{'tasks': [...]}``
+    formats. Each returned dict has keys: id, title, status, priority,
+    dependencies, metadata.
+
+    Returns [] if the file is missing, contains invalid JSON, or lacks
+    the expected structure.
+    """
+    try:
+        raw = tasks_json_path.read_text()
+    except FileNotFoundError:
+        return []
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning('Malformed JSON in %s', tasks_json_path)
+        return []
+
+    try:
+        raw_tasks = data['master']['tasks']
+    except (KeyError, TypeError):
+        try:
+            raw_tasks = data['tasks']
+        except (KeyError, TypeError):
+            logger.warning('No tasks found in %s', tasks_json_path)
+            return []
+
+    result: list[dict] = []
+    for task in raw_tasks:
+        result.append({
+            'id': task.get('id'),
+            'title': task.get('title'),
+            'status': task.get('status'),
+            'priority': task.get('priority'),
+            'dependencies': task.get('dependencies', []),
+            'metadata': task.get('metadata', {}),
+        })
+
+    return result
