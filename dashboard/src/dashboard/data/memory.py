@@ -47,7 +47,10 @@ async def mcp_tool_call(
     if resp.status_code != 200:
         raise ValueError(f'MCP call {tool_name} returned non-200 status: {resp.status_code}')
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except (json.JSONDecodeError, ValueError):
+        return {}
     content = data.get('result', {}).get('content', [])
     if not content:
         return {}
@@ -66,7 +69,7 @@ async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) 
     """Fetch memory subsystem status from the fused-memory MCP server.
 
     Returns the status dict on success, or {offline: True, error: str} on
-    connection/timeout failure.
+    connection/timeout/server-error failure.
     """
     try:
         return await mcp_tool_call(
@@ -75,7 +78,7 @@ async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) 
             'get_status',
             {'project_id': config.fused_memory_project_id},
         )
-    except (httpx.ConnectError, httpx.TimeoutException) as e:
+    except (httpx.ConnectError, httpx.TimeoutException, ValueError) as e:
         return {'offline': True, 'error': str(e)}
 
 
@@ -83,7 +86,7 @@ async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) ->
     """Fetch write queue statistics from the fused-memory MCP server.
 
     Returns the queue stats dict on success, or {offline: True, error: str} on
-    connection/timeout failure.
+    connection/timeout/server-error failure.
     """
     try:
         return await mcp_tool_call(
@@ -92,5 +95,5 @@ async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) ->
             'get_queue_stats',
             {},
         )
-    except (httpx.ConnectError, httpx.TimeoutException) as e:
+    except (httpx.ConnectError, httpx.TimeoutException, ValueError) as e:
         return {'offline': True, 'error': str(e)}
