@@ -17,5 +17,18 @@
     <main class="container mx-auto px-6 py-8">
         {% block content %}{% endblock %}
     </main>
+    <script>
+        (function () {
+            function showError(evt) {
+                var target = evt.detail.target;
+                if (target) {
+                    target.innerHTML = '<div class="bg-red-900/30 border border-red-800 rounded-lg p-4 text-red-300 text-sm">Failed to load \u2014 retrying...</div>';
+                }
+            }
+            document.body.addEventListener('htmx:responseError', showError);
+            document.body.addEventListener('htmx:timeout', showError);
+            document.body.addEventListener('htmx:sendError', showError);
+        })();
+    </script>
 </body>
 </html>
