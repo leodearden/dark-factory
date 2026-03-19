@@ -29,6 +29,14 @@ NEAR_CAP_PREFIXES = [
     "You're now using extra usage",
 ]
 
+# Codex (OpenAI) cap-hit patterns
+CODEX_CAP_PATTERNS = ['usage limit reached', 'rate limit', 'quota exceeded',
+                      'insufficient_quota', 'rate_limit_exceeded']
+
+# Gemini (Google) cap-hit patterns
+GEMINI_CAP_PATTERNS = ['quota exceeded', 'rate limit', 'resource exhausted',
+                       'RESOURCE_EXHAUSTED', 'quota_exceeded']
+
 CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
 USAGE_API_URL = 'https://claude.ai/api/oauth/usage'
 
@@ -93,7 +101,7 @@ class UsageGate:
                 and self._cumulative_cost >= self._config.session_budget_usd):
             raise SessionBudgetExhausted(self._cumulative_cost)
 
-    def detect_cap_hit(self, stderr: str, result_text: str) -> bool:
+    def detect_cap_hit(self, stderr: str, result_text: str, backend: str = 'claude') -> bool:
         """Scan stderr and result text for cap-hit patterns.
 
         If detected, closes the gate synchronously and returns True.
@@ -101,6 +109,26 @@ class UsageGate:
         until the gate reopens. The resume probe is started asynchronously.
         """
         combined = f'{stderr}\n{result_text}'
+
+        # Check backend-specific patterns first
+        if backend == 'codex':
+            for pattern in CODEX_CAP_PATTERNS:
+                if pattern.lower() in combined.lower():
+                    self._open.clear()
+                    self._paused_reason = f'Codex cap hit: {pattern}'
+                    if self._pause_started_at is None:
+                        self._pause_started_at = datetime.now(UTC)
+                    logger.warning(f'Usage gate PAUSED: Codex cap — {pattern}')
+                    return True
+        elif backend == 'gemini':
+            for pattern in GEMINI_CAP_PATTERNS:
+                if pattern.lower() in combined.lower():
+                    self._open.clear()
+                    self._paused_reason = f'Gemini cap hit: {pattern}'
+                    if self._pause_started_at is None:
+                        self._pause_started_at = datetime.now(UTC)
+                    logger.warning(f'Usage gate PAUSED: Gemini cap — {pattern}')
+                    return True
 
         for prefixes in (CAP_HIT_PREFIXES, NEAR_CAP_PREFIXES):
             for prefix in prefixes:

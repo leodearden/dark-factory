@@ -97,6 +97,28 @@ class TurnsConfig(BaseModel):
     module_tagger: int = Field(default=30)
 
 
+class EffortConfig(BaseModel):
+    """Reasoning effort level per agent role."""
+
+    architect: str = Field(default='high')
+    implementer: str = Field(default='high')
+    debugger: str = Field(default='high')
+    reviewer: str = Field(default='medium')
+    merger: str = Field(default='high')
+    module_tagger: str = Field(default='medium')
+
+
+class BackendsConfig(BaseModel):
+    """Backend CLI selection per agent role. Values: 'claude', 'codex', 'gemini'."""
+
+    architect: str = Field(default='claude')
+    implementer: str = Field(default='claude')
+    debugger: str = Field(default='claude')
+    reviewer: str = Field(default='claude')
+    merger: str = Field(default='claude')
+    module_tagger: str = Field(default='claude')
+
+
 class FusedMemoryConfig(BaseModel):
     """Fused-memory HTTP server connection."""
 
@@ -112,13 +134,38 @@ class FusedMemoryConfig(BaseModel):
     )
 
 
+class SandboxConfig(BaseModel):
+    """Bubblewrap filesystem sandbox configuration."""
+
+    enabled: bool = Field(default=True)
+
+
+class EscalationConfig(BaseModel):
+    """Escalation MCP server configuration."""
+
+    queue_dir: str = Field(default='data/escalations')
+    port: int = Field(default=8100)
+    host: str = Field(default='127.0.0.1')
+
+
+class UsageCapConfig(BaseModel):
+    """Usage cap detection and handling."""
+
+    enabled: bool = Field(default=True)
+    session_budget_usd: float | None = Field(default=None)
+    pause_threshold: float = Field(default=0.96)
+    wait_for_reset: bool = Field(default=True)
+    probe_interval_secs: int = Field(default=300)
+    max_probe_interval_secs: int = Field(default=1800)
+
+
 class GitConfig(BaseModel):
     """Git operations configuration."""
 
     main_branch: str = Field(default='main')
     branch_prefix: str = Field(default='task/')
     remote: str = Field(default='origin')
-    worktree_dir: str = Field(default='../worktrees')
+    worktree_dir: str = Field(default='.worktrees')
 
 
 # --- Top-level ---
@@ -130,6 +177,7 @@ class OrchestratorConfig(BaseSettings):
     # Concurrency
     max_concurrent_tasks: int = Field(default=3)
     max_per_module: int = Field(default=1)
+    lock_depth: int = Field(default=2)
     module_overrides: dict[str, int] = Field(default_factory=dict)
 
     # Iteration limits
@@ -141,6 +189,8 @@ class OrchestratorConfig(BaseSettings):
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     budgets: BudgetsConfig = Field(default_factory=BudgetsConfig)
     max_turns: TurnsConfig = Field(default_factory=TurnsConfig)
+    effort: EffortConfig = Field(default_factory=EffortConfig)
+    backends: BackendsConfig = Field(default_factory=BackendsConfig)
 
     # Verification commands
     test_command: str = Field(default='pytest')
@@ -150,8 +200,17 @@ class OrchestratorConfig(BaseSettings):
     # Fused memory
     fused_memory: FusedMemoryConfig = Field(default_factory=FusedMemoryConfig)
 
+    # Sandbox
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+
+    # Escalation
+    escalation: EscalationConfig = Field(default_factory=EscalationConfig)
+
     # Git
     git: GitConfig = Field(default_factory=GitConfig)
+
+    # Usage cap handling
+    usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)
 
     # Project
     project_root: Path = Field(default=Path('.'))

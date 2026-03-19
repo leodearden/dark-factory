@@ -1,0 +1,89 @@
+{
+  "id": "df_task_12",
+  "name": "Bug: verify.py fails with 'source: not found' on dash systems",
+  "project": "dark-factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "pre_task_commit": "e53c9a555cf64117c19aa5834df269fc3e97d8a3",
+  "post_task_commit": "503b9d768296888befcedfc3f0c2135d6b031161",
+  "task_definition": {
+    "title": "Bug: verify.py fails with 'source: not found' on dash systems",
+    "description": "The verify step fails with 'source: not found' on Ubuntu systems where /bin/sh is dash. Fix create_subprocess_shell in verify.py to use executable='/bin/bash' so shell builtins like 'source' work correctly."
+  },
+  "verify_commands": {
+    "test": "cd orchestrator && uv run pytest tests/ -x",
+    "lint": "cd orchestrator && uv run ruff check src/",
+    "typecheck": "cd orchestrator && uv run pyright src/"
+  },
+  "modules": [
+    "orchestrator/src/orchestrator"
+  ],
+  "complexity": "small",
+  "setup_commands": ["cd orchestrator && uv sync --quiet"],
+  "expected_files_changed": [
+    "orchestrator/src/orchestrator/verify.py"
+  ],
+  "plan": {
+    "task_id": "12",
+    "title": "Bug: verify.py fails with 'source: not found' on dash systems",
+    "modules": [
+      "orchestrator/src/orchestrator",
+      "orchestrator/tests"
+    ],
+    "analysis": "The bug is in orchestrator/src/orchestrator/verify.py, line 36. The `_run_cmd()` function calls `asyncio.create_subprocess_shell()` without specifying the `executable` parameter. On Ubuntu/Debian systems where /bin/sh is symlinked to dash (not bash), shell builtins like `source` fail with 'source: not found' because dash only supports the POSIX `.` command. The fix is to add `executable='/bin/bash'` to the `create_subprocess_shell()` call. There are currently NO unit tests for verify.py \u2014 it is only mocked in the e2e workflow tests (test_workflow_e2e.py). We need to create a new test file `orchestrator/tests/test_verify.py` with tests that verify: (1) the bash executable is passed to subprocess creation, and (2) bash-specific builtins like `source` work when executed through `_run_cmd`. The fix is a one-line change but the test coverage gap should be addressed.",
+    "prerequisites": [],
+    "steps": [
+      {
+        "id": "step-1",
+        "type": "test",
+        "description": "Write failing test in orchestrator/tests/test_verify.py that patches asyncio.create_subprocess_shell and asserts it is called with executable='/bin/bash'. Also write an integration test that runs a command using `source` (or bash-only syntax) through _run_cmd and asserts it succeeds (returncode 0). Both tests should fail currently since _run_cmd does not pass executable='/bin/bash'.",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-2",
+        "type": "impl",
+        "description": "Fix _run_cmd() in orchestrator/src/orchestrator/verify.py by adding executable='/bin/bash' to the asyncio.create_subprocess_shell() call on line 36. This ensures bash is used as the shell interpreter regardless of what /bin/sh points to, making `source` and other bash builtins work on dash systems.",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-3",
+        "type": "test",
+        "description": "Write additional tests for _run_cmd edge cases: (1) test that timeout handling still works correctly with the bash executable, (2) test that run_verification passes results through correctly. Verify all tests in orchestrator/tests/test_verify.py pass.",
+        "status": "pending",
+        "commit": null
+      }
+    ],
+    "design_decisions": [
+      {
+        "decision": "Use executable='/bin/bash' rather than rewriting commands to be POSIX-compatible",
+        "rationale": "The verification commands (pytest, ruff, pyright) may use shell features that depend on bash. Forcing bash is simpler and more robust than auditing all possible user-configured commands for POSIX compliance. The task description explicitly requests this approach."
+      },
+      {
+        "decision": "Create a new test_verify.py rather than adding to test_workflow_e2e.py",
+        "rationale": "verify.py has zero unit test coverage currently \u2014 only mocked in e2e tests. A dedicated test file follows the existing pattern (test_config.py, test_git_ops.py, test_artifacts.py) and enables focused testing of _run_cmd and run_verification."
+      },
+      {
+        "decision": "Test the executable parameter via mock rather than only integration tests",
+        "rationale": "An integration test that relies on the system having dash as /bin/sh would not be portable. Mocking create_subprocess_shell lets us assert the executable parameter is passed correctly on any CI system. We supplement with an integration test using bash-specific syntax (e.g., source /dev/null) that would fail under dash but pass under bash."
+      }
+    ],
+    "reuse": [
+      {
+        "what": "Test patterns from test_workflow_e2e.py",
+        "where": "orchestrator/tests/test_workflow_e2e.py",
+        "how": "Reuse the VerifyResult construction pattern and pytest-asyncio test class style"
+      },
+      {
+        "what": "OrchestratorConfig test fixture pattern",
+        "where": "orchestrator/tests/test_workflow_e2e.py lines 53-66",
+        "how": "Create a minimal OrchestratorConfig for run_verification tests"
+      },
+      {
+        "what": "Existing _run_cmd function signature",
+        "where": "orchestrator/src/orchestrator/verify.py line 33",
+        "how": "Test _run_cmd directly since it is a module-level async function (not private to a class)"
+      }
+    ]
+  }
+}

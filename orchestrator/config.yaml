@@ -39,11 +39,11 @@ max_turns:
 
 # Reasoning effort per role
 effort:
-  architect: "high"
-  implementer: "high"
-  debugger: "high"
+  architect: "max"
+  implementer: "max"
+  debugger: "max"
   reviewer: "medium"
-  merger: "high"
+  merger: "max"
   module_tagger: "medium"
 
 # Backend CLI per role (claude, codex, gemini)

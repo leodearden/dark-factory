@@ -1,0 +1,139 @@
+{
+  "id": "df_task_13",
+  "name": "Bug: Reviewers receive empty diff, rubber-stamp PASS",
+  "project": "dark-factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "pre_task_commit": "e53c9a555cf64117c19aa5834df269fc3e97d8a3",
+  "post_task_commit": "503b9d768296888befcedfc3f0c2135d6b031161",
+  "task_definition": {
+    "title": "Bug: Reviewers receive empty diff, rubber-stamp PASS",
+    "description": "Reviewers receive an empty diff because git_ops uses dynamic main...HEAD which returns empty when main advances during task execution. Fix by capturing main's SHA at worktree creation time (base_commit), storing it in .task/metadata.json, and using get_diff_from_base(base_commit) in the review stage."
+  },
+  "verify_commands": {
+    "test": "cd orchestrator && uv run pytest tests/ -x",
+    "lint": "cd orchestrator && uv run ruff check src/",
+    "typecheck": "cd orchestrator && uv run pyright src/"
+  },
+  "modules": [
+    "orchestrator/src/orchestrator"
+  ],
+  "complexity": "small",
+  "setup_commands": ["cd orchestrator && uv sync --quiet"],
+  "expected_files_changed": [
+    "orchestrator/src/orchestrator/git_ops.py",
+    "orchestrator/src/orchestrator/artifacts.py",
+    "orchestrator/src/orchestrator/workflow.py"
+  ],
+  "plan": {
+    "task_id": "df_task_13",
+    "title": "Bug: Reviewers receive empty diff, rubber-stamp PASS",
+    "modules": [
+      "orchestrator"
+    ],
+    "analysis": "The bug is in workflow.py:282 which calls git_ops.get_diff_from_main(worktree), running `git diff main...HEAD`. Since worktrees share refs with the main repo, the `main` ref advances as other tasks merge during execution. In certain merge topologies (e.g., fast-forward merges, or when main absorbs overlapping changes), the three-dot diff against the moving `main` ref can return empty, causing all 5 reviewers to receive an empty diff and rubber-stamp PASS.\n\nThe fix pins the diff to main's SHA at worktree creation time:\n1. git_ops.create_worktree() captures main's SHA before branching, returns it alongside the worktree path via a new WorktreeInfo dataclass\n2. artifacts.init() accepts and persists base_commit in .task/metadata.json\n3. A new git_ops.get_diff_from_base(worktree, base_commit) method replaces get_diff_from_main in the review stage\n4. workflow.py threads base_commit through setup \u2192 artifacts \u2192 review\n\nExisting tests in test_git_ops.py, test_artifacts.py, and test_workflow_e2e.py provide patterns to follow. All changes are within the orchestrator package.",
+    "prerequisites": [],
+    "steps": [
+      {
+        "id": "step-1",
+        "type": "test",
+        "description": "Write failing test in test_git_ops.py: test_create_worktree_returns_worktree_info \u2014 assert create_worktree returns a WorktreeInfo with .path (existing Path) and .base_commit (40-char SHA matching main's HEAD at creation time)",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-2",
+        "type": "impl",
+        "description": "Add WorktreeInfo dataclass (path: Path, base_commit: str) to git_ops.py. Modify create_worktree to capture main's SHA via `git rev-parse main` before creating the worktree, and return WorktreeInfo instead of Path. Update existing test_create_worktree to use .path accessor",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-3",
+        "type": "test",
+        "description": "Write failing test in test_git_ops.py: test_get_diff_from_base \u2014 create worktree, commit a file, advance main with a separate commit, then call get_diff_from_base(worktree, base_commit) and assert the branch's changes are present in the diff",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-4",
+        "type": "impl",
+        "description": "Add get_diff_from_base(worktree: Path, base_commit: str) -> str method to GitOps that runs `git diff <base_commit>...HEAD` \u2014 pinned SHA instead of moving ref",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-5",
+        "type": "test",
+        "description": "Write failing test in test_artifacts.py: test_metadata_contains_base_commit \u2014 call init() with base_commit='abc123def' and assert metadata.json contains that value under the 'base_commit' key",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-6",
+        "type": "impl",
+        "description": "Modify artifacts.init() to accept optional base_commit: str | None = None parameter, store it in metadata dict when provided",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-7",
+        "type": "test",
+        "description": "Write failing test in test_workflow_e2e.py: test_review_uses_base_commit_diff \u2014 simulate main advancing during execution (in the implementer stub, add a commit to main), then verify the reviewer prompt contains the branch's actual diff (non-empty) by inspecting what build_reviewer_prompt receives",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-8",
+        "type": "impl",
+        "description": "Wire base_commit through TaskWorkflow: (1) In run(), unpack WorktreeInfo from create_worktree into self.worktree and self.base_commit, (2) Pass base_commit to artifacts.init(), (3) In _review(), replace get_diff_from_main(self.worktree) with get_diff_from_base(self.worktree, self.base_commit). Update all existing e2e tests that access worktree_info.path or call create_worktree",
+        "status": "pending",
+        "commit": null
+      }
+    ],
+    "design_decisions": [
+      {
+        "decision": "Use a WorktreeInfo dataclass instead of returning a tuple from create_worktree",
+        "rationale": "A named dataclass is more readable than (Path, str) tuple unpacking, self-documenting, and extensible if we need to attach more metadata to worktrees later (e.g., branch name). Follows the existing MergeResult pattern in the same file."
+      },
+      {
+        "decision": "Keep get_diff_from_main as-is; add get_diff_from_base alongside it",
+        "rationale": "get_diff_from_main may be used in other contexts or for debugging. Adding a new method avoids breaking any indirect callers. The workflow switches to get_diff_from_base, and get_diff_from_main can be deprecated later."
+      },
+      {
+        "decision": "Make base_commit optional in artifacts.init() with default None",
+        "rationale": "Backward compatible \u2014 existing callers (including tests) that don't pass base_commit continue to work. The field is only written to metadata.json when provided."
+      },
+      {
+        "decision": "Store base_commit as an instance variable on TaskWorkflow rather than re-reading from metadata.json",
+        "rationale": "The workflow creates the worktree and immediately has the base_commit. Re-reading from disk adds unnecessary I/O. The metadata.json storage is for crash recovery and debugging, not for the hot path."
+      }
+    ],
+    "reuse": [
+      {
+        "what": "MergeResult dataclass pattern",
+        "where": "orchestrator/src/orchestrator/git_ops.py:14-18",
+        "how": "WorktreeInfo follows the same dataclass pattern already in git_ops.py for returning structured results from git operations"
+      },
+      {
+        "what": "_run() helper for async git commands",
+        "where": "orchestrator/src/orchestrator/git_ops.py:21-30",
+        "how": "get_diff_from_base uses the same _run() helper that get_diff_from_main and all other git operations use"
+      },
+      {
+        "what": "git_repo fixture and _setup_repo helper",
+        "where": "orchestrator/tests/test_git_ops.py:13-28",
+        "how": "New tests reuse the existing git_repo fixture for creating temporary repos with initial commits"
+      },
+      {
+        "what": "AgentStub / FakeBriefing / FakeScheduler test infrastructure",
+        "where": "orchestrator/tests/test_workflow_e2e.py:132-370",
+        "how": "The e2e test for base_commit wiring subclasses AgentStub to advance main during execution, reusing the entire fake infrastructure"
+      },
+      {
+        "what": "artifacts fixture pattern",
+        "where": "orchestrator/tests/test_artifacts.py:12-21",
+        "how": "New artifact test follows the same fixture pattern with tmp_path-based worktree"
+      }
+    ]
+  }
+}

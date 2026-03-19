@@ -26,8 +26,11 @@ from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.verify import run_verification
 
+from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
+
 if TYPE_CHECKING:
     from orchestrator.mcp_lifecycle import McpLifecycle
+    from orchestrator.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +43,14 @@ class WorkflowState(enum.Enum):
     MERGE = 'merge'
     DONE = 'done'
     BLOCKED = 'blocked'
+    ESCALATED = 'escalated'
 
 
 class WorkflowOutcome(enum.Enum):
     DONE = 'done'
     BLOCKED = 'blocked'
     REQUEUED = 'requeued'
+    ESCALATED = 'escalated'
 
 
 @dataclass
@@ -69,6 +74,10 @@ class TaskWorkflow:
         scheduler: Scheduler,
         briefing: BriefingAssembler,
         mcp: McpLifecycle,
+        escalation_queue=None,
+        escalation_event: asyncio.Event | None = None,
+        usage_gate: UsageGate | None = None,
+        initial_plan: dict | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -82,9 +91,18 @@ class TaskWorkflow:
         self.task_id = assignment.task_id
         self.modules = list(assignment.modules)
         self.worktree: Path | None = None
+        self._worktree_external = False  # True when worktree was pre-created (eval mode)
         self.artifacts: TaskArtifacts | None = None
         self.plan: dict = {}
+        self.initial_plan = initial_plan
         self.metrics = WorkflowMetrics()
+
+        # Escalation support
+        self.escalation_queue = escalation_queue
+        self._escalation_event = escalation_event
+
+        # Usage cap gate
+        self.usage_gate = usage_gate
 
     async def run(self) -> WorkflowOutcome:
         """Execute the full state machine."""
@@ -93,44 +111,89 @@ class TaskWorkflow:
             # Set task in-progress
             await self.scheduler.set_task_status(self.task_id, 'in-progress')
 
-            # Create worktree
-            self.worktree = await self.git_ops.create_worktree(branch_name)
+            # Create worktree (captures base commit for stable diffs)
+            # If worktree is already set (e.g. eval mode), skip creation
+            if self.worktree is None:
+                self.worktree, base_commit = await self.git_ops.create_worktree(branch_name)
+            else:
+                # Eval mode: worktree was pre-created, skip creation and cleanup
+                self._worktree_external = True
+                proc = await asyncio.create_subprocess_exec(
+                    'git', 'rev-parse', 'HEAD',
+                    cwd=str(self.worktree),
+                    stdout=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                base_commit = stdout.decode().strip()
             self.artifacts = TaskArtifacts(self.worktree)
             self.artifacts.init(
                 self.task_id,
                 self.task.get('title', ''),
                 self.task.get('description', ''),
+                base_commit=base_commit,
             )
 
-            # PLAN
-            self.state = WorkflowState.PLAN
-            plan_outcome = await self._plan()
-            if plan_outcome == WorkflowOutcome.REQUEUED:
-                return WorkflowOutcome.REQUEUED
-            if plan_outcome == WorkflowOutcome.BLOCKED:
-                return await self._mark_blocked('Planning failed')
-
-            # EXECUTE + VERIFY + REVIEW loop
-            outcome = await self._execute_verify_review_loop()
-            if outcome != WorkflowOutcome.DONE:
-                return outcome
-
-            # MERGE
-            self.state = WorkflowState.MERGE
-            merge_outcome = await self._merge(branch_name)
-            if merge_outcome != WorkflowOutcome.DONE:
-                return merge_outcome
-
-            # POST-MERGE VERIFY
-            post_merge = await run_verification(self.config.project_root, self.config)
-            if not post_merge.passed:
-                logger.error(f'Task {self.task_id}: post-merge verification failed')
-                await self.git_ops.revert_last_merge(self.config.project_root)
-                return await self._mark_blocked(
-                    f'Post-merge verification failed: {post_merge.summary}'
+            # PLAN (skip if initial_plan was provided — eval mode)
+            if self.initial_plan:
+                self.artifacts.write_plan(self.initial_plan)
+                self.plan = self.initial_plan
+                logger.info(
+                    f'Task {self.task_id}: using provided plan '
+                    f'({len(self.plan.get("steps", []))} steps)'
                 )
+            else:
+                self.state = WorkflowState.PLAN
+                plan_outcome = await self._plan()
+                if plan_outcome == WorkflowOutcome.REQUEUED:
+                    return WorkflowOutcome.REQUEUED
+                if plan_outcome == WorkflowOutcome.BLOCKED:
+                    return await self._mark_blocked('Planning failed')
 
-            # SUCCESS
+            # EXECUTE + VERIFY + REVIEW loop (with escalation retry)
+            while True:
+                outcome = await self._execute_verify_review_loop()
+                if outcome == WorkflowOutcome.ESCALATED:
+                    self.state = WorkflowState.ESCALATED
+                    logger.info(f'Task {self.task_id}: waiting for escalation resolution')
+                    resolution = await self._wait_for_resolution()
+                    # Check if any escalation was dismissed (terminate)
+                    dismissed = [
+                        e for e in self.escalation_queue.get_by_task(self.task_id)
+                        if e.status == 'dismissed'
+                    ]
+                    if dismissed:
+                        return await self._mark_blocked('Task terminated via escalation')
+                    # Resume with resolution context
+                    logger.info(f'Task {self.task_id}: resuming after escalation resolution')
+                    resume_prompt = await self.briefing.build_resume_prompt(
+                        self.task, self.plan,
+                        '\n'.join(e.summary for e in self._check_escalations()),
+                        resolution, self.worktree,
+                    )
+                    await self._invoke(IMPLEMENTER, resume_prompt, self.worktree)
+                    continue
+                if outcome != WorkflowOutcome.DONE:
+                    return outcome
+                break
+
+            # MERGE (skip for eval mode — no merge into main)
+            if not self._worktree_external:
+                self.state = WorkflowState.MERGE
+                merge_outcome = await self._merge(branch_name)
+                if merge_outcome != WorkflowOutcome.DONE:
+                    return merge_outcome
+
+                # POST-MERGE VERIFY
+                post_merge = await run_verification(self.config.project_root, self.config)
+                if not post_merge.passed:
+                    logger.error(f'Task {self.task_id}: post-merge verification failed')
+                    await self.git_ops.revert_last_merge(self.config.project_root)
+                    return await self._mark_blocked(
+                        f'Post-merge verification failed: {post_merge.summary}'
+                    )
+
+            # SUCCESS — write completion knowledge before status change (ordering guarantee)
+            await self._write_completion_to_memory()
             self.state = WorkflowState.DONE
             await self.scheduler.set_task_status(self.task_id, 'done')
             logger.info(
@@ -140,18 +203,23 @@ class TaskWorkflow:
             )
             return WorkflowOutcome.DONE
 
+        except _SessionBudgetExhausted:
+            logger.warning(f'Task {self.task_id}: session budget exhausted')
+            return await self._mark_blocked('Session budget exhausted')
+
         except Exception as e:
             logger.exception(f'Task {self.task_id} workflow error: {e}')
             return await self._mark_blocked(f'Workflow error: {e}')
 
         finally:
             # Cleanup worktree (only if done — keep for debugging if blocked)
-            if self.state == WorkflowState.DONE and self.worktree:
+            # Skip cleanup for externally-managed worktrees (eval mode)
+            if self.state == WorkflowState.DONE and self.worktree and not self._worktree_external:
                 await self.git_ops.cleanup_worktree(self.worktree, branch_name)
 
     async def _plan(self) -> WorkflowOutcome:
         """Invoke the architect to produce a plan."""
-        prompt = await self.briefing.build_architect_prompt(self.task)
+        prompt = await self.briefing.build_architect_prompt(self.task, worktree=self.worktree)
         result = await self._invoke(ARCHITECT, prompt, self.worktree)
 
         if not result.success:
@@ -160,6 +228,7 @@ class TaskWorkflow:
 
         # Read the plan the architect wrote
         self.plan = self.artifacts.read_plan()
+
         if not self.plan:
             logger.error(f'Task {self.task_id}: architect produced no plan.json')
             return WorkflowOutcome.BLOCKED
@@ -192,12 +261,16 @@ class TaskWorkflow:
             # EXECUTE
             self.state = WorkflowState.EXECUTE
             exec_outcome = await self._execute_iterations()
+            if exec_outcome == WorkflowOutcome.ESCALATED:
+                return WorkflowOutcome.ESCALATED
             if exec_outcome == WorkflowOutcome.BLOCKED:
                 return await self._mark_blocked('Execution iterations exhausted')
 
             # VERIFY + DEBUGFIX loop
             self.state = WorkflowState.VERIFY
             verify_outcome = await self._verify_debugfix_loop()
+            if verify_outcome == WorkflowOutcome.ESCALATED:
+                return WorkflowOutcome.ESCALATED
             if verify_outcome == WorkflowOutcome.BLOCKED:
                 return await self._mark_blocked('Verification attempts exhausted')
 
@@ -238,6 +311,11 @@ class TaskWorkflow:
 
             self.metrics.execute_iterations += 1
 
+            # Check for escalations
+            blocking = [e for e in self._check_escalations() if e.severity == 'blocking']
+            if blocking:
+                return WorkflowOutcome.ESCALATED
+
             # Re-read plan to see progress
             self.plan = self.artifacts.read_plan()
 
@@ -274,12 +352,21 @@ class TaskWorkflow:
             )
             debug_result = await self._invoke(DEBUGGER, prompt, self.worktree)
 
+            # Check for escalations from debugger
+            blocking = [e for e in self._check_escalations() if e.severity == 'blocking']
+            if blocking:
+                return WorkflowOutcome.ESCALATED
+
             if not debug_result.success:
                 logger.warning(f'Task {self.task_id}: debugger failed')
 
     async def _review(self):
         """Run all 5 reviewers in parallel, aggregate results."""
-        diff = await self.git_ops.get_diff_from_main(self.worktree)
+        base_commit = self.artifacts.read_base_commit()
+        if base_commit:
+            diff = await self.git_ops.get_diff_from_base(self.worktree, base_commit)
+        else:
+            diff = await self.git_ops.get_diff_from_main(self.worktree)
 
         # Launch all reviewers concurrently
         review_tasks = []
@@ -415,34 +502,74 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         models = self.config.models
         budgets = self.config.budgets
         turns = self.config.max_turns
+        effort_cfg = self.config.effort
+        backends_cfg = self.config.backends
 
-        model = getattr(models, role.name.split('_')[0], role.default_model)
-        budget = getattr(budgets, role.name.split('_')[0], role.default_budget)
-        max_turns_val = getattr(turns, role.name.split('_')[0], role.default_max_turns)
+        role_key = role.name.split('_')[0]
+
+        model = getattr(models, role_key, role.default_model)
+        budget = getattr(budgets, role_key, role.default_budget)
+        max_turns_val = getattr(turns, role_key, role.default_max_turns)
+        effort_val = getattr(effort_cfg, role_key, 'high')
+        backend_val = getattr(backends_cfg, role_key, 'claude')
 
         # Use reviewer config for all reviewer variants
         if role.name.startswith('reviewer'):
             model = models.reviewer
             budget = budgets.reviewer
             max_turns_val = turns.reviewer
+            effort_val = effort_cfg.reviewer
+            backend_val = backends_cfg.reviewer
 
-        result = await invoke_agent(
-            prompt=prompt,
-            system_prompt=role.system_prompt,
-            cwd=cwd,
-            model=model,
-            max_turns=max_turns_val,
-            max_budget_usd=budget,
-            allowed_tools=role.allowed_tools or None,
-            disallowed_tools=role.disallowed_tools or None,
-            mcp_config=self.mcp.mcp_config_json(),
-            output_schema=output_schema,
-        )
+        # Determine sandbox modules based on role
+        sandbox_modules = None
+        if self.config.sandbox.enabled and role.name in ('implementer', 'debugger'):
+            sandbox_modules = self.modules
+
+        # Build MCP config with escalation server if available
+        mcp_config = None
+        if self.escalation_queue and role.name in ('architect', 'implementer', 'debugger', 'merger'):
+            esc = self.config.escalation
+            mcp_config = self.mcp.mcp_config_json(
+                escalation_url=f'http://{esc.host}:{esc.port}/mcp'
+            )
+
+        while True:
+            if self.usage_gate:
+                await self.usage_gate.before_invoke()
+
+            result = await invoke_agent(
+                prompt=prompt,
+                system_prompt=role.system_prompt,
+                cwd=cwd,
+                model=model,
+                max_turns=max_turns_val,
+                max_budget_usd=budget,
+                allowed_tools=role.allowed_tools or None,
+                disallowed_tools=role.disallowed_tools or None,
+                mcp_config=mcp_config,
+                output_schema=output_schema,
+                sandbox_modules=sandbox_modules,
+                effort=effort_val,
+                backend=backend_val,
+            )
+
+            # Check for cap hit — if detected, loop back to before_invoke which blocks
+            if self.usage_gate and self.usage_gate.detect_cap_hit(result.stderr, result.output, backend_val):
+                logger.warning(
+                    f'Task {self.task_id} [{role.name}]: usage cap hit, waiting for reset'
+                )
+                continue
+
+            break
 
         # Track metrics
         self.metrics.total_cost_usd += result.cost_usd
         self.metrics.total_duration_ms += result.duration_ms
         self.metrics.agent_invocations += 1
+
+        if self.usage_gate:
+            self.usage_gate.on_agent_complete(result.cost_usd)
 
         logger.info(
             f'Task {self.task_id} [{role.name}]: '
@@ -452,12 +579,108 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         return result
 
+    def _check_escalations(self):
+        """Check for pending escalations for this task."""
+        if not self.escalation_queue:
+            return []
+        return self.escalation_queue.get_by_task(self.task_id, status='pending')
+
+    async def _wait_for_resolution(self) -> str:
+        """Wait for all pending escalations to be resolved."""
+        if self._escalation_event is None:
+            self._escalation_event = asyncio.Event()
+
+        # Poll until all pending escalations for this task are resolved
+        while True:
+            pending = self._check_escalations()
+            if not pending:
+                break
+            self._escalation_event.clear()
+            await self._escalation_event.wait()
+
+        # Collect resolutions
+        resolved = [
+            e for e in self.escalation_queue.get_by_task(self.task_id)
+            if e.status == 'resolved' and e.resolution
+        ]
+        return '\n'.join(e.resolution for e in resolved)
+
     async def _mark_blocked(self, reason: str) -> WorkflowOutcome:
-        """Mark task as blocked."""
+        """Mark task as blocked and create an escalation entry."""
         self.state = WorkflowState.BLOCKED
         await self.scheduler.set_task_status(self.task_id, 'blocked')
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
+
+        if self.escalation_queue:
+            from escalation.models import Escalation
+
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role='orchestrator',
+                severity='blocking',
+                category='task_failure',
+                summary=reason[:200],
+                detail=reason,
+                suggested_action='investigate_and_retry',
+                worktree=str(self.worktree) if self.worktree else None,
+                workflow_state=self.state.value,
+            )
+            self.escalation_queue.submit(esc)
+
         return WorkflowOutcome.BLOCKED
+
+    async def _write_completion_to_memory(self) -> None:
+        """Write task completion summary so dependent tasks find it in briefings."""
+        parts = [f"Completed: {self.task.get('title', '')}"]
+
+        desc = self.task.get('description', '')
+        if desc:
+            parts.append(f"Description: {desc}")
+
+        analysis = self.plan.get('analysis', '')
+        if analysis:
+            parts.append(f"Analysis: {analysis}")
+
+        decisions = self.plan.get('design_decisions', [])
+        if decisions:
+            decision_text = '; '.join(
+                d.get('decision', '') for d in decisions[:3]
+            )
+            parts.append(f"Key decisions: {decision_text}")
+
+        steps = self.plan.get('steps', [])
+        done_count = sum(1 for s in steps if s.get('status') == 'done')
+        parts.append(f"Steps completed: {done_count}/{len(steps)}")
+
+        if self.modules:
+            parts.append(f"Modules: {', '.join(self.modules)}")
+
+        content = '\n'.join(parts)
+
+        try:
+            import httpx as httpx_mod
+            async with httpx_mod.AsyncClient() as client:
+                await client.post(
+                    f'{self.mcp.url}/mcp/',
+                    json={
+                        'jsonrpc': '2.0',
+                        'id': 1,
+                        'method': 'tools/call',
+                        'params': {
+                            'name': 'add_memory',
+                            'arguments': {
+                                'content': content,
+                                'category': 'observations_and_summaries',
+                                'project_id': self.config.fused_memory.project_id,
+                                'agent_id': f'orchestrator-task-{self.task_id}',
+                            },
+                        },
+                    },
+                    timeout=10,
+                )
+        except Exception as e:
+            logger.warning(f'Failed to write completion to memory: {e}')
 
     async def _write_decisions_to_memory(self) -> None:
         """Write plan design decisions to fused-memory."""

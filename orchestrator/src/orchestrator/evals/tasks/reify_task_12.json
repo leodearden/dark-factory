@@ -1,0 +1,268 @@
+{
+  "id": "reify_task_12",
+  "name": "Content-hash caching and early cutoff",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "88d537a84e8e37e943b3f55e578c65943de4c2f7",
+  "post_task_commit": "6140657f5cce2e115755fa9081c5022a080e77e6",
+  "task_definition": {
+    "title": "Content-hash caching and early cutoff",
+    "description": "Implement a content-hash caching layer with early cutoff optimization for the reify evaluation pipeline. Includes CacheStore with version-based fast path, dependency tracing, invalidation propagation, and early cutoff that prevents downstream re-evaluation when content hashes match."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [
+    "crates/reify-types",
+    "crates/reify-eval"
+  ],
+  "complexity": "high",
+  "expected_files_changed": [],
+  "plan": {
+    "task_id": "task_12",
+    "title": "Content-hash caching and early cutoff",
+    "modules": [
+      "crates/reify-eval"
+    ],
+    "analysis": "The reify-eval crate has a three-stage evaluation pipeline (eval \u2192 check \u2192 build) driven by Engine, with an EvaluationGraph backed by PersistentMaps and content-hashed nodes, plus a Snapshot type for immutable state. However, no caching layer exists \u2014 every eval() call recomputes all values from scratch. The task requires: (1) A CacheStore that maps ValueCellId \u2192 cached result with version-based fast path, (2) Dependency tracing to know which cells depend on which, (3) Invalidation propagation when inputs change, (4) Early cutoff \u2014 when a cell re-evaluates to the same content hash, its dependents are not re-evaluated. The existing infrastructure provides excellent foundations: ContentHash (XXH3-128) with combine/combine_all, Value::content_hash() with NaN/-0.0 normalization, CompiledExprKind::ValueRef for dependency extraction, VersionId for versioning, Freshness enum with Pending{last_substantive} for early cutoff state, and PersistentMap for O(1) cloneable storage. We add two new modules to reify-eval: deps.rs (dependency extraction from expressions and DependencyMap with forward/reverse/topological-sort) and cache.rs (CacheEntry, CacheStore with version-based fast path, input hash computation, invalidation propagation, and early cutoff). No changes to reify-types are needed.",
+    "prerequisites": [
+      {
+        "id": "pre-1",
+        "description": "Add `pub mod deps;` and `pub mod cache;` declarations to crates/reify-eval/src/lib.rs, and create empty deps.rs and cache.rs stub files",
+        "status": "pending",
+        "commit": null,
+        "tests": []
+      }
+    ],
+    "steps": [
+      {
+        "id": "step-1",
+        "type": "test",
+        "description": "Write tests for extract_value_deps: literal expr returns empty vec, ValueRef returns the referenced id, BinOp recursively collects from both sides, nested expressions (UnOp, Conditional, FunctionCall) collect all transitive ValueRef deps, and duplicates are deduplicated",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-2",
+        "type": "impl",
+        "description": "Implement extract_value_deps(expr: &CompiledExpr) -> Vec<ValueCellId> as a recursive walk over CompiledExprKind variants, collecting all ValueRef IDs into a HashSet then returning as a sorted Vec for determinism",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-3",
+        "type": "test",
+        "description": "Write tests for DependencyMap::from_graph: using bracket fixture, verify forward deps (volume depends on width/height/thickness, params have no deps), verify the map contains entries for all value cells in the graph",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-4",
+        "type": "impl",
+        "description": "Implement DependencyMap struct with forward: HashMap<ValueCellId, Vec<ValueCellId>> and from_graph(graph: &EvaluationGraph) constructor that iterates value cells, extracts deps from default_expr using extract_value_deps, and populates forward map",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-5",
+        "type": "test",
+        "description": "Write tests for DependencyMap::dependents_of (reverse lookup): verify that width/height/thickness each list volume as a dependent, and volume has no dependents. Also test deps_of accessor for forward lookup",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-6",
+        "type": "impl",
+        "description": "Add reverse: HashMap<ValueCellId, Vec<ValueCellId>> to DependencyMap, build it during from_graph by inverting the forward map. Add deps_of() and dependents_of() accessor methods returning &[ValueCellId]",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-7",
+        "type": "test",
+        "description": "Write tests for DependencyMap::topological_order: verify params come before let bindings that depend on them (width before volume), all cells are included, and the ordering is valid (no cell appears before its dependencies)",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-8",
+        "type": "impl",
+        "description": "Implement topological_order() -> Vec<ValueCellId> using Kahn's algorithm: start with cells that have no deps (in-degree 0), process queue, decrement dependents' in-degree, emit when in-degree reaches 0",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-9",
+        "type": "test",
+        "description": "Write tests for CacheEntry and CacheStore: construct CacheEntry with value/value_hash/version/input_hash, test CacheStore::new is empty, put then get returns the entry, get for missing key returns None, len tracks entries",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-10",
+        "type": "impl",
+        "description": "Implement CacheEntry struct {value: Value, value_hash: ContentHash, version: VersionId, input_hash: ContentHash} and CacheStore struct with PersistentMap<ValueCellId, CacheEntry>, new(), get(), put(), len() methods, and current version tracking",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-11",
+        "type": "test",
+        "description": "Write tests for version-based fast path: is_fresh returns true when entry version == store version, returns false after bump_version(), returns false for missing entries. Test bump_version increments the version",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-12",
+        "type": "impl",
+        "description": "Implement is_fresh(id: &ValueCellId) -> bool that checks entry.version == self.version, and bump_version() -> VersionId that increments self.version and returns the new value",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-13",
+        "type": "test",
+        "description": "Write tests for compute_input_hash: combining an expression's content_hash with sorted dependency value hashes produces deterministic results, different dep values produce different hashes, empty deps produces hash from expr alone",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-14",
+        "type": "impl",
+        "description": "Implement compute_input_hash(expr: &CompiledExpr, deps: &[ValueCellId], values: &ValueMap) -> ContentHash that combines expr.content_hash with ContentHash::combine_all of dependency values' content hashes (sorted by ValueCellId for determinism)",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-15",
+        "type": "test",
+        "description": "Write tests for invalidation propagation: invalidate([width]) with bracket dep graph marks volume as stale (removed from cache or version decremented), but height/thickness remain fresh. Invalidating a leaf with no dependents is a no-op on others",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-16",
+        "type": "impl",
+        "description": "Implement invalidate(changed: &[ValueCellId], dep_map: &DependencyMap) that performs BFS/DFS through reverse deps starting from changed set, removing or marking stale all transitively affected entries in the cache",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-17",
+        "type": "test",
+        "description": "Write tests for early cutoff: after re-evaluating a cell that produces the same value_hash as cached, check_early_cutoff returns true. After re-evaluating a cell with a different value_hash, returns false. Verify dirty_set with early cutoff: change an input that flows through a cell whose output doesn't change \u2014 dependents of that cell are excluded from the dirty set",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-18",
+        "type": "impl",
+        "description": "Implement check_early_cutoff(id: &ValueCellId, new_value_hash: ContentHash) -> bool comparing against cached entry's value_hash. Implement dirty_set(changed: &[ValueCellId], dep_map: &DependencyMap, graph: &EvaluationGraph, values: &ValueMap) -> Vec<ValueCellId> that walks dependents in topological order, evaluating and checking for early cutoff to prune the propagation frontier",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-19",
+        "type": "test",
+        "description": "Write integration test for incremental_eval: build bracket module, evaluate fully populating cache, change one param (width) value, call incremental_eval \u2014 verify only width and volume are re-evaluated (not height/thickness/fillet_radius/hole_diameter), and returned values are correct",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-20",
+        "type": "impl",
+        "description": "Implement incremental_eval(cache: &mut CacheStore, graph: &EvaluationGraph, dep_map: &DependencyMap, values: &mut ValueMap, changed: &[ValueCellId]) -> Vec<ValueCellId> that: (1) bumps version, (2) computes dirty set with early cutoff, (3) re-evaluates dirty cells in topological order using eval_expr, (4) updates cache entries, (5) returns list of cells that actually changed value",
+        "status": "pending",
+        "commit": null
+      }
+    ],
+    "design_decisions": [
+      {
+        "decision": "Separate deps.rs and cache.rs modules rather than a single module",
+        "rationale": "Dependency analysis (static, from expression structure) and caching (dynamic, from evaluation results) are orthogonal concerns. Separating them improves testability and allows DependencyMap to be reused independently (e.g., for cycle detection, visualization)."
+      },
+      {
+        "decision": "Use std::collections::HashMap for DependencyMap internals, PersistentMap for CacheStore",
+        "rationale": "DependencyMap is built once from the EvaluationGraph and used read-only \u2014 no need for structural sharing. CacheStore needs O(1) cloning for snapshot integration (matching codebase pattern where all state containers use PersistentMap)."
+      },
+      {
+        "decision": "input_hash combines expression content_hash with sorted dependency value hashes",
+        "rationale": "Including the expression's content_hash ensures that if the expression itself changes (e.g., from 'a*b' to 'a+b'), the input_hash changes even if the same value cells are referenced. Sorting by ValueCellId ensures determinism regardless of extraction order."
+      },
+      {
+        "decision": "Early cutoff compares value content hashes (ContentHash) not Value equality",
+        "rationale": "ContentHash comparison is O(1) and already handles NaN/-0.0 normalization. Value equality via PartialEq is also O(1) for scalars but requires pattern matching. Content hash is the canonical comparison mechanism throughout the codebase and is already computed for Value."
+      },
+      {
+        "decision": "extract_value_deps deduplicates and sorts results",
+        "rationale": "An expression like 'x + x' references x twice but x is one dependency. Sorting ensures deterministic input_hash computation and consistent test assertions."
+      },
+      {
+        "decision": "incremental_eval operates on ValueMap + CacheStore rather than modifying Engine",
+        "rationale": "Keeping the cache external to Engine preserves Engine's current stateless-per-call design. The caller (LSP, runtime) owns the CacheStore and passes it to incremental_eval, enabling flexible lifetime management and testing without Engine ceremony."
+      },
+      {
+        "decision": "Invalidation via BFS through reverse deps, with early cutoff pruning the frontier",
+        "rationale": "BFS ensures we process cells level-by-level (breadth-first through the dependency DAG), which naturally handles diamond dependencies. Early cutoff prunes branches where a cell's output hash is unchanged, preventing unnecessary downstream re-evaluation \u2014 this is the core optimization of build systems like Shake/salsa."
+      },
+      {
+        "decision": "Topological sort uses Kahn's algorithm",
+        "rationale": "Kahn's algorithm (BFS-based) is simple, handles DAGs correctly, detects cycles (if not all nodes are emitted), and produces a deterministic ordering when ties are broken consistently. It matches the existing two-pass evaluation pattern (params first, then lets)."
+      }
+    ],
+    "reuse": [
+      {
+        "what": "ContentHash (XXH3-128) with combine/combine_all",
+        "where": "reify-types/src/hash.rs",
+        "how": "Used for input_hash computation (combining dep value hashes), value_hash in CacheEntry, and early cutoff comparison"
+      },
+      {
+        "what": "Value::content_hash() with NaN/-0.0 normalization",
+        "where": "reify-types/src/value.rs",
+        "how": "Used to hash evaluation results for early cutoff detection \u2014 determines if a re-evaluated cell produced the same output"
+      },
+      {
+        "what": "CompiledExprKind::ValueRef(ValueCellId)",
+        "where": "reify-types/src/expr.rs",
+        "how": "The extract_value_deps function pattern-matches on ValueRef to discover which value cells an expression depends on"
+      },
+      {
+        "what": "CompiledExpr::content_hash (precomputed)",
+        "where": "reify-types/src/expr.rs",
+        "how": "Included in input_hash computation so that expression structure changes (not just value changes) trigger re-evaluation"
+      },
+      {
+        "what": "VersionId (monotonic u64 wrapper with Copy + Ord)",
+        "where": "reify-types/src/identity.rs",
+        "how": "CacheStore tracks current version; CacheEntry stores version at computation time; is_fresh compares entry.version == store.version for fast-path cache hit"
+      },
+      {
+        "what": "Freshness enum with Pending{last_substantive}",
+        "where": "reify-types/src/value.rs",
+        "how": "Existing type designed for incremental evaluation lifecycle tracking \u2014 CacheStore can use Freshness to track cell states, and last_substantive holds the content hash for early cutoff"
+      },
+      {
+        "what": "PersistentMap (im::HashMap wrapper)",
+        "where": "reify-types/src/persistent.rs",
+        "how": "CacheStore uses PersistentMap<ValueCellId, CacheEntry> for O(1) clone, matching codebase convention for all state containers"
+      },
+      {
+        "what": "EvaluationGraph with value_cells PersistentMap",
+        "where": "reify-eval/src/graph.rs",
+        "how": "DependencyMap::from_graph iterates graph.value_cells to extract each cell's default_expr and build the dependency structure"
+      },
+      {
+        "what": "reify_expr::eval_expr(expr, values)",
+        "where": "reify-expr/src/lib.rs",
+        "how": "incremental_eval calls eval_expr to re-evaluate individual dirty cells, same as the current Engine::eval() path"
+      },
+      {
+        "what": "TopologyTemplateBuilder, bracket_compiled_module(), value test helpers",
+        "where": "reify-test-support/src/builders.rs, fixtures.rs, values.rs",
+        "how": "Used in all tests to construct evaluation graphs, compiled modules, and expected values without manual boilerplate"
+      }
+    ]
+  }
+}

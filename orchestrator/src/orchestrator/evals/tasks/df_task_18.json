@@ -1,0 +1,335 @@
+{
+  "id": "df_task_18",
+  "name": "Sleep mode reconciliation system",
+  "project": "dark-factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "pre_task_commit": "236b2dd602c2e06bda0e047ec4929c4693506573",
+  "post_task_commit": "386713c8d1be05ba1dbd7571817fd65b6d956bff",
+  "task_definition": {
+    "title": "Sleep mode reconciliation system",
+    "description": "Implement the sleep mode reconciliation system for fused-memory that synchronizes state across Graphiti, Mem0, and Taskmaster during idle periods. Three-way reconciliation with consolidation, cross-store integrity, and task-knowledge sync."
+  },
+  "verify_commands": {
+    "test": "cd fused-memory && uv run pytest tests/ -x",
+    "lint": "cd fused-memory && uv run ruff check src/",
+    "typecheck": "cd fused-memory && uv run pyright src/"
+  },
+  "modules": [
+    "fused-memory/src/fused_memory"
+  ],
+  "complexity": "medium",
+  "setup_commands": ["cd orchestrator && uv sync --quiet"],
+  "expected_files_changed": [],
+  "plan": {
+    "task_id": "18",
+    "title": "Sleep mode reconciliation system",
+    "modules": [
+      "fused-memory/src/fused_memory/models",
+      "fused-memory/src/fused_memory/config",
+      "fused-memory/src/fused_memory/reconciliation",
+      "fused-memory/src/fused_memory/middleware",
+      "fused-memory/src/fused_memory/backends",
+      "fused-memory/src/fused_memory/services",
+      "fused-memory/tests",
+      "fused-memory/config"
+    ],
+    "analysis": "The worktree has the base fused-memory system (MemoryService, GraphitiBackend, Mem0Backend, routing, config, models) but no reconciliation code. The main repo already has the full implementation, providing a reference for the target architecture. The task requires building the complete three-stage sleep-mode reconciliation pipeline from scratch: (1) data models for events/runs/journals/verdicts, (2) SQLite-backed event buffer with burst detection and quiescence triggers, (3) persistent journal for audit trail, (4) generic LLM agent loop with Claude CLI support, (5) three pipeline stages (MemoryConsolidator, TaskKnowledgeSync, IntegrityCheck), (6) codebase verifier via explore agent, (7) LLM-as-judge for run quality evaluation, (8) targeted reconciliation for task state transitions, (9) pipeline harness with background loop, (10) task interceptor middleware, (11) taskmaster backend client, and (12) config schema extension. The TDD plan builds bottom-up: models/config \u2192 event_buffer \u2192 journal \u2192 agent_loop \u2192 stages \u2192 verifier \u2192 judge \u2192 targeted \u2192 harness, with tests before each implementation.",
+    "prerequisites": [
+      {
+        "id": "pre-1",
+        "description": "Create models/reconciliation.py with all data models: EventType, EventSource, StageId enums; ReconciliationEvent, JournalEntry, StageReport, ReconciliationRun, MemoryHints, VerificationResult, Watermark, JudgeVerdict Pydantic models",
+        "status": "pending",
+        "commit": null,
+        "tests": []
+      },
+      {
+        "id": "pre-2",
+        "description": "Extend config/schema.py with ReconciliationConfig (buffer thresholds, burst/quiescence params, agent LLM settings, stage/cycle timeouts, judge settings, explore codebase root, safety limits) and add it to FusedMemoryConfig as optional field",
+        "status": "pending",
+        "commit": null,
+        "tests": []
+      },
+      {
+        "id": "pre-3",
+        "description": "Create reconciliation/ package directory with __init__.py, stages/ sub-package with __init__.py, and prompts/ sub-package with __init__.py",
+        "status": "pending",
+        "commit": null,
+        "tests": []
+      },
+      {
+        "id": "pre-4",
+        "description": "Create prompts/stage1.py, stage2.py, stage3.py, and judge.py with system prompt constants for each reconciliation stage and the LLM judge",
+        "status": "pending",
+        "commit": null,
+        "tests": []
+      },
+      {
+        "id": "pre-5",
+        "description": "Create backends/taskmaster_client.py with TaskmasterBackend class providing async methods: get_tasks, get_task, set_task_status, add_task, update_task, add_subtask, remove_task, add_dependency, remove_dependency (wrapping CLI subprocess calls)",
+        "status": "pending",
+        "commit": null,
+        "tests": []
+      },
+      {
+        "id": "pre-6",
+        "description": "Create middleware/ package with __init__.py and task_interceptor.py stub (TaskInterceptor class that will wrap taskmaster operations to emit reconciliation events)",
+        "status": "pending",
+        "commit": null,
+        "tests": []
+      },
+      {
+        "id": "pre-7",
+        "description": "Update conftest.py to add mock_config fixtures with ReconciliationConfig support, and add QueueConfig with tmp_path data_dir for test isolation",
+        "status": "pending",
+        "commit": null,
+        "tests": []
+      }
+    ],
+    "steps": [
+      {
+        "id": "step-1",
+        "type": "test",
+        "description": "Write failing tests for EventBuffer: test_push_and_stats (push event, verify stats), test_should_trigger_buffer_size (3 events trigger at threshold=3), test_should_trigger_staleness (old event triggers), test_no_trigger_when_empty, test_no_trigger_when_active_run, test_drain_returns_events_and_clears, test_mark_run_active_prevents_double_run, test_mark_run_complete_allows_new_run, test_separate_project_buffers, test_get_active_projects, test_empty_project_stats",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-2",
+        "type": "impl",
+        "description": "Implement reconciliation/event_buffer.py: SQLite-backed EventBuffer with initialize(), push(), get_buffer_stats(), should_trigger() with size/staleness hard triggers, drain() with atomic status update, mark_run_active()/mark_run_complete() cross-instance locking, get_active_projects(), close(). Schema: event_buffer table (id, project_id, event_type, event_source, agent_id, timestamp, payload, status), reconciliation_locks table (project_id, instance_id, acquired_at, heartbeat_at)",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-3",
+        "type": "test",
+        "description": "Write failing tests for EventBuffer cross-instance and burst detection: test_cross_instance_visibility (two buffers on same DB see each other), test_burst_detection_enters_bursting (2 rapid events from same agent), test_burst_cooldown_exits_bursting (old burst expires), test_quiescent_trigger_at_33_percent, test_not_quiescent_when_bursting, test_not_quiescent_when_queue_active, test_cross_instance_lock, test_stale_lock_recovery, test_agent_id_none_excluded_from_burst, test_cleanup_drained",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-4",
+        "type": "impl",
+        "description": "Extend EventBuffer with burst detection: burst_state table (agent_id, state, last_write_at, burst_started_at), _update_burst_state() on push, _is_quiescent() checking burst states + queue_stats_fn, conditional trigger at ratio threshold + quiescence, heartbeat() method, stale lock recovery, cleanup_drained() with configurable max_age",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-5",
+        "type": "test",
+        "description": "Write failing tests for ReconciliationJournal: test_watermark_default (returns default watermark), test_watermark_roundtrip (write and read back), test_run_lifecycle (start, is_active, complete, get), test_journal_entries (add and retrieve with before/after state), test_judge_verdict (add and retrieve recent), test_recent_runs, test_stats, test_get_nonexistent_run, test_stage_reports_roundtrip",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-6",
+        "type": "impl",
+        "description": "Implement reconciliation/journal.py: ReconciliationJournal with SQLite backend. Tables: watermarks, runs, journal_entries, judge_verdicts. Methods: initialize(), get_watermark(), update_watermark(), start_run(), complete_run(), is_run_active(), get_run(), add_entry(), get_entries(), add_verdict(), get_recent_verdicts(), get_recent_runs(), get_stats(), update_run_stage_reports(). Use aiosqlite with WAL mode, JSON serialization for complex fields",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-7",
+        "type": "test",
+        "description": "Write failing tests for AgentLoop: test_terminal_tool_ends_loop (stage_complete stops execution), test_mutation_is_journaled (mutation tools produce JournalEntry), test_circuit_breaker (exceeding max_mutations raises CircuitBreakerError), test_max_steps_reached (stops with warning after max_steps), test_no_tool_calls_ends_loop (text-only response ends gracefully)",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-8",
+        "type": "impl",
+        "description": "Implement reconciliation/agent_loop.py: AgentLoop with ToolDefinition dataclass (name, description, parameters, function, is_mutation, target_system), Anthropic API provider (_call_llm dispatching to anthropic client), tool dispatch loop with mutation tracking, circuit breaker (CircuitBreakerError), journal entry creation for mutations (before/after state), max_steps enforcement, token/cost tracking",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-9",
+        "type": "test",
+        "description": "Write failing tests for AgentLoop Claude CLI provider: test_claude_cli_provider_first_call (uses --session-id and --system-prompt with tool schemas), test_claude_cli_provider_resume (second call uses --resume), test_claude_cli_response_adapter (parses structured_output into TextBlock/ToolUseBlock), test_claude_cli_response_adapter_no_thinking, test_claude_cli_tool_results_serialization, test_claude_cli_not_installed (FileNotFoundError \u2192 RuntimeError)",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-10",
+        "type": "impl",
+        "description": "Extend AgentLoop with Claude CLI provider: _CLIResponseAdapter (converts structured_output {thinking, tool_calls} to content blocks), _TextBlock/_ToolUseBlock lightweight dataclasses, _call_claude_cli() using asyncio.create_subprocess_exec with --session-id/--resume, --system-prompt with embedded tool schemas, --json-schema for structured output, CLAUDE_CLI_RESPONSE_SCHEMA constant, _serialize_tool_results() for multi-turn context",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-11",
+        "type": "test",
+        "description": "Write failing tests for BaseStage and MemoryConsolidator: test_memory_consolidator_tools (verify correct read + write tools returned), test_memory_consolidator_payload_assembly (verify payload includes events, episodes, mem0 memories, store status, watermark context), test_memory_consolidator_verify_tool (when verifier present, verify_against_codebase tool is included), test_base_stage_run_creates_report (mock agent loop, verify StageReport created with correct fields)",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-12",
+        "type": "impl",
+        "description": "Implement reconciliation/stages/base.py: BaseStage abstract class with stage_id, memory, taskmaster, journal, config, project_id. Methods: get_tools(), get_system_prompt(), assemble_payload() (all abstract), run() that creates AgentLoop, executes with timeout, persists journal entries, returns StageReport. Shared tool builders: _memory_read_tools() (search, get_entity, get_episodes, get_status), _memory_write_tools() (add_memory, delete_memory), _task_read_tools() (get_tasks, get_task), _task_write_tools() (set_task_status, add_task, update_task, add_subtask, remove_task, add_dependency, remove_dependency, attach_memory_hints). Then implement stages/memory_consolidator.py: MemoryConsolidator extending BaseStage with Stage 1 system prompt, read+write memory tools + verify_against_codebase, payload assembling events/episodes/memories/status/watermark",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-13",
+        "type": "test",
+        "description": "Write failing tests for TaskKnowledgeSync and IntegrityCheck stages: test_task_knowledge_sync_tools (includes memory read/write + task read/write + verify), test_task_knowledge_sync_payload (includes stage1 report, flagged items, active/done task tree), test_integrity_check_tools (read-only: memory read + task read + verify, NO write tools), test_integrity_check_payload (includes stage1+stage2 reports, combined flagged items)",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-14",
+        "type": "impl",
+        "description": "Implement stages/task_knowledge_sync.py: TaskKnowledgeSync (Stage 2) with all memory + task tools + verify, payload assembling stage1 report, flagged items, task tree (active/done). IntegrityCheck (Stage 3) in same file with read-only memory + task tools + verify, payload assembling stage1+stage2 reports and combined flagged items. Create stages/integrity_check.py re-exporting IntegrityCheck. Add helper formatters: _format_report(), _format_flagged(), _format_tasks()",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-15",
+        "type": "test",
+        "description": "Write failing tests for CodebaseVerifier: test_verify_tool_set (verify read_file, glob_search, grep_search, git_log, git_show, verification_complete tools created), test_read_file_sandboxing (path outside codebase root returns error), test_verify_returns_verification_result (mock AgentLoop, verify VerificationResult with verdict/confidence/evidence/summary)",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-16",
+        "type": "impl",
+        "description": "Implement reconciliation/verify.py: CodebaseVerifier with codebase_root and config. verify() method builds explore agent tools (read_file with path sandboxing, glob_search, grep_search via subprocess, git_log, git_show), verification_complete terminal tool, EXPLORE_AGENT_SYSTEM_PROMPT. Spawns AgentLoop and returns VerificationResult",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-17",
+        "type": "test",
+        "description": "Write failing tests for Judge: test_review_run_produces_verdict (mock LLM, verify JudgeVerdict created and persisted), test_judge_parse_verdict_json (parse JSON response into verdict), test_judge_parse_verdict_markdown (parse ```json wrapped response), test_judge_parse_failure_returns_minor (unparseable response returns minor severity), test_judge_halts_on_serious (serious verdict halts project when configured), test_judge_error_trend_detection (5+ non-ok verdicts in 10 triggers halt), test_judge_skips_halted_project",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-18",
+        "type": "impl",
+        "description": "Implement reconciliation/judge.py: Judge class with config, journal, _halted_projects set. review_run() loads run+entries+recent verdicts, builds review prompt, calls LLM, parses verdict, persists. _build_review_prompt() formatting. _call_llm() with Claude CLI and Anthropic/OpenAI providers. _parse_verdict() extracting JSON from markdown. Severity escalation: moderate\u2192rollback, serious\u2192halt. _check_error_trends() detecting rising error rates. is_halted()/unhalt() methods",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-19",
+        "type": "test",
+        "description": "Write failing tests for TargetedReconciler: test_on_task_done_fast_path_write (immediate completion fact written), test_on_task_done_sparse_knowledge (verifies and writes when knowledge sparse), test_on_task_done_rich_knowledge (skips verification when 3+ results), test_on_task_done_checks_dependents (finds unblocked dependents), test_on_task_blocked_attaches_hints (memory search \u2192 hints attached to task), test_on_task_cancelled_checks_subtasks (flags active subtasks for review), test_on_task_deferred_same_as_blocked, test_reconcile_task_failure_handling (exception caught gracefully)",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-20",
+        "type": "impl",
+        "description": "Implement reconciliation/targeted.py: TargetedReconciler with memory_service, taskmaster, journal, config, verifier. reconcile_task() dispatcher routing to handlers by transition. _on_task_done(): fast-path write, search for existing knowledge, verify if sparse, check dependents. _on_task_blocked()/_on_task_deferred(): search related memories, attach hints via taskmaster.update_task. _on_task_cancelled(): check active subtasks, flag for review. Error handling wrapping all handlers",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-21",
+        "type": "test",
+        "description": "Write failing tests for ReconciliationHarness: test_event_buffer_trigger_starts_pipeline (push events, verify trigger conditions), test_drain_clears_buffer (drain atomically clears), test_active_run_prevents_trigger, test_journal_run_lifecycle (start, complete, query). Also test_harness_full_cycle_with_mocked_stages (verify 3 stages called in order, reports collected, watermark updated)",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-22",
+        "type": "impl",
+        "description": "Implement reconciliation/harness.py: ReconciliationHarness with memory_service, taskmaster, journal, event_buffer, config. Builds stages (MemoryConsolidator, TaskKnowledgeSync, IntegrityCheck) with verifier. run_loop() background loop checking trigger every 5s with heartbeat. run_full_cycle() drains events, starts run, executes stages sequentially, updates watermark, async judge review. Error handling for CircuitBreakerError and general exceptions. _heartbeat_loop() keeping locks alive",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-23",
+        "type": "test",
+        "description": "Write failing tests for TaskInterceptor: test_status_transition_emits_event (updating task status pushes ReconciliationEvent to buffer), test_bulk_operation_emits_event (parse_prd/expand_task emit events), test_done_transition_spawns_targeted (done transition triggers targeted reconciliation), test_non_trigger_status_no_targeted (pending\u2192in-progress doesn't trigger targeted)",
+        "status": "pending",
+        "commit": null
+      },
+      {
+        "id": "step-24",
+        "type": "impl",
+        "description": "Implement middleware/task_interceptor.py: TaskInterceptor wrapping TaskmasterBackend. STATUS_TRIGGERS = {'done', 'blocked', 'cancelled', 'deferred'}, BULK_TRIGGERS = {'parse_prd', 'expand_task'}. Intercepts set_task_status() to emit ReconciliationEvent, spawns targeted reconciliation for status triggers. Intercepts bulk operations to emit events. Fire-and-forget async task pattern for targeted reconciliation",
+        "status": "pending",
+        "commit": null
+      }
+    ],
+    "design_decisions": [
+      {
+        "decision": "SQLite-backed event buffer instead of in-memory per-instance",
+        "rationale": "Multiple stdio MCP processes need cross-instance visibility for event accumulation and lock coordination. SQLite with WAL mode supports concurrent reads and single-writer semantics needed for buffer operations"
+      },
+      {
+        "decision": "Three-tier trigger model: hard size, hard staleness, conditional quiescence",
+        "rationale": "Size threshold catches burst periods, staleness timer ensures eventual reconciliation during quiet periods, and quiescence detection enables early runs when the system is idle (no agent bursting + empty queue)"
+      },
+      {
+        "decision": "Claude CLI via subprocess for reconciliation agents instead of direct API",
+        "rationale": "Uses Max subscription OAuth which avoids ANTHROPIC_API_KEY costs. --session-id on first call and --resume on subsequent calls enables multi-turn tool dispatch within a single agent loop"
+      },
+      {
+        "decision": "Stage 3 (IntegrityCheck) is read-only with findings feeding next cycle",
+        "rationale": "Separating verification from mutation ensures a clean audit boundary. Stage 3 findings become input to the next cycle's Stage 1 and Stage 2, preventing cascading changes in a single run"
+      },
+      {
+        "decision": "Memory hints on tasks (entity refs + queries) rather than inline content duplication",
+        "rationale": "Inline content goes stale immediately. References to entities and semantic queries are resolved at task execution time, always returning current knowledge state"
+      },
+      {
+        "decision": "Bottom-up TDD build order: models \u2192 buffer \u2192 journal \u2192 agent_loop \u2192 stages \u2192 verifier \u2192 judge \u2192 targeted \u2192 harness",
+        "rationale": "Each layer depends on the layers below it. Building bottom-up ensures each component can be fully tested in isolation before integration. The harness comes last as it orchestrates all other components"
+      },
+      {
+        "decision": "Circuit breaker per stage with max_mutations_per_stage limit",
+        "rationale": "Prevents runaway LLM agents from making unbounded mutations. When exceeded, raises CircuitBreakerError which the harness catches and records in the run's stage_reports"
+      },
+      {
+        "decision": "Targeted reconciliation runs synchronously within task state transitions",
+        "rationale": "When a task completes, knowledge capture should happen immediately (fast-path write) before the agent moves on. The lightweight targeted handler ensures key facts are captured without waiting for the next full cycle"
+      }
+    ],
+    "reuse": [
+      {
+        "what": "MemoryService (search, add_memory, delete_memory, get_episodes, get_entity, get_status)",
+        "where": "fused-memory/src/fused_memory/services/memory_service.py",
+        "how": "Stage tool builders wrap MemoryService methods as ToolDefinition instances for the agent loop. All memory read/write operations flow through the existing service layer"
+      },
+      {
+        "what": "Pydantic models pattern and Field conventions",
+        "where": "fused-memory/src/fused_memory/models/memory.py",
+        "how": "Follow the same pattern of BaseModel with Field(default_factory=...) for collections, Field(ge=..., le=...) for bounded values, and str Enum subclasses"
+      },
+      {
+        "what": "Config schema pattern with pydantic-settings",
+        "where": "fused-memory/src/fused_memory/config/schema.py",
+        "how": "Add ReconciliationConfig as a nested BaseModel within FusedMemoryConfig, following the same pattern as QueueConfig, RoutingConfig etc."
+      },
+      {
+        "what": "Scope model for project/agent/session scoping",
+        "where": "fused-memory/src/fused_memory/models/scope.py",
+        "how": "Used in stage tool builders to scope memory operations to the correct project"
+      },
+      {
+        "what": "MemoryResult model for search results",
+        "where": "fused-memory/src/fused_memory/models/memory.py",
+        "how": "TargetedReconciler uses MemoryResult to check knowledge richness (count results from search)"
+      },
+      {
+        "what": "Test fixture patterns (AsyncMock, pytest_asyncio.fixture, tmp_path)",
+        "where": "fused-memory/tests/conftest.py, fused-memory/tests/test_memory_service.py",
+        "how": "Follow existing async test patterns: @pytest.mark.asyncio, @pytest_asyncio.fixture for async fixtures, AsyncMock for service mocking, tmp_path for SQLite test databases"
+      },
+      {
+        "what": "GraphitiBackend subprocess pattern",
+        "where": "fused-memory/src/fused_memory/backends/graphiti_client.py",
+        "how": "TaskmasterBackend follows similar async initialization and method patterns but wraps CLI subprocess calls instead of a library client"
+      },
+      {
+        "what": "QueueService idle detection",
+        "where": "fused-memory/src/fused_memory/services/queue_service.py",
+        "how": "EventBuffer's quiescence check can query queue stats to determine if the durable queue has pending/in-flight items"
+      }
+    ]
+  }
+}
