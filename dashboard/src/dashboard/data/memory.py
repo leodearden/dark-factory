@@ -56,7 +56,10 @@ async def mcp_tool_call(
     if not text:
         return {}
 
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return {}
 
 
 async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) -> dict:

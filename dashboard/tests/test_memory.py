@@ -52,9 +52,7 @@ class TestMcpToolCall:
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             with pytest.raises(httpx.TimeoutException):
-                await mcp_tool_call(
-                    client, 'http://localhost:8000', 'get_status', {}
-                )
+                await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
 
     async def test_non_200_raises_value_error(self):
         """Non-200 HTTP status raises ValueError."""
@@ -66,9 +64,7 @@ class TestMcpToolCall:
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             with pytest.raises(ValueError, match='non-200'):
-                await mcp_tool_call(
-                    client, 'http://localhost:8000', 'get_status', {}
-                )
+                await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
 
 
 # --- Helpers for higher-level function tests ---
@@ -193,9 +189,7 @@ class TestMalformedResponse:
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            result = await mcp_tool_call(
-                client, 'http://localhost:8000', 'get_status', {}
-            )
+            result = await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
 
         assert result == {}
 
@@ -215,9 +209,7 @@ class TestMalformedResponse:
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            result = await mcp_tool_call(
-                client, 'http://localhost:8000', 'get_status', {}
-            )
+            result = await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
 
         assert result == {}
 
@@ -235,8 +227,6 @@ class TestMalformedResponse:
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            result = await mcp_tool_call(
-                client, 'http://localhost:8000', 'get_status', {}
-            )
+            result = await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
 
         assert result == {}
