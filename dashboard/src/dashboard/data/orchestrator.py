@@ -211,21 +211,6 @@ def read_task_artifacts(worktree_path: Path) -> dict:
     }
 
 
-def _extract_task_id(dirname: str) -> str | None:
-    """Normalize a worktree directory name to a numeric task ID string.
-
-    Handles two naming conventions:
-    - Plain numeric: '7' → '7'
-    - Prefixed: 'task-7' → '7'
-
-    Returns None for non-task directories ('tmp-backup', 'task-abc', 'task-', '').
-    """
-    if dirname.startswith('task-'):
-        suffix = dirname[len('task-'):]
-        return suffix if suffix.isdigit() else None
-    return dirname if dirname.isdigit() else None
-
-
 def discover_orchestrators(config: DashboardConfig) -> list[dict]:
     """Discover running orchestrators and enrich with task tree and worktree data.
 
