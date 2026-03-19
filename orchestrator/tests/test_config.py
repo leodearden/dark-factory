@@ -154,3 +154,11 @@ class TestModuleConfigDiscovery:
         assert 'backend' in config._module_configs
         assert config._module_configs['backend'].test_command == 'cargo test'
         assert config._module_configs['backend'].max_per_module == 2
+
+
+class TestPathResolution:
+    def test_fused_memory_paths_resolve_under_project_root(self, tmp_path: Path):
+        config = OrchestratorConfig(project_root=tmp_path)
+        resolved = (config.project_root / config.fused_memory.config_path).resolve()
+        assert str(resolved).startswith(str(tmp_path))
+        assert '..' not in resolved.parts
