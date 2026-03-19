@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import runpy
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
@@ -255,5 +256,18 @@ class TestMainModule:
                 'dashboard.app:app',
                 host='127.0.0.1',
                 port=8080,
+                reload=True,
+            )
+
+    def test_main_respects_env_var_overrides(self):
+        with (
+            patch.dict(os.environ, {'DASHBOARD_HOST': '0.0.0.0', 'DASHBOARD_PORT': '9090'}),
+            patch('uvicorn.run') as mock_run,
+        ):
+            runpy.run_module('dashboard', run_name='__main__')
+            mock_run.assert_called_once_with(
+                'dashboard.app:app',
+                host='0.0.0.0',
+                port=9090,
                 reload=True,
             )
