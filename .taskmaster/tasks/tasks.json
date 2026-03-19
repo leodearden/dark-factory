@@ -107,13 +107,13 @@
         "description": "Create data/orchestrator.py \u2014 process scanning, task tree parsing, and worktree artifact reading for orchestrator status.",
         "details": "Create `dashboard/src/dashboard/data/orchestrator.py` with:\n\n1. `def find_running_orchestrators() -> list[dict]` \u2014 run `subprocess.run([\"ps\", \"aux\"], capture_output=True, text=True)`. For each line containing \"orchestrator\" and \"--prd\", extract PID (field 1), start time (fields 8-9), and PRD path (regex `--prd\\s+(\\S+)`). Return list of `{\"pid\": int, \"prd\": str, \"running\": True, \"started\": str}`. Filter out the grep/ps process itself.\n\n2. `def load_task_tree(tasks_json_path: Path) -> list[dict]` \u2014 read and parse `.taskmaster/tasks/tasks.json`. Extract `data[\"master\"][\"tasks\"]` (or `data[\"tasks\"]` \u2014 handle both formats). Return list of task dicts with keys: id, title, status, priority, dependencies, and metadata (if present, includes modules). Handle FileNotFoundError \u2192 return []. Handle malformed JSON \u2192 log warning, return [].\n\n3. `def read_task_artifacts(worktree_path: Path) -> dict` \u2014 Read orchestrator artifacts from a worktree's `.task/` directory:\n   - `.task/metadata.json`: parse for task_id, title, base_commit, created_at\n   - `.task/plan.json`: parse steps array, count done vs total \u2192 derive phase (PLAN if no plan, EXECUTE/VERIFY/REVIEW/MERGE based on step progress, DONE if all done)\n   - `.task/iterations.jsonl`: count lines (don't parse each line)\n   - `.task/reviews/*.json`: glob, parse each, count PASS vs ISSUES_FOUND \u2192 return summary like \"3/5 PASS\"\n   All wrapped in try/except, return None/0/\"\u2014\" for missing files.\n   Returns: `{\"metadata\": dict|None, \"phase\": str, \"plan_progress\": {\"done\": int, \"total\": int}, \"iteration_count\": int, \"review_summary\": str}`.\n\n4. `def discover_orchestrators(config: DashboardConfig) -> list[dict]` \u2014 combine process scan + worktree scan:\n   - Get running orchestrators from find_running_orchestrators()\n   - Get task tree from load_task_tree(config.tasks_json)\n   - Scan config.worktrees_dir for subdirectories, read artifacts from each\n   - For each running orchestrator: attach the task tree and per-task artifacts\n   - Compute summary stats: total, done, in_progress, blocked, pending counts\n   - Return list of orchestrator dicts with all combined data\n\nCreate `dashboard/tests/test_orchestrator.py`:\n- Test find_running_orchestrators: mock subprocess.run to return canned ps output with orchestrator lines. Verify PID and PRD extraction.\n- Test load_task_tree: create a temp tasks.json with sample data. Verify parsing. Test missing file. Test malformed JSON.\n- Test read_task_artifacts: create temp dir with .task/ subdirectory containing sample metadata.json, plan.json (with mix of done/pending steps), iterations.jsonl (3 lines), reviews/reviewer-1.json (PASS), reviews/reviewer-2.json (ISSUES_FOUND). Verify all fields parsed correctly.\n- Test discover_orchestrators: mock process scan, create temp worktrees dir with one worktree containing artifacts. Verify combined output.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [
           "16"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-19T06:58:53.936Z"
+        "updatedAt": "2026-03-19T07:44:10.200Z"
       },
       {
         "id": "20",
@@ -127,7 +127,7 @@
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-18T06:56:24.426Z"
+        "updatedAt": "2026-03-19T07:46:43.370Z"
       },
       {
         "id": "21",
@@ -135,13 +135,13 @@
         "description": "Create the reconciliation panel HTML partial template and its FastAPI route, wiring data from the reconciliation data module.",
         "details": "Create `dashboard/src/dashboard/templates/partials/recon.html`:\n\nTwo-column grid layout (grid grid-cols-2 gap-6). Dark themed cards (bg-gray-800 rounded-lg p-6).\n\n**Left column \u2014 Current State:**\n\n- **Event Buffer** section: Show \"N events buffered\". If oldest_event_age_seconds is not None, show \"oldest: Xm Xs ago\". Use yellow text if age > 300s.\n\n- **Burst State** table: columns agent_id, state. State \"bursting\" in orange badge, \"idle\" in gray badge. Show \"No agents\" if empty.\n\n- **Watermarks** section: Show each timestamp as relative time (implement a Jinja2 filter `timeago` that converts ISO 8601 to \"Xm ago\" / \"Xh ago\" / \"Xd ago\" relative to now). Fields: Last full run, Last episode, Last memory, Last task change. Use text-gray-400 for labels, text-white for values.\n\n- **Latest Verdict**: Severity badge \u2014 bg-green-600 for \"ok\", bg-yellow-600 for \"minor\", bg-orange-600 for \"moderate\", bg-red-600 for \"serious\". Show action_taken next to it. Show \"No verdicts yet\" if None.\n\n**Right column \u2014 Recent Runs (last 5):**\n\nTable with columns: Trigger, Type, Status, Events, Duration, When.\n- Status badges: bg-green-600=completed, bg-blue-600=running, bg-red-600=failed, bg-orange-600=rolled_back, bg-purple-600=circuit_breaker.\n- Duration: show in seconds or \"\u2014\" if still running.\n- When: relative time (timeago filter).\n- Show \"No reconciliation runs yet\" if empty.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/recon` async route: call all 5 reconciliation query functions (get_recent_runs, get_watermarks, get_buffer_stats, get_burst_state, get_latest_verdict) with config.reconciliation_db and render the partial.\n- Register the `timeago` Jinja2 filter on the templates environment.\n\nThe `timeago` filter: accept an ISO 8601 string, parse with datetime.fromisoformat, compute delta from now (UTC), return human string like \"3m ago\", \"2h ago\", \"1d ago\". Handle None \u2192 return \"never\".\n\nTest strategy: verify route returns 200. Test with mock reconciliation data. Check HTML contains expected badges and table structure.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [
           "18"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-18T06:56:24.427Z"
+        "updatedAt": "2026-03-19T07:35:39.236Z"
       },
       {
         "id": "22",
@@ -254,9 +254,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-19T06:58:53.936Z",
+      "lastModified": "2026-03-19T07:46:43.370Z",
       "taskCount": 17,
-      "completedCount": 7,
+      "completedCount": 9,
       "tags": [
         "master"
       ]
