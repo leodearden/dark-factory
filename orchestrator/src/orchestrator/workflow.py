@@ -523,6 +523,8 @@ class TaskWorkflow:
 
     async def _replan(self, reviews) -> None:
         """Feed review feedback back to architect for re-planning."""
+        assert self.artifacts is not None, '_replan called before artifacts initialized'
+        assert self.worktree is not None, '_replan called before worktree initialized'
         feedback = reviews.format_for_replan()
         self.plan = self.artifacts.read_plan()
 
@@ -546,6 +548,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
     async def _merge(self, branch_name: str) -> WorkflowOutcome:
         """Merge task branch into main."""
+        assert self.worktree is not None, '_merge called before worktree initialized'
         merge_result = await self.git_ops.merge_to_main(self.worktree, branch_name)
 
         if merge_result.success:
@@ -723,6 +726,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             await self._escalation_event.wait()
 
         # Collect resolutions
+        if self.escalation_queue is None:
+            return ''
         resolved = [
             e for e in self.escalation_queue.get_by_task(self.task_id)
             if e.status == 'resolved' and e.resolution
