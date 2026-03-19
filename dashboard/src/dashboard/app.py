@@ -54,7 +54,7 @@ templates.env.filters['timeago'] = timeago
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage httpx.AsyncClient lifecycle."""
-    app.state.http_client = httpx.AsyncClient()
+    app.state.http_client = httpx.AsyncClient(follow_redirects=True)
     app.state.config = DashboardConfig.from_env()
     yield
     await app.state.http_client.aclose()
