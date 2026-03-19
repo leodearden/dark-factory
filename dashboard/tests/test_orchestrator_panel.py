@@ -7,7 +7,7 @@ from unittest.mock import patch
 # --- Mock data for route tests ---
 
 MOCK_ORCHESTRATOR_RUNNING = {
-    'pid': 1234,
+    'pids': [1234],
     'prd': '/home/leo/src/dark-factory/prd/dashboard.md',
     'running': True,
     'started': 'Mar18',
@@ -138,6 +138,11 @@ class TestOrchestratorRouteBasics:
             html = client.get('/partials/orchestrators').text
         assert 'Show tasks' in html
 
+    def test_card_shows_single_pid_label(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'PID 1234' in html
+
 
 class TestOrchestratorRouteEmpty:
     """Tests for GET /partials/orchestrators with no orchestrators."""
@@ -226,7 +231,7 @@ class TestTaskTable:
 
 
 MOCK_ORCHESTRATOR_COMPLETED = {
-    'pid': 5678,
+    'pids': [5678],
     'prd': '/other/memory.md',
     'running': False,
     'started': 'Mar17',
@@ -297,3 +302,38 @@ class TestOrchestratorBadgeAriaLabels:
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
         assert 'aria-label="Task progress' in html
+
+
+MOCK_ORCHESTRATOR_MULTI_PID = {
+    'pids': [1234, 5678],
+    'prd': '/home/leo/src/dark-factory/prd/dashboard.md',
+    'running': True,
+    'started': 'Mar18',
+    'tasks': [],
+    'worktrees': {},
+    'summary': {
+        'total': 0,
+        'done': 0,
+        'in_progress': 0,
+        'blocked': 0,
+        'pending': 0,
+    },
+}
+
+
+class TestOrchestratorMultiPid:
+    """Tests for orchestrator cards with multiple PIDs sharing a single PRD."""
+
+    def test_card_shows_multi_pid_label(self, client):
+        """Multi-PID entry renders 'PIDs' (plural) with both PIDs present."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_MULTI_PID]):
+            html = client.get('/partials/orchestrators').text
+        assert 'PIDs' in html
+        assert '1234' in html
+        assert '5678' in html
+
+    def test_count_badge_shows_one_for_grouped(self, client):
+        """Count badge shows '1' for a single grouped entry with multiple PIDs."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_MULTI_PID]):
+            html = client.get('/partials/orchestrators').text
+        assert '>1<' in html
