@@ -65,6 +65,17 @@ class TestYamlLoading:
             for r in caplog.records
         )
 
+    def test_load_config_discovers_orchestrator_subdir(self, tmp_path: Path, monkeypatch):
+        # Create orchestrator/config.yaml under tmp_path
+        orch_dir = tmp_path / 'orchestrator'
+        orch_dir.mkdir()
+        (orch_dir / 'config.yaml').write_text(yaml.dump({'max_concurrent_tasks': 7}))
+        # Change cwd to tmp_path and clear ORCH_CONFIG_PATH
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = load_config(None)
+        assert config.max_concurrent_tasks == 7
+
     def test_load_from_yaml(self, tmp_path: Path):
         config_data = {
             'max_concurrent_tasks': 5,
