@@ -206,6 +206,45 @@ class TestLoadTaskTree:
         expected_keys = {'id', 'title', 'status', 'priority', 'dependencies', 'metadata'}
         assert set(result[0].keys()) == expected_keys
 
+    def test_null_tasks_in_master_format(self, tmp_path):
+        """tasks.json with {'master': {'tasks': null}} returns empty list, not TypeError."""
+        import json
+
+        from dashboard.data.orchestrator import load_task_tree
+
+        tasks_json = tmp_path / 'tasks.json'
+        tasks_json.write_text(json.dumps({'master': {'tasks': None}}))
+
+        result = load_task_tree(tasks_json)
+
+        assert result == []
+
+    def test_null_tasks_in_flat_format(self, tmp_path):
+        """tasks.json with {'tasks': null} returns empty list, not TypeError."""
+        import json
+
+        from dashboard.data.orchestrator import load_task_tree
+
+        tasks_json = tmp_path / 'tasks.json'
+        tasks_json.write_text(json.dumps({'tasks': None}))
+
+        result = load_task_tree(tasks_json)
+
+        assert result == []
+
+    def test_tasks_not_a_list(self, tmp_path):
+        """tasks.json with {'tasks': 'oops'} (string instead of list) returns empty list."""
+        import json
+
+        from dashboard.data.orchestrator import load_task_tree
+
+        tasks_json = tmp_path / 'tasks.json'
+        tasks_json.write_text(json.dumps({'tasks': 'oops'}))
+
+        result = load_task_tree(tasks_json)
+
+        assert result == []
+
 
 class TestReadTaskArtifacts:
     """Tests for read_task_artifacts — reads .task/ directory in a worktree."""
