@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import runpy
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
@@ -242,3 +243,17 @@ class TestOrchestratorsPartialIntegration:
             assert resp.status_code == 200
             html = resp.text
             assert 'No orchestrators detected' in html
+
+
+class TestMainModule:
+    """Tests for python -m dashboard entry point."""
+
+    def test_main_calls_uvicorn_run(self):
+        with patch('uvicorn.run') as mock_run:
+            runpy.run_module('dashboard', run_name='__main__')
+            mock_run.assert_called_once_with(
+                'dashboard.app:app',
+                host='127.0.0.1',
+                port=8080,
+                reload=True,
+            )
