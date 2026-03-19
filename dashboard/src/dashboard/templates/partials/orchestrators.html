@@ -1,1 +1,14 @@
-<div>Orchestrators</div>
+<div>
+  <div class="flex items-center gap-3 mb-6">
+    <h2 class="text-xl font-bold text-gray-100">Orchestrators</h2>
+    <span class="inline-block bg-blue-600 rounded-full px-2 text-sm text-white">{{ orchestrators|length }}</span>
+  </div>
+
+  {% if orchestrators %}
+    {% for orch in orchestrators %}
+      <div>{{ orch.pid }}</div>
+    {% endfor %}
+  {% else %}
+    <p class="text-gray-400 text-center py-12">No orchestrators detected</p>
+  {% endif %}
+</div>
