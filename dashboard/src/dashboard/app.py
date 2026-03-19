@@ -14,6 +14,7 @@ from fastapi.templating import Jinja2Templates
 
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
+from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.reconciliation import (
     get_buffer_stats,
     get_burst_state,
@@ -103,4 +104,14 @@ async def partials_recon(request: Request):
             'verdict': verdict,
             'runs': runs,
         },
+    )
+
+
+@app.get('/partials/orchestrators')
+async def partials_orchestrators(request: Request):
+    """Render the orchestrators panel partial (htmx fragment)."""
+    config = request.app.state.config
+    orchestrators = await asyncio.to_thread(discover_orchestrators, config)
+    return templates.TemplateResponse(
+        request, 'partials/orchestrators.html', context={'orchestrators': orchestrators}
     )
