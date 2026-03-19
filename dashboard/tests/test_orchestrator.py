@@ -506,7 +506,7 @@ class TestDiscoverOrchestrators:
 
         assert len(result) == 1
         entry = result[0]
-        assert entry['pid'] == 1234
+        assert 1234 in entry['pids']
         assert entry['prd'] == '/home/leo/prd.md'
         assert entry['running'] is True
         assert len(entry['tasks']) == 5

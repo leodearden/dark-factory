@@ -246,10 +246,19 @@ def discover_orchestrators(config: DashboardConfig) -> list[dict]:
         'pending': sum(1 for t in tasks if t.get('status') == 'pending'),
     }
 
-    result: list[dict] = []
+    # Group processes by PRD path — multiple PIDs targeting the same PRD
+    # are merged into a single entry with a 'pids' list.
+    groups: dict[str, list[dict]] = {}
     for proc in processes:
+        groups.setdefault(proc['prd'], []).append(proc)
+
+    result: list[dict] = []
+    for prd, group in groups.items():
         result.append({
-            **proc,
+            'pids': [p['pid'] for p in group],
+            'prd': prd,
+            'running': any(p['running'] for p in group),
+            'started': group[0]['started'],
             'tasks': tasks,
             'worktrees': worktrees,
             'summary': summary,
