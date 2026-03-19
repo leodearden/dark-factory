@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
 from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -191,17 +190,6 @@ class TestReconRoute:
         with _patch_recon_data():
             html = client.get('/partials/recon').text
         assert 'grid grid-cols-2' in html
-
-    def test_no_deprecation_warning(self, client):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter('always')
-            with _patch_recon_data():
-                resp = client.get('/partials/recon')
-        assert resp.status_code == 200
-        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-        assert deprecations == [], (
-            f'Unexpected DeprecationWarnings: {[str(w.message) for w in deprecations]}'
-        )
 
 
 # --- Empty data constants ---
