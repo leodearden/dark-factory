@@ -55,7 +55,8 @@ async def mcp_tool_call(
     if not content:
         return {}
 
-    text = content[0].get('text', '')
+    first = content[0]
+    text = first.get('text', '') if isinstance(first, dict) else ''
     if not text:
         return {}
 
