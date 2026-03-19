@@ -4,7 +4,7 @@
 # Concurrency
 max_concurrent_tasks: 3
 max_per_module: 1
-lock_depth: 2
+lock_depth: 4
 module_overrides:
   tests: 2
 
