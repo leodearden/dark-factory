@@ -125,3 +125,56 @@ class TestGetMemoryStatus:
 
         assert result['offline'] is True
         assert 'error' in result
+
+
+_QUEUE_STATS_PAYLOAD = {
+    'counts': {'pending': 3, 'in_flight': 1, 'retry': 0, 'completed': 10, 'dead': 0},
+    'oldest_pending_age_seconds': 5.5,
+}
+
+
+class TestGetQueueStats:
+    """Tests for get_queue_stats."""
+
+    async def test_successful_stats(self, dashboard_config):
+        """Returns the parsed queue stats dict from a successful MCP response."""
+        from dashboard.data.memory import get_queue_stats
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _make_mcp_response(_QUEUE_STATS_PAYLOAD)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await get_queue_stats(client, dashboard_config)
+
+        assert result == _QUEUE_STATS_PAYLOAD
+        assert result['counts']['pending'] == 3
+        assert result['oldest_pending_age_seconds'] == 5.5
+
+    async def test_connect_error_returns_offline(self, dashboard_config):
+        """ConnectError returns {offline: True, error: ...}."""
+        from dashboard.data.memory import get_queue_stats
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError('connection refused')
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await get_queue_stats(client, dashboard_config)
+
+        assert result['offline'] is True
+        assert 'error' in result
+
+    async def test_timeout_returns_offline(self, dashboard_config):
+        """TimeoutException returns {offline: True, error: ...}."""
+        from dashboard.data.memory import get_queue_stats
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.TimeoutException('timed out')
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await get_queue_stats(client, dashboard_config)
+
+        assert result['offline'] is True
+        assert 'error' in result
