@@ -461,3 +461,81 @@ class TestDiscoverOrchestrators:
         assert result[0]['tasks'] == []
         assert result[0]['worktrees'] == {}
         assert result[0]['summary'] == {'total': 0, 'done': 0, 'in_progress': 0, 'blocked': 0, 'pending': 0}
+
+    def test_worktree_keyed_by_metadata_task_id(self, tmp_path):
+        """Worktree dict uses metadata.task_id as key, not the directory name."""
+        import json
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        # Create worktree directory named 'task-7' (different from task ID '7')
+        wt_dir = tmp_path / '.worktrees' / 'task-7'
+        wt_dir.mkdir(parents=True)
+        task_dir = wt_dir / '.task'
+        task_dir.mkdir()
+        (task_dir / 'metadata.json').write_text(json.dumps({'task_id': '7', 'title': 'Widget'}))
+
+        mock_procs = [{'pid': 1234, 'prd': '/prd.md', 'running': True, 'started': 'Mar18'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        worktrees = result[0]['worktrees']
+        # Key should be '7' from metadata.task_id, NOT 'task-7' from directory name
+        assert '7' in worktrees, f"Expected key '7' from metadata.task_id, got keys: {list(worktrees.keys())}"
+        assert 'task-7' not in worktrees
+
+    def test_worktree_falls_back_to_dir_name_without_metadata(self, tmp_path):
+        """Worktree dict uses directory name as key when no .task/ metadata is present."""
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        # Create worktree directory named '9' with no .task/ subdirectory
+        wt_dir = tmp_path / '.worktrees' / '9'
+        wt_dir.mkdir(parents=True)
+        # No .task/ directory — metadata will be None
+
+        mock_procs = [{'pid': 9999, 'prd': '/prd.md', 'running': True, 'started': 'Mar18'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        worktrees = result[0]['worktrees']
+        # Key should fall back to '9' (directory name) since no metadata.json exists
+        assert '9' in worktrees, f"Expected fallback key '9' from dir name, got keys: {list(worktrees.keys())}"
+        assert worktrees['9']['metadata'] is None
+
+    def test_worktree_non_dict_metadata_falls_back_to_dir_name(self, tmp_path):
+        """Non-dict JSON metadata (e.g. array) must not crash discover_orchestrators."""
+        import json
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        # Create worktree directory named '11' with metadata.json containing a JSON array
+        wt_dir = tmp_path / '.worktrees' / '11'
+        wt_dir.mkdir(parents=True)
+        task_dir = wt_dir / '.task'
+        task_dir.mkdir()
+        (task_dir / 'metadata.json').write_text(json.dumps([1, 2, 3]))
+
+        mock_procs = [{'pid': 1111, 'prd': '/prd.md', 'running': True, 'started': 'Mar19'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            # Must NOT raise AttributeError even though metadata is a list, not a dict
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        worktrees = result[0]['worktrees']
+        # Falls back to directory name '11' since non-dict metadata has no task_id
+        assert '11' in worktrees, f"Expected fallback key '11' from dir name, got keys: {list(worktrees.keys())}"
