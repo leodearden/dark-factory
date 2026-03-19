@@ -6,10 +6,11 @@
     <title>{% block title %}Dark Factory{% endblock %}</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <script src="https://unpkg.com/idiomorph@0.3.0/dist/idiomorph-ext.min.js"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
     <link rel="stylesheet" href="/static/style.css">
 </head>
-<body class="h-full bg-gray-900 text-gray-100">
+<body class="h-full bg-gray-900 text-gray-100" hx-ext="morph">
     <header class="border-b border-gray-700 px-6 py-4">
         <h1 class="text-xl font-semibold">Dark Factory</h1>
     </header>
