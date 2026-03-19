@@ -203,3 +203,33 @@ async def test_reconciler_receives_both_ids(interceptor, reconciler):
         project_root='/home/leo/src/dark-factory',
         task_before={'id': '1', 'status': 'pending', 'title': 'Test Task'},
     )
+
+
+@pytest.mark.asyncio
+async def test_event_roundtrip_preserves_both_ids(taskmaster, event_buffer):
+    """End-to-end: interceptor -> buffer -> drain preserves both project_id and _project_root."""
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+    project_path = '/home/leo/src/dark-factory'
+
+    # Multiple operations
+    await interceptor.set_task_status('1', 'in-progress', project_path)
+    await interceptor.add_task(project_path, prompt='New task')
+    await interceptor.update_task('1', project_path, prompt='Updated')
+
+    # Buffer queryable by resolved id
+    stats = await event_buffer.get_buffer_stats('dark_factory')
+    assert stats['size'] == 3
+
+    # Drain by resolved id
+    events = await event_buffer.drain('dark_factory')
+    assert len(events) == 3
+
+    for ev in events:
+        # Event project_id is the logical identifier
+        assert ev.project_id == 'dark_factory'
+        # Payload carries the original path
+        assert ev.payload['_project_root'] == project_path
+
+    # Buffer is now empty
+    stats = await event_buffer.get_buffer_stats('dark_factory')
+    assert stats['size'] == 0
