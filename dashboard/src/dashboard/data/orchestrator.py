@@ -105,3 +105,74 @@ def load_task_tree(tasks_json_path: Path) -> list[dict]:
         })
 
     return result
+
+
+def read_task_artifacts(worktree_path: Path) -> dict:
+    """Read .task/ artifacts from a worktree directory.
+
+    Returns a dict with keys:
+    - metadata: parsed metadata.json dict, or None
+    - phase: 'PLAN', 'EXECUTE', or 'DONE'
+    - plan_progress: {'done': int, 'total': int}
+    - iteration_count: number of lines in iterations.jsonl
+    - review_summary: 'N/M passed' or '—' if no reviews
+    """
+    task_dir = worktree_path / '.task'
+
+    # Metadata
+    metadata = None
+    try:
+        metadata = json.loads((task_dir / 'metadata.json').read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    # Plan progress and phase
+    done_count = 0
+    total_count = 0
+    try:
+        plan_data = json.loads((task_dir / 'plan.json').read_text())
+        steps = plan_data.get('steps', [])
+        total_count = len(steps)
+        done_count = sum(1 for s in steps if s.get('status') == 'done')
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    if total_count == 0:
+        phase = 'PLAN'
+    elif done_count == total_count:
+        phase = 'DONE'
+    else:
+        phase = 'EXECUTE'
+
+    # Iteration count
+    iteration_count = 0
+    try:
+        with open(task_dir / 'iterations.jsonl') as f:
+            iteration_count = sum(1 for _ in f)
+    except FileNotFoundError:
+        pass
+
+    # Review summary
+    review_summary = '\u2014'
+    reviews_dir = task_dir / 'reviews'
+    if reviews_dir.is_dir():
+        review_files = list(reviews_dir.glob('*.json'))
+        if review_files:
+            total_reviews = len(review_files)
+            passed = 0
+            for review_file in review_files:
+                try:
+                    review = json.loads(review_file.read_text())
+                    if review.get('verdict') == 'PASS':
+                        passed += 1
+                except (json.JSONDecodeError, FileNotFoundError):
+                    pass
+            review_summary = f'{passed}/{total_reviews} passed'
+
+    return {
+        'metadata': metadata,
+        'phase': phase,
+        'plan_progress': {'done': done_count, 'total': total_count},
+        'iteration_count': iteration_count,
+        'review_summary': review_summary,
+    }
