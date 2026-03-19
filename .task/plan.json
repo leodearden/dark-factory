@@ -98,6 +98,20 @@
       "description": "Add conditional text styling to Write Queue card. Dead count: {% if queue.counts.dead|default(0) > 0 %}<span class=\"text-red-400\">{{ queue.counts.dead }} dead</span>{% else %}0 dead{% endif %}. Oldest age: {% if queue.oldest_pending_age_seconds is not none and queue.oldest_pending_age_seconds > 60 %}<div class=\"text-yellow-400 text-xs mt-1\">oldest: {{ (queue.oldest_pending_age_seconds // 60)|int }}m ago</div>{% endif %}.",
       "status": "done",
       "commit": "53ae745"
+    },
+    {
+      "id": "step-13",
+      "type": "test",
+      "description": "Add TestSplitBrainQueueOffline class to test_memory_partial.py for the split-brain scenario where get_memory_status returns online but get_queue_stats independently returns {offline: True, error: 'Connection reset'}. This reproduces the bug where the template enters the online branch (status is not offline) but queue.oldest_pending_age_seconds is Jinja2 Undefined. The bare 'is not none' check passes for Undefined, causing 'Undefined > 60' to raise TypeError and produce a 500 response.\n\nTests:\n- test_status_online_queue_offline_returns_200: Mock get_memory_status returning _ONLINE_STATUS and get_queue_stats returning {'offline': True, 'error': 'Connection reset'}. Assert response status_code == 200 (NOT 500). This test will FAIL on the current template at line 47 due to TypeError.\n- test_status_online_queue_offline_no_oldest_warning: Same mocks. Assert 'oldest:' NOT in HTML (should gracefully skip the oldest age display when queue data is unavailable).\n- test_status_online_queue_offline_shows_cards: Same mocks. Assert 'Graphiti' and 'Mem0' and 'Taskmaster' and 'Write Queue' still appear in HTML (the four cards should still render since status is online).\n- test_status_online_queue_offline_queue_metrics_default: Same mocks. Assert '0 pending' and '0 retry' and '0 dead' in HTML (queue counts should safely fall back to 0 via |default(0) filters).",
+      "status": "done",
+      "commit": "a1d67ee"
+    },
+    {
+      "id": "step-14",
+      "type": "impl",
+      "description": "Fix the oldest_pending_age_seconds condition in memory.html line 47 to handle Jinja2 Undefined safely. Change from:\n  {% if queue.oldest_pending_age_seconds is not none and queue.oldest_pending_age_seconds > 60 %}\nto:\n  {% if queue.oldest_pending_age_seconds is defined and queue.oldest_pending_age_seconds is not none and queue.oldest_pending_age_seconds is number and queue.oldest_pending_age_seconds > 60 %}\n\nThe three-guard chain works as follows:\n1. 'is defined' — returns False for Jinja2 Undefined (split-brain: queue offline dict has no oldest_pending_age_seconds key), short-circuits immediately.\n2. 'is not none' — returns False for Python None (normal case: no pending items so age is None).\n3. 'is number' — returns False for any non-numeric type that somehow got through, providing defense-in-depth. Also returns False for Undefined, providing redundant safety.\n4. '> 60' — only reached when value is a real number.\n\nAll existing tests (steps 1-12) must still pass. The new step-13 tests must now pass.",
+      "status": "done",
+      "commit": "a11b82e"
     }
   ],
   "design_decisions": [
@@ -136,6 +150,10 @@
     {
       "decision": "Use integer floor division for oldest age display",
       "rationale": "Task spec says 'oldest: Xm ago' implying minutes. Floor division (oldest_pending_age_seconds // 60) gives a clean integer minute count appropriate for a dashboard glance metric."
+    },
+    {
+      "decision": "Guard oldest_pending_age_seconds with 'is defined', 'is not none', and 'is number' triple-check",
+      "rationale": "The two sequential awaits (get_memory_status, get_queue_stats) can return inconsistent results if the server goes down between calls. When status is online but queue returns {offline: True, error: ...}, queue.oldest_pending_age_seconds is Jinja2 Undefined. 'Undefined is not none' is True (Undefined is not Python None), so the bare 'is not none' check is insufficient — it lets the comparison 'Undefined > 60' proceed, which raises TypeError since Undefined doesn't implement comparison operators. Adding 'is defined' as the first guard short-circuits for Undefined. Adding 'is number' provides defense-in-depth. The |default(0) filters on queue.counts.* already safely handle this case (chained Undefined access returns Undefined, and |default catches it), but the oldest_pending_age_seconds condition used a different pattern that was vulnerable."
     }
   ],
   "reuse": [
@@ -173,6 +191,11 @@
       "what": "Dark theme Tailwind classes from base.html",
       "where": "dashboard/src/dashboard/templates/base.html",
       "how": "Follow same palette: bg-gray-800 for cards, text-gray-100/400/500 for text hierarchy, border-gray-700 for borders."
+    },
+    {
+      "what": "Existing _ONLINE_STATUS and _ONLINE_QUEUE mock data constants in test_memory_partial.py",
+      "where": "dashboard/tests/test_memory_partial.py lines 7-15",
+      "how": "Reuse _ONLINE_STATUS in step-13 split-brain tests (status online, queue offline). Define a new _SPLIT_BRAIN_QUEUE constant for the offline queue response."
     }
   ]
 }
