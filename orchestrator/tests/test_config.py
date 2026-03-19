@@ -34,8 +34,19 @@ class TestDefaults:
 
     def test_fused_memory_defaults(self):
         config = OrchestratorConfig()
-        assert config.fused_memory.url == 'http://localhost:8000'
+        assert config.fused_memory.url == 'http://localhost:8002'
         assert config.fused_memory.project_id == 'dark_factory'
+        assert config.fused_memory.config_path == 'fused-memory/config/config.yaml'
+        # server_command must contain '--project' followed by 'fused-memory' (no ../)
+        cmd = config.fused_memory.server_command
+        assert '--project' in cmd
+        project_arg_idx = cmd.index('--project')
+        assert cmd[project_arg_idx + 1] == 'fused-memory'
+
+    def test_fused_memory_defaults_no_parent_traversal(self):
+        config = OrchestratorConfig()
+        assert '../' not in config.fused_memory.config_path
+        assert not any('../' in arg for arg in config.fused_memory.server_command)
 
 
 class TestYamlLoading:
