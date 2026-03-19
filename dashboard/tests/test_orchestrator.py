@@ -79,3 +79,87 @@ class TestFindRunningOrchestrators:
             result = find_running_orchestrators()
 
         assert result == []
+
+
+class TestLoadTaskTree:
+    """Tests for load_task_tree — parses tasks.json into a list of task dicts."""
+
+    def test_parses_master_format(self, tmp_path):
+        """tasks.json with {'master': {'tasks': [...]}} is parsed correctly."""
+        import json
+
+        from dashboard.data.orchestrator import load_task_tree
+
+        tasks = [
+            {'id': '1', 'title': 'Setup', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {'assignee': 'leo'}},
+            {'id': '2', 'title': 'Build', 'status': 'in-progress', 'priority': 'medium', 'dependencies': ['1'], 'metadata': {}},
+            {'id': '3', 'title': 'Test', 'status': 'pending', 'priority': 'low', 'dependencies': ['2'], 'metadata': {}},
+        ]
+        tasks_json = tmp_path / 'tasks.json'
+        tasks_json.write_text(json.dumps({'master': {'tasks': tasks}}))
+
+        result = load_task_tree(tasks_json)
+
+        assert len(result) == 3
+        assert result[0]['id'] == '1'
+        assert result[0]['title'] == 'Setup'
+        assert result[0]['status'] == 'done'
+        assert result[0]['priority'] == 'high'
+        assert result[0]['dependencies'] == []
+        assert result[0]['metadata'] == {'assignee': 'leo'}
+
+    def test_parses_flat_format(self, tmp_path):
+        """tasks.json with {'tasks': [...]} (no master wrapper) is parsed correctly."""
+        import json
+
+        from dashboard.data.orchestrator import load_task_tree
+
+        tasks = [
+            {'id': '1', 'title': 'Setup', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+            {'id': '2', 'title': 'Build', 'status': 'pending', 'priority': 'medium', 'dependencies': ['1'], 'metadata': {}},
+        ]
+        tasks_json = tmp_path / 'tasks.json'
+        tasks_json.write_text(json.dumps({'tasks': tasks}))
+
+        result = load_task_tree(tasks_json)
+
+        assert len(result) == 2
+        assert result[0]['status'] == 'done'
+        assert result[1]['dependencies'] == ['1']
+
+    def test_file_not_found(self, tmp_path):
+        """Non-existent path returns empty list."""
+        from dashboard.data.orchestrator import load_task_tree
+
+        result = load_task_tree(tmp_path / 'nonexistent.json')
+
+        assert result == []
+
+    def test_malformed_json(self, tmp_path):
+        """Invalid JSON in file returns empty list."""
+        from dashboard.data.orchestrator import load_task_tree
+
+        bad_file = tmp_path / 'tasks.json'
+        bad_file.write_text('{not valid json!!!')
+
+        result = load_task_tree(bad_file)
+
+        assert result == []
+
+    def test_extracts_expected_keys(self, tmp_path):
+        """Each returned task dict has all expected keys."""
+        import json
+
+        from dashboard.data.orchestrator import load_task_tree
+
+        tasks = [
+            {'id': '1', 'title': 'Task One', 'status': 'pending', 'priority': 'high', 'dependencies': ['2'], 'metadata': {'tag': 'x'}},
+        ]
+        tasks_json = tmp_path / 'tasks.json'
+        tasks_json.write_text(json.dumps({'tasks': tasks}))
+
+        result = load_task_tree(tasks_json)
+
+        assert len(result) == 1
+        expected_keys = {'id', 'title', 'status', 'priority', 'dependencies', 'metadata'}
+        assert set(result[0].keys()) == expected_keys
