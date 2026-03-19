@@ -8,6 +8,7 @@ when *all* accounts are capped.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -345,7 +346,7 @@ class UsageGate:
                 continue
 
             still_capped = False
-            for tier_name, tier_data in usage.items():
+            for _tier_name, tier_data in usage.items():
                 if not isinstance(tier_data, dict):
                     continue
                 utilization = tier_data.get('utilization', 0)
@@ -547,19 +548,15 @@ class UsageGate:
         for acct in self._accounts:
             if acct.resume_task and not acct.resume_task.done():
                 acct.resume_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await acct.resume_task
-                except asyncio.CancelledError:
-                    pass
                 acct.resume_task = None
 
         # Legacy single-account probe
         if self._resume_task and not self._resume_task.done():
             self._resume_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._resume_task
-            except asyncio.CancelledError:
-                pass
             self._resume_task = None
 
     @property

@@ -297,7 +297,7 @@ class FakeMcp:
     def url(self) -> str:
         return 'http://localhost:9999'
 
-    def mcp_config_json(self, **kwargs) -> dict:
+    def mcp_config_json(self, escalation_url: str | None = None) -> dict:
         return {'mcpServers': {}}
 
 
@@ -344,6 +344,16 @@ class FakeBriefing:
         self, conflicts: str, task_intent: str, context: str | None = None
     ) -> str:
         return f'Merge: {conflicts[:100]}'
+
+    async def build_resume_prompt(
+        self,
+        task: dict,
+        plan: dict,
+        escalation_summary: str,
+        resolution: str,
+        worktree=None,
+    ) -> str:
+        return f'Resume: {resolution[:100]}'
 
 
 def _build_workflow(

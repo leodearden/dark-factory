@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import AgentResult, invoke_agent
 from orchestrator.agents.roles import (
     ALL_REVIEWERS,
@@ -23,13 +22,12 @@ from orchestrator.agents.roles import (
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.scheduler import Scheduler, TaskAssignment, files_to_modules
+from orchestrator.protocols import BriefingProtocol, McpProtocol, SchedulerProtocol
+from orchestrator.scheduler import TaskAssignment, files_to_modules
+from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import run_verification
 
-from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
-
 if TYPE_CHECKING:
-    from orchestrator.mcp_lifecycle import McpLifecycle
     from orchestrator.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
@@ -71,9 +69,9 @@ class TaskWorkflow:
         assignment: TaskAssignment,
         config: OrchestratorConfig,
         git_ops: GitOps,
-        scheduler: Scheduler,
-        briefing: BriefingAssembler,
-        mcp: McpLifecycle,
+        scheduler: SchedulerProtocol,
+        briefing: BriefingProtocol,
+        mcp: McpProtocol,
         escalation_queue=None,
         escalation_event: asyncio.Event | None = None,
         usage_gate: UsageGate | None = None,
