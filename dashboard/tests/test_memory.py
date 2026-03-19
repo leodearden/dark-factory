@@ -178,3 +178,65 @@ class TestGetQueueStats:
 
         assert result['offline'] is True
         assert 'error' in result
+
+
+class TestMalformedResponse:
+    """Tests for mcp_tool_call with malformed MCP responses."""
+
+    async def test_missing_content_key(self):
+        """Response with no result.content path returns empty dict."""
+        from dashboard.data.memory import mcp_tool_call
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            # Valid JSON but missing the result.content path
+            return httpx.Response(200, json={'jsonrpc': '2.0', 'id': 1, 'result': {}})
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await mcp_tool_call(
+                client, 'http://localhost:8000', 'get_status', {}
+            )
+
+        assert result == {}
+
+    async def test_invalid_inner_json(self):
+        """Response where text field contains non-JSON returns empty dict."""
+        from dashboard.data.memory import mcp_tool_call
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = {
+                'jsonrpc': '2.0',
+                'id': 1,
+                'result': {
+                    'content': [{'type': 'text', 'text': 'not valid json!!!'}],
+                },
+            }
+            return httpx.Response(200, json=body)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await mcp_tool_call(
+                client, 'http://localhost:8000', 'get_status', {}
+            )
+
+        assert result == {}
+
+    async def test_empty_content_array(self):
+        """Response with empty content array returns empty dict."""
+        from dashboard.data.memory import mcp_tool_call
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = {
+                'jsonrpc': '2.0',
+                'id': 1,
+                'result': {'content': []},
+            }
+            return httpx.Response(200, json=body)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await mcp_tool_call(
+                client, 'http://localhost:8000', 'get_status', {}
+            )
+
+        assert result == {}
