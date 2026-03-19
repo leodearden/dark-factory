@@ -62,7 +62,7 @@
       "type": "test",
       "description": "Update test_orchestrator_panel.py mock data: change MOCK_ORCHESTRATOR_RUNNING from 'pid': 1234 to 'pids': [1234], and MOCK_ORCHESTRATOR_COMPLETED from 'pid': 5678 to 'pids': [5678]. Add new test class TestOrchestratorMultiPid with MOCK_ORCHESTRATOR_MULTI_PID constant (pids: [1234, 5678], same PRD, same tasks/worktrees/summary as RUNNING). Tests: (1) test_multi_pid_header_shows_pids_plural — 'PIDs' in html + both '1234' and '5678'; (2) test_single_pid_header_shows_pid_singular — 'PID ' in html for single-PID entry; (3) test_count_badge_shows_one_for_grouped — count badge '1' for single grouped entry with multiple PIDs; (4) test_multi_pid_comma_separated — pids=[111, 222, 333] renders '111, 222, 333'.",
       "status": "done",
-      "commit": "b0306e7"
+      "commit": "51bedbc"
     },
     {
       "id": "step-8",
@@ -76,7 +76,7 @@
       "type": "test",
       "description": "Run full test suite (pytest dashboard/tests/) to verify no regressions. Check that existing tests in test_app.py, test_badge_macros.py, and other test files still pass. Fix any issues.",
       "status": "done",
-      "commit": "ea5c085"
+      "commit": "51bedbc"
     }
   ],
   "design_decisions": [
