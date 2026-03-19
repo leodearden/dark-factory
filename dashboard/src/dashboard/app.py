@@ -36,6 +36,9 @@ def timeago(value: str | None) -> str:
     return f'{total_minutes}m ago'
 
 
+templates.env.filters['timeago'] = timeago
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage httpx.AsyncClient lifecycle."""
