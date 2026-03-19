@@ -200,7 +200,7 @@ async def test_reconcile_task_failure_handling(reconciler, journal):
 @pytest.mark.asyncio
 async def test_done_memory_ops_use_project_id(reconciler, mock_memory_service):
     """Memory calls (add_memory, search) should use logical project_id, not filesystem path."""
-    result = await reconciler.reconcile_task(
+    await reconciler.reconcile_task(
         task_id='1',
         transition='done',
         project_id='dark_factory',
@@ -223,7 +223,7 @@ async def test_done_memory_ops_use_project_id(reconciler, mock_memory_service):
 @pytest.mark.asyncio
 async def test_done_task_ops_use_project_root(reconciler, mock_taskmaster):
     """Taskmaster calls (get_tasks) should use filesystem project_root, not logical id."""
-    result = await reconciler.reconcile_task(
+    await reconciler.reconcile_task(
         task_id='1',
         transition='done',
         project_id='dark_factory',
@@ -244,7 +244,7 @@ async def test_blocked_task_update_uses_project_root(reconciler, mock_memory_ser
         MemoryResult(id='1', content='info', source_store='mem0', entities=['EntityA']),
     ])
 
-    result = await reconciler.reconcile_task(
+    await reconciler.reconcile_task(
         task_id='1',
         transition='blocked',
         project_id='dark_factory',
@@ -270,7 +270,7 @@ async def test_bulk_reconcile_separates_ids(reconciler, mock_memory_service, moc
         MemoryResult(id='m1', content='info', source_store='mem0', entities=['E1']),
     ])
 
-    result = await reconciler.reconcile_bulk_tasks(
+    await reconciler.reconcile_bulk_tasks(
         parent_task_id=None,
         project_id='dark_factory',
         project_root='/home/leo/src/dark-factory',

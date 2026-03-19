@@ -1,7 +1,5 @@
 """Tests for resolve_project_id() — converts filesystem project_root to logical project_id."""
 
-import pytest
-
 from fused_memory.models.scope import resolve_project_id
 
 
