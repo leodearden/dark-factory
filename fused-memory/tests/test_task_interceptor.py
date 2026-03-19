@@ -56,7 +56,7 @@ async def test_set_task_status_non_trigger(interceptor, taskmaster, reconciler, 
     taskmaster.set_task_status.assert_called_once()
     reconciler.reconcile_task.assert_not_called()
     # Event should be buffered
-    stats = await event_buffer.get_buffer_stats('/project')
+    stats = await event_buffer.get_buffer_stats('project')
     assert stats['size'] == 1
 
 
@@ -72,7 +72,8 @@ async def test_set_task_status_done_triggers_async_reconciliation(interceptor, r
     reconciler.reconcile_task.assert_called_once_with(
         task_id='1',
         transition='done',
-        project_id='/project',
+        project_id='project',
+        project_root='/project',
         task_before={'id': '1', 'status': 'pending', 'title': 'Test Task'},
     )
 
@@ -98,14 +99,14 @@ async def test_read_operations_no_events(interceptor, taskmaster, event_buffer):
     """Pure reads don't emit events."""
     await interceptor.get_tasks('/project')
     await interceptor.get_task('1', '/project')
-    stats = await event_buffer.get_buffer_stats('/project')
+    stats = await event_buffer.get_buffer_stats('project')
     assert stats['size'] == 0
 
 
 @pytest.mark.asyncio
 async def test_add_task_emits_event(interceptor, event_buffer):
     await interceptor.add_task('/project', prompt='Test')
-    stats = await event_buffer.get_buffer_stats('/project')
+    stats = await event_buffer.get_buffer_stats('project')
     assert stats['size'] == 1
 
 
@@ -116,7 +117,7 @@ async def test_expand_task_triggers_async_bulk_reconciliation(interceptor, recon
     assert result['reconciliation']['status'] == 'async'
     await asyncio.sleep(0)
     reconciler.reconcile_bulk_tasks.assert_called_once()
-    stats = await event_buffer.get_buffer_stats('/project')
+    stats = await event_buffer.get_buffer_stats('project')
     assert stats['size'] == 1
 
 
@@ -142,7 +143,7 @@ async def test_no_reconciler_still_proxies(taskmaster, event_buffer):
 @pytest.mark.asyncio
 async def test_remove_task_emits_event(interceptor, event_buffer):
     await interceptor.remove_task('1', '/project')
-    stats = await event_buffer.get_buffer_stats('/project')
+    stats = await event_buffer.get_buffer_stats('project')
     assert stats['size'] == 1
 
 
@@ -150,7 +151,7 @@ async def test_remove_task_emits_event(interceptor, event_buffer):
 async def test_dependency_operations_emit_events(interceptor, event_buffer):
     await interceptor.add_dependency('2', '1', '/project')
     await interceptor.remove_dependency('2', '1', '/project')
-    stats = await event_buffer.get_buffer_stats('/project')
+    stats = await event_buffer.get_buffer_stats('project')
     assert stats['size'] == 2
 
 

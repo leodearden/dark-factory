@@ -12,6 +12,7 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 if TYPE_CHECKING:
@@ -37,13 +38,14 @@ class TaskInterceptor:
         self.buffer = event_buffer
 
     def _make_event(
-        self, event_type: EventType, project_id: str, payload: dict
+        self, event_type: EventType, project_root: str, payload: dict
     ) -> ReconciliationEvent:
+        payload = {**payload, '_project_root': project_root}
         return ReconciliationEvent(
             id=str(uuid_mod.uuid4()),
             type=event_type,
             source=EventSource.agent,
-            project_id=project_id,
+            project_id=resolve_project_id(project_root),
             timestamp=datetime.now(UTC),
             payload=payload,
         )
@@ -88,7 +90,8 @@ class TaskInterceptor:
                 self.reconciler.reconcile_task(
                     task_id=task_id,
                     transition=status,
-                    project_id=project_root,
+                    project_id=resolve_project_id(project_root),
+                    project_root=project_root,
                     task_before=before,
                 ),
                 name=f'targeted-recon-{task_id}-{status}',
@@ -122,7 +125,9 @@ class TaskInterceptor:
         if self.reconciler:
             task = asyncio.create_task(
                 self.reconciler.reconcile_bulk_tasks(
-                    parent_task_id=task_id, project_id=project_root
+                    parent_task_id=task_id,
+                    project_id=resolve_project_id(project_root),
+                    project_root=project_root,
                 ),
                 name=f'bulk-recon-expand-{task_id}',
             )
@@ -151,7 +156,9 @@ class TaskInterceptor:
         if self.reconciler:
             task = asyncio.create_task(
                 self.reconciler.reconcile_bulk_tasks(
-                    parent_task_id=None, project_id=project_root
+                    parent_task_id=None,
+                    project_id=resolve_project_id(project_root),
+                    project_root=project_root,
                 ),
                 name='bulk-recon-parse-prd',
             )
