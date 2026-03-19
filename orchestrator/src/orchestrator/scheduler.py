@@ -332,7 +332,8 @@ class Scheduler:
         return False
 
     def release(self, task_id: str) -> None:
-        """Release all module locks for a task."""
+        """Release all module locks for a task and clear dispatch guard."""
+        self._dispatched.discard(task_id)
         self.lock_table.release(task_id)
 
     def _get_modules(self, task: dict) -> list[str]:
