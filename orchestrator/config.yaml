@@ -5,8 +5,7 @@
 max_concurrent_tasks: 3
 max_per_module: 1
 lock_depth: 4
-module_overrides:
-  fused-memory/tests: 2
+module_overrides: {}
 
 # Iteration limits
 max_execute_iterations: 10
@@ -56,9 +55,9 @@ backends:
   module_tagger: "claude"
 
 # Verification commands
-test_command: "cd fused-memory && uv run pytest tests/ -x"
-lint_command: "cd fused-memory && uv run ruff check src/ tests/"
-type_check_command: "cd fused-memory && uv run pyright src/"
+test_command: "pytest"
+lint_command: "ruff check"
+type_check_command: "pyright"
 
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
