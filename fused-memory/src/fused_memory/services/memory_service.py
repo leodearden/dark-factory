@@ -153,6 +153,7 @@ class MemoryService:
             group_id=scope.graphiti_group_id,
             operation='add_episode',
             payload={
+                'uuid': episode_id,
                 'name': f'episode_{episode_id[:8]}',
                 'content': content,
                 'source': source_name,
