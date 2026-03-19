@@ -1,0 +1,119 @@
+{
+  "task_id": "40",
+  "title": "Add ARIA labels to status indicator dots and auto-updating sections",
+  "files": [
+    "dashboard/src/dashboard/templates/partials/recon.html",
+    "dashboard/src/dashboard/templates/index.html",
+    "dashboard/tests/test_recon_panel.py",
+    "dashboard/tests/test_app.py"
+  ],
+  "modules": [
+    "dashboard/src/dashboard/templates/partials",
+    "dashboard/src/dashboard/templates",
+    "dashboard/tests"
+  ],
+  "analysis": "After thorough codebase exploration, memory.html is ALREADY FULLY IMPLEMENTED: all 4 status dots have role='status' and dynamic aria-label (Graphiti/Mem0/Taskmaster connected/disconnected, Write Queue healthy/pending/dead letters), and test_memory_partial.py has TestMemoryDotAriaLabels with 11 passing tests. Two files still need changes:\n\n1. **recon.html** \u2014 Three groups of status badges lack aria-label:\n   - Burst state badges (lines 38, 40): <span> with 'bursting'/'idle' text, colored bg-orange-600/bg-gray-600\n   - Verdict severity badges (lines 82-91): ok/minor/moderate/serious spans, colored green/yellow/orange/red\n   - Run status badges (lines 125-135): completed/running/failed/rolled_back/circuit_breaker spans\n   All are inline text badges within tables/cards \u2014 they have visible text but no aria-label for semantic context.\n\n2. **index.html** \u2014 Three HTMX-polled <section> elements (memory at line 6, recon at line 19, orchestrators at line 32) use hx-trigger='every Ns' + hx-swap='morph:innerHTML'. No aria-live attribute means screen readers won't announce content updates.\n\nTest infrastructure: pytest with Starlette TestClient, mocked async data functions. test_recon_panel.py has _patch_recon_data() helper (lines 148-180) and MOCK_BURST_STATE/MOCK_VERDICT/MOCK_RUNS constants. test_app.py has TestHtmxTimeout (lines 334-356) with section-extraction pattern for index.html assertions.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing tests in test_recon_panel.py: new TestReconBurstBadgeAria class with 3 tests. (1) test_bursting_badge_has_aria_label \u2014 using MOCK_BURST_STATE (agent-1 bursting, agent-2 idle), assert 'aria-label=\"agent-1 bursting\"' in rendered HTML. (2) test_idle_badge_has_aria_label \u2014 assert 'aria-label=\"agent-2 idle\"'. (3) test_no_burst_aria_when_empty \u2014 with burst_state=[], assert no burst badge aria-labels appear. Reuse _patch_recon_data helper.",
+      "status": "done",
+      "commit": "9da7900"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Add aria-label to burst state badge spans in recon.html. Line 38 bursting span: add aria-label=\"{{ agent.agent_id }} bursting\". Line 40 idle span: add aria-label=\"{{ agent.agent_id }} idle\".",
+      "status": "done",
+      "commit": "8f10050"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing tests in test_recon_panel.py: new TestReconVerdictBadgeAria class with 4 tests. (1) test_ok_verdict_has_aria_label \u2014 with verdict severity='ok', assert 'aria-label=\"Verdict: ok\"' in HTML. (2) test_minor_verdict_has_aria_label \u2014 verdict severity='minor'. (3) test_serious_verdict_has_aria_label \u2014 verdict severity='serious'. (4) test_no_verdict_aria_when_none \u2014 verdict=None, assert no verdict aria-label. Reuse _patch_recon_data with verdict overrides.",
+      "status": "done",
+      "commit": "cbdd4be"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Add aria-label to verdict severity badge spans in recon.html. Lines 82, 84, 86, 88, 90: add aria-label=\"Verdict: {{ verdict.severity }}\" to each severity span. The prefix 'Verdict:' disambiguates since raw text like 'ok' is meaningless without context.",
+      "status": "done",
+      "commit": "8f10050"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing tests in test_recon_panel.py: new TestReconRunStatusBadgeAria class with 4 tests. (1) test_completed_run_has_aria_label \u2014 assert 'aria-label=\"Run completed\"'. (2) test_running_run_has_aria_label \u2014 run with status='running'. (3) test_failed_run_has_aria_label \u2014 run with status='failed'. (4) test_no_run_aria_when_empty \u2014 runs=[], no run status aria-labels. Reuse _patch_recon_data with runs overrides.",
+      "status": "done",
+      "commit": "cbdd4be"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Add aria-label to run status badge spans in recon.html. Lines 125, 127, 129, 131, 133, 135: add aria-label=\"Run {{ run.status }}\" to each status span. The 'Run' prefix provides table context.",
+      "status": "done",
+      "commit": "8f10050"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing tests in test_app.py: new TestAriaLivePolling class with 4 tests. (1) test_memory_section_has_aria_live \u2014 fetch '/', locate 'hx-get=\"/partials/memory\"' section, assert 'aria-live=\"polite\"' in surrounding HTML. (2) test_recon_section_has_aria_live \u2014 same for /partials/recon. (3) test_orchestrators_section_has_aria_live \u2014 same for /partials/orchestrators. (4) test_three_aria_live_regions \u2014 assert html.count('aria-live=\"polite\"') == 3. Follow TestHtmxTimeout section-extraction pattern (find hx-get index, extract html[idx-200:idx+500]).",
+      "status": "done",
+      "commit": "60ff2c4"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Add aria-live='polite' attribute to each of the three <section> elements in index.html. Line 6 memory section: <section aria-live=\"polite\" hx-get=... >. Line 19 recon section: same. Line 32 orchestrators section: same.",
+      "status": "done",
+      "commit": "f1f3487"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Skip memory.html \u2014 already fully implemented with tests",
+      "rationale": "memory.html already has role='status' and dynamic aria-label on all 4 status dots (lines 13, 23, 33, 46). test_memory_partial.py has TestMemoryDotAriaLabels (lines 376-499) with 11 passing tests covering connected/disconnected for Graphiti/Mem0/Taskmaster and healthy/pending/dead-letters for Write Queue. No work needed."
+    },
+    {
+      "decision": "Use compound aria-labels with prefixes for recon badges: 'agent-id state', 'Verdict: severity', 'Run status'",
+      "rationale": "Burst badges include agent_id because the badge is in a table row where agent_id is in a sibling cell \u2014 screen readers navigating non-linearly need full context. Verdict badges use 'Verdict:' prefix because raw text 'ok' or 'minor' is ambiguous. Run badges use 'Run' prefix because 'completed' alone doesn't convey what completed."
+    },
+    {
+      "decision": "Do not add role='status' to recon badges",
+      "rationale": "Memory dots are empty <div> elements invisible to screen readers without role='status'. Recon badges are <span> elements with visible text. Adding role='status' would create live regions that re-announce on every 15-second htmx poll, overwhelming screen reader users. aria-label alone provides identification."
+    },
+    {
+      "decision": "Place aria-live='polite' on <section> elements, not inner content",
+      "rationale": "The <section> is the htmx swap target (hx-swap='morph:innerHTML'). Its content is replaced every 10-15 seconds. aria-live on the section means screen readers detect changes after each swap. Using 'polite' (not 'assertive') avoids interrupting the user during routine polling."
+    },
+    {
+      "decision": "Test ARIA attributes via HTML string assertions, not DOM parsing",
+      "rationale": "All 400+ existing assertions use string-in-HTML checks. Introducing BeautifulSoup/lxml would add a foreign dependency. Exact string assertions like 'aria-label=\"Verdict: ok\"' are precise, fast, and consistent with codebase conventions."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "_patch_recon_data() helper and MOCK_* constants",
+      "where": "dashboard/tests/test_recon_panel.py lines 101-180",
+      "how": "All new recon tests reuse _patch_recon_data() with targeted overrides. MOCK_BURST_STATE (agent-1 bursting, agent-2 idle), MOCK_VERDICT (severity='ok'), MOCK_RUNS (status='completed') provide default data. Override-specific values for testing other severities/statuses (e.g., _patch_recon_data(verdict={'severity': 'serious', ...}))."
+    },
+    {
+      "what": "TestHtmxTimeout section-extraction pattern",
+      "where": "dashboard/tests/test_app.py lines 334-356",
+      "how": "TestAriaLivePolling uses the identical technique: html.index('hx-get=\"/partials/X\"'), extract html[idx-200:idx+500], assert attribute in window. Proven approach for testing per-section attributes in index.html without DOM parsing."
+    },
+    {
+      "what": "TestMemoryDotAriaLabels as reference pattern",
+      "where": "dashboard/tests/test_memory_partial.py lines 376-499",
+      "how": "Proven pattern: one test per label value, assert exact 'aria-label=\"X\"' string in rendered HTML. Recon badge tests follow the same structure with recon-specific mock data and patches."
+    },
+    {
+      "what": "conftest.py client fixture",
+      "where": "dashboard/tests/conftest.py lines 96-102",
+      "how": "All new test classes use the shared 'client' fixture providing Starlette TestClient with proper FastAPI app lifecycle."
+    }
+  ]
+}

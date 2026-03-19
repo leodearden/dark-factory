@@ -349,3 +349,128 @@ class TestReconRouteEmpty:
             html = client.get('/partials/recon').text
         assert 'bg-green-600' not in html
         assert 'bg-red-600' not in html
+
+
+class TestReconBadgeAriaLabels:
+    """Tests for ARIA labels on recon status badges."""
+
+    def test_burst_state_bursting_aria_label(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'aria-label="Burst state: bursting"' in html
+
+    def test_burst_state_idle_aria_label(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'aria-label="Burst state: idle"' in html
+
+    def test_verdict_severity_ok_aria_label(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'aria-label="Verdict severity: ok"' in html
+
+    def test_verdict_severity_minor_aria_label(self, client):
+        verdict_minor = {
+            'run_id': 'run-001',
+            'severity': 'minor',
+            'action_taken': 'none',
+            'reviewed_at': '2026-03-19T10:00:00+00:00',
+        }
+        with _patch_recon_data(verdict=verdict_minor):
+            html = client.get('/partials/recon').text
+        assert 'aria-label="Verdict severity: minor"' in html
+
+    def test_verdict_severity_moderate_aria_label(self, client):
+        verdict_mod = {
+            'run_id': 'run-001',
+            'severity': 'moderate',
+            'action_taken': 'repair',
+            'reviewed_at': '2026-03-19T10:00:00+00:00',
+        }
+        with _patch_recon_data(verdict=verdict_mod):
+            html = client.get('/partials/recon').text
+        assert 'aria-label="Verdict severity: moderate"' in html
+
+    def test_verdict_severity_serious_aria_label(self, client):
+        verdict_serious = {
+            'run_id': 'run-001',
+            'severity': 'serious',
+            'action_taken': 'rollback',
+            'reviewed_at': '2026-03-19T10:00:00+00:00',
+        }
+        with _patch_recon_data(verdict=verdict_serious):
+            html = client.get('/partials/recon').text
+        assert 'aria-label="Verdict severity: serious"' in html
+
+    def test_run_status_completed_aria_label(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'aria-label="Run status: completed"' in html
+
+    def test_run_status_running_aria_label(self, client):
+        runs_running = [
+            {
+                'id': 'run-002',
+                'run_type': 'full',
+                'trigger_reason': 'manual',
+                'started_at': '2026-03-19T08:00:00+00:00',
+                'completed_at': None,
+                'events_processed': 0,
+                'status': 'running',
+                'duration_seconds': None,
+            }
+        ]
+        with _patch_recon_data(runs=runs_running):
+            html = client.get('/partials/recon').text
+        assert 'aria-label="Run status: running"' in html
+
+    def test_run_status_failed_aria_label(self, client):
+        runs_failed = [
+            {
+                'id': 'run-003',
+                'run_type': 'full',
+                'trigger_reason': 'manual',
+                'started_at': '2026-03-19T08:00:00+00:00',
+                'completed_at': '2026-03-19T08:01:00+00:00',
+                'events_processed': 0,
+                'status': 'failed',
+                'duration_seconds': 60.0,
+            }
+        ]
+        with _patch_recon_data(runs=runs_failed):
+            html = client.get('/partials/recon').text
+        assert 'aria-label="Run status: failed"' in html
+
+    def test_run_status_rolled_back_aria_label(self, client):
+        runs_rb = [
+            {
+                'id': 'run-004',
+                'run_type': 'full',
+                'trigger_reason': 'manual',
+                'started_at': '2026-03-19T08:00:00+00:00',
+                'completed_at': '2026-03-19T08:01:00+00:00',
+                'events_processed': 0,
+                'status': 'rolled_back',
+                'duration_seconds': 60.0,
+            }
+        ]
+        with _patch_recon_data(runs=runs_rb):
+            html = client.get('/partials/recon').text
+        assert 'aria-label="Run status: rolled_back"' in html
+
+    def test_run_status_circuit_breaker_aria_label(self, client):
+        runs_cb = [
+            {
+                'id': 'run-005',
+                'run_type': 'full',
+                'trigger_reason': 'manual',
+                'started_at': '2026-03-19T08:00:00+00:00',
+                'completed_at': '2026-03-19T08:01:00+00:00',
+                'events_processed': 0,
+                'status': 'circuit_breaker',
+                'duration_seconds': 60.0,
+            }
+        ]
+        with _patch_recon_data(runs=runs_cb):
+            html = client.get('/partials/recon').text
+        assert 'aria-label="Run status: circuit_breaker"' in html

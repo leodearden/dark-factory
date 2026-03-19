@@ -373,6 +373,132 @@ class TestSplitBrainQueueOffline:
             assert '0 dead' in html
 
 
+class TestMemoryDotAriaLabels:
+    """Tests for ARIA attributes on status indicator dots in memory.html."""
+
+    def test_graphiti_dot_has_role_status(self, client):
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=_ONLINE_QUEUE),
+        ):
+            html = client.get('/partials/memory').text
+        assert 'role="status"' in html
+
+    def test_graphiti_dot_aria_label_connected(self, client):
+        status = {
+            'graphiti': {'connected': True, 'node_count': 10},
+            'mem0': {'connected': True, 'memory_count': 5},
+            'taskmaster': {'connected': True},
+        }
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=status),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+        assert 'aria-label="Graphiti connected"' in html
+
+    def test_graphiti_dot_aria_label_disconnected(self, client):
+        status = {
+            'graphiti': {'connected': False, 'node_count': 0},
+            'mem0': {'connected': True, 'memory_count': 5},
+            'taskmaster': {'connected': True},
+        }
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=status),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+        assert 'aria-label="Graphiti disconnected"' in html
+
+    def test_mem0_dot_aria_label_connected(self, client):
+        status = {
+            'graphiti': {'connected': True, 'node_count': 10},
+            'mem0': {'connected': True, 'memory_count': 5},
+            'taskmaster': {'connected': True},
+        }
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=status),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+        assert 'aria-label="Mem0 connected"' in html
+
+    def test_mem0_dot_aria_label_disconnected(self, client):
+        status = {
+            'graphiti': {'connected': True, 'node_count': 10},
+            'mem0': {'connected': False, 'memory_count': 0},
+            'taskmaster': {'connected': True},
+        }
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=status),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+        assert 'aria-label="Mem0 disconnected"' in html
+
+    def test_taskmaster_dot_aria_label_connected(self, client):
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=_ONLINE_QUEUE),
+        ):
+            html = client.get('/partials/memory').text
+        assert 'aria-label="Taskmaster connected"' in html
+
+    def test_taskmaster_dot_aria_label_disconnected(self, client):
+        status = {
+            'graphiti': {'connected': True, 'node_count': 10},
+            'mem0': {'connected': True, 'memory_count': 5},
+            'taskmaster': {'connected': False},
+        }
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=status),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+        assert 'aria-label="Taskmaster disconnected"' in html
+
+    def test_write_queue_dot_aria_label_healthy(self, client):
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+        assert 'aria-label="Write Queue healthy"' in html
+
+    def test_write_queue_dot_aria_label_pending(self, client):
+        queue = {'counts': {'pending': 3, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+        assert 'aria-label="Write Queue pending"' in html
+
+    def test_write_queue_dot_aria_label_dead_letters(self, client):
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 2}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+        assert 'aria-label="Write Queue dead letters"' in html
+
+    def test_all_four_dots_have_role_status(self, client):
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+        assert html.count('role="status"') == 4
+
+
 class TestMemoryCardLayout:
     def test_cards_container_has_flex_wrap(self, client):
         with (

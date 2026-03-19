@@ -10,7 +10,7 @@
   <!-- Graphiti card -->
   <div class="bg-gray-800 rounded-lg p-6 shadow flex-1 min-w-[200px]">
     <div class="flex items-center gap-2 mb-3">
-      <div class="w-3 h-3 rounded-full {% if status.graphiti.connected|default(false) %}bg-green-500{% else %}bg-red-500{% endif %}"></div>
+      <div class="w-3 h-3 rounded-full {% if status.graphiti.connected|default(false) %}bg-green-500{% else %}bg-red-500{% endif %}" role="status" aria-label="Graphiti {% if status.graphiti.connected|default(false) %}connected{% else %}disconnected{% endif %}"></div>
       <span class="text-sm text-gray-400">Graphiti</span>
     </div>
     <div class="text-3xl font-bold text-white">{{ status.graphiti.node_count|default(0) }}</div>
@@ -20,7 +20,7 @@
   <!-- Mem0 card -->
   <div class="bg-gray-800 rounded-lg p-6 shadow flex-1 min-w-[200px]">
     <div class="flex items-center gap-2 mb-3">
-      <div class="w-3 h-3 rounded-full {% if status.mem0.connected|default(false) %}bg-green-500{% else %}bg-red-500{% endif %}"></div>
+      <div class="w-3 h-3 rounded-full {% if status.mem0.connected|default(false) %}bg-green-500{% else %}bg-red-500{% endif %}" role="status" aria-label="Mem0 {% if status.mem0.connected|default(false) %}connected{% else %}disconnected{% endif %}"></div>
       <span class="text-sm text-gray-400">Mem0</span>
     </div>
     <div class="text-3xl font-bold text-white">{{ status.mem0.memory_count|default(0) }}</div>
@@ -30,7 +30,7 @@
   <!-- Taskmaster card -->
   <div class="bg-gray-800 rounded-lg p-6 shadow flex-1 min-w-[200px]">
     <div class="flex items-center gap-2 mb-3">
-      <div class="w-3 h-3 rounded-full {% if status.taskmaster is defined and status.taskmaster.connected|default(false) %}bg-green-500{% else %}bg-red-500{% endif %}"></div>
+      <div class="w-3 h-3 rounded-full {% if status.taskmaster is defined and status.taskmaster.connected|default(false) %}bg-green-500{% else %}bg-red-500{% endif %}" role="status" aria-label="Taskmaster {% if status.taskmaster is defined and status.taskmaster.connected|default(false) %}connected{% else %}disconnected{% endif %}"></div>
       <span class="text-sm text-gray-400">Taskmaster</span>
     </div>
     <div class="text-3xl font-bold text-white">{% if status.taskmaster is defined and status.taskmaster.connected|default(false) %}Connected{% else %}Disconnected{% endif %}</div>
@@ -43,7 +43,7 @@
   {% set q_dead = q_counts.dead|default(0) %}
   <div class="bg-gray-800 rounded-lg p-6 shadow flex-1 min-w-[200px]">
     <div class="flex items-center gap-2 mb-3">
-      <div class="w-3 h-3 rounded-full {% if q_dead > 0 %}bg-red-500{% elif q_pending > 0 %}bg-yellow-500{% else %}bg-green-500{% endif %}"></div>
+      <div class="w-3 h-3 rounded-full {% if q_dead > 0 %}bg-red-500{% elif q_pending > 0 %}bg-yellow-500{% else %}bg-green-500{% endif %}" role="status" aria-label="Write Queue {% if q_dead > 0 %}dead letters{% elif q_pending > 0 %}pending{% else %}healthy{% endif %}"></div>
       <span class="text-sm text-gray-400">Write Queue</span>
     </div>
     <div class="text-sm text-gray-300">

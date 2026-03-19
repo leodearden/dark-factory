@@ -272,3 +272,28 @@ class TestOrchestratorRouteMultiple:
             html = client.get('/partials/orchestrators').text
         assert 'dashboard.md' in html
         assert 'memory.md' in html
+
+
+class TestOrchestratorBadgeAriaLabels:
+    """Tests for ARIA labels on orchestrator running/completed status badges."""
+
+    def test_running_badge_aria_label(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'aria-label="Orchestrator status: running"' in html
+
+    def test_completed_badge_aria_label(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_COMPLETED]):
+            html = client.get('/partials/orchestrators').text
+        assert 'aria-label="Orchestrator status: completed"' in html
+
+    def test_both_badges_aria_labels_when_multiple(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING, MOCK_ORCHESTRATOR_COMPLETED]):
+            html = client.get('/partials/orchestrators').text
+        assert 'aria-label="Orchestrator status: running"' in html
+        assert 'aria-label="Orchestrator status: completed"' in html
+
+    def test_progress_bar_aria_label(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'aria-label="Task progress' in html
