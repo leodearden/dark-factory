@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -252,6 +252,11 @@ class OrchestratorConfig(BaseSettings):
 
     # Per-module overrides (populated by load_config via _discover_module_configs)
     _module_configs: dict[str, ModuleConfig] = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode='after')
+    def _resolve_project_root(self) -> 'OrchestratorConfig':
+        self.project_root = self.project_root.resolve()
+        return self
 
     def for_module(self, module_path: str) -> ModuleConfig | None:
         """Return ModuleConfig matching the first path component, or None."""
