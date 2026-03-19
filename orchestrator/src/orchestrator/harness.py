@@ -85,6 +85,7 @@ class Harness:
         self.scheduler = Scheduler(config)
         self.briefing = BriefingAssembler(config)
         self.report = HarnessReport()
+        self._recovered_plans: dict[str, dict] = {}
 
         # Usage cap gate
         self.usage_gate: UsageGate | None = (
@@ -128,6 +129,9 @@ class Harness:
             # 2b. Tag tasks with code modules for concurrency locking
             logger.info('Tagging tasks with code modules...')
             await self._tag_task_modules()
+
+            # 2c. Recover crashed tasks from surviving worktrees
+            await self._recover_crashed_tasks()
 
             tasks = await self.scheduler.get_tasks()
             self.report.total_tasks = len([t for t in tasks if t.get('status') == 'pending'])
@@ -358,6 +362,89 @@ Output JSON matching the schema. Every task must appear in the output.
 
         logger.info(f'Tagged {tagged_count}/{len(untagged)} tasks with module metadata')
 
+    async def _recover_crashed_tasks(self) -> None:
+        """Scan surviving worktrees and recover plans with completed work.
+
+        For each worktree in the worktree base directory:
+        - If it has a plan.json with completed steps, store the plan for
+          injection into the resumed workflow.
+        - Otherwise, clean up the worktree (no useful work to recover).
+
+        Also resets any in-progress tasks to pending so acquire_next() picks
+        them up.
+        """
+        worktree_base = self.git_ops.worktree_base
+        if not worktree_base.exists():
+            return
+
+        recovered = 0
+        cleaned = 0
+
+        for entry in worktree_base.iterdir():
+            if not entry.is_dir():
+                continue
+            task_id = entry.name
+            plan_path = entry / '.task' / 'plan.json'
+
+            if not plan_path.exists():
+                logger.info(
+                    f'Recovery: worktree {task_id} has no plan — cleaning up'
+                )
+                await self.git_ops.cleanup_worktree(entry, task_id)
+                cleaned += 1
+                continue
+
+            try:
+                plan = json.loads(plan_path.read_text())
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(
+                    f'Recovery: worktree {task_id} has corrupt plan — '
+                    f'cleaning up ({e})'
+                )
+                await self.git_ops.cleanup_worktree(entry, task_id)
+                cleaned += 1
+                continue
+
+            # Check if plan has any completed steps
+            completed = [
+                s for col in ('prerequisites', 'steps')
+                for s in plan.get(col, [])
+                if s.get('status') == 'done'
+            ]
+
+            if not completed:
+                logger.info(
+                    f'Recovery: worktree {task_id} has plan but no '
+                    f'completed steps — cleaning up'
+                )
+                await self.git_ops.cleanup_worktree(entry, task_id)
+                cleaned += 1
+                continue
+
+            total = sum(len(plan.get(col, [])) for col in ('prerequisites', 'steps'))
+            logger.info(
+                f'Recovery: worktree {task_id} has plan with '
+                f'{len(completed)}/{total} steps done — storing for resumption'
+            )
+            self._recovered_plans[task_id] = plan
+            recovered += 1
+
+        # Reset in-progress tasks to pending
+        tasks = await self.scheduler.get_tasks()
+        reset_count = 0
+        for t in tasks:
+            if t.get('status') == 'in-progress':
+                tid = str(t.get('id', ''))
+                await self.scheduler.set_task_status(tid, 'pending')
+                logger.info(f'Recovery: reset task {tid} from in-progress to pending')
+                reset_count += 1
+
+        if recovered or cleaned or reset_count:
+            logger.info(
+                f'Crash recovery: {recovered} plans recovered, '
+                f'{cleaned} worktrees cleaned, {reset_count} tasks reset'
+            )
+
     async def _run_slot(
         self, assignment, sem: asyncio.Semaphore
     ) -> TaskReport | None:
@@ -373,6 +460,8 @@ Output JSON matching the schema. Every task must appear in the output.
                 esc_event = asyncio.Event()
                 self._escalation_events[assignment.task_id] = esc_event
 
+            recovered_plan = self._recovered_plans.pop(assignment.task_id, None)
+
             workflow = TaskWorkflow(
                 assignment=assignment,
                 config=self.config,
@@ -383,6 +472,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 escalation_queue=self._escalation_queue,
                 escalation_event=esc_event,
                 usage_gate=self.usage_gate,
+                initial_plan=recovered_plan,
             )
             outcome = await workflow.run()
 
