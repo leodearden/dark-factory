@@ -1,3 +1,10 @@
+{% if status.offline is defined and status.offline %}
+<!-- Offline error card -->
+<div class="bg-red-900/50 border border-red-700 rounded-lg p-6">
+  <div class="text-red-200 font-bold text-lg">Fused Memory Server Offline</div>
+  <div class="text-red-300 text-sm mt-2">{{ status.error }}</div>
+</div>
+{% else %}
 <div class="flex gap-4">
   <!-- Graphiti card -->
   <div class="bg-gray-800 rounded-lg p-6 shadow flex-1">
@@ -39,3 +46,4 @@
     </div>
   </div>
 </div>
+{% endif %}
