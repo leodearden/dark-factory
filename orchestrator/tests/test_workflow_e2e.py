@@ -358,9 +358,9 @@ def _build_workflow(
         assignment=assignment,
         config=config,
         git_ops=git_ops,
-        scheduler=scheduler,
-        briefing=FakeBriefing(),
-        mcp=FakeMcp(),
+        scheduler=scheduler,  # type: ignore[arg-type]
+        briefing=FakeBriefing(),  # type: ignore[arg-type]
+        mcp=FakeMcp(),  # type: ignore[arg-type]
     )
     return workflow, scheduler
 
@@ -808,9 +808,9 @@ class TestBlastRadiusExpansion:
             assignment=task_assignment,
             config=config,
             git_ops=git_ops,
-            scheduler=deny_scheduler,
-            briefing=FakeBriefing(),
-            mcp=FakeMcp(),
+            scheduler=deny_scheduler,  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=FakeMcp(),  # type: ignore[arg-type]
         )
 
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
@@ -924,9 +924,9 @@ def _build_workflow_with_escalation(
         assignment=assignment,
         config=config,
         git_ops=git_ops,
-        scheduler=scheduler,
-        briefing=FakeBriefing(),
-        mcp=FakeMcp(),
+        scheduler=scheduler,  # type: ignore[arg-type]
+        briefing=FakeBriefing(),  # type: ignore[arg-type]
+        mcp=FakeMcp(),  # type: ignore[arg-type]
         escalation_queue=queue,
     )
     return workflow, scheduler, queue

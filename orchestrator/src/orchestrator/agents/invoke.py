@@ -371,7 +371,7 @@ def _write_codex_mcp_config(config_path: Path, mcp_config: dict) -> None:
     lines = []
     servers = mcp_config.get('mcpServers', {})
     for name, cfg in servers.items():
-        lines.append(f'[[mcp_servers]]')
+        lines.append('[[mcp_servers]]')
         lines.append(f'name = "{name}"')
         command = cfg.get('command', '')
         args = cfg.get('args', [])

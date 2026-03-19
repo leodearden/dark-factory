@@ -1,11 +1,12 @@
 """Tests for scheduler module lock logic."""
 
 
-import pytest
 from unittest.mock import AsyncMock
 
+import pytest
+
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules, normalize_lock
+from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules
 
 
 @pytest.fixture

@@ -24,9 +24,8 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment, files_to_modules
-from orchestrator.verify import run_verification
-
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
+from orchestrator.verify import run_verification
 
 if TYPE_CHECKING:
     from orchestrator.mcp_lifecycle import McpLifecycle
