@@ -216,7 +216,13 @@ def discover_orchestrators(config: DashboardConfig) -> list[dict]:
     if worktrees_dir.is_dir():
         for subdir in sorted(worktrees_dir.iterdir()):
             if subdir.is_dir():
-                worktrees[subdir.name] = read_task_artifacts(subdir)
+                artifacts = read_task_artifacts(subdir)
+                metadata = artifacts.get('metadata')
+                if metadata and metadata.get('task_id') is not None:
+                    key = str(metadata['task_id'])
+                else:
+                    key = subdir.name
+                worktrees[key] = artifacts
 
     # Compute summary stats from task tree
     summary = {
