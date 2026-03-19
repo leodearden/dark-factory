@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 
@@ -221,3 +223,39 @@ class TestGetLatestVerdict:
 
         result = await get_latest_verdict(missing_db_path)
         assert result is None
+
+
+class TestExceptionLogging:
+    """Tests that reconciliation functions emit DEBUG-level logs on DB unavailability."""
+
+    async def test_missing_db_logs_debug(self, missing_db_path, caplog):
+        """get_recent_runs with a missing DB path emits a DEBUG log."""
+        from dashboard.data.reconciliation import get_recent_runs
+
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
+            result = await get_recent_runs(missing_db_path)
+
+        assert result == []
+        assert any(
+            r.levelno == logging.DEBUG and 'dashboard.data.reconciliation' in r.name
+            for r in caplog.records
+        ), f'Expected DEBUG log from dashboard.data.reconciliation, got: {caplog.records}'
+
+    async def test_operational_error_logs_debug(self, tmp_path, caplog):
+        """get_watermarks with an empty (no-tables) DB file emits a DEBUG log on OperationalError."""
+        from dashboard.data.reconciliation import get_watermarks
+
+        # Create a valid SQLite file but with no tables — causes OperationalError
+        db_path = tmp_path / 'empty.db'
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.close()
+
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
+            result = await get_watermarks(db_path, project_id='dark_factory')
+
+        assert result == {}
+        assert any(
+            r.levelno == logging.DEBUG and 'dashboard.data.reconciliation' in r.name
+            for r in caplog.records
+        ), f'Expected DEBUG log from dashboard.data.reconciliation, got: {caplog.records}'

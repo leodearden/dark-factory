@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 
 class TestFindRunningOrchestrators:
     """Tests for find_running_orchestrators — scans ps aux for orchestrator processes."""
@@ -76,6 +78,42 @@ class TestFindRunningOrchestrators:
         from dashboard.data.orchestrator import find_running_orchestrators
 
         with patch('dashboard.data.orchestrator.subprocess.run', side_effect=OSError('ps not found')):
+            result = find_running_orchestrators()
+
+        assert result == []
+
+    def test_unexpected_exception_propagates(self):
+        """subprocess.run raising RuntimeError (non-subprocess error) propagates to caller.
+
+        With the narrowed `except (OSError, subprocess.TimeoutExpired):`, unexpected
+        errors like RuntimeError should NOT be swallowed — they indicate bugs and
+        should be visible to callers.
+        """
+        from unittest.mock import patch
+
+        from dashboard.data.orchestrator import find_running_orchestrators
+
+        with pytest.raises(RuntimeError, match='unexpected'), patch(
+            'dashboard.data.orchestrator.subprocess.run',
+            side_effect=RuntimeError('unexpected'),
+        ):
+            find_running_orchestrators()
+
+    def test_subprocess_timeout_caught(self):
+        """subprocess.run raising TimeoutExpired is caught and returns empty list.
+
+        TimeoutExpired is a legitimate subprocess failure mode and should remain
+        handled gracefully.
+        """
+        import subprocess
+        from unittest.mock import patch
+
+        from dashboard.data.orchestrator import find_running_orchestrators
+
+        with patch(
+            'dashboard.data.orchestrator.subprocess.run',
+            side_effect=subprocess.TimeoutExpired(cmd=['ps', 'aux'], timeout=30),
+        ):
             result = find_running_orchestrators()
 
         assert result == []

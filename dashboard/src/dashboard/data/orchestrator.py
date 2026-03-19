@@ -49,7 +49,7 @@ def find_running_orchestrators() -> list[dict]:
             capture_output=True,
             text=True,
         )
-    except Exception:
+    except (OSError, subprocess.TimeoutExpired):
         logger.warning('Failed to run ps aux', exc_info=True)
         return []
 

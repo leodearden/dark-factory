@@ -6,11 +6,14 @@ and returns structured data. Missing database files return empty defaults.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
+
+logger = logging.getLogger(__name__)
 
 
 async def get_recent_runs(db_path: Path, *, limit: int = 10) -> list[dict]:
@@ -30,6 +33,7 @@ async def get_recent_runs(db_path: Path, *, limit: int = 10) -> list[dict]:
             ) as cursor:
                 rows = await cursor.fetchall()
     except (FileNotFoundError, sqlite3.OperationalError):
+        logger.debug('get_recent_runs: DB unavailable at %s', db_path, exc_info=True)
         return []
 
     results = []
@@ -72,6 +76,7 @@ async def get_watermarks(db_path: Path, *, project_id: str = 'dark_factory') -> 
             ) as cursor:
                 row = await cursor.fetchone()
     except (FileNotFoundError, sqlite3.OperationalError):
+        logger.debug('get_watermarks: DB unavailable at %s', db_path, exc_info=True)
         return {}
 
     if row is None:
@@ -107,6 +112,7 @@ async def get_buffer_stats(db_path: Path) -> dict:
                 row = await cursor.fetchone()
                 oldest_ts = row[0] if row else None
     except (FileNotFoundError, sqlite3.OperationalError):
+        logger.debug('get_buffer_stats: DB unavailable at %s', db_path, exc_info=True)
         return dict(_BUFFER_STATS_DEFAULT)
 
     age = None
@@ -133,6 +139,7 @@ async def get_burst_state(db_path: Path) -> list[dict]:
             ) as cursor:
                 rows = await cursor.fetchall()
     except (FileNotFoundError, sqlite3.OperationalError):
+        logger.debug('get_burst_state: DB unavailable at %s', db_path, exc_info=True)
         return []
 
     return [
@@ -160,6 +167,7 @@ async def get_latest_verdict(db_path: Path) -> dict | None:
             ) as cursor:
                 row = await cursor.fetchone()
     except (FileNotFoundError, sqlite3.OperationalError):
+        logger.debug('get_latest_verdict: DB unavailable at %s', db_path, exc_info=True)
         return None
 
     if row is None:
