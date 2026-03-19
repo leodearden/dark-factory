@@ -356,6 +356,18 @@ class TestHtmxTimeout:
         assert '"timeout": 8000' in section_html or '"timeout":8000' in section_html
 
 
+class TestCdnVersionPinning:
+    """Tests that Alpine.js CDN URL uses a pinned version, not a wildcard."""
+
+    def test_alpine_no_wildcard_version(self, client):
+        html = client.get('/').text
+        assert '@3.x.x' not in html
+
+    def test_alpine_pinned_to_3_14_8(self, client):
+        html = client.get('/').text
+        assert 'alpinejs@3.14.8' in html
+
+
 class TestMainModule:
     """Tests for python -m dashboard entry point."""
 
