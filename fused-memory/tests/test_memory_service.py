@@ -223,6 +223,46 @@ class TestSearch:
         assert len(results) == 1
         assert results[0].category == MemoryCategory.preferences_and_norms
 
+    @pytest.mark.asyncio
+    async def test_search_category_filter_includes_graphiti_when_graphiti_primary_requested(
+        self, service
+    ):
+        """When filtering by a GRAPHITI_PRIMARY category, Graphiti results
+        (which have category=None) must NOT be silently dropped."""
+        from tests.conftest import MockEdge, MockNode
+
+        # Mock Graphiti returning edges (category=None in MemoryResult)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Auth service depends on Redis',
+                uuid='edge-uuid-1',
+                source_node=MockNode(name='Auth Service'),
+                target_node=MockNode(name='Redis'),
+            ),
+        ])
+        # Mock Mem0 returning a result with matching category
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm1',
+                    'memory': 'Redis is the caching layer',
+                    'score': 0.8,
+                    'metadata': {'category': 'entities_and_relations'},
+                },
+            ]
+        })
+        results = await service.search(
+            query='Redis dependencies',
+            project_id='test',
+            categories=['entities_and_relations'],
+        )
+        # Both the Graphiti edge and the Mem0 result should be present
+        source_stores = {r.source_store for r in results}
+        assert SourceStore.graphiti in source_stores, (
+            'Graphiti results were silently dropped by category filter'
+        )
+        assert SourceStore.mem0 in source_stores
+
 
 class TestDeleteMemory:
     @pytest.mark.asyncio
