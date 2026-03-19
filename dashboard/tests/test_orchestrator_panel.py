@@ -337,3 +337,16 @@ class TestOrchestratorMultiPid:
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_MULTI_PID]):
             html = client.get('/partials/orchestrators').text
         assert '>1<' in html
+
+    def test_multi_pid_comma_separated(self, client):
+        """Three PIDs render as comma-separated list '111, 222, 333'."""
+        mock_entry = {
+            **MOCK_ORCHESTRATOR_MULTI_PID,
+            'pids': [111, 222, 333],
+        }
+        with _patch_orchestrator_data([mock_entry]):
+            html = client.get('/partials/orchestrators').text
+        assert '111' in html
+        assert '222' in html
+        assert '333' in html
+        assert '111, 222, 333' in html
