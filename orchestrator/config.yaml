@@ -4,8 +4,9 @@
 # Concurrency
 max_concurrent_tasks: 3
 max_per_module: 1
+lock_depth: 4
 module_overrides:
-  tests: 2
+  fused-memory/tests: 2
 
 # Iteration limits
 max_execute_iterations: 10
@@ -36,33 +37,70 @@ max_turns:
   reviewer: 30
   merger: 50
 
-# Verification commands
-test_command: "pytest"
-lint_command: "ruff check"
-type_check_command: "pyright"
+# Reasoning effort per role
+effort:
+  architect: "high"
+  implementer: "high"
+  debugger: "high"
+  reviewer: "medium"
+  merger: "high"
+  module_tagger: "medium"
 
-# Fused memory HTTP server
+# Backend CLI per role (claude, codex, gemini)
+backends:
+  architect: "claude"
+  implementer: "claude"
+  debugger: "claude"
+  reviewer: "claude"
+  merger: "claude"
+  module_tagger: "claude"
+
+# Verification commands
+test_command: "cd fused-memory && uv run pytest tests/ -x"
+lint_command: "cd fused-memory && uv run ruff check src/ tests/"
+type_check_command: "cd fused-memory && uv run pyright src/"
+
+# Fused memory HTTP server — port 8002
+# Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
 fused_memory:
-  url: "http://localhost:8000"
+  url: "http://localhost:8002"
   project_id: "dark_factory"
-  config_path: "../fused-memory/config/config.yaml"
+  config_path: "fused-memory/config/config.yaml"
   server_command:
     - "uv"
     - "run"
     - "--project"
-    - "../fused-memory"
+    - "fused-memory"
     - "python"
     - "-m"
     - "fused_memory.server.main"
     - "--transport"
     - "http"
 
+# Sandbox
+sandbox:
+  enabled: false
+
+# Escalation — port 8102 (matches .mcp.json so interactive sessions share the server)
+escalation:
+  queue_dir: "data/escalations"
+  port: 8102
+
 # Git
 git:
   main_branch: "main"
   branch_prefix: "task/"
   remote: "origin"
-  worktree_dir: "../worktrees"
+  worktree_dir: ".worktrees"
+
+# Usage cap handling
+usage_cap:
+  enabled: true
+  # session_budget_usd: 50.0    # uncomment to limit per-run spend
+  pause_threshold: 0.96          # pause if startup check shows >96% utilization
+  wait_for_reset: true           # wait and auto-resume vs exit
+  probe_interval_secs: 300       # 5 min initial probe interval
+  max_probe_interval_secs: 1800  # 30 min max backoff
 
 # Project root (absolute path)
 project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"
