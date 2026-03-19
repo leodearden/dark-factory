@@ -35,9 +35,9 @@
                 <td class="py-2 text-gray-100">{{ agent.agent_id }}</td>
                 <td class="py-2">
                   {% if agent.state == 'bursting' %}
-                    <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-orange-600 text-white">bursting</span>
+                    <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-orange-600 text-white" aria-label="Burst state: bursting">bursting</span>
                   {% else %}
-                    <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-gray-600 text-white">idle</span>
+                    <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-gray-600 text-white" aria-label="Burst state: idle">idle</span>
                   {% endif %}
                 </td>
                 <td class="py-2 text-gray-400">{{ agent.last_write_at | timeago }}</td>
@@ -79,15 +79,15 @@
       {% if verdict %}
         <div class="flex items-center gap-3">
           {% if verdict.severity == 'ok' %}
-            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-green-600 text-white">ok</span>
+            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-green-600 text-white" aria-label="Verdict severity: ok">ok</span>
           {% elif verdict.severity == 'minor' %}
-            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-yellow-600 text-white">minor</span>
+            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-yellow-600 text-white" aria-label="Verdict severity: minor">minor</span>
           {% elif verdict.severity == 'moderate' %}
-            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-orange-600 text-white">moderate</span>
+            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-orange-600 text-white" aria-label="Verdict severity: moderate">moderate</span>
           {% elif verdict.severity == 'serious' %}
-            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-red-600 text-white">serious</span>
+            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-red-600 text-white" aria-label="Verdict severity: serious">serious</span>
           {% else %}
-            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-gray-600 text-white">{{ verdict.severity }}</span>
+            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-gray-600 text-white" aria-label="Verdict severity: {{ verdict.severity }}">{{ verdict.severity }}</span>
           {% endif %}
           <span class="text-gray-400">Action: {{ verdict.action_taken }}</span>
         </div>
@@ -122,17 +122,17 @@
               <td class="py-2 text-gray-100">{{ run.run_type }}</td>
               <td class="py-2">
                 {% if run.status == 'completed' %}
-                  <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-green-600 text-white">completed</span>
+                  <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-green-600 text-white" aria-label="Run status: completed">completed</span>
                 {% elif run.status == 'running' %}
-                  <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-blue-600 text-white">running</span>
+                  <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-blue-600 text-white" aria-label="Run status: running">running</span>
                 {% elif run.status == 'failed' %}
-                  <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-red-600 text-white">failed</span>
+                  <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-red-600 text-white" aria-label="Run status: failed">failed</span>
                 {% elif run.status == 'rolled_back' %}
-                  <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-orange-600 text-white">rolled_back</span>
+                  <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-orange-600 text-white" aria-label="Run status: rolled_back">rolled_back</span>
                 {% elif run.status == 'circuit_breaker' %}
-                  <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-purple-600 text-white">circuit_breaker</span>
+                  <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-purple-600 text-white" aria-label="Run status: circuit_breaker">circuit_breaker</span>
                 {% else %}
-                  <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-gray-600 text-white">{{ run.status }}</span>
+                  <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-gray-600 text-white" aria-label="Run status: {{ run.status }}">{{ run.status }}</span>
                 {% endif %}
               </td>
               <td class="py-2 text-gray-100">{{ run.events_processed }}</td>
