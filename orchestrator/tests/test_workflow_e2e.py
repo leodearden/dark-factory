@@ -543,7 +543,7 @@ class TestVerifyDebugfixLoop:
         # First verify fails, second passes
         call_count = 0
 
-        async def verify_sequence(worktree, cfg):
+        async def verify_sequence(worktree, cfg, module_cfg=None):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -724,7 +724,7 @@ class TestPostMergeFailure:
 
         verify_call = 0
 
-        async def verify_fn(cwd, cfg):
+        async def verify_fn(cwd, cfg, module_cfg=None):
             nonlocal verify_call
             verify_call += 1
             if cwd == config.project_root:
