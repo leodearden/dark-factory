@@ -620,3 +620,43 @@ class TestDiscoverOrchestrators:
         assert isinstance(entry['pids'], list)
         assert entry['pids'] == [1234]
         assert 'pid' not in entry
+
+    def test_same_prd_grouped_into_single_entry(self, tmp_path):
+        """Two processes on the same PRD path produce one grouped entry with both PIDs."""
+        import json
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        # Create a worktree so we get non-empty worktrees dict
+        wt_dir = tmp_path / '.worktrees' / '7'
+        wt_dir.mkdir(parents=True)
+        task_dir = wt_dir / '.task'
+        task_dir.mkdir()
+        steps = [{'id': 'step-1', 'status': 'done'}]
+        (task_dir / 'plan.json').write_text(json.dumps({'steps': steps}))
+
+        # Create tasks.json
+        tasks_dir = tmp_path / '.taskmaster' / 'tasks'
+        tasks_dir.mkdir(parents=True)
+        (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': []}))
+
+        # Two processes on the same PRD, different PIDs
+        mock_procs = [
+            {'pid': 1234, 'prd': '/home/leo/prd.md', 'running': True, 'started': 'Mar18'},
+            {'pid': 5678, 'prd': '/home/leo/prd.md', 'running': True, 'started': 'Mar18'},
+        ]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        # Should produce exactly one entry, not two
+        assert len(result) == 1
+        entry = result[0]
+        assert entry['pids'] == [1234, 5678]
+        # Should have shared task tree and worktree data
+        assert 'tasks' in entry
+        assert 'worktrees' in entry
+        assert 'summary' in entry
