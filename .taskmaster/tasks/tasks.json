@@ -79,13 +79,13 @@
         "description": "Create data/memory.py \u2014 the data access layer for memory health metrics from the fused-memory MCP HTTP server.",
         "details": "Create `dashboard/src/dashboard/data/memory.py` with:\n\n1. `async def mcp_tool_call(client: httpx.AsyncClient, base_url: str, tool_name: str, arguments: dict) -> dict` \u2014 POST JSON-RPC to `{base_url}/mcp` with body `{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/call\", \"params\": {\"name\": tool_name, \"arguments\": arguments}}`. Parse response: extract `result.content[0].text`, json.loads it, return dict. Timeout: 10s.\n\n2. `async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) -> dict` \u2014 call MCP tool `get_status` with `{\"project_id\": config.fused_memory_project_id}`. Returns dict with keys: graphiti (connected, node_count), mem0 (connected, memory_count), queue (counts dict, oldest_pending_age_seconds), taskmaster (connected). On httpx.ConnectError or httpx.TimeoutException, return `{\"offline\": True, \"error\": str(e)}`.\n\n3. `async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) -> dict` \u2014 call MCP tool `get_queue_stats` with `{}`. Returns dict with counts (pending, in_flight, retry, completed, dead) and oldest_pending_age_seconds. Same error handling as above.\n\nCreate `dashboard/tests/test_memory.py` with tests:\n- Test successful get_memory_status: mock httpx to return a valid MCP response, verify parsed output matches expected structure.\n- Test successful get_queue_stats: same pattern.\n- Test offline fallback: mock httpx to raise ConnectError, verify returns {\"offline\": True, ...}.\n- Test malformed response: mock httpx to return unexpected JSON, verify graceful handling (returns empty dict or raises clear error).\n\nUse httpx's MockTransport or pytest-httpx for mocking.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [
           "16"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-18T13:08:09.437Z"
+        "updatedAt": "2026-03-19T06:58:53.904Z"
       },
       {
         "id": "18",
@@ -113,7 +113,7 @@
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-18T13:07:10.198Z"
+        "updatedAt": "2026-03-19T06:58:53.936Z"
       },
       {
         "id": "20",
@@ -121,7 +121,7 @@
         "description": "Create the memory health cards HTML partial template and its FastAPI route, wiring data from the memory data module.",
         "details": "Create `dashboard/src/dashboard/templates/partials/memory.html`:\n\nFour cards in a horizontal flex row (flex, gap-4). Each card: bg-gray-800, rounded-lg, p-6, shadow.\n\n1. **Graphiti card**: Status dot (green if connected, red if not \u2014 use a 3x3 rounded-full div with bg-green-500/bg-red-500). \"Graphiti\" label (text-sm text-gray-400). Node count as large number (text-3xl font-bold text-white). Subtitle \"knowledge graph nodes\" (text-xs text-gray-500).\n\n2. **Mem0 card**: Same pattern. Memory count. Subtitle \"vector memories\".\n\n3. **Taskmaster card**: Same dot pattern. \"Taskmaster\" label. Text \"Connected\" or \"Disconnected\" (instead of a number).\n\n4. **Write Queue card**: Tri-state dot: green if all counts are 0, yellow if pending > 0, red if dead > 0. \"Write Queue\" label. Show three metrics inline: \"N pending \u00b7 N retry \u00b7 N dead\" with dead count in red text if > 0. If oldest_pending_age_seconds is not None and > 60, show \"oldest: Xm ago\" in yellow text.\n\nIf the data has `offline: True`, show a single full-width card: \"Fused Memory Server Offline\" with red styling and the error message.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/memory` async route: get httpx client from request.app.state, call get_memory_status() and get_queue_stats() from dashboard.data.memory, render templates/partials/memory.html with the data as template context, return HTMLResponse.\n- Import the data functions at the top of app.py.\n\nTest strategy: verify the route returns 200 with text/html content-type. Test with mock data module returning both online and offline states. Check that the HTML contains expected elements (e.g., \"Graphiti\", \"Mem0\", node count value).",
         "testStrategy": "",
-        "status": "deferred",
+        "status": "pending",
         "dependencies": [
           "17"
         ],
@@ -135,7 +135,7 @@
         "description": "Create the reconciliation panel HTML partial template and its FastAPI route, wiring data from the reconciliation data module.",
         "details": "Create `dashboard/src/dashboard/templates/partials/recon.html`:\n\nTwo-column grid layout (grid grid-cols-2 gap-6). Dark themed cards (bg-gray-800 rounded-lg p-6).\n\n**Left column \u2014 Current State:**\n\n- **Event Buffer** section: Show \"N events buffered\". If oldest_event_age_seconds is not None, show \"oldest: Xm Xs ago\". Use yellow text if age > 300s.\n\n- **Burst State** table: columns agent_id, state. State \"bursting\" in orange badge, \"idle\" in gray badge. Show \"No agents\" if empty.\n\n- **Watermarks** section: Show each timestamp as relative time (implement a Jinja2 filter `timeago` that converts ISO 8601 to \"Xm ago\" / \"Xh ago\" / \"Xd ago\" relative to now). Fields: Last full run, Last episode, Last memory, Last task change. Use text-gray-400 for labels, text-white for values.\n\n- **Latest Verdict**: Severity badge \u2014 bg-green-600 for \"ok\", bg-yellow-600 for \"minor\", bg-orange-600 for \"moderate\", bg-red-600 for \"serious\". Show action_taken next to it. Show \"No verdicts yet\" if None.\n\n**Right column \u2014 Recent Runs (last 5):**\n\nTable with columns: Trigger, Type, Status, Events, Duration, When.\n- Status badges: bg-green-600=completed, bg-blue-600=running, bg-red-600=failed, bg-orange-600=rolled_back, bg-purple-600=circuit_breaker.\n- Duration: show in seconds or \"\u2014\" if still running.\n- When: relative time (timeago filter).\n- Show \"No reconciliation runs yet\" if empty.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/recon` async route: call all 5 reconciliation query functions (get_recent_runs, get_watermarks, get_buffer_stats, get_burst_state, get_latest_verdict) with config.reconciliation_db and render the partial.\n- Register the `timeago` Jinja2 filter on the templates environment.\n\nThe `timeago` filter: accept an ISO 8601 string, parse with datetime.fromisoformat, compute delta from now (UTC), return human string like \"3m ago\", \"2h ago\", \"1d ago\". Handle None \u2192 return \"never\".\n\nTest strategy: verify route returns 200. Test with mock reconciliation data. Check HTML contains expected badges and table structure.",
         "testStrategy": "",
-        "status": "deferred",
+        "status": "pending",
         "dependencies": [
           "18"
         ],
@@ -149,7 +149,7 @@
         "description": "Create the orchestrator list and task detail HTML partial templates and their FastAPI routes, wiring data from the orchestrator discovery module.",
         "details": "Create `dashboard/src/dashboard/templates/partials/orchestrators.html`:\n\n**Header**: \"Orchestrators\" (text-xl font-bold) + count of running instances as badge (bg-blue-600 rounded-full px-2 text-sm).\n\n**Per-orchestrator card** (bg-gray-800 rounded-lg p-6 mb-4):\n- **Header line**: PID with green \"running\" badge (bg-green-600 text-xs rounded px-2 py-0.5) or gray \"completed\" badge. PRD filename (extracted from path, text-gray-400).\n- **Progress bar**: Full-width bar (h-3 rounded-full bg-gray-700 overflow-hidden). Colored segments inside as flex children: green (done), blue (in-progress), yellow (pending), red (blocked). Width proportional to count/total.\n- **Stats row**: Flex with gap, each stat: count + label. \"N done \u00b7 N in-progress \u00b7 N blocked \u00b7 N pending\" with matching colors.\n- **Expand button**: \"Show tasks\" / \"Hide tasks\" toggle using Alpine.js `@click=\"open = !open\"` and `x-show=\"open\"`. Wrap card in `<div x-data=\"{ open: false }\">`.\n\nCreate `dashboard/src/dashboard/templates/partials/tasks.html`:\n\n**Task table** (inside the expandable section, rendered per orchestrator):\n- Table with classes: w-full text-sm text-left text-gray-300.\n- Header row: ID, Title, Status, Phase, Iterations, Reviews, Modules (bg-gray-700 text-gray-400 text-xs uppercase).\n- Data rows: \n  - **Status** as badge: bg-green-600=done, bg-blue-600=in-progress, bg-yellow-600=pending, bg-red-600=blocked, bg-gray-600=cancelled/deferred.\n  - **Phase**: short label (PLAN/EXEC/VERIFY/REVIEW/MERGE/DONE/\u2014) with muted color.\n  - **Iterations**: number or \"\u2014\".\n  - **Reviews**: e.g. \"3/5 PASS\" or \"\u2014\".\n  - **Modules**: comma-joined, text-xs text-gray-500, truncated with `truncate max-w-[200px]`.\n\nIf no orchestrators found, show a centered message: \"No orchestrators detected\" with gray text.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/orchestrators` async route: call discover_orchestrators(config), render orchestrators.html with the orchestrator list. The tasks.html partial is included inline within orchestrators.html (use Jinja2 include or render tasks directly in the template loop).\n\nTest strategy: verify route returns 200. Test with mock discover_orchestrators returning both empty list and a list with one running + one completed orchestrator. Check HTML contains progress bar, stats, task table elements.",
         "testStrategy": "",
-        "status": "deferred",
+        "status": "pending",
         "dependencies": [
           "19"
         ],
@@ -163,7 +163,7 @@
         "description": "Create index.html combining all partials with htmx polling, add __main__.py entry point, and write integration tests for all routes.",
         "details": "Create `dashboard/src/dashboard/templates/index.html`:\n\nExtends base.html. Content block contains 4 sections stacked vertically (space-y-8 max-w-7xl mx-auto p-6):\n\n1. **Memory Health** section: `<div hx-get=\"/partials/memory\" hx-trigger=\"load, every 10s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n2. **Reconciliation** section: `<div hx-get=\"/partials/recon\" hx-trigger=\"load, every 15s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n3. **Orchestrators** section: `<div hx-get=\"/partials/orchestrators\" hx-trigger=\"load, every 10s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n4. **Footer**: Small text \"Dark Factory Dashboard\" with current time (updated via Alpine.js `x-text` with a setInterval, or just static).\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /` route: render index.html (no data needed \u2014 partials load themselves via htmx).\n\nCreate `dashboard/src/dashboard/__main__.py`:\n```python\n\"\"\"Entry point: python -m dashboard.app\"\"\"\nimport uvicorn\nfrom dashboard.config import DashboardConfig\n\nconfig = DashboardConfig()\nuvicorn.run(\"dashboard.app:app\", host=config.host, port=config.port, reload=True)\n```\n\nCreate `dashboard/tests/test_app.py` \u2014 integration tests using FastAPI TestClient:\n\n1. **Test GET /** \u2014 returns 200, content-type text/html, body contains \"Dark Factory\", contains hx-get=\"/partials/memory\", hx-get=\"/partials/recon\", hx-get=\"/partials/orchestrators\".\n\n2. **Test GET /partials/memory** \u2014 mock dashboard.data.memory functions to return sample data. Returns 200, text/html, contains \"Graphiti\", \"Mem0\", \"Taskmaster\", \"Write Queue\".\n\n3. **Test GET /partials/memory offline** \u2014 mock to return {\"offline\": True}. Returns 200, contains \"Offline\".\n\n4. **Test GET /partials/recon** \u2014 mock dashboard.data.reconciliation functions. Returns 200, contains expected table elements.\n\n5. **Test GET /partials/recon no data** \u2014 mock to return empty defaults. Returns 200, contains \"No reconciliation runs\".\n\n6. **Test GET /partials/orchestrators** \u2014 mock dashboard.data.orchestrator.discover_orchestrators to return a sample orchestrator with tasks. Returns 200, contains progress bar elements, task table.\n\n7. **Test GET /partials/orchestrators empty** \u2014 mock to return []. Returns 200, contains \"No orchestrators detected\".\n\n8. **Test GET /api/health** \u2014 returns 200, application/json, body is {\"status\": \"ok\"}.\n\nUse `unittest.mock.patch` or `monkeypatch` to mock the data modules. Import the app and create TestClient in a fixture.\n\nTest strategy: `cd dashboard && uv run pytest tests/ -x -v`. All 8+ tests should pass. Also manually verify by running `cd dashboard && uv run python -m dashboard.app` and opening http://127.0.0.1:8080 in a browser.",
         "testStrategy": "",
-        "status": "deferred",
+        "status": "pending",
         "dependencies": [
           "20",
           "21",
@@ -179,7 +179,7 @@
         "description": "Task-triggered reconciliation currently emits events keyed by Taskmaster's `project_root` and then reuses that string as the memory `project_id`. That causes completion knowledge, memory hints, and related searches to land under a different Graphiti group / Mem0 collection than the rest of the project's memory, fragmenting the knowledge base.",
         "details": "The repo docs distinguish task routing (`project_root=\"/home/leo/src/dark-factory\"`) from memory routing (`project_id=\"dark_factory\"`), but the reconciliation path collapses them. Relevant code paths: `fused_memory.middleware.task_interceptor.TaskInterceptor._make_event`, `fused_memory.reconciliation.targeted.TargetedReconciler`, and `fused_memory.models.scope.Scope`. Fix should establish a canonical mapping from task project root to memory project_id and use it consistently across targeted and full reconciliation stages.",
         "testStrategy": "Add integration tests proving a task status transition writes memory into the canonical project scope (`dark_factory`) rather than the filesystem path. Cover both targeted reconciliation and any stage-base task tools that currently pass `project_root=project_id`.",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "high",
         "metadata": {
@@ -199,7 +199,7 @@
         "description": "MemoryService generates and returns an `episode_id` immediately from `add_episode()`, but that UUID is not included in the queued Graphiti write. The actual Graphiti episode therefore gets a different UUID, so the returned ID cannot be used reliably for provenance, follow-up reads, or deletion.",
         "details": "Relevant paths: `fused_memory.services.memory_service.MemoryService.add_episode`, `_execute_graphiti_write`, and `fused_memory.backends.graphiti_client.GraphitiBackend.add_episode`. The durable queue payload needs to carry the generated UUID through to Graphiti, or the API contract needs to change so the system does not promise a stable episode ID before the backend has accepted one.",
         "testStrategy": "Add a test that enqueues an episode, drains the queue, and asserts the returned `episode_id` matches the UUID passed into the Graphiti backend. Also cover delete/provenance flows that depend on the returned ID.",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "high",
         "metadata": {
@@ -254,9 +254,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-19T06:56:59.734Z",
+      "lastModified": "2026-03-19T06:58:53.936Z",
       "taskCount": 17,
-      "completedCount": 6,
+      "completedCount": 7,
       "tags": [
         "master"
       ]
