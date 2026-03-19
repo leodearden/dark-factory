@@ -122,6 +122,20 @@ class TestGetMemoryStatus:
         assert result['offline'] is True
         assert 'error' in result
 
+    async def test_non_200_response_returns_offline(self, dashboard_config):
+        """Non-200 HTTP status (ValueError from mcp_tool_call) returns offline fallback."""
+        from dashboard.data.memory import get_memory_status
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text='Internal Server Error')
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await get_memory_status(client, dashboard_config)
+
+        assert result['offline'] is True
+        assert 'error' in result
+
 
 _QUEUE_STATS_PAYLOAD = {
     'counts': {'pending': 3, 'in_flight': 1, 'retry': 0, 'completed': 10, 'dead': 0},
@@ -167,6 +181,20 @@ class TestGetQueueStats:
 
         def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.TimeoutException('timed out')
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await get_queue_stats(client, dashboard_config)
+
+        assert result['offline'] is True
+        assert 'error' in result
+
+    async def test_non_200_response_returns_offline(self, dashboard_config):
+        """Non-200 HTTP status (ValueError from mcp_tool_call) returns offline fallback."""
+        from dashboard.data.memory import get_queue_stats
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text='Internal Server Error')
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
@@ -224,6 +252,19 @@ class TestMalformedResponse:
                 'result': {'content': []},
             }
             return httpx.Response(200, json=body)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
+
+        assert result == {}
+
+    async def test_non_json_body_returns_empty_dict(self):
+        """HTTP 200 with non-JSON body (e.g. HTML from reverse proxy) returns empty dict."""
+        from dashboard.data.memory import mcp_tool_call
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text='<html>Bad Gateway</html>')
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
