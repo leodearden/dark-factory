@@ -1,168 +1,71 @@
 {
-  "task_id": "26",
-  "title": "Bug: Unified Graphiti search/delete contract is internally inconsistent",
-  "modules": [
-    "fused-memory/src/fused_memory/services",
-    "fused-memory/src/fused_memory/server",
-    "fused-memory/src/fused_memory/models",
-    "fused-memory/src/fused_memory/backends",
-    "fused-memory/tests"
-  ],
-  "analysis": "Three interrelated bugs in the fused-memory unified API:\n\n1. **ID type mismatch in delete contract**: `_search_graphiti` returns edge UUIDs (EntityEdge.uuid) as the `id` field on MemoryResult, but `delete_memory(store='graphiti')` calls `graphiti.remove_episode(memory_id)` which expects an EpisodicNode UUID. Passing an edge UUID to remove_episode would raise an error or delete the wrong thing. The MCP tool docs promise 'The memory_id and store values come from search results' — this contract is broken for Graphiti.\n\n2. **Category filter silently drops ALL Graphiti results**: `_search_graphiti` (line 467) hardcodes `category=None` on every result. The `search()` category filter at line 423 (`[r for r in results if r.category in cat_set]`) then excludes every Graphiti result since None is never in the category set. Users filtering by 'entities_and_relations' (a Graphiti-primary category) get zero Graphiti results.\n\n3. **No category recovery for Graphiti edges**: At write time, categories route to Graphiti (entities_and_relations, temporal_facts, decisions_and_rationale via GRAPHITI_PRIMARY). At search time, this mapping is lost because Graphiti edges don't carry category metadata. The source_description on the episode has it (e.g. 'add_memory:entities_and_relations') but that's not accessible on the edge object returned by search.\n\n**Fix approach**:\n- Add `remove_edge` to GraphitiBackend using `EntityEdge.get_by_uuid` + `edge.delete` (confirmed available in graphiti_core).\n- Change `delete_memory(store='graphiti')` to delete edges instead of episodes. Episode deletion stays in the dedicated `delete_episode` tool.\n- Fix category filter: when requested categories overlap with GRAPHITI_PRIMARY, include Graphiti results (category=None) rather than silently dropping them. When exactly one GRAPHITI_PRIMARY category is requested, assign it to the Graphiti results for best-effort category metadata.\n- Update MCP tool docs to accurately describe what Graphiti search IDs represent (edge UUIDs, not episode UUIDs).",
-  "prerequisites": [
-    {
-      "id": "pre-1",
-      "description": "Extend MockEdge in conftest.py with uuid, source_node, target_node, episodes, valid_at, invalid_at attributes for realistic Graphiti search result mocking in new tests",
-      "status": "done",
-      "commit": "d51143a",
-      "tests": []
-    }
-  ],
+  "task_id": "28",
+  "title": "Fix HTMX polling destroying Alpine.js state on orchestrators panel",
+  "modules": ["dashboard/src/dashboard"],
+  "analysis": "The dashboard uses HTMX polling (every 10s/15s) with hx-swap=\"innerHTML\" on three sections in index.html: memory, recon, and orchestrators. The orchestrators partial (orchestrators.html) uses Alpine.js x-data=\"{ open: false }\" for show/hide task accordions. Each HTMX innerHTML swap destroys the entire DOM subtree and re-creates it, resetting all Alpine.js component state — so expanded accordions collapse every poll cycle.\n\nThe fix uses the idiomorph extension for HTMX, which performs a DOM morph (diff) instead of a full innerHTML replace. This preserves Alpine.js component state because existing DOM nodes are patched in-place rather than destroyed and recreated.\n\nImplementation: (1) Add the idiomorph extension script to base.html with a pinned version, (2) Add hx-ext=\"morph\" to the body tag so the extension is available to all HTMX elements, (3) Change all three section hx-swap attributes from \"innerHTML\" to \"morph:innerHTML\" in index.html.\n\nExisting tests in test_app.py (TestIndex class) only check for hx-get attributes, not hx-swap, so they will continue to pass. The orchestrator panel tests in test_orchestrator_panel.py test the partial content, not the swap mechanism, so they are also unaffected.\n\nThe test strategy uses the same pattern as existing tests: render the full index page via GET / and assert on the HTML content for the new idiomorph-related attributes.",
+  "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing test: test_search_category_filter_includes_graphiti_when_graphiti_primary_requested — mock Graphiti returning edges (via extended MockEdge with uuid) and Mem0 returning results, filter by ['entities_and_relations'], assert Graphiti results are NOT dropped. Currently fails because category=None is filtered out by the list comprehension at line 423.",
+      "description": "Write failing tests in test_app.py in a new TestIdiomorphExtension class: (1) test_idiomorph_script_tag — GET / and assert the rendered HTML contains the idiomorph extension script URL 'unpkg.com/idiomorph@0.3.0/dist/idiomorph-ext.min.js', (2) test_body_has_morph_extension — GET / and assert 'hx-ext=\"morph\"' appears in the HTML. Both use the existing client fixture.",
       "status": "done",
-      "commit": "81d641c"
+      "commit": "e9180fe"
     },
     {
       "id": "step-2",
-      "type": "test",
-      "description": "Write failing test: test_search_category_filter_excludes_graphiti_when_only_mem0_primary_requested — filter by ['preferences_and_norms'] only, mock both stores returning results, assert Graphiti results (category=None) ARE correctly excluded since none of the requested categories are in GRAPHITI_PRIMARY. This test should pass after the fix but documents the expected behavior.",
+      "type": "impl",
+      "description": "Modify base.html: (1) Add <script src=\"https://unpkg.com/idiomorph@0.3.0/dist/idiomorph-ext.min.js\"></script> after the htmx script tag (after line 8), (2) Change <body> tag (line 12) to <body class=\"h-full bg-gray-900 text-gray-100\" hx-ext=\"morph\">. This makes the idiomorph morph swap strategy available to all HTMX elements.",
       "status": "done",
-      "commit": "06f45bd"
+      "commit": "3775a27"
     },
     {
       "id": "step-3",
-      "type": "impl",
-      "description": "Fix category filter logic in MemoryService.search() (line 420-423): when the requested categories overlap with GRAPHITI_PRIMARY, include Graphiti results that have category=None. Change filter from `r.category in cat_set` to also accept `(r.source_store == SourceStore.graphiti and r.category is None and cat_set & GRAPHITI_PRIMARY)`. Import GRAPHITI_PRIMARY is already at line 18.",
+      "type": "test",
+      "description": "Write failing tests in test_app.py in a new TestMorphSwap class: (1) test_memory_section_uses_morph — assert 'hx-swap=\"morph:innerHTML\"' appears near hx-get=\"/partials/memory\", (2) test_recon_section_uses_morph — same for /partials/recon, (3) test_orchestrators_section_uses_morph — same for /partials/orchestrators, (4) test_no_plain_innerhtml_on_polling_sections — assert the plain 'hx-swap=\"innerHTML\"' string does NOT appear in the rendered index page, confirming all sections were migrated.",
       "status": "done",
-      "commit": "2729aac"
+      "commit": "1401253"
     },
     {
       "id": "step-4",
-      "type": "test",
-      "description": "Write failing test: test_search_graphiti_results_get_inferred_category_when_single_primary — when category filter has exactly one GRAPHITI_PRIMARY category (e.g. ['entities_and_relations']), verify the returned Graphiti results have that category assigned (not left as None). This helps downstream consumers know what category was requested.",
-      "status": "done",
-      "commit": "9beb389"
-    },
-    {
-      "id": "step-5",
       "type": "impl",
-      "description": "Enhance category filter to assign inferred category to Graphiti results: after filtering, for Graphiti results with category=None, if exactly one GRAPHITI_PRIMARY category is in the filter set, assign it. When multiple GRAPHITI_PRIMARY categories are in the filter, leave as None (ambiguous). This provides best-effort category info without false precision.",
+      "description": "Modify index.html: Change all three hx-swap=\"innerHTML\" attributes to hx-swap=\"morph:innerHTML\" — on the memory section (line 9), recon section (line 18), and orchestrators section (line 27).",
       "status": "done",
-      "commit": "b1d4bc4"
-    },
-    {
-      "id": "step-6",
-      "type": "test",
-      "description": "Write failing test: test_graphiti_backend_remove_edge — unit test for new GraphitiBackend.remove_edge(edge_uuid) method. Mock EntityEdge.get_by_uuid to return a mock edge, verify edge.delete is called with the driver. Method doesn't exist yet so this fails with AttributeError.",
-      "status": "done",
-      "commit": "b4b1470"
-    },
-    {
-      "id": "step-7",
-      "type": "impl",
-      "description": "Add remove_edge method to GraphitiBackend (graphiti_client.py): import EntityEdge from graphiti_core.edges, implement remove_edge(edge_uuid) using get_by_uuid + edge.delete with asyncio.wait_for timeout wrapper, same pattern as existing remove_episode (lines 205-212).",
-      "status": "done",
-      "commit": "340b4b7"
-    },
-    {
-      "id": "step-8",
-      "type": "test",
-      "description": "Write failing test: test_delete_memory_graphiti_calls_remove_edge — verify that MemoryService.delete_memory(memory_id='edge-uuid', store='graphiti') calls self.graphiti.remove_edge('edge-uuid') instead of self.graphiti.remove_episode('edge-uuid'). Add remove_edge mock to the service fixture. Currently fails because delete_memory calls remove_episode.",
-      "status": "done",
-      "commit": "2c4789a"
-    },
-    {
-      "id": "step-9",
-      "type": "impl",
-      "description": "Change MemoryService.delete_memory (line 583) to call self.graphiti.remove_edge(memory_id) instead of self.graphiti.remove_episode(memory_id) when source is SourceStore.graphiti. The delete_episode method continues to use remove_episode.",
-      "status": "done",
-      "commit": "5ef0057"
-    },
-    {
-      "id": "step-10",
-      "type": "test",
-      "description": "Write regression test: test_delete_episode_still_uses_remove_episode — verify MemoryService.delete_episode continues to call self.graphiti.remove_episode (not remove_edge). Should pass immediately as a regression guard.",
-      "status": "done",
-      "commit": "cdcc465"
-    },
-    {
-      "id": "step-11",
-      "type": "impl",
-      "description": "Update MCP tool docs in tools.py: (1) delete_memory docstring (line 264) — clarify that for Graphiti this deletes the edge/fact found by search, not the episode; mention delete_episode for episode removal. (2) search tool docstring — note that Graphiti results may have inferred category when category filtering is active. (3) FUSED_MEMORY_INSTRUCTIONS (line 47) — clarify that delete_memory deletes the item type returned by search (edges for Graphiti, memories for Mem0).",
-      "status": "done",
-      "commit": "7055275"
-    },
-    {
-      "id": "step-12",
-      "type": "test",
-      "description": "Write roundtrip test: test_search_then_delete_graphiti_roundtrip — mock a full search→delete workflow: configure graphiti.search to return edges with known UUIDs, call service.search(), take the first Graphiti result's id and source_store, pass them to service.delete_memory(), verify graphiti.remove_edge is called with the correct edge UUID. Validates the end-to-end contract is now internally consistent.",
-      "status": "done",
-      "commit": "42127fe"
-    },
-    {
-      "id": "step-13",
-      "type": "impl",
-      "description": "Run full test suite (pytest fused-memory/tests/) to verify all existing tests pass alongside new tests. Fix any regressions from the category filter change or delete_memory change.",
-      "status": "done",
-      "commit": "e10097c"
+      "commit": "635b1bd"
     }
   ],
   "design_decisions": [
     {
-      "decision": "delete_memory(store=graphiti) deletes edges, not episodes",
-      "rationale": "Graphiti search returns EntityEdge UUIDs as the result ID. The MCP contract promises search result IDs work with delete_memory. Since search finds edges (facts), delete should delete edges. Episode deletion remains available via the dedicated delete_episode tool. This makes the search→delete contract internally consistent without adding new ID-type fields."
+      "decision": "Use idiomorph extension (option 1 from task) rather than localStorage state or selective swapping",
+      "rationale": "Idiomorph is the simplest, most maintainable approach — a single script tag + attribute change. It handles all Alpine.js state preservation automatically via DOM morphing. No custom JavaScript needed, no state serialization/restoration logic. The HTMX maintainers recommend this pattern for Alpine.js compatibility."
     },
     {
-      "decision": "Category filter uses GRAPHITI_PRIMARY set overlap to include Graphiti results",
-      "rationale": "Graphiti edges don't carry category metadata — the category is only known at write time (for routing) and not stored on the edge itself. Rather than running expensive LLM classification at search time, we use the known routing table: if the user filters by any GRAPHITI_PRIMARY category (entities_and_relations, temporal_facts, decisions_and_rationale), Graphiti results with category=None pass through the filter. This prevents silent data loss (the current bug) while being truthful about what we know."
+      "decision": "Pin idiomorph to version 0.3.0 via unpkg CDN",
+      "rationale": "Version pinning prevents unexpected breakage from upstream changes. Using unpkg is consistent with the existing pattern of loading htmx and Alpine.js from CDNs (lines 8-9 of base.html). Version 0.3.0 is stable and compatible with htmx 2.x."
     },
     {
-      "decision": "Assign inferred category to Graphiti results only when unambiguous (single GRAPHITI_PRIMARY category in filter)",
-      "rationale": "When a user filters by exactly one Graphiti-primary category, we can confidently assign it to the Graphiti results since they explicitly requested that specific category from a store that handles those types. When multiple GRAPHITI_PRIMARY categories are in the filter, we leave category as None to avoid false precision. This gives best-effort metadata without lying about what we know."
+      "decision": "Add hx-ext=\"morph\" to the <body> tag rather than to each individual section",
+      "rationale": "Placing the extension attribute on body makes the morph strategy available to all HTMX elements without repeating the attribute. This is cleaner and follows the HTMX documentation recommendation for page-wide extensions."
     },
     {
-      "decision": "No new fields added to MemoryResult model",
-      "rationale": "The source_store field already disambiguates what the id represents (edge UUID for graphiti, memory UUID for mem0). Adding an id_type field would be redundant given the fix makes the existing contract work correctly. The simplest change that fixes the bug is preferred."
+      "decision": "Apply morph:innerHTML to all three polling sections, not just orchestrators",
+      "rationale": "Task explicitly requests consistency across all sections. Even though memory and recon don't currently use Alpine.js, applying morph:innerHTML prevents future state-destruction bugs if Alpine or other stateful JS is added to those panels."
     },
     {
-      "decision": "backends module added to modules list beyond the original task spec",
-      "rationale": "The GraphitiBackend (in backends/) needs a new remove_edge method to fix the delete contract. This is the minimal backend change needed. The alternative — putting edge deletion logic in MemoryService — would violate the existing layering where MemoryService delegates all Graphiti operations to GraphitiBackend."
+      "decision": "Add tests to existing test_app.py rather than creating a new test file",
+      "rationale": "The existing TestIndex class in test_app.py already tests the rendered index page HTML attributes (hx-get, content type, etc.). Adding new test classes in the same file keeps related tests co-located and follows the established pattern."
     }
   ],
   "reuse": [
     {
-      "what": "GRAPHITI_PRIMARY / MEM0_PRIMARY category sets from enums.py",
-      "where": "fused_memory/models/enums.py lines 36-47",
-      "how": "Already imported in memory_service.py (line 18). Use GRAPHITI_PRIMARY in the category filter logic to determine which Graphiti results to keep when category filtering is active."
+      "what": "TestClient fixture from conftest.py",
+      "where": "dashboard/tests/conftest.py line 97-102",
+      "how": "Reuse the existing 'client' fixture to make GET / requests and inspect the rendered HTML, same pattern used by TestIndex class."
     },
     {
-      "what": "GraphitiBackend.remove_episode pattern (get_by_uuid → delete)",
-      "where": "fused_memory/backends/graphiti_client.py lines 205-212",
-      "how": "Copy the exact pattern for the new remove_edge method, substituting EntityEdge for EpisodicNode. Same asyncio.wait_for timeout wrapper."
-    },
-    {
-      "what": "EntityEdge from graphiti_core with get_by_uuid and delete methods",
-      "where": "graphiti_core.edges.EntityEdge (confirmed available via runtime inspection)",
-      "how": "Import EntityEdge and use get_by_uuid(driver, uuid) + edge.delete(driver) for edge removal."
-    },
-    {
-      "what": "MockEdge dataclass in conftest.py",
-      "where": "fused-memory/tests/conftest.py lines 20-23",
-      "how": "Extend with uuid, source_node, target_node, episodes, valid_at, invalid_at fields to enable realistic Graphiti search result mocking in the new tests."
-    },
-    {
-      "what": "service fixture with mocked backends",
-      "where": "fused-memory/tests/test_memory_service.py lines 12-38",
-      "how": "Add graphiti.remove_edge = AsyncMock() to the existing fixture. All new tests use this fixture for consistent mocking."
-    },
-    {
-      "what": "Existing test_search_category_filter test pattern",
-      "where": "fused-memory/tests/test_memory_service.py lines 200-224",
-      "how": "Follow the same structure (mock store returns, call search with categories, assert on results) but add Graphiti results to the mock setup to test the cross-store filtering behavior."
+      "what": "HTML assertion pattern from TestIndex",
+      "where": "dashboard/tests/test_app.py lines 11-36",
+      "how": "Follow the same pattern: client.get('/').text then assert substring presence in HTML. This is the established convention for testing template output."
     }
   ]
 }
