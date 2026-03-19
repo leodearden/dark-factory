@@ -291,7 +291,7 @@ async def test_not_quiescent_when_bursting(tmp_path):
 async def test_not_quiescent_when_queue_active(tmp_path):
     """165 events + pending queue items → no conditional trigger."""
     async def mock_queue_stats():
-        return {'pending': 3, 'retry': 0, 'in_flight': 0}
+        return {'counts': {'pending': 3, 'retry': 0, 'in_flight': 0}, 'oldest_pending_age_seconds': None}
 
     buf = EventBuffer(
         db_path=tmp_path / 'no_q_queue.db',
