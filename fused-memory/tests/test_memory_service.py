@@ -147,6 +147,21 @@ class TestExecuteGraphitiWrite:
         call_kwargs = service.graphiti.add_episode.call_args[1]
         assert call_kwargs.get('uuid') == test_uuid
 
+    @pytest.mark.asyncio
+    async def test_missing_uuid_passes_none(self, service):
+        """Legacy payloads without uuid should pass uuid=None without error."""
+        payload = {
+            'name': 'episode_legacy',
+            'content': 'legacy content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+        service.graphiti.add_episode.assert_called_once()
+        call_kwargs = service.graphiti.add_episode.call_args[1]
+        assert call_kwargs.get('uuid') is None
+
 
 class TestReplayFromStore:
     @pytest.mark.asyncio
