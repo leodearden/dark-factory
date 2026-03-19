@@ -251,7 +251,7 @@ class TestReconPartialIntegration:
 
 
 _MOCK_ORCHESTRATOR = {
-    'pid': 1234,
+    'pids': [1234],
     'prd': '/home/leo/src/dark-factory/prd/dashboard.md',
     'running': True,
     'started': 'Mar18',
