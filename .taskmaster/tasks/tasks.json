@@ -149,13 +149,13 @@
         "description": "Create the orchestrator list and task detail HTML partial templates and their FastAPI routes, wiring data from the orchestrator discovery module.",
         "details": "Create `dashboard/src/dashboard/templates/partials/orchestrators.html`:\n\n**Header**: \"Orchestrators\" (text-xl font-bold) + count of running instances as badge (bg-blue-600 rounded-full px-2 text-sm).\n\n**Per-orchestrator card** (bg-gray-800 rounded-lg p-6 mb-4):\n- **Header line**: PID with green \"running\" badge (bg-green-600 text-xs rounded px-2 py-0.5) or gray \"completed\" badge. PRD filename (extracted from path, text-gray-400).\n- **Progress bar**: Full-width bar (h-3 rounded-full bg-gray-700 overflow-hidden). Colored segments inside as flex children: green (done), blue (in-progress), yellow (pending), red (blocked). Width proportional to count/total.\n- **Stats row**: Flex with gap, each stat: count + label. \"N done \u00b7 N in-progress \u00b7 N blocked \u00b7 N pending\" with matching colors.\n- **Expand button**: \"Show tasks\" / \"Hide tasks\" toggle using Alpine.js `@click=\"open = !open\"` and `x-show=\"open\"`. Wrap card in `<div x-data=\"{ open: false }\">`.\n\nCreate `dashboard/src/dashboard/templates/partials/tasks.html`:\n\n**Task table** (inside the expandable section, rendered per orchestrator):\n- Table with classes: w-full text-sm text-left text-gray-300.\n- Header row: ID, Title, Status, Phase, Iterations, Reviews, Modules (bg-gray-700 text-gray-400 text-xs uppercase).\n- Data rows: \n  - **Status** as badge: bg-green-600=done, bg-blue-600=in-progress, bg-yellow-600=pending, bg-red-600=blocked, bg-gray-600=cancelled/deferred.\n  - **Phase**: short label (PLAN/EXEC/VERIFY/REVIEW/MERGE/DONE/\u2014) with muted color.\n  - **Iterations**: number or \"\u2014\".\n  - **Reviews**: e.g. \"3/5 PASS\" or \"\u2014\".\n  - **Modules**: comma-joined, text-xs text-gray-500, truncated with `truncate max-w-[200px]`.\n\nIf no orchestrators found, show a centered message: \"No orchestrators detected\" with gray text.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/orchestrators` async route: call discover_orchestrators(config), render orchestrators.html with the orchestrator list. The tasks.html partial is included inline within orchestrators.html (use Jinja2 include or render tasks directly in the template loop).\n\nTest strategy: verify route returns 200. Test with mock discover_orchestrators returning both empty list and a list with one running + one completed orchestrator. Check HTML contains progress bar, stats, task table elements.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [
           "19"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-19T08:17:15.591Z"
+        "updatedAt": "2026-03-19T08:50:12.235Z"
       },
       {
         "id": "23",
@@ -254,9 +254,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-19T08:19:56.055Z",
+      "lastModified": "2026-03-19T08:50:12.235Z",
       "taskCount": 17,
-      "completedCount": 10,
+      "completedCount": 11,
       "tags": [
         "master"
       ]
