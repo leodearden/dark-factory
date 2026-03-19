@@ -187,7 +187,7 @@ class TaskWorkflow:
                     return merge_outcome
 
                 # POST-MERGE VERIFY
-                post_merge = await run_verification(self.config.project_root, self.config)
+                post_merge = await run_verification(self.config.project_root, self.config, self._module_config)
                 if not post_merge.passed:
                     logger.error(f'Task {self.task_id}: post-merge verification failed')
                     await self.git_ops.revert_last_merge(self.config.project_root)
@@ -565,7 +565,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         if merger_result.success and 'BLOCKED' not in merger_result.output.upper():
             # Verify the merge resolution
-            verify = await run_verification(self.config.project_root, self.config)
+            verify = await run_verification(self.config.project_root, self.config, self._module_config)
             if verify.passed:
                 return WorkflowOutcome.DONE
             else:
