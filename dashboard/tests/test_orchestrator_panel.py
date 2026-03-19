@@ -156,3 +156,70 @@ class TestOrchestratorRouteEmpty:
         with _patch_orchestrator_data([]):
             html = client.get('/partials/orchestrators').text
         assert 'bg-green-600' not in html
+
+
+class TestTaskTable:
+    """Tests for the task detail table rendered inside orchestrator cards."""
+
+    def test_table_headers(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        for header in ('ID', 'Title', 'Status', 'Phase', 'Iterations', 'Reviews', 'Modules'):
+            assert header in html
+
+    def test_table_classes(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'w-full' in html
+        assert 'text-sm' in html
+        assert 'text-left' in html
+        assert 'text-gray-300' in html
+
+    def test_task_status_done_badge(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # done tasks produce green badges (bg-green-600 already checked elsewhere,
+        # but verify 'done' text appears in table context)
+        assert 'done' in html
+
+    def test_task_status_blocked_badge(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'bg-red-600' in html
+
+    def test_phase_exec_label(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # Task 3 has EXECUTE phase worktree, displayed as EXEC
+        assert 'EXEC' in html
+
+    def test_phase_done_label(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # Task 1 has DONE phase worktree
+        assert 'DONE' in html
+
+    def test_iteration_count(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # Task 3 worktree has iteration_count=5
+        assert '5' in html
+
+    def test_review_summary(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # Task 3 worktree has review_summary='3/5 passed'
+        assert '3/5 passed' in html
+
+    def test_modules_displayed(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # Task 3 worktree has modules=['auth/', 'api/']
+        assert 'auth/' in html
+        assert 'api/' in html
+
+    def test_task_without_worktree_shows_dash(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # Tasks 2, 4, 5 have no worktree entries — should show em-dash
+        assert '\u2014' in html or '&mdash;' in html
