@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from orchestrator.config import AccountConfig, UsageCapConfig
-from orchestrator.usage_gate import (
+from shared.config_models import AccountConfig, UsageCapConfig
+from shared.usage_gate import (
     AccountState,
     SessionBudgetExhausted,
     UsageGate,

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from datetime import UTC, datetime
 
 from fused_memory.config.schema import ReconciliationConfig
@@ -15,10 +16,12 @@ logger = logging.getLogger(__name__)
 class Judge:
     """Async LLM reviewer that evaluates reconciliation run quality."""
 
-    def __init__(self, config: ReconciliationConfig, journal: ReconciliationJournal):
+    def __init__(self, config: ReconciliationConfig, journal: ReconciliationJournal,
+                 usage_gate=None):
         self.config = config
         self.journal = journal
         self._halted_projects: set[str] = set()
+        self._usage_gate = usage_gate
 
     async def review_run(self, run_id: str) -> JudgeVerdict | None:
         """Review a completed reconciliation run asynchronously."""
@@ -157,47 +160,73 @@ Review this run and provide your verdict as JSON.
             return response.choices[0].message.content or ''
 
     async def _call_judge_cli(self, prompt: str) -> str:
-        """Single-shot Claude CLI call for judge evaluation."""
+        """Single-shot Claude CLI call for judge evaluation.
+
+        Includes: stdin isolation, stdout+stderr error reading, and usage-cap
+        retry with account failover when a UsageGate is attached.
+        """
         import asyncio as _asyncio
 
-        cmd = [
-            'claude', '--print', '--output-format', 'json',
-            '--model', self.config.judge_llm_model,
-            '--system-prompt', JUDGE_SYSTEM_PROMPT,
-            '--permission-mode', 'bypassPermissions',
-            '--tools', '',
-            '--', prompt,
-        ]
+        while True:
+            # Gate: get OAuth token (or None)
+            oauth_token = None
+            if self._usage_gate:
+                oauth_token = await self._usage_gate.before_invoke()
 
-        try:
-            proc = await _asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=_asyncio.subprocess.PIPE,
-                stderr=_asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                'Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code'
-            ) from exc
+            cmd = [
+                'claude', '--print', '--output-format', 'json',
+                '--model', self.config.judge_llm_model,
+                '--system-prompt', JUDGE_SYSTEM_PROMPT,
+                '--permission-mode', 'bypassPermissions',
+                '--tools', '',
+                '--', prompt,
+            ]
 
-        try:
-            stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=120)
-        except TimeoutError as exc:
-            proc.kill()
-            raise RuntimeError('Claude CLI timed out after 120 seconds') from exc
+            # Build env: strip ANTHROPIC_API_KEY, inject OAuth token
+            env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+            if oauth_token:
+                env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
 
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f'Claude CLI exited with code {proc.returncode}: '
-                f'{stderr.decode()[-500:]}'
-            )
+            try:
+                proc = await _asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=_asyncio.subprocess.DEVNULL,
+                    stdout=_asyncio.subprocess.PIPE,
+                    stderr=_asyncio.subprocess.PIPE,
+                    env=env,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    'Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code'
+                ) from exc
 
-        raw = stdout.decode()
-        if not raw.strip():
-            return ''
+            try:
+                stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=120)
+            except TimeoutError as exc:
+                proc.kill()
+                raise RuntimeError('Claude CLI timed out after 120 seconds') from exc
 
-        result = json.loads(raw)
-        return result.get('result', '')
+            stdout_text = stdout.decode()
+            stderr_text = stderr.decode()
+
+            # Check for cap hit before processing results
+            if self._usage_gate and self._usage_gate.detect_cap_hit(
+                stderr_text, stdout_text, 'claude', oauth_token=oauth_token,
+            ):
+                logger.warning('Usage cap hit during judge CLI call, retrying')
+                continue
+
+            if proc.returncode != 0:
+                error_detail = stderr_text[-500:] if stderr_text.strip() else stdout_text[-500:]
+                raise RuntimeError(
+                    f'Claude CLI exited with code {proc.returncode}: {error_detail}'
+                )
+
+            if not stdout_text.strip():
+                return ''
+
+            result = json.loads(stdout_text)
+            return result.get('result', '')
 
     def _parse_verdict(self, response_text: str, run_id: str) -> JudgeVerdict:
         """Parse judge response into JudgeVerdict."""

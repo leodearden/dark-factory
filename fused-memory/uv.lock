@@ -334,6 +334,21 @@ wheels = [
 ]
 
 [[package]]
+name = "dark-factory-shared"
+version = "0.1.0"
+source = { editable = "../shared" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "pydantic", specifier = ">=2.7" },
+]
+
+[[package]]
 name = "distro"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -371,6 +386,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
     { name = "anthropic" },
+    { name = "dark-factory-shared" },
     { name = "graphiti-core", extra = ["falkordb"] },
     { name = "mcp" },
     { name = "mem0ai" },
@@ -393,6 +409,7 @@ dev = [
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20.0" },
     { name = "anthropic", specifier = ">=0.52.0" },
+    { name = "dark-factory-shared", editable = "../shared" },
     { name = "graphiti-core", extras = ["falkordb"], specifier = ">=0.28.1" },
     { name = "mcp", specifier = ">=1.9.4" },
     { name = "mem0ai", specifier = ">=1.0.5" },

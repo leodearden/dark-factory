@@ -85,3 +85,14 @@ reconciliation:
   judge_llm_provider: "claude_cli"
   judge_llm_model: "sonnet"
   explore_codebase_root: "${PROJECT_ROOT:.}"
+  usage_cap:
+    enabled: true
+    pause_threshold: 0.96
+    wait_for_reset: true
+    probe_interval_secs: 300
+    max_probe_interval_secs: 1800
+    accounts:
+      - name: max-a
+        oauth_token_env: CLAUDE_OAUTH_TOKEN_A
+      - name: max-b
+        oauth_token_env: CLAUDE_OAUTH_TOKEN_B

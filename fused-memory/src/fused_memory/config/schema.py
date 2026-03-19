@@ -7,6 +7,7 @@ from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field
+from shared.config_models import UsageCapConfig
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -221,6 +222,9 @@ class ReconciliationConfig(BaseModel):
     # Safety
     max_mutations_per_stage: int = Field(default=50)
     halt_on_judge_serious: bool = Field(default=True)
+
+    # Usage cap detection and multi-account failover
+    usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)
 
 
 # --- Top-level ---

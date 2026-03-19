@@ -24,6 +24,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 )
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
+from shared.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
 
@@ -45,22 +46,30 @@ class ReconciliationHarness:
         self.buffer = event_buffer
         self.config = config.reconciliation
 
+        # Usage gate (multi-account cap failover)
+        self.usage_gate: UsageGate | None = None
+        if hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
+            self.usage_gate = UsageGate(self.config.usage_cap)
+
         # Verifier
         verifier = CodebaseVerifier(self.config) if self.config.explore_codebase_root else None
 
         # Build stages
         stage1 = MemoryConsolidator(
-            StageId.memory_consolidator, memory_service, taskmaster, journal, self.config
+            StageId.memory_consolidator, memory_service, taskmaster, journal, self.config,
+            usage_gate=self.usage_gate,
         )
         stage1.verifier = verifier
 
         stage2 = TaskKnowledgeSync(
-            StageId.task_knowledge_sync, memory_service, taskmaster, journal, self.config
+            StageId.task_knowledge_sync, memory_service, taskmaster, journal, self.config,
+            usage_gate=self.usage_gate,
         )
         stage2.verifier = verifier
 
         stage3 = IntegrityCheck(
-            StageId.integrity_check, memory_service, taskmaster, journal, self.config
+            StageId.integrity_check, memory_service, taskmaster, journal, self.config,
+            usage_gate=self.usage_gate,
         )
         stage3.verifier = verifier
 
@@ -68,12 +77,15 @@ class ReconciliationHarness:
 
         # Judge
         self.judge = (
-            Judge(self.config, journal) if self.config.judge_enabled else None
+            Judge(self.config, journal, usage_gate=self.usage_gate)
+            if self.config.judge_enabled else None
         )
 
     async def run_loop(self) -> None:
         """Background loop — check trigger conditions, run pipeline when needed."""
         logger.info('Reconciliation harness background loop started')
+        if self.usage_gate:
+            await self.usage_gate.check_at_startup()
         loop_count = 0
         while True:
             try:

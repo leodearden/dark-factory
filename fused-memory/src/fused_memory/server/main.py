@@ -7,6 +7,10 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import MemoryService

@@ -85,7 +85,7 @@ class ReconciliationRun(BaseModel):
     started_at: datetime
     completed_at: datetime | None = None
     events_processed: int = 0
-    stage_reports: dict[str, StageReport] = Field(default_factory=dict)
+    stage_reports: dict[str, StageReport | dict] = Field(default_factory=dict)
     status: str = 'running'  # 'running', 'completed', 'failed', 'rolled_back', 'circuit_breaker'
 
 

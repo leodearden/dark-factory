@@ -17,10 +17,12 @@ dependencies = [
     "pydantic-settings>=2.0",
     "pyyaml>=6.0",
     "escalation",
+    "dark-factory-shared",
 ]
 
 [tool.uv.sources]
 escalation = { path = "../escalation", editable = true }
+dark-factory-shared = { path = "../shared", editable = true }
 
 [project.scripts]
 orchestrator = "orchestrator.cli:main"

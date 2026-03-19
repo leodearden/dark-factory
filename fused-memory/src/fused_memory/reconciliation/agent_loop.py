@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid as uuid_mod
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -70,6 +71,7 @@ class AgentLoop:
         system_prompt: str,
         tools: dict[str, ToolDefinition],
         terminal_tool: str = 'stage_complete',
+        usage_gate=None,
     ):
         self.config = config
         self.system_prompt = system_prompt
@@ -80,6 +82,7 @@ class AgentLoop:
         self.llm_call_count: int = 0
         self.token_count: int = 0
         self._cli_session_id: str | None = None
+        self._usage_gate = usage_gate
 
     async def run(self, initial_payload: str) -> tuple[dict, list[JournalEntry]]:
         """Execute agent loop. Returns (terminal_tool_args, journal_entries)."""
@@ -312,85 +315,115 @@ class AgentLoop:
         return '\n\n'.join(parts)
 
     async def _call_claude_cli(self, messages: list[dict], tool_schemas: list[dict]) -> Any:
-        """Call Claude via CLI subprocess with --resume for multi-turn."""
+        """Call Claude via CLI subprocess with --resume for multi-turn.
+
+        Includes: stdin isolation, stdout+stderr error reading, and usage-cap
+        retry with account failover when a UsageGate is attached.
+        """
         import asyncio as _asyncio
 
-        is_first_call = self._cli_session_id is None
-        if is_first_call:
-            self._cli_session_id = str(uuid_mod.uuid4())
+        while True:
+            # 1. Gate: get OAuth token (or None)
+            oauth_token = None
+            if self._usage_gate:
+                oauth_token = await self._usage_gate.before_invoke()
 
-        cmd = [
-            'claude', '--print', '--output-format', 'json',
-            '--model', self.config.agent_llm_model,
-            '--json-schema', json.dumps(CLAUDE_CLI_RESPONSE_SCHEMA),
-            '--permission-mode', 'bypassPermissions',
-            '--tools', '',
-        ]
+            is_first_call = self._cli_session_id is None
+            if is_first_call:
+                self._cli_session_id = str(uuid_mod.uuid4())
 
-        if is_first_call:
-            cmd.extend(['--system-prompt', self._build_cli_system_prompt(tool_schemas)])
-            cmd.extend(['--session-id', self._cli_session_id])
-            prompt = messages[-1]['content']  # Initial payload string
-        else:
-            cmd.extend(['--resume', self._cli_session_id])
-            prompt = self._serialize_tool_results(messages[-1]['content'])
+            cmd = [
+                'claude', '--print', '--output-format', 'json',
+                '--model', self.config.agent_llm_model,
+                '--json-schema', json.dumps(CLAUDE_CLI_RESPONSE_SCHEMA),
+                '--permission-mode', 'bypassPermissions',
+                '--tools', '',
+            ]
 
-        cmd.extend(['--', prompt])
-
-        try:
-            proc = await _asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=_asyncio.subprocess.PIPE,
-                stderr=_asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                'Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code'
-            ) from exc
-
-        try:
-            stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=180)
-        except TimeoutError as exc:
-            proc.kill()
-            raise RuntimeError('Claude CLI timed out after 180 seconds') from exc
-
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f'Claude CLI exited with code {proc.returncode}: '
-                f'{stderr.decode()[-500:]}'
-            )
-
-        raw = stdout.decode()
-        if not raw.strip():
-            raise RuntimeError('Claude CLI produced no output')
-
-        result = json.loads(raw)
-
-        # Update session_id from result if available
-        if result.get('session_id'):
-            self._cli_session_id = result['session_id']
-
-        # Extract structured output
-        structured = result.get('structured_output')
-        if isinstance(structured, str):
-            structured = json.loads(structured)
-        if not structured:
-            result_text = result.get('result', '')
-            if result_text:
-                try:
-                    structured = json.loads(result_text)
-                except (json.JSONDecodeError, TypeError):
-                    structured = {'thinking': result_text, 'tool_calls': []}
+            if is_first_call:
+                cmd.extend(['--system-prompt', self._build_cli_system_prompt(tool_schemas)])
+                cmd.extend(['--session-id', self._cli_session_id])
+                prompt = messages[-1]['content']  # Initial payload string
             else:
-                structured = {'thinking': '', 'tool_calls': []}
+                cmd.extend(['--resume', self._cli_session_id])
+                prompt = self._serialize_tool_results(messages[-1]['content'])
 
-        self.llm_call_count += 1
-        self.token_count += (
-            int(result.get('num_input_tokens', 0))
-            + int(result.get('num_output_tokens', 0))
-        )
+            cmd.extend(['--', prompt])
 
-        return _CLIResponseAdapter(structured)
+            # 2. Build env: strip ANTHROPIC_API_KEY, inject OAuth token
+            env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+            if oauth_token:
+                env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
+
+            try:
+                proc = await _asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=_asyncio.subprocess.DEVNULL,
+                    stdout=_asyncio.subprocess.PIPE,
+                    stderr=_asyncio.subprocess.PIPE,
+                    env=env,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    'Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code'
+                ) from exc
+
+            try:
+                stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=180)
+            except TimeoutError as exc:
+                proc.kill()
+                raise RuntimeError('Claude CLI timed out after 180 seconds') from exc
+
+            stdout_text = stdout.decode()
+            stderr_text = stderr.decode()
+
+            # 3. Check for cap hit before processing results
+            if self._usage_gate and self._usage_gate.detect_cap_hit(
+                stderr_text, stdout_text, 'claude', oauth_token=oauth_token,
+            ):
+                logger.warning('Usage cap hit during CLI call, resetting session and retrying')
+                # Reset session so next call starts fresh (can't --resume a capped session)
+                if is_first_call:
+                    self._cli_session_id = None
+                continue
+
+            # 4. Non-zero exit: include both stdout and stderr in error
+            if proc.returncode != 0:
+                error_detail = stderr_text[-500:] if stderr_text.strip() else stdout_text[-500:]
+                raise RuntimeError(
+                    f'Claude CLI exited with code {proc.returncode}: {error_detail}'
+                )
+
+            if not stdout_text.strip():
+                raise RuntimeError('Claude CLI produced no output')
+
+            result = json.loads(stdout_text)
+
+            # Update session_id from result if available
+            if result.get('session_id'):
+                self._cli_session_id = result['session_id']
+
+            # Extract structured output
+            structured = result.get('structured_output')
+            if isinstance(structured, str):
+                structured = json.loads(structured)
+            if not structured:
+                result_text = result.get('result', '')
+                if result_text:
+                    try:
+                        structured = json.loads(result_text)
+                    except (json.JSONDecodeError, TypeError):
+                        structured = {'thinking': result_text, 'tool_calls': []}
+                else:
+                    structured = {'thinking': '', 'tool_calls': []}
+
+            self.llm_call_count += 1
+            self.token_count += (
+                int(result.get('num_input_tokens', 0))
+                + int(result.get('num_output_tokens', 0))
+            )
+
+            return _CLIResponseAdapter(structured)
 
 
 class _OpenAIResponseAdapter:

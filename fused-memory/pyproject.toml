@@ -20,7 +20,11 @@ dependencies = [
     "openai>=1.90.0",
     "anthropic>=0.52.0",
     "aiosqlite>=0.20.0",
+    "dark-factory-shared",
 ]
+
+[tool.uv.sources]
+dark-factory-shared = { path = "../shared", editable = true }
 
 [tool.pyright]
 include = ["src", "tests"]

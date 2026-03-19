@@ -284,6 +284,21 @@ wheels = [
 ]
 
 [[package]]
+name = "dark-factory-shared"
+version = "0.1.0"
+source = { editable = "../shared" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "pydantic", specifier = ">=2.7" },
+]
+
+[[package]]
 name = "dnspython"
 version = "2.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -683,6 +698,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
+    { name = "dark-factory-shared" },
     { name = "escalation" },
     { name = "httpx" },
     { name = "pydantic" },
@@ -702,6 +718,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.0" },
+    { name = "dark-factory-shared", editable = "../shared" },
     { name = "escalation", editable = "../escalation" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.7" },

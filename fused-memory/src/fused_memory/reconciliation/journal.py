@@ -195,10 +195,12 @@ class ReconciliationJournal:
         await db.commit()
 
     async def update_run_stage_reports(
-        self, run_id: str, stage_reports: dict[str, StageReport]
+        self, run_id: str, stage_reports: dict[str, StageReport | dict]
     ) -> None:
         db = self._require_db()
-        serialized = {k: v.model_dump(mode='json') for k, v in stage_reports.items()}
+        serialized = {}
+        for k, v in stage_reports.items():
+            serialized[k] = v.model_dump(mode='json') if hasattr(v, 'model_dump') else v
         await db.execute(
             'UPDATE runs SET stage_reports = ? WHERE id = ?',
             (json.dumps(serialized), run_id),

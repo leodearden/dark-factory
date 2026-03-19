@@ -34,6 +34,7 @@ class BaseStage:
         taskmaster: TaskmasterBackend | None,
         journal: ReconciliationJournal,
         config: ReconciliationConfig,
+        usage_gate=None,
     ):
         self.stage_id = stage_id
         self.memory = memory_service
@@ -42,6 +43,7 @@ class BaseStage:
         self.config = config
         self.project_id: str = ''
         self.project_root: str = ''
+        self._usage_gate = usage_gate
 
     def get_tools(self) -> dict[str, ToolDefinition]:
         """Override in subclass — return tools available to this stage."""
@@ -103,6 +105,7 @@ class BaseStage:
             system_prompt=self.get_system_prompt(),
             tools=tools,
             terminal_tool='stage_complete',
+            usage_gate=self._usage_gate,
         )
 
         started = datetime.now(UTC)
