@@ -179,6 +179,34 @@ class TestMemoryPartialDots:
             # All 4 cards should have green dots when everything is connected
             assert html.count('bg-green-500') >= 3
 
+    def test_taskmaster_red_when_disconnected(self, client):
+        status = {
+            'graphiti': {'connected': True, 'node_count': 10},
+            'mem0': {'connected': True, 'memory_count': 5},
+            'taskmaster': {'connected': False},
+        }
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=status),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'bg-red-500' in html
+
+    def test_taskmaster_shows_disconnected_text(self, client):
+        status = {
+            'graphiti': {'connected': True, 'node_count': 10},
+            'mem0': {'connected': True, 'memory_count': 5},
+            'taskmaster': {'connected': False},
+        }
+        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=status),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'Disconnected' in html
+
 
 class TestWriteQueueCard:
     def test_queue_dot_green_all_zero(self, client):
