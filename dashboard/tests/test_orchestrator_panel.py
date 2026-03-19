@@ -61,3 +61,22 @@ class TestOrchestratorRouteBasics:
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             resp = client.get('/partials/orchestrators')
         assert 'text/html' in resp.headers['content-type']
+
+
+class TestOrchestratorRouteEmpty:
+    """Tests for GET /partials/orchestrators with no orchestrators."""
+
+    def test_returns_200(self, client):
+        with _patch_orchestrator_data([]):
+            resp = client.get('/partials/orchestrators')
+        assert resp.status_code == 200
+
+    def test_no_orchestrators_message(self, client):
+        with _patch_orchestrator_data([]):
+            html = client.get('/partials/orchestrators').text
+        assert 'No orchestrators detected' in html
+
+    def test_no_progress_elements(self, client):
+        with _patch_orchestrator_data([]):
+            html = client.get('/partials/orchestrators').text
+        assert 'bg-green-600' not in html
