@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from dashboard.config import DashboardConfig
-from dashboard.data.memory import get_memory_status, get_queue_stats
+from dashboard.data import memory as memory_data
 
 _pkg_dir = Path(__file__).parent
 
@@ -40,8 +40,8 @@ async def health():
 async def memory_partial(request: Request):
     http_client = request.app.state.http_client
     config = request.app.state.config
-    status = await get_memory_status(http_client, config)
-    queue = await get_queue_stats(http_client, config)
+    status = await memory_data.get_memory_status(http_client, config)
+    queue = await memory_data.get_queue_stats(http_client, config)
     return templates.TemplateResponse(
         request, 'partials/memory.html', context={'status': status, 'queue': queue}
     )
