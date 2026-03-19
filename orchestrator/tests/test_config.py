@@ -48,6 +48,10 @@ class TestDefaults:
         assert '../' not in config.fused_memory.config_path
         assert not any('../' in arg for arg in config.fused_memory.server_command)
 
+    def test_project_root_resolved_to_absolute(self):
+        config = OrchestratorConfig(project_root=Path('.'))
+        assert config.project_root.is_absolute() is True
+
 
 class TestYamlLoading:
     def test_load_from_yaml(self, tmp_path: Path):
