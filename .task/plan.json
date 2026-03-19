@@ -1,0 +1,148 @@
+{
+  "task_id": "17",
+  "title": "Memory data module",
+  "modules": [
+    "dashboard/src/dashboard/data",
+    "dashboard/tests"
+  ],
+  "analysis": "Create dashboard/src/dashboard/data/memory.py \u2014 a data access layer for memory health metrics from the fused-memory MCP HTTP server. The module follows the same pattern as the existing reconciliation.py data module (async functions returning dicts, graceful error handling), but instead of querying SQLite it makes HTTP JSON-RPC calls to the fused-memory MCP endpoint. The orchestrator's briefing.py already demonstrates the exact MCP call pattern: POST to {base_url}/mcp/ with JSON-RPC body, parse result.content[0].text. We need three functions: (1) mcp_tool_call \u2014 generic low-level JSON-RPC caller, (2) get_memory_status \u2014 calls get_status tool, (3) get_queue_stats \u2014 calls get_queue_stats tool. Tests will use httpx.MockTransport to intercept HTTP calls, following the project's existing async test patterns (pytest-asyncio auto mode, class-based test organization). The MCP response envelope wraps tool output as {\"result\": {\"content\": [{\"type\": \"text\", \"text\": \"<json-encoded-dict>\"}]}}.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write test_memory.py with TestMcpToolCall class: test_successful_call mocks httpx transport to return a valid MCP JSON-RPC response, asserts mcp_tool_call returns the parsed inner dict. test_timeout mocks transport to raise httpx.TimeoutException, asserts the exception propagates. test_non_200_status mocks a 500 response, verifies error handling.",
+      "status": "done",
+      "commit": "a07c983"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Create dashboard/src/dashboard/data/memory.py with the mcp_tool_call function: POST JSON-RPC to {base_url}/mcp with body {jsonrpc: 2.0, id: 1, method: tools/call, params: {name, arguments}}, timeout 10s. Parse response: extract result.content[0].text, json.loads it, return dict. Raise ValueError on non-200 or missing content.",
+      "status": "done",
+      "commit": "c3ca942"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write TestGetMemoryStatus class: test_successful_status mocks transport returning a valid MCP response wrapping {graphiti: {connected: true, node_count: 42}, mem0: {connected: true, memory_count: 5}, queue: {counts: {...}, oldest_pending_age_seconds: 1.2}}. Asserts returned dict matches expected structure. test_connect_error mocks httpx.ConnectError, asserts returns {offline: True, error: str}. test_timeout mocks httpx.TimeoutException, asserts returns {offline: True, error: str}.",
+      "status": "done",
+      "commit": "d6e79dc"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Implement get_memory_status: calls mcp_tool_call with tool_name='get_status' and arguments={project_id: config.fused_memory_project_id}. Wraps call in try/except for httpx.ConnectError and httpx.TimeoutException, returning {offline: True, error: str(e)} on failure.",
+      "status": "done",
+      "commit": "1c1a379"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write TestGetQueueStats class: test_successful_stats mocks transport returning valid MCP response wrapping {counts: {pending: 3, in_flight: 1, retry: 0, completed: 10, dead: 0}, oldest_pending_age_seconds: 5.5}. Asserts returned dict matches. test_connect_error and test_timeout verify offline fallback dict.",
+      "status": "done",
+      "commit": "79a94d9"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Implement get_queue_stats: calls mcp_tool_call with tool_name='get_queue_stats' and arguments={}. Same ConnectError/TimeoutException fallback pattern as get_memory_status.",
+      "status": "done",
+      "commit": "a948e8d"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write TestMalformedResponse class: test_missing_content_key mocks response with valid JSON but no result.content path, verifies graceful handling (returns empty dict or raises clear ValueError). test_invalid_inner_json mocks response where text field contains non-JSON string, verifies graceful handling. test_empty_content_array mocks response with result.content as empty list.",
+      "status": "done",
+      "commit": "e6a8378"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Harden mcp_tool_call to handle malformed responses: add defensive checks for missing result/content keys and invalid JSON in text field. Return empty dict or raise ValueError with descriptive message as appropriate. Run full test suite to confirm all tests pass.",
+      "status": "done",
+      "commit": "28fc0ac"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write failing tests for three blocking review issues. (1) Add test_non_200_response_returns_offline to TestGetMemoryStatus: mock transport returns HTTP 500, assert get_memory_status returns {offline: True, error: str} (not an uncaught ValueError). This covers the untested failure mode where mcp_tool_call raises ValueError on non-200 and the get_* function must catch it. (2) Add test_non_200_response_returns_offline to TestGetQueueStats: same pattern — mock 500 response, assert get_queue_stats returns {offline: True, error: str}. (3) Add test_non_json_body_returns_empty_dict to TestMcpToolCall: mock transport returns HTTP 200 with non-JSON body (e.g. HTML string '<html>Bad Gateway</html>'), assert mcp_tool_call returns {} instead of raising json.JSONDecodeError from resp.json(). All three tests should FAIL against the current implementation, proving the gaps identified by reviewers.",
+      "status": "done",
+      "commit": "bc25e2a"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Fix all three blocking issues in dashboard/src/dashboard/data/memory.py. (1) In get_memory_status, widen the except clause on line 78 to include ValueError: `except (httpx.ConnectError, httpx.TimeoutException, ValueError) as e:` — so a non-200 response from the MCP server produces the {offline: True, error: ...} fallback instead of propagating. (2) In get_queue_stats, apply the same fix on line 95: `except (httpx.ConnectError, httpx.TimeoutException, ValueError) as e:`. (3) In mcp_tool_call, wrap the resp.json() call on line 50 in try/except: `try: data = resp.json() except (json.JSONDecodeError, ValueError): return {}` — so a 200 response with non-JSON body (e.g. HTML from reverse proxy) returns empty dict instead of crashing. Update the docstring for get_memory_status and get_queue_stats to document that ValueError (from non-200 MCP responses) is also caught. Run the full test suite to confirm all tests pass including the new ones from step-9.",
+      "status": "done",
+      "commit": "523f24c"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use httpx.MockTransport for test mocking instead of pytest-httpx",
+      "rationale": "MockTransport is built into httpx (already a dependency), requires no extra package, and matches the project's minimalist dependency approach. It gives full control over response bodies and can simulate exceptions by raising in the handler."
+    },
+    {
+      "decision": "mcp_tool_call is a standalone function, not a method on a class",
+      "rationale": "Matches the existing reconciliation.py pattern where each function is a standalone async function. The client and base_url are passed as arguments, keeping the function stateless and easy to test."
+    },
+    {
+      "decision": "Parse MCP response envelope inline in mcp_tool_call rather than in each caller",
+      "rationale": "The JSON-RPC envelope structure (result.content[0].text \u2192 json.loads) is the same for every tool call. Centralizing parsing in mcp_tool_call avoids duplication and makes the higher-level functions (get_memory_status, get_queue_stats) cleaner."
+    },
+    {
+      "decision": "Error handling catches httpx.ConnectError and httpx.TimeoutException at the get_* function level, not in mcp_tool_call",
+      "rationale": "mcp_tool_call is a generic transport function that should let network errors propagate. The higher-level functions know the right fallback shape ({offline: True, error: ...}) for their consumers. This separation keeps mcp_tool_call reusable for future tools that may want different error handling."
+    },
+    {
+      "decision": "Malformed MCP responses return empty dict from mcp_tool_call",
+      "rationale": "Per task spec: 'returns empty dict or raises clear error'. An empty dict is safest for dashboard rendering \u2014 the template can check for missing keys and show placeholder text rather than crashing."
+    },
+    {
+      "decision": "POST to {base_url}/mcp (no trailing slash)",
+      "rationale": "The task spec says POST to {base_url}/mcp. The orchestrator's briefing.py uses /mcp/ with trailing slash. We'll use the trailing-slash variant to match the existing working pattern in the codebase, since FastMCP mounts with trailing slash."
+    },
+    {
+      "decision": "ValueError from mcp_tool_call (non-200 status) is caught at the get_* level alongside httpx network errors",
+      "rationale": "Review identified that a running-but-broken MCP server returning 500/503 is a realistic failure mode. The ValueError raised by mcp_tool_call for non-200 responses must produce the same {offline: True, error: ...} fallback as connection/timeout errors. This keeps the contract documented in the docstrings honest: all server-unreachable-or-broken scenarios return the offline fallback dict. mcp_tool_call itself continues to raise ValueError (not catch it) so future callers with different error handling needs can still intercept it."
+    },
+    {
+      "decision": "resp.json() parse failure returns empty dict from mcp_tool_call, consistent with other malformed response handling",
+      "rationale": "A 200 response with non-JSON body (e.g., HTML from a reverse proxy or WAF) is a malformed response, same category as missing content keys or invalid inner JSON \u2014 all of which already return {}. Consistent treatment: any response that can't be parsed into a valid tool result yields empty dict, letting the caller (get_* functions) decide whether to treat an empty result as noteworthy."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "MCP JSON-RPC call pattern",
+      "where": "orchestrator/src/orchestrator/agents/briefing.py lines 228-254",
+      "how": "Reuse the exact same JSON-RPC envelope structure: POST to {url}/mcp/, body with jsonrpc/id/method/params, parse result.content[0].text. The new mcp_tool_call function generalizes this pattern."
+    },
+    {
+      "what": "DashboardConfig dataclass",
+      "where": "dashboard/src/dashboard/config.py",
+      "how": "Import and use config.fused_memory_url and config.fused_memory_project_id for MCP endpoint URL and project scoping."
+    },
+    {
+      "what": "Test fixture pattern \u2014 dashboard_config with tmp_path",
+      "where": "dashboard/tests/conftest.py line 88-93",
+      "how": "Reuse existing dashboard_config fixture for tests that need a config object. The fixture already sets up a DashboardConfig with tmp_path-based project_root."
+    },
+    {
+      "what": "Test organization pattern \u2014 class-based with async methods",
+      "where": "dashboard/tests/test_reconciliation.py",
+      "how": "Follow the same TestClassName pattern with async test methods, one class per function under test, testing happy path, error cases, and edge cases."
+    },
+    {
+      "what": "httpx.AsyncClient from app lifespan",
+      "where": "dashboard/src/dashboard/app.py line 21",
+      "how": "The FastAPI app already creates an httpx.AsyncClient in its lifespan. The memory.py functions accept client as a parameter, so routes can pass app.state.http_client."
+    },
+    {
+      "what": "Module docstring and import conventions",
+      "where": "dashboard/src/dashboard/data/reconciliation.py",
+      "how": "Follow same style: from __future__ import annotations, descriptive module docstring, return dicts not dataclasses."
+    }
+  ]
+}
