@@ -66,6 +66,62 @@ class TestMcpToolCall:
             with pytest.raises(ValueError, match='non-200'):
                 await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
 
+    async def test_307_redirect_followed_with_follow_redirects(self):
+        """Regression: 307 from /mcp/ to /mcp is followed when follow_redirects=True.
+
+        Documents the original bug: the fused-memory MCP server (Starlette with
+        redirect_slashes=True) redirects POST /mcp/ -> POST /mcp via 307.
+        With follow_redirects=False (old default), mcp_tool_call raised
+        ValueError('MCP call get_status returned non-200 status: 307').
+
+        This test verifies the safety net: when a client has follow_redirects=True,
+        the 307 is transparently followed and the call succeeds.
+        """
+        from dashboard.data.memory import mcp_tool_call
+
+        expected = {'graphiti': {'connected': True}, 'mem0': {'connected': True}}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == '/mcp/':
+                # Simulate Starlette's redirect_slashes=True behaviour
+                return httpx.Response(
+                    307,
+                    headers={'Location': 'http://localhost:8000/mcp'},
+                )
+            # Canonical path: return valid MCP response
+            return _make_mcp_response(expected)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            result = await mcp_tool_call(
+                client, 'http://localhost:8000', 'get_status', {}
+            )
+
+        assert result == expected
+
+    async def test_posts_to_correct_url_path(self):
+        """mcp_tool_call posts to '{base_url}/mcp' (no trailing slash)."""
+        from dashboard.data.memory import mcp_tool_call
+
+        captured_path: list[str] = []
+        expected = {'ok': True}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_path.append(request.url.path)
+            return _make_mcp_response(expected)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await mcp_tool_call(
+                client, 'http://localhost:8000', 'get_status', {}
+            )
+
+        assert result == expected
+        assert len(captured_path) == 1, 'handler should be called exactly once'
+        assert captured_path[0] == '/mcp', (
+            f'Expected path /mcp (no trailing slash), got {captured_path[0]!r}'
+        )
+
 
 # --- Helpers for higher-level function tests ---
 

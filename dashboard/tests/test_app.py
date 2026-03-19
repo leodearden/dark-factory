@@ -43,6 +43,19 @@ class TestMorphSwap:
         assert 'hx-swap="innerHTML"' not in html
 
 
+class TestLifespan:
+    """Tests for the app lifespan — verifies http_client configuration."""
+
+    def test_lifespan_sets_follow_redirects(self, client):
+        """The http_client created during lifespan has follow_redirects=True."""
+        from dashboard.app import app
+
+        assert app.state.http_client.follow_redirects is True, (
+            'http_client must be created with follow_redirects=True '
+            'to handle Starlette 307 redirects from /mcp/ to /mcp'
+        )
+
+
 class TestIndex:
     """Tests for GET / — the main dashboard page."""
 

@@ -22,7 +22,7 @@ async def mcp_tool_call(
 ) -> dict:
     """Make a JSON-RPC tools/call request to the fused-memory MCP endpoint.
 
-    Posts to {base_url}/mcp/ with a JSON-RPC 2.0 envelope, parses the MCP
+    Posts to {base_url}/mcp with a JSON-RPC 2.0 envelope, parses the MCP
     response content, and returns the inner dict.
 
     Raises:
@@ -31,7 +31,7 @@ async def mcp_tool_call(
         httpx.ConnectError: If the connection fails (propagated).
     """
     resp = await client.post(
-        f'{base_url}/mcp/',
+        f'{base_url}/mcp',
         json={
             'jsonrpc': '2.0',
             'id': 1,
