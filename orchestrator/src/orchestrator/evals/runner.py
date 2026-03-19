@@ -13,20 +13,19 @@ from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.config import (
     BackendsConfig,
     BudgetsConfig,
-    SandboxConfig,
     EffortConfig,
     ModelsConfig,
     OrchestratorConfig,
-    TurnsConfig,
+    SandboxConfig,
     load_config,
 )
 from orchestrator.git_ops import GitOps
-from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
-from .configs import EVAL_CONFIGS, EvalConfig, get_config_by_name
-from .metrics import EvalMetrics, collect_metrics
-from .snapshots import cleanup_eval_worktree, create_eval_worktree
+from .configs import EVAL_CONFIGS, EvalConfig
+from .metrics import collect_metrics
+from .snapshots import create_eval_worktree
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +157,7 @@ async def run_eval(
     assignment = TaskAssignment(
         task_id=task_id,
         task=task_def,
-        modules=set(modules),
+        modules=list(modules),
     )
 
     # 4. Set up workflow dependencies
@@ -179,9 +178,9 @@ async def run_eval(
         assignment=assignment,
         config=orch_config,
         git_ops=git_ops,
-        scheduler=scheduler,
+        scheduler=scheduler,  # type: ignore[arg-type]
         briefing=briefing,
-        mcp=mcp,
+        mcp=mcp,  # type: ignore[arg-type]
         initial_plan=initial_plan,
     )
 
@@ -290,5 +289,5 @@ class _EvalMcpStub:
     def __init__(self, url: str):
         self.url = url
 
-    def mcp_config_json(self, **kwargs):
-        return None
+    def mcp_config_json(self, escalation_url: str | None = None) -> dict:
+        return {}

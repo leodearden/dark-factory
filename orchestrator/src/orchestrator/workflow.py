@@ -8,9 +8,8 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
-from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import AgentResult, invoke_agent
 from orchestrator.agents.roles import (
     ALL_REVIEWERS,
@@ -23,14 +22,56 @@ from orchestrator.agents.roles import (
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.scheduler import Scheduler, TaskAssignment, files_to_modules
+from orchestrator.scheduler import TaskAssignment, files_to_modules
+from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import run_verification
 
-from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
-
 if TYPE_CHECKING:
-    from orchestrator.mcp_lifecycle import McpLifecycle
     from orchestrator.usage_gate import UsageGate
+
+
+# ---------------------------------------------------------------------------
+# Structural protocols — allow test doubles without inheriting concrete classes
+# ---------------------------------------------------------------------------
+
+
+class _SchedulerLike(Protocol):
+    async def set_task_status(self, task_id: str, status: str, /) -> None: ...
+    async def handle_blast_radius_expansion(
+        self, task_id: str, current: list[str], needed: list[str], /
+    ) -> bool: ...
+
+
+class _McpLike(Protocol):
+    @property
+    def url(self) -> str: ...
+    def mcp_config_json(self, escalation_url: str | None = None) -> dict: ...
+
+
+class _BriefingLike(Protocol):
+    async def build_architect_prompt(
+        self, task: dict, worktree: Path | None = ..., context: str | None = ...
+    ) -> str: ...
+    async def build_resume_prompt(
+        self,
+        task: dict,
+        plan: dict,
+        escalation_summary: str,
+        resolution: str,
+        worktree: Path | None = ...,
+    ) -> str: ...
+    async def build_implementer_prompt(
+        self, plan: dict, iteration_log: list, context: str | None = ...
+    ) -> str: ...
+    async def build_debugger_prompt(
+        self, failures: str, plan: dict, context: str | None = ...
+    ) -> str: ...
+    async def build_reviewer_prompt(
+        self, reviewer_type: str, diff: str, context: str | None = ...
+    ) -> str: ...
+    async def build_merger_prompt(
+        self, conflicts: str, task_intent: str, context: str | None = ...
+    ) -> str: ...
 
 logger = logging.getLogger(__name__)
 
@@ -71,9 +112,9 @@ class TaskWorkflow:
         assignment: TaskAssignment,
         config: OrchestratorConfig,
         git_ops: GitOps,
-        scheduler: Scheduler,
-        briefing: BriefingAssembler,
-        mcp: McpLifecycle,
+        scheduler: _SchedulerLike,
+        briefing: _BriefingLike,
+        mcp: _McpLike,
         escalation_queue=None,
         escalation_event: asyncio.Event | None = None,
         usage_gate: UsageGate | None = None,
@@ -160,6 +201,7 @@ class TaskWorkflow:
                     logger.info(f'Task {self.task_id}: waiting for escalation resolution')
                     resolution = await self._wait_for_resolution()
                     # Check if any escalation was dismissed (terminate)
+                    assert self.escalation_queue is not None
                     dismissed = [
                         e for e in self.escalation_queue.get_by_task(self.task_id)
                         if e.status == 'dismissed'
@@ -244,6 +286,7 @@ class TaskWorkflow:
 
     async def _plan(self) -> WorkflowOutcome:
         """Invoke the architect to produce a plan."""
+        assert self.worktree is not None and self.artifacts is not None
         prompt = await self.briefing.build_architect_prompt(self.task, worktree=self.worktree)
         result = await self._invoke(ARCHITECT, prompt, self.worktree)
 
@@ -335,6 +378,7 @@ class TaskWorkflow:
 
     async def _execute_iterations(self) -> WorkflowOutcome:
         """Run implementer iterations until plan is complete."""
+        assert self.worktree is not None and self.artifacts is not None
         while self.artifacts.get_pending_steps():
             if self.metrics.execute_iterations >= self.config.max_execute_iterations:
                 return WorkflowOutcome.BLOCKED
@@ -406,6 +450,7 @@ class TaskWorkflow:
 
     async def _verify_debugfix_loop(self) -> WorkflowOutcome:
         """Run verification, invoke debugger on failures."""
+        assert self.worktree is not None and self.artifacts is not None
         verify_attempt = 0
 
         while True:
@@ -451,6 +496,7 @@ class TaskWorkflow:
 
     async def _review(self):
         """Run all 5 reviewers in parallel, aggregate results."""
+        assert self.worktree is not None and self.artifacts is not None
         base_commit = self.artifacts.read_base_commit()
         if base_commit:
             diff = await self.git_ops.get_diff_from_base(self.worktree, base_commit)
@@ -476,6 +522,7 @@ class TaskWorkflow:
 
     async def _run_reviewer(self, role: AgentRole, diff: str) -> dict:
         """Run a single reviewer and parse its JSON output."""
+        assert self.worktree is not None
         prompt = await self.briefing.build_reviewer_prompt(role.name, diff)
 
         # Use structured output for reviewers
@@ -524,6 +571,7 @@ class TaskWorkflow:
 
     async def _replan(self, reviews) -> None:
         """Feed review feedback back to architect for re-planning."""
+        assert self.worktree is not None and self.artifacts is not None
         feedback = reviews.format_for_replan()
         self.plan = self.artifacts.read_plan()
 
@@ -547,6 +595,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
     async def _merge(self, branch_name: str) -> WorkflowOutcome:
         """Merge task branch into main."""
+        assert self.worktree is not None
         merge_result = await self.git_ops.merge_to_main(self.worktree, branch_name)
 
         if merge_result.success:
@@ -724,6 +773,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             await self._escalation_event.wait()
 
         # Collect resolutions
+        assert self.escalation_queue is not None
         resolved = [
             e for e in self.escalation_queue.get_by_task(self.task_id)
             if e.status == 'resolved' and e.resolution

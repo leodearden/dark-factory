@@ -27,7 +27,7 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await proc.communicate()
-    return proc.returncode, stdout.decode().strip(), stderr.decode().strip()
+    return proc.returncode if proc.returncode is not None else 1, stdout.decode().strip(), stderr.decode().strip()
 
 
 class GitOps:

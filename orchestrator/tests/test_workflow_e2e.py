@@ -297,7 +297,7 @@ class FakeMcp:
     def url(self) -> str:
         return 'http://localhost:9999'
 
-    def mcp_config_json(self, **kwargs) -> dict:
+    def mcp_config_json(self, escalation_url: str | None = None) -> dict:
         return {'mcpServers': {}}
 
 
@@ -345,6 +345,16 @@ class FakeBriefing:
     ) -> str:
         return f'Merge: {conflicts[:100]}'
 
+    async def build_resume_prompt(
+        self,
+        task: dict,
+        plan: dict,
+        escalation_summary: str,
+        resolution: str,
+        worktree=None,
+    ) -> str:
+        return f'Resume: {resolution[:100]}'
+
 
 def _build_workflow(
     config: OrchestratorConfig,
@@ -358,9 +368,9 @@ def _build_workflow(
         assignment=assignment,
         config=config,
         git_ops=git_ops,
-        scheduler=scheduler,
-        briefing=FakeBriefing(),
-        mcp=FakeMcp(),
+        scheduler=scheduler,  # type: ignore[arg-type]
+        briefing=FakeBriefing(),  # type: ignore[arg-type]
+        mcp=FakeMcp(),  # type: ignore[arg-type]
     )
     return workflow, scheduler
 
@@ -533,7 +543,7 @@ class TestVerifyDebugfixLoop:
         # First verify fails, second passes
         call_count = 0
 
-        async def verify_sequence(worktree, cfg):
+        async def verify_sequence(worktree, cfg, module_cfg=None):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -714,7 +724,7 @@ class TestPostMergeFailure:
 
         verify_call = 0
 
-        async def verify_fn(cwd, cfg):
+        async def verify_fn(cwd, cfg, module_cfg=None):
             nonlocal verify_call
             verify_call += 1
             if cwd == config.project_root:
@@ -808,9 +818,9 @@ class TestBlastRadiusExpansion:
             assignment=task_assignment,
             config=config,
             git_ops=git_ops,
-            scheduler=deny_scheduler,
-            briefing=FakeBriefing(),
-            mcp=FakeMcp(),
+            scheduler=deny_scheduler,  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=FakeMcp(),  # type: ignore[arg-type]
         )
 
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
@@ -924,9 +934,9 @@ def _build_workflow_with_escalation(
         assignment=assignment,
         config=config,
         git_ops=git_ops,
-        scheduler=scheduler,
-        briefing=FakeBriefing(),
-        mcp=FakeMcp(),
+        scheduler=scheduler,  # type: ignore[arg-type]
+        briefing=FakeBriefing(),  # type: ignore[arg-type]
+        mcp=FakeMcp(),  # type: ignore[arg-type]
         escalation_queue=queue,
     )
     return workflow, scheduler, queue

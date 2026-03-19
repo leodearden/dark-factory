@@ -371,7 +371,7 @@ def _write_codex_mcp_config(config_path: Path, mcp_config: dict) -> None:
     lines = []
     servers = mcp_config.get('mcpServers', {})
     for name, cfg in servers.items():
-        lines.append(f'[[mcp_servers]]')
+        lines.append('[[mcp_servers]]')
         lines.append(f'name = "{name}"')
         command = cfg.get('command', '')
         args = cfg.get('args', [])
@@ -548,7 +548,7 @@ async def _run_subprocess(
     return _SubprocessResult(
         stdout=stdout.decode(),
         stderr=stderr_text,
-        returncode=proc.returncode,
+        returncode=proc.returncode if proc.returncode is not None else 1,
         duration_ms=duration_ms,
     )
 

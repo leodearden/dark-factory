@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from orchestrator.config import ModuleConfig
 from orchestrator.verify import _run_cmd, run_verification
 
-
 # ---------------------------------------------------------------------------
 # _run_cmd: executable parameter
 # ---------------------------------------------------------------------------

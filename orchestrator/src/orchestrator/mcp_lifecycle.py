@@ -285,6 +285,8 @@ class McpLifecycle:
 
     async def _wait_for_health(self, timeout: float = 30) -> bool:
         """Poll health endpoint until ready or timeout."""
+        if self._process is None:
+            return False
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
             if self._process.returncode is not None:

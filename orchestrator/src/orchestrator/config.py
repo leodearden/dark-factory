@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -54,8 +54,8 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
             return [self._expand_env_vars(item) for item in value]
         return value
 
-    def get_field_value(self, field_name: str, field_info: Any) -> Any:
-        return None
+    def get_field_value(self, field: Any, field_name: str) -> tuple[Any, str, bool]:
+        return None, field_name, False
 
     def __call__(self) -> dict[str, Any]:
         if not self.config_path.exists():
@@ -126,12 +126,12 @@ class BackendsConfig(BaseModel):
 class FusedMemoryConfig(BaseModel):
     """Fused-memory HTTP server connection."""
 
-    url: str = Field(default='http://localhost:8000')
+    url: str = Field(default='http://localhost:8002')
     project_id: str = Field(default='dark_factory')
-    config_path: str = Field(default='../fused-memory/config/config.yaml')
+    config_path: str = Field(default='fused-memory/config/config.yaml')
     server_command: list[str] = Field(
         default_factory=lambda: [
-            'uv', 'run', '--project', '../fused-memory',
+            'uv', 'run', '--project', 'fused-memory',
             'python', '-m', 'fused_memory.server.main',
             '--transport', 'http',
         ]
@@ -253,6 +253,11 @@ class OrchestratorConfig(BaseSettings):
     # Per-module overrides (populated by load_config via _discover_module_configs)
     _module_configs: dict[str, ModuleConfig] = PrivateAttr(default_factory=dict)
 
+    @model_validator(mode='after')
+    def _resolve_project_root(self) -> 'OrchestratorConfig':
+        self.project_root = self.project_root.resolve()
+        return self
+
     def for_module(self, module_path: str) -> ModuleConfig | None:
         """Return ModuleConfig matching the first path component, or None."""
         if not self._module_configs:
@@ -281,10 +286,44 @@ class OrchestratorConfig(BaseSettings):
         return (init_settings, env_settings, yaml_settings, dotenv_settings)
 
 
+def _find_config(explicit_path: Path | None) -> Path | None:
+    """Find the config file to load, searching standard locations.
+
+    Search order:
+    1. explicit_path (if given and exists)
+    2. ORCH_CONFIG_PATH env var (if set and exists)
+    3. cwd/config.yaml
+    4. cwd/orchestrator/config.yaml
+    """
+    if explicit_path is not None:
+        return explicit_path if explicit_path.exists() else None
+    env_path = os.environ.get('ORCH_CONFIG_PATH')
+    if env_path:
+        p = Path(env_path)
+        if p.exists():
+            return p
+    cwd_config = Path('config.yaml')
+    if cwd_config.exists():
+        return cwd_config
+    orch_config = Path('orchestrator') / 'config.yaml'
+    if orch_config.exists():
+        return orch_config
+    return None
+
+
 def load_config(config_path: Path | None = None) -> OrchestratorConfig:
     """Load configuration from YAML file, env vars, and defaults."""
-    if config_path:
-        os.environ['ORCH_CONFIG_PATH'] = str(config_path)
+    found = _find_config(config_path)
+    if found:
+        os.environ['ORCH_CONFIG_PATH'] = str(found)
+    elif 'ORCH_CONFIG_PATH' in os.environ:
+        # Clear stale env var so YamlSettingsSource returns {}
+        del os.environ['ORCH_CONFIG_PATH']
     config = OrchestratorConfig()
+    if found is None:
+        logger.warning(
+            'No config file found (checked config.yaml, orchestrator/config.yaml). '
+            'Using defaults. Pass --config or set ORCH_CONFIG_PATH to specify.',
+        )
     config._module_configs = _discover_module_configs(config.project_root)
     return config

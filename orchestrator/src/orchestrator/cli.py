@@ -244,10 +244,7 @@ def _run_plan_only(task_path: Path | None, base_config):
 
     tasks_dir = Path(__file__).parent / 'evals' / 'tasks'
 
-    if task_path:
-        task_paths = [task_path]
-    else:
-        task_paths = sorted(tasks_dir.glob('*.json'))
+    task_paths = [task_path] if task_path else sorted(tasks_dir.glob('*.json'))
 
     if not task_paths:
         click.echo('No task files found', err=True)
@@ -313,7 +310,7 @@ def _run_plan_only(task_path: Path | None, base_config):
                 # Read the plan the architect wrote
                 plan = artifacts.read_plan()
                 if not plan:
-                    click.echo(f'    FAILED: architect produced no plan.json', err=True)
+                    click.echo('    FAILED: architect produced no plan.json', err=True)
                     continue
 
                 # Save plan into task JSON
