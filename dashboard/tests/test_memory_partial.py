@@ -101,3 +101,29 @@ class TestMemoryPartialOnline:
         ):
             html = client.get('/partials/memory').text
             assert 'Connected' in html
+
+
+_OFFLINE_STATUS = {'offline': True, 'error': 'Connection refused'}
+_OFFLINE_QUEUE = {'offline': True, 'error': 'Connection refused'}
+
+
+class TestMemoryPartialOffline:
+    def test_offline_shows_error_card(self, client):
+        with (
+            patch(
+                'dashboard.data.memory.get_memory_status',
+                new_callable=AsyncMock,
+                return_value=_OFFLINE_STATUS,
+            ),
+            patch(
+                'dashboard.data.memory.get_queue_stats',
+                new_callable=AsyncMock,
+                return_value=_OFFLINE_QUEUE,
+            ),
+        ):
+            resp = client.get('/partials/memory')
+            assert resp.status_code == 200
+            html = resp.text
+            assert 'Fused Memory Server Offline' in html
+            assert 'Connection refused' in html
+            assert 'knowledge graph nodes' not in html
