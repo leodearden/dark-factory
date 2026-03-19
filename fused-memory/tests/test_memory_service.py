@@ -347,6 +347,35 @@ class TestDeleteMemory:
         assert result['store'] == 'mem0'
 
 
+class TestGraphitiBackendRemoveEdge:
+    @pytest.mark.asyncio
+    async def test_graphiti_backend_remove_edge(self, mock_config):
+        """Unit test for GraphitiBackend.remove_edge — should call
+        EntityEdge.get_by_uuid then edge.delete."""
+        from unittest.mock import patch
+
+        from fused_memory.backends.graphiti_client import GraphitiBackend
+
+        backend = GraphitiBackend(mock_config)
+        # Provide a mock client so _require_client succeeds
+        mock_client = MagicMock()
+        backend.client = mock_client
+
+        mock_edge = AsyncMock()
+        mock_edge.delete = AsyncMock()
+
+        with patch(
+            'fused_memory.backends.graphiti_client.EntityEdge'
+        ) as MockEntityEdge:
+            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
+            await backend.remove_edge('test-edge-uuid')
+
+            MockEntityEdge.get_by_uuid.assert_called_once_with(
+                mock_client.driver, 'test-edge-uuid'
+            )
+            mock_edge.delete.assert_called_once_with(mock_client.driver)
+
+
 class TestGetEpisodes:
     @pytest.mark.asyncio
     async def test_returns_list(self, service):
