@@ -20,6 +20,29 @@ class TestIdiomorphExtension:
         assert 'hx-ext="morph"' in html
 
 
+class TestMorphSwap:
+    """Tests that all polling sections use morph:innerHTML swap strategy."""
+
+    def test_memory_section_uses_morph(self, client):
+        html = client.get('/').text
+        assert 'hx-swap="morph:innerHTML"' in html
+        assert 'hx-get="/partials/memory"' in html
+
+    def test_recon_section_uses_morph(self, client):
+        html = client.get('/').text
+        assert 'hx-swap="morph:innerHTML"' in html
+        assert 'hx-get="/partials/recon"' in html
+
+    def test_orchestrators_section_uses_morph(self, client):
+        html = client.get('/').text
+        assert 'hx-swap="morph:innerHTML"' in html
+        assert 'hx-get="/partials/orchestrators"' in html
+
+    def test_no_plain_innerhtml_on_polling_sections(self, client):
+        html = client.get('/').text
+        assert 'hx-swap="innerHTML"' not in html
+
+
 class TestIndex:
     """Tests for GET / — the main dashboard page."""
 
