@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 _ONLINE_STATUS = {
     'graphiti': {'connected': True, 'node_count': 42},
     'mem0': {'connected': True, 'memory_count': 128},
+    'taskmaster': {'connected': True},
 }
 
 _ONLINE_QUEUE = {
