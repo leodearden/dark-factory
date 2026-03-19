@@ -42,8 +42,11 @@
       <span class="text-sm text-gray-400">Write Queue</span>
     </div>
     <div class="text-sm text-gray-300">
-      {{ queue.counts.pending|default(0) }} pending · {{ queue.counts.retry|default(0) }} retry · {{ queue.counts.dead|default(0) }} dead
+      {{ queue.counts.pending|default(0) }} pending · {{ queue.counts.retry|default(0) }} retry · {% if queue.counts.dead|default(0) > 0 %}<span class="text-red-400">{{ queue.counts.dead }} dead</span>{% else %}0 dead{% endif %}
     </div>
+    {% if queue.oldest_pending_age_seconds is not none and queue.oldest_pending_age_seconds > 60 %}
+    <div class="text-yellow-400 text-xs mt-1">oldest: {{ (queue.oldest_pending_age_seconds // 60)|int }}m ago</div>
+    {% endif %}
   </div>
 </div>
 {% endif %}
