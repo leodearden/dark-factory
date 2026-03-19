@@ -106,14 +106,18 @@ def load_task_tree(tasks_json_path: Path) -> list[dict]:
 
     result: list[dict] = []
     for task in raw_tasks:
-        result.append({
-            'id': task.get('id'),
-            'title': task.get('title'),
-            'status': task.get('status'),
-            'priority': task.get('priority'),
-            'dependencies': task.get('dependencies', []),
-            'metadata': task.get('metadata', {}),
-        })
+        try:
+            result.append({
+                'id': task.get('id'),
+                'title': task.get('title'),
+                'status': task.get('status'),
+                'priority': task.get('priority'),
+                'dependencies': task.get('dependencies', []),
+                'metadata': task.get('metadata', {}),
+            })
+        except AttributeError:
+            logger.warning('Skipping non-dict task entry in %s', tasks_json_path)
+            continue
 
     return result
 
@@ -143,7 +147,7 @@ def read_task_artifacts(worktree_path: Path) -> dict:
         steps = plan_data.get('steps', [])
         total_count = len(steps)
         done_count = sum(1 for s in steps if s.get('status') == 'done')
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError, AttributeError, TypeError):
         pass
 
     if total_count == 0:
