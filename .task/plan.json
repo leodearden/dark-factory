@@ -1,0 +1,52 @@
+{
+  "task_id": "39",
+  "title": "Memory cards don't wrap on narrow viewports — horizontal overflow",
+  "modules": [
+    "dashboard/src/dashboard/templates/partials",
+    "dashboard/tests"
+  ],
+  "analysis": "The memory partial (memory.html line 9) uses `flex gap-4` without `flex-wrap`, causing four health cards to stay side-by-side and crush on narrow viewports. Each card uses `flex-1` but has no minimum width, so they shrink to unreadable sizes. The fix is two Tailwind class additions: (1) `flex-wrap` on the container div, and (2) `min-w-[200px]` on each of the four card divs. The existing test suite (test_memory_partial.py) uses starlette TestClient with patched MCP calls and checks rendered HTML string content — the same pattern will be used for the new layout assertions. There are exactly four card divs with class `bg-gray-800 rounded-lg p-6 shadow flex-1` (Graphiti, Mem0, Taskmaster, Write Queue).",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing tests in test_memory_partial.py: (1) assert the card container div includes 'flex-wrap' in its class list, (2) assert all four card divs include 'min-w-[200px]' class. Add a new TestMemoryCardLayout class with two test methods following the existing patch pattern.",
+      "status": "done",
+      "commit": "223ed18"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Update memory.html line 9: change `<div class=\"flex gap-4\">` to `<div class=\"flex flex-wrap gap-4\">`. Update each of the four card divs (lines 11, 21, 31, 44) to add `min-w-[200px]` — changing `bg-gray-800 rounded-lg p-6 shadow flex-1` to `bg-gray-800 rounded-lg p-6 shadow flex-1 min-w-[200px]`.",
+      "status": "done",
+      "commit": "60525ef"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use min-w-[200px] rather than a responsive grid (e.g., grid-cols-2)",
+      "rationale": "The task description specifies min-w-[200px] with flex-wrap for natural wrapping. This is simpler than a grid approach and lets cards wrap to 2x2 or 1-column naturally based on available space, matching the PRD intent of graceful degradation without full mobile support."
+    },
+    {
+      "decision": "Keep flex-1 alongside min-w-[200px]",
+      "rationale": "flex-1 allows cards to grow and fill available space on wide viewports, while min-w-[200px] prevents them from shrinking below readable width. Together they give the desired behavior: equal-width cards that wrap when constrained."
+    },
+    {
+      "decision": "Test via HTML string assertions rather than visual/browser tests",
+      "rationale": "The existing test suite checks rendered HTML classes via string matching (e.g., 'bg-green-500' in html). CSS class presence is sufficient to verify the fix since the actual layout behavior is defined by Tailwind's well-tested utility classes. Browser-based layout testing would be disproportionate for this change."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "TestClient + patch pattern from test_memory_partial.py",
+      "where": "dashboard/tests/test_memory_partial.py",
+      "how": "Reuse the same _ONLINE_STATUS, _ONLINE_QUEUE fixtures and the dual-patch context manager pattern to render the memory partial and inspect the HTML output."
+    },
+    {
+      "what": "client fixture from conftest.py",
+      "where": "dashboard/tests/conftest.py",
+      "how": "Use the existing client() fixture that creates a Starlette TestClient for the dashboard app."
+    }
+  ]
+}
