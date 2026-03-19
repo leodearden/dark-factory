@@ -1,8 +1,11 @@
 {
   "task_id": "17",
   "title": "Memory data module",
-  "modules": ["dashboard/src/dashboard/data", "dashboard/tests"],
-  "analysis": "Create dashboard/src/dashboard/data/memory.py — a data access layer for memory health metrics from the fused-memory MCP HTTP server. The module follows the same pattern as the existing reconciliation.py data module (async functions returning dicts, graceful error handling), but instead of querying SQLite it makes HTTP JSON-RPC calls to the fused-memory MCP endpoint. The orchestrator's briefing.py already demonstrates the exact MCP call pattern: POST to {base_url}/mcp/ with JSON-RPC body, parse result.content[0].text. We need three functions: (1) mcp_tool_call — generic low-level JSON-RPC caller, (2) get_memory_status — calls get_status tool, (3) get_queue_stats — calls get_queue_stats tool. Tests will use httpx.MockTransport to intercept HTTP calls, following the project's existing async test patterns (pytest-asyncio auto mode, class-based test organization). The MCP response envelope wraps tool output as {\"result\": {\"content\": [{\"type\": \"text\", \"text\": \"<json-encoded-dict>\"}]}}.",
+  "modules": [
+    "dashboard/src/dashboard/data",
+    "dashboard/tests"
+  ],
+  "analysis": "Create dashboard/src/dashboard/data/memory.py \u2014 a data access layer for memory health metrics from the fused-memory MCP HTTP server. The module follows the same pattern as the existing reconciliation.py data module (async functions returning dicts, graceful error handling), but instead of querying SQLite it makes HTTP JSON-RPC calls to the fused-memory MCP endpoint. The orchestrator's briefing.py already demonstrates the exact MCP call pattern: POST to {base_url}/mcp/ with JSON-RPC body, parse result.content[0].text. We need three functions: (1) mcp_tool_call \u2014 generic low-level JSON-RPC caller, (2) get_memory_status \u2014 calls get_status tool, (3) get_queue_stats \u2014 calls get_queue_stats tool. Tests will use httpx.MockTransport to intercept HTTP calls, following the project's existing async test patterns (pytest-asyncio auto mode, class-based test organization). The MCP response envelope wraps tool output as {\"result\": {\"content\": [{\"type\": \"text\", \"text\": \"<json-encoded-dict>\"}]}}.",
   "prerequisites": [],
   "steps": [
     {
@@ -60,6 +63,20 @@
       "description": "Harden mcp_tool_call to handle malformed responses: add defensive checks for missing result/content keys and invalid JSON in text field. Return empty dict or raise ValueError with descriptive message as appropriate. Run full test suite to confirm all tests pass.",
       "status": "done",
       "commit": "28fc0ac"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write failing tests for three blocking review issues. (1) Add test_non_200_response_returns_offline to TestGetMemoryStatus: mock transport returns HTTP 500, assert get_memory_status returns {offline: True, error: str} (not an uncaught ValueError). This covers the untested failure mode where mcp_tool_call raises ValueError on non-200 and the get_* function must catch it. (2) Add test_non_200_response_returns_offline to TestGetQueueStats: same pattern — mock 500 response, assert get_queue_stats returns {offline: True, error: str}. (3) Add test_non_json_body_returns_empty_dict to TestMcpToolCall: mock transport returns HTTP 200 with non-JSON body (e.g. HTML string '<html>Bad Gateway</html>'), assert mcp_tool_call returns {} instead of raising json.JSONDecodeError from resp.json(). All three tests should FAIL against the current implementation, proving the gaps identified by reviewers.",
+      "status": "done",
+      "commit": "bc25e2a"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Fix all three blocking issues in dashboard/src/dashboard/data/memory.py. (1) In get_memory_status, widen the except clause on line 78 to include ValueError: `except (httpx.ConnectError, httpx.TimeoutException, ValueError) as e:` — so a non-200 response from the MCP server produces the {offline: True, error: ...} fallback instead of propagating. (2) In get_queue_stats, apply the same fix on line 95: `except (httpx.ConnectError, httpx.TimeoutException, ValueError) as e:`. (3) In mcp_tool_call, wrap the resp.json() call on line 50 in try/except: `try: data = resp.json() except (json.JSONDecodeError, ValueError): return {}` — so a 200 response with non-JSON body (e.g. HTML from reverse proxy) returns empty dict instead of crashing. Update the docstring for get_memory_status and get_queue_stats to document that ValueError (from non-200 MCP responses) is also caught. Run the full test suite to confirm all tests pass including the new ones from step-9.",
+      "status": "done",
+      "commit": "523f24c"
     }
   ],
   "design_decisions": [
@@ -73,7 +90,7 @@
     },
     {
       "decision": "Parse MCP response envelope inline in mcp_tool_call rather than in each caller",
-      "rationale": "The JSON-RPC envelope structure (result.content[0].text → json.loads) is the same for every tool call. Centralizing parsing in mcp_tool_call avoids duplication and makes the higher-level functions (get_memory_status, get_queue_stats) cleaner."
+      "rationale": "The JSON-RPC envelope structure (result.content[0].text \u2192 json.loads) is the same for every tool call. Centralizing parsing in mcp_tool_call avoids duplication and makes the higher-level functions (get_memory_status, get_queue_stats) cleaner."
     },
     {
       "decision": "Error handling catches httpx.ConnectError and httpx.TimeoutException at the get_* function level, not in mcp_tool_call",
@@ -81,11 +98,19 @@
     },
     {
       "decision": "Malformed MCP responses return empty dict from mcp_tool_call",
-      "rationale": "Per task spec: 'returns empty dict or raises clear error'. An empty dict is safest for dashboard rendering — the template can check for missing keys and show placeholder text rather than crashing."
+      "rationale": "Per task spec: 'returns empty dict or raises clear error'. An empty dict is safest for dashboard rendering \u2014 the template can check for missing keys and show placeholder text rather than crashing."
     },
     {
       "decision": "POST to {base_url}/mcp (no trailing slash)",
       "rationale": "The task spec says POST to {base_url}/mcp. The orchestrator's briefing.py uses /mcp/ with trailing slash. We'll use the trailing-slash variant to match the existing working pattern in the codebase, since FastMCP mounts with trailing slash."
+    },
+    {
+      "decision": "ValueError from mcp_tool_call (non-200 status) is caught at the get_* level alongside httpx network errors",
+      "rationale": "Review identified that a running-but-broken MCP server returning 500/503 is a realistic failure mode. The ValueError raised by mcp_tool_call for non-200 responses must produce the same {offline: True, error: ...} fallback as connection/timeout errors. This keeps the contract documented in the docstrings honest: all server-unreachable-or-broken scenarios return the offline fallback dict. mcp_tool_call itself continues to raise ValueError (not catch it) so future callers with different error handling needs can still intercept it."
+    },
+    {
+      "decision": "resp.json() parse failure returns empty dict from mcp_tool_call, consistent with other malformed response handling",
+      "rationale": "A 200 response with non-JSON body (e.g., HTML from a reverse proxy or WAF) is a malformed response, same category as missing content keys or invalid inner JSON \u2014 all of which already return {}. Consistent treatment: any response that can't be parsed into a valid tool result yields empty dict, letting the caller (get_* functions) decide whether to treat an empty result as noteworthy."
     }
   ],
   "reuse": [
@@ -100,12 +125,12 @@
       "how": "Import and use config.fused_memory_url and config.fused_memory_project_id for MCP endpoint URL and project scoping."
     },
     {
-      "what": "Test fixture pattern — dashboard_config with tmp_path",
+      "what": "Test fixture pattern \u2014 dashboard_config with tmp_path",
       "where": "dashboard/tests/conftest.py line 88-93",
       "how": "Reuse existing dashboard_config fixture for tests that need a config object. The fixture already sets up a DashboardConfig with tmp_path-based project_root."
     },
     {
-      "what": "Test organization pattern — class-based with async methods",
+      "what": "Test organization pattern \u2014 class-based with async methods",
       "where": "dashboard/tests/test_reconciliation.py",
       "how": "Follow the same TestClassName pattern with async test methods, one class per function under test, testing happy path, error cases, and edge cases."
     },
