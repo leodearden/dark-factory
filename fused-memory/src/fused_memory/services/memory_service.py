@@ -110,6 +110,7 @@ class MemoryService:
             source=episode_type,
             group_id=payload['group_id'],
             source_description=payload.get('source_description', ''),
+            uuid=payload.get('uuid'),
         )
 
     async def _dual_write_callback(
