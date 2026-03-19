@@ -1,142 +1,168 @@
 {
-  "task_id": "24",
-  "title": "Bug: Task reconciliation uses project_root as memory project_id",
+  "task_id": "26",
+  "title": "Bug: Unified Graphiti search/delete contract is internally inconsistent",
   "modules": [
+    "fused-memory/src/fused_memory/services",
+    "fused-memory/src/fused_memory/server",
     "fused-memory/src/fused_memory/models",
-    "fused-memory/src/fused_memory/middleware",
-    "fused-memory/src/fused_memory/reconciliation",
+    "fused-memory/src/fused_memory/backends",
     "fused-memory/tests"
   ],
-  "analysis": "The bug is a systematic conflation of two distinct identifiers: `project_root` (a filesystem path like `/home/leo/src/dark-factory` used by Taskmaster for task operations) and `project_id` (a logical identifier like `dark_factory` used by Graphiti/Mem0 for memory scoping). The conflation originates in `TaskInterceptor._make_event()` which receives `project_root` and passes it directly as `project_id` to `ReconciliationEvent`. This tainted value then flows through: (1) the event buffer (keyed by this path-as-id), (2) targeted reconciliation (passes it to both memory and task services), and (3) full pipeline stages via the harness (sets `stage.project_id` to the path). The `Scope` model then uses this path as `graphiti_group_id` and in `mem0_collection_name`, creating collections like `fused_/home/leo/src/dark-factory` instead of `fused_dark_factory`.\n\nThe fix introduces a `resolve_project_id(project_root)` function as the single conversion point, and threads both identifiers through all affected code paths: `project_id` (logical) for memory operations, `project_root` (filesystem) for task operations. The original `project_root` is preserved in event payloads under `_project_root` key so the full pipeline harness can extract it for stage task tools, avoiding any SQLite schema migration.",
-  "prerequisites": [],
+  "analysis": "Three interrelated bugs in the fused-memory unified API:\n\n1. **ID type mismatch in delete contract**: `_search_graphiti` returns edge UUIDs (EntityEdge.uuid) as the `id` field on MemoryResult, but `delete_memory(store='graphiti')` calls `graphiti.remove_episode(memory_id)` which expects an EpisodicNode UUID. Passing an edge UUID to remove_episode would raise an error or delete the wrong thing. The MCP tool docs promise 'The memory_id and store values come from search results' — this contract is broken for Graphiti.\n\n2. **Category filter silently drops ALL Graphiti results**: `_search_graphiti` (line 467) hardcodes `category=None` on every result. The `search()` category filter at line 423 (`[r for r in results if r.category in cat_set]`) then excludes every Graphiti result since None is never in the category set. Users filtering by 'entities_and_relations' (a Graphiti-primary category) get zero Graphiti results.\n\n3. **No category recovery for Graphiti edges**: At write time, categories route to Graphiti (entities_and_relations, temporal_facts, decisions_and_rationale via GRAPHITI_PRIMARY). At search time, this mapping is lost because Graphiti edges don't carry category metadata. The source_description on the episode has it (e.g. 'add_memory:entities_and_relations') but that's not accessible on the edge object returned by search.\n\n**Fix approach**:\n- Add `remove_edge` to GraphitiBackend using `EntityEdge.get_by_uuid` + `edge.delete` (confirmed available in graphiti_core).\n- Change `delete_memory(store='graphiti')` to delete edges instead of episodes. Episode deletion stays in the dedicated `delete_episode` tool.\n- Fix category filter: when requested categories overlap with GRAPHITI_PRIMARY, include Graphiti results (category=None) rather than silently dropping them. When exactly one GRAPHITI_PRIMARY category is requested, assign it to the Graphiti results for best-effort category metadata.\n- Update MCP tool docs to accurately describe what Graphiti search IDs represent (edge UUIDs, not episode UUIDs).",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Extend MockEdge in conftest.py with uuid, source_node, target_node, episodes, valid_at, invalid_at attributes for realistic Graphiti search result mocking in new tests",
+      "status": "done",
+      "commit": "d51143a",
+      "tests": []
+    }
+  ],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write tests for `resolve_project_id()` in new file `tests/test_scope.py`. Test cases: (1) `/home/leo/src/dark-factory` -> `dark_factory`, (2) trailing slash handling `/project/` -> `project`, (3) simple path `/project` -> `project`, (4) already-clean ID `my_project` passthrough, (5) path with multiple hyphens `/foo/my-cool-project` -> `my_cool_project`, (6) explicit mapping dict overrides derivation.",
+      "description": "Write failing test: test_search_category_filter_includes_graphiti_when_graphiti_primary_requested — mock Graphiti returning edges (via extended MockEdge with uuid) and Mem0 returning results, filter by ['entities_and_relations'], assert Graphiti results are NOT dropped. Currently fails because category=None is filtered out by the list comprehension at line 423.",
       "status": "done",
-      "commit": "2f9762f"
+      "commit": "81d641c"
     },
     {
       "id": "step-2",
-      "type": "impl",
-      "description": "Implement `resolve_project_id(project_root: str, mapping: dict[str, str] | None = None) -> str` in `models/scope.py`. Logic: check mapping dict first, then derive from `PurePosixPath(project_root.rstrip('/')).name` with hyphens replaced by underscores and lowercased.",
+      "type": "test",
+      "description": "Write failing test: test_search_category_filter_excludes_graphiti_when_only_mem0_primary_requested — filter by ['preferences_and_norms'] only, mock both stores returning results, assert Graphiti results (category=None) ARE correctly excluded since none of the requested categories are in GRAPHITI_PRIMARY. This test should pass after the fix but documents the expected behavior.",
       "status": "done",
-      "commit": "c1c337f"
+      "commit": "06f45bd"
     },
     {
       "id": "step-3",
-      "type": "test",
-      "description": "Write tests for TaskInterceptor event emission with resolved project_id. In `tests/test_task_interceptor.py`, add: (1) `test_event_project_id_is_resolved` - verify event in buffer has logical project_id (not filesystem path) after `set_task_status`, (2) `test_event_payload_contains_project_root` - verify event payload has `_project_root` key with original path, (3) `test_reconciler_receives_both_ids` - verify `reconciler.reconcile_task` is called with both `project_id` (logical) and `project_root` (path).",
+      "type": "impl",
+      "description": "Fix category filter logic in MemoryService.search() (line 420-423): when the requested categories overlap with GRAPHITI_PRIMARY, include Graphiti results that have category=None. Change filter from `r.category in cat_set` to also accept `(r.source_store == SourceStore.graphiti and r.category is None and cat_set & GRAPHITI_PRIMARY)`. Import GRAPHITI_PRIMARY is already at line 18.",
       "status": "done",
-      "commit": "01ca665"
+      "commit": "2729aac"
     },
     {
       "id": "step-4",
-      "type": "impl",
-      "description": "Update `TaskInterceptor._make_event()` to call `resolve_project_id(project_root)` for the event's `project_id` and inject `_project_root: project_root` into the payload dict. Update all `self.reconciler.reconcile_task()` calls to pass `project_root=project_root` alongside `project_id=resolve_project_id(project_root)`. Update `self.reconciler.reconcile_bulk_tasks()` calls similarly. Update existing tests that assert on event buffer stats to query by the resolved project_id instead of the raw path.",
+      "type": "test",
+      "description": "Write failing test: test_search_graphiti_results_get_inferred_category_when_single_primary — when category filter has exactly one GRAPHITI_PRIMARY category (e.g. ['entities_and_relations']), verify the returned Graphiti results have that category assigned (not left as None). This helps downstream consumers know what category was requested.",
       "status": "done",
-      "commit": "6408e45"
+      "commit": "9beb389"
     },
     {
       "id": "step-5",
-      "type": "test",
-      "description": "Write tests for TargetedReconciler using correct identifiers per service type. In `tests/test_targeted.py`, add: (1) `test_done_memory_ops_use_project_id` - verify `memory.add_memory` and `memory.search` are called with logical project_id (not path), (2) `test_done_task_ops_use_project_root` - verify `taskmaster.get_tasks` is called with filesystem project_root (not logical id), (3) `test_blocked_task_update_uses_project_root` - verify `taskmaster.update_task` for hints attachment uses project_root, (4) `test_bulk_reconcile_separates_ids` - verify `reconcile_bulk_tasks` uses project_id for memory.search and project_root for taskmaster calls.",
+      "type": "impl",
+      "description": "Enhance category filter to assign inferred category to Graphiti results: after filtering, for Graphiti results with category=None, if exactly one GRAPHITI_PRIMARY category is in the filter set, assign it. When multiple GRAPHITI_PRIMARY categories are in the filter, leave as None (ambiguous). This provides best-effort category info without false precision.",
       "status": "done",
-      "commit": "0349f21"
+      "commit": "b1d4bc4"
     },
     {
       "id": "step-6",
-      "type": "impl",
-      "description": "Update `TargetedReconciler.reconcile_task()` to accept `project_root: str` parameter alongside existing `project_id`. Thread `project_root` through to `_on_task_done`, `_on_task_blocked`, `_on_task_cancelled`, `_on_task_deferred` handlers. In handlers, use `project_id` for all `self.memory.*` calls and `project_root` for all `self.taskmaster.*` calls. Similarly update `reconcile_bulk_tasks()` to accept and use `project_root`.",
+      "type": "test",
+      "description": "Write failing test: test_graphiti_backend_remove_edge — unit test for new GraphitiBackend.remove_edge(edge_uuid) method. Mock EntityEdge.get_by_uuid to return a mock edge, verify edge.delete is called with the driver. Method doesn't exist yet so this fails with AttributeError.",
       "status": "done",
-      "commit": "db4f089"
+      "commit": "b4b1470"
     },
     {
       "id": "step-7",
-      "type": "test",
-      "description": "Write tests for BaseStage tool separation. In `tests/test_targeted.py` or a new `tests/test_stages.py`, test that: (1) `_memory_read_tools` closures use `self.project_id` for search/get_entity/get_episodes calls, (2) `_task_read_tools` closures use `self.project_root` for get_tasks/get_task calls, (3) `_task_write_tools` closures use `self.project_root` for set_task_status/update_task calls, (4) `_memory_write_tools` closures use `self.project_id` for add_memory/delete_memory calls.",
+      "type": "impl",
+      "description": "Add remove_edge method to GraphitiBackend (graphiti_client.py): import EntityEdge from graphiti_core.edges, implement remove_edge(edge_uuid) using get_by_uuid + edge.delete with asyncio.wait_for timeout wrapper, same pattern as existing remove_episode (lines 205-212).",
       "status": "done",
-      "commit": "fb6a704"
+      "commit": "340b4b7"
     },
     {
       "id": "step-8",
-      "type": "impl",
-      "description": "Update `BaseStage` to add `project_root: str = ''` attribute alongside existing `project_id`. Update `_task_read_tools()` and `_task_write_tools()` to use `self.project_root` instead of `self.project_id` for all `taskmaster.*` calls. Memory tool methods remain using `self.project_id`.",
+      "type": "test",
+      "description": "Write failing test: test_delete_memory_graphiti_calls_remove_edge — verify that MemoryService.delete_memory(memory_id='edge-uuid', store='graphiti') calls self.graphiti.remove_edge('edge-uuid') instead of self.graphiti.remove_episode('edge-uuid'). Add remove_edge mock to the service fixture. Currently fails because delete_memory calls remove_episode.",
       "status": "done",
-      "commit": "cb1a455"
+      "commit": "2c4789a"
     },
     {
       "id": "step-9",
-      "type": "test",
-      "description": "Write test for ReconciliationHarness setting both identifiers on stages. In `tests/test_harness.py`, add: (1) `test_full_cycle_extracts_project_root_from_events` - push events with `_project_root` in payload, run full cycle (mocked stages), verify both `stage.project_id` and `stage.project_root` are set correctly on each stage.",
+      "type": "impl",
+      "description": "Change MemoryService.delete_memory (line 583) to call self.graphiti.remove_edge(memory_id) instead of self.graphiti.remove_episode(memory_id) when source is SourceStore.graphiti. The delete_episode method continues to use remove_episode.",
       "status": "done",
-      "commit": "d8f4dca"
+      "commit": "5ef0057"
     },
     {
       "id": "step-10",
-      "type": "impl",
-      "description": "Update `ReconciliationHarness.run_full_cycle()` to extract `project_root` from drained events' payloads (first event with `_project_root` key). After draining, set both `stage.project_id = project_id` and `stage.project_root = project_root` for each stage. Handle case where project_root is not in payload (fallback to project_id for backwards compatibility).",
+      "type": "test",
+      "description": "Write regression test: test_delete_episode_still_uses_remove_episode — verify MemoryService.delete_episode continues to call self.graphiti.remove_episode (not remove_edge). Should pass immediately as a regression guard.",
       "status": "done",
-      "commit": "75b7f17"
+      "commit": "cdcc465"
     },
     {
       "id": "step-11",
-      "type": "test",
-      "description": "Write integration test: end-to-end event flow from TaskInterceptor through buffer and back. In `tests/test_task_interceptor.py`, add `test_event_roundtrip_preserves_both_ids` - create interceptor, call set_task_status with a filesystem path, drain events from buffer, verify: event.project_id is logical, event.payload['_project_root'] is the original path, buffer stats queryable by logical project_id.",
+      "type": "impl",
+      "description": "Update MCP tool docs in tools.py: (1) delete_memory docstring (line 264) — clarify that for Graphiti this deletes the edge/fact found by search, not the episode; mention delete_episode for episode removal. (2) search tool docstring — note that Graphiti results may have inferred category when category filtering is active. (3) FUSED_MEMORY_INSTRUCTIONS (line 47) — clarify that delete_memory deletes the item type returned by search (edges for Graphiti, memories for Mem0).",
       "status": "done",
-      "commit": "39811e9"
+      "commit": "7055275"
     },
     {
       "id": "step-12",
-      "type": "impl",
-      "description": "Update all existing tests across test_task_interceptor.py, test_targeted.py, and test_harness.py to use resolved project_ids where they assert on buffer stats or event project_id values. Ensure full test suite passes with `pytest fused-memory/tests/`.",
+      "type": "test",
+      "description": "Write roundtrip test: test_search_then_delete_graphiti_roundtrip — mock a full search→delete workflow: configure graphiti.search to return edges with known UUIDs, call service.search(), take the first Graphiti result's id and source_store, pass them to service.delete_memory(), verify graphiti.remove_edge is called with the correct edge UUID. Validates the end-to-end contract is now internally consistent.",
       "status": "done",
-      "commit": "39811e9"
+      "commit": "42127fe"
+    },
+    {
+      "id": "step-13",
+      "type": "impl",
+      "description": "Run full test suite (pytest fused-memory/tests/) to verify all existing tests pass alongside new tests. Fix any regressions from the category filter change or delete_memory change.",
+      "status": "done",
+      "commit": "e10097c"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Pure function `resolve_project_id()` in models/scope.py as the single conversion point",
-      "rationale": "Keeps the mapping logic co-located with the Scope model that maps project_id to backend identifiers. A pure function (not a method) is easily testable and callable from any context without instantiation. Accepts optional mapping dict for explicit overrides without requiring config dependency."
+      "decision": "delete_memory(store=graphiti) deletes edges, not episodes",
+      "rationale": "Graphiti search returns EntityEdge UUIDs as the result ID. The MCP contract promises search result IDs work with delete_memory. Since search finds edges (facts), delete should delete edges. Episode deletion remains available via the dedicated delete_episode tool. This makes the search→delete contract internally consistent without adding new ID-type fields."
     },
     {
-      "decision": "Store project_root in event payload under `_project_root` key rather than adding a column to the event_buffer SQLite schema",
-      "rationale": "Avoids SQLite schema migration complexity. The payload dict is already JSON-serialized and round-tripped through the buffer. The underscore prefix signals it's system metadata, not user-supplied. Backwards compatible: events without the key are handled gracefully."
+      "decision": "Category filter uses GRAPHITI_PRIMARY set overlap to include Graphiti results",
+      "rationale": "Graphiti edges don't carry category metadata — the category is only known at write time (for routing) and not stored on the edge itself. Rather than running expensive LLM classification at search time, we use the known routing table: if the user filters by any GRAPHITI_PRIMARY category (entities_and_relations, temporal_facts, decisions_and_rationale), Graphiti results with category=None pass through the filter. This prevents silent data loss (the current bug) while being truthful about what we know."
     },
     {
-      "decision": "Default derivation uses Path.name with hyphens replaced by underscores",
-      "rationale": "Matches the established convention: project_root `/home/leo/src/dark-factory` maps to project_id `dark_factory`. Hyphens are problematic in Qdrant collection names and Graphiti group IDs. Lowercasing ensures consistency."
+      "decision": "Assign inferred category to Graphiti results only when unambiguous (single GRAPHITI_PRIMARY category in filter)",
+      "rationale": "When a user filters by exactly one Graphiti-primary category, we can confidently assign it to the Graphiti results since they explicitly requested that specific category from a store that handles those types. When multiple GRAPHITI_PRIMARY categories are in the filter, we leave category as None to avoid false precision. This gives best-effort metadata without lying about what we know."
     },
     {
-      "decision": "TargetedReconciler and BaseStage receive both project_id and project_root as separate parameters/attributes",
-      "rationale": "Makes the dual-identity explicit in the API rather than hiding it behind a lookup. Each call site clearly shows which identifier is used for which service. The TaskInterceptor resolves once and passes both down."
+      "decision": "No new fields added to MemoryResult model",
+      "rationale": "The source_store field already disambiguates what the id represents (edge UUID for graphiti, memory UUID for mem0). Adding an id_type field would be redundant given the fix makes the existing contract work correctly. The simplest change that fixes the bug is preferred."
     },
     {
-      "decision": "Harness extracts project_root from drained events with fallback to project_id",
-      "rationale": "Graceful degradation: events created before the fix (without `_project_root` in payload) still work — the harness falls back to using project_id for task operations, which was the old behavior. New events carry both identifiers."
+      "decision": "backends module added to modules list beyond the original task spec",
+      "rationale": "The GraphitiBackend (in backends/) needs a new remove_edge method to fix the delete contract. This is the minimal backend change needed. The alternative — putting edge deletion logic in MemoryService — would violate the existing layering where MemoryService delegates all Graphiti operations to GraphitiBackend."
     }
   ],
   "reuse": [
     {
-      "what": "Scope model in models/scope.py",
-      "where": "Already maps project_id to graphiti_group_id and mem0_collection_name",
-      "how": "Co-locate resolve_project_id() in the same module since it produces the project_id that Scope consumes. No changes to Scope itself needed — the fix is upstream."
+      "what": "GRAPHITI_PRIMARY / MEM0_PRIMARY category sets from enums.py",
+      "where": "fused_memory/models/enums.py lines 36-47",
+      "how": "Already imported in memory_service.py (line 18). Use GRAPHITI_PRIMARY in the category filter logic to determine which Graphiti results to keep when category filtering is active."
     },
     {
-      "what": "EventBuffer push/drain round-trip via payload JSON",
-      "where": "reconciliation/event_buffer.py already serializes payload to JSON on push and deserializes on drain",
-      "how": "Leverage existing payload serialization to carry _project_root through the buffer without schema changes."
+      "what": "GraphitiBackend.remove_episode pattern (get_by_uuid → delete)",
+      "where": "fused_memory/backends/graphiti_client.py lines 205-212",
+      "how": "Copy the exact pattern for the new remove_edge method, substituting EntityEdge for EpisodicNode. Same asyncio.wait_for timeout wrapper."
     },
     {
-      "what": "Existing test fixtures (taskmaster, reconciler, event_buffer, mock_memory_service)",
-      "where": "tests/test_task_interceptor.py and tests/test_targeted.py",
-      "how": "Reuse existing AsyncMock fixtures; add assertions for the new project_root parameter on mock calls."
+      "what": "EntityEdge from graphiti_core with get_by_uuid and delete methods",
+      "where": "graphiti_core.edges.EntityEdge (confirmed available via runtime inspection)",
+      "how": "Import EntityEdge and use get_by_uuid(driver, uuid) + edge.delete(driver) for edge removal."
     },
     {
-      "what": "BaseStage._memory_read_tools() and _task_read_tools() pattern",
-      "where": "reconciliation/stages/base.py",
-      "how": "The existing closure pattern that captures self.project_id already works — just need to add self.project_root and update task tool closures to capture that instead."
+      "what": "MockEdge dataclass in conftest.py",
+      "where": "fused-memory/tests/conftest.py lines 20-23",
+      "how": "Extend with uuid, source_node, target_node, episodes, valid_at, invalid_at fields to enable realistic Graphiti search result mocking in the new tests."
+    },
+    {
+      "what": "service fixture with mocked backends",
+      "where": "fused-memory/tests/test_memory_service.py lines 12-38",
+      "how": "Add graphiti.remove_edge = AsyncMock() to the existing fixture. All new tests use this fixture for consistent mocking."
+    },
+    {
+      "what": "Existing test_search_category_filter test pattern",
+      "where": "fused-memory/tests/test_memory_service.py lines 200-224",
+      "how": "Follow the same structure (mock store returns, call search with categories, assert on results) but add Graphiti results to the mock setup to test the cross-store filtering behavior."
     }
   ]
 }

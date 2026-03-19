@@ -420,7 +420,22 @@ class MemoryService:
         # Filter by categories if requested
         if categories:
             cat_set = {MemoryCategory(c) for c in categories}
-            results = [r for r in results if r.category in cat_set]
+            graphiti_overlap = cat_set & GRAPHITI_PRIMARY
+            results = [
+                r for r in results
+                if r.category in cat_set
+                or (
+                    r.source_store == SourceStore.graphiti
+                    and r.category is None
+                    and graphiti_overlap
+                )
+            ]
+            # Assign inferred category to Graphiti results when unambiguous
+            if len(graphiti_overlap) == 1:
+                inferred = next(iter(graphiti_overlap))
+                for r in results:
+                    if r.source_store == SourceStore.graphiti and r.category is None:
+                        r.category = inferred
 
         return results[:limit]
 
@@ -580,7 +595,7 @@ class MemoryService:
         source = SourceStore(store)
 
         if source == SourceStore.graphiti:
-            await self.graphiti.remove_episode(memory_id)
+            await self.graphiti.remove_edge(memory_id)
             result = {'status': 'deleted', 'store': 'graphiti', 'id': memory_id}
         else:
             del_result = await self.mem0.delete(memory_id, scope)

@@ -20,6 +20,7 @@ def service(mock_config):
     svc.graphiti.retrieve_episodes = AsyncMock(return_value=[])
     svc.graphiti.add_episode = AsyncMock(return_value=None)
     svc.graphiti.remove_episode = AsyncMock()
+    svc.graphiti.remove_edge = AsyncMock()
     svc.graphiti._require_client = MagicMock()
 
     svc.mem0 = MagicMock()
@@ -223,6 +224,111 @@ class TestSearch:
         assert len(results) == 1
         assert results[0].category == MemoryCategory.preferences_and_norms
 
+    @pytest.mark.asyncio
+    async def test_search_category_filter_includes_graphiti_when_graphiti_primary_requested(
+        self, service
+    ):
+        """When filtering by a GRAPHITI_PRIMARY category, Graphiti results
+        (which have category=None) must NOT be silently dropped."""
+        from tests.conftest import MockEdge, MockNode
+
+        # Mock Graphiti returning edges (category=None in MemoryResult)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Auth service depends on Redis',
+                uuid='edge-uuid-1',
+                source_node=MockNode(name='Auth Service'),
+                target_node=MockNode(name='Redis'),
+            ),
+        ])
+        # Mock Mem0 returning a result with matching category
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm1',
+                    'memory': 'Redis is the caching layer',
+                    'score': 0.8,
+                    'metadata': {'category': 'entities_and_relations'},
+                },
+            ]
+        })
+        results = await service.search(
+            query='Redis dependencies',
+            project_id='test',
+            categories=['entities_and_relations'],
+        )
+        # Both the Graphiti edge and the Mem0 result should be present
+        source_stores = {r.source_store for r in results}
+        assert SourceStore.graphiti in source_stores, (
+            'Graphiti results were silently dropped by category filter'
+        )
+        assert SourceStore.mem0 in source_stores
+
+    @pytest.mark.asyncio
+    async def test_search_category_filter_excludes_graphiti_when_only_mem0_primary_requested(
+        self, service
+    ):
+        """When filtering by only MEM0_PRIMARY categories (e.g. preferences_and_norms),
+        Graphiti results (category=None) should be correctly excluded."""
+        from tests.conftest import MockEdge, MockNode
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Auth service depends on Redis',
+                uuid='edge-uuid-1',
+                source_node=MockNode(name='Auth Service'),
+                target_node=MockNode(name='Redis'),
+            ),
+        ])
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm1',
+                    'memory': 'Always use black for formatting',
+                    'score': 0.9,
+                    'metadata': {'category': 'preferences_and_norms'},
+                },
+            ]
+        })
+        results = await service.search(
+            query='formatting preferences',
+            project_id='test',
+            categories=['preferences_and_norms'],
+        )
+        source_stores = {r.source_store for r in results}
+        # Only Mem0 results should remain; Graphiti results must be excluded
+        assert SourceStore.graphiti not in source_stores
+        assert SourceStore.mem0 in source_stores
+        assert len(results) == 1
+
+    @pytest.mark.asyncio
+    async def test_search_graphiti_results_get_inferred_category_when_single_primary(
+        self, service
+    ):
+        """When exactly one GRAPHITI_PRIMARY category is in the filter,
+        Graphiti results should have that category assigned (not left as None)."""
+        from tests.conftest import MockEdge, MockNode
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Auth service depends on Redis',
+                uuid='edge-uuid-1',
+                source_node=MockNode(name='Auth Service'),
+                target_node=MockNode(name='Redis'),
+            ),
+        ])
+        service.mem0.search = AsyncMock(return_value={'results': []})
+
+        results = await service.search(
+            query='Redis',
+            project_id='test',
+            categories=['entities_and_relations'],
+        )
+        assert len(results) == 1
+        assert results[0].source_store == SourceStore.graphiti
+        # Should have the inferred category, not None
+        assert results[0].category == MemoryCategory.entities_and_relations
+
 
 class TestDeleteMemory:
     @pytest.mark.asyncio
@@ -240,6 +346,96 @@ class TestDeleteMemory:
         )
         assert result['status'] == 'deleted'
         assert result['store'] == 'mem0'
+
+    @pytest.mark.asyncio
+    async def test_delete_memory_graphiti_calls_remove_edge(self, service):
+        """delete_memory(store='graphiti') should call remove_edge (not remove_episode)
+        because search returns edge UUIDs."""
+        service.graphiti.remove_edge = AsyncMock()
+        await service.delete_memory(
+            memory_id='edge-uuid-123', store='graphiti', project_id='test'
+        )
+        service.graphiti.remove_edge.assert_called_once_with('edge-uuid-123')
+        service.graphiti.remove_episode.assert_not_called()
+
+
+class TestSearchDeleteRoundtrip:
+    @pytest.mark.asyncio
+    async def test_search_then_delete_graphiti_roundtrip(self, service):
+        """End-to-end contract test: search returns edge UUIDs that work with delete_memory."""
+        from tests.conftest import MockEdge, MockNode
+
+        edge_uuid = 'edge-roundtrip-uuid-42'
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Payment gateway depends on billing API',
+                uuid=edge_uuid,
+                source_node=MockNode(name='Payment Gateway'),
+                target_node=MockNode(name='Billing API'),
+            ),
+        ])
+        service.mem0.search = AsyncMock(return_value={'results': []})
+
+        # Step 1: Search
+        results = await service.search(query='payment', project_id='test')
+        assert len(results) >= 1
+        graphiti_result = next(
+            r for r in results if r.source_store == SourceStore.graphiti
+        )
+        assert graphiti_result.id == edge_uuid
+
+        # Step 2: Delete using search result's id and source_store
+        result = await service.delete_memory(
+            memory_id=graphiti_result.id,
+            store=graphiti_result.source_store.value,
+            project_id='test',
+        )
+        assert result['status'] == 'deleted'
+        assert result['store'] == 'graphiti'
+
+        # Verify remove_edge was called with the correct edge UUID
+        service.graphiti.remove_edge.assert_called_once_with(edge_uuid)
+        # Verify remove_episode was NOT called (edge != episode)
+        service.graphiti.remove_episode.assert_not_called()
+
+
+class TestDeleteEpisode:
+    @pytest.mark.asyncio
+    async def test_delete_episode_still_uses_remove_episode(self, service):
+        """Regression guard: delete_episode must continue to call remove_episode
+        (not the new remove_edge), since episodes are EpisodicNodes."""
+        await service.delete_episode(episode_id='ep-uuid-123', project_id='test')
+        service.graphiti.remove_episode.assert_called_once_with('ep-uuid-123')
+        service.graphiti.remove_edge.assert_not_called()
+
+
+class TestGraphitiBackendRemoveEdge:
+    @pytest.mark.asyncio
+    async def test_graphiti_backend_remove_edge(self, mock_config):
+        """Unit test for GraphitiBackend.remove_edge — should call
+        EntityEdge.get_by_uuid then edge.delete."""
+        from unittest.mock import patch
+
+        from fused_memory.backends.graphiti_client import GraphitiBackend
+
+        backend = GraphitiBackend(mock_config)
+        # Provide a mock client so _require_client succeeds
+        mock_client = MagicMock()
+        backend.client = mock_client
+
+        mock_edge = AsyncMock()
+        mock_edge.delete = AsyncMock()
+
+        with patch(
+            'fused_memory.backends.graphiti_client.EntityEdge'
+        ) as MockEntityEdge:
+            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
+            await backend.remove_edge('test-edge-uuid')
+
+            MockEntityEdge.get_by_uuid.assert_called_once_with(
+                mock_client.driver, 'test-edge-uuid'
+            )
+            mock_edge.delete.assert_called_once_with(mock_client.driver)
 
 
 class TestGetEpisodes:
