@@ -296,8 +296,8 @@ class Scheduler:
     async def handle_blast_radius_expansion(
         self,
         task_id: str,
-        current_modules: list[str],
-        needed_modules: list[str],
+        current: list[str],
+        needed: list[str],
     ) -> bool:
         """Handle plan discovering wider blast radius.
 
@@ -306,22 +306,22 @@ class Scheduler:
         3. If fail: update task with new modules, reset to pending, release current locks
         """
         depth = self.config.lock_depth
-        current_normalized = [normalize_lock(m, depth) for m in current_modules]
-        needed_normalized = [normalize_lock(m, depth) for m in needed_modules]
+        current_normalized = [normalize_lock(m, depth) for m in current]
+        needed_normalized = [normalize_lock(m, depth) for m in needed]
         additional = [m for m in needed_normalized if m not in current_normalized]
         if not additional:
             return True
 
         if self.lock_table.try_acquire_additional(task_id, additional):
-            logger.info(f'Task {task_id} expanded to modules: {needed_modules}')
+            logger.info(f'Task {task_id} expanded to modules: {needed}')
             return True
 
         # Can't acquire — reset task
         logger.warning(
-            f'Task {task_id} needs modules {needed_modules} but locks unavailable. Requeuing.'
+            f'Task {task_id} needs modules {needed} but locks unavailable. Requeuing.'
         )
         import json
-        updated = await self.update_task(task_id, json.dumps({'modules': needed_modules}))
+        updated = await self.update_task(task_id, json.dumps({'modules': needed}))
         if not updated:
             logger.error(
                 f'Task {task_id}: metadata update failed — task will retry with '

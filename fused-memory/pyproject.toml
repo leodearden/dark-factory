@@ -35,6 +35,8 @@ typeCheckingMode = "basic"
 reportArgumentType = "warning"
 reportAttributeAccessIssue = "warning"
 reportOptionalMemberAccess = "warning"
+reportOptionalSubscript = "warning"
+reportAssignmentType = "warning"
 
 [tool.ruff]
 line-length = 100

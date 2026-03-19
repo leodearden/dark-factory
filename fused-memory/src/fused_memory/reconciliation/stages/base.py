@@ -379,7 +379,10 @@ class BaseStage:
             target_system='taskmaster',
         )
 
-        async def task_update_task(id: str, prompt: str | None = None, metadata: str | None = None):
+        async def task_update_task(id: str, prompt: str | None = None, metadata: str | dict | None = None):
+            import json as json_mod
+            if isinstance(metadata, dict):
+                metadata = json_mod.dumps(metadata)
             return await taskmaster.update_task(
                 task_id=id, prompt=prompt, metadata=metadata, project_root=project_root
             )
@@ -392,7 +395,7 @@ class BaseStage:
                 'properties': {
                     'id': {'type': 'string'},
                     'prompt': {'type': 'string'},
-                    'metadata': {'type': 'string', 'description': 'JSON metadata to merge'},
+                    'metadata': {'type': ['string', 'object'], 'description': 'JSON metadata to merge (object or JSON string)'},
                 },
                 'required': ['id'],
             },

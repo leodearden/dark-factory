@@ -153,3 +153,35 @@ class TestTaskWriteToolsUseProjectRoot:
         mock_taskmaster.remove_task.assert_called_once_with(
             task_id='1', project_root='/home/leo/src/dark-factory'
         )
+
+
+class TestUpdateTaskMetadataCoercion:
+    """update_task should coerce dict metadata to JSON string before forwarding."""
+
+    @pytest.mark.asyncio
+    async def test_update_task_dict_metadata_coerced_to_json_string(
+        self, stage, mock_taskmaster
+    ):
+        tools = stage._task_write_tools()
+        await tools['update_task'].function(id='1', metadata={'key': 'value'})
+        mock_taskmaster.update_task.assert_called_once_with(
+            task_id='1', prompt=None, metadata='{"key": "value"}',
+            project_root='/home/leo/src/dark-factory'
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_task_string_metadata_passed_through(
+        self, stage, mock_taskmaster
+    ):
+        tools = stage._task_write_tools()
+        await tools['update_task'].function(id='1', metadata='{"key": "value"}')
+        mock_taskmaster.update_task.assert_called_once_with(
+            task_id='1', prompt=None, metadata='{"key": "value"}',
+            project_root='/home/leo/src/dark-factory'
+        )
+
+    def test_update_task_schema_accepts_string_and_object(self, stage):
+        tools = stage._task_write_tools()
+        tool_def = tools['update_task']
+        metadata_schema = tool_def.parameters['properties']['metadata']
+        assert metadata_schema['type'] == ['string', 'object']

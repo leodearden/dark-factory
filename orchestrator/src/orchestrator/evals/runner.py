@@ -279,7 +279,7 @@ class _EvalScheduler:
     async def set_task_status(self, task_id: str, status: str):
         logger.info(f'[eval] Task {task_id} → {status}')
 
-    async def handle_blast_radius_expansion(self, task_id, current, requested):
+    async def handle_blast_radius_expansion(self, task_id: str, current: list[str], needed: list[str]) -> bool:
         return True  # always allow in eval mode
 
 
