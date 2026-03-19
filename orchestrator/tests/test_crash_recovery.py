@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig
 from orchestrator.harness import Harness
 
 

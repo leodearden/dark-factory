@@ -8,9 +8,8 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
-from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import AgentResult, invoke_agent
 from orchestrator.agents.roles import (
     ALL_REVIEWERS,
@@ -23,14 +22,56 @@ from orchestrator.agents.roles import (
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.scheduler import Scheduler, TaskAssignment, files_to_modules
+from orchestrator.scheduler import TaskAssignment, files_to_modules
+from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import run_verification
 
-from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
-
 if TYPE_CHECKING:
-    from orchestrator.mcp_lifecycle import McpLifecycle
     from orchestrator.usage_gate import UsageGate
+
+
+# ---------------------------------------------------------------------------
+# Structural protocols — allow test doubles without inheriting concrete classes
+# ---------------------------------------------------------------------------
+
+
+class _SchedulerLike(Protocol):
+    async def set_task_status(self, task_id: str, status: str, /) -> None: ...
+    async def handle_blast_radius_expansion(
+        self, task_id: str, current: list[str], needed: list[str], /
+    ) -> bool: ...
+
+
+class _McpLike(Protocol):
+    @property
+    def url(self) -> str: ...
+    def mcp_config_json(self, escalation_url: str | None = None) -> dict: ...
+
+
+class _BriefingLike(Protocol):
+    async def build_architect_prompt(
+        self, task: dict, worktree: Path | None = ..., context: str | None = ...
+    ) -> str: ...
+    async def build_resume_prompt(
+        self,
+        task: dict,
+        plan: dict,
+        escalation_summary: str,
+        resolution: str,
+        worktree: Path | None = ...,
+    ) -> str: ...
+    async def build_implementer_prompt(
+        self, plan: dict, iteration_log: list, context: str | None = ...
+    ) -> str: ...
+    async def build_debugger_prompt(
+        self, failures: str, plan: dict, context: str | None = ...
+    ) -> str: ...
+    async def build_reviewer_prompt(
+        self, reviewer_type: str, diff: str, context: str | None = ...
+    ) -> str: ...
+    async def build_merger_prompt(
+        self, conflicts: str, task_intent: str, context: str | None = ...
+    ) -> str: ...
 
 logger = logging.getLogger(__name__)
 
@@ -71,9 +112,9 @@ class TaskWorkflow:
         assignment: TaskAssignment,
         config: OrchestratorConfig,
         git_ops: GitOps,
-        scheduler: Scheduler,
-        briefing: BriefingAssembler,
-        mcp: McpLifecycle,
+        scheduler: _SchedulerLike,
+        briefing: _BriefingLike,
+        mcp: _McpLike,
         escalation_queue=None,
         escalation_event: asyncio.Event | None = None,
         usage_gate: UsageGate | None = None,

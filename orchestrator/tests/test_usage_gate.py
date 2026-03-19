@@ -7,7 +7,6 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import (
     AccountState,

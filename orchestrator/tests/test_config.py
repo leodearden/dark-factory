@@ -1,10 +1,8 @@
 """Tests for configuration loading."""
 
 import logging
-import os
 from pathlib import Path
 
-import pytest
 import yaml
 
 from orchestrator.config import (
