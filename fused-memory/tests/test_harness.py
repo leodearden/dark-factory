@@ -134,7 +134,7 @@ def _make_event_with_root(
 @pytest.mark.asyncio
 async def test_full_cycle_extracts_project_root_from_events(journal, event_buffer, mock_memory_service):
     """Harness should set both stage.project_id and stage.project_root from drained events."""
-    from unittest.mock import AsyncMock, MagicMock, patch
+    from unittest.mock import AsyncMock
 
     from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
     from fused_memory.models.reconciliation import StageReport
