@@ -595,7 +595,7 @@ class MemoryService:
         source = SourceStore(store)
 
         if source == SourceStore.graphiti:
-            await self.graphiti.remove_episode(memory_id)
+            await self.graphiti.remove_edge(memory_id)
             result = {'status': 'deleted', 'store': 'graphiti', 'id': memory_id}
         else:
             del_result = await self.mem0.delete(memory_id, scope)

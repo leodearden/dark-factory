@@ -20,6 +20,7 @@ def service(mock_config):
     svc.graphiti.retrieve_episodes = AsyncMock(return_value=[])
     svc.graphiti.add_episode = AsyncMock(return_value=None)
     svc.graphiti.remove_episode = AsyncMock()
+    svc.graphiti.remove_edge = AsyncMock()
     svc.graphiti._require_client = MagicMock()
 
     svc.mem0 = MagicMock()
