@@ -33,6 +33,23 @@ class TestMemoryPartialOnline:
             assert resp.status_code == 200
             assert 'text/html' in resp.headers['content-type']
 
+    def test_memory_heading_present(self, client):
+        with (
+            patch(
+                'dashboard.data.memory.get_memory_status',
+                new_callable=AsyncMock,
+                return_value=_ONLINE_STATUS,
+            ),
+            patch(
+                'dashboard.data.memory.get_queue_stats',
+                new_callable=AsyncMock,
+                return_value=_ONLINE_QUEUE,
+            ),
+        ):
+            html = client.get('/partials/memory').text
+            assert '<h2' in html
+            assert 'Memory' in html
+
     def test_online_contains_card_labels(self, client):
         with (
             patch(
