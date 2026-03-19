@@ -14,6 +14,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from dashboard.config import DashboardConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -176,3 +178,48 @@ def read_task_artifacts(worktree_path: Path) -> dict:
         'iteration_count': iteration_count,
         'review_summary': review_summary,
     }
+
+
+def discover_orchestrators(config: DashboardConfig) -> list[dict]:
+    """Discover running orchestrators and enrich with task tree and worktree data.
+
+    For each running orchestrator process, attaches:
+    - tasks: parsed task tree from tasks.json
+    - worktrees: dict mapping worktree name → artifact data
+    - summary: status counts {total, done, in_progress, blocked, pending}
+
+    Returns [] if no orchestrator processes are running.
+    """
+    processes = find_running_orchestrators()
+    if not processes:
+        return []
+
+    tasks = load_task_tree(config.tasks_json)
+
+    # Scan worktrees
+    worktrees: dict[str, dict] = {}
+    worktrees_dir = config.worktrees_dir
+    if worktrees_dir.is_dir():
+        for subdir in sorted(worktrees_dir.iterdir()):
+            if subdir.is_dir():
+                worktrees[subdir.name] = read_task_artifacts(subdir)
+
+    # Compute summary stats from task tree
+    summary = {
+        'total': len(tasks),
+        'done': sum(1 for t in tasks if t.get('status') == 'done'),
+        'in_progress': sum(1 for t in tasks if t.get('status') == 'in-progress'),
+        'blocked': sum(1 for t in tasks if t.get('status') == 'blocked'),
+        'pending': sum(1 for t in tasks if t.get('status') == 'pending'),
+    }
+
+    result: list[dict] = []
+    for proc in processes:
+        result.append({
+            **proc,
+            'tasks': tasks,
+            'worktrees': worktrees,
+            'summary': summary,
+        })
+
+    return result
