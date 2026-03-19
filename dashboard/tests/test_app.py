@@ -8,6 +8,18 @@ from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
 
+class TestIdiomorphExtension:
+    """Tests for idiomorph extension setup in base.html."""
+
+    def test_idiomorph_script_tag(self, client):
+        html = client.get('/').text
+        assert 'unpkg.com/idiomorph@0.3.0/dist/idiomorph-ext.min.js' in html
+
+    def test_body_has_morph_extension(self, client):
+        html = client.get('/').text
+        assert 'hx-ext="morph"' in html
+
+
 class TestIndex:
     """Tests for GET / — the main dashboard page."""
 
