@@ -263,9 +263,10 @@ class EventBuffer:
         if self._queue_stats_fn is not None:
             try:
                 stats = await self._queue_stats_fn()
-                pending = stats.get('pending', 0)
-                retry = stats.get('retry', 0)
-                in_flight = stats.get('in_flight', 0)
+                counts = stats.get('counts', {})
+                pending = counts.get('pending', 0)
+                retry = counts.get('retry', 0)
+                in_flight = counts.get('in_flight', 0)
                 if (pending + retry + in_flight) > 0:
                     return False
             except Exception:
