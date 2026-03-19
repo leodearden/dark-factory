@@ -129,6 +129,25 @@ class TestAddEpisode:
         assert payload['uuid'] == result.episode_id
 
 
+class TestExecuteGraphitiWrite:
+    @pytest.mark.asyncio
+    async def test_uuid_passed_to_graphiti_backend(self, service):
+        """_execute_graphiti_write must forward uuid from payload to graphiti.add_episode."""
+        test_uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        payload = {
+            'uuid': test_uuid,
+            'name': 'episode_aaaaaaaa',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+        service.graphiti.add_episode.assert_called_once()
+        call_kwargs = service.graphiti.add_episode.call_args[1]
+        assert call_kwargs.get('uuid') == test_uuid
+
+
 class TestReplayFromStore:
     @pytest.mark.asyncio
     async def test_replay_enqueues_mem0_memories(self, service):
