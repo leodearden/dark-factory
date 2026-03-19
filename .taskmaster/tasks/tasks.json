@@ -179,7 +179,7 @@
         "description": "Task-triggered reconciliation currently emits events keyed by Taskmaster's `project_root` and then reuses that string as the memory `project_id`. That causes completion knowledge, memory hints, and related searches to land under a different Graphiti group / Mem0 collection than the rest of the project's memory, fragmenting the knowledge base.",
         "details": "The repo docs distinguish task routing (`project_root=\"/home/leo/src/dark-factory\"`) from memory routing (`project_id=\"dark_factory\"`), but the reconciliation path collapses them. Relevant code paths: `fused_memory.middleware.task_interceptor.TaskInterceptor._make_event`, `fused_memory.reconciliation.targeted.TargetedReconciler`, and `fused_memory.models.scope.Scope`. Fix should establish a canonical mapping from task project root to memory project_id and use it consistently across targeted and full reconciliation stages.",
         "testStrategy": "Add integration tests proving a task status transition writes memory into the canonical project scope (`dark_factory`) rather than the filesystem path. Cover both targeted reconciliation and any stage-base task tools that currently pass `project_root=project_id`.",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "high",
         "metadata": {
@@ -191,7 +191,7 @@
           ]
         },
         "subtasks": [],
-        "updatedAt": "2026-03-19T06:50:41.847Z"
+        "updatedAt": "2026-03-19T11:01:40.058Z"
       },
       {
         "id": "25",
@@ -199,7 +199,7 @@
         "description": "MemoryService generates and returns an `episode_id` immediately from `add_episode()`, but that UUID is not included in the queued Graphiti write. The actual Graphiti episode therefore gets a different UUID, so the returned ID cannot be used reliably for provenance, follow-up reads, or deletion.",
         "details": "Relevant paths: `fused_memory.services.memory_service.MemoryService.add_episode`, `_execute_graphiti_write`, and `fused_memory.backends.graphiti_client.GraphitiBackend.add_episode`. The durable queue payload needs to carry the generated UUID through to Graphiti, or the API contract needs to change so the system does not promise a stable episode ID before the backend has accepted one.",
         "testStrategy": "Add a test that enqueues an episode, drains the queue, and asserts the returned `episode_id` matches the UUID passed into the Graphiti backend. Also cover delete/provenance flows that depend on the returned ID.",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "high",
         "metadata": {
@@ -210,7 +210,7 @@
           ]
         },
         "subtasks": [],
-        "updatedAt": "2026-03-19T06:56:59.734Z"
+        "updatedAt": "2026-03-19T10:44:42.699Z"
       },
       {
         "id": "26",
@@ -218,7 +218,7 @@
         "description": "The fused-memory API presents search results and deletion as a uniform cross-store contract, but Graphiti results currently return edge UUIDs with no category while `delete_memory(store=\"graphiti\")` expects an episode UUID. Category filtering also silently drops all Graphiti results because their category is always null.",
         "details": "Relevant paths: `fused_memory.services.memory_service._search_graphiti`, `search(... categories=...)`, `delete_memory()`, and the MCP tool docs in `fused_memory.server.tools`. This needs either a real unified identifier contract or explicit store-specific semantics. At minimum the API/docs/tests should agree on what Graphiti IDs represent and whether category-filtered searches can include Graphiti facts.",
         "testStrategy": "Add coverage for: (1) Graphiti search results used as delete inputs, (2) category-filtered searches that include Graphiti results when appropriate, and (3) tool docs / response schema consistency around `memory_id`, `source_store`, and category handling.",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "high",
         "metadata": {
@@ -230,7 +230,7 @@
           ]
         },
         "subtasks": [],
-        "updatedAt": "2026-03-19T06:45:34.099Z"
+        "updatedAt": "2026-03-19T11:22:09.141Z"
       },
       {
         "id": "27",
@@ -238,7 +238,7 @@
         "description": "Reconciliation's quiescence logic expects top-level `pending`, `retry`, and `in_flight` fields from the durable write queue, but `DurableWriteQueue.get_stats()` returns those counts nested under `counts`. That can make the system think the queue is idle and trigger reconciliation while Graphiti writes are still outstanding.",
         "details": "Relevant paths: `fused_memory.reconciliation.event_buffer.EventBuffer._is_quiescent` and `fused_memory.services.durable_queue.DurableWriteQueue.get_stats`. The current tests mock the flat shape instead of the real one, so the mismatch passes unnoticed. Fix the consumer, then align the tests with the actual queue contract.",
         "testStrategy": "Add a regression test that wires `EventBuffer` to a real or realistically mocked `DurableWriteQueue.get_stats()` response and proves quiescence stays false while `counts.pending + counts.retry + counts.in_flight > 0`.",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "metadata": {
@@ -249,14 +249,254 @@
           ]
         },
         "subtasks": [],
-        "updatedAt": "2026-03-19T06:45:34.168Z"
+        "updatedAt": "2026-03-19T11:37:11.993Z"
+      },
+      {
+        "id": "28",
+        "title": "Fix HTMX polling destroying Alpine.js state on orchestrators panel",
+        "description": "The orchestrators partial uses hx-swap=\"innerHTML\" with every-10s polling. Each HTMX refresh re-initializes Alpine.js x-data=\"{ open: false }\" components, causing any expanded \"Show tasks\" accordion to collapse every 10 seconds. This makes the only interactive element on the dashboard completely broken in practice.\n\nThe fix must preserve Alpine.js component state across HTMX partial refreshes. Options:\n1. Use the HTMX idiomorph extension (hx-swap=\"morph:innerHTML\") which diffs the DOM and preserves Alpine state.\n2. Move the toggle state out of Alpine into a URL hash or localStorage, and restore it on HTMX swap.\n3. Use hx-swap=\"outerHTML\" with hx-select to swap only data elements, keeping the Alpine container intact.\n\nOption 1 (idiomorph) is the simplest and most maintainable. It requires adding the idiomorph extension script tag to base.html and changing the hx-swap attribute on the orchestrators section in index.html.\n\nThe fix should also apply to the other polling sections (memory, recon) for consistency, even though they don't currently use Alpine.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/templates/base.html — add idiomorph extension script tag\n- dashboard/src/dashboard/templates/index.html — change hx-swap=\"innerHTML\" to hx-swap=\"morph:innerHTML\" on all three polling sections\n\nThe idiomorph extension CDN: https://unpkg.com/idiomorph@0.3.0/dist/idiomorph-ext.min.js (pin the version). Add hx-ext=\"morph\" to the body tag or to each section.\n\nTest: After the fix, expanding \"Show tasks\" on an orchestrator card should survive HTMX poll cycles without collapsing. Verify by running the dashboard, clicking Show tasks, and waiting >10s.",
+        "testStrategy": "Write a test that renders the orchestrators partial twice with different data and verifies the HTML structure is morph-compatible (stable element IDs/structure). Also verify the idiomorph script tag is present in base.html output.",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "high",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        },
+        "subtasks": [],
+        "updatedAt": "2026-03-19T12:20:00.000Z"
+      },
+      {
+        "id": "29",
+        "title": "Fix httpx not following redirects for fused-memory MCP calls",
+        "description": "The dashboard shows \"Fused Memory Server Offline\" with error \"MCP call get_status returned non-200 status: 307\" even when the fused-memory server is running. This is because httpx.AsyncClient() defaults to follow_redirects=False, and the MCP server returns a 307 redirect (likely trailing-slash normalization from /mcp/ to /mcp or vice versa).\n\nFix: Either set follow_redirects=True on the httpx.AsyncClient in app.py's lifespan, or remove the trailing slash from the URL in memory.py's mcp_tool_call (currently posts to {base_url}/mcp/).\n\nBoth fixes should be applied: follow_redirects=True as a safety net, and correct the URL to avoid the redirect entirely.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/app.py line 57 — change httpx.AsyncClient() to httpx.AsyncClient(follow_redirects=True)\n- dashboard/src/dashboard/data/memory.py line 34 — verify the URL path matches what the fused-memory HTTP server expects (check if it's /mcp or /mcp/)\n\nTest by curling the fused-memory server directly to determine the correct URL:\n  curl -v -X POST http://localhost:8000/mcp/ vs http://localhost:8000/mcp",
+        "testStrategy": "Add a test that verifies httpx.AsyncClient is created with follow_redirects=True. Add a test that mocks a 307 response and verifies the client follows it rather than returning offline status.",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "high",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        },
+        "subtasks": [],
+        "updatedAt": "2026-03-19T12:20:00.000Z"
+      },
+      {
+        "id": "30",
+        "title": "Make recon panel responsive and truncate raw trigger timestamps",
+        "description": "Two related layout issues in the reconciliation panel:\n\n1. The grid-cols-2 layout in recon.html is hardcoded and doesn't stack on mobile. At 480px the left column (Event Buffer, Burst State, Watermarks, Verdict) gets crushed to ~200px and the Recent Runs table overflows horizontally.\n\n2. The Trigger column in the Recent Runs table displays raw trigger_reason strings like \"max_staleness:2026-03-19T06:59:04.491867+00:00\" which are very long ISO timestamps that cause horizontal overflow even on desktop.\n\nFix the grid to be responsive (grid-cols-1 lg:grid-cols-2). Add a Jinja2 filter or inline logic to format trigger_reason strings — extract the trigger type and convert the timestamp to relative time, e.g. \"max_staleness (1h ago)\" or just \"staleness\" with the timestamp as a tooltip.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/templates/partials/recon.html line 1 — change grid-cols-2 to grid-cols-1 lg:grid-cols-2\n- dashboard/src/dashboard/templates/partials/recon.html trigger column — add truncation/formatting for trigger_reason values\n- dashboard/src/dashboard/app.py — add a trigger_format Jinja2 filter if needed\n\nThe trigger_reason format is \"type:value\" where type is one of: quiescent, buffer_size, max_staleness, manual. For max_staleness, the value is an ISO timestamp. For quiescent and buffer_size, the value is a number. Format as:\n- \"quiescent:6\" → \"quiescent (6)\"\n- \"buffer_size:10\" → \"buffer (10)\"\n- \"max_staleness:2026-03-19T...\" → \"staleness (1h ago)\"\n- \"manual\" → \"manual\"\n\nAlso add overflow-x-auto to the Recent Runs table container as a fallback.",
+        "testStrategy": "Test the trigger_format filter with all four trigger types. Verify the recon partial HTML contains responsive grid classes. Visual verification at 480px and 768px widths.",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        },
+        "subtasks": [],
+        "updatedAt": "2026-03-19T12:20:00.000Z"
+      },
+      {
+        "id": "31",
+        "title": "Add section headings, loading skeletons, and fix timeago edge case",
+        "description": "Three minor UX issues grouped together:\n\n1. No section headings for Memory and Reconciliation panels. Only \"Orchestrators\" has a visible heading. The page structure is unclear at a glance. Add \"Memory\" and \"Reconciliation\" headings to match the Orchestrators pattern.\n\n2. When partials are loading, the user sees bare gray \"Loading...\" text with no visual indicator. Replace with a pulsing skeleton placeholder (Tailwind animate-pulse with gray placeholder boxes).\n\n3. The timeago filter returns \"0m ago\" when total_minutes is 0 (event happened <60 seconds ago). Should return \"just now\" or \"<1m ago\" instead.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/templates/index.html — add section headings above each hx-get div, replace \"Loading...\" with skeleton HTML\n- dashboard/src/dashboard/app.py timeago filter — handle the 0-minute case\n\nFor skeletons, use something like:\n<div class=\"animate-pulse space-y-4\">\n  <div class=\"h-4 bg-gray-700 rounded w-1/3\"></div>\n  <div class=\"h-32 bg-gray-800 rounded\"></div>\n</div>\n\nFor timeago: if total_minutes == 0, return \"just now\".",
+        "testStrategy": "Test timeago filter with a timestamp from 30 seconds ago, verify it returns \"just now\". Test index.html contains section headings and animate-pulse classes.",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        },
+        "subtasks": [],
+        "updatedAt": "2026-03-19T12:20:00.000Z"
+      },
+      {
+        "id": "32",
+        "title": "Add HTMX error and timeout fallback for partial endpoints",
+        "description": "If a partial endpoint hangs or returns a server error, the HTMX section stays at \"Loading...\" permanently with no indication of failure. HTMX doesn't surface errors by default.\n\nAdd error handling so that failed partial loads show a visible error state rather than silent failure. Use HTMX's hx-on::after-request event or the htmx:responseError event to detect failures and show an error message in the target element.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/templates/base.html or index.html — add HTMX event listener for htmx:responseError and htmx:timeout that replaces the target with an error card\n- dashboard/src/dashboard/templates/index.html — add hx-timeout attribute to polling sections (e.g. 8s for a 10s poll interval)\n\nExample error handler:\n<script>\n  document.addEventListener('htmx:responseError', function(evt) {\n    evt.detail.target.innerHTML = '<div class=\"bg-red-900/30 border border-red-800 rounded-lg p-4 text-red-300 text-sm\">Failed to load — retrying...</div>';\n  });\n</script>\n\nThis ensures a visual indicator appears on failure while HTMX continues to poll and will recover on the next successful response.",
+        "testStrategy": "Test that the error handler script is present in the base template. Integration test: mock a partial endpoint to return 500 and verify the HTMX error handling is wired up (check for the event listener in rendered HTML).",
+        "status": "pending",
+        "dependencies": [
+          "28"
+        ],
+        "priority": "medium",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        },
+        "subtasks": [],
+        "updatedAt": "2026-03-19T12:20:00.000Z"
+      },
+      {
+        "id": "33",
+        "title": "Fix worktree artifact lookup key mismatch with task IDs",
+        "description": "In tasks.html line 16, the template does orch.worktrees.get(tid, {}) where tid is the task ID as a string. But discover_orchestrators() in orchestrator.py keys worktrees by subdir.name (the directory name under .worktrees/). These only match if the worktree directory is named exactly as the task ID string.\n\nThe orchestrator names worktrees as \"task-{id}\" (e.g. \"task-7\"), not just \"{id}\". So the lookup always fails and every task shows dashes for Phase, Iterations, Reviews, and Modules columns.\n\nFix the key to match the orchestrator's naming convention, or normalize the worktree keys during discovery.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/data/orchestrator.py discover_orchestrators() — when building the worktrees dict, either:\n  (a) Key by the task ID extracted from the directory name (strip \"task-\" prefix), or\n  (b) Key by the raw directory name and update the template to use the correct key format\n\nOption (a) is better — extract the task ID from worktree directory names like \"task-7\" → \"7\" and key the dict by \"7\".\n\nAlso check the actual worktree directory naming convention by looking at git_ops.py or the orchestrator's worktree creation code.",
+        "testStrategy": "Test discover_orchestrators with a temp worktrees dir containing a \"task-7\" subdirectory. Verify the returned worktrees dict is keyed by \"7\" (the task ID), not \"task-7\".",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        },
+        "subtasks": [],
+        "updatedAt": "2026-03-19T12:20:00.000Z"
+      },
+      {
+        "id": "34",
+        "title": "Pin CDN dependencies with SRI hashes and add favicon",
+        "description": "Three issues with external dependencies and assets:\n\n1. Alpine.js is loaded from alpinejs@3.x.x which auto-resolves to any 3.x version — could break without warning on a minor release.\n\n2. HTMX is pinned to 2.0.4 but loaded from unpkg.com with no Subresource Integrity (SRI) hash, leaving it vulnerable to CDN compromise.\n\n3. No favicon is served, causing a 404 console error on every page load.\n\nPin Alpine.js to a specific version (e.g. 3.14.8), add SRI integrity attributes to all CDN script tags, and add a minimal favicon (can be a simple SVG inline or a static file).",
+        "details": "Files to modify:\n- dashboard/src/dashboard/templates/base.html — pin Alpine version, add integrity and crossorigin attributes to all CDN script tags\n- dashboard/src/dashboard/static/ — add a favicon.ico or favicon.svg\n- dashboard/src/dashboard/templates/base.html — add <link rel=\"icon\"> in head\n\nTo generate SRI hashes: curl the CDN URL and pipe through `openssl dgst -sha384 -binary | openssl base64 -A`\n\nFor the favicon, a minimal SVG works:\n<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏭</text></svg>\">\n\nOr create a simple static favicon.",
+        "testStrategy": "Test that base.html contains integrity attributes on all CDN script tags. Test that GET /favicon.ico returns 200 (or that the inline SVG favicon link is present in the HTML head).",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        },
+        "subtasks": [],
+        "updatedAt": "2026-03-19T12:20:00.000Z"
+      },
+      {
+        "id": "35",
+        "title": "Deduplicate identical orchestrator cards when sharing task tree",
+        "description": "When multiple orchestrator processes are running against the same PRD, discover_orchestrators() loads the task tree once and attaches the identical data to all processes. The dashboard then shows two (or more) visually identical cards with the same task list, progress bar, and stats — confusing for users who expect each card to represent distinct work.\n\nThe fix should either:\n1. Group orchestrators by PRD and show a single card with a note about multiple PIDs, or\n2. Scope each orchestrator's task view to its actual working set (if the orchestrator's task assignment is tracked somewhere), or\n3. At minimum, add visual differentiation (show all PIDs in the card header, note that they share the same task tree).\n\nOption 3 is the simplest and most honest — show all PIDs sharing the same task tree in a single card.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/data/orchestrator.py discover_orchestrators() — group processes by PRD path, merge PIDs into a single entry\n- dashboard/src/dashboard/templates/partials/orchestrators.html — show multiple PIDs in the header when grouped\n\nIn discover_orchestrators: after getting processes, group by proc['prd']. For each unique PRD, create one orchestrator entry with a 'pids' list instead of a single 'pid'. Attach the shared task tree and worktrees once.\n\nIn the template: show \"PIDs 2109809, 2109812\" instead of separate cards.",
+        "testStrategy": "Test discover_orchestrators with mock ps output containing two processes with the same PRD. Verify the result contains one entry with both PIDs. Test the template renders multiple PIDs correctly.",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        },
+        "subtasks": [],
+        "updatedAt": "2026-03-19T12:20:00.000Z"
+      },
+      {
+        "id": "36",
+        "title": "Fix deprecated TemplateResponse API in recon route",
+        "description": "The recon partial route (app.py:102-112) uses the old Starlette TemplateResponse(name, {request: ...}) signature while the other three routes already use the new TemplateResponse(request, name, context=...) API. This produces 18 deprecation warnings in the test suite and will break on the next Starlette major version.\n\nThe fix is a one-line change: rewrite the call to match the pattern used by the memory and orchestrators routes.",
+        "details": "File: dashboard/src/dashboard/app.py lines 102-112\n\nCurrent (deprecated):\n```python\nreturn templates.TemplateResponse(\n    'partials/recon.html',\n    {\n        'request': request,\n        'buffer_stats': buffer_stats,\n        ...\n    },\n)\n```\n\nShould be:\n```python\nreturn templates.TemplateResponse(\n    request, 'partials/recon.html',\n    context={\n        'buffer_stats': buffer_stats,\n        ...\n    },\n)\n```\n\nVerify: `uv run pytest tests/ -x -W error::DeprecationWarning` should pass with zero warnings.",
+        "testStrategy": "Run pytest with -W error::DeprecationWarning to verify no deprecation warnings remain.",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "high",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        },
+        "subtasks": [],
+        "updatedAt": "2026-03-19T13:30:00.000Z"
+      },
+      {
+        "id": "37",
+        "title": "Taskmaster card hardcoded to 'Connected' — ignores actual status",
+        "description": "The Taskmaster card in memory.html (line 32-35) always renders a green dot and 'Connected' text regardless of the actual taskmaster connection status. The MCP get_status response includes a taskmaster.connected boolean, but the template doesn't reference it.\n\nThis means when Taskmaster is down, the dashboard still shows it as connected — directly misleading for the monitoring use case.",
+        "details": "File: dashboard/src/dashboard/templates/partials/memory.html lines 30-36\n\nCurrent (hardcoded):\n```html\n<div class=\"w-3 h-3 rounded-full bg-green-500\"></div>\n...\n<div class=\"text-3xl font-bold text-white\">Connected</div>\n```\n\nShould conditionally check status.taskmaster.connected like the Graphiti and Mem0 cards do:\n```html\n<div class=\"w-3 h-3 rounded-full {% if status.taskmaster.connected|default(false) %}bg-green-500{% else %}bg-red-500{% endif %}\"></div>\n...\n<div class=\"text-3xl font-bold text-white\">{% if status.taskmaster.connected|default(false) %}Connected{% else %}Disconnected{% endif %}</div>\n```\n\nAlso add a test in test_memory_partial.py that verifies the card reflects actual taskmaster status.",
+        "testStrategy": "Add test cases for taskmaster connected=true and connected=false. Verify the HTML contains the correct dot color and text for each state.",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "high",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        },
+        "subtasks": [],
+        "updatedAt": "2026-03-19T13:30:00.000Z"
+      },
+      {
+        "id": "38",
+        "title": "Narrow broad exception handlers and add logging for silent failures",
+        "description": "Three data modules silently swallow errors, making production debugging difficult:\n\n1. orchestrator.py:35 catches bare `except Exception` on subprocess.run — this also catches KeyboardInterrupt and SystemExit. Should be `except (OSError, subprocess.TimeoutExpired)`.\n\n2. memory.py:52-53 and 65-66 silently return empty dicts on JSON parse failures with no logging. Malformed MCP responses vanish without a trace.\n\n3. reconciliation.py has 5 identical try/except blocks catching FileNotFoundError and sqlite3.OperationalError with no logging.\n\nAll three should log at WARNING level when catching errors, and the orchestrator exception should be narrowed to specific types.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/data/orchestrator.py:35 — change `except Exception:` to `except (OSError, subprocess.TimeoutExpired):`\n- dashboard/src/dashboard/data/memory.py:52,65 — add `logger.warning('MCP response parse error', exc_info=True)` before returning {}\n- dashboard/src/dashboard/data/reconciliation.py — add logger and log at debug level in each except block\n\nAll three modules already import logging or can trivially add it. The key is to not change behavior (still return defaults) but make failures visible in logs.",
+        "testStrategy": "Test that narrowed orchestrator exception still handles OSError. Test that a malformed MCP response triggers a log warning (use caplog fixture).",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        },
+        "subtasks": [],
+        "updatedAt": "2026-03-19T13:30:00.000Z"
+      },
+      {
+        "id": "39",
+        "title": "Memory cards don't wrap on narrow viewports — horizontal overflow",
+        "description": "The memory health cards use `flex gap-4` without `flex-wrap`, so the four cards (Graphiti, Mem0, Taskmaster, Write Queue) are always side-by-side. On viewports narrower than ~900px, the cards get crushed below readable widths. The PRD lists mobile as a non-goal, but the cards should at least wrap gracefully on smaller desktop/laptop windows.\n\nFix: add `flex-wrap` to the flex container and set `min-w-[200px]` on each card so they wrap to 2x2 or 1-column naturally.",
+        "details": "File: dashboard/src/dashboard/templates/partials/memory.html line 8\n\nCurrent: `<div class=\"flex gap-4\">`\nFix: `<div class=\"flex flex-wrap gap-4\">`\n\nAlso add `min-w-[200px]` to each card div to ensure they wrap before becoming unreadably narrow.\n\nThis is visible in the audit screenshots at tablet (768px) and mobile (480px) widths where the Write Queue card text gets truncated.",
+        "testStrategy": "Visual verification at 768px and 480px widths. Test that the memory partial HTML contains flex-wrap class.",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        },
+        "subtasks": [],
+        "updatedAt": "2026-03-19T13:30:00.000Z"
+      },
+      {
+        "id": "40",
+        "title": "Add ARIA labels to status indicator dots and auto-updating sections",
+        "description": "Status indicator dots (colored circles showing connected/disconnected) throughout the dashboard are purely visual — they have no aria-label, role, or screen-reader text. This means accessibility tools see empty divs.\n\nAlso, the three auto-polling sections (memory, recon, orchestrators) lack aria-live attributes, so screen readers won't announce updates.\n\nFix: add role='status' and aria-label to indicator dots, and aria-live='polite' to each polling section.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/templates/partials/memory.html — add aria-label to each status dot div (e.g., aria-label='Graphiti connected' or 'Graphiti disconnected')\n- dashboard/src/dashboard/templates/partials/recon.html — add aria-label to status badges\n- dashboard/src/dashboard/templates/index.html — add aria-live='polite' to each hx-get section\n\nExample for memory.html:\n```html\n<div class=\"w-3 h-3 rounded-full bg-green-500\" role=\"status\" aria-label=\"Graphiti connected\"></div>\n```\n\nUse Jinja2 conditionals to set the label dynamically:\n```html\naria-label=\"Graphiti {% if status.graphiti.connected|default(false) %}connected{% else %}disconnected{% endif %}\"\n```",
+        "testStrategy": "Test that rendered HTML contains aria-label attributes on status dots and aria-live on polling sections.",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        },
+        "subtasks": [],
+        "updatedAt": "2026-03-19T13:30:00.000Z"
+      },
+      {
+        "id": "41",
+        "title": "Extract duplicated badge color logic into Jinja2 macros",
+        "description": "Status badge HTML and color-mapping logic is duplicated 15+ times across four partial templates. Each template independently maps status strings to Tailwind color classes (e.g., 'done' → bg-green-600, 'blocked' → bg-red-600). Changes require updating every template, and inconsistencies are easy to introduce.\n\nExtract a Jinja2 macro file with reusable badge components: status_badge(status), severity_badge(severity), and indicator_dot(connected).",
+        "details": "Create dashboard/src/dashboard/templates/macros/badges.html:\n```html\n{% macro status_badge(status) %}\n  {% set colors = {'done': 'bg-green-600', 'in-progress': 'bg-blue-600', 'pending': 'bg-yellow-600', 'blocked': 'bg-red-600', 'cancelled': 'bg-gray-600', 'deferred': 'bg-gray-600', 'running': 'bg-blue-600', 'completed': 'bg-green-600', 'failed': 'bg-red-600'} %}\n  <span class=\"inline-block px-2 py-0.5 text-xs font-medium rounded {{ colors.get(status, 'bg-gray-600') }} text-white\">{{ status }}</span>\n{% endmacro %}\n```\n\nThen replace inline badge HTML in orchestrators.html, tasks.html, recon.html with:\n```html\n{% from 'macros/badges.html' import status_badge %}\n{{ status_badge(task.status) }}\n```\n\nThis reduces ~60 lines of duplicated HTML to ~15 lines in one macro file.",
+        "testStrategy": "Verify all partial templates render the same badge colors as before. Run existing test suite to ensure no visual regression.",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        },
+        "subtasks": [],
+        "updatedAt": "2026-03-19T13:30:00.000Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-19T09:28:27.034Z",
-      "taskCount": 17,
-      "completedCount": 13,
+      "lastModified": "2026-03-19T13:30:00.000Z",
+      "taskCount": 31,
+      "completedCount": 17,
       "tags": [
         "master"
       ]
