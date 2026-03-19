@@ -116,6 +116,18 @@ class TestAddEpisode:
         assert call_kwargs['callback_type'] == 'dual_write_episode'
         assert call_kwargs['payload']['project_id'] == 'test'
 
+    @pytest.mark.asyncio
+    async def test_enqueue_payload_contains_uuid(self, service):
+        """The enqueue payload must include 'uuid' matching the returned episode_id."""
+        result = await service.add_episode(
+            content='User discussed auth changes',
+            project_id='test',
+        )
+        call_kwargs = service.durable_queue.enqueue.call_args[1]
+        payload = call_kwargs['payload']
+        assert 'uuid' in payload, "Payload must include 'uuid' field"
+        assert payload['uuid'] == result.episode_id
+
 
 class TestReplayFromStore:
     @pytest.mark.asyncio
