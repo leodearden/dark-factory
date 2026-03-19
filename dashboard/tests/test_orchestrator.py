@@ -721,3 +721,43 @@ class TestDiscoverOrchestrators:
         pids_by_prd = {entry['prd']: entry['pids'] for entry in result}
         assert pids_by_prd['/prd1.md'] == [1234]
         assert pids_by_prd['/prd2.md'] == [5678]
+
+    def test_grouped_running_true_when_any_running(self, tmp_path):
+        """Grouped entry has running=True if at least one process is still running."""
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        # One running, one not — grouped result should be running=True
+        mock_procs = [
+            {'pid': 1234, 'prd': '/prd.md', 'running': True, 'started': 'Mar18'},
+            {'pid': 5678, 'prd': '/prd.md', 'running': False, 'started': 'Mar17'},
+        ]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        assert result[0]['running'] is True
+
+    def test_grouped_running_false_when_all_completed(self, tmp_path):
+        """Grouped entry has running=False if all processes in the group have completed."""
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        # Both not running — grouped result should be running=False
+        mock_procs = [
+            {'pid': 1234, 'prd': '/prd.md', 'running': False, 'started': 'Mar18'},
+            {'pid': 5678, 'prd': '/prd.md', 'running': False, 'started': 'Mar17'},
+        ]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        assert result[0]['running'] is False
