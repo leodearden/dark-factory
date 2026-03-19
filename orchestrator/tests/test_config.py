@@ -14,7 +14,11 @@ from orchestrator.config import (
 
 
 class TestDefaults:
-    def test_default_values(self):
+    """Tests for OrchestratorConfig defaults — isolated from real config files."""
+
+    def test_default_values(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         config = OrchestratorConfig()
         assert config.max_concurrent_tasks == 3
         assert config.max_per_module == 1
@@ -27,12 +31,16 @@ class TestDefaults:
         assert config.max_turns.implementer == 80
         assert config.test_command == 'pytest'
 
-    def test_git_defaults(self):
+    def test_git_defaults(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         config = OrchestratorConfig()
         assert config.git.main_branch == 'main'
         assert config.git.branch_prefix == 'task/'
 
-    def test_fused_memory_defaults(self):
+    def test_fused_memory_defaults(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         config = OrchestratorConfig()
         assert config.fused_memory.url == 'http://localhost:8002'
         assert config.fused_memory.project_id == 'dark_factory'
@@ -43,12 +51,16 @@ class TestDefaults:
         project_arg_idx = cmd.index('--project')
         assert cmd[project_arg_idx + 1] == 'fused-memory'
 
-    def test_fused_memory_defaults_no_parent_traversal(self):
+    def test_fused_memory_defaults_no_parent_traversal(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         config = OrchestratorConfig()
         assert '../' not in config.fused_memory.config_path
         assert not any('../' in arg for arg in config.fused_memory.server_command)
 
-    def test_project_root_resolved_to_absolute(self):
+    def test_project_root_resolved_to_absolute(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         config = OrchestratorConfig(project_root=Path('.'))
         assert config.project_root.is_absolute() is True
 
