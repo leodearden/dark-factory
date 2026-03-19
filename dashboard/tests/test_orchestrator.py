@@ -8,8 +8,8 @@ class TestFindRunningOrchestrators:
 
     def test_parses_orchestrator_lines(self):
         """Two orchestrator lines with --prd flags produce two dicts with pid, prd, running, started."""
-        from unittest.mock import patch
         import subprocess
+        from unittest.mock import patch
 
         from dashboard.data.orchestrator import find_running_orchestrators
 
@@ -33,8 +33,8 @@ class TestFindRunningOrchestrators:
 
     def test_filters_out_grep_process(self):
         """A 'grep orchestrator' line in ps output is excluded from results."""
-        from unittest.mock import patch
         import subprocess
+        from unittest.mock import patch
 
         from dashboard.data.orchestrator import find_running_orchestrators
 
@@ -53,8 +53,8 @@ class TestFindRunningOrchestrators:
 
     def test_no_orchestrators_running(self):
         """No orchestrator lines in ps output returns empty list."""
-        from unittest.mock import patch
         import subprocess
+        from unittest.mock import patch
 
         from dashboard.data.orchestrator import find_running_orchestrators
 

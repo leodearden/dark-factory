@@ -8,6 +8,7 @@ memory.py and reconciliation.py modules.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
@@ -123,10 +124,8 @@ def read_task_artifacts(worktree_path: Path) -> dict:
 
     # Metadata
     metadata = None
-    try:
+    with contextlib.suppress(FileNotFoundError, json.JSONDecodeError):
         metadata = json.loads((task_dir / 'metadata.json').read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
 
     # Plan progress and phase
     done_count = 0
