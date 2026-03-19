@@ -1,0 +1,56 @@
+{% if status.offline is defined and status.offline %}
+<!-- Offline error card -->
+<div class="bg-red-900/50 border border-red-700 rounded-lg p-6">
+  <div class="text-red-200 font-bold text-lg">Fused Memory Server Offline</div>
+  <div class="text-red-300 text-sm mt-2">{{ status.error }}</div>
+</div>
+{% else %}
+<div class="flex gap-4">
+  <!-- Graphiti card -->
+  <div class="bg-gray-800 rounded-lg p-6 shadow flex-1">
+    <div class="flex items-center gap-2 mb-3">
+      <div class="w-3 h-3 rounded-full {% if status.graphiti.connected|default(false) %}bg-green-500{% else %}bg-red-500{% endif %}"></div>
+      <span class="text-sm text-gray-400">Graphiti</span>
+    </div>
+    <div class="text-3xl font-bold text-white">{{ status.graphiti.node_count|default(0) }}</div>
+    <div class="text-xs text-gray-500">knowledge graph nodes</div>
+  </div>
+
+  <!-- Mem0 card -->
+  <div class="bg-gray-800 rounded-lg p-6 shadow flex-1">
+    <div class="flex items-center gap-2 mb-3">
+      <div class="w-3 h-3 rounded-full {% if status.mem0.connected|default(false) %}bg-green-500{% else %}bg-red-500{% endif %}"></div>
+      <span class="text-sm text-gray-400">Mem0</span>
+    </div>
+    <div class="text-3xl font-bold text-white">{{ status.mem0.memory_count|default(0) }}</div>
+    <div class="text-xs text-gray-500">vector memories</div>
+  </div>
+
+  <!-- Taskmaster card -->
+  <div class="bg-gray-800 rounded-lg p-6 shadow flex-1">
+    <div class="flex items-center gap-2 mb-3">
+      <div class="w-3 h-3 rounded-full bg-green-500"></div>
+      <span class="text-sm text-gray-400">Taskmaster</span>
+    </div>
+    <div class="text-3xl font-bold text-white">Connected</div>
+  </div>
+
+  <!-- Write Queue card -->
+  {% set q_counts = queue.counts if queue.counts is defined else {} %}
+  {% set q_pending = q_counts.pending|default(0) %}
+  {% set q_retry = q_counts.retry|default(0) %}
+  {% set q_dead = q_counts.dead|default(0) %}
+  <div class="bg-gray-800 rounded-lg p-6 shadow flex-1">
+    <div class="flex items-center gap-2 mb-3">
+      <div class="w-3 h-3 rounded-full {% if q_dead > 0 %}bg-red-500{% elif q_pending > 0 %}bg-yellow-500{% else %}bg-green-500{% endif %}"></div>
+      <span class="text-sm text-gray-400">Write Queue</span>
+    </div>
+    <div class="text-sm text-gray-300">
+      {{ q_pending }} pending · {{ q_retry }} retry · {% if q_dead > 0 %}<span class="text-red-400">{{ q_dead }} dead</span>{% else %}0 dead{% endif %}
+    </div>
+    {% if queue.oldest_pending_age_seconds is defined and queue.oldest_pending_age_seconds is not none and queue.oldest_pending_age_seconds is number and queue.oldest_pending_age_seconds > 60 %}
+    <div class="text-yellow-400 text-xs mt-1">oldest: {{ (queue.oldest_pending_age_seconds // 60)|int }}m ago</div>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
