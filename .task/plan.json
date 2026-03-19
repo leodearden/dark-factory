@@ -19,8 +19,8 @@
     {
       "id": "pre-1",
       "description": "Create the macros/ directory under templates/ (mkdir -p dashboard/src/dashboard/templates/macros)",
-      "status": "pending",
-      "commit": null,
+      "status": "done",
+      "commit": "acbb7ae",
       "tests": []
     }
   ],
@@ -29,78 +29,78 @@
       "id": "step-1",
       "type": "test",
       "description": "Write failing unit tests for status_badge macro in dashboard/tests/test_badge_macros.py. Create a jinja2_env fixture that imports dashboard.app.templates.env. Test class TestStatusBadge renders via env.from_string('{% from \"macros/badges.html\" import status_badge %}{{ status_badge(...) }}'). Tests: (1) test_done_green — 'done' produces bg-green-600; (2) test_in_progress_blue — 'in-progress' produces bg-blue-600; (3) test_pending_yellow — 'pending' produces bg-yellow-600; (4) test_blocked_red — 'blocked' produces bg-red-600; (5) test_running_blue — 'running' produces bg-blue-600; (6) test_completed_green — 'completed' produces bg-green-600; (7) test_failed_red — 'failed' produces bg-red-600; (8) test_bursting_orange — 'bursting' produces bg-orange-600; (9) test_circuit_breaker_purple — 'circuit_breaker' produces bg-purple-600; (10) test_unknown_fallback_gray — 'xyz' produces bg-gray-600; (11) test_renders_status_text — badge contains status as visible text; (12) test_no_aria_label_by_default — aria_label not in output when called as status_badge(status); (13) test_aria_label_with_prefix — status_badge('done', aria_label='Run status') produces aria-label=\"Run status: done\"; (14) test_color_override — status_badge('running', color='bg-green-600') uses green not blue; (15) test_badge_span_classes — output contains 'inline-block px-2 py-0.5 text-xs font-medium rounded' and 'text-white'.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "5c0e2f5"
     },
     {
       "id": "step-2",
       "type": "impl",
       "description": "Create badges.html in macros/ with status_badge(status, aria_label=None, color=None) macro. Color map dict: done/completed->bg-green-600, in-progress/running->bg-blue-600, pending->bg-yellow-600, blocked/failed->bg-red-600, cancelled/deferred/idle->bg-gray-600, bursting/rolled_back->bg-orange-600, circuit_breaker->bg-purple-600. Uses 'color if color else colors.get(status, \"bg-gray-600\")' for the bg class. Conditionally renders aria-label only if aria_label is not None: {% if aria_label %}aria-label=\"{{ aria_label }}: {{ status }}\"{% endif %}. Renders <span> with standard badge classes.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "acbb7ae"
     },
     {
       "id": "step-3",
       "type": "test",
       "description": "Write failing unit tests for severity_badge macro in test_badge_macros.py. TestSeverityBadge class: (1) test_ok_green — 'ok' produces bg-green-600; (2) test_minor_yellow — 'minor' produces bg-yellow-600; (3) test_moderate_orange — 'moderate' produces bg-orange-600; (4) test_serious_red — 'serious' produces bg-red-600; (5) test_unknown_fallback_gray — 'xyz' produces bg-gray-600; (6) test_renders_severity_text — output contains severity string; (7) test_no_aria_label_by_default — no aria-label when called as severity_badge(severity); (8) test_aria_label_with_prefix — severity_badge('ok', 'Verdict severity') produces aria-label=\"Verdict severity: ok\".",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "5c0e2f5"
     },
     {
       "id": "step-4",
       "type": "impl",
       "description": "Add severity_badge(severity, aria_label=None) macro to badges.html. Color map: ok->bg-green-600, minor->bg-yellow-600, moderate->bg-orange-600, serious->bg-red-600. Fallback: bg-gray-600. Same <span> structure and conditional aria-label pattern as status_badge.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "acbb7ae"
     },
     {
       "id": "step-5",
       "type": "test",
       "description": "Write failing unit tests for indicator_dot macro in test_badge_macros.py. TestIndicatorDot class: (1) test_connected_green — connected=true produces bg-green-500; (2) test_disconnected_red — connected=false produces bg-red-500; (3) test_connected_aria_label — indicator_dot(true, 'Graphiti') produces aria-label=\"Graphiti connected\"; (4) test_disconnected_aria_label — indicator_dot(false, 'Mem0') produces aria-label=\"Mem0 disconnected\"; (5) test_role_status — output contains role=\"status\"; (6) test_dot_classes — output contains 'w-3 h-3 rounded-full'; (7) test_renders_div — output uses <div> not <span>.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "5c0e2f5"
     },
     {
       "id": "step-6",
       "type": "impl",
       "description": "Add indicator_dot(connected, label) macro to badges.html. Renders <div class=\"w-3 h-3 rounded-full {% if connected %}bg-green-500{% else %}bg-red-500{% endif %}\" role=\"status\" aria-label=\"{{ label }} {% if connected %}connected{% else %}disconnected{% endif %}\"></div>.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "acbb7ae"
     },
     {
       "id": "step-7",
       "type": "test",
       "description": "Write failing structural tests in test_badge_macros.py verifying templates import macros after refactoring. TestTemplateMacroImports class reads template files directly via pathlib. (1) test_tasks_imports_status_badge — tasks.html contains \"from 'macros/badges.html' import status_badge\"; (2) test_orchestrators_imports_status_badge — orchestrators.html contains same import; (3) test_recon_imports_badges — recon.html contains import of both status_badge and severity_badge; (4) test_memory_imports_indicator_dot — memory.html contains import of indicator_dot. All 4 fail before refactoring.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "5c0e2f5"
     },
     {
       "id": "step-8",
       "type": "impl",
       "description": "Refactor tasks.html: add {% from 'macros/badges.html' import status_badge %} at top. Replace 12-line if/elif/else badge block (lines 20-31) with {{ status_badge(task.status) }}. No aria_label passed — tasks.html badges currently lack aria-labels. Run test_orchestrator_panel.py (tasks.html is {% include %}'d by orchestrators.html) to verify all existing tests pass. Step-7 test_tasks_imports_status_badge now passes.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "47cf151"
     },
     {
       "id": "step-9",
       "type": "impl",
       "description": "Refactor orchestrators.html: add {% from 'macros/badges.html' import status_badge %} at top. Replace running/completed if/else block (lines 12-16) with {{ status_badge('running' if orch.running else 'completed', aria_label='Orchestrator status', color='bg-green-600' if orch.running else 'bg-gray-600') }}. Color override preserves existing green=running, gray=completed behavior. Progress bar stays inline. Run test_orchestrator_panel.py to verify all tests pass including TestOrchestratorBadgeAriaLabels. Step-7 test_orchestrators_imports_status_badge now passes.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "2b72593"
     },
     {
       "id": "step-10",
       "type": "impl",
       "description": "Refactor recon.html: add {% from 'macros/badges.html' import status_badge, severity_badge %} at top. (1) Burst state (lines 37-41): replace if/else with {{ status_badge(agent.state, aria_label='Burst state') }}. (2) Verdict severity (lines 81-91): replace 10-line if/elif chain with {{ severity_badge(verdict.severity, aria_label='Verdict severity') }}. (3) Run status (lines 124-136): replace 12-line if/elif chain with {{ status_badge(run.status, aria_label='Run status') }}. Run test_recon_panel.py to verify all tests pass including TestReconBadgeAriaLabels (11 tests). Step-7 test_recon_imports_badges now passes.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "01c94cc"
     },
     {
       "id": "step-11",
       "type": "impl",
       "description": "Refactor memory.html: add {% from 'macros/badges.html' import indicator_dot %} at top. (1) Graphiti dot (line 13): replace inline div with {{ indicator_dot(status.graphiti.connected|default(false), 'Graphiti') }}. (2) Mem0 dot (line 23): replace with {{ indicator_dot(status.mem0.connected|default(false), 'Mem0') }}. (3) Taskmaster dot (line 33): replace with {{ indicator_dot(status.taskmaster is defined and status.taskmaster.connected|default(false), 'Taskmaster') }}. Leave Write Queue 3-state dot inline. Run test_memory_partial.py to verify all tests pass including TestMemoryDotAriaLabels (11 tests). Step-7 test_memory_imports_indicator_dot now passes.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "0835e8d"
     }
   ],
   "design_decisions": [
