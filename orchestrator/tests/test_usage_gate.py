@@ -67,16 +67,19 @@ class TestDetectCapHit:
 class TestParseResetsAt:
     def test_relative_hours(self):
         dt = _parse_resets_at('resets in 3h')
+        assert dt is not None
         expected = datetime.now(UTC) + timedelta(hours=3)
         assert abs((dt - expected).total_seconds()) < 2
 
     def test_relative_minutes(self):
         dt = _parse_resets_at('resets in 45m')
+        assert dt is not None
         expected = datetime.now(UTC) + timedelta(minutes=45)
         assert abs((dt - expected).total_seconds()) < 2
 
     def test_relative_days(self):
         dt = _parse_resets_at('resets in 2d')
+        assert dt is not None
         expected = datetime.now(UTC) + timedelta(days=2)
         assert abs((dt - expected).total_seconds()) < 2
 
@@ -92,12 +95,14 @@ class TestParseResetsAt:
 
     def test_fallback_to_1_hour(self):
         dt = _parse_resets_at('no reset info here')
+        assert dt is not None
         expected = datetime.now(UTC) + timedelta(hours=1)
         assert abs((dt - expected).total_seconds()) < 2
 
     def test_embedded_in_longer_text(self):
         text = "You've hit your limit. Your usage resets in 5h. Please wait."
         dt = _parse_resets_at(text)
+        assert dt is not None
         expected = datetime.now(UTC) + timedelta(hours=5)
         assert abs((dt - expected).total_seconds()) < 2
 

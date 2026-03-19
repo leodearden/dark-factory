@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-
-import httpx
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
@@ -539,10 +538,8 @@ Output JSON matching the schema. Every task must appear in the output.
         """Stop the escalation server."""
         if self._escalation_task is not None:
             self._escalation_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._escalation_task
-            except asyncio.CancelledError:
-                pass
             self._escalation_task = None
             logger.info('Escalation server stopped')
 

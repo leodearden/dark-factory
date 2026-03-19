@@ -87,7 +87,7 @@ class TestRecoverCrashedTasks:
         assert len(recovered['steps']) == 5
         done = [s for s in recovered['steps'] if s['status'] == 'done']
         assert len(done) == 3
-        harness.git_ops.cleanup_worktree.assert_not_called()
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
     async def test_recover_planless_worktree_cleaned_up(self, harness: Harness):
         """Worktree with no .task/ dir -> cleaned up."""
@@ -96,7 +96,7 @@ class TestRecoverCrashedTasks:
         await harness._recover_crashed_tasks()
 
         assert '36' not in harness._recovered_plans
-        harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '36')
+        harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '36')  # type: ignore[attr-defined]
 
     async def test_recover_plan_no_progress_cleaned_up(self, harness: Harness):
         """Plan with all steps pending -> cleaned up."""
@@ -106,7 +106,7 @@ class TestRecoverCrashedTasks:
         await harness._recover_crashed_tasks()
 
         assert '37' not in harness._recovered_plans
-        harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '37')
+        harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '37')  # type: ignore[attr-defined]
 
     async def test_recover_corrupt_plan_cleaned_up(self, harness: Harness):
         """Invalid JSON in plan.json -> cleaned up with warning."""
@@ -119,7 +119,7 @@ class TestRecoverCrashedTasks:
         await harness._recover_crashed_tasks()
 
         assert '38' not in harness._recovered_plans
-        harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '38')
+        harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '38')  # type: ignore[attr-defined]
 
     async def test_recover_no_worktrees_dir_noop(self, harness: Harness):
         """Worktree base doesn't exist -> no-op, no errors."""
@@ -129,12 +129,12 @@ class TestRecoverCrashedTasks:
         await harness._recover_crashed_tasks()
 
         assert harness._recovered_plans == {}
-        harness.git_ops.cleanup_worktree.assert_not_called()
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
     async def test_in_progress_tasks_reset_to_pending(self, harness: Harness):
         """In-progress tasks are reset to pending."""
         harness.git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
-        harness.scheduler.get_tasks.return_value = [
+        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
             {'id': 10, 'status': 'in-progress', 'title': 'Stuck task'},
             {'id': 11, 'status': 'pending', 'title': 'Normal task'},
             {'id': 12, 'status': 'done', 'title': 'Done task'},
@@ -143,7 +143,7 @@ class TestRecoverCrashedTasks:
 
         await harness._recover_crashed_tasks()
 
-        calls = harness.scheduler.set_task_status.call_args_list
+        calls = harness.scheduler.set_task_status.call_args_list  # type: ignore[attr-defined]
         assert len(calls) == 2
         reset_ids = {c.args[0] for c in calls}
         assert reset_ids == {'10', '13'}
@@ -226,7 +226,7 @@ class TestRecoverCrashedTasks:
         assert '51' not in harness._recovered_plans
         assert '52' not in harness._recovered_plans
 
-        cleanup_calls = harness.git_ops.cleanup_worktree.call_args_list
+        cleanup_calls = harness.git_ops.cleanup_worktree.call_args_list  # type: ignore[attr-defined]
         cleaned_paths = {str(c.args[0]) for c in cleanup_calls}
         assert str(wt_noplan) in cleaned_paths
         assert str(wt_noprog) in cleaned_paths
