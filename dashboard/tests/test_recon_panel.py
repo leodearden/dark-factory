@@ -231,7 +231,13 @@ class TestReconRoute:
     def test_grid_layout(self, client):
         with _patch_recon_data():
             html = client.get('/partials/recon').text
-        assert 'grid grid-cols-2' in html
+        assert 'grid-cols-1' in html
+        assert 'lg:grid-cols-2' in html
+
+    def test_responsive_grid_stacks(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'grid grid-cols-1 lg:grid-cols-2' in html
 
 
 # --- Empty data constants ---
