@@ -1,3 +1,4 @@
+{% from 'macros/badges.html' import status_badge %}
 <table class="w-full text-sm text-left text-gray-300">
   <thead>
     <tr class="bg-gray-700 text-gray-400 text-xs uppercase">
@@ -18,17 +19,7 @@
         <td class="px-3 py-2">{{ task.id }}</td>
         <td class="px-3 py-2">{{ task.title }}</td>
         <td class="px-3 py-2">
-          {% if task.status == 'done' %}
-            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-green-600 text-white">done</span>
-          {% elif task.status == 'in-progress' %}
-            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-blue-600 text-white">in-progress</span>
-          {% elif task.status == 'blocked' %}
-            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-red-600 text-white">blocked</span>
-          {% elif task.status == 'pending' %}
-            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-yellow-600 text-white">pending</span>
-          {% else %}
-            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-gray-600 text-white">{{ task.status }}</span>
-          {% endif %}
+          {{ status_badge(task.status) }}
         </td>
         <td class="px-3 py-2">
           {% if wt %}
