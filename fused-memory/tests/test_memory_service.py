@@ -359,6 +359,16 @@ class TestDeleteMemory:
         service.graphiti.remove_episode.assert_not_called()
 
 
+class TestDeleteEpisode:
+    @pytest.mark.asyncio
+    async def test_delete_episode_still_uses_remove_episode(self, service):
+        """Regression guard: delete_episode must continue to call remove_episode
+        (not the new remove_edge), since episodes are EpisodicNodes."""
+        await service.delete_episode(episode_id='ep-uuid-123', project_id='test')
+        service.graphiti.remove_episode.assert_called_once_with('ep-uuid-123')
+        service.graphiti.remove_edge.assert_not_called()
+
+
 class TestGraphitiBackendRemoveEdge:
     @pytest.mark.asyncio
     async def test_graphiti_backend_remove_edge(self, mock_config):
