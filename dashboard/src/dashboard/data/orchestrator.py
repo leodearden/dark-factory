@@ -49,19 +49,23 @@ def find_running_orchestrators() -> list[dict]:
         if len(fields) < 11:
             continue
 
-        pid = int(fields[1])
-        started = fields[8]
+        try:
+            pid = int(fields[1])
+            started = fields[8]
 
-        prd_match = re.search(r'--prd\s+(\S+)', line)
-        if not prd_match:
+            prd_match = re.search(r'--prd\s+(\S+)', line)
+            if not prd_match:
+                continue
+
+            orchestrators.append({
+                'pid': pid,
+                'prd': prd_match.group(1),
+                'running': True,
+                'started': started,
+            })
+        except (ValueError, IndexError):
+            logger.warning('Skipping malformed ps line: %s', line.strip())
             continue
-
-        orchestrators.append({
-            'pid': pid,
-            'prd': prd_match.group(1),
-            'running': True,
-            'started': started,
-        })
 
     return orchestrators
 
