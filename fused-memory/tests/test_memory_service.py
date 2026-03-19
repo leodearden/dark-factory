@@ -359,6 +359,46 @@ class TestDeleteMemory:
         service.graphiti.remove_episode.assert_not_called()
 
 
+class TestSearchDeleteRoundtrip:
+    @pytest.mark.asyncio
+    async def test_search_then_delete_graphiti_roundtrip(self, service):
+        """End-to-end contract test: search returns edge UUIDs that work with delete_memory."""
+        from tests.conftest import MockEdge, MockNode
+
+        edge_uuid = 'edge-roundtrip-uuid-42'
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Payment gateway depends on billing API',
+                uuid=edge_uuid,
+                source_node=MockNode(name='Payment Gateway'),
+                target_node=MockNode(name='Billing API'),
+            ),
+        ])
+        service.mem0.search = AsyncMock(return_value={'results': []})
+
+        # Step 1: Search
+        results = await service.search(query='payment', project_id='test')
+        assert len(results) >= 1
+        graphiti_result = next(
+            r for r in results if r.source_store == SourceStore.graphiti
+        )
+        assert graphiti_result.id == edge_uuid
+
+        # Step 2: Delete using search result's id and source_store
+        result = await service.delete_memory(
+            memory_id=graphiti_result.id,
+            store=graphiti_result.source_store.value,
+            project_id='test',
+        )
+        assert result['status'] == 'deleted'
+        assert result['store'] == 'graphiti'
+
+        # Verify remove_edge was called with the correct edge UUID
+        service.graphiti.remove_edge.assert_called_once_with(edge_uuid)
+        # Verify remove_episode was NOT called (edge != episode)
+        service.graphiti.remove_episode.assert_not_called()
+
+
 class TestDeleteEpisode:
     @pytest.mark.asyncio
     async def test_delete_episode_still_uses_remove_episode(self, service):
