@@ -11,6 +11,8 @@ import json
 
 import httpx
 
+from dashboard.config import DashboardConfig
+
 
 async def mcp_tool_call(
     client: httpx.AsyncClient,
@@ -55,3 +57,20 @@ async def mcp_tool_call(
         return {}
 
     return json.loads(text)
+
+
+async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
+    """Fetch memory subsystem status from the fused-memory MCP server.
+
+    Returns the status dict on success, or {offline: True, error: str} on
+    connection/timeout failure.
+    """
+    try:
+        return await mcp_tool_call(
+            client,
+            config.fused_memory_url,
+            'get_status',
+            {'project_id': config.fused_memory_project_id},
+        )
+    except (httpx.ConnectError, httpx.TimeoutException) as e:
+        return {'offline': True, 'error': str(e)}
