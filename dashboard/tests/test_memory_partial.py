@@ -267,3 +267,47 @@ class TestWriteQueueConditionalStyling:
         ):
             html = client.get('/partials/memory').text
             assert 'oldest:' not in html
+
+
+_SPLIT_BRAIN_QUEUE = {'offline': True, 'error': 'Connection reset'}
+
+
+class TestSplitBrainQueueOffline:
+    """Tests for split-brain: status online but queue offline."""
+
+    def test_status_online_queue_offline_returns_200(self, client):
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=_SPLIT_BRAIN_QUEUE),
+        ):
+            resp = client.get('/partials/memory')
+            assert resp.status_code == 200
+
+    def test_status_online_queue_offline_no_oldest_warning(self, client):
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=_SPLIT_BRAIN_QUEUE),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'oldest:' not in html
+
+    def test_status_online_queue_offline_shows_cards(self, client):
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=_SPLIT_BRAIN_QUEUE),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'Graphiti' in html
+            assert 'Mem0' in html
+            assert 'Taskmaster' in html
+            assert 'Write Queue' in html
+
+    def test_status_online_queue_offline_queue_metrics_default(self, client):
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=_SPLIT_BRAIN_QUEUE),
+        ):
+            html = client.get('/partials/memory').text
+            assert '0 pending' in html
+            assert '0 retry' in html
+            assert '0 dead' in html
