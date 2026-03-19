@@ -10,15 +10,15 @@
         <div class="flex items-center gap-3">
           <span class="text-gray-100 font-semibold">PID {{ orch.pid }}</span>
           {% if orch.running %}
-            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-green-600 text-white">running</span>
+            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-green-600 text-white" aria-label="Orchestrator status: running">running</span>
           {% else %}
-            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-gray-600 text-white">completed</span>
+            <span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-gray-600 text-white" aria-label="Orchestrator status: completed">completed</span>
           {% endif %}
           <span class="text-gray-400 text-sm">{{ orch.prd.split('/')[-1] }}</span>
         </div>
 
         {% if orch.summary.total > 0 %}
-          <div class="h-3 rounded-full bg-gray-700 overflow-hidden mt-4 flex">
+          <div class="h-3 rounded-full bg-gray-700 overflow-hidden mt-4 flex" aria-label="Task progress: {{ orch.summary.done }} done, {{ orch.summary.in_progress }} in-progress, {{ orch.summary.blocked }} blocked, {{ orch.summary.pending }} pending">
             <div class="bg-green-600" style="width:{{ (orch.summary.done / orch.summary.total * 100)|round|int }}%"></div>
             <div class="bg-blue-600" style="width:{{ (orch.summary.in_progress / orch.summary.total * 100)|round|int }}%"></div>
             <div class="bg-red-600" style="width:{{ (orch.summary.blocked / orch.summary.total * 100)|round|int }}%"></div>
