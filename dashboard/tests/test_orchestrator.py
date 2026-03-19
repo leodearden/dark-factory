@@ -491,7 +491,6 @@ class TestDiscoverOrchestrators:
 
     def test_worktree_falls_back_to_dir_name_without_metadata(self, tmp_path):
         """Worktree dict uses directory name as key when no .task/ metadata is present."""
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
