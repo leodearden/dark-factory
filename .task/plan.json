@@ -1,148 +1,139 @@
 {
-  "task_id": "17",
-  "title": "Memory data module",
-  "modules": [
-    "dashboard/src/dashboard/data",
-    "dashboard/tests"
+  "task_id": "21",
+  "title": "Reconciliation panel partial and route",
+  "modules": ["dashboard"],
+  "analysis": "Task 21 requires creating the reconciliation panel HTML partial template and its FastAPI route. The dashboard already has: (1) a fully implemented data layer in dashboard/src/dashboard/data/reconciliation.py with 5 async query functions (get_recent_runs, get_watermarks, get_buffer_stats, get_burst_state, get_latest_verdict), (2) comprehensive tests for those data functions in test_reconciliation.py, (3) a base.html template with Tailwind CSS + htmx + Alpine.js and dark theme conventions, (4) a DashboardConfig with a reconciliation_db property deriving the DB path from project_root, (5) conftest fixtures including reconciliation_db with full sample data and client for TestClient. What's missing: the templates/partials/ directory, the recon.html partial template, the /partials/recon route in app.py, a timeago Jinja2 filter, and a config instance in app.py. The route will call all 5 data functions with config.reconciliation_db and pass results to the template. The partial is a standalone HTML fragment (loaded via htmx, not extending base.html) with a two-column grid: left column shows buffer stats, burst state, watermarks, and verdict; right column shows a recent runs table. Tests will mock the 5 data functions to avoid needing a real SQLite DB, verifying route returns 200 with expected HTML structure, badges, and empty-state fallbacks.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Create templates/partials/ directory at dashboard/src/dashboard/templates/partials/ so the recon.html template can be placed there",
+      "status": "done",
+      "commit": "9601aeb",
+      "tests": []
+    }
   ],
-  "analysis": "Create dashboard/src/dashboard/data/memory.py \u2014 a data access layer for memory health metrics from the fused-memory MCP HTTP server. The module follows the same pattern as the existing reconciliation.py data module (async functions returning dicts, graceful error handling), but instead of querying SQLite it makes HTTP JSON-RPC calls to the fused-memory MCP endpoint. The orchestrator's briefing.py already demonstrates the exact MCP call pattern: POST to {base_url}/mcp/ with JSON-RPC body, parse result.content[0].text. We need three functions: (1) mcp_tool_call \u2014 generic low-level JSON-RPC caller, (2) get_memory_status \u2014 calls get_status tool, (3) get_queue_stats \u2014 calls get_queue_stats tool. Tests will use httpx.MockTransport to intercept HTTP calls, following the project's existing async test patterns (pytest-asyncio auto mode, class-based test organization). The MCP response envelope wraps tool output as {\"result\": {\"content\": [{\"type\": \"text\", \"text\": \"<json-encoded-dict>\"}]}}.",
-  "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write test_memory.py with TestMcpToolCall class: test_successful_call mocks httpx transport to return a valid MCP JSON-RPC response, asserts mcp_tool_call returns the parsed inner dict. test_timeout mocks transport to raise httpx.TimeoutException, asserts the exception propagates. test_non_200_status mocks a 500 response, verifies error handling.",
+      "description": "Write tests for timeago filter function in dashboard/tests/test_recon_panel.py class TestTimeagoFilter. Tests: (1) test_none_returns_never — timeago(None) returns 'never', (2) test_minutes_ago — ISO timestamp ~3 minutes ago returns '3m ago', (3) test_hours_ago — ISO timestamp ~2 hours ago returns '2h ago', (4) test_days_ago — ISO timestamp ~2 days ago returns '2d ago', (5) test_invalid_string_returns_never — timeago('not-a-date') returns 'never', (6) test_empty_string_returns_never — timeago('') returns 'never'. Import timeago from dashboard.app.",
       "status": "done",
-      "commit": "a07c983"
+      "commit": "fd2682f"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Create dashboard/src/dashboard/data/memory.py with the mcp_tool_call function: POST JSON-RPC to {base_url}/mcp with body {jsonrpc: 2.0, id: 1, method: tools/call, params: {name, arguments}}, timeout 10s. Parse response: extract result.content[0].text, json.loads it, return dict. Raise ValueError on non-200 or missing content.",
+      "description": "Implement timeago filter function in dashboard/src/dashboard/app.py. Function signature: def timeago(value: str | None) -> str. If value is None, return 'never'. Try datetime.fromisoformat(value); on ValueError/TypeError, return 'never'. Ensure timezone-aware (add UTC if naive). Compute delta = datetime.now(UTC) - parsed. Return 'Xd ago' if delta >= 24h, 'Xh ago' if delta >= 60m, 'Xm ago' otherwise (minimum 0m).",
       "status": "done",
-      "commit": "c3ca942"
+      "commit": "cd8b279"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write TestGetMemoryStatus class: test_successful_status mocks transport returning a valid MCP response wrapping {graphiti: {connected: true, node_count: 42}, mem0: {connected: true, memory_count: 5}, queue: {counts: {...}, oldest_pending_age_seconds: 1.2}}. Asserts returned dict matches expected structure. test_connect_error mocks httpx.ConnectError, asserts returns {offline: True, error: str}. test_timeout mocks httpx.TimeoutException, asserts returns {offline: True, error: str}.",
+      "description": "Write test in TestTimeagoFilter: test_filter_registered_on_jinja2_env — import templates from dashboard.app, assert 'timeago' in templates.env.filters and templates.env.filters['timeago'] is the timeago function.",
       "status": "done",
-      "commit": "d6e79dc"
+      "commit": "2489e0c"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Implement get_memory_status: calls mcp_tool_call with tool_name='get_status' and arguments={project_id: config.fused_memory_project_id}. Wraps call in try/except for httpx.ConnectError and httpx.TimeoutException, returning {offline: True, error: str(e)} on failure.",
+      "description": "Register the timeago function as a Jinja2 filter on the templates environment in app.py. Add line: templates.env.filters['timeago'] = timeago (after both templates and timeago are defined).",
       "status": "done",
-      "commit": "1c1a379"
+      "commit": "89e3e15"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write TestGetQueueStats class: test_successful_stats mocks transport returning valid MCP response wrapping {counts: {pending: 3, in_flight: 1, retry: 0, completed: 10, dead: 0}, oldest_pending_age_seconds: 5.5}. Asserts returned dict matches. test_connect_error and test_timeout verify offline fallback dict.",
+      "description": "Write tests for GET /partials/recon route with populated mock data in class TestReconRoute. Use unittest.mock.patch as decorators or context managers to mock all 5 data functions at the dashboard.app module level (e.g., patch('dashboard.app.get_buffer_stats', new_callable=AsyncMock)). Mock return values: get_buffer_stats → {'buffered_count': 3, 'oldest_event_age_seconds': 600.0}, get_burst_state → [{'agent_id': 'agent-1', 'state': 'bursting', 'last_write_at': '2026-03-19T00:00:00+00:00', 'burst_started_at': '2026-03-19T00:00:00+00:00'}, {'agent_id': 'agent-2', 'state': 'idle', 'last_write_at': '2026-03-19T00:00:00+00:00', 'burst_started_at': None}], get_watermarks → {'last_full_run_completed': '2026-03-19T10:00:00+00:00', 'last_episode_timestamp': '2026-03-19T10:30:00+00:00', 'last_memory_timestamp': '2026-03-19T10:40:00+00:00', 'last_task_change_timestamp': '2026-03-19T10:50:00+00:00'}, get_latest_verdict → {'run_id': 'run-001', 'severity': 'ok', 'action_taken': 'none', 'reviewed_at': '2026-03-19T10:00:00+00:00'}, get_recent_runs → [{'id': 'run-001', 'run_type': 'full', 'trigger_reason': 'staleness_timer', 'started_at': '2026-03-19T08:00:00+00:00', 'completed_at': '2026-03-19T08:05:00+00:00', 'events_processed': 7, 'status': 'completed', 'duration_seconds': 300.0}]. Assertions: (a) response status 200, (b) content-type includes text/html, (c) HTML contains '3 events buffered', (d) contains 'agent-1' and 'agent-2', (e) contains burst state badge indicators (text 'bursting' and 'idle'), (f) contains watermark labels 'Last full run' and 'Last episode' and 'Last memory' and 'Last task change', (g) contains verdict severity 'bg-green-600' badge class (for 'ok'), (h) contains 'none' (action_taken), (i) contains runs table content: 'staleness_timer', 'completed', 'bg-green-600', (j) contains 'grid grid-cols-2' layout class.",
       "status": "done",
-      "commit": "79a94d9"
+      "commit": "711d928"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Implement get_queue_stats: calls mcp_tool_call with tool_name='get_queue_stats' and arguments={}. Same ConnectError/TimeoutException fallback pattern as get_memory_status.",
+      "description": "Implement GET /partials/recon async route in app.py and create templates/partials/recon.html. In app.py: import the 5 data functions from dashboard.data.reconciliation, import DashboardConfig from dashboard.config, import Request from fastapi. Route handler: create config = DashboardConfig.from_env(), db = config.reconciliation_db, await all 5 functions concurrently with asyncio.gather, render templates.TemplateResponse('partials/recon.html', context). Template: two-column grid (grid grid-cols-2 gap-6). Left column cards (bg-gray-800 rounded-lg p-6): (1) Event Buffer — 'N events buffered', oldest age formatted as Xm Xs with text-yellow-400 if >300s; (2) Burst State — table with agent_id + state badges (bg-orange-600 for bursting, bg-gray-600 for idle), 'No agents' fallback; (3) Watermarks — 4 rows with text-gray-400 labels and text-white values using timeago filter; (4) Latest Verdict — severity badge (bg-green-600=ok, bg-yellow-600=minor, bg-orange-600=moderate, bg-red-600=serious) + action_taken, 'No verdicts yet' fallback. Right column card: Recent Runs table with columns Trigger, Type, Status, Events, Duration, When. Status badges (bg-green-600=completed, bg-blue-600=running, bg-red-600=failed, bg-orange-600=rolled_back, bg-purple-600=circuit_breaker). Duration in seconds or '—'. When using timeago. 'No reconciliation runs yet' fallback.",
       "status": "done",
-      "commit": "a948e8d"
+      "commit": "e656513"
     },
     {
       "id": "step-7",
       "type": "test",
-      "description": "Write TestMalformedResponse class: test_missing_content_key mocks response with valid JSON but no result.content path, verifies graceful handling (returns empty dict or raises clear ValueError). test_invalid_inner_json mocks response where text field contains non-JSON string, verifies graceful handling. test_empty_content_array mocks response with result.content as empty list.",
+      "description": "Write tests for GET /partials/recon with empty/default data in class TestReconRouteEmpty. Same mock pattern but with empty returns: get_buffer_stats → {'buffered_count': 0, 'oldest_event_age_seconds': None}, get_burst_state → [], get_watermarks → {}, get_latest_verdict → None, get_recent_runs → []. Assertions: (a) response status 200, (b) HTML contains '0 events buffered', (c) contains 'No agents', (d) contains 'No verdicts yet', (e) contains 'No reconciliation runs yet', (f) does NOT contain 'bg-green-600' or 'bg-red-600' (no verdict or run badges when empty).",
       "status": "done",
-      "commit": "e6a8378"
+      "commit": "89c5bb1"
     },
     {
       "id": "step-8",
       "type": "impl",
-      "description": "Harden mcp_tool_call to handle malformed responses: add defensive checks for missing result/content keys and invalid JSON in text field. Return empty dict or raise ValueError with descriptive message as appropriate. Run full test suite to confirm all tests pass.",
-      "status": "done",
-      "commit": "28fc0ac"
-    },
-    {
-      "id": "step-9",
-      "type": "test",
-      "description": "Write failing tests for three blocking review issues. (1) Add test_non_200_response_returns_offline to TestGetMemoryStatus: mock transport returns HTTP 500, assert get_memory_status returns {offline: True, error: str} (not an uncaught ValueError). This covers the untested failure mode where mcp_tool_call raises ValueError on non-200 and the get_* function must catch it. (2) Add test_non_200_response_returns_offline to TestGetQueueStats: same pattern — mock 500 response, assert get_queue_stats returns {offline: True, error: str}. (3) Add test_non_json_body_returns_empty_dict to TestMcpToolCall: mock transport returns HTTP 200 with non-JSON body (e.g. HTML string '<html>Bad Gateway</html>'), assert mcp_tool_call returns {} instead of raising json.JSONDecodeError from resp.json(). All three tests should FAIL against the current implementation, proving the gaps identified by reviewers.",
-      "status": "done",
-      "commit": "bc25e2a"
-    },
-    {
-      "id": "step-10",
-      "type": "impl",
-      "description": "Fix all three blocking issues in dashboard/src/dashboard/data/memory.py. (1) In get_memory_status, widen the except clause on line 78 to include ValueError: `except (httpx.ConnectError, httpx.TimeoutException, ValueError) as e:` — so a non-200 response from the MCP server produces the {offline: True, error: ...} fallback instead of propagating. (2) In get_queue_stats, apply the same fix on line 95: `except (httpx.ConnectError, httpx.TimeoutException, ValueError) as e:`. (3) In mcp_tool_call, wrap the resp.json() call on line 50 in try/except: `try: data = resp.json() except (json.JSONDecodeError, ValueError): return {}` — so a 200 response with non-JSON body (e.g. HTML from reverse proxy) returns empty dict instead of crashing. Update the docstring for get_memory_status and get_queue_stats to document that ValueError (from non-200 MCP responses) is also caught. Run the full test suite to confirm all tests pass including the new ones from step-9.",
-      "status": "done",
-      "commit": "523f24c"
+      "description": "Verify and fix template empty state handling. Ensure all Jinja2 conditionals are correct: {% if burst_state %}...{% else %}No agents{% endif %}, {% if verdict %}...{% else %}No verdicts yet{% endif %}, {% if runs %}...{% else %}No reconciliation runs yet{% endif %}, {% if watermarks %}...{% else %} show 'never' for all 4 fields {% endif %}. These should mostly be covered by step-6 implementation but this step ensures the empty-state tests from step-7 pass. Run full test suite to confirm all tests green.",
+      "status": "pending",
+      "commit": null
     }
   ],
   "design_decisions": [
     {
-      "decision": "Use httpx.MockTransport for test mocking instead of pytest-httpx",
-      "rationale": "MockTransport is built into httpx (already a dependency), requires no extra package, and matches the project's minimalist dependency approach. It gives full control over response bodies and can simulate exceptions by raising in the handler."
+      "decision": "Create DashboardConfig.from_env() inside the route handler, not as module-level state",
+      "rationale": "The app currently has no config instance. Creating it in the handler is simplest, keeps state local, and is easily testable (the data functions are mocked so the config's DB path is never actually used in tests). A module-level config or FastAPI dependency can be introduced later when more routes need it."
     },
     {
-      "decision": "mcp_tool_call is a standalone function, not a method on a class",
-      "rationale": "Matches the existing reconciliation.py pattern where each function is a standalone async function. The client and base_url are passed as arguments, keeping the function stateless and easy to test."
+      "decision": "Place timeago filter function directly in app.py alongside the filter registration",
+      "rationale": "Only one custom filter is needed. The task explicitly says to register it on the templates environment in app.py. A separate filters.py would be premature — refactor when more filters are added."
     },
     {
-      "decision": "Parse MCP response envelope inline in mcp_tool_call rather than in each caller",
-      "rationale": "The JSON-RPC envelope structure (result.content[0].text \u2192 json.loads) is the same for every tool call. Centralizing parsing in mcp_tool_call avoids duplication and makes the higher-level functions (get_memory_status, get_queue_stats) cleaner."
+      "decision": "Mock the 5 data functions in route tests rather than using real SQLite fixtures",
+      "rationale": "The data functions are already thoroughly tested in test_reconciliation.py with full SQLite fixtures. Route tests should verify route+template integration (HTTP contract, HTML structure, badge rendering), not re-test the data layer. Mocking gives precise control over rendering scenarios and avoids the complexity of wiring a temp DB into the app's config."
     },
     {
-      "decision": "Error handling catches httpx.ConnectError and httpx.TimeoutException at the get_* function level, not in mcp_tool_call",
-      "rationale": "mcp_tool_call is a generic transport function that should let network errors propagate. The higher-level functions know the right fallback shape ({offline: True, error: ...}) for their consumers. This separation keeps mcp_tool_call reusable for future tools that may want different error handling."
+      "decision": "Partial template is a standalone HTML fragment, not extending base.html",
+      "rationale": "Per the PRD and htmx architecture, partials are loaded into the page via htmx swaps. They must be HTML fragments without <!DOCTYPE>, <html>, <head>, or <body> tags. The base.html template with full document structure is only for full page renders."
     },
     {
-      "decision": "Malformed MCP responses return empty dict from mcp_tool_call",
-      "rationale": "Per task spec: 'returns empty dict or raises clear error'. An empty dict is safest for dashboard rendering \u2014 the template can check for missing keys and show placeholder text rather than crashing."
+      "decision": "Mock data functions at the dashboard.app import location, not at dashboard.data.reconciliation",
+      "rationale": "The route in app.py will import the functions directly (from dashboard.data.reconciliation import ...). Patching at 'dashboard.app.get_recent_runs' etc. ensures the mock applies to the actual references used in the route handler."
     },
     {
-      "decision": "POST to {base_url}/mcp (no trailing slash)",
-      "rationale": "The task spec says POST to {base_url}/mcp. The orchestrator's briefing.py uses /mcp/ with trailing slash. We'll use the trailing-slash variant to match the existing working pattern in the codebase, since FastMCP mounts with trailing slash."
+      "decision": "Use text-yellow-400 for buffer age warning when oldest_event_age_seconds > 300",
+      "rationale": "Task specifies 'yellow text if age > 300s'. Tailwind's text-yellow-400 provides clearly visible yellow on the dark bg-gray-800 card background while maintaining readability."
     },
     {
-      "decision": "ValueError from mcp_tool_call (non-200 status) is caught at the get_* level alongside httpx network errors",
-      "rationale": "Review identified that a running-but-broken MCP server returning 500/503 is a realistic failure mode. The ValueError raised by mcp_tool_call for non-200 responses must produce the same {offline: True, error: ...} fallback as connection/timeout errors. This keeps the contract documented in the docstrings honest: all server-unreachable-or-broken scenarios return the offline fallback dict. mcp_tool_call itself continues to raise ValueError (not catch it) so future callers with different error handling needs can still intercept it."
+      "decision": "Use asyncio.gather for concurrent data fetching in the route handler",
+      "rationale": "All 5 data queries are independent SQLite reads. Running them concurrently with asyncio.gather minimizes route latency instead of awaiting each sequentially."
     },
     {
-      "decision": "resp.json() parse failure returns empty dict from mcp_tool_call, consistent with other malformed response handling",
-      "rationale": "A 200 response with non-JSON body (e.g., HTML from a reverse proxy or WAF) is a malformed response, same category as missing content keys or invalid inner JSON \u2014 all of which already return {}. Consistent treatment: any response that can't be parsed into a valid tool result yields empty dict, letting the caller (get_* functions) decide whether to treat an empty result as noteworthy."
+      "decision": "Format buffer age as 'Xm Xs' inline in the template rather than through timeago filter",
+      "rationale": "The buffer age is a float (seconds), not an ISO timestamp. The timeago filter is designed for ISO strings. The template will compute minutes/seconds from the float directly using Jinja2 arithmetic: {{ (age // 60)|int }}m {{ (age % 60)|int }}s."
     }
   ],
   "reuse": [
     {
-      "what": "MCP JSON-RPC call pattern",
-      "where": "orchestrator/src/orchestrator/agents/briefing.py lines 228-254",
-      "how": "Reuse the exact same JSON-RPC envelope structure: POST to {url}/mcp/, body with jsonrpc/id/method/params, parse result.content[0].text. The new mcp_tool_call function generalizes this pattern."
-    },
-    {
-      "what": "DashboardConfig dataclass",
-      "where": "dashboard/src/dashboard/config.py",
-      "how": "Import and use config.fused_memory_url and config.fused_memory_project_id for MCP endpoint URL and project scoping."
-    },
-    {
-      "what": "Test fixture pattern \u2014 dashboard_config with tmp_path",
-      "where": "dashboard/tests/conftest.py line 88-93",
-      "how": "Reuse existing dashboard_config fixture for tests that need a config object. The fixture already sets up a DashboardConfig with tmp_path-based project_root."
-    },
-    {
-      "what": "Test organization pattern \u2014 class-based with async methods",
-      "where": "dashboard/tests/test_reconciliation.py",
-      "how": "Follow the same TestClassName pattern with async test methods, one class per function under test, testing happy path, error cases, and edge cases."
-    },
-    {
-      "what": "httpx.AsyncClient from app lifespan",
-      "where": "dashboard/src/dashboard/app.py line 21",
-      "how": "The FastAPI app already creates an httpx.AsyncClient in its lifespan. The memory.py functions accept client as a parameter, so routes can pass app.state.http_client."
-    },
-    {
-      "what": "Module docstring and import conventions",
+      "what": "5 async reconciliation query functions (get_recent_runs, get_watermarks, get_buffer_stats, get_burst_state, get_latest_verdict)",
       "where": "dashboard/src/dashboard/data/reconciliation.py",
-      "how": "Follow same style: from __future__ import annotations, descriptive module docstring, return dicts not dataclasses."
+      "how": "Import all 5 functions and call them with config.reconciliation_db in the route handler. They return dicts/lists ready for template rendering."
+    },
+    {
+      "what": "DashboardConfig with reconciliation_db property",
+      "where": "dashboard/src/dashboard/config.py",
+      "how": "Use DashboardConfig.from_env() to get config instance in route handler, access config.reconciliation_db for the SQLite DB path passed to all 5 query functions."
+    },
+    {
+      "what": "Existing Jinja2Templates instance",
+      "where": "dashboard/src/dashboard/app.py line 15",
+      "how": "Use existing `templates` variable for TemplateResponse rendering and register timeago filter on templates.env.filters dict."
+    },
+    {
+      "what": "Dark theme Tailwind CSS conventions from base.html",
+      "where": "dashboard/src/dashboard/templates/base.html",
+      "how": "Follow established dark palette: bg-gray-900 page background, bg-gray-800 for cards, text-gray-100 for primary text, text-gray-400 for labels, border-gray-700 for borders. These are visually consistent with the base template's header and body styling."
+    },
+    {
+      "what": "TestClient fixture and class-based test organization",
+      "where": "dashboard/tests/conftest.py (client fixture) and test_scaffold.py (test patterns)",
+      "how": "Use existing `client` fixture for route tests. Follow same class-based test organization (TestClassName with descriptive method names) and import-inside-test pattern used throughout test_scaffold.py and test_reconciliation.py."
+    },
+    {
+      "what": "conftest reconciliation_db fixture with sample data",
+      "where": "dashboard/tests/conftest.py lines 105-226",
+      "how": "Available as reference for mock data shapes — the fixture inserts sample runs, events, burst state, watermarks, and verdicts that document the exact data structures the template must handle."
     }
   ]
 }
