@@ -13,20 +13,19 @@ from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.config import (
     BackendsConfig,
     BudgetsConfig,
-    SandboxConfig,
     EffortConfig,
     ModelsConfig,
     OrchestratorConfig,
-    TurnsConfig,
+    SandboxConfig,
     load_config,
 )
 from orchestrator.git_ops import GitOps
-from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
-from .configs import EVAL_CONFIGS, EvalConfig, get_config_by_name
-from .metrics import EvalMetrics, collect_metrics
-from .snapshots import cleanup_eval_worktree, create_eval_worktree
+from .configs import EVAL_CONFIGS, EvalConfig
+from .metrics import collect_metrics
+from .snapshots import create_eval_worktree
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +157,7 @@ async def run_eval(
     assignment = TaskAssignment(
         task_id=task_id,
         task=task_def,
-        modules=set(modules),
+        modules=list(modules),
     )
 
     # 4. Set up workflow dependencies
@@ -280,7 +279,7 @@ class _EvalScheduler:
     async def set_task_status(self, task_id: str, status: str):
         logger.info(f'[eval] Task {task_id} → {status}')
 
-    async def handle_blast_radius_expansion(self, task_id, current, requested):
+    async def handle_blast_radius_expansion(self, task_id: str, current: list[str], needed: list[str]) -> bool:
         return True  # always allow in eval mode
 
 
@@ -290,5 +289,5 @@ class _EvalMcpStub:
     def __init__(self, url: str):
         self.url = url
 
-    def mcp_config_json(self, **kwargs):
-        return None
+    def mcp_config_json(self, escalation_url: str | None = None) -> dict:
+        return {}
