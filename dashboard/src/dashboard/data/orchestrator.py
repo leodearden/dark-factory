@@ -100,6 +100,10 @@ def load_task_tree(tasks_json_path: Path) -> list[dict]:
             logger.warning('No tasks found in %s', tasks_json_path)
             return []
 
+    if not isinstance(raw_tasks, list):
+        logger.warning('tasks is not a list in %s', tasks_json_path)
+        return []
+
     result: list[dict] = []
     for task in raw_tasks:
         result.append({
