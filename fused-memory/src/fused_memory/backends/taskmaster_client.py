@@ -31,7 +31,11 @@ class TaskmasterBackend:
             if self.config.tool_mode:
                 import os
 
-                env = {**os.environ, 'TASK_MASTER_TOOLS': self.config.tool_mode}
+                env = {
+                    **os.environ,
+                    'TASK_MASTER_TOOLS': self.config.tool_mode,
+                    'TASK_MASTER_ALLOW_METADATA_UPDATES': 'true',
+                }
 
             # Use project_root as subprocess CWD so relative paths in args
             # (e.g. ./taskmaster-ai/dist/mcp-server.js) resolve correctly

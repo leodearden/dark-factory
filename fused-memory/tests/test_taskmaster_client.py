@@ -142,6 +142,44 @@ async def test_require_session_raises_without_init(config):
 
 
 @pytest.mark.asyncio
+async def test_initialize_sets_metadata_updates_env(config):
+    """TASK_MASTER_ALLOW_METADATA_UPDATES must be set in subprocess env."""
+    import contextlib
+    from unittest.mock import patch
+
+    c = TaskmasterBackend(config)
+
+    captured_params = {}
+
+    @contextlib.asynccontextmanager
+    async def fake_ctx(params):
+        captured_params['params'] = params
+        yield (AsyncMock(), AsyncMock())
+
+    with patch(
+        'fused_memory.backends.taskmaster_client.stdio_client',
+        side_effect=lambda p: fake_ctx(p),
+    ):
+        mock_session = AsyncMock()
+        mock_session.initialize = AsyncMock()
+        # Patch ClientSession to return our mock
+        with patch(
+            'fused_memory.backends.taskmaster_client.ClientSession',
+            return_value=MagicMock(
+                __aenter__=AsyncMock(return_value=mock_session),
+                __aexit__=AsyncMock(return_value=False),
+            ),
+        ):
+            await c.initialize()
+
+    assert 'params' in captured_params
+    env = captured_params['params'].env
+    assert env is not None
+    assert env.get('TASK_MASTER_ALLOW_METADATA_UPDATES') == 'true'
+    assert env.get('TASK_MASTER_TOOLS') == config.tool_mode
+
+
+@pytest.mark.asyncio
 async def test_call_tool_non_json_response(client):
     """Non-JSON response should be wrapped."""
     c, session = client

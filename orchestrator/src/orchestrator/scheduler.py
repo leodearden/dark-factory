@@ -196,10 +196,10 @@ class Scheduler:
         except Exception as e:
             logger.error(f'Failed to set task {task_id} status to {status}: {e}')
 
-    async def update_task(self, task_id: str, metadata: str) -> None:
-        """Update task metadata via fused-memory."""
+    async def update_task(self, task_id: str, metadata: str) -> bool:
+        """Update task metadata via fused-memory. Returns True on success."""
         try:
-            await mcp_call(
+            result = await mcp_call(
                 f'{self._memory_url}/mcp',
                 'tools/call',
                 {
@@ -212,8 +212,20 @@ class Scheduler:
                 },
                 timeout=15,
             )
+            # MCP tool errors return in the response body, not as exceptions
+            content = result.get('result', result) if isinstance(result, dict) else result
+            if isinstance(content, dict) and content.get('isError'):
+                text = ''
+                for block in content.get('content', []):
+                    if isinstance(block, dict) and block.get('type') == 'text':
+                        text = block.get('text', '')
+                        break
+                logger.error(f'Failed to update task {task_id}: {text}')
+                return False
+            return True
         except Exception as e:
             logger.error(f'Failed to update task {task_id}: {e}')
+            return False
 
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task: pending, deps done, module locks available.
@@ -301,7 +313,12 @@ class Scheduler:
             f'Task {task_id} needs modules {needed_modules} but locks unavailable. Requeuing.'
         )
         import json
-        await self.update_task(task_id, json.dumps({'modules': needed_modules}))
+        updated = await self.update_task(task_id, json.dumps({'modules': needed_modules}))
+        if not updated:
+            logger.error(
+                f'Task {task_id}: metadata update failed — task will retry with '
+                f'original modules and may cycle. Check TASK_MASTER_ALLOW_METADATA_UPDATES.'
+            )
         await self.set_task_status(task_id, 'pending')
         self.lock_table.release(task_id)
         return False
