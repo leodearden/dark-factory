@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
+
+import pytest
 
 
 class TestTimeagoFilter:
@@ -96,109 +99,93 @@ MOCK_RUNS = [
 ]
 
 
+def _patch_recon_data(buffer_stats=None, burst_state=None, watermarks=None,
+                      verdict=None, runs=None):
+    """Return an ExitStack that patches all 5 recon data functions."""
+    stack = ExitStack()
+    stack.enter_context(patch(
+        'dashboard.app.get_buffer_stats',
+        new_callable=AsyncMock,
+        return_value=buffer_stats if buffer_stats is not None else MOCK_BUFFER_STATS,
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_burst_state',
+        new_callable=AsyncMock,
+        return_value=burst_state if burst_state is not None else MOCK_BURST_STATE,
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_watermarks',
+        new_callable=AsyncMock,
+        return_value=watermarks if watermarks is not None else MOCK_WATERMARKS,
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_latest_verdict',
+        new_callable=AsyncMock,
+        return_value=verdict if verdict is not None else MOCK_VERDICT,
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_recent_runs',
+        new_callable=AsyncMock,
+        return_value=runs if runs is not None else MOCK_RUNS,
+    ))
+    return stack
+
+
 class TestReconRoute:
     """Tests for GET /partials/recon with populated data."""
 
-    @patch('dashboard.app.get_recent_runs', new_callable=AsyncMock, return_value=MOCK_RUNS)
-    @patch('dashboard.app.get_latest_verdict', new_callable=AsyncMock, return_value=MOCK_VERDICT)
-    @patch('dashboard.app.get_watermarks', new_callable=AsyncMock, return_value=MOCK_WATERMARKS)
-    @patch('dashboard.app.get_burst_state', new_callable=AsyncMock, return_value=MOCK_BURST_STATE)
-    @patch('dashboard.app.get_buffer_stats', new_callable=AsyncMock, return_value=MOCK_BUFFER_STATS)
-    def test_returns_200(self, *_mocks, client):
-        resp = client.get('/partials/recon')
+    def test_returns_200(self, client):
+        with _patch_recon_data():
+            resp = client.get('/partials/recon')
         assert resp.status_code == 200
 
-    @patch('dashboard.app.get_recent_runs', new_callable=AsyncMock, return_value=MOCK_RUNS)
-    @patch('dashboard.app.get_latest_verdict', new_callable=AsyncMock, return_value=MOCK_VERDICT)
-    @patch('dashboard.app.get_watermarks', new_callable=AsyncMock, return_value=MOCK_WATERMARKS)
-    @patch('dashboard.app.get_burst_state', new_callable=AsyncMock, return_value=MOCK_BURST_STATE)
-    @patch('dashboard.app.get_buffer_stats', new_callable=AsyncMock, return_value=MOCK_BUFFER_STATS)
-    def test_content_type_html(self, *_mocks, client):
-        resp = client.get('/partials/recon')
+    def test_content_type_html(self, client):
+        with _patch_recon_data():
+            resp = client.get('/partials/recon')
         assert 'text/html' in resp.headers['content-type']
 
-    @patch('dashboard.app.get_recent_runs', new_callable=AsyncMock, return_value=MOCK_RUNS)
-    @patch('dashboard.app.get_latest_verdict', new_callable=AsyncMock, return_value=MOCK_VERDICT)
-    @patch('dashboard.app.get_watermarks', new_callable=AsyncMock, return_value=MOCK_WATERMARKS)
-    @patch('dashboard.app.get_burst_state', new_callable=AsyncMock, return_value=MOCK_BURST_STATE)
-    @patch('dashboard.app.get_buffer_stats', new_callable=AsyncMock, return_value=MOCK_BUFFER_STATS)
-    def test_buffer_stats_displayed(self, *_mocks, client):
-        resp = client.get('/partials/recon')
-        html = resp.text
+    def test_buffer_stats_displayed(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
         assert '3 events buffered' in html
 
-    @patch('dashboard.app.get_recent_runs', new_callable=AsyncMock, return_value=MOCK_RUNS)
-    @patch('dashboard.app.get_latest_verdict', new_callable=AsyncMock, return_value=MOCK_VERDICT)
-    @patch('dashboard.app.get_watermarks', new_callable=AsyncMock, return_value=MOCK_WATERMARKS)
-    @patch('dashboard.app.get_burst_state', new_callable=AsyncMock, return_value=MOCK_BURST_STATE)
-    @patch('dashboard.app.get_buffer_stats', new_callable=AsyncMock, return_value=MOCK_BUFFER_STATS)
-    def test_burst_agents_displayed(self, *_mocks, client):
-        resp = client.get('/partials/recon')
-        html = resp.text
+    def test_burst_agents_displayed(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
         assert 'agent-1' in html
         assert 'agent-2' in html
 
-    @patch('dashboard.app.get_recent_runs', new_callable=AsyncMock, return_value=MOCK_RUNS)
-    @patch('dashboard.app.get_latest_verdict', new_callable=AsyncMock, return_value=MOCK_VERDICT)
-    @patch('dashboard.app.get_watermarks', new_callable=AsyncMock, return_value=MOCK_WATERMARKS)
-    @patch('dashboard.app.get_burst_state', new_callable=AsyncMock, return_value=MOCK_BURST_STATE)
-    @patch('dashboard.app.get_buffer_stats', new_callable=AsyncMock, return_value=MOCK_BUFFER_STATS)
-    def test_burst_state_badges(self, *_mocks, client):
-        resp = client.get('/partials/recon')
-        html = resp.text
+    def test_burst_state_badges(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
         assert 'bursting' in html
         assert 'idle' in html
 
-    @patch('dashboard.app.get_recent_runs', new_callable=AsyncMock, return_value=MOCK_RUNS)
-    @patch('dashboard.app.get_latest_verdict', new_callable=AsyncMock, return_value=MOCK_VERDICT)
-    @patch('dashboard.app.get_watermarks', new_callable=AsyncMock, return_value=MOCK_WATERMARKS)
-    @patch('dashboard.app.get_burst_state', new_callable=AsyncMock, return_value=MOCK_BURST_STATE)
-    @patch('dashboard.app.get_buffer_stats', new_callable=AsyncMock, return_value=MOCK_BUFFER_STATS)
-    def test_watermark_labels(self, *_mocks, client):
-        resp = client.get('/partials/recon')
-        html = resp.text
+    def test_watermark_labels(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
         assert 'Last full run' in html
         assert 'Last episode' in html
         assert 'Last memory' in html
         assert 'Last task change' in html
 
-    @patch('dashboard.app.get_recent_runs', new_callable=AsyncMock, return_value=MOCK_RUNS)
-    @patch('dashboard.app.get_latest_verdict', new_callable=AsyncMock, return_value=MOCK_VERDICT)
-    @patch('dashboard.app.get_watermarks', new_callable=AsyncMock, return_value=MOCK_WATERMARKS)
-    @patch('dashboard.app.get_burst_state', new_callable=AsyncMock, return_value=MOCK_BURST_STATE)
-    @patch('dashboard.app.get_buffer_stats', new_callable=AsyncMock, return_value=MOCK_BUFFER_STATS)
-    def test_verdict_severity_badge(self, *_mocks, client):
-        resp = client.get('/partials/recon')
-        html = resp.text
+    def test_verdict_severity_badge(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
         assert 'bg-green-600' in html  # ok severity → green badge
 
-    @patch('dashboard.app.get_recent_runs', new_callable=AsyncMock, return_value=MOCK_RUNS)
-    @patch('dashboard.app.get_latest_verdict', new_callable=AsyncMock, return_value=MOCK_VERDICT)
-    @patch('dashboard.app.get_watermarks', new_callable=AsyncMock, return_value=MOCK_WATERMARKS)
-    @patch('dashboard.app.get_burst_state', new_callable=AsyncMock, return_value=MOCK_BURST_STATE)
-    @patch('dashboard.app.get_buffer_stats', new_callable=AsyncMock, return_value=MOCK_BUFFER_STATS)
-    def test_verdict_action(self, *_mocks, client):
-        resp = client.get('/partials/recon')
-        html = resp.text
+    def test_verdict_action(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
         assert 'none' in html  # action_taken
 
-    @patch('dashboard.app.get_recent_runs', new_callable=AsyncMock, return_value=MOCK_RUNS)
-    @patch('dashboard.app.get_latest_verdict', new_callable=AsyncMock, return_value=MOCK_VERDICT)
-    @patch('dashboard.app.get_watermarks', new_callable=AsyncMock, return_value=MOCK_WATERMARKS)
-    @patch('dashboard.app.get_burst_state', new_callable=AsyncMock, return_value=MOCK_BURST_STATE)
-    @patch('dashboard.app.get_buffer_stats', new_callable=AsyncMock, return_value=MOCK_BUFFER_STATS)
-    def test_runs_table_content(self, *_mocks, client):
-        resp = client.get('/partials/recon')
-        html = resp.text
+    def test_runs_table_content(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
         assert 'staleness_timer' in html
         assert 'completed' in html
 
-    @patch('dashboard.app.get_recent_runs', new_callable=AsyncMock, return_value=MOCK_RUNS)
-    @patch('dashboard.app.get_latest_verdict', new_callable=AsyncMock, return_value=MOCK_VERDICT)
-    @patch('dashboard.app.get_watermarks', new_callable=AsyncMock, return_value=MOCK_WATERMARKS)
-    @patch('dashboard.app.get_burst_state', new_callable=AsyncMock, return_value=MOCK_BURST_STATE)
-    @patch('dashboard.app.get_buffer_stats', new_callable=AsyncMock, return_value=MOCK_BUFFER_STATS)
-    def test_grid_layout(self, *_mocks, client):
-        resp = client.get('/partials/recon')
-        html = resp.text
+    def test_grid_layout(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
         assert 'grid grid-cols-2' in html

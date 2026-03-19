@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+
+from dashboard.config import DashboardConfig
+from dashboard.data.reconciliation import (
+    get_buffer_stats,
+    get_burst_state,
+    get_latest_verdict,
+    get_recent_runs,
+    get_watermarks,
+)
 
 _pkg_dir = Path(__file__).parent
 
@@ -54,3 +64,30 @@ app.mount('/static', StaticFiles(directory=str(_pkg_dir / 'static')), name='stat
 @app.get('/api/health')
 async def health():
     return {'status': 'ok'}
+
+
+@app.get('/partials/recon')
+async def partials_recon(request: Request):
+    """Render the reconciliation panel partial (htmx fragment)."""
+    config = DashboardConfig.from_env()
+    db = config.reconciliation_db
+
+    buffer_stats, burst_state, watermarks, verdict, runs = await asyncio.gather(
+        get_buffer_stats(db),
+        get_burst_state(db),
+        get_watermarks(db),
+        get_latest_verdict(db),
+        get_recent_runs(db),
+    )
+
+    return templates.TemplateResponse(
+        'partials/recon.html',
+        {
+            'request': request,
+            'buffer_stats': buffer_stats,
+            'burst_state': burst_state,
+            'watermarks': watermarks,
+            'verdict': verdict,
+            'runs': runs,
+        },
+    )
