@@ -163,3 +163,94 @@ class TestLoadTaskTree:
         assert len(result) == 1
         expected_keys = {'id', 'title', 'status', 'priority', 'dependencies', 'metadata'}
         assert set(result[0].keys()) == expected_keys
+
+
+class TestReadTaskArtifacts:
+    """Tests for read_task_artifacts — reads .task/ directory in a worktree."""
+
+    def test_full_artifacts(self, tmp_path):
+        """Worktree with complete .task/ returns metadata, phase, progress, iterations, reviews."""
+        import json
+
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+        reviews_dir = task_dir / 'reviews'
+        reviews_dir.mkdir()
+
+        # metadata.json
+        metadata = {'task_id': '7', 'title': 'Build widget', 'base_commit': 'abc123', 'created_at': '2026-03-18T10:00:00'}
+        (task_dir / 'metadata.json').write_text(json.dumps(metadata))
+
+        # plan.json with 3 done, 2 pending out of 5 total
+        steps = [
+            {'id': f'step-{i}', 'status': 'done'} for i in range(1, 4)
+        ] + [
+            {'id': f'step-{i}', 'status': 'pending'} for i in range(4, 6)
+        ]
+        (task_dir / 'plan.json').write_text(json.dumps({'steps': steps}))
+
+        # iterations.jsonl with 3 lines
+        with open(task_dir / 'iterations.jsonl', 'w') as f:
+            for i in range(3):
+                f.write(json.dumps({'iteration': i + 1}) + '\n')
+
+        # Two reviews
+        (reviews_dir / 'reviewer-1.json').write_text(json.dumps({'verdict': 'PASS'}))
+        (reviews_dir / 'reviewer-2.json').write_text(json.dumps({'verdict': 'ISSUES_FOUND'}))
+
+        result = read_task_artifacts(tmp_path)
+
+        assert result['metadata'] == metadata
+        assert result['phase'] == 'EXECUTE'
+        assert result['plan_progress'] == {'done': 3, 'total': 5}
+        assert result['iteration_count'] == 3
+        assert result['review_summary'] == '1/2 passed'
+
+    def test_empty_worktree(self, tmp_path):
+        """Worktree with no .task/ subdir returns defaults."""
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        result = read_task_artifacts(tmp_path)
+
+        assert result['metadata'] is None
+        assert result['phase'] == 'PLAN'
+        assert result['plan_progress'] == {'done': 0, 'total': 0}
+        assert result['iteration_count'] == 0
+        assert result['review_summary'] == '\u2014'
+
+    def test_plan_all_done(self, tmp_path):
+        """All steps done in plan.json results in phase='DONE'."""
+        import json
+
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+
+        steps = [{'id': f'step-{i}', 'status': 'done'} for i in range(1, 4)]
+        (task_dir / 'plan.json').write_text(json.dumps({'steps': steps}))
+
+        result = read_task_artifacts(tmp_path)
+
+        assert result['phase'] == 'DONE'
+        assert result['plan_progress'] == {'done': 3, 'total': 3}
+
+    def test_no_plan_file(self, tmp_path):
+        """Worktree with .task/ but no plan.json results in phase='PLAN'."""
+        import json
+
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+
+        metadata = {'task_id': '7', 'title': 'Build widget'}
+        (task_dir / 'metadata.json').write_text(json.dumps(metadata))
+
+        result = read_task_artifacts(tmp_path)
+
+        assert result['phase'] == 'PLAN'
+        assert result['plan_progress'] == {'done': 0, 'total': 0}
+        assert result['metadata'] == metadata
