@@ -126,12 +126,12 @@ class BackendsConfig(BaseModel):
 class FusedMemoryConfig(BaseModel):
     """Fused-memory HTTP server connection."""
 
-    url: str = Field(default='http://localhost:8000')
+    url: str = Field(default='http://localhost:8002')
     project_id: str = Field(default='dark_factory')
-    config_path: str = Field(default='../fused-memory/config/config.yaml')
+    config_path: str = Field(default='fused-memory/config/config.yaml')
     server_command: list[str] = Field(
         default_factory=lambda: [
-            'uv', 'run', '--project', '../fused-memory',
+            'uv', 'run', '--project', 'fused-memory',
             'python', '-m', 'fused_memory.server.main',
             '--transport', 'http',
         ]
