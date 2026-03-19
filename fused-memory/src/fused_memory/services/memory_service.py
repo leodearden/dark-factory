@@ -430,6 +430,12 @@ class MemoryService:
                     and graphiti_overlap
                 )
             ]
+            # Assign inferred category to Graphiti results when unambiguous
+            if len(graphiti_overlap) == 1:
+                inferred = next(iter(graphiti_overlap))
+                for r in results:
+                    if r.source_store == SourceStore.graphiti and r.category is None:
+                        r.category = inferred
 
         return results[:limit]
 
