@@ -1,148 +1,178 @@
 {
-  "task_id": "17",
-  "title": "Memory data module",
-  "modules": [
-    "dashboard/src/dashboard/data",
-    "dashboard/tests"
+  "task_id": "20",
+  "title": "Memory health cards partial and route",
+  "modules": ["dashboard"],
+  "analysis": "This task creates a Jinja2 partial template (templates/partials/memory.html) with four health status cards and a GET /partials/memory FastAPI route wired to the existing data module from task 17.\n\nCurrent state: app.py has lifespan managing httpx.AsyncClient on app.state, Jinja2Templates configured, and only a /api/health route. DashboardConfig exists in config.py but is NOT on app.state yet — must be added as a prerequisite. templates/partials/ directory does not exist. data/memory.py has get_memory_status() and get_queue_stats() fully implemented and tested.\n\nData shapes (from memory.py and test_memory.py):\n- get_memory_status: returns e.g. {graphiti: {connected: bool, node_count: int}, mem0: {connected: bool, memory_count: int}, ...} or {offline: True, error: str}\n- get_queue_stats: returns e.g. {counts: {pending: N, retry: N, dead: N, ...}, oldest_pending_age_seconds: float|None} or {offline: True, error: str}\n- NOTE: counts dict keys may be sparse (only statuses present in DB). Template must use |default(0) filters.\n\nStarlette 0.52+ uses new TemplateResponse API: templates.TemplateResponse(request, name, context={}) — request is first positional arg, not inside the context dict.\n\nTaskmaster connectivity: The MCP server IS the taskmaster bridge. If the server responds (status not offline), taskmaster is connected. No explicit taskmaster key in get_status response.\n\nTest strategy: mock data functions with unittest.mock.patch at the import boundary in app.py. Data layer already well-tested in test_memory.py. Route tests focus on HTTP response + HTML content assertions.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Add app.state.config = DashboardConfig.from_env() to the lifespan in app.py, importing DashboardConfig from dashboard.config. Required before the /partials/memory route can pass config to data functions. Also create the templates/partials/ directory. Existing tests (health endpoint, static files, client fixture) must still pass.",
+      "status": "done",
+      "commit": "b6ed21f",
+      "tests": [
+        "Existing test_scaffold.py tests must still pass"
+      ]
+    }
   ],
-  "analysis": "Create dashboard/src/dashboard/data/memory.py \u2014 a data access layer for memory health metrics from the fused-memory MCP HTTP server. The module follows the same pattern as the existing reconciliation.py data module (async functions returning dicts, graceful error handling), but instead of querying SQLite it makes HTTP JSON-RPC calls to the fused-memory MCP endpoint. The orchestrator's briefing.py already demonstrates the exact MCP call pattern: POST to {base_url}/mcp/ with JSON-RPC body, parse result.content[0].text. We need three functions: (1) mcp_tool_call \u2014 generic low-level JSON-RPC caller, (2) get_memory_status \u2014 calls get_status tool, (3) get_queue_stats \u2014 calls get_queue_stats tool. Tests will use httpx.MockTransport to intercept HTTP calls, following the project's existing async test patterns (pytest-asyncio auto mode, class-based test organization). The MCP response envelope wraps tool output as {\"result\": {\"content\": [{\"type\": \"text\", \"text\": \"<json-encoded-dict>\"}]}}.",
-  "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write test_memory.py with TestMcpToolCall class: test_successful_call mocks httpx transport to return a valid MCP JSON-RPC response, asserts mcp_tool_call returns the parsed inner dict. test_timeout mocks transport to raise httpx.TimeoutException, asserts the exception propagates. test_non_200_status mocks a 500 response, verifies error handling.",
+      "description": "Write dashboard/tests/test_memory_partial.py with TestMemoryPartialOnline class. Define module-level mock data: _ONLINE_STATUS = {'graphiti': {'connected': True, 'node_count': 42}, 'mem0': {'connected': True, 'memory_count': 128}} and _ONLINE_QUEUE = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}. Test test_route_returns_200_html: use unittest.mock.patch on 'dashboard.data.memory.get_memory_status' (AsyncMock returning _ONLINE_STATUS) and 'dashboard.data.memory.get_queue_stats' (AsyncMock returning _ONLINE_QUEUE). Use client fixture to GET /partials/memory. Assert status_code == 200 and 'text/html' in content-type header.",
       "status": "done",
-      "commit": "a07c983"
+      "commit": "05b4c6d"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Create dashboard/src/dashboard/data/memory.py with the mcp_tool_call function: POST JSON-RPC to {base_url}/mcp with body {jsonrpc: 2.0, id: 1, method: tools/call, params: {name, arguments}}, timeout 10s. Parse response: extract result.content[0].text, json.loads it, return dict. Raise ValueError on non-200 or missing content.",
+      "description": "Create route and minimal template. In app.py: add imports for Request (fastapi), DashboardConfig (dashboard.config), get_memory_status and get_queue_stats (dashboard.data.memory). Add app.state.config = DashboardConfig.from_env() to lifespan. Add async GET /partials/memory route that gets http_client and config from request.app.state, awaits both data functions, returns templates.TemplateResponse(request, 'partials/memory.html', context={'status': status, 'queue': queue}). Create templates/partials/memory.html with minimal placeholder content (<div>memory</div>).",
       "status": "done",
-      "commit": "c3ca942"
+      "commit": "ebb9374"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write TestGetMemoryStatus class: test_successful_status mocks transport returning a valid MCP response wrapping {graphiti: {connected: true, node_count: 42}, mem0: {connected: true, memory_count: 5}, queue: {counts: {...}, oldest_pending_age_seconds: 1.2}}. Asserts returned dict matches expected structure. test_connect_error mocks httpx.ConnectError, asserts returns {offline: True, error: str}. test_timeout mocks httpx.TimeoutException, asserts returns {offline: True, error: str}.",
+      "description": "Add tests for online card content in TestMemoryPartialOnline. test_online_contains_card_labels: assert HTML contains 'Graphiti', 'Mem0', 'Taskmaster', 'Write Queue'. test_online_graphiti_count: assert '42' and 'knowledge graph nodes' in HTML. test_online_mem0_count: assert '128' and 'vector memories' in HTML. test_online_taskmaster_connected: assert 'Connected' in HTML.",
       "status": "done",
-      "commit": "d6e79dc"
+      "commit": "078a8c5"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Implement get_memory_status: calls mcp_tool_call with tool_name='get_status' and arguments={project_id: config.fused_memory_project_id}. Wraps call in try/except for httpx.ConnectError and httpx.TimeoutException, returning {offline: True, error: str(e)} on failure.",
+      "description": "Build full four-card online template in memory.html. Flex container div (class='flex gap-4'). Each card: div with bg-gray-800 rounded-lg p-6 shadow. Card 1 (Graphiti): status dot (w-3 h-3 rounded-full bg-green-500), 'Graphiti' label (text-sm text-gray-400), node_count as text-3xl font-bold text-white, subtitle 'knowledge graph nodes' (text-xs text-gray-500). Card 2 (Mem0): same pattern with memory_count and 'vector memories'. Card 3 (Taskmaster): dot + label + 'Connected'/'Disconnected' text. Card 4 (Write Queue): dot + label + placeholder metrics line. Use Jinja2 {{ status.graphiti.node_count|default(0) }} pattern.",
       "status": "done",
-      "commit": "1c1a379"
+      "commit": "a123db7"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write TestGetQueueStats class: test_successful_stats mocks transport returning valid MCP response wrapping {counts: {pending: 3, in_flight: 1, retry: 0, completed: 10, dead: 0}, oldest_pending_age_seconds: 5.5}. Asserts returned dict matches. test_connect_error and test_timeout verify offline fallback dict.",
+      "description": "Add TestMemoryPartialOffline class. test_offline_shows_error_card: mock get_memory_status returning {'offline': True, 'error': 'Connection refused'} and get_queue_stats returning {'offline': True, 'error': 'Connection refused'}. Assert 200 status, HTML contains 'Fused Memory Server Offline' and 'Connection refused'. Assert 'knowledge graph nodes' NOT in HTML (four cards hidden when offline).",
       "status": "done",
-      "commit": "79a94d9"
+      "commit": "cfd8fd4"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Implement get_queue_stats: calls mcp_tool_call with tool_name='get_queue_stats' and arguments={}. Same ConnectError/TimeoutException fallback pattern as get_memory_status.",
+      "description": "Add offline conditional to memory.html. Wrap entire content in: {% if status.offline is defined and status.offline %}...offline card...{% else %}...four cards...{% endif %}. Offline card: single full-width div with bg-red-900/50 border border-red-700 rounded-lg p-6. Heading 'Fused Memory Server Offline' (text-red-200 font-bold text-lg). Error message {{ status.error }} (text-red-300 text-sm mt-2).",
       "status": "done",
-      "commit": "a948e8d"
+      "commit": "646087e"
     },
     {
       "id": "step-7",
       "type": "test",
-      "description": "Write TestMalformedResponse class: test_missing_content_key mocks response with valid JSON but no result.content path, verifies graceful handling (returns empty dict or raises clear ValueError). test_invalid_inner_json mocks response where text field contains non-JSON string, verifies graceful handling. test_empty_content_array mocks response with result.content as empty list.",
+      "description": "Add TestMemoryPartialDots class for status dot colors. test_graphiti_green_when_connected: mock graphiti connected=True, assert 'bg-green-500' in HTML. test_graphiti_red_when_disconnected: mock graphiti connected=False, assert 'bg-red-500' in HTML. test_mem0_red_when_disconnected: mock mem0 connected=False, assert 'bg-red-500' in HTML. test_taskmaster_green_when_online: mock online status (no offline key), assert at least 3 occurrences of 'bg-green-500'.",
       "status": "done",
-      "commit": "e6a8378"
+      "commit": "c995abc"
     },
     {
       "id": "step-8",
       "type": "impl",
-      "description": "Harden mcp_tool_call to handle malformed responses: add defensive checks for missing result/content keys and invalid JSON in text field. Return empty dict or raise ValueError with descriptive message as appropriate. Run full test suite to confirm all tests pass.",
+      "description": "Implement conditional dot colors in template. Graphiti dot: {% if status.graphiti.connected|default(false) %}bg-green-500{% else %}bg-red-500{% endif %}. Mem0 dot: same pattern with status.mem0.connected. Taskmaster dot: green when server is online (not offline). All dots must be div with w-3 h-3 rounded-full classes.",
       "status": "done",
-      "commit": "28fc0ac"
+      "commit": "ab84d90"
     },
     {
       "id": "step-9",
       "type": "test",
-      "description": "Write failing tests for three blocking review issues. (1) Add test_non_200_response_returns_offline to TestGetMemoryStatus: mock transport returns HTTP 500, assert get_memory_status returns {offline: True, error: str} (not an uncaught ValueError). This covers the untested failure mode where mcp_tool_call raises ValueError on non-200 and the get_* function must catch it. (2) Add test_non_200_response_returns_offline to TestGetQueueStats: same pattern — mock 500 response, assert get_queue_stats returns {offline: True, error: str}. (3) Add test_non_json_body_returns_empty_dict to TestMcpToolCall: mock transport returns HTTP 200 with non-JSON body (e.g. HTML string '<html>Bad Gateway</html>'), assert mcp_tool_call returns {} instead of raising json.JSONDecodeError from resp.json(). All three tests should FAIL against the current implementation, proving the gaps identified by reviewers.",
+      "description": "Add TestWriteQueueCard class. test_queue_dot_green_all_zero: mock counts {pending: 0, retry: 0, dead: 0}, assert 'bg-green-500' for queue card dot. test_queue_dot_yellow_pending: mock counts {pending: 3, retry: 0, dead: 0}, assert 'bg-yellow-500'. test_queue_dot_red_dead: mock counts {pending: 0, retry: 0, dead: 2}, assert 'bg-red-500'. test_queue_metrics_inline: mock counts {pending: 3, retry: 1, dead: 0}, assert '3 pending' and '1 retry' and '0 dead' in HTML.",
       "status": "done",
-      "commit": "bc25e2a"
+      "commit": "3a2958a"
     },
     {
       "id": "step-10",
       "type": "impl",
-      "description": "Fix all three blocking issues in dashboard/src/dashboard/data/memory.py. (1) In get_memory_status, widen the except clause on line 78 to include ValueError: `except (httpx.ConnectError, httpx.TimeoutException, ValueError) as e:` — so a non-200 response from the MCP server produces the {offline: True, error: ...} fallback instead of propagating. (2) In get_queue_stats, apply the same fix on line 95: `except (httpx.ConnectError, httpx.TimeoutException, ValueError) as e:`. (3) In mcp_tool_call, wrap the resp.json() call on line 50 in try/except: `try: data = resp.json() except (json.JSONDecodeError, ValueError): return {}` — so a 200 response with non-JSON body (e.g. HTML from reverse proxy) returns empty dict instead of crashing. Update the docstring for get_memory_status and get_queue_stats to document that ValueError (from non-200 MCP responses) is also caught. Run the full test suite to confirm all tests pass including the new ones from step-9.",
+      "description": "Implement Write Queue card tri-state dot and inline metrics. Dot: {% if queue.counts.dead|default(0) > 0 %}bg-red-500{% elif queue.counts.pending|default(0) > 0 %}bg-yellow-500{% else %}bg-green-500{% endif %}. Metrics line: '{{ queue.counts.pending|default(0) }} pending · {{ queue.counts.retry|default(0) }} retry · {{ queue.counts.dead|default(0) }} dead'.",
       "status": "done",
-      "commit": "523f24c"
+      "commit": "09ce26b"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Add TestWriteQueueConditionalStyling class. test_dead_count_red_text: mock dead=2, assert 'text-red-' class appears near dead count. test_dead_zero_no_red: mock dead=0, assert dead count is NOT wrapped in red text span. test_oldest_age_shown_over_60: mock oldest_pending_age_seconds=120, assert 'oldest:' and '2m ago' in HTML with 'text-yellow-' styling. test_oldest_age_hidden_under_60: mock oldest_pending_age_seconds=30, assert 'oldest:' NOT in HTML. test_oldest_age_hidden_none: mock oldest_pending_age_seconds=None, assert 'oldest:' NOT in HTML.",
+      "status": "done",
+      "commit": "0e37eb4"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Add conditional text styling to Write Queue card. Dead count: {% if queue.counts.dead|default(0) > 0 %}<span class=\"text-red-400\">{{ queue.counts.dead }} dead</span>{% else %}0 dead{% endif %}. Oldest age: {% if queue.oldest_pending_age_seconds is not none and queue.oldest_pending_age_seconds > 60 %}<div class=\"text-yellow-400 text-xs mt-1\">oldest: {{ (queue.oldest_pending_age_seconds // 60)|int }}m ago</div>{% endif %}.",
+      "status": "done",
+      "commit": "53ae745"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Use httpx.MockTransport for test mocking instead of pytest-httpx",
-      "rationale": "MockTransport is built into httpx (already a dependency), requires no extra package, and matches the project's minimalist dependency approach. It gives full control over response bodies and can simulate exceptions by raising in the handler."
+      "decision": "Add DashboardConfig to app.state in lifespan via from_env()",
+      "rationale": "The route needs config for data function calls. Storing on app.state alongside http_client is consistent with the existing pattern. from_env() allows env var overrides in production."
     },
     {
-      "decision": "mcp_tool_call is a standalone function, not a method on a class",
-      "rationale": "Matches the existing reconciliation.py pattern where each function is a standalone async function. The client and base_url are passed as arguments, keeping the function stateless and easy to test."
+      "decision": "Use Starlette 0.52+ TemplateResponse API: templates.TemplateResponse(request, name, context={})",
+      "rationale": "Starlette 0.52 deprecated old-style TemplateResponse(name, {'request': request}). New API has request as first positional arg, context as keyword. Avoids DeprecationWarnings."
     },
     {
-      "decision": "Parse MCP response envelope inline in mcp_tool_call rather than in each caller",
-      "rationale": "The JSON-RPC envelope structure (result.content[0].text \u2192 json.loads) is the same for every tool call. Centralizing parsing in mcp_tool_call avoids duplication and makes the higher-level functions (get_memory_status, get_queue_stats) cleaner."
+      "decision": "Mock data functions at dashboard.data.memory module level, not at app module level",
+      "rationale": "Patching at the source module (dashboard.data.memory.get_memory_status) is more robust since it doesn't depend on import style in app.py. unittest.mock.patch resolves the name at the source."
     },
     {
-      "decision": "Error handling catches httpx.ConnectError and httpx.TimeoutException at the get_* function level, not in mcp_tool_call",
-      "rationale": "mcp_tool_call is a generic transport function that should let network errors propagate. The higher-level functions know the right fallback shape ({offline: True, error: ...}) for their consumers. This separation keeps mcp_tool_call reusable for future tools that may want different error handling."
+      "decision": "Template is a standalone HTMX partial, not extending base.html",
+      "rationale": "This partial returns an HTML fragment for HTMX swapping into a parent page. It should NOT extend base.html or include <html>/<head>/<body> tags — just the card markup."
     },
     {
-      "decision": "Malformed MCP responses return empty dict from mcp_tool_call",
-      "rationale": "Per task spec: 'returns empty dict or raises clear error'. An empty dict is safest for dashboard rendering \u2014 the template can check for missing keys and show placeholder text rather than crashing."
+      "decision": "Check status.offline for the offline/online branching",
+      "rationale": "Both data functions connect to the same fused-memory server. If get_memory_status fails, get_queue_stats almost certainly will too. Checking status.offline is sufficient to gate between the offline error card and the four online cards."
     },
     {
-      "decision": "POST to {base_url}/mcp (no trailing slash)",
-      "rationale": "The task spec says POST to {base_url}/mcp. The orchestrator's briefing.py uses /mcp/ with trailing slash. We'll use the trailing-slash variant to match the existing working pattern in the codebase, since FastMCP mounts with trailing slash."
+      "decision": "Derive Taskmaster connected state from server reachability",
+      "rationale": "get_status response has no explicit 'taskmaster' key. The MCP server IS the taskmaster bridge. If the server responds with data (not offline), taskmaster is connected."
     },
     {
-      "decision": "ValueError from mcp_tool_call (non-200 status) is caught at the get_* level alongside httpx network errors",
-      "rationale": "Review identified that a running-but-broken MCP server returning 500/503 is a realistic failure mode. The ValueError raised by mcp_tool_call for non-200 responses must produce the same {offline: True, error: ...} fallback as connection/timeout errors. This keeps the contract documented in the docstrings honest: all server-unreachable-or-broken scenarios return the offline fallback dict. mcp_tool_call itself continues to raise ValueError (not catch it) so future callers with different error handling needs can still intercept it."
+      "decision": "Use Jinja2 |default(0) for queue count keys",
+      "rationale": "get_queue_stats builds counts from DB rows grouped by status — only statuses with >0 count may appear as keys. Template must use |default(0) for safe access to pending, retry, dead."
     },
     {
-      "decision": "resp.json() parse failure returns empty dict from mcp_tool_call, consistent with other malformed response handling",
-      "rationale": "A 200 response with non-JSON body (e.g., HTML from a reverse proxy or WAF) is a malformed response, same category as missing content keys or invalid inner JSON \u2014 all of which already return {}. Consistent treatment: any response that can't be parsed into a valid tool result yields empty dict, letting the caller (get_* functions) decide whether to treat an empty result as noteworthy."
+      "decision": "Separate test file test_memory_partial.py for route+template tests",
+      "rationale": "test_memory.py tests data module (MCP transport + data functions). test_memory_partial.py tests route+template integration. Different concerns warrant separate files."
+    },
+    {
+      "decision": "Use integer floor division for oldest age display",
+      "rationale": "Task spec says 'oldest: Xm ago' implying minutes. Floor division (oldest_pending_age_seconds // 60) gives a clean integer minute count appropriate for a dashboard glance metric."
     }
   ],
   "reuse": [
     {
-      "what": "MCP JSON-RPC call pattern",
-      "where": "orchestrator/src/orchestrator/agents/briefing.py lines 228-254",
-      "how": "Reuse the exact same JSON-RPC envelope structure: POST to {url}/mcp/, body with jsonrpc/id/method/params, parse result.content[0].text. The new mcp_tool_call function generalizes this pattern."
+      "what": "get_memory_status() and get_queue_stats() from dashboard.data.memory",
+      "where": "dashboard/src/dashboard/data/memory.py",
+      "how": "Import and call in the route handler. These handle all errors internally, returning {offline: True, error: str} on failure — no error handling needed in the route."
     },
     {
-      "what": "DashboardConfig dataclass",
+      "what": "Jinja2Templates instance (templates variable) already in app.py",
+      "where": "dashboard/src/dashboard/app.py line 15",
+      "how": "Use templates.TemplateResponse(request, 'partials/memory.html', context={...}) to render the partial."
+    },
+    {
+      "what": "httpx.AsyncClient lifecycle on app.state",
+      "where": "dashboard/src/dashboard/app.py lifespan lines 18-23",
+      "how": "Route accesses via request.app.state.http_client and passes it to data functions. Already managed by lifespan."
+    },
+    {
+      "what": "DashboardConfig with from_env() classmethod",
       "where": "dashboard/src/dashboard/config.py",
-      "how": "Import and use config.fused_memory_url and config.fused_memory_project_id for MCP endpoint URL and project scoping."
+      "how": "Import in app.py, call from_env() in lifespan to populate app.state.config."
     },
     {
-      "what": "Test fixture pattern \u2014 dashboard_config with tmp_path",
-      "where": "dashboard/tests/conftest.py line 88-93",
-      "how": "Reuse existing dashboard_config fixture for tests that need a config object. The fixture already sets up a DashboardConfig with tmp_path-based project_root."
+      "what": "TestClient fixture from conftest.py",
+      "where": "dashboard/tests/conftest.py lines 96-102",
+      "how": "Use the 'client' fixture in route tests. It creates TestClient wrapping the app with proper lifespan, so app.state.http_client and config are available."
     },
     {
-      "what": "Test organization pattern \u2014 class-based with async methods",
-      "where": "dashboard/tests/test_reconciliation.py",
-      "how": "Follow the same TestClassName pattern with async test methods, one class per function under test, testing happy path, error cases, and edge cases."
+      "what": "Test data shape patterns from test_memory.py",
+      "where": "dashboard/tests/test_memory.py lines 72-76 (_STATUS_PAYLOAD), 140-143 (_QUEUE_STATS_PAYLOAD)",
+      "how": "Reference for realistic mock return values. Adapt for route test mock data constants."
     },
     {
-      "what": "httpx.AsyncClient from app lifespan",
-      "where": "dashboard/src/dashboard/app.py line 21",
-      "how": "The FastAPI app already creates an httpx.AsyncClient in its lifespan. The memory.py functions accept client as a parameter, so routes can pass app.state.http_client."
-    },
-    {
-      "what": "Module docstring and import conventions",
-      "where": "dashboard/src/dashboard/data/reconciliation.py",
-      "how": "Follow same style: from __future__ import annotations, descriptive module docstring, return dicts not dataclasses."
+      "what": "Dark theme Tailwind classes from base.html",
+      "where": "dashboard/src/dashboard/templates/base.html",
+      "how": "Follow same palette: bg-gray-800 for cards, text-gray-100/400/500 for text hierarchy, border-gray-700 for borders."
     }
   ]
 }
