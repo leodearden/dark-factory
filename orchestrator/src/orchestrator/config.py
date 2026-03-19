@@ -1,17 +1,21 @@
 """Configuration schema for the orchestrator."""
 
+import logging
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class YamlSettingsSource(PydanticBaseSettingsSource):
@@ -148,6 +152,15 @@ class EscalationConfig(BaseModel):
     host: str = Field(default='127.0.0.1')
 
 
+class AccountConfig(BaseModel):
+    """A Claude Max account for failover."""
+
+    name: str = Field(description='Human-readable account label')
+    oauth_token_env: str = Field(
+        description='Env var holding the long-lived OAuth token for this account'
+    )
+
+
 class UsageCapConfig(BaseModel):
     """Usage cap detection and handling."""
 
@@ -157,6 +170,7 @@ class UsageCapConfig(BaseModel):
     wait_for_reset: bool = Field(default=True)
     probe_interval_secs: int = Field(default=300)
     max_probe_interval_secs: int = Field(default=1800)
+    accounts: list[AccountConfig] = Field(default_factory=list)
 
 
 class GitConfig(BaseModel):
@@ -166,6 +180,45 @@ class GitConfig(BaseModel):
     branch_prefix: str = Field(default='task/')
     remote: str = Field(default='origin')
     worktree_dir: str = Field(default='.worktrees')
+
+
+# --- Per-module overrides ---
+
+_OVERRIDABLE_FIELDS = frozenset({
+    'test_command', 'lint_command', 'type_check_command',
+    'lock_depth', 'max_per_module', 'module_overrides',
+})
+
+
+@dataclass
+class ModuleConfig:
+    """Per-subproject overrides for verification and scheduling."""
+
+    prefix: str
+    test_command: str | None = None
+    lint_command: str | None = None
+    type_check_command: str | None = None
+    lock_depth: int | None = None
+    max_per_module: int | None = None
+    module_overrides: dict[str, int] | None = None
+
+
+def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
+    """Scan project_root/*/orchestrator.yaml and load overridable fields."""
+    configs: dict[str, ModuleConfig] = {}
+    for yaml_path in sorted(project_root.glob('*/orchestrator.yaml')):
+        prefix = yaml_path.parent.name
+        try:
+            with open(yaml_path) as f:
+                raw = yaml.safe_load(f) or {}
+        except Exception:
+            logger.warning('Failed to parse %s, skipping', yaml_path)
+            continue
+        kwargs = {k: raw[k] for k in _OVERRIDABLE_FIELDS if k in raw}
+        if kwargs:
+            configs[prefix] = ModuleConfig(prefix=prefix, **kwargs)
+            logger.info('Loaded module config for %r: %s', prefix, list(kwargs))
+    return configs
 
 
 # --- Top-level ---
@@ -215,6 +268,16 @@ class OrchestratorConfig(BaseSettings):
     # Project
     project_root: Path = Field(default=Path('.'))
 
+    # Per-module overrides (populated by load_config via _discover_module_configs)
+    _module_configs: dict[str, ModuleConfig] = PrivateAttr(default_factory=dict)
+
+    def for_module(self, module_path: str) -> ModuleConfig | None:
+        """Return ModuleConfig matching the first path component, or None."""
+        if not self._module_configs:
+            return None
+        first = module_path.strip('/').split('/')[0]
+        return self._module_configs.get(first)
+
     model_config = SettingsConfigDict(
         env_prefix='ORCH_',
         env_nested_delimiter='__',
@@ -240,4 +303,6 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
     """Load configuration from YAML file, env vars, and defaults."""
     if config_path:
         os.environ['ORCH_CONFIG_PATH'] = str(config_path)
-    return OrchestratorConfig()
+    config = OrchestratorConfig()
+    config._module_configs = _discover_module_configs(config.project_root)
+    return config

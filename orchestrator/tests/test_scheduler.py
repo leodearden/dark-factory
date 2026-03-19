@@ -3,7 +3,7 @@
 
 import pytest
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.scheduler import ModuleLockTable
 
 
@@ -76,3 +76,61 @@ class TestModuleLockTable:
     def test_release_nonexistent_task(self, lock_table: ModuleLockTable):
         # Should not raise
         lock_table.release('nonexistent')
+
+
+class TestModuleLockWithModuleConfig:
+    """Test that ModuleConfig overrides are respected in lock limits."""
+
+    def test_limit_uses_mc_max_per_module(self):
+        config = OrchestratorConfig(max_per_module=1, lock_depth=1)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', max_per_module=3),
+        }
+        lt = ModuleLockTable(config)
+        assert lt.try_acquire('t1', ['dashboard'])
+        assert lt.try_acquire('t2', ['dashboard'])
+        assert lt.try_acquire('t3', ['dashboard'])
+        assert not lt.try_acquire('t4', ['dashboard'])
+
+    def test_limit_uses_mc_module_overrides(self):
+        config = OrchestratorConfig(max_per_module=1, lock_depth=1)
+        config._module_configs = {
+            'dashboard': ModuleConfig(
+                prefix='dashboard',
+                max_per_module=1,
+                module_overrides={'dashboard': 2},
+            ),
+        }
+        lt = ModuleLockTable(config)
+        assert lt.try_acquire('t1', ['dashboard'])
+        assert lt.try_acquire('t2', ['dashboard'])
+        assert not lt.try_acquire('t3', ['dashboard'])
+
+    def test_global_override_still_works(self):
+        """Global module_overrides takes effect when no ModuleConfig matches."""
+        config = OrchestratorConfig(
+            max_per_module=1, lock_depth=1,
+            module_overrides={'infra': 3},
+        )
+        lt = ModuleLockTable(config)
+        assert lt.try_acquire('t1', ['infra'])
+        assert lt.try_acquire('t2', ['infra'])
+        assert lt.try_acquire('t3', ['infra'])
+        assert not lt.try_acquire('t4', ['infra'])
+
+    def test_mc_module_overrides_beats_global(self):
+        """Subproject module_overrides takes precedence over global module_overrides."""
+        config = OrchestratorConfig(
+            max_per_module=1, lock_depth=1,
+            module_overrides={'dashboard': 5},
+        )
+        config._module_configs = {
+            'dashboard': ModuleConfig(
+                prefix='dashboard',
+                module_overrides={'dashboard': 2},
+            ),
+        }
+        lt = ModuleLockTable(config)
+        assert lt.try_acquire('t1', ['dashboard'])
+        assert lt.try_acquire('t2', ['dashboard'])
+        assert not lt.try_acquire('t3', ['dashboard'])

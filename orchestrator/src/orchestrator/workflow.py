@@ -21,7 +21,7 @@ from orchestrator.agents.roles import (
     AgentRole,
 )
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.verify import run_verification
@@ -96,6 +96,9 @@ class TaskWorkflow:
         self.plan: dict = {}
         self.initial_plan = initial_plan
         self.metrics = WorkflowMetrics()
+
+        # Per-module config for verification/scheduling
+        self._module_config = self._resolve_module_config()
 
         # Escalation support
         self.escalation_queue = escalation_queue
@@ -217,6 +220,28 @@ class TaskWorkflow:
             if self.state == WorkflowState.DONE and self.worktree and not self._worktree_external:
                 await self.git_ops.cleanup_worktree(self.worktree, branch_name)
 
+    def _resolve_module_config(self) -> ModuleConfig | None:
+        """Pick ModuleConfig for this task's modules.
+
+        If all modules share the same subproject prefix, use that config.
+        If modules span multiple subprojects, fall back to global (None).
+        """
+        if not self.modules:
+            return None
+        prefixes = set()
+        for m in self.modules:
+            mc = self.config.for_module(m)
+            if mc:
+                prefixes.add(mc.prefix)
+        if len(prefixes) == 1:
+            return self.config.for_module(self.modules[0])
+        if len(prefixes) > 1:
+            logger.warning(
+                'Task %s spans subprojects %s — using global verification config',
+                self.task_id, prefixes,
+            )
+        return None
+
     async def _plan(self) -> WorkflowOutcome:
         """Invoke the architect to produce a plan."""
         prompt = await self.briefing.build_architect_prompt(self.task, worktree=self.worktree)
@@ -242,6 +267,7 @@ class TaskWorkflow:
             if not expanded:
                 return WorkflowOutcome.REQUEUED
             self.modules = plan_modules
+            self._module_config = self._resolve_module_config()
 
         # Write plan decisions to memory
         await self._write_decisions_to_memory()
@@ -373,7 +399,7 @@ class TaskWorkflow:
         verify_attempt = 0
 
         while True:
-            result = await run_verification(self.worktree, self.config)
+            result = await run_verification(self.worktree, self.config, self._module_config)
             if result.passed:
                 return WorkflowOutcome.DONE
 
@@ -588,8 +614,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
 
         while True:
+            oauth_token = None
             if self.usage_gate:
-                await self.usage_gate.before_invoke()
+                oauth_token = await self.usage_gate.before_invoke()
 
             result = await invoke_agent(
                 prompt=prompt,
@@ -605,10 +632,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 sandbox_modules=sandbox_modules,
                 effort=effort_val,
                 backend=backend_val,
+                oauth_token=oauth_token,
             )
 
-            # Check for cap hit — if detected, loop back to before_invoke which blocks
-            if self.usage_gate and self.usage_gate.detect_cap_hit(result.stderr, result.output, backend_val):
+            # Check for cap hit — if detected, loop back to before_invoke which picks
+            # the next available account (multi-account) or blocks (single-account)
+            if self.usage_gate and self.usage_gate.detect_cap_hit(
+                result.stderr, result.output, backend_val, oauth_token=oauth_token,
+            ):
                 logger.warning(
                     f'Task {self.task_id} [{role.name}]: usage cap hit, waiting for reset'
                 )

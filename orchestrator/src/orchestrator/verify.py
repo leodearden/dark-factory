@@ -5,7 +5,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,7 @@ async def _run_cmd(cmd: str, cwd: Path, timeout: float = 300) -> tuple[int, str]
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            executable='/bin/bash',
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return proc.returncode, stdout.decode()
@@ -48,12 +49,20 @@ async def _run_cmd(cmd: str, cwd: Path, timeout: float = 300) -> tuple[int, str]
         return 1, f'Command failed: {e}'
 
 
-async def run_verification(worktree: Path, config: OrchestratorConfig) -> VerifyResult:
+async def run_verification(
+    worktree: Path,
+    config: OrchestratorConfig,
+    module_config: ModuleConfig | None = None,
+) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result."""
+    test_cmd = (module_config and module_config.test_command) or config.test_command
+    lint_cmd = (module_config and module_config.lint_command) or config.lint_command
+    type_cmd = (module_config and module_config.type_check_command) or config.type_check_command
+
     # Run all three in parallel
-    test_task = _run_cmd(config.test_command, worktree)
-    lint_task = _run_cmd(config.lint_command, worktree)
-    type_task = _run_cmd(config.type_check_command, worktree)
+    test_task = _run_cmd(test_cmd, worktree)
+    lint_task = _run_cmd(lint_cmd, worktree)
+    type_task = _run_cmd(type_cmd, worktree)
 
     (test_rc, test_out), (lint_rc, lint_out), (type_rc, type_out) = await asyncio.gather(
         test_task, lint_task, type_task
