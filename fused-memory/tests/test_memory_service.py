@@ -346,6 +346,17 @@ class TestDeleteMemory:
         assert result['status'] == 'deleted'
         assert result['store'] == 'mem0'
 
+    @pytest.mark.asyncio
+    async def test_delete_memory_graphiti_calls_remove_edge(self, service):
+        """delete_memory(store='graphiti') should call remove_edge (not remove_episode)
+        because search returns edge UUIDs."""
+        service.graphiti.remove_edge = AsyncMock()
+        await service.delete_memory(
+            memory_id='edge-uuid-123', store='graphiti', project_id='test'
+        )
+        service.graphiti.remove_edge.assert_called_once_with('edge-uuid-123')
+        service.graphiti.remove_episode.assert_not_called()
+
 
 class TestGraphitiBackendRemoveEdge:
     @pytest.mark.asyncio
