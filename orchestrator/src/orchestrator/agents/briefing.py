@@ -46,8 +46,9 @@ class BriefingAssembler:
 
 1. Explore the codebase thoroughly — read relevant files, understand existing patterns and utilities.
 2. Produce a TDD implementation plan.
-3. Ensure the `modules` field accurately lists ALL code directories this task will touch.
-4. Write the plan using the Write tool to `{plan_path}`.
+3. List ALL files you expect to create or modify in the `files` field — this drives concurrency locks, so be exhaustive and precise.
+4. Ensure the `modules` field accurately lists ALL code directories this task will touch.
+5. Write the plan using the Write tool to `{plan_path}`.
 """
 
     async def build_implementer_prompt(

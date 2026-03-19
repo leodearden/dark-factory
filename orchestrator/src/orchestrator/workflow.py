@@ -23,7 +23,7 @@ from orchestrator.agents.roles import (
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.scheduler import Scheduler, TaskAssignment, files_to_modules
 from orchestrator.verify import run_verification
 
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
@@ -258,8 +258,18 @@ class TaskWorkflow:
             logger.error(f'Task {self.task_id}: architect produced no plan.json')
             return WorkflowOutcome.BLOCKED
 
-        # Check if plan needs modules beyond what we hold
-        plan_modules = self.plan.get('modules', [])
+        # Derive modules from plan's file list (deterministic) or fall back to
+        # the plan's module list (heuristic).
+        plan_files = self.plan.get('files', [])
+        if plan_files:
+            plan_modules = files_to_modules(plan_files, self.config.lock_depth)
+            logger.info(
+                f'Task {self.task_id}: derived {len(plan_modules)} modules '
+                f'from {len(plan_files)} files: {plan_modules}'
+            )
+        else:
+            plan_modules = self.plan.get('modules', [])
+
         if set(plan_modules) != set(self.modules):
             expanded = await self.scheduler.handle_blast_radius_expansion(
                 self.task_id, self.modules, plan_modules

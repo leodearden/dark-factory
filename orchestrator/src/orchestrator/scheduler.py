@@ -22,6 +22,19 @@ def normalize_lock(module: str, depth: int = 2) -> str:
     return '/'.join(parts[:depth])
 
 
+def files_to_modules(files: list[str], depth: int) -> list[str]:
+    """Derive unique module locks from a list of file paths.
+
+    Each file path is normalized to ``depth`` components, then deduplicated.
+    """
+    modules: set[str] = set()
+    for f in files:
+        normalized = normalize_lock(f, depth)
+        if normalized:
+            modules.add(normalized)
+    return sorted(modules)
+
+
 @dataclass
 class TaskAssignment:
     """A task that has been assigned to a workflow slot, with module locks held."""
@@ -32,13 +45,40 @@ class TaskAssignment:
 
 
 class ModuleLockTable:
-    """Per-module counters. Serialize entire workflow per module."""
+    """Hierarchical module locking — two modules conflict if one is a prefix
+    of the other (parent/child), but siblings are independent.
+
+    Examples (all conflict):
+        autopilot/analyze  <->  autopilot/analyze/asr   (parent <-> child)
+        src/server         <->  src/server               (exact match)
+
+    Examples (no conflict):
+        autopilot/analyze/asr  <->  autopilot/analyze/speech  (siblings)
+    """
 
     def __init__(self, config: OrchestratorConfig):
         self._limits: dict[str, int] = {}
-        self._counts: dict[str, int] = {}  # module -> current holders
         self._held: dict[str, set[str]] = {}  # task_id -> set of held modules
         self._config = config
+
+    # --- Hierarchy helpers ---
+
+    @staticmethod
+    def _conflicts(a: str, b: str) -> bool:
+        """Two modules conflict if one is a prefix of the other (or exact match)."""
+        return a == b or a.startswith(b + '/') or b.startswith(a + '/')
+
+    def _count_conflicts(self, module: str, exclude_task: str | None = None) -> int:
+        """Count how many *other* tasks hold a lock that conflicts with ``module``."""
+        count = 0
+        for task_id, task_modules in self._held.items():
+            if task_id == exclude_task:
+                continue
+            if any(self._conflicts(held, module) for held in task_modules):
+                count += 1
+        return count
+
+    # --- Limit lookup (unchanged) ---
 
     def _limit_for(self, module: str) -> int:
         module = normalize_lock(module, self._config.lock_depth)
@@ -54,26 +94,22 @@ class ModuleLockTable:
                 self._limits[module] = self._config.max_per_module
         return self._limits[module]
 
-    def _count(self, module: str) -> int:
-        return self._counts.get(module, 0)
+    # --- Public API ---
 
     def try_acquire(self, task_id: str, modules: list[str]) -> bool:
         """Non-blocking attempt to acquire all module locks.
 
+        Uses hierarchical conflict detection: a lock on ``A/B`` conflicts with
+        ``A/B/C`` (and vice-versa) but NOT with ``A/D``.
+
         Returns True if all acquired, False if any unavailable.
-        On failure, releases any partially acquired locks.
         """
         depth = self._config.lock_depth
-        normalized = [normalize_lock(m, depth) for m in modules]
-        acquired = []
+        normalized = list({normalize_lock(m, depth) for m in modules})
+
+        # Check every requested module against all other tasks' held locks
         for module in normalized:
-            if self._count(module) < self._limit_for(module):
-                self._counts[module] = self._count(module) + 1
-                acquired.append(module)
-            else:
-                # Release what we acquired
-                for m in acquired:
-                    self._counts[m] -= 1
+            if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
                 return False
 
         self._held[task_id] = set(normalized)
@@ -83,8 +119,6 @@ class ModuleLockTable:
     def release(self, task_id: str) -> None:
         """Release all module locks held by a task."""
         modules = self._held.pop(task_id, set())
-        for module in modules:
-            self._counts[module] = max(0, self._count(module) - 1)
         if modules:
             logger.info(f'Task {task_id} released locks: {list(modules)}')
 
@@ -92,18 +126,16 @@ class ModuleLockTable:
         """Non-blocking attempt to expand lock set for a task."""
         depth = self._config.lock_depth
         current = self._held.get(task_id, set())
-        new_modules = [normalize_lock(m, depth) for m in additional if normalize_lock(m, depth) not in current]
+        new_modules = [
+            normalize_lock(m, depth)
+            for m in additional
+            if normalize_lock(m, depth) not in current
+        ]
         if not new_modules:
             return True
 
-        acquired = []
         for module in new_modules:
-            if self._count(module) < self._limit_for(module):
-                self._counts[module] = self._count(module) + 1
-                acquired.append(module)
-            else:
-                for m in acquired:
-                    self._counts[m] -= 1
+            if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
                 return False
 
         self._held[task_id].update(new_modules)
@@ -279,11 +311,22 @@ class Scheduler:
         self.lock_table.release(task_id)
 
     def _get_modules(self, task: dict) -> list[str]:
-        """Extract module list from task metadata, normalized for locking."""
+        """Extract module list from task metadata, normalized for locking.
+
+        Priority: metadata.files (deterministic) > metadata.modules (heuristic).
+        """
+        depth = self.config.lock_depth
         metadata = task.get('metadata', {})
         if isinstance(metadata, dict):
+            # Prefer file-derived modules (most accurate)
+            files = metadata.get('files', [])
+            if isinstance(files, list) and files:
+                derived = files_to_modules(files, depth)
+                if derived:
+                    return derived
+            # Fall back to explicitly tagged modules
             modules = metadata.get('modules', [])
             if isinstance(modules, list) and modules:
-                return [normalize_lock(m, self.config.lock_depth) for m in modules]
+                return [normalize_lock(m, depth) for m in modules]
         # Fallback: use a generic module name based on task id
         return [f'task-{task.get("id", "unknown")}']

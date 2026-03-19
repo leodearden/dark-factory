@@ -57,6 +57,7 @@ You MUST produce a JSON plan written to the path specified in the prompt's Actio
 {
   "task_id": "<task id>",
   "title": "<task title>",
+  "files": ["path/to/file1.py", "path/to/file2.py"],
   "modules": ["<module1>", "<module2>"],
   "analysis": "<your analysis of the task, existing code, and approach>",
   "prerequisites": [
@@ -82,8 +83,9 @@ You MUST produce a JSON plan written to the path specified in the prompt's Actio
 3. **Maximize reuse.** Identify existing utilities, patterns, and code that can be reused. Document in the `reuse` section.
 4. **Prerequisites first.** If setup work (config files, fixtures, etc.) is needed before TDD steps, put them in prerequisites.
 5. **Small steps.** Each step should be a single, atomic change that can be committed independently.
-6. **Module identification.** List all code modules/directories this task will touch in the `modules` field. Be precise — this controls concurrency locks.
-7. **Design decisions.** Document non-obvious choices and their rationale.
+6. **File listing.** List ALL files this task will create or modify in the `files` field. Use paths relative to the worktree root. Be exhaustive — this is used to derive concurrency locks. Include test files.
+7. **Module identification.** List all code modules/directories this task will touch in the `modules` field. These are derived from `files` but serve as a human-readable summary.
+8. **Design decisions.** Document non-obvious choices and their rationale.
 
 ## Important
 

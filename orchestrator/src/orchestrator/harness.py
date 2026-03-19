@@ -273,9 +273,14 @@ class Harness:
                         'type': 'object',
                         'properties': {
                             'id': {'type': 'string'},
+                            'files': {
+                                'type': 'array',
+                                'items': {'type': 'string'},
+                                'description': 'Predicted file paths this task will create or modify',
+                            },
                             'modules': {'type': 'array', 'items': {'type': 'string'}},
                         },
-                        'required': ['id', 'modules'],
+                        'required': ['id', 'files', 'modules'],
                     },
                 },
             },
@@ -283,9 +288,15 @@ class Harness:
         }
 
         prompt = f"""\
-Given these tasks and this codebase structure, assign each task a list of
-code modules (top-level directories) it will need to modify. Be specific —
-use directory-level granularity (e.g. "src/backends", "src/server", "tests").
+Given these tasks and this codebase structure, predict which files each task
+will create or modify, and which code modules (directories) it will touch.
+
+Be specific and exhaustive with file predictions — include source files AND
+test files. Use paths relative to the project root. The `files` field is used
+to derive concurrency locks, so accuracy prevents unnecessary serialization.
+
+The `modules` field should list directory-level groupings (e.g. "src/backends",
+"src/server", "tests") as a human-readable summary.
 
 # Codebase top-level directories
 {json.dumps(entries)}
@@ -335,8 +346,14 @@ Output JSON matching the schema. Every task must appear in the output.
         for entry in mapping.get('tasks', []):
             task_id = str(entry.get('id', ''))
             modules = entry.get('modules', [])
-            if task_id and modules:
-                await self.scheduler.update_task(task_id, json.dumps({'modules': modules}))
+            files = entry.get('files', [])
+            if task_id and (modules or files):
+                metadata: dict = {}
+                if files:
+                    metadata['files'] = files
+                if modules:
+                    metadata['modules'] = modules
+                await self.scheduler.update_task(task_id, json.dumps(metadata))
                 tagged_count += 1
 
         logger.info(f'Tagged {tagged_count}/{len(untagged)} tasks with module metadata')

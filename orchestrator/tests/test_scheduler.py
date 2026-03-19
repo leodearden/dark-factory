@@ -4,7 +4,7 @@
 import pytest
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.scheduler import ModuleLockTable
+from orchestrator.scheduler import ModuleLockTable, files_to_modules, normalize_lock
 
 
 @pytest.fixture
@@ -45,7 +45,7 @@ class TestModuleLockTable:
         assert lock_table.try_acquire('task-1', ['backend'])
         # task-2 needs backend + server; backend is locked so should fail
         assert not lock_table.try_acquire('task-2', ['server', 'backend'])
-        # server should NOT be locked (rollback)
+        # server should NOT be locked (atomic failure)
         assert lock_table.try_acquire('task-3', ['server'])
 
     def test_module_override_allows_concurrency(self, lock_table: ModuleLockTable):
@@ -76,6 +76,152 @@ class TestModuleLockTable:
     def test_release_nonexistent_task(self, lock_table: ModuleLockTable):
         # Should not raise
         lock_table.release('nonexistent')
+
+
+class TestHierarchicalLocking:
+    """Test that parent/child modules conflict but siblings don't."""
+
+    def test_parent_blocks_child(self):
+        """Lock on autopilot/analyze blocks autopilot/analyze/asr."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        lt = ModuleLockTable(config)
+        assert lt.try_acquire('t1', ['autopilot/analyze'])
+        assert not lt.try_acquire('t2', ['autopilot/analyze/asr'])
+
+    def test_child_blocks_parent(self):
+        """Lock on autopilot/analyze/asr blocks autopilot/analyze."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        lt = ModuleLockTable(config)
+        assert lt.try_acquire('t1', ['autopilot/analyze/asr'])
+        assert not lt.try_acquire('t2', ['autopilot/analyze'])
+
+    def test_siblings_dont_conflict(self):
+        """autopilot/analyze/asr and autopilot/analyze/speech are independent."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        lt = ModuleLockTable(config)
+        assert lt.try_acquire('t1', ['autopilot/analyze/asr'])
+        assert lt.try_acquire('t2', ['autopilot/analyze/speech'])
+
+    def test_deep_ancestor_blocks_deep_descendant(self):
+        """Lock on src blocks src/server/handlers/auth."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=5)
+        lt = ModuleLockTable(config)
+        assert lt.try_acquire('t1', ['src'])
+        assert not lt.try_acquire('t2', ['src/server/handlers/auth'])
+
+    def test_unrelated_paths_dont_conflict(self):
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        lt = ModuleLockTable(config)
+        assert lt.try_acquire('t1', ['backend/server'])
+        assert lt.try_acquire('t2', ['frontend/components'])
+
+    def test_release_parent_unblocks_child(self):
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        lt = ModuleLockTable(config)
+        assert lt.try_acquire('t1', ['autopilot/analyze'])
+        assert not lt.try_acquire('t2', ['autopilot/analyze/asr'])
+        lt.release('t1')
+        assert lt.try_acquire('t2', ['autopilot/analyze/asr'])
+
+    def test_task_own_modules_dont_self_conflict(self):
+        """A task holding A should be able to expand to A/B via additional."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        lt = ModuleLockTable(config)
+        assert lt.try_acquire('t1', ['autopilot/analyze'])
+        # Expanding to a child of an already-held parent should work
+        assert lt.try_acquire_additional('t1', ['autopilot/analyze/asr'])
+
+    def test_hierarchy_with_limit_gt_1(self):
+        """Parent/child conflict still applies when limit > 1."""
+        config = OrchestratorConfig(
+            max_per_module=2, lock_depth=4,
+        )
+        lt = ModuleLockTable(config)
+        assert lt.try_acquire('t1', ['autopilot/analyze'])
+        # Second task on parent: allowed (limit=2)
+        assert lt.try_acquire('t2', ['autopilot/analyze'])
+        # Third task on child: blocked (2 conflicts from t1 and t2)
+        assert not lt.try_acquire('t3', ['autopilot/analyze/asr'])
+
+    def test_exact_prefix_string_not_confused(self):
+        """'src/server' must not conflict with 'src/serverless' (not a parent)."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        lt = ModuleLockTable(config)
+        assert lt.try_acquire('t1', ['src/server'])
+        assert lt.try_acquire('t2', ['src/serverless'])
+
+
+class TestFilesToModules:
+    def test_basic_derivation(self):
+        files = [
+            'autopilot/analyze/asr/model.py',
+            'autopilot/analyze/asr/tests/test_model.py',
+            'autopilot/analyze/speech/recognizer.py',
+        ]
+        assert files_to_modules(files, depth=3) == [
+            'autopilot/analyze/asr',
+            'autopilot/analyze/speech',
+        ]
+
+    def test_depth_2_collapses(self):
+        files = [
+            'autopilot/analyze/asr/model.py',
+            'autopilot/analyze/speech/recognizer.py',
+        ]
+        assert files_to_modules(files, depth=2) == ['autopilot/analyze']
+
+    def test_deduplication(self):
+        files = [
+            'src/server/app.py',
+            'src/server/routes.py',
+            'src/server/models.py',
+        ]
+        assert files_to_modules(files, depth=2) == ['src/server']
+
+    def test_empty_list(self):
+        assert files_to_modules([], depth=2) == []
+
+    def test_single_component_files(self):
+        files = ['setup.py', 'pyproject.toml']
+        assert files_to_modules(files, depth=2) == ['pyproject.toml', 'setup.py']
+
+    def test_mixed_depths(self):
+        files = [
+            'orchestrator/src/orchestrator/scheduler.py',
+            'orchestrator/tests/test_scheduler.py',
+            'dashboard/src/dashboard/app.py',
+        ]
+        assert files_to_modules(files, depth=2) == [
+            'dashboard/src',
+            'orchestrator/src',
+            'orchestrator/tests',
+        ]
+
+
+class TestConflictsMethod:
+    """Direct unit tests for the _conflicts static method."""
+
+    def test_exact_match(self):
+        assert ModuleLockTable._conflicts('a/b', 'a/b')
+
+    def test_parent_child(self):
+        assert ModuleLockTable._conflicts('a', 'a/b')
+
+    def test_child_parent(self):
+        assert ModuleLockTable._conflicts('a/b', 'a')
+
+    def test_siblings(self):
+        assert not ModuleLockTable._conflicts('a/b', 'a/c')
+
+    def test_prefix_string_not_hierarchy(self):
+        """'ab' is not a parent of 'abc'."""
+        assert not ModuleLockTable._conflicts('ab', 'abc')
+
+    def test_deep_hierarchy(self):
+        assert ModuleLockTable._conflicts('a/b/c', 'a/b/c/d/e')
+
+    def test_completely_unrelated(self):
+        assert not ModuleLockTable._conflicts('foo', 'bar')
 
 
 class TestModuleLockWithModuleConfig:
