@@ -62,6 +62,33 @@ class TestOrchestratorRouteBasics:
             resp = client.get('/partials/orchestrators')
         assert 'text/html' in resp.headers['content-type']
 
+    def test_header_title(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'Orchestrators' in html
+
+    def test_count_badge(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # Count badge should show "1" for single orchestrator
+        assert '>1<' in html
+
+    def test_card_shows_pid(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert '1234' in html
+
+    def test_running_badge(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'bg-green-600' in html
+        assert 'running' in html
+
+    def test_prd_filename(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'dashboard.md' in html
+
 
 class TestOrchestratorRouteEmpty:
     """Tests for GET /partials/orchestrators with no orchestrators."""
