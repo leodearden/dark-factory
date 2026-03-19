@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="space-y-8 max-w-7xl mx-auto p-6">
+    <!-- Memory Health -->
+    <section
+        hx-get="/partials/memory"
+        hx-trigger="load, every 10s"
+        hx-swap="innerHTML"
+    >
+        <p class="text-gray-400">Loading...</p>
+    </section>
+
+    <!-- Reconciliation -->
+    <section
+        hx-get="/partials/recon"
+        hx-trigger="load, every 15s"
+        hx-swap="innerHTML"
+    >
+        <p class="text-gray-400">Loading...</p>
+    </section>
+
+    <!-- Orchestrators -->
+    <section
+        hx-get="/partials/orchestrators"
+        hx-trigger="load, every 10s"
+        hx-swap="innerHTML"
+    >
+        <p class="text-gray-400">Loading...</p>
+    </section>
+
+    <!-- Footer -->
+    <footer class="text-center text-sm text-gray-500 pt-4 border-t border-gray-700">
+        Dark Factory Dashboard
+    </footer>
+</div>
+{% endblock %}

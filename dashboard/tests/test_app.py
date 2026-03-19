@@ -1,0 +1,273 @@
+"""Integration tests for the full dashboard application."""
+
+from __future__ import annotations
+
+import os
+import runpy
+from contextlib import ExitStack
+from unittest.mock import AsyncMock, patch
+
+
+class TestIndex:
+    """Tests for GET / — the main dashboard page."""
+
+    def test_get_root_returns_200(self, client):
+        resp = client.get('/')
+        assert resp.status_code == 200
+
+    def test_get_root_content_type_html(self, client):
+        resp = client.get('/')
+        assert 'text/html' in resp.headers['content-type']
+
+    def test_get_root_contains_dark_factory(self, client):
+        html = client.get('/').text
+        assert 'Dark Factory' in html
+
+    def test_get_root_htmx_memory(self, client):
+        html = client.get('/').text
+        assert 'hx-get="/partials/memory"' in html
+
+    def test_get_root_htmx_recon(self, client):
+        html = client.get('/').text
+        assert 'hx-get="/partials/recon"' in html
+
+    def test_get_root_htmx_orchestrators(self, client):
+        html = client.get('/').text
+        assert 'hx-get="/partials/orchestrators"' in html
+
+
+class TestHealthIntegration:
+    """Tests for GET /api/health."""
+
+    def test_health_returns_200(self, client):
+        resp = client.get('/api/health')
+        assert resp.status_code == 200
+
+    def test_health_content_type_json(self, client):
+        resp = client.get('/api/health')
+        assert 'application/json' in resp.headers['content-type']
+
+    def test_health_body(self, client):
+        resp = client.get('/api/health')
+        assert resp.json() == {'status': 'ok'}
+
+
+class TestMemoryPartialIntegration:
+    """Integration tests for GET /partials/memory."""
+
+    def test_memory_online(self, client):
+        mock_status = {
+            'graphiti': {'connected': True, 'node_count': 42},
+            'mem0': {'connected': True, 'memory_count': 128},
+        }
+        mock_queue = {
+            'counts': {'pending': 0, 'retry': 0, 'dead': 0},
+            'oldest_pending_age_seconds': None,
+        }
+        with (
+            patch(
+                'dashboard.data.memory.get_memory_status',
+                new_callable=AsyncMock,
+                return_value=mock_status,
+            ),
+            patch(
+                'dashboard.data.memory.get_queue_stats',
+                new_callable=AsyncMock,
+                return_value=mock_queue,
+            ),
+        ):
+            resp = client.get('/partials/memory')
+            assert resp.status_code == 200
+            assert 'text/html' in resp.headers['content-type']
+            html = resp.text
+            assert 'Graphiti' in html
+            assert 'Mem0' in html
+            assert 'Taskmaster' in html
+            assert 'Write Queue' in html
+
+    def test_memory_offline(self, client):
+        mock_status = {'offline': True, 'error': 'Connection refused'}
+        mock_queue = {'offline': True, 'error': 'Connection refused'}
+        with (
+            patch(
+                'dashboard.data.memory.get_memory_status',
+                new_callable=AsyncMock,
+                return_value=mock_status,
+            ),
+            patch(
+                'dashboard.data.memory.get_queue_stats',
+                new_callable=AsyncMock,
+                return_value=mock_queue,
+            ),
+        ):
+            resp = client.get('/partials/memory')
+            assert resp.status_code == 200
+            html = resp.text
+            assert 'Offline' in html
+
+
+def _patch_recon_data(
+    buffer_stats=None,
+    burst_state=None,
+    watermarks=None,
+    verdict=None,
+    runs=None,
+):
+    """Return an ExitStack that patches all 5 recon data functions."""
+    defaults = {
+        'buffer_stats': buffer_stats if buffer_stats is not None else {
+            'buffered_count': 3, 'oldest_event_age_seconds': 600.0,
+        },
+        'burst_state': burst_state if burst_state is not None else [
+            {
+                'agent_id': 'agent-1',
+                'state': 'bursting',
+                'last_write_at': '2026-03-19T00:00:00+00:00',
+                'burst_started_at': '2026-03-19T00:00:00+00:00',
+            },
+        ],
+        'watermarks': watermarks if watermarks is not None else {
+            'last_full_run_completed': '2026-03-19T10:00:00+00:00',
+        },
+        'verdict': verdict,
+        'runs': runs if runs is not None else [
+            {
+                'id': 'run-001',
+                'run_type': 'full',
+                'trigger_reason': 'staleness_timer',
+                'started_at': '2026-03-19T08:00:00+00:00',
+                'completed_at': '2026-03-19T08:05:00+00:00',
+                'events_processed': 7,
+                'status': 'completed',
+                'duration_seconds': 300.0,
+            },
+        ],
+    }
+    stack = ExitStack()
+    stack.enter_context(patch(
+        'dashboard.app.get_buffer_stats',
+        new_callable=AsyncMock,
+        return_value=defaults['buffer_stats'],
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_burst_state',
+        new_callable=AsyncMock,
+        return_value=defaults['burst_state'],
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_watermarks',
+        new_callable=AsyncMock,
+        return_value=defaults['watermarks'],
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_latest_verdict',
+        new_callable=AsyncMock,
+        return_value=defaults['verdict'],
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_recent_runs',
+        new_callable=AsyncMock,
+        return_value=defaults['runs'],
+    ))
+    return stack
+
+
+class TestReconPartialIntegration:
+    """Integration tests for GET /partials/recon."""
+
+    def test_recon_with_data(self, client):
+        with _patch_recon_data():
+            resp = client.get('/partials/recon')
+            assert resp.status_code == 200
+            assert 'text/html' in resp.headers['content-type']
+            html = resp.text
+            assert 'staleness_timer' in html
+            assert 'completed' in html
+
+    def test_recon_empty(self, client):
+        with _patch_recon_data(
+            buffer_stats={'buffered_count': 0, 'oldest_event_age_seconds': None},
+            burst_state=[],
+            watermarks={},
+            runs=[],
+        ):
+            resp = client.get('/partials/recon')
+            assert resp.status_code == 200
+            html = resp.text
+            assert 'No reconciliation runs' in html
+
+
+_MOCK_ORCHESTRATOR = {
+    'pid': 1234,
+    'prd': '/home/leo/src/dark-factory/prd/dashboard.md',
+    'running': True,
+    'started': 'Mar18',
+    'tasks': [
+        {'id': 1, 'title': 'Setup infra', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+        {'id': 2, 'title': 'Build API', 'status': 'in-progress', 'priority': 'medium', 'dependencies': [1], 'metadata': {}},
+    ],
+    'worktrees': {
+        '1': {
+            'phase': 'DONE',
+            'plan_progress': {'done': 3, 'total': 3},
+            'iteration_count': 2,
+            'review_summary': '2/2 passed',
+            'modules': ['infra/'],
+        },
+    },
+    'summary': {
+        'total': 2,
+        'done': 1,
+        'in_progress': 1,
+        'blocked': 0,
+        'pending': 0,
+    },
+}
+
+
+class TestOrchestratorsPartialIntegration:
+    """Integration tests for GET /partials/orchestrators."""
+
+    def test_orchestrators_with_data(self, client):
+        with patch('dashboard.app.discover_orchestrators', return_value=[_MOCK_ORCHESTRATOR]):
+            resp = client.get('/partials/orchestrators')
+            assert resp.status_code == 200
+            assert 'text/html' in resp.headers['content-type']
+            html = resp.text
+            assert '1234' in html
+            assert 'dashboard.md' in html
+            assert '1 done' in html
+
+    def test_orchestrators_empty(self, client):
+        with patch('dashboard.app.discover_orchestrators', return_value=[]):
+            resp = client.get('/partials/orchestrators')
+            assert resp.status_code == 200
+            html = resp.text
+            assert 'No orchestrators detected' in html
+
+
+class TestMainModule:
+    """Tests for python -m dashboard entry point."""
+
+    def test_main_calls_uvicorn_run(self):
+        with patch('uvicorn.run') as mock_run:
+            runpy.run_module('dashboard', run_name='__main__')
+            mock_run.assert_called_once_with(
+                'dashboard.app:app',
+                host='127.0.0.1',
+                port=8080,
+                reload=True,
+            )
+
+    def test_main_respects_env_var_overrides(self):
+        with (
+            patch.dict(os.environ, {'DASHBOARD_HOST': '0.0.0.0', 'DASHBOARD_PORT': '9090'}),
+            patch('uvicorn.run') as mock_run,
+        ):
+            runpy.run_module('dashboard', run_name='__main__')
+            mock_run.assert_called_once_with(
+                'dashboard.app:app',
+                host='0.0.0.0',
+                port=9090,
+                reload=True,
+            )

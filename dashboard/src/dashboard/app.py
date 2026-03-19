@@ -64,6 +64,11 @@ app = FastAPI(title='Dark Factory Dashboard', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory=str(_pkg_dir / 'static')), name='static')
 
 
+@app.get('/')
+async def index(request: Request):
+    return templates.TemplateResponse(request, 'index.html')
+
+
 @app.get('/api/health')
 async def health():
     return {'status': 'ok'}
