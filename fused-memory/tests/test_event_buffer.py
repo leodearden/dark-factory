@@ -357,6 +357,30 @@ async def test_not_quiescent_when_queue_has_retries(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_quiescent_when_queue_truly_empty(tmp_path):
+    """165 events + empty queue → conditional trigger fires."""
+    async def mock_queue_stats():
+        return {'counts': {}, 'oldest_pending_age_seconds': None}
+
+    buf = EventBuffer(
+        db_path=tmp_path / 'q_empty.db',
+        buffer_size_threshold=500,
+        conditional_trigger_ratio=0.33,
+        queue_stats_fn=mock_queue_stats,
+    )
+    await buf.initialize()
+    try:
+        for _ in range(165):
+            await buf.push(_make_event())
+
+        should, reason = await buf.should_trigger('test-project')
+        assert should
+        assert 'quiescent:165' == reason
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
 async def test_cross_instance_lock(tmp_path):
     """Instance B can't lock while A holds it."""
     db_path = tmp_path / 'lock.db'
