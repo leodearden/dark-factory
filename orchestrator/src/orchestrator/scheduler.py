@@ -96,6 +96,10 @@ class ModuleLockTable:
 
     # --- Public API ---
 
+    def is_held(self, task_id: str) -> bool:
+        """Return True if task_id currently holds any module locks."""
+        return task_id in self._held
+
     def try_acquire(self, task_id: str, modules: list[str]) -> bool:
         """Non-blocking attempt to acquire all module locks.
 
