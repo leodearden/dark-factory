@@ -89,6 +89,55 @@ class TestOrchestratorRouteBasics:
             html = client.get('/partials/orchestrators').text
         assert 'dashboard.md' in html
 
+    def test_progress_bar_container(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'h-3' in html
+        assert 'rounded-full' in html
+        assert 'bg-gray-700' in html
+        assert 'overflow-hidden' in html
+
+    def test_progress_bar_segments(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # All four segment colors should be present (done=green, in_progress=blue, blocked=red, pending=yellow)
+        assert 'bg-green-600' in html
+        assert 'bg-blue-600' in html
+        assert 'bg-yellow-600' in html
+        assert 'bg-red-600' in html
+
+    def test_stats_done(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert '2 done' in html
+
+    def test_stats_in_progress(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert '1 in-progress' in html
+
+    def test_stats_blocked(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert '1 blocked' in html
+
+    def test_stats_pending(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert '1 pending' in html
+
+    def test_alpine_toggle(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'x-data' in html
+        assert 'x-show' in html
+        assert '@click' in html
+
+    def test_show_tasks_button(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'Show tasks' in html
+
 
 class TestOrchestratorRouteEmpty:
     """Tests for GET /partials/orchestrators with no orchestrators."""
