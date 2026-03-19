@@ -379,3 +379,43 @@ class TestAcquireNextNoDuplicates:
         second = await scheduler.acquire_next()
         assert second is not None
         assert second.task_id == '1'
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_dispatches_different_tasks_concurrently(
+        self, scheduler: Scheduler
+    ):
+        """Three non-conflicting tasks can each be dispatched in turn; fourth returns None."""
+        tasks = [
+            {
+                'id': '1',
+                'title': 'Backend task',
+                'status': 'pending',
+                'dependencies': [],
+                'metadata': {'modules': ['backend']},
+            },
+            {
+                'id': '2',
+                'title': 'Frontend task',
+                'status': 'pending',
+                'dependencies': [],
+                'metadata': {'modules': ['frontend']},
+            },
+            {
+                'id': '3',
+                'title': 'Infra task',
+                'status': 'pending',
+                'dependencies': [],
+                'metadata': {'modules': ['infra']},
+            },
+        ]
+        scheduler.get_tasks = AsyncMock(return_value=tasks)
+
+        first = await scheduler.acquire_next()
+        second = await scheduler.acquire_next()
+        third = await scheduler.acquire_next()
+
+        ids = {a.task_id for a in [first, second, third] if a is not None}
+        assert ids == {'1', '2', '3'}, f'Expected 3 distinct tasks, got: {ids}'
+
+        fourth = await scheduler.acquire_next()
+        assert fourth is None
