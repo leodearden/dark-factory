@@ -1,139 +1,121 @@
 {
-  "task_id": "35",
-  "title": "Deduplicate identical orchestrator cards when sharing task tree",
+  "task_id": "43",
+  "title": "Bug: FusedMemoryConfig defaults assume orchestrator/ cwd",
   "files": [
-    "dashboard/src/dashboard/data/orchestrator.py",
-    "dashboard/src/dashboard/templates/partials/orchestrators.html",
-    "dashboard/tests/test_orchestrator.py",
-    "dashboard/tests/test_orchestrator_panel.py"
+    "orchestrator/src/orchestrator/config.py",
+    "orchestrator/tests/test_config.py"
   ],
   "modules": [
-    "dashboard/src/dashboard/data",
-    "dashboard/src/dashboard/templates/partials",
-    "dashboard/tests"
+    "orchestrator/src/orchestrator",
+    "orchestrator/tests"
   ],
-  "analysis": "The bug: discover_orchestrators() loads the task tree once and attaches the identical tasks/worktrees/summary to every process entry. When two orchestrator processes run against the same PRD, the dashboard renders two visually identical cards — same progress bar, same task list, same stats — differing only by PID. This is confusing.\n\nRoot cause in orchestrator.py lines 249-256: the function iterates over all processes and blindly spreads each proc dict (**proc) into the result, attaching the shared task tree to each. There is no grouping by PRD.\n\nFix approach (Option 3 from task description): Group processes by PRD path in discover_orchestrators(), merging PIDs into a 'pids' list. Produce one entry per unique PRD. The template then conditionally renders 'PID 1234' (singular) or 'PIDs 1234, 5678' (plural).\n\nKey observations:\n- find_running_orchestrators() returns dicts with 'pid' (int), 'prd' (str), 'running' (bool), 'started' (str)\n- discover_orchestrators() spreads proc dict via **proc into result entries\n- Template references orch.pid (singular) on line 12\n- MOCK_ORCHESTRATOR_RUNNING/COMPLETED in test_orchestrator_panel.py use 'pid' key\n- 4 existing TestDiscoverOrchestrators tests assert entry['pid']\n- find_running_orchestrators() stays unchanged — it correctly reports raw per-process data\n- Grouping is a pure data transformation in discover_orchestrators()\n- 'running' for a group should be True if ANY constituent process is running (OR semantics)\n- 'started' is display-only from ps — use first entry's value",
+  "analysis": "FusedMemoryConfig has three defaults that only work when cwd is the orchestrator/ subdirectory:\n\n1. `url` defaults to `http://localhost:8000` — dark-factory uses port 8002 (port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2). During the dashboard run, this caused the orchestrator to connect to reify's server on port 8000 and see 0 pending tasks.\n\n2. `config_path` defaults to `../fused-memory/config/config.yaml` — parent-relative path that only resolves correctly from orchestrator/ dir. McpLifecycle resolves this as (project_root / config_path).resolve(), so with project_root=repo-root it becomes repo-root/../fused-memory/... which escapes the repo.\n\n3. `server_command` defaults with `--project ../fused-memory` — same parent-relative issue. McpLifecycle runs server_command with cwd=project_root, so ../fused-memory resolves above repo root.\n\nThe real config at `orchestrator/config.yaml` already has correct values (url=8002, repo-root-relative paths), but load_config without --config only looks for `config.yaml` in cwd. When cwd is repo root (common case), there's no config.yaml there — YamlSettingsSource returns {} and all (wrong) defaults apply.\n\nSecondary issue: `settings_customise_sources` defaults to loading `config.yaml` from cwd. When no --config is passed and no config.yaml exists in cwd, it silently uses all defaults with no warning.\n\nFix approach:\n- Change FusedMemoryConfig defaults to be repo-root-relative (matching McpLifecycle's resolution: config_path relative to project_root, server_command run with cwd=project_root)\n- Add model_validator to resolve project_root to absolute path (prevents cwd-sensitivity after construction)\n- Add config file auto-discovery in load_config to search orchestrator/config.yaml when cwd/config.yaml not found\n- Log warning when no config file found at any standard location\n\nDownstream consumers need no changes — mcp_lifecycle.py already resolves config_path against project_root (line 233) and runs server_command with cwd=project_root (line 239). The existing test test_fused_memory_defaults asserts old broken defaults and must be updated.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write test test_single_process_produces_pids_list in TestDiscoverOrchestrators: mock one running orchestrator, call discover_orchestrators, assert result[0] has 'pids' key containing [1234], and assert 'pid' key is absent from result[0].",
+      "description": "Update test_fused_memory_defaults to assert correct repo-root-relative defaults: url='http://localhost:8002', config_path='fused-memory/config/config.yaml' (no ../), server_command containing '--project' followed by 'fused-memory' (no ../). Add assertion that no element in server_command contains '../'. This test will FAIL because current defaults have port 8000 and parent-relative paths.",
       "status": "done",
-      "commit": "370db08"
+      "commit": "51395d1"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Refactor discover_orchestrators() to group processes by PRD: use groups = {} / groups.setdefault(proc['prd'], []).append(proc). Iterate over groups instead of individual processes. For each unique PRD, emit one entry with 'pids': [p['pid'] for p in group], 'prd': prd, 'running': any(p['running'] for p in group), 'started': group[0]['started'], plus shared tasks/worktrees/summary. Also update the 4 existing TestDiscoverOrchestrators tests to use entry['pids'] instead of entry['pid']: test_combines_process_and_worktree_data, test_missing_tasks_json, test_worktree_keyed_by_task_id_not_dirname, test_non_task_worktree_dirs_excluded.",
+      "description": "Fix FusedMemoryConfig defaults in config.py: (1) url from 'http://localhost:8000' to 'http://localhost:8002', (2) config_path from '../fused-memory/config/config.yaml' to 'fused-memory/config/config.yaml', (3) server_command '--project' arg from '../fused-memory' to 'fused-memory'.",
       "status": "done",
-      "commit": "bc045ad"
+      "commit": "81b272a"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write test test_same_prd_grouped_into_single_entry in TestDiscoverOrchestrators: mock find_running_orchestrators returning two processes with the same PRD path but different PIDs (1234 and 5678, both prd='/home/leo/prd.md'). Create tasks.json and a worktree. Assert len(result)==1. Assert result[0]['pids']==[1234, 5678]. Assert tasks/worktrees/summary present once.",
+      "description": "Write test_project_root_resolved_to_absolute in TestDefaults: create OrchestratorConfig with default project_root=Path('.'), assert config.project_root.is_absolute(). Write test_fused_memory_paths_resolve_under_project_root in a new TestPathResolution class: create config with project_root=tmp_path, verify (project_root / config.fused_memory.config_path).resolve() starts with str(tmp_path), verify no '..' segments remain after resolve. Both tests FAIL because no model_validator exists yet.",
       "status": "done",
-      "commit": "69db19b"
+      "commit": "87beb1a"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Verify step-3 test passes with existing grouping logic from step-2. No new production code expected — setdefault grouping already handles same-PRD merging. Fix if needed.",
+      "description": "Add model_validator(mode='after') on OrchestratorConfig that resolves project_root to absolute: self.project_root = self.project_root.resolve(). Import model_validator from pydantic. This ensures all downstream path joins work regardless of cwd changes after config construction.",
       "status": "done",
-      "commit": "69db19b"
+      "commit": "5f8a3a3"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write test test_different_prds_produce_separate_entries: mock two processes with different PRD paths (/prd1.md and /prd2.md). Assert len(result)==2, each with pids list of length 1. Write test test_grouped_running_true_when_any_running: two procs same PRD, one running=True one running=False, assert entry['running']==True. Write test test_grouped_running_false_when_all_stopped: two procs same PRD both running=False, assert entry['running']==False.",
+      "description": "Write test_load_config_discovers_orchestrator_subdir in TestYamlLoading: create tmp_path/orchestrator/config.yaml with max_concurrent_tasks=7, monkeypatch chdir to tmp_path and clear ORCH_CONFIG_PATH, call load_config(None), assert config.max_concurrent_tasks == 7. This tests auto-discovery of orchestrator/config.yaml from repo root — will FAIL because load_config only checks cwd/config.yaml.",
       "status": "done",
-      "commit": "2c30a4e"
+      "commit": "b1bd925"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Verify step-5 tests pass with existing logic. The any() call for running and dict key grouping should cover all cases. Fix if needed.",
+      "description": "Add _find_config(explicit_path: Path | None) -> Path | None helper to config.py. Search order: (1) explicit_path if given, (2) ORCH_CONFIG_PATH env var path if it exists, (3) cwd/config.yaml, (4) cwd/orchestrator/config.yaml. Update load_config to call _find_config and set ORCH_CONFIG_PATH when found.",
       "status": "done",
-      "commit": "2c30a4e"
+      "commit": "cbb9255"
     },
     {
       "id": "step-7",
       "type": "test",
-      "description": "Update test_orchestrator_panel.py mock data: change MOCK_ORCHESTRATOR_RUNNING from 'pid': 1234 to 'pids': [1234], and MOCK_ORCHESTRATOR_COMPLETED from 'pid': 5678 to 'pids': [5678]. Add new test class TestOrchestratorMultiPid with MOCK_ORCHESTRATOR_MULTI_PID constant (pids: [1234, 5678], same PRD, same tasks/worktrees/summary as RUNNING). Tests: (1) test_multi_pid_header_shows_pids_plural — 'PIDs' in html + both '1234' and '5678'; (2) test_single_pid_header_shows_pid_singular — 'PID ' in html for single-PID entry; (3) test_count_badge_shows_one_for_grouped — count badge '1' for single grouped entry with multiple PIDs; (4) test_multi_pid_comma_separated — pids=[111, 222, 333] renders '111, 222, 333'.",
+      "description": "Write test_load_config_warns_when_no_config_found in TestYamlLoading: monkeypatch chdir to empty tmp_path, clear ORCH_CONFIG_PATH env var, call load_config(None), use caplog fixture to assert a WARNING-level message containing 'No config file found' is logged. Will FAIL because no warning logic exists yet.",
       "status": "done",
-      "commit": "51bedbc"
+      "commit": "752c979"
     },
     {
       "id": "step-8",
       "type": "impl",
-      "description": "Update orchestrators.html template line 12: replace '<span ...>PID {{ orch.pid }}</span>' with conditional: {% if orch.pids|length > 1 %}<span ...>PIDs {{ orch.pids|join(', ') }}</span>{% else %}<span ...>PID {{ orch.pids[0] }}</span>{% endif %}. Verify ALL panel tests pass including new multi-PID tests and all existing tests with updated mock data.",
+      "description": "Add warning log in load_config when _find_config returns None and no explicit path was given. Message: 'No config file found (checked config.yaml, orchestrator/config.yaml). Using defaults. Pass --config or set ORCH_CONFIG_PATH to specify.'",
       "status": "done",
-      "commit": "ea5c085"
-    },
-    {
-      "id": "step-9",
-      "type": "test",
-      "description": "Run full test suite (pytest dashboard/tests/) to verify no regressions. Check that existing tests in test_app.py, test_badge_macros.py, and other test files still pass. Fix any issues.",
-      "status": "done",
-      "commit": "51bedbc"
+      "commit": "cbb9255"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Use 'pids' (list[int]) instead of keeping 'pid' (int) alongside",
-      "rationale": "Clean break over backward compatibility. The only consumer is the orchestrators.html template (also modified in this task), so there is no external API contract to maintain. A list is the natural representation whether there's 1 or N processes. Keeping both 'pid' and 'pids' would invite confusion about which to use."
+      "decision": "Change url default to http://localhost:8002 (dark-factory port)",
+      "rationale": "The port scheme documented in orchestrator/config.yaml is: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2. Port 8000 collides with reify and caused the actual bug (connecting to wrong project's server, seeing 0 pending tasks). Since this is the dark-factory orchestrator, its defaults should match the dark-factory port. The fused-memory config.yaml also defines port: 8002."
     },
     {
-      "decision": "Group by exact PRD path string",
-      "rationale": "Simplest correct matching. PRD paths come from the same ps aux regex parsing, so identical processes will have byte-identical path strings. Path normalization (resolve, expanduser) adds complexity without benefit since orchestrator invocations use consistent paths."
+      "decision": "Fix defaults to repo-root-relative paths (Option 1) rather than adding complex path rewriting in a model_validator (pure Option 3)",
+      "rationale": "mcp_lifecycle.py already resolves config_path against project_root (line 233) and runs server_command with cwd=project_root (line 239). The bug is simply that defaults use '../' which assumes orchestrator/ as cwd. Changing defaults to repo-root-relative is the minimal correct fix. A model_validator that rewrites FusedMemoryConfig paths would duplicate logic already in mcp_lifecycle."
     },
     {
-      "decision": "Set grouped 'running' to any(p['running'] for p in group)",
-      "rationale": "If any process in the group is still running, the orchestration is active. This is the most informative signal for the dashboard user. The status badge should show green/running as long as at least one process is alive."
+      "decision": "Add model_validator to resolve project_root to absolute (light Option 3 addition)",
+      "rationale": "project_root defaults to Path('.') which is relative and context-dependent. Making it absolute in a model_validator ensures all downstream path joins (config_path, server_command cwd, escalation queue_dir) work correctly regardless of cwd changes after config construction. This is a 2-line addition with high defensive value."
     },
     {
-      "decision": "Keep 'started' as first process's value, not min/max",
-      "rationale": "The template does not currently render 'started'. Lexicographic comparison of ps time formats (e.g. 'Mar18' vs '10:30') is unreliable across different ps output conventions. Using group[0]['started'] is simple and sufficient."
+      "decision": "Add config auto-discovery searching orchestrator/config.yaml",
+      "rationale": "The standard config file lives at orchestrator/config.yaml. When running 'orchestrator run' from repo root (common case), load_config should find it automatically rather than silently using defaults. This directly addresses the task's secondary concern about settings_customise_sources silently using all defaults when no config.yaml exists in cwd."
     },
     {
-      "decision": "Inline grouping in discover_orchestrators() rather than a separate _group_by_prd() helper",
-      "rationale": "The grouping logic is 5-6 lines (setdefault + list iteration + any()). Extracting a helper would add a function boundary, docstring, and test class for trivial logic. The discover_orchestrators tests already cover the grouping behavior end-to-end. If the logic grows, it can be extracted later."
-    },
-    {
-      "decision": "find_running_orchestrators() stays unchanged",
-      "rationale": "Separation of concerns: find_running_orchestrators() reports raw per-process data faithfully. discover_orchestrators() is the aggregation/enrichment layer where grouping belongs. This keeps the process-scanning function simple and independently testable."
-    },
-    {
-      "decision": "Singular/plural PID label via Jinja2 conditional on pids|length",
-      "rationale": "'PID 1234' reads naturally for single process; 'PIDs 1234, 5678' clearly communicates shared work. The |join filter handles any number of PIDs. No new macros or filters needed — reuses existing Jinja2 patterns in the template."
+      "decision": "Warn on missing config rather than fail",
+      "rationale": "Failing would be a breaking change for scripts that rely on defaults or env vars (ORCH_ prefix). A warning is the right balance: it surfaces the problem (silent defaults) without breaking anything, and points the user to the fix (--config or ORCH_CONFIG_PATH)."
     }
   ],
   "reuse": [
     {
-      "what": "Existing find_running_orchestrators() function",
-      "where": "dashboard/src/dashboard/data/orchestrator.py lines 40-87",
-      "how": "Unchanged — still returns per-process dicts. Grouping is applied to its output in discover_orchestrators()."
+      "what": "Existing test_fused_memory_defaults test",
+      "where": "orchestrator/tests/test_config.py lines 35-38",
+      "how": "Update the existing test to assert new correct defaults instead of writing a separate test. This keeps the test suite clean and avoids two tests checking the same thing."
     },
     {
-      "what": "_patch_orchestrator_data() test helper",
-      "where": "dashboard/tests/test_orchestrator_panel.py lines 47-49",
-      "how": "Reused unchanged for all panel tests — patches discover_orchestrators at app.py import location. Mock data just needs 'pids' instead of 'pid'."
+      "what": "McpLifecycle path resolution pattern",
+      "where": "orchestrator/src/orchestrator/mcp_lifecycle.py lines 232-239",
+      "how": "McpLifecycle already resolves config_path as (project_root / config_path).resolve() and runs server_command with cwd=project_root. New defaults align with this existing resolution — no changes needed in mcp_lifecycle.py."
     },
     {
-      "what": "status_badge macro from badges.html",
-      "where": "dashboard/src/dashboard/templates/macros/badges.html",
-      "how": "No changes needed — badge rendering for running/completed status is independent of PID grouping."
+      "what": "YamlSettingsSource and ORCH_CONFIG_PATH pipeline",
+      "where": "orchestrator/src/orchestrator/config.py lines 21-65, 279-281",
+      "how": "The _find_config helper works upstream of YamlSettingsSource — it locates the right path and sets ORCH_CONFIG_PATH for YamlSettingsSource to consume. No changes needed to YamlSettingsSource itself."
     },
     {
-      "what": "TestDiscoverOrchestrators test patterns",
-      "where": "dashboard/tests/test_orchestrator.py lines 468-603",
-      "how": "New tests follow the same pattern: tmp_path fixtures, mock find_running_orchestrators, call discover_orchestrators(config), assert result structure. Only change: assertions use entry['pids'] (list) instead of entry['pid'] (int)."
+      "what": "TestYamlLoading test patterns (tmp_path, yaml.dump, load_config)",
+      "where": "orchestrator/tests/test_config.py lines 41-56",
+      "how": "New config discovery and warning tests follow the same pattern: create config files under tmp_path, call load_config, assert values. Add monkeypatch for chdir since discovery depends on cwd."
     },
     {
-      "what": "Jinja2 |length and |join filter patterns",
-      "where": "dashboard/src/dashboard/templates/partials/orchestrators.html line 6",
-      "how": "Template already uses |length for count badge. PID display uses the same |length for conditional and adds |join for comma-separated rendering."
+      "what": "Pydantic model_validator decorator",
+      "where": "pydantic (already a dependency)",
+      "how": "Use @model_validator(mode='after') on OrchestratorConfig to resolve project_root. Pydantic 2.x model_validator is the standard approach for post-processing constructed models."
     }
   ]
 }
