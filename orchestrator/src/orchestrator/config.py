@@ -286,18 +286,44 @@ class OrchestratorConfig(BaseSettings):
         return (init_settings, env_settings, yaml_settings, dotenv_settings)
 
 
+def _find_config(explicit_path: Path | None) -> Path | None:
+    """Find the config file to load, searching standard locations.
+
+    Search order:
+    1. explicit_path (if given and exists)
+    2. ORCH_CONFIG_PATH env var (if set and exists)
+    3. cwd/config.yaml
+    4. cwd/orchestrator/config.yaml
+    """
+    if explicit_path is not None:
+        return explicit_path if explicit_path.exists() else None
+    env_path = os.environ.get('ORCH_CONFIG_PATH')
+    if env_path:
+        p = Path(env_path)
+        if p.exists():
+            return p
+    cwd_config = Path('config.yaml')
+    if cwd_config.exists():
+        return cwd_config
+    orch_config = Path('orchestrator') / 'config.yaml'
+    if orch_config.exists():
+        return orch_config
+    return None
+
+
 def load_config(config_path: Path | None = None) -> OrchestratorConfig:
     """Load configuration from YAML file, env vars, and defaults."""
-    if config_path:
-        os.environ['ORCH_CONFIG_PATH'] = str(config_path)
+    found = _find_config(config_path)
+    if found:
+        os.environ['ORCH_CONFIG_PATH'] = str(found)
+    elif 'ORCH_CONFIG_PATH' in os.environ:
+        # Clear stale env var so YamlSettingsSource returns {}
+        del os.environ['ORCH_CONFIG_PATH']
     config = OrchestratorConfig()
-    # Warn if no config file was actually loaded
-    effective_path = Path(os.environ.get('ORCH_CONFIG_PATH', 'config.yaml'))
-    if not effective_path.exists():
+    if found is None:
         logger.warning(
-            'No config file found at %s — using defaults. '
-            'Pass --config or set ORCH_CONFIG_PATH.',
-            effective_path,
+            'No config file found (checked config.yaml, orchestrator/config.yaml). '
+            'Using defaults. Pass --config or set ORCH_CONFIG_PATH to specify.',
         )
     config._module_configs = _discover_module_configs(config.project_root)
     return config
