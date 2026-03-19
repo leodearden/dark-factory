@@ -164,3 +164,41 @@ async def test_async_reconciliation_error_logged(interceptor, reconciler, event_
     await asyncio.sleep(0)
     # The caller still got a result — error is logged, not raised
     assert 'success' in result
+
+
+# ── Tests for resolved project_id (step-3) ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_event_project_id_is_resolved(interceptor, event_buffer):
+    """Event in buffer should have logical project_id, not filesystem path."""
+    await interceptor.set_task_status('1', 'in-progress', '/home/leo/src/dark-factory')
+    # Buffer should be queryable by the resolved project_id
+    stats = await event_buffer.get_buffer_stats('dark_factory')
+    assert stats['size'] == 1
+    # And NOT by the raw path
+    stats_raw = await event_buffer.get_buffer_stats('/home/leo/src/dark-factory')
+    assert stats_raw['size'] == 0
+
+
+@pytest.mark.asyncio
+async def test_event_payload_contains_project_root(interceptor, event_buffer):
+    """Event payload should include _project_root with original filesystem path."""
+    await interceptor.set_task_status('1', 'in-progress', '/home/leo/src/dark-factory')
+    events = await event_buffer.drain('dark_factory')
+    assert len(events) == 1
+    assert events[0].payload['_project_root'] == '/home/leo/src/dark-factory'
+
+
+@pytest.mark.asyncio
+async def test_reconciler_receives_both_ids(interceptor, reconciler):
+    """reconcile_task should be called with project_id (logical) and project_root (path)."""
+    await interceptor.set_task_status('1', 'done', '/home/leo/src/dark-factory')
+    await asyncio.sleep(0)
+    reconciler.reconcile_task.assert_called_once_with(
+        task_id='1',
+        transition='done',
+        project_id='dark_factory',
+        project_root='/home/leo/src/dark-factory',
+        task_before={'id': '1', 'status': 'pending', 'title': 'Test Task'},
+    )
