@@ -20,6 +20,23 @@ from dashboard.config import DashboardConfig
 logger = logging.getLogger(__name__)
 
 
+def _extract_task_id(dirname: str) -> str | None:
+    """Normalise a worktree directory name to a numeric task ID string.
+
+    Handles two naming conventions:
+    - ``'task-{id}'`` (e.g. ``'task-7'``) — strips the prefix and returns the
+      digit portion.
+    - ``'{id}'`` (e.g. ``'7'``) — returns it directly.
+
+    Returns ``None`` for any name that doesn't yield a non-empty digit string
+    (e.g. ``'task-abc'``, ``'task-'``, ``'random-dir'``, ``''``).
+    """
+    if dirname.startswith('task-'):
+        suffix = dirname[len('task-'):]
+        return suffix if suffix.isdigit() and suffix else None
+    return dirname if dirname.isdigit() and dirname else None
+
+
 def find_running_orchestrators() -> list[dict]:
     """Scan ``ps aux`` for running orchestrator processes.
 
