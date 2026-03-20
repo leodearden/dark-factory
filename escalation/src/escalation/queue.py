@@ -129,6 +129,21 @@ class EscalationQueue:
         logger.info(f'Escalation {escalation_id} {esc.status}: {resolution[:100]}')
         return esc
 
+    def dismiss_all_pending(self, resolution: str) -> int:
+        """Dismiss all pending escalations with the given resolution message.
+
+        Returns the number of escalations dismissed.
+        Already-resolved or already-dismissed escalations are not modified.
+        """
+        pending = self.get_pending()
+        count = 0
+        for esc in pending:
+            if self.resolve(esc.id, resolution, dismiss=True) is not None:
+                count += 1
+        if count:
+            logger.info(f'Dismissed {count} stale escalation(s): {resolution[:100]}')
+        return count
+
     def make_id(self, task_id: str) -> str:
         """Generate a unique escalation ID."""
         return f'esc-{task_id}-{self._next_seq()}'
