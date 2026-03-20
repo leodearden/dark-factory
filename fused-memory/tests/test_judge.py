@@ -84,3 +84,84 @@ def mock_journal():
     journal.get_recent_verdicts = AsyncMock(return_value=[])
     journal.add_verdict = AsyncMock(return_value=None)
     return journal
+
+
+# --- Judge._call_llm anthropic branch tests ---
+
+
+@pytest.mark.asyncio
+async def test_judge_call_llm_anthropic_normal(mock_journal):
+    """_call_llm with anthropic provider extracts text from response content."""
+    config = _make_judge_config(judge_llm_provider='anthropic')
+    judge = Judge(config=config, journal=mock_journal)
+
+    verdict_text = '{"severity": "ok", "findings": [], "summary": "All good."}'
+    fake_response = FakeAnthropicResponse(
+        content=[FakeAnthropicTextBlock(text=verdict_text)],
+    )
+
+    mock_messages = MagicMock()
+    mock_messages.create = AsyncMock(return_value=fake_response)
+    mock_client = MagicMock()
+    mock_client.messages = mock_messages
+
+    with patch('anthropic.AsyncAnthropic', return_value=mock_client):
+        result = await judge._call_llm('Evaluate this run.')
+
+    assert result == verdict_text
+
+    # Verify SDK called with JUDGE_SYSTEM_PROMPT and correct model
+    call_kwargs = mock_messages.create.call_args.kwargs
+    assert call_kwargs['system'] == JUDGE_SYSTEM_PROMPT
+    assert call_kwargs['model'] == config.judge_llm_model
+    assert call_kwargs['max_tokens'] == 4096
+    assert call_kwargs['messages'] == [{'role': 'user', 'content': 'Evaluate this run.'}]
+
+
+@pytest.mark.asyncio
+async def test_judge_call_llm_anthropic_no_text_blocks(mock_journal):
+    """_call_llm with anthropic provider returns empty string when no text blocks."""
+    config = _make_judge_config(judge_llm_provider='anthropic')
+    judge = Judge(config=config, journal=mock_journal)
+
+    # Response with only a tool_use block — no TextBlocks
+    fake_response = FakeAnthropicResponse(
+        content=[FakeAnthropicToolUseBlock(type='tool_use', id='t1', name='some_tool')],
+    )
+
+    mock_messages = MagicMock()
+    mock_messages.create = AsyncMock(return_value=fake_response)
+    mock_client = MagicMock()
+    mock_client.messages = mock_messages
+
+    with patch('anthropic.AsyncAnthropic', return_value=mock_client):
+        result = await judge._call_llm('Evaluate this run.')
+
+    assert result == ''
+
+
+@pytest.mark.asyncio
+async def test_judge_call_llm_anthropic_mixed_content(mock_journal):
+    """_call_llm with anthropic provider returns only first text block when mixed content."""
+    config = _make_judge_config(judge_llm_provider='anthropic')
+    judge = Judge(config=config, journal=mock_journal)
+
+    # Mixed: tool_use block first, then text block
+    fake_response = FakeAnthropicResponse(
+        content=[
+            FakeAnthropicToolUseBlock(),
+            FakeAnthropicTextBlock(text='First text block'),
+            FakeAnthropicTextBlock(text='Second text block'),
+        ],
+    )
+
+    mock_messages = MagicMock()
+    mock_messages.create = AsyncMock(return_value=fake_response)
+    mock_client = MagicMock()
+    mock_client.messages = mock_messages
+
+    with patch('anthropic.AsyncAnthropic', return_value=mock_client):
+        result = await judge._call_llm('Evaluate this.')
+
+    # Only first text block's text is returned
+    assert result == 'First text block'
