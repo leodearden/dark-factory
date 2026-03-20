@@ -53,14 +53,14 @@
       "type": "impl",
       "description": "Add TYPE_CHECKING imports and type annotations: (1) Add `from typing import TYPE_CHECKING` and guard block importing ToolParam from anthropic.types, and ChatCompletionMessageParam/ChatCompletionToolParam from openai.types.chat. (2) Change to_anthropic_schema() return type from `dict` to `ToolParam`. (3) Change _call_llm, _call_openai, _call_claude_cli message/tool_schemas params from `list[dict]` to `list[dict[str, Any]]`. (4) Annotate openai_messages and openai_tools local variables in _call_openai with the OpenAI SDK TypedDicts. (5) Change run() local `messages: list[dict]` to `list[dict[str, Any]]`. All annotations use string form via `from __future__ import annotations` already at line 3. Run tests to verify no regressions.",
       "status": "done",
-      "commit": null
+      "commit": "b871b8f"
     },
     {
       "id": "step-7",
       "type": "impl",
       "description": "Update pyproject.toml pyright config: Remove the comment '# agent_loop.py SDK calls use untyped dicts — tracked in task #50' and delete the two suppression lines `reportArgumentType = \"warning\"` and `reportAttributeAccessIssue = \"warning\"`. These revert to basic-mode defaults (error). Run pyright on agent_loop.py to verify the targeted warnings are resolved. Run full test suite to confirm no regressions.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "d09c87c"
     }
   ],
   "design_decisions": [

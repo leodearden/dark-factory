@@ -12,7 +12,6 @@ from fused_memory.reconciliation.agent_loop import (
     CircuitBreakerError,
     ToolDefinition,
     _CLIResponseAdapter,
-    _OpenAIResponseAdapter,
     _TextBlock,
     _ToolUseBlock,
 )
@@ -163,7 +162,7 @@ async def test_openai_content_block_dispatch():
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
-        await agent._call_openai(messages, tool_schemas)
+        await agent._call_openai(messages, tool_schemas)  # type: ignore[arg-type]
 
     sent = captured['messages']
 

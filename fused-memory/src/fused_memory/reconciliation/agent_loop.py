@@ -10,10 +10,10 @@ import uuid as uuid_mod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from anthropic.types import ToolParam
+    from anthropic.types import MessageParam, ToolParam
     from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 
 from fused_memory.config.schema import ReconciliationConfig
@@ -197,7 +197,7 @@ class AgentLoop:
 
         return result
 
-    async def _call_llm(self, messages: list[dict[str, Any]], tool_schemas: list[dict[str, Any]]) -> Any:
+    async def _call_llm(self, messages: list[dict[str, Any]], tool_schemas: list[ToolParam]) -> Any:
         """Call the configured LLM provider."""
         import anthropic
 
@@ -209,7 +209,7 @@ class AgentLoop:
                 model=self.config.agent_llm_model,
                 max_tokens=self.config.agent_max_tokens,
                 system=self.system_prompt,
-                messages=messages,
+                messages=cast('list[MessageParam]', messages),
                 tools=tool_schemas,
             )
             self.llm_call_count += 1
@@ -222,20 +222,20 @@ class AgentLoop:
         else:
             raise ValueError(f'Unsupported agent LLM provider: {provider}')
 
-    async def _call_openai(self, messages: list[dict[str, Any]], tool_schemas: list[dict[str, Any]]) -> Any:
+    async def _call_openai(self, messages: list[dict[str, Any]], tool_schemas: list[ToolParam]) -> Any:
         """Call OpenAI and convert response to Anthropic-like format."""
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI()
 
         # Convert Anthropic tool schemas to OpenAI format
-        openai_tools: list[ChatCompletionToolParam] = []
+        openai_tools: list[Any] = []
         for schema in tool_schemas:
             openai_tools.append({
                 'type': 'function',
                 'function': {
                     'name': schema['name'],
-                    'description': schema['description'],
+                    'description': schema.get('description', ''),
                     'parameters': schema['input_schema'],
                 },
             })
@@ -286,13 +286,13 @@ class AgentLoop:
         # Convert OpenAI response to Anthropic-like structure
         return _OpenAIResponseAdapter(response)
 
-    def _build_cli_system_prompt(self, tool_schemas: list[dict]) -> str:
+    def _build_cli_system_prompt(self, tool_schemas: list[ToolParam]) -> str:
         """Build system prompt that includes tool schemas for CLI-based tool dispatch."""
         tools_section = []
         for t in tool_schemas:
             tools_section.append(
                 f"### {t['name']}\n"
-                f"{t['description']}\n"
+                f"{t.get('description', '')}\n"
                 f"Parameters: {json.dumps(t['input_schema'], indent=2)}"
             )
         return (
@@ -320,7 +320,7 @@ class AgentLoop:
                 )
         return '\n\n'.join(parts)
 
-    async def _call_claude_cli(self, messages: list[dict[str, Any]], tool_schemas: list[dict[str, Any]]) -> Any:
+    async def _call_claude_cli(self, messages: list[dict[str, Any]], tool_schemas: list[ToolParam]) -> Any:
         """Call Claude via CLI subprocess with --resume for multi-turn.
 
         Includes: stdin isolation, stdout+stderr error reading, and usage-cap
