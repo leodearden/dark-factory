@@ -344,6 +344,20 @@ class TaskWorkflow:
     async def _plan(self) -> WorkflowOutcome:
         """Invoke the architect to produce a plan."""
         assert self.worktree is not None and self.artifacts is not None
+
+        # Defense-in-depth: if plan.lock already exists, reuse existing plan
+        if self.artifacts.is_plan_locked() and self.artifacts.read_plan():
+            logger.info(
+                f'Task {self.task_id}: plan.lock exists, skipping architect — '
+                f'reusing existing plan'
+            )
+            self.plan = self.artifacts.read_plan()
+            # Ensure provenance is present (may not be if lock was pre-created externally)
+            if '_session_id' not in self.plan:
+                self.artifacts.stamp_plan_provenance(self.session_id)
+                self.plan = self.artifacts.read_plan()
+            return WorkflowOutcome.DONE
+
         prompt = await self.briefing.build_architect_prompt(self.task, worktree=self.worktree)
         result = await self._invoke(ARCHITECT, prompt, self.worktree)
 
