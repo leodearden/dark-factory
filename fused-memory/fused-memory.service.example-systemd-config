@@ -1,0 +1,33 @@
+[Unit]
+Description=Fused Memory MCP Server (dark-factory)
+Documentation=file:///home/leo/src/dark-factory/DESIGN.md
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/leo/src/dark-factory
+ExecStart=/home/leo/.local/bin/uv run --project fused-memory \
+  python -m fused_memory.server.main \
+  --transport http \
+  --config /home/leo/src/dark-factory/fused-memory/config/config.yaml
+
+# Environment: secrets loaded by dotenv from fused-memory/.env
+# These are the non-secret vars the config.yaml ${} expansion needs
+Environment=CONFIG_PATH=/home/leo/src/dark-factory/fused-memory/config/config.yaml
+Environment=PROJECT_ROOT=/home/leo/src/dark-factory
+Environment=TASKMASTER_DIR=/home/leo/src/dark-factory/taskmaster-ai
+
+# Restart policy: always restart on failure, back off up to 60s
+Restart=on-failure
+RestartSec=5
+RestartMaxDelaySec=60
+
+# Give it time to shut down gracefully (async cleanup)
+TimeoutStopSec=30
+
+# Logging goes to journalctl --user -u fused-memory
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
