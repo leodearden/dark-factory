@@ -180,8 +180,16 @@ class Scheduler:
                     data = json.loads(block['text'])
                     # Handle taskmaster's nested response format: {data: {tasks: [...]}}
                     if 'data' in data and isinstance(data['data'], dict):
-                        return data['data'].get('tasks', [])
-                    return data.get('tasks', [])
+                        tasks = data['data'].get('tasks', [])
+                    else:
+                        tasks = data.get('tasks', [])
+                    # Seed status cache from task list
+                    for t in tasks:
+                        tid = str(t.get('id', ''))
+                        s = t.get('status', '')
+                        if tid and s:
+                            self._status_cache[tid] = s
+                    return tasks
         except Exception as e:
             logger.error(f'Failed to fetch tasks: {e}')
         return []
