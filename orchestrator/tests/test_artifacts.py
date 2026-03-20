@@ -177,6 +177,47 @@ class TestIterationLog:
         assert len(corrupted) == 3
 
 
+class TestPlanProvenance:
+    def test_stamp_plan_provenance_adds_session_id_and_created_at(self, artifacts: TaskArtifacts):
+        plan = {'task_id': 'task-1', 'steps': []}
+        artifacts.write_plan(plan)
+        artifacts.stamp_plan_provenance('session-abc123')
+        updated = artifacts.read_plan()
+        assert updated['_session_id'] == 'session-abc123'
+        assert '_created_at' in updated
+
+    def test_stamp_plan_provenance_preserves_existing_plan_data(self, artifacts: TaskArtifacts):
+        plan = {
+            'task_id': 'task-1',
+            'analysis': 'Some analysis',
+            'steps': [{'id': 'step-1', 'status': 'pending'}],
+        }
+        artifacts.write_plan(plan)
+        artifacts.stamp_plan_provenance('session-abc123')
+        updated = artifacts.read_plan()
+        assert updated['task_id'] == 'task-1'
+        assert updated['analysis'] == 'Some analysis'
+        assert len(updated['steps']) == 1
+
+    def test_validate_plan_owner_true_for_matching_session(self, artifacts: TaskArtifacts):
+        plan = {'task_id': 'task-1', 'steps': []}
+        artifacts.write_plan(plan)
+        artifacts.stamp_plan_provenance('session-abc123')
+        assert artifacts.validate_plan_owner('session-abc123') is True
+
+    def test_validate_plan_owner_false_for_mismatched_session(self, artifacts: TaskArtifacts):
+        plan = {'task_id': 'task-1', 'steps': []}
+        artifacts.write_plan(plan)
+        artifacts.stamp_plan_provenance('session-abc123')
+        assert artifacts.validate_plan_owner('session-different') is False
+
+    def test_validate_plan_owner_false_when_no_provenance(self, artifacts: TaskArtifacts):
+        plan = {'task_id': 'task-1', 'steps': []}
+        artifacts.write_plan(plan)
+        # Not stamped — no _session_id in plan
+        assert artifacts.validate_plan_owner('session-abc123') is False
+
+
 class TestPlanLock:
     def test_is_plan_locked_false_initially(self, artifacts: TaskArtifacts):
         assert artifacts.is_plan_locked() is False
