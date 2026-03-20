@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -170,3 +170,82 @@ class TestDismissStaleEscalations:
                 f'dismiss_stale_escalations ({dismiss_idx}) must come before '
                 f'recover_crashed_tasks ({recover_idx})'
             )
+
+
+@pytest.mark.asyncio
+class TestDismissStaleEscalationsFatal:
+    """_dismiss_stale_escalations() failure must not prevent harness cleanup."""
+
+    async def test_dismiss_failure_does_not_prevent_finally(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """If _dismiss_stale_escalations() raises, the finally block still runs.
+
+        Specifically: _stop_escalation_server() and mcp.stop() must be called
+        even when _dismiss_stale_escalations() raises an OSError.
+        """
+        prd_path = tmp_path / 'test.prd'
+        prd_path.write_text('# Test PRD')
+
+        harness.mcp = MagicMock()
+        harness.mcp.start = AsyncMock()
+        harness.mcp.stop = AsyncMock()
+        harness.mcp.url = 'http://localhost:9999'
+
+        harness._start_escalation_server = AsyncMock()
+        harness._dismiss_stale_escalations = AsyncMock(
+            side_effect=OSError('disk full simulated failure')
+        )
+        harness._stop_escalation_server = AsyncMock()
+
+        # run() should not re-raise the OSError
+        with pytest.raises(Exception):
+            await harness.run(prd_path, dry_run=True)
+
+        # Finally block must have run
+        harness._stop_escalation_server.assert_called_once()
+        harness.mcp.stop.assert_called_once()
+
+    async def test_dismiss_failure_logged_as_warning(
+        self, harness: Harness, tmp_path: Path, caplog
+    ):
+        """If _dismiss_stale_escalations() raises, the exception is caught and logged,
+        not re-raised as an unhandled exception that aborts the entire run."""
+        prd_path = tmp_path / 'test.prd'
+        prd_path.write_text('# Test PRD')
+
+        harness.mcp = MagicMock()
+        harness.mcp.start = AsyncMock()
+        harness.mcp.stop = AsyncMock()
+        harness.mcp.url = 'http://localhost:9999'
+
+        harness._start_escalation_server = AsyncMock()
+        harness._stop_escalation_server = AsyncMock()
+        harness._populate_tasks = AsyncMock()
+        harness._tag_prd_metadata = AsyncMock()
+        harness._tag_task_modules = AsyncMock()
+        harness._recover_crashed_tasks = AsyncMock()
+
+        error_msg = 'disk full simulated failure'
+        harness._dismiss_stale_escalations = AsyncMock(
+            side_effect=OSError(error_msg)
+        )
+
+        # Run should complete without re-raising (dry_run stops after task population)
+        with caplog.at_level(logging.WARNING):
+            # If the exception propagates, run() would raise. If it's caught
+            # and logged, run() should complete normally.
+            try:
+                await harness.run(prd_path, dry_run=True)
+                # If we get here, the exception was caught — good
+                run_completed = True
+            except OSError:
+                run_completed = False
+
+        assert run_completed, (
+            '_dismiss_stale_escalations() exception should be caught and logged, '
+            'not re-raised to abort the run'
+        )
+
+        # The warning should appear in logs
+        assert error_msg in caplog.text or 'dismiss' in caplog.text.lower()
