@@ -431,6 +431,52 @@ async def test_no_tool_calls_ends_loop():
     assert 'I am done thinking.' in result.get('text', '')
 
 
+@pytest.mark.asyncio
+async def test_openai_tools_omitted_when_empty():
+    """When tool_schemas=[], 'tools' key must NOT appear in kwargs to create().
+
+    This test FAILS with current code because line 273 passes tools=None to the
+    OpenAI SDK when openai_tools is empty — None is type-invalid for the tools param
+    (the SDK uses NOT_GIVEN sentinel internally).  The fix is a conditional kwargs dict.
+    """
+    config = _make_config(agent_llm_provider='openai', agent_llm_model='gpt-4o')
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='Tool omission test.',
+        tools={},
+        terminal_tool='stage_complete',
+    )
+
+    captured_kwargs: dict = {}
+
+    async def fake_create(**kwargs):
+        captured_kwargs.update(kwargs)
+        return FakeOpenAIResponse(
+            choices=[
+                FakeOpenAIChoice(
+                    message=FakeOpenAIMessage(content='done', tool_calls=None)
+                )
+            ],
+            usage=FakeOpenAIUsage(total_tokens=10),
+        )
+
+    mock_completions = MagicMock()
+    mock_completions.create = fake_create
+    mock_chat = MagicMock()
+    mock_chat.completions = mock_completions
+    mock_client = MagicMock()
+    mock_client.chat = mock_chat
+
+    with patch('openai.AsyncOpenAI', return_value=mock_client):
+        await agent._call_openai([{'role': 'user', 'content': 'hi'}], [])
+
+    # When tool_schemas is empty, 'tools' must NOT be sent to the API at all.
+    assert 'tools' not in captured_kwargs, (
+        f"'tools' key should be absent when no tool schemas provided, got: {captured_kwargs.get('tools')!r}"
+    )
+
+
 # --- Claude CLI provider tests ---
 
 

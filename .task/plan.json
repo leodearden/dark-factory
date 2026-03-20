@@ -25,13 +25,13 @@
       "type": "impl",
       "description": "In _call_openai lines 255-268, replace `hasattr(block, 'type') and block.type == 'text'` with `isinstance(block, _TextBlock)` and `hasattr(block, 'type') and block.type == 'tool_use'` with `isinstance(block, _ToolUseBlock)`. No new imports needed — both types are defined in the same file. This resolves 5 reportAttributeAccessIssue warnings by enabling pyright type narrowing: after isinstance(_TextBlock), pyright knows block.text exists; after isinstance(_ToolUseBlock), pyright knows block.id/name/input exist.",
       "status": "done",
-      "commit": null
+      "commit": "fdcd15f"
     },
     {
       "id": "step-3",
       "type": "test",
       "description": "Write test_openai_tools_omitted_when_empty: Create an AgentLoop with provider='openai'. Mock AsyncOpenAI and capture kwargs passed to chat.completions.create(). Call agent._call_openai with tool_schemas=[]. Assert that 'tools' key is NOT in captured kwargs. This test FAILS with current code (line 273 passes tools=None when openai_tools is empty).",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
