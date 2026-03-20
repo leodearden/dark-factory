@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Pre-commit hook: enforce ruff + pyright on main branch only.
+# Worktree branches (used by orchestrator agents) are not gated.
+
+branch="$(git rev-parse --abbrev-ref HEAD)"
+
+if [ "$branch" != "main" ]; then
+    exit 0
+fi
+
+ROOT="$(git rev-parse --show-toplevel)"
+echo "pre-commit: linting (main branch)..."
+
+# All first-party packages (for ruff)
+ALL_PACKAGES=(shared escalation fused-memory orchestrator dashboard)
+# Packages with [tool.pyright] config (pyright runs per-package from its directory)
+PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard)
+
+DIRS=()
+for pkg in "${ALL_PACKAGES[@]}"; do
+    [ -d "$ROOT/$pkg" ] && DIRS+=("$ROOT/$pkg")
+done
+
+# ruff check (runs from repo root, all packages at once)
+if ! ruff check --quiet "${DIRS[@]}"; then
+    echo "pre-commit: ruff check failed. Fix lint errors before committing to main."
+    exit 1
+fi
+
+# pyright (must run from each package directory to pick up [tool.pyright] config)
+for pkg in "${PYRIGHT_PACKAGES[@]}"; do
+    dir="$ROOT/$pkg"
+    [ -d "$dir" ] || continue
+    echo "  pyright: $pkg"
+    if ! (cd "$dir" && npx pyright); then
+        echo "pre-commit: pyright failed in $pkg. Fix type errors before committing to main."
+        exit 1
+    fi
+done
+
+echo "pre-commit: all checks passed."
