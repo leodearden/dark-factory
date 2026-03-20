@@ -844,6 +844,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
     async def _mark_blocked(self, reason: str) -> WorkflowOutcome:
         """Mark task as blocked and create an escalation entry."""
+        if self.state == WorkflowState.DONE:
+            logger.warning(
+                'Task %s: already DONE, ignoring late blocked transition: %s',
+                self.task_id, reason,
+            )
+            return WorkflowOutcome.DONE
         self.state = WorkflowState.BLOCKED
         await self.scheduler.set_task_status(self.task_id, 'blocked')
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
