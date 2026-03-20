@@ -6,6 +6,7 @@ import asyncio
 import enum
 import json
 import logging
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -148,6 +149,9 @@ class TaskWorkflow:
         # Usage cap gate
         self.usage_gate = usage_gate
 
+        # Unique session identifier for plan ownership (format: {task_id}-{uuid_hex[:8]})
+        self.session_id = f'{self.task_id}-{uuid.uuid4().hex[:8]}'
+
     async def run(self) -> WorkflowOutcome:
         """Execute the full state machine."""
         branch_name = self.task_id
@@ -184,7 +188,9 @@ class TaskWorkflow:
             # PLAN (skip if initial_plan was provided — eval mode)
             if self.initial_plan:
                 self.artifacts.write_plan(self.initial_plan)
-                self.plan = self.initial_plan
+                self.artifacts.stamp_plan_provenance(self.session_id)
+                self.artifacts.lock_plan(self.session_id)
+                self.plan = self.artifacts.read_plan()
                 logger.info(
                     f'Task {self.task_id}: using provided plan '
                     f'({len(self.plan.get("steps", []))} steps)'
@@ -352,6 +358,11 @@ class TaskWorkflow:
             logger.error(f'Task {self.task_id}: architect produced no plan.json')
             return WorkflowOutcome.BLOCKED
 
+        # Stamp provenance and acquire lock
+        self.artifacts.stamp_plan_provenance(self.session_id)
+        self.artifacts.lock_plan(self.session_id)
+        self.plan = self.artifacts.read_plan()
+
         # Derive modules from plan's file list (deterministic) or fall back to
         # the plan's module list (heuristic).
         plan_files = self.plan.get('files', [])
@@ -425,6 +436,10 @@ class TaskWorkflow:
                 f'{len(reviews.blocking_issues)} blocking issues'
             )
             await self._replan(reviews)
+            # Re-stamp provenance — architect may have overwritten plan.json
+            assert self.artifacts is not None
+            self.artifacts.stamp_plan_provenance(self.session_id)
+            self.plan = self.artifacts.read_plan()
             self.metrics.review_cycles += 1
 
     async def _execute_iterations(self) -> WorkflowOutcome:
