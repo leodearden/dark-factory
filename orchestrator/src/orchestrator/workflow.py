@@ -345,16 +345,18 @@ class TaskWorkflow:
         """Invoke the architect to produce a plan."""
         assert self.worktree is not None and self.artifacts is not None
 
-        # Defense-in-depth: if plan.lock already exists, reuse existing plan
+        # Defense-in-depth: if plan.lock already exists, this is a duplicate workflow.
+        # Return REQUEUED so run() exits immediately — the original lock-holder retains
+        # ownership. Do NOT re-stamp provenance (that would hijack the first workflow's
+        # session_id and cause its validate_plan_owner() checks to fail).
         if self.artifacts.is_plan_locked() and self.artifacts.read_plan():
+            lock_data = self.artifacts.read_plan_lock()
+            lock_owner = lock_data.get('session_id', 'unknown') if lock_data else 'unknown'
             logger.info(
-                f'Task {self.task_id}: plan.lock exists, skipping architect — '
-                f'reusing existing plan and taking ownership'
+                f'Task {self.task_id}: plan.lock is held by session {lock_owner!r}, '
+                f'skipping architect — requeuing to avoid duplicate execution'
             )
-            # Take ownership by re-stamping provenance with our session_id
-            self.artifacts.stamp_plan_provenance(self.session_id)
-            self.plan = self.artifacts.read_plan()
-            return WorkflowOutcome.DONE
+            return WorkflowOutcome.REQUEUED
 
         prompt = await self.briefing.build_architect_prompt(self.task, worktree=self.worktree)
         result = await self._invoke(ARCHITECT, prompt, self.worktree)
