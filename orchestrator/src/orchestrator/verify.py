@@ -254,16 +254,42 @@ async def run_scoped_verification(
     worktree: Path,
     config: OrchestratorConfig,
     module_configs: list[ModuleConfig],
+    task_files: list[str] | None = None,
 ) -> VerifyResult:
-    """Run verification scoped to specific subprojects.
+    """Run verification scoped to specific subprojects and optionally to task files.
 
-    If *module_configs* is empty, falls back to global ``run_verification``.
-    Otherwise runs ``run_verification`` per ModuleConfig and aggregates.
+    Scoping modes (in priority order):
+
+    1. **File-scoped within subprojects** — when *module_configs* is non-empty
+       and *task_files* is provided, each ModuleConfig's commands are narrowed
+       to the specific files via :func:`scope_module_config`.
+    2. **Fallback-scoped** — when *module_configs* is empty and *task_files* is
+       provided, a synthetic ModuleConfig is built via
+       :func:`_build_fallback_config`, bypassing the global commands entirely.
+    3. **Global** — when *task_files* is ``None`` (or falsy) with no
+       module_configs, or when fallback returns ``None`` (no .py files).
     """
-    if not module_configs:
-        return await run_verification(worktree, config)
+    if module_configs:
+        # Apply file-level scoping within each subproject when task_files given
+        if task_files:
+            scoped = [scope_module_config(mc, task_files) for mc in module_configs]
+            n_files = len(task_files)
+            n_mods = len(scoped)
+            logger.info('Verification mode: file-scoped (%d files across %d subprojects)', n_files, n_mods)
+        else:
+            scoped = module_configs
+            logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
+        results = await asyncio.gather(
+            *(run_verification(worktree, config, mc) for mc in scoped)
+        )
+        return _aggregate_results(list(results))
 
-    results = await asyncio.gather(
-        *(run_verification(worktree, config, mc) for mc in module_configs)
-    )
-    return _aggregate_results(list(results))
+    # No module_configs — try fallback or global
+    if task_files:
+        fallback = _build_fallback_config(task_files)
+        if fallback is not None:
+            logger.info('Verification mode: fallback-scoped (%d files)', len(task_files))
+            return await run_verification(worktree, config, fallback)
+
+    logger.info('Verification mode: global (no scope info)')
+    return await run_verification(worktree, config)
