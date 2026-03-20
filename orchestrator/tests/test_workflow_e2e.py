@@ -1097,3 +1097,66 @@ class TestCorruptedIterationLogEscalation:
         esc = info_escs[0]
         assert esc.category == 'infra_issue'
         assert 'corrupted' in esc.summary.lower()
+
+
+# ---------------------------------------------------------------------------
+# Tests: Done-is-Terminal (_mark_blocked guard)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDoneIsTerminal:
+    """_mark_blocked must be a no-op when workflow.state is already DONE."""
+
+    async def test_mark_blocked_skipped_when_done(
+        self, config, git_ops, task_assignment
+    ):
+        """When state=DONE, _mark_blocked returns DONE without calling set_task_status."""
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        # Manually put the workflow into the DONE state (simulates completed task)
+        workflow.state = WorkflowState.DONE
+
+        outcome = await workflow._mark_blocked('late error from duplicate workflow')
+
+        assert outcome == WorkflowOutcome.DONE
+        # 'blocked' must NOT appear in scheduler status history
+        assert 'blocked' not in scheduler.statuses.get(task_assignment.task_id, [])
+
+    async def test_mark_blocked_skips_escalation_when_done(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """When state=DONE, _mark_blocked must not create an escalation entry."""
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path
+        )
+
+        workflow.state = WorkflowState.DONE
+
+        outcome = await workflow._mark_blocked('late error after done')
+
+        assert outcome == WorkflowOutcome.DONE
+        # No escalation should be created for this task
+        assert queue.get_by_task(task_assignment.task_id) == []
+
+    async def test_mark_blocked_works_normally_when_not_done(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Without DONE state, _mark_blocked sets blocked and creates an escalation."""
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path
+        )
+
+        # Default state is PLAN — not DONE
+        assert workflow.state == WorkflowState.PLAN
+
+        outcome = await workflow._mark_blocked('genuine failure')
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert 'blocked' in scheduler.statuses.get(task_assignment.task_id, [])
+        escalations = queue.get_by_task(task_assignment.task_id)
+        assert len(escalations) == 1
+        assert escalations[0].category == 'task_failure'
