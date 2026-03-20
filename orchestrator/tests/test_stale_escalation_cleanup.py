@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -198,8 +198,8 @@ class TestDismissStaleEscalationsFatal:
         )
         harness._stop_escalation_server = AsyncMock()
 
-        # run() should not re-raise the OSError
-        with pytest.raises(Exception):
+        # run() catches the OSError internally; _populate_tasks (un-mocked) raises RuntimeError
+        with pytest.raises(RuntimeError):
             await harness.run(prd_path, dry_run=True)
 
         # Finally block must have run
