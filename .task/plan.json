@@ -1,0 +1,110 @@
+{
+  "task_id": "50",
+  "title": "Type agent_loop.py Anthropic/OpenAI SDK calls with proper SDK types",
+  "files": [
+    "fused-memory/src/fused_memory/reconciliation/agent_loop.py",
+    "fused-memory/tests/test_agent_loop.py",
+    "fused-memory/pyproject.toml"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/reconciliation",
+    "fused-memory/tests"
+  ],
+  "analysis": "agent_loop.py has 7 pyright warnings in _call_openai (lines 255-265, 273) plus 2 import-resolution errors (lines 198, 223 — lazy imports of anthropic/openai that pyright can't resolve). The 7 warnings break down as: 5 reportAttributeAccessIssue from hasattr-based content block dispatch (accessing .type, .text, .id, .name, .input on dict[Unknown, Unknown] because pyright sees the content list as list[dict] and hasattr doesn't narrow types), 1 reportArgumentType from appending a dict with list values to a list typed as list[dict[str, str]], and 1 more reportAttributeAccessIssue. Root cause: method signatures use bare `list[dict]` making pyright infer dict values as Unknown, and hasattr checks don't enable type narrowing.\n\nThree fixes needed: (1) Replace hasattr dispatch in _call_openai with isinstance using _TextBlock/_ToolUseBlock (the actual runtime types — produced by _OpenAIResponseAdapter). (2) Fix tools=None on line 273 using conditional kwargs dict (OpenAI SDK uses NOT_GIVEN sentinel internally; None is type-invalid). (3) Add TYPE_CHECKING imports for SDK TypedDicts and properly annotate types at SDK call boundaries.\n\nKey insight: In the OpenAI code path, content blocks are ALWAYS _TextBlock/_ToolUseBlock from _OpenAIResponseAdapter (not Anthropic SDK TextBlock/ToolUseBlock), because provider='openai' is fixed for the entire AgentLoop session. So isinstance checks should target the internal adapter types. The pyproject.toml has pyright severity downgrades (reportArgumentType/reportAttributeAccessIssue = 'warning') with a comment 'tracked in task #50' — these revert to default ('error') once fixed.\n\nAll 11 existing tests pass (they mock _call_llm, so _call_openai has zero direct test coverage). New tests added before implementation.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write test_openai_content_block_dispatch: Import _TextBlock, _ToolUseBlock from agent_loop. Build a messages list simulating a multi-turn conversation: (a) initial user message with string content, (b) assistant message with content=[_TextBlock('thinking'), _ToolUseBlock(id='tc1', name='my_tool', input={'x': 1})], (c) user message with tool_result dicts. Mock AsyncOpenAI.chat.completions.create to capture the openai_messages arg. Call agent._call_openai(messages, tool_schemas). Assert the converted openai_messages contain: system message, user text, assistant text from _TextBlock, assistant tool_calls from _ToolUseBlock, and tool result. Test should pass with current hasattr code (establishes baseline coverage before refactoring).",
+      "status": "done",
+      "commit": null
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "In _call_openai lines 255-268, replace `hasattr(block, 'type') and block.type == 'text'` with `isinstance(block, _TextBlock)` and `hasattr(block, 'type') and block.type == 'tool_use'` with `isinstance(block, _ToolUseBlock)`. No new imports needed — both types are defined in the same file. This resolves 5 reportAttributeAccessIssue warnings by enabling pyright type narrowing: after isinstance(_TextBlock), pyright knows block.text exists; after isinstance(_ToolUseBlock), pyright knows block.id/name/input exist.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write test_openai_tools_omitted_when_empty: Create an AgentLoop with provider='openai'. Mock AsyncOpenAI and capture kwargs passed to chat.completions.create(). Call agent._call_openai with tool_schemas=[]. Assert that 'tools' key is NOT in captured kwargs. This test FAILS with current code (line 273 passes tools=None when openai_tools is empty).",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Fix line 270-274: Replace direct create() call with conditional kwargs. Build `create_kwargs: dict[str, Any] = {'model': self.config.agent_llm_model, 'messages': openai_messages}`, then `if openai_tools: create_kwargs['tools'] = openai_tools`, then `response = await client.chat.completions.create(**create_kwargs)`. This avoids passing tools=None and eliminates the type error.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write test_to_anthropic_schema_returns_tool_param_shape: Create a ToolDefinition, call to_anthropic_schema(), and assert the returned dict has exactly the keys ToolParam requires: 'name' (str), 'input_schema' (dict), 'description' (str). Validates structural compatibility. Test passes immediately (locks in contract before type annotation change).",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Add TYPE_CHECKING imports and type annotations: (1) Add `from typing import TYPE_CHECKING` and guard block importing ToolParam from anthropic.types, and ChatCompletionMessageParam/ChatCompletionToolParam from openai.types.chat. (2) Change to_anthropic_schema() return type from `dict` to `ToolParam`. (3) Change _call_llm, _call_openai, _call_claude_cli message/tool_schemas params from `list[dict]` to `list[dict[str, Any]]`. (4) Annotate openai_messages and openai_tools local variables in _call_openai with the OpenAI SDK TypedDicts. (5) Change run() local `messages: list[dict]` to `list[dict[str, Any]]`. All annotations use string form via `from __future__ import annotations` already at line 3. Run tests to verify no regressions.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-7",
+      "type": "impl",
+      "description": "Update pyproject.toml pyright config: Remove the comment '# agent_loop.py SDK calls use untyped dicts — tracked in task #50' and delete the two suppression lines `reportArgumentType = \"warning\"` and `reportAttributeAccessIssue = \"warning\"`. These revert to basic-mode defaults (error). Run pyright on agent_loop.py to verify the targeted warnings are resolved. Run full test suite to confirm no regressions.",
+      "status": "pending",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use local _TextBlock/_ToolUseBlock for isinstance, not Anthropic SDK TextBlock/ToolUseBlock",
+      "rationale": "In _call_openai, content blocks are always _TextBlock/_ToolUseBlock from _OpenAIResponseAdapter (since provider='openai' is fixed for the entire AgentLoop session). Anthropic SDK types would never match at runtime. Using adapter types gives correct isinstance narrowing and resolves pyright warnings through the actual runtime types."
+    },
+    {
+      "decision": "Conditional kwargs dict for OpenAI tools parameter instead of NOT_GIVEN sentinel",
+      "rationale": "OpenAI SDK uses NOT_GIVEN as default for tools — passing None is type-invalid. Conditional kwargs dict (`if openai_tools: create_kwargs['tools'] = openai_tools`) avoids importing NOT_GIVEN, is more readable, and is idiomatic Python for optional SDK parameters."
+    },
+    {
+      "decision": "Use list[dict[str, Any]] for internal message format, SDK TypedDicts only at SDK boundaries",
+      "rationale": "The internal message list mixes string content, adapter content blocks, and tool-result dicts — a hybrid format that doesn't cleanly map to any SDK's MessageParam. dict[str, Any] resolves pyright's Unknown-attribute issues. Properly typed locals at SDK boundaries (list[ChatCompletionMessageParam]) enforce safety where it matters."
+    },
+    {
+      "decision": "Remove pyright severity downgrades from pyproject.toml after fixing",
+      "rationale": "Lines 35-37 of pyproject.toml downgrade reportArgumentType and reportAttributeAccessIssue to 'warning' with a comment tracking task #50. Once root causes are fixed, reverting to basic-mode defaults (error) catches future regressions."
+    },
+    {
+      "decision": "TYPE_CHECKING guard for SDK TypedDict imports only",
+      "rationale": "ToolParam, ChatCompletionMessageParam, ChatCompletionToolParam are only used in annotations. With `from __future__ import annotations` (already present), annotations are strings at runtime. Guarding behind TYPE_CHECKING avoids runtime import cost. No new runtime imports needed — _TextBlock/_ToolUseBlock are already in the same file."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "_TextBlock and _ToolUseBlock adapter dataclasses",
+      "where": "agent_loop.py lines 480-490",
+      "how": "Used in isinstance() checks for content block dispatch in _call_openai. These are the actual runtime types of blocks in the OpenAI/CLI paths. Also imported in tests to construct realistic message content."
+    },
+    {
+      "what": "Existing test infrastructure (FakeToolUse, FakeText, FakeResponse, FakeUsage, _make_config)",
+      "where": "test_agent_loop.py lines 18-56",
+      "how": "Reuse _make_config with agent_llm_provider='openai' for new OpenAI-specific tests. FakeResponse/FakeUsage for mock response construction."
+    },
+    {
+      "what": "_OpenAIResponseAdapter",
+      "where": "agent_loop.py lines 430-449",
+      "how": "Understanding that it produces _TextBlock/_ToolUseBlock (not SDK types) informs the isinstance design — only adapter types need to be checked in the OpenAI path."
+    },
+    {
+      "what": "from __future__ import annotations (line 3)",
+      "where": "agent_loop.py line 3",
+      "how": "Enables TYPE_CHECKING-only imports for SDK types used in annotations — annotations become strings and are never evaluated at runtime."
+    }
+  ]
+}

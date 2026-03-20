@@ -12,6 +12,9 @@ from fused_memory.reconciliation.agent_loop import (
     CircuitBreakerError,
     ToolDefinition,
     _CLIResponseAdapter,
+    _OpenAIResponseAdapter,
+    _TextBlock,
+    _ToolUseBlock,
 )
 
 
@@ -53,6 +56,142 @@ class FakeUsage:
 class FakeResponse:
     content: list = field(default_factory=list)
     usage: FakeUsage = field(default_factory=FakeUsage)
+
+
+# --- Fake OpenAI SDK response dataclasses ---
+
+
+@dataclass
+class FakeOpenAIFunction:
+    """Fake function object nested inside a tool call."""
+    name: str
+    arguments: str  # JSON string
+
+
+@dataclass
+class FakeOpenAIToolCall:
+    """Fake tool_call object on an OpenAI message."""
+    id: str
+    type: str
+    function: FakeOpenAIFunction
+
+
+@dataclass
+class FakeOpenAIMessage:
+    """Fake message object from OpenAI chat completion choice."""
+    content: str | None
+    tool_calls: list | None = None
+
+
+@dataclass
+class FakeOpenAIChoice:
+    """Fake single choice in an OpenAI response."""
+    message: FakeOpenAIMessage
+
+
+@dataclass
+class FakeOpenAIUsage:
+    """Fake usage stats for OpenAI response."""
+    total_tokens: int = 150
+
+
+@dataclass
+class FakeOpenAIResponse:
+    """Fake OpenAI chat completion response."""
+    choices: list = field(default_factory=list)
+    usage: FakeOpenAIUsage = field(default_factory=FakeOpenAIUsage)
+
+
+# --- OpenAI content block dispatch test ---
+
+
+@pytest.mark.asyncio
+async def test_openai_content_block_dispatch():
+    """_call_openai correctly dispatches _TextBlock/_ToolUseBlock (actual adapter types).
+
+    Uses _TextBlock and _ToolUseBlock directly (not FakeText/FakeToolUse) to establish
+    baseline coverage before refactoring hasattr dispatch to isinstance.  Should pass
+    with current hasattr code because both types carry a .type attribute.
+    """
+    config = _make_config(agent_llm_provider='openai', agent_llm_model='gpt-4o')
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='Dispatch test agent.',
+        tools={},
+        terminal_tool='stage_complete',
+    )
+
+    # Messages using the actual runtime adapter types produced by _OpenAIResponseAdapter
+    messages = [
+        {'role': 'user', 'content': 'initial string message'},
+        {'role': 'assistant', 'content': [
+            _TextBlock(text='thinking about it'),
+            _ToolUseBlock(id='tc1', name='my_tool', input={'x': 1}),
+        ]},
+        {'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': 'tc1', 'content': '{"result": 42}'},
+        ]},
+    ]
+
+    tool_schemas = [
+        {
+            'name': 'my_tool',
+            'description': 'A tool',
+            'input_schema': {'type': 'object', 'properties': {'x': {'type': 'integer'}}},
+        }
+    ]
+
+    captured: dict = {}
+
+    async def fake_create(**kwargs):
+        captured['messages'] = list(kwargs['messages'])
+        return FakeOpenAIResponse(
+            choices=[
+                FakeOpenAIChoice(
+                    message=FakeOpenAIMessage(content='done', tool_calls=None)
+                )
+            ],
+            usage=FakeOpenAIUsage(total_tokens=50),
+        )
+
+    mock_completions = MagicMock()
+    mock_completions.create = fake_create
+    mock_chat = MagicMock()
+    mock_chat.completions = mock_completions
+    mock_client = MagicMock()
+    mock_client.chat = mock_chat
+
+    with patch('openai.AsyncOpenAI', return_value=mock_client):
+        await agent._call_openai(messages, tool_schemas)
+
+    sent = captured['messages']
+
+    # Index 0: system message injected by _call_openai
+    assert sent[0] == {'role': 'system', 'content': 'Dispatch test agent.'}
+
+    # Index 1: user string passthrough
+    assert sent[1] == {'role': 'user', 'content': 'initial string message'}
+
+    # _TextBlock → role=assistant, content=text string
+    text_msg = next(
+        m for m in sent if m.get('role') == 'assistant' and isinstance(m.get('content'), str)
+    )
+    assert text_msg['content'] == 'thinking about it'
+
+    # _ToolUseBlock → role=assistant, tool_calls=[{id, type, function}]
+    tool_call_msg = next(
+        m for m in sent if m.get('role') == 'assistant' and 'tool_calls' in m
+    )
+    assert tool_call_msg['tool_calls'][0]['id'] == 'tc1'
+    assert tool_call_msg['tool_calls'][0]['type'] == 'function'
+    assert tool_call_msg['tool_calls'][0]['function']['name'] == 'my_tool'
+    assert json.loads(tool_call_msg['tool_calls'][0]['function']['arguments']) == {'x': 1}
+
+    # tool_result dict → role=tool
+    tool_result_msg = next(m for m in sent if m.get('role') == 'tool')
+    assert tool_result_msg['tool_call_id'] == 'tc1'
+    assert tool_result_msg['content'] == '{"result": 42}'
 
 
 @pytest.mark.asyncio
