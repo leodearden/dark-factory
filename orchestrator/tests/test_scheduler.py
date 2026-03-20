@@ -377,6 +377,41 @@ class TestStatusTransitionGuard:
         assert mock.call_count == call_count_before
 
 
+class TestGetTasksSeedsCache:
+    """get_tasks() should populate the _status_cache so pre-existing terminal tasks are guarded."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_seeds_status_cache(self, scheduler: Scheduler, monkeypatch):
+        """After get_tasks(), set_task_status for a 'done' task is rejected without MCP call."""
+        tasks_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [{"id": "42", "status": "done", "title": "T"}]}',
+                    }
+                ]
+            }
+        }
+        mcp_mock = AsyncMock(return_value=tasks_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+
+        await scheduler.get_tasks()  # seeds cache from tasks response
+
+        call_count_after_seed = mcp_mock.call_count
+
+        # Now try to set blocked on the done task
+        await scheduler.set_task_status('42', 'blocked')
+
+        # Cache was seeded: the blocked call must be rejected (no new MCP call)
+        assert mcp_mock.call_count == call_count_after_seed
+
+
 class TestAcquireNextNoDuplicates:
     """acquire_next() must not return the same task twice while its locks are held."""
 
