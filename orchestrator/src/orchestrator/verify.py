@@ -95,6 +95,34 @@ def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig
     )
 
 
+def _build_fallback_config(task_files: list[str]) -> ModuleConfig | None:
+    """Build a synthetic ModuleConfig from *task_files* when no module configs match.
+
+    Filters to ``.py`` files, classifies into source vs test, and builds bare
+    ``ruff check``/``pyright``/``pytest`` commands (no ``uv run`` wrapper —
+    callers run these in the worktree root where venvs aren't needed for the
+    fallback path).
+
+    Returns ``None`` when no ``.py`` files are found.
+    """
+    py_files = [f for f in task_files if f.endswith('.py')]
+    if not py_files:
+        return None
+
+    test_files = [f for f in py_files if _is_test_file(f)]
+
+    lint_cmd = 'ruff check ' + ' '.join(py_files)
+    type_cmd = 'pyright ' + ' '.join(py_files)
+    test_cmd = ('pytest ' + ' '.join(test_files)) if test_files else None
+
+    return ModuleConfig(
+        prefix='__fallback__',
+        lint_command=lint_cmd,
+        type_check_command=type_cmd,
+        test_command=test_cmd,
+    )
+
+
 @dataclass
 class VerifyResult:
     passed: bool
