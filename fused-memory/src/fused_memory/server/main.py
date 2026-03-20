@@ -89,6 +89,14 @@ async def run_server():
     memory_service = MemoryService(config)
     await memory_service.initialize()
 
+    # Initialize write journal
+    from fused_memory.services.write_journal import WriteJournal
+
+    wj_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
+    write_journal = WriteJournal(wj_data_dir)
+    await write_journal.initialize()
+    memory_service.set_write_journal(write_journal)
+
     # Initialize Taskmaster backend
     taskmaster = None
     task_interceptor = None
@@ -114,6 +122,7 @@ async def run_server():
 
         journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await journal.initialize()
+        journal.set_write_journal(write_journal)
 
         db_path = Path(config.reconciliation.data_dir) / 'reconciliation.db'
         assert memory_service.durable_queue is not None  # set by initialize()

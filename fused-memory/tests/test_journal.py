@@ -202,3 +202,69 @@ async def test_stage_reports_roundtrip(journal):
     loaded = await journal.get_run(run_id)
     assert 'memory_consolidator' in loaded.stage_reports
     assert loaded.stage_reports['memory_consolidator'].llm_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_add_run_action(journal):
+    run_id = str(uuid.uuid4())
+    await journal.add_run_action(
+        run_id, 'write', 'memory', 'add_memory',
+        {'task_id': '1', 'type': 'completion'},
+        causation_id=run_id,
+    )
+    actions = await journal.get_run_actions(run_id)
+    assert len(actions) == 1
+    assert actions[0]['action_type'] == 'write'
+    assert actions[0]['target'] == 'memory'
+    assert actions[0]['operation'] == 'add_memory'
+    assert actions[0]['causation_id'] == run_id
+    assert actions[0]['detail']['task_id'] == '1'
+
+
+@pytest.mark.asyncio
+async def test_get_run_actions_multiple(journal):
+    run_id = str(uuid.uuid4())
+    await journal.add_run_action(run_id, 'write', 'memory', 'add_memory', {'n': 1})
+    await journal.add_run_action(run_id, 'read', 'search', 'search', {'n': 2})
+    await journal.add_run_action(run_id, 'write', 'taskmaster', 'update_task', {'n': 3})
+
+    actions = await journal.get_run_actions(run_id)
+    assert len(actions) == 3
+    assert {a['operation'] for a in actions} == {'add_memory', 'search', 'update_task'}
+
+
+@pytest.mark.asyncio
+async def test_get_run_actions_combined_without_write_journal(journal):
+    """Without a write journal, combined returns only run_actions."""
+    run_id = str(uuid.uuid4())
+    await journal.add_run_action(run_id, 'write', 'memory', 'add_memory')
+    combined = await journal.get_run_actions_combined(run_id)
+    assert len(combined) == 1
+    assert combined[0]['source'] == 'run_actions'
+
+
+@pytest.mark.asyncio
+async def test_get_run_actions_combined_with_write_journal(journal, tmp_path):
+    """Combined returns actions from both run_actions and write journal."""
+    from fused_memory.services.write_journal import WriteJournal
+
+    wj = WriteJournal(tmp_path / 'combined_wj')
+    await wj.initialize()
+    journal.set_write_journal(wj)
+
+    run_id = str(uuid.uuid4())
+    await journal.add_run_action(run_id, 'write', 'memory', 'add_memory')
+    await wj.log_write_op(
+        write_op_id=str(uuid.uuid4()),
+        causation_id=run_id,
+        operation='add_memory',
+        project_id='test',
+    )
+
+    combined = await journal.get_run_actions_combined(run_id)
+    sources = {a['source'] for a in combined}
+    assert 'run_actions' in sources
+    assert 'write_journal' in sources
+    assert len(combined) == 2
+
+    await wj.close()

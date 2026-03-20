@@ -119,8 +119,15 @@ class TargetedReconciler:
                     'task_id': task_id,
                     'transition': 'done',
                 },
+                causation_id=run_id,
+                _source='targeted_recon',
             )
             result['actions'].append({'type': 'knowledge_captured_fast'})
+            await self.journal.add_run_action(
+                run_id, 'write', 'memory', 'add_memory',
+                {'task_id': task_id, 'type': 'completion_fast'},
+                causation_id=run_id,
+            )
         except Exception as e:
             logger.warning(f'Fast-path write failed for task {task_id}: {e}')
 
@@ -129,6 +136,12 @@ class TargetedReconciler:
             query=f'{title} {description}',
             project_id=project_id,
             limit=5,
+            causation_id=run_id,
+        )
+        await self.journal.add_run_action(
+            run_id, 'read', 'search', 'search',
+            {'query': f'{title} {description}'[:200], 'results': len(related)},
+            causation_id=run_id,
         )
 
         # 2. If sparse knowledge, verify against codebase and write findings
@@ -149,11 +162,18 @@ class TargetedReconciler:
                             'task_id': task_id,
                             'verification_verdict': verification.verdict,
                         },
+                        causation_id=run_id,
+                        _source='targeted_recon',
                     )
                     result['actions'].append({
                         'type': 'knowledge_captured',
                         'verification': verification.verdict,
                     })
+                    await self.journal.add_run_action(
+                        run_id, 'write', 'memory', 'add_memory',
+                        {'task_id': task_id, 'type': 'verification', 'verdict': verification.verdict},
+                        causation_id=run_id,
+                    )
             except Exception as e:
                 logger.warning(f'Verification failed for task {task_id}: {e}')
 
@@ -200,6 +220,12 @@ class TargetedReconciler:
             query=f'blockers for: {title} {description}',
             project_id=project_id,
             limit=5,
+            causation_id=run_id,
+        )
+        await self.journal.add_run_action(
+            run_id, 'read', 'search', 'search',
+            {'query': f'blockers for: {title}'[:200], 'results': len(related)},
+            causation_id=run_id,
         )
 
         if related:
@@ -220,6 +246,11 @@ class TargetedReconciler:
                     'type': 'hints_attached',
                     'hints': hints.model_dump(),
                 })
+                await self.journal.add_run_action(
+                    run_id, 'write', 'taskmaster', 'update_task',
+                    {'task_id': task_id, 'type': 'hints_attached'},
+                    causation_id=run_id,
+                )
             except Exception as e:
                 logger.warning(f'Failed to attach hints to task {task_id}: {e}')
 
@@ -312,7 +343,7 @@ class TargetedReconciler:
                 tid = task.get('id', '')
 
                 related = await self.memory.search(
-                    query=title, project_id=project_id, limit=3
+                    query=title, project_id=project_id, limit=3,
                 )
 
                 if related:

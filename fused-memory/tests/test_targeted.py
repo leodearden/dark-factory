@@ -79,6 +79,40 @@ async def test_on_task_done_fast_path_write(reconciler, mock_memory_service):
 
 
 @pytest.mark.asyncio
+async def test_on_task_done_passes_causation_id(reconciler, mock_memory_service):
+    """All memory calls during targeted recon pass causation_id=run_id."""
+    task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
+    await reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project', task_before=task_before
+    )
+    for call in mock_memory_service.add_memory.call_args_list:
+        assert call.kwargs.get('causation_id') is not None, (
+            f'add_memory called without causation_id: {call}'
+        )
+        assert call.kwargs.get('_source') == 'targeted_recon'
+    for call in mock_memory_service.search.call_args_list:
+        assert call.kwargs.get('causation_id') is not None
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_logs_run_actions(reconciler, journal):
+    """Targeted recon logs run_actions to journal."""
+    task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
+    await reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project', task_before=task_before
+    )
+    # Find the run
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1
+    actions = await journal.get_run_actions(runs[0].id)
+    # At minimum: fast-path write + search
+    assert len(actions) >= 2
+    ops = {a['operation'] for a in actions}
+    assert 'add_memory' in ops
+    assert 'search' in ops
+
+
+@pytest.mark.asyncio
 async def test_on_task_done_sparse_knowledge(reconciler, mock_memory_service):
     """When task is done and knowledge is sparse, should verify and write."""
     task_before = {'id': '1', 'title': 'Add tests', 'status': 'in-progress', 'description': 'Test suite'}

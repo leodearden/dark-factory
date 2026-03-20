@@ -38,6 +38,7 @@ from fused_memory.services.durable_queue import DurableWriteQueue
 
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
+    from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +54,16 @@ class MemoryService:
         self.router = ReadRouter(config)
         self.durable_queue: DurableWriteQueue | None = None
         self._event_buffer: EventBuffer | None = None
+        self._write_journal: WriteJournal | None = None
         self.taskmaster_connected: bool = False
 
     def set_event_buffer(self, buffer: EventBuffer) -> None:
         """Wire the reconciliation event buffer into the service."""
         self._event_buffer = buffer
+
+    def set_write_journal(self, journal: WriteJournal) -> None:
+        """Wire the write journal for durable auditing."""
+        self._write_journal = journal
 
     async def _emit_event(self, event: ReconciliationEvent) -> None:
         if self._event_buffer:
@@ -91,6 +97,47 @@ class MemoryService:
         await self.graphiti.close()
 
     # ------------------------------------------------------------------
+    # Journal helper
+    # ------------------------------------------------------------------
+
+    async def _journaled_backend_call(
+        self,
+        write_op_id: str | None,
+        causation_id: str | None,
+        backend: str,
+        operation: str,
+        payload: dict[str, Any],
+        coro: Any,
+    ) -> Any:
+        """Execute a backend call and log to write journal."""
+        result = None
+        try:
+            result = await coro
+            if self._write_journal:
+                await self._write_journal.log_backend_op(
+                    write_op_id=write_op_id,
+                    causation_id=causation_id,
+                    backend=backend,
+                    operation=operation,
+                    payload=payload,
+                    result_summary=str(result)[:500] if result else None,
+                    success=True,
+                )
+            return result
+        except Exception as e:
+            if self._write_journal:
+                await self._write_journal.log_backend_op(
+                    write_op_id=write_op_id,
+                    causation_id=causation_id,
+                    backend=backend,
+                    operation=operation,
+                    payload=payload,
+                    success=False,
+                    error=str(e),
+                )
+            raise
+
+    # ------------------------------------------------------------------
     # Durable queue: execute write dispatcher
     # ------------------------------------------------------------------
 
@@ -104,14 +151,26 @@ class MemoryService:
         except (KeyError, AttributeError):
             episode_type = EpisodeType.text
 
-        return await self.graphiti.add_episode(
-            name=payload.get('name', ''),
-            content=payload['content'],
-            source=episode_type,
-            group_id=payload['group_id'],
-            source_description=payload.get('source_description', ''),
-            uuid=payload.get('uuid'),
+        # Extract journal metadata from payload (injected at enqueue time)
+        causation_id = payload.pop('_causation_id', None)
+        write_op_id = payload.pop('_write_op_id', None)
+
+        result = await self._journaled_backend_call(
+            write_op_id=write_op_id,
+            causation_id=causation_id,
+            backend='graphiti',
+            operation='add_episode',
+            payload={'content': payload['content'][:200], 'group_id': payload.get('group_id')},
+            coro=self.graphiti.add_episode(
+                name=payload.get('name', ''),
+                content=payload['content'],
+                source=episode_type,
+                group_id=payload['group_id'],
+                source_description=payload.get('source_description', ''),
+                uuid=payload.get('uuid'),
+            ),
         )
+        return result
 
     async def _dual_write_callback(
         self, callback_type: str, result: Any, payload: dict[str, Any]
@@ -122,7 +181,8 @@ class MemoryService:
             agent_id=payload.get('agent_id'),
             session_id=payload.get('session_id'),
         )
-        await self._dual_write_from_episode(result, scope)
+        causation_id = payload.get('_causation_id')
+        await self._dual_write_from_episode(result, scope, causation_id=causation_id)
 
     # ------------------------------------------------------------------
     # Write: add_episode
@@ -137,10 +197,13 @@ class MemoryService:
         session_id: str | None = None,
         reference_time: datetime | None = None,
         source_description: str = '',
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
     ) -> AddEpisodeResponse:
         """Full ingestion pipeline — durably enqueue episode, return immediately."""
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         episode_id = str(uuid_mod.uuid4())
+        write_op_id = str(uuid_mod.uuid4())
 
         # Parse source type name for storage
         try:
@@ -150,23 +213,47 @@ class MemoryService:
 
         assert self.durable_queue is not None
 
-        await self.durable_queue.enqueue(
-            group_id=scope.graphiti_group_id,
-            operation='add_episode',
-            payload={
-                'uuid': episode_id,
-                'name': f'episode_{episode_id[:8]}',
-                'content': content,
-                'source': source_name,
-                'group_id': scope.graphiti_group_id,
-                'source_description': source_description,
-                # Scope fields for callback reconstruction
-                'project_id': project_id,
-                'agent_id': agent_id,
-                'session_id': session_id,
-            },
-            callback_type='dual_write_episode',
-        )
+        success = True
+        error_msg = None
+        try:
+            await self.durable_queue.enqueue(
+                group_id=scope.graphiti_group_id,
+                operation='add_episode',
+                payload={
+                    'uuid': episode_id,
+                    'name': f'episode_{episode_id[:8]}',
+                    'content': content,
+                    'source': source_name,
+                    'group_id': scope.graphiti_group_id,
+                    'source_description': source_description,
+                    # Scope fields for callback reconstruction
+                    'project_id': project_id,
+                    'agent_id': agent_id,
+                    'session_id': session_id,
+                    # Journal metadata (popped by _execute_graphiti_write)
+                    '_causation_id': causation_id,
+                    '_write_op_id': write_op_id,
+                },
+                callback_type='dual_write_episode',
+            )
+        except Exception as e:
+            success = False
+            error_msg = str(e)
+            raise
+        finally:
+            if self._write_journal:
+                await self._write_journal.log_write_op(
+                    write_op_id=write_op_id,
+                    causation_id=causation_id,
+                    source=_source,
+                    operation='add_episode',
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    params={'content': content[:200], 'source': source},
+                    result_summary={'episode_id': episode_id, 'status': 'queued'} if success else None,
+                    success=success,
+                    error=error_msg,
+                )
 
         await self._emit_event(ReconciliationEvent(
             id=str(uuid_mod.uuid4()),
@@ -184,7 +271,9 @@ class MemoryService:
             message=f'Episode queued for processing in project {project_id}',
         )
 
-    async def _dual_write_from_episode(self, result: Any, scope: Scope) -> None:
+    async def _dual_write_from_episode(
+        self, result: Any, scope: Scope, *, causation_id: str | None = None
+    ) -> None:
         """Classify extracted facts and write Mem0-bound memories."""
         if result is None:
             return
@@ -193,6 +282,7 @@ class MemoryService:
         edges = getattr(result, 'entity_edges', None) or []
         for edge in edges:
             fact_text = getattr(edge, 'fact', None) or str(edge)
+            write_op_id = str(uuid_mod.uuid4())
             try:
                 classification = await self.classifier.classify(fact_text)
                 if classification.primary in MEM0_PRIMARY or classification.secondary is not None:
@@ -203,9 +293,46 @@ class MemoryService:
                     }
                     if classification.secondary:
                         metadata['secondary_category'] = classification.secondary.value
-                    await self.mem0.add(content=fact_text, scope=scope, metadata=metadata)
+
+                    mem0_result = await self._journaled_backend_call(
+                        write_op_id=write_op_id,
+                        causation_id=causation_id,
+                        backend='mem0',
+                        operation='add',
+                        payload={'content': fact_text[:200]},
+                        coro=self.mem0.add(content=fact_text, scope=scope, metadata=metadata),
+                    )
+
+                    # Log Layer 1 for the derived write
+                    if self._write_journal:
+                        await self._write_journal.log_write_op(
+                            write_op_id=write_op_id,
+                            causation_id=causation_id,
+                            source='dual_write',
+                            provenance='derived',
+                            operation='add_memory',
+                            project_id=scope.project_id,
+                            agent_id=scope.agent_id,
+                            params={'content': fact_text[:200], 'category': classification.primary.value},
+                            result_summary=str(mem0_result)[:500] if mem0_result else None,
+                            success=True,
+                        )
+
                     logger.debug(f'Dual-wrote fact to Mem0: {fact_text[:80]}')
             except Exception as e:
+                if self._write_journal:
+                    await self._write_journal.log_write_op(
+                        write_op_id=write_op_id,
+                        causation_id=causation_id,
+                        source='dual_write',
+                        provenance='derived',
+                        operation='add_memory',
+                        project_id=scope.project_id,
+                        agent_id=scope.agent_id,
+                        params={'content': fact_text[:200]},
+                        success=False,
+                        error=str(e),
+                    )
                 logger.error(f'Dual-write failed for fact: {e}')
 
     # ------------------------------------------------------------------
@@ -221,9 +348,12 @@ class MemoryService:
         session_id: str | None = None,
         metadata: dict | None = None,
         dual_write: bool = False,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
     ) -> AddMemoryResponse:
         """Lightweight classified write — skip extraction pipeline."""
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
+        write_op_id = str(uuid_mod.uuid4())
 
         # Resolve category
         if category is None:
@@ -247,6 +377,7 @@ class MemoryService:
         )
 
         _graphiti_error = None
+        _mem0_error = None
 
         # Graphiti: enqueue via durable queue (async, but durably persisted)
         if write_graphiti:
@@ -261,6 +392,8 @@ class MemoryService:
                         'source': 'text',
                         'group_id': scope.graphiti_group_id,
                         'source_description': f'add_memory:{resolved_category.value}',
+                        '_causation_id': causation_id,
+                        '_write_op_id': write_op_id,
                     },
                 )
                 # Durably persisted to SQLite — report as written
@@ -272,7 +405,14 @@ class MemoryService:
         # Mem0: direct write (fast, no queue needed)
         if write_mem0:
             try:
-                result = await self.mem0.add(content=content, scope=scope, metadata=meta)
+                result = await self._journaled_backend_call(
+                    write_op_id=write_op_id,
+                    causation_id=causation_id,
+                    backend='mem0',
+                    operation='add',
+                    payload={'content': content[:200], 'category': resolved_category.value},
+                    coro=self.mem0.add(content=content, scope=scope, metadata=meta),
+                )
                 results = result.get('results', [])
                 for r in results:
                     if 'id' in r:
@@ -280,6 +420,25 @@ class MemoryService:
                 stores_written.append(SourceStore.mem0)
             except Exception as e:
                 logger.error(f'Mem0 write failed: {e}')
+                _mem0_error = str(e)
+
+        # Layer 1 journal entry
+        if self._write_journal:
+            await self._write_journal.log_write_op(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                source=_source,
+                operation='add_memory',
+                project_id=project_id,
+                agent_id=agent_id,
+                params={'content': content[:200], 'category': resolved_category.value},
+                result_summary={
+                    'memory_ids': memory_ids,
+                    'stores': [s.value for s in stores_written],
+                },
+                success=not (_graphiti_error and _mem0_error),
+                error=_graphiti_error or _mem0_error,
+            )
 
         await self._emit_event(ReconciliationEvent(
             id=str(uuid_mod.uuid4()),
@@ -368,6 +527,7 @@ class MemoryService:
         limit: int = 10,
         agent_id: str | None = None,
         session_id: str | None = None,
+        causation_id: str | None = None,
     ) -> list[MemoryResult]:
         """Unified search across both stores with automatic fan-out."""
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
@@ -442,7 +602,23 @@ class MemoryService:
                     if r.source_store == SourceStore.graphiti and r.category is None:
                         r.category = inferred
 
-        return results[:limit]
+        final = results[:limit]
+
+        # Log search when causation_id is present (recon paths)
+        if causation_id and self._write_journal:
+            await self._write_journal.log_write_op(
+                write_op_id=str(uuid_mod.uuid4()),
+                causation_id=causation_id,
+                source='mcp_tool',
+                operation='search',
+                project_id=project_id,
+                agent_id=agent_id,
+                params={'query': query[:200], 'limit': limit},
+                result_summary={'count': len(final)},
+                success=True,
+            )
+
+        return final
 
     async def _search_graphiti(
         self, query: str, scope: Scope, limit: int
@@ -594,17 +770,46 @@ class MemoryService:
         memory_id: str,
         store: str,
         project_id: str = 'main',
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
     ) -> dict:
         """Delete a memory from the specified store."""
         scope = Scope(project_id=project_id)
         source = SourceStore(store)
+        write_op_id = str(uuid_mod.uuid4())
 
         if source == SourceStore.graphiti:
-            await self.graphiti.remove_edge(memory_id)
+            await self._journaled_backend_call(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                backend='graphiti',
+                operation='remove_edge',
+                payload={'memory_id': memory_id},
+                coro=self.graphiti.remove_edge(memory_id),
+            )
             result = {'status': 'deleted', 'store': 'graphiti', 'id': memory_id}
         else:
-            del_result = await self.mem0.delete(memory_id, scope)
+            del_result = await self._journaled_backend_call(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                backend='mem0',
+                operation='delete',
+                payload={'memory_id': memory_id},
+                coro=self.mem0.delete(memory_id, scope),
+            )
             result = {'status': 'deleted', 'store': 'mem0', 'id': memory_id, **del_result}
+
+        if self._write_journal:
+            await self._write_journal.log_write_op(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                source=_source,
+                operation='delete_memory',
+                project_id=project_id,
+                params={'memory_id': memory_id, 'store': store},
+                result_summary=result,
+                success=True,
+            )
 
         await self._emit_event(ReconciliationEvent(
             id=str(uuid_mod.uuid4()),
@@ -622,9 +827,33 @@ class MemoryService:
         episode_id: str,
         project_id: str = 'main',
         cascade: bool = True,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
     ) -> dict:
         """Delete a Graphiti episode."""
-        await self.graphiti.remove_episode(episode_id)
+        write_op_id = str(uuid_mod.uuid4())
+
+        await self._journaled_backend_call(
+            write_op_id=write_op_id,
+            causation_id=causation_id,
+            backend='graphiti',
+            operation='remove_episode',
+            payload={'episode_id': episode_id},
+            coro=self.graphiti.remove_episode(episode_id),
+        )
+
+        if self._write_journal:
+            await self._write_journal.log_write_op(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                source=_source,
+                operation='delete_episode',
+                project_id=project_id,
+                params={'episode_id': episode_id, 'cascade': cascade},
+                result_summary={'status': 'deleted'},
+                success=True,
+            )
+
         return {'status': 'deleted', 'episode_id': episode_id, 'cascade': cascade}
 
     # ------------------------------------------------------------------

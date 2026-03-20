@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid as uuid_mod
 from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import FastMCP
@@ -67,6 +68,29 @@ Conventions:
 """
 
 
+def _extract_causation(
+    metadata: dict | None, agent_id: str | None
+) -> tuple[str, str, dict | None]:
+    """Extract or generate causation_id, determine source, clean metadata.
+
+    Returns (causation_id, source, cleaned_metadata).
+    """
+    causation_id: str | None = None
+    cleaned = dict(metadata) if metadata else None
+
+    if cleaned and '_causation_id' in cleaned:
+        causation_id = cleaned.pop('_causation_id')
+
+    if causation_id is None:
+        causation_id = str(uuid_mod.uuid4())
+
+    source = 'mcp_tool'
+    if agent_id and agent_id.startswith('recon-stage-'):
+        source = 'full_recon'
+
+    return causation_id, source, cleaned
+
+
 def create_mcp_server(
     memory_service: MemoryService,
     task_interceptor: TaskInterceptor | None = None,
@@ -98,6 +122,7 @@ def create_mcp_server(
         agent_id: str | None = None,
         session_id: str | None = None,
         source_description: str = '',
+        metadata: dict | None = None,
     ) -> dict[str, Any]:
         """Add an episode to memory. Full ingestion pipeline: raw content is processed
         through Graphiti's extraction pipeline, then classified facts are dual-written
@@ -110,8 +135,10 @@ def create_mcp_server(
             agent_id: Which agent is writing (optional)
             session_id: Session context (optional)
             source_description: E.g. "pair programming session"
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         try:
+            causation_id, op_source, _ = _extract_causation(metadata, agent_id)
             result = await memory_service.add_episode(
                 content=content,
                 source=source,
@@ -119,6 +146,8 @@ def create_mcp_server(
                 agent_id=agent_id,
                 session_id=session_id,
                 source_description=source_description,
+                causation_id=causation_id,
+                _source=op_source,
             )
             return result.model_dump()
         except Exception as e:
@@ -150,14 +179,17 @@ def create_mcp_server(
             dual_write: Force write to both stores (default: false)
         """
         try:
+            causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
             result = await memory_service.add_memory(
                 content=content,
                 category=category,
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                metadata=metadata,
+                metadata=cleaned_meta,
                 dual_write=dual_write,
+                causation_id=causation_id,
+                _source=source,
             )
             return result.model_dump()
         except Exception as e:
@@ -267,6 +299,7 @@ def create_mcp_server(
         memory_id: str,
         store: str,
         project_id: str,
+        metadata: dict | None = None,
     ) -> dict[str, Any]:
         """Delete a specific memory from a store. IRREVERSIBLE.
 
@@ -282,10 +315,13 @@ def create_mcp_server(
             memory_id: The memory ID (from search results)
             store: "graphiti" or "mem0" (from search results)
             project_id: Project scope (required)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         try:
+            causation_id, source, _ = _extract_causation(metadata, None)
             return await memory_service.delete_memory(
-                memory_id=memory_id, store=store, project_id=project_id
+                memory_id=memory_id, store=store, project_id=project_id,
+                causation_id=causation_id, _source=source,
             )
         except Exception as e:
             logger.error(f'delete_memory error: {e}')
@@ -296,6 +332,7 @@ def create_mcp_server(
         episode_id: str,
         project_id: str,
         cascade: bool = True,
+        metadata: dict | None = None,
     ) -> dict[str, Any]:
         """Delete a Graphiti episode. IRREVERSIBLE.
 
@@ -307,10 +344,13 @@ def create_mcp_server(
             episode_id: Graphiti episode UUID
             project_id: Project scope (required)
             cascade: Also delete exclusive entities/edges (default: true)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         try:
+            causation_id, source, _ = _extract_causation(metadata, None)
             return await memory_service.delete_episode(
-                episode_id=episode_id, project_id=project_id, cascade=cascade
+                episode_id=episode_id, project_id=project_id, cascade=cascade,
+                causation_id=causation_id, _source=source,
             )
         except Exception as e:
             logger.error(f'delete_episode error: {e}')

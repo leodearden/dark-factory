@@ -1,9 +1,13 @@
 """SQLite-backed journal for reconciliation audit trail and watermark tracking."""
 
+from __future__ import annotations
+
 import json
 import logging
+import uuid as uuid_mod
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import aiosqlite
 
@@ -15,6 +19,9 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
+
+if TYPE_CHECKING:
+    from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +109,18 @@ CREATE TABLE IF NOT EXISTS chunk_boundaries (
     created_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_chunk_project ON chunk_boundaries(project_id);
+
+CREATE TABLE IF NOT EXISTS run_actions (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    target TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    detail TEXT DEFAULT '{}',
+    causation_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ra_run ON run_actions(run_id);
 """
 
 
@@ -111,6 +130,11 @@ class ReconciliationJournal:
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
         self._db: aiosqlite.Connection | None = None
+        self._write_journal: WriteJournal | None = None
+
+    def set_write_journal(self, write_journal: WriteJournal) -> None:
+        """Store reference for cross-queries (combined run actions)."""
+        self._write_journal = write_journal
 
     async def initialize(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -453,6 +477,81 @@ class ReconciliationJournal:
             'events_count': row['events_count'],
             'created_at': row['created_at'],
         }
+
+    # ── Run actions (targeted recon audit trail) ─────────────────────────
+
+    async def add_run_action(
+        self,
+        run_id: str,
+        action_type: str,
+        target: str,
+        operation: str,
+        detail: dict | None = None,
+        causation_id: str | None = None,
+    ) -> None:
+        """Record an action performed during a reconciliation run."""
+        try:
+            db = self._require_db()
+            await db.execute(
+                """INSERT INTO run_actions
+                   (id, run_id, action_type, target, operation, detail, causation_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid_mod.uuid4()),
+                    run_id,
+                    action_type,
+                    target,
+                    operation,
+                    json.dumps(detail) if detail else '{}',
+                    causation_id,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            await db.commit()
+        except Exception as e:
+            logger.warning(f'Failed to record run_action: {e}')
+
+    async def get_run_actions(self, run_id: str) -> list[dict]:
+        """Get all run_actions for a reconciliation run."""
+        db = self._require_db()
+        async with db.execute(
+            'SELECT * FROM run_actions WHERE run_id = ? ORDER BY created_at',
+            (run_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            {
+                'id': row['id'],
+                'run_id': row['run_id'],
+                'action_type': row['action_type'],
+                'target': row['target'],
+                'operation': row['operation'],
+                'detail': json.loads(row['detail']),
+                'causation_id': row['causation_id'],
+                'created_at': row['created_at'],
+                'source': 'run_actions',
+            }
+            for row in rows
+        ]
+
+    async def get_run_actions_combined(self, run_id: str) -> list[dict]:
+        """UNION of run_actions table AND write journal ops by causation_id.
+
+        Provides redundant coverage: targeted recon logs to run_actions directly,
+        full recon logs via write journal (causation_id = run_id).
+        """
+        actions = await self.get_run_actions(run_id)
+
+        if self._write_journal:
+            wj_ops = await self._write_journal.get_ops_by_causation(run_id)
+            for op in wj_ops:
+                actions.append({
+                    **op,
+                    'source': 'write_journal',
+                })
+
+        actions.sort(key=lambda a: a.get('created_at', ''))
+        return actions
 
     # ── Dashboard stats ────────────────────────────────────────────────
 
