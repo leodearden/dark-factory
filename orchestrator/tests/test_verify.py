@@ -359,6 +359,7 @@ class TestScopeModuleConfig:
         mc = self._make_mc()
         result = scope_module_config(mc, ['orchestrator/src/orchestrator/verify.py'])
         # The command should contain the stripped path
+        assert result.lint_command is not None
         assert 'src/orchestrator/verify.py' in result.lint_command
         # Should NOT contain the original directory args
         assert 'src/ tests/' not in result.lint_command
@@ -418,8 +419,10 @@ class TestScopeModuleConfig:
             'orchestrator/tests/test_verify.py',
         ]
         result = scope_module_config(mc, task_files)
+        assert result.lint_command is not None
         assert 'src/orchestrator/verify.py' in result.lint_command
         assert 'tests/test_verify.py' in result.lint_command
+        assert result.test_command is not None
         assert 'tests/test_verify.py' in result.test_command
 
 
@@ -516,7 +519,7 @@ class TestRunScopedVerificationTaskFiles:
         config.type_check_command = 'exit 1'
 
         task_files = ['src/foo.py', 'tests/test_foo.py']
-        result = asyncio.run(run_scoped_verification(tmp_path, config, [], task_files=task_files))
+        asyncio.run(run_scoped_verification(tmp_path, config, [], task_files=task_files))
         # Fallback builds 'ruff check src/foo.py tests/test_foo.py' — these files don't
         # exist so ruff/pyright might fail; use echo commands via the echo trick: the key
         # assertion is that the global 'exit 1' was NOT executed (if it were, every check fails)
