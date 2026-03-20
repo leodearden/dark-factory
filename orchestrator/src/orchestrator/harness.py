@@ -107,10 +107,13 @@ class Harness:
         # 1b. Start escalation server
         await self._start_escalation_server()
 
-        # 1c. Dismiss stale escalations from prior runs
-        await self._dismiss_stale_escalations()
-
         try:
+            # 1c. Dismiss stale escalations from prior runs (non-fatal)
+            try:
+                await self._dismiss_stale_escalations()
+            except Exception as e:
+                logger.warning(f'Failed to dismiss stale escalations: {e}')
+
             # 1d. Usage cap startup check
             if self.usage_gate:
                 logger.info('Checking usage cap status...')
