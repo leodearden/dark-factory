@@ -13,6 +13,8 @@ from fused_memory.reconciliation.agent_loop import (
     ToolDefinition,
     _CLIResponseAdapter,
     _OpenAIResponseAdapter,
+    _TextBlock,
+    _ToolUseBlock,
 )
 
 
@@ -98,6 +100,98 @@ class FakeOpenAIResponse:
     """Fake OpenAI chat completion response."""
     choices: list = field(default_factory=list)
     usage: FakeOpenAIUsage = field(default_factory=FakeOpenAIUsage)
+
+
+# --- OpenAI content block dispatch test ---
+
+
+@pytest.mark.asyncio
+async def test_openai_content_block_dispatch():
+    """_call_openai correctly dispatches _TextBlock/_ToolUseBlock (actual adapter types).
+
+    Uses _TextBlock and _ToolUseBlock directly (not FakeText/FakeToolUse) to establish
+    baseline coverage before refactoring hasattr dispatch to isinstance.  Should pass
+    with current hasattr code because both types carry a .type attribute.
+    """
+    config = _make_config(agent_llm_provider='openai', agent_llm_model='gpt-4o')
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='Dispatch test agent.',
+        tools={},
+        terminal_tool='stage_complete',
+    )
+
+    # Messages using the actual runtime adapter types produced by _OpenAIResponseAdapter
+    messages = [
+        {'role': 'user', 'content': 'initial string message'},
+        {'role': 'assistant', 'content': [
+            _TextBlock(text='thinking about it'),
+            _ToolUseBlock(id='tc1', name='my_tool', input={'x': 1}),
+        ]},
+        {'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': 'tc1', 'content': '{"result": 42}'},
+        ]},
+    ]
+
+    tool_schemas = [
+        {
+            'name': 'my_tool',
+            'description': 'A tool',
+            'input_schema': {'type': 'object', 'properties': {'x': {'type': 'integer'}}},
+        }
+    ]
+
+    captured: dict = {}
+
+    async def fake_create(**kwargs):
+        captured['messages'] = list(kwargs['messages'])
+        return FakeOpenAIResponse(
+            choices=[
+                FakeOpenAIChoice(
+                    message=FakeOpenAIMessage(content='done', tool_calls=None)
+                )
+            ],
+            usage=FakeOpenAIUsage(total_tokens=50),
+        )
+
+    mock_completions = MagicMock()
+    mock_completions.create = fake_create
+    mock_chat = MagicMock()
+    mock_chat.completions = mock_completions
+    mock_client = MagicMock()
+    mock_client.chat = mock_chat
+
+    with patch('openai.AsyncOpenAI', return_value=mock_client):
+        await agent._call_openai(messages, tool_schemas)  # type: ignore[arg-type]
+
+    sent = captured['messages']
+
+    # Index 0: system message injected by _call_openai
+    assert sent[0] == {'role': 'system', 'content': 'Dispatch test agent.'}
+
+    # Index 1: user string passthrough
+    assert sent[1] == {'role': 'user', 'content': 'initial string message'}
+
+    # _TextBlock → role=assistant, content=text string
+    text_msg = next(
+        m for m in sent if m.get('role') == 'assistant' and isinstance(m.get('content'), str)
+    )
+    assert text_msg['content'] == 'thinking about it'
+
+    # _ToolUseBlock → role=assistant, tool_calls=[{id, type, function}]
+    tool_call_msg = next(
+        m for m in sent if m.get('role') == 'assistant' and 'tool_calls' in m
+    )
+    assert tool_call_msg['tool_calls'][0]['id'] == 'tc1'
+    assert tool_call_msg['tool_calls'][0]['type'] == 'function'
+    assert tool_call_msg['tool_calls'][0]['function']['name'] == 'my_tool'
+    assert json.loads(tool_call_msg['tool_calls'][0]['function']['arguments']) == {'x': 1}
+
+    # tool_result dict → role=tool
+    tool_result_msg = next(m for m in sent if m.get('role') == 'tool')
+    assert tool_result_msg['tool_call_id'] == 'tc1'
+    assert tool_result_msg['content'] == '{"result": 42}'
 
 
 @pytest.mark.asyncio
@@ -454,6 +548,37 @@ def test_openai_adapter_tool_arguments_json_parsed():
 # --- OpenAI provider _call_openai tests ---
 
 
+def test_to_anthropic_schema_returns_tool_param_shape():
+    """to_anthropic_schema() returns a dict with exactly the keys ToolParam requires.
+
+    Validates structural compatibility before type annotation is tightened to ToolParam.
+    """
+    tool = ToolDefinition(
+        name='search_memory',
+        description='Search for memories by query string.',
+        parameters={
+            'type': 'object',
+            'properties': {'query': {'type': 'string'}, 'limit': {'type': 'integer'}},
+            'required': ['query'],
+        },
+        function=lambda **kw: kw,
+    )
+
+    schema = tool.to_anthropic_schema()
+
+    # Must have exactly the three keys ToolParam requires
+    assert isinstance(schema, dict)
+    assert 'name' in schema
+    assert 'description' in schema
+    assert 'input_schema' in schema
+
+    # Correct values
+    assert schema['name'] == 'search_memory'
+    assert schema['description'] == 'Search for memories by query string.'
+    assert schema['input_schema'] == tool.parameters
+    assert isinstance(schema['input_schema'], dict)
+
+
 @pytest.mark.asyncio
 async def test_openai_tool_schema_conversion():
     """_call_openai converts Anthropic tool schemas (input_schema) to OpenAI format (parameters)."""
@@ -577,11 +702,13 @@ async def test_openai_message_conversion():
     # 2. List with text block (assistant thinking)
     # 3. List with tool_use block (assistant tool call)
     # 4. List with tool_result dicts (user follow-up)
+    # Use _TextBlock/_ToolUseBlock (the actual runtime adapter types) because
+    # _call_openai dispatches via isinstance, not hasattr.
     messages = [
         {'role': 'user', 'content': 'initial payload string'},
         {'role': 'assistant', 'content': [
-            FakeText(text='Thinking about this...'),
-            FakeToolUse(id='call_a', name='noop', input={'x': 1}),
+            _TextBlock(text='Thinking about this...'),
+            _ToolUseBlock(id='call_a', name='noop', input={'x': 1}),
         ]},
         {'role': 'user', 'content': [
             {'type': 'tool_result', 'tool_use_id': 'call_a', 'content': '{"ok": true}'},
@@ -650,6 +777,52 @@ async def test_openai_message_conversion():
     tool_result_msg = next(m for m in sent if m.get('role') == 'tool')
     assert tool_result_msg['tool_call_id'] == 'call_a'
     assert tool_result_msg['content'] == '{"ok": true}'
+
+
+@pytest.mark.asyncio
+async def test_openai_tools_omitted_when_empty():
+    """When tool_schemas=[], 'tools' key must NOT appear in kwargs to create().
+
+    This test FAILS with current code because line 273 passes tools=None to the
+    OpenAI SDK when openai_tools is empty — None is type-invalid for the tools param
+    (the SDK uses NOT_GIVEN sentinel internally).  The fix is a conditional kwargs dict.
+    """
+    config = _make_config(agent_llm_provider='openai', agent_llm_model='gpt-4o')
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='Tool omission test.',
+        tools={},
+        terminal_tool='stage_complete',
+    )
+
+    captured_kwargs: dict = {}
+
+    async def fake_create(**kwargs):
+        captured_kwargs.update(kwargs)
+        return FakeOpenAIResponse(
+            choices=[
+                FakeOpenAIChoice(
+                    message=FakeOpenAIMessage(content='done', tool_calls=None)
+                )
+            ],
+            usage=FakeOpenAIUsage(total_tokens=10),
+        )
+
+    mock_completions = MagicMock()
+    mock_completions.create = fake_create
+    mock_chat = MagicMock()
+    mock_chat.completions = mock_completions
+    mock_client = MagicMock()
+    mock_client.chat = mock_chat
+
+    with patch('openai.AsyncOpenAI', return_value=mock_client):
+        await agent._call_openai([{'role': 'user', 'content': 'hi'}], [])
+
+    # When tool_schemas is empty, 'tools' must NOT be sent to the API at all.
+    assert 'tools' not in captured_kwargs, (
+        f"'tools' key should be absent when no tool schemas provided, got: {captured_kwargs.get('tools')!r}"
+    )
 
 
 @pytest.mark.asyncio

@@ -32,7 +32,7 @@ for pkg in "${PYRIGHT_PACKAGES[@]}"; do
     dir="$ROOT/$pkg"
     [ -d "$dir" ] || continue
     echo "  pyright: $pkg"
-    if ! (cd "$dir" && npx pyright); then
+    if ! (cd "$dir" && uv run pyright); then
         echo "pre-commit: pyright failed in $pkg. Fix type errors before committing to main."
         exit 1
     fi

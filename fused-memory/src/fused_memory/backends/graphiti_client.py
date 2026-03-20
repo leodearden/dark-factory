@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import logging
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
@@ -232,13 +232,13 @@ class GraphitiBackend:
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
         client = self._require_client()
-        all_graphs = await client.driver.client.list_graphs()
+        all_graphs = await cast(Any, client.driver).client.list_graphs()
         return [g for g in all_graphs if g != 'default_db' and not g.endswith('_db')]
 
     async def node_count(self, graph_name: str) -> int:
         """Count nodes in a specific FalkorDB graph."""
         client = self._require_client()
-        graph = client.driver._get_graph(graph_name)
+        graph = cast(Any, client.driver)._get_graph(graph_name)
         result = await graph.query('MATCH (n) RETURN count(n) as count')
         return result.result_set[0][0] if result.result_set else 0
 

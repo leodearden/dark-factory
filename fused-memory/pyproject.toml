@@ -31,9 +31,6 @@ include = ["src", "tests"]
 extraPaths = ["src", "../shared/src", "../escalation/src"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
-# agent_loop.py SDK calls use untyped dicts — tracked in task #50
-reportArgumentType = "warning"
-reportAttributeAccessIssue = "warning"
 
 [tool.ruff]
 line-length = 100
