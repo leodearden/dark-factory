@@ -144,13 +144,20 @@ MOCK_RUNS = [
     }
 ]
 
+MOCK_LAST_ATTEMPTED = {
+    'id': 'run-002',
+    'status': 'failed',
+    'started_at': '2026-03-19T09:00:00+00:00',
+    'completed_at': '2026-03-19T09:01:00+00:00',
+}
+
 
 _UNSET = object()
 
 
 def _patch_recon_data(buffer_stats=_UNSET, burst_state=_UNSET, watermarks=_UNSET,
-                      verdict=_UNSET, runs=_UNSET):
-    """Return an ExitStack that patches all 5 recon data functions."""
+                      verdict=_UNSET, runs=_UNSET, last_attempted=_UNSET):
+    """Return an ExitStack that patches all 6 recon data functions."""
     stack = ExitStack()
     stack.enter_context(patch(
         'dashboard.app.get_buffer_stats',
@@ -176,6 +183,11 @@ def _patch_recon_data(buffer_stats=_UNSET, burst_state=_UNSET, watermarks=_UNSET
         'dashboard.app.get_recent_runs',
         new_callable=AsyncMock,
         return_value=runs if runs is not _UNSET else MOCK_RUNS,
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_last_attempted_run',
+        new_callable=AsyncMock,
+        return_value=last_attempted if last_attempted is not _UNSET else MOCK_LAST_ATTEMPTED,
     ))
     return stack
 
@@ -213,10 +225,29 @@ class TestReconRoute:
     def test_watermark_labels(self, client):
         with _patch_recon_data():
             html = client.get('/partials/recon').text
-        assert 'Last full run' in html
+        assert 'Last successful run' in html
         assert 'Last episode' in html
         assert 'Last memory' in html
         assert 'Last task change' in html
+
+    def test_last_attempted_run_displayed(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'Last attempted run' in html
+        assert 'aria-label="Last attempted run status: failed"' in html
+
+    def test_last_successful_run_label(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'Last successful run' in html
+
+    def test_last_attempted_none_shows_never(self, client):
+        with _patch_recon_data(last_attempted=None):
+            html = client.get('/partials/recon').text
+        assert 'Last attempted run' in html
+        # The "never" text should appear in the last attempted run row
+        # Check the row contains "never"
+        assert 'never' in html
 
     def test_verdict_severity_badge(self, client):
         with _patch_recon_data():
@@ -290,6 +321,7 @@ class TestReconRouteEmpty:
             watermarks={},
             verdict=None,
             runs=[],
+            last_attempted=None,
         ):
             resp = client.get('/partials/recon')
         assert resp.status_code == 200
@@ -301,6 +333,7 @@ class TestReconRouteEmpty:
             watermarks={},
             verdict=None,
             runs=[],
+            last_attempted=None,
         ):
             html = client.get('/partials/recon').text
         assert '0 events buffered' in html
@@ -312,6 +345,7 @@ class TestReconRouteEmpty:
             watermarks={},
             verdict=None,
             runs=[],
+            last_attempted=None,
         ):
             html = client.get('/partials/recon').text
         assert 'No agents' in html
@@ -323,6 +357,7 @@ class TestReconRouteEmpty:
             watermarks={},
             verdict=None,
             runs=[],
+            last_attempted=None,
         ):
             html = client.get('/partials/recon').text
         assert 'No verdicts yet' in html
@@ -334,6 +369,7 @@ class TestReconRouteEmpty:
             watermarks={},
             verdict=None,
             runs=[],
+            last_attempted=None,
         ):
             html = client.get('/partials/recon').text
         assert 'No reconciliation runs yet' in html
@@ -345,6 +381,7 @@ class TestReconRouteEmpty:
             watermarks={},
             verdict=None,
             runs=[],
+            last_attempted=None,
         ):
             html = client.get('/partials/recon').text
         assert 'bg-green-600' not in html

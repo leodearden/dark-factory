@@ -266,6 +266,7 @@ class ReconciliationHarness:
                                             f'Full cycle timed out after '
                                             f'{self.config.cycle_timeout_seconds}s for {project_id}'
                                         )
+                                        await self.buffer.restore_drained(project_id)
                                     finally:
                                         heartbeat_task.cancel()
                                         with suppress(asyncio.CancelledError):
@@ -391,6 +392,7 @@ class ReconciliationHarness:
                 'traceback': traceback.format_exc(),
             }
             await self.journal.complete_run(run_id, 'failed')
+            await self.buffer.restore_drained(project_id)
             logger.error(f'Reconciliation failed: {e}')
             self._escalate(
                 'recon_failure', run_id,
@@ -466,6 +468,7 @@ class BacklogIterator:
                     'recon_backlog_overflow', chunk_id,
                     f'Backlog chunk {chunk_num} failed, stopping iteration: {e}',
                 )
+                await self.buffer.restore_drained(project_id)
                 return  # Stop iteration on failure
 
         # Final consolidation pass
@@ -481,3 +484,4 @@ class BacklogIterator:
                 )
             except Exception as e:
                 logger.error(f'Backlog final consolidation failed: {e}')
+                await self.buffer.restore_drained(project_id)

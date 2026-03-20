@@ -90,6 +90,31 @@ async def get_watermarks(db_path: Path, *, project_id: str = 'dark_factory') -> 
     }
 
 
+async def get_last_attempted_run(
+    db_path: Path, *, project_id: str = 'dark_factory',
+) -> dict | None:
+    """Return the most recent run regardless of status."""
+    try:
+        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                'SELECT id, status, started_at, completed_at'
+                ' FROM runs WHERE project_id = ?'
+                ' ORDER BY started_at DESC LIMIT 1',
+                (project_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+    except (FileNotFoundError, sqlite3.OperationalError):
+        logger.debug('get_last_attempted_run: DB unavailable at %s', db_path, exc_info=True)
+        return None
+    if row is None:
+        return None
+    return {
+        'id': row['id'], 'status': row['status'],
+        'started_at': row['started_at'], 'completed_at': row['completed_at'],
+    }
+
+
 _BUFFER_STATS_DEFAULT = {'buffered_count': 0, 'oldest_event_age_seconds': None}
 
 

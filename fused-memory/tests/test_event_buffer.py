@@ -470,6 +470,137 @@ async def test_agent_id_none_excluded_from_burst(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_restore_drained_moves_events_back_to_buffered(buf):
+    """Push 3, drain, restore → count should be 3 again."""
+    for _ in range(3):
+        await buf.push(_make_event())
+
+    await buf.drain('test-project')
+    assert (await buf.get_buffer_stats('test-project'))['size'] == 0
+
+    restored = await buf.restore_drained('test-project')
+    assert restored == 3
+    assert (await buf.get_buffer_stats('test-project'))['size'] == 3
+
+
+@pytest.mark.asyncio
+async def test_restore_drained_returns_zero_when_empty(buf):
+    """Restore on empty buffer returns 0."""
+    restored = await buf.restore_drained('test-project')
+    assert restored == 0
+
+
+@pytest.mark.asyncio
+async def test_restore_drained_only_affects_target_project(tmp_path):
+    """Multi-project isolation — restore only affects the specified project."""
+    buf = EventBuffer(db_path=tmp_path / 'multi.db', buffer_size_threshold=5)
+    await buf.initialize()
+    try:
+        await buf.push(_make_event(project_id='project-a'))
+        await buf.push(_make_event(project_id='project-b'))
+
+        await buf.drain('project-a')
+        await buf.drain('project-b')
+
+        restored = await buf.restore_drained('project-a')
+        assert restored == 1
+        assert (await buf.get_buffer_stats('project-a'))['size'] == 1
+        assert (await buf.get_buffer_stats('project-b'))['size'] == 0
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_expire_stale_bursts_transitions_old_agents(tmp_path):
+    """Old burst → idle after cooldown."""
+    buf = EventBuffer(
+        db_path=tmp_path / 'expire.db',
+        burst_window_seconds=30.0,
+        burst_cooldown_seconds=150.0,
+    )
+    await buf.initialize()
+    try:
+        old_time = datetime.now(UTC) - timedelta(seconds=200)
+        await buf.push(_make_event(agent_id='agent-1', timestamp=old_time))
+        await buf.push(_make_event(agent_id='agent-1', timestamp=old_time + timedelta(seconds=1)))
+
+        expired = await buf.expire_stale_bursts()
+        assert expired == 1
+
+        db = buf._require_db()
+        async with db.execute(
+            "SELECT state FROM burst_state WHERE agent_id = 'agent-1'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row['state'] == 'idle'
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_expire_stale_bursts_preserves_recent_bursts(tmp_path):
+    """Recent burst should remain unchanged."""
+    buf = EventBuffer(
+        db_path=tmp_path / 'recent_burst.db',
+        burst_window_seconds=30.0,
+        burst_cooldown_seconds=150.0,
+    )
+    await buf.initialize()
+    try:
+        now = datetime.now(UTC)
+        await buf.push(_make_event(agent_id='agent-1', timestamp=now))
+        await buf.push(_make_event(agent_id='agent-1', timestamp=now + timedelta(seconds=1)))
+
+        expired = await buf.expire_stale_bursts()
+        assert expired == 0
+
+        db = buf._require_db()
+        async with db.execute(
+            "SELECT state FROM burst_state WHERE agent_id = 'agent-1'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row['state'] == 'bursting'
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_should_trigger_expires_bursts_when_buffer_empty(tmp_path):
+    """Empty buffer still expires stale bursts via should_trigger."""
+    buf = EventBuffer(
+        db_path=tmp_path / 'empty_expire.db',
+        burst_cooldown_seconds=150.0,
+    )
+    await buf.initialize()
+    try:
+        # Create a stale burst state directly
+        old_time = datetime.now(UTC) - timedelta(seconds=200)
+        db = buf._require_db()
+        await db.execute(
+            """INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)
+               VALUES (?, 'bursting', ?, ?)""",
+            ('agent-1', old_time.isoformat(), old_time.isoformat()),
+        )
+        await db.commit()
+
+        # should_trigger with empty buffer
+        should, _ = await buf.should_trigger('test-project')
+        assert not should
+
+        # But the burst should have been expired
+        async with db.execute(
+            "SELECT state FROM burst_state WHERE agent_id = 'agent-1'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row['state'] == 'idle'
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
 async def test_cleanup_drained(tmp_path):
     """Drained events older than cutoff get cleaned up."""
     buf = EventBuffer(db_path=tmp_path / 'cleanup.db')

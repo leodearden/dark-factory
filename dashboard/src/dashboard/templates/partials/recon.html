@@ -51,8 +51,19 @@
     <div class="bg-gray-800 rounded-lg p-6">
       <h3 class="text-lg font-semibold text-gray-100 mb-4">Watermarks</h3>
       <div class="space-y-3">
+        <div class="flex justify-between items-center">
+          <span class="text-gray-400">Last attempted run</span>
+          <span class="text-white">
+            {% if last_attempted %}
+              {{ last_attempted.completed_at or last_attempted.started_at | timeago }}
+              {{ status_badge(last_attempted.status, aria_label='Last attempted run status') }}
+            {% else %}
+              never
+            {% endif %}
+          </span>
+        </div>
         <div class="flex justify-between">
-          <span class="text-gray-400">Last full run</span>
+          <span class="text-gray-400">Last successful run</span>
           <span class="text-white">{{ watermarks.get('last_full_run_completed') | timeago }}</span>
         </div>
         <div class="flex justify-between">

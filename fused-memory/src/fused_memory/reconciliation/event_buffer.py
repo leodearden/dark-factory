@@ -193,6 +193,8 @@ class EventBuffer:
         count = row['cnt'] if row else 0
         oldest_str = row['oldest'] if row else None
 
+        await self.expire_stale_bursts()
+
         if count == 0:
             return False, ''
 
@@ -236,21 +238,26 @@ class EventBuffer:
         ) as cursor:
             return await cursor.fetchone() is not None
 
-    async def _is_quiescent(self) -> bool:
-        """System is quiescent when no agent is bursting and durable queue is idle."""
+    async def expire_stale_bursts(self) -> int:
+        """Transition 'bursting' agents to 'idle' when cooldown has elapsed."""
         db = self._require_db()
-
-        # Expire stale bursts (cooldown elapsed since last write)
         cooldown_cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - self.burst_cooldown_seconds,
             tz=UTC,
         ).isoformat()
-        await db.execute(
-            """UPDATE burst_state SET state = 'idle', burst_started_at = NULL
-               WHERE state = 'bursting' AND last_write_at < ?""",
+        cursor = await db.execute(
+            "UPDATE burst_state SET state = 'idle', burst_started_at = NULL "
+            "WHERE state = 'bursting' AND last_write_at < ?",
             (cooldown_cutoff,),
         )
         await db.commit()
+        return cursor.rowcount
+
+    async def _is_quiescent(self) -> bool:
+        """System is quiescent when no agent is bursting and durable queue is idle."""
+        db = self._require_db()
+
+        await self.expire_stale_bursts()
 
         # Any agents still bursting?
         async with db.execute(
@@ -349,6 +356,20 @@ class EventBuffer:
                 payload=json.loads(row['payload']),
             ))
         return events
+
+    async def restore_drained(self, project_id: str) -> int:
+        """Restore drained events to 'buffered' after a failed run."""
+        db = self._require_db()
+        cursor = await db.execute(
+            "UPDATE event_buffer SET status = 'buffered' "
+            "WHERE project_id = ? AND status = 'drained'",
+            (project_id,),
+        )
+        await db.commit()
+        count = cursor.rowcount
+        if count:
+            logger.info(f'Restored {count} drained events to buffered for {project_id}')
+        return count
 
     async def count_buffered(self, project_id: str) -> int:
         """Return count of buffered events for a project."""

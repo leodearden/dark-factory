@@ -69,9 +69,9 @@ taskmaster:
 reconciliation:
   enabled: true
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
-  buffer_size_threshold: 500
+  buffer_size_threshold: 250
   max_staleness_seconds: 14400
-  conditional_trigger_ratio: 0.33
+  conditional_trigger_ratio: 0.2
   burst_window_seconds: 30
   burst_cooldown_seconds: 150
   stale_lock_seconds: 7200

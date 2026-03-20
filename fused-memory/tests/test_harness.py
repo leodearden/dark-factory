@@ -114,6 +114,43 @@ async def test_journal_run_lifecycle(journal):
     assert loaded.status == 'completed'
 
 
+@pytest.mark.asyncio
+async def test_run_full_cycle_restores_events_on_failure(journal, event_buffer, mock_memory_service):
+    """Failed stage should restore drained events to buffered."""
+    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+    from fused_memory.reconciliation.harness import ReconciliationHarness
+
+    config = FusedMemoryConfig(
+        reconciliation=ReconciliationConfig(
+            enabled=True,
+            explore_codebase_root='/tmp/test',
+            agent_llm_provider='anthropic',
+            agent_llm_model='claude-sonnet-4-20250514',
+        )
+    )
+
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+
+    harness = ReconciliationHarness(
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        journal=journal,
+        event_buffer=event_buffer,
+        config=config,
+    )
+
+    # Make first stage raise
+    harness.stages[0].run = AsyncMock(side_effect=RuntimeError('stage exploded'))
+
+    with pytest.raises(RuntimeError, match='stage exploded'):
+        await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+    # Events should be restored to buffered
+    stats = await event_buffer.get_buffer_stats('test-project')
+    assert stats['size'] == 2
+
+
 # ── Tests for harness extracting project_root from events (step-9) ────
 
 

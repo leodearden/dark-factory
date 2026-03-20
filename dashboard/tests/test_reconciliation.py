@@ -121,6 +121,57 @@ class TestGetWatermarks:
         assert result == {}
 
 
+class TestGetLastAttemptedRun:
+    """Tests for get_last_attempted_run."""
+
+    async def test_happy_path_returns_most_recent_run(self, reconciliation_db):
+        """Returns the most recent run regardless of status."""
+        from dashboard.data.reconciliation import get_last_attempted_run
+
+        result = await get_last_attempted_run(reconciliation_db, project_id='dark_factory')
+
+        assert result is not None
+        assert result['id'] == 'run-002'  # Most recent by started_at
+        assert set(result.keys()) == {'id', 'status', 'started_at', 'completed_at'}
+
+    async def test_failed_most_recent(self, tmp_path):
+        """Returns a failed run when it's the most recent."""
+        import sqlite3
+
+        from dashboard.data.reconciliation import get_last_attempted_run
+
+        db_path = tmp_path / 'failed.db'
+        conn = sqlite3.connect(str(db_path))
+        from tests.conftest import RECONCILIATION_SCHEMA
+        conn.executescript(RECONCILIATION_SCHEMA)
+        conn.execute(
+            "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
+            "completed_at, events_processed, status) "
+            "VALUES ('run-f1', 'dark_factory', 'full', 'test', '2026-03-19T12:00:00', "
+            "'2026-03-19T12:01:00', 5, 'failed')"
+        )
+        conn.commit()
+        conn.close()
+
+        result = await get_last_attempted_run(db_path, project_id='dark_factory')
+        assert result is not None
+        assert result['status'] == 'failed'
+
+    async def test_empty_table(self, empty_reconciliation_db):
+        """Returns None when runs table has no data."""
+        from dashboard.data.reconciliation import get_last_attempted_run
+
+        result = await get_last_attempted_run(empty_reconciliation_db, project_id='dark_factory')
+        assert result is None
+
+    async def test_missing_db_file(self, missing_db_path):
+        """Returns None when database file does not exist."""
+        from dashboard.data.reconciliation import get_last_attempted_run
+
+        result = await get_last_attempted_run(missing_db_path, project_id='dark_factory')
+        assert result is None
+
+
 class TestGetBufferStats:
     """Tests for get_buffer_stats."""
 

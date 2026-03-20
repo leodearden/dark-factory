@@ -18,6 +18,7 @@ from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.reconciliation import (
     get_buffer_stats,
     get_burst_state,
+    get_last_attempted_run,
     get_latest_verdict,
     get_recent_runs,
     get_watermarks,
@@ -123,12 +124,13 @@ async def partials_recon(request: Request):
     config = request.app.state.config
     db = config.reconciliation_db
 
-    buffer_stats, burst_state, watermarks, verdict, runs = await asyncio.gather(
+    buffer_stats, burst_state, watermarks, verdict, runs, last_attempted = await asyncio.gather(
         get_buffer_stats(db),
         get_burst_state(db),
         get_watermarks(db),
         get_latest_verdict(db),
         get_recent_runs(db),
+        get_last_attempted_run(db),
     )
 
     return templates.TemplateResponse(
@@ -139,6 +141,7 @@ async def partials_recon(request: Request):
             'watermarks': watermarks,
             'verdict': verdict,
             'runs': runs,
+            'last_attempted': last_attempted,
         },
     )
 
