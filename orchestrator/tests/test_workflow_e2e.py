@@ -915,6 +915,92 @@ class TestArtifactsIntegrity:
 
 
 # ---------------------------------------------------------------------------
+# Tests: Plan Lock and Provenance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPlanLockAndProvenance:
+    """Workflow acquires plan.lock and stamps provenance after planning."""
+
+    async def test_workflow_has_unique_session_id(
+        self, config, git_ops, task_assignment
+    ):
+        """TaskWorkflow generates a unique session_id in __init__."""
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+        assert hasattr(workflow, 'session_id')
+        assert workflow.session_id.startswith('42-')
+        assert len(workflow.session_id) > 4  # more than just task_id
+
+    async def test_plan_phase_creates_lock_and_stamps_provenance(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """After _plan() completes, plan.lock exists and plan.json has provenance."""
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+        assert outcome == WorkflowOutcome.DONE
+
+        # Worktree is cleaned up on success — capture artifacts before run
+        # We can check via the workflow's plan (stamped in-memory)
+        assert '_session_id' in workflow.plan
+        assert '_created_at' in workflow.plan
+        assert workflow.plan['_session_id'] == workflow.session_id
+
+    async def test_plan_phase_creates_lock_and_stamps_provenance_captured(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Capture plan before cleanup to verify lock file and provenance."""
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        captured_plan: dict = {}
+        lock_existed: list[bool] = []
+
+        original_cleanup = git_ops.cleanup_worktree
+
+        async def capture_then_cleanup(worktree, branch):
+            nonlocal captured_plan
+            from orchestrator.artifacts import TaskArtifacts
+            arts = TaskArtifacts(worktree)
+            captured_plan = arts.read_plan()
+            lock_existed.append(arts.is_plan_locked())
+            await original_cleanup(worktree, branch)
+
+        git_ops.cleanup_worktree = capture_then_cleanup
+
+        outcome = await workflow.run()
+        assert outcome == WorkflowOutcome.DONE
+
+        # plan.lock must have been created
+        assert lock_existed == [True]
+
+        # plan.json must contain provenance matching workflow session_id
+        assert captured_plan.get('_session_id') == workflow.session_id
+        assert '_created_at' in captured_plan
+
+
+# ---------------------------------------------------------------------------
 # Tests: Task Failure Escalation
 # ---------------------------------------------------------------------------
 
