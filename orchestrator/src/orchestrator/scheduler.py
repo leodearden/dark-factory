@@ -190,12 +190,11 @@ class Scheduler:
                     for t in tasks:
                         tid = str(t.get('id', ''))
                         s = t.get('status', '')
-                        if tid and s:
-                            if (
-                                tid not in self._status_cache
-                                or self._status_cache[tid] not in TERMINAL_STATUSES
-                            ):
-                                self._status_cache[tid] = s
+                        if tid and s and (
+                            tid not in self._status_cache
+                            or self._status_cache[tid] not in TERMINAL_STATUSES
+                        ):
+                            self._status_cache[tid] = s
                     return tasks
         except Exception as e:
             logger.error(f'Failed to fetch tasks: {e}')
