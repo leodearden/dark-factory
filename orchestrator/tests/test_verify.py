@@ -5,7 +5,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from orchestrator.config import ModuleConfig
-from orchestrator.verify import _run_cmd, run_scoped_verification, run_verification
+from orchestrator.verify import (
+    _run_cmd,
+    _scope_command,
+    run_scoped_verification,
+    run_verification,
+)
 
 # ---------------------------------------------------------------------------
 # _run_cmd: executable parameter
@@ -279,3 +284,53 @@ class TestRunScopedVerification:
         result = asyncio.run(run_scoped_verification(tmp_path, config, [mc1, mc2]))
         assert 'test-a' in result.test_output
         assert 'test-b' in result.test_output
+
+
+# ---------------------------------------------------------------------------
+# _scope_command: replace path args with specific files
+# ---------------------------------------------------------------------------
+
+
+class TestScopeCommand:
+    """Tests for _scope_command(cmd, tool_keyword, files)."""
+
+    def test_ruff_check_replaces_paths(self):
+        """Basic ruff check: directory args replaced with specific file."""
+        cmd = 'uv run --project fused-memory --directory fused-memory ruff check src/ tests/'
+        result = _scope_command(cmd, 'ruff check', ['src/verify.py'])
+        assert result == 'uv run --project fused-memory --directory fused-memory ruff check src/verify.py'
+
+    def test_pyright_replaces_paths(self):
+        """Pyright: directory args replaced with specific file."""
+        cmd = 'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
+        result = _scope_command(cmd, 'pyright', ['src/orchestrator/verify.py'])
+        assert result == 'uv run --project orchestrator --directory orchestrator pyright src/orchestrator/verify.py'
+
+    def test_pytest_preserves_flags(self):
+        """Pytest: --tb and -q flags are preserved after file list."""
+        cmd = 'uv run --project orchestrator --directory orchestrator pytest tests/ --tb=short -q'
+        result = _scope_command(cmd, 'pytest', ['tests/test_verify.py'])
+        assert result == 'uv run --project orchestrator --directory orchestrator pytest tests/test_verify.py --tb=short -q'
+
+    def test_pytest_multiple_files_with_flags(self):
+        """Multiple files and multiple flags are all included."""
+        cmd = 'pytest tests/ --tb=short -q'
+        result = _scope_command(cmd, 'pytest', ['tests/test_a.py', 'tests/test_b.py'])
+        assert result == 'pytest tests/test_a.py tests/test_b.py --tb=short -q'
+
+    def test_returns_none_when_cmd_is_none(self):
+        """None cmd → None result."""
+        result = _scope_command(None, 'ruff check', ['src/foo.py'])
+        assert result is None
+
+    def test_returns_none_when_files_empty(self):
+        """Empty files list → None result."""
+        cmd = 'ruff check src/ tests/'
+        result = _scope_command(cmd, 'ruff check', [])
+        assert result is None
+
+    def test_returns_original_when_tool_not_found(self):
+        """Tool keyword not in command → original command returned unchanged."""
+        cmd = 'echo hello world'
+        result = _scope_command(cmd, 'ruff check', ['src/foo.py'])
+        assert result == cmd
