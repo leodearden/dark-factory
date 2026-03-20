@@ -59,9 +59,8 @@ class TestDismissStaleEscalations:
     async def test_has_escalation_false_is_noop(self, harness: Harness, caplog):
         """When HAS_ESCALATION is False, method is a no-op with no side effects."""
         harness._escalation_queue = None
-        with patch('orchestrator.harness.HAS_ESCALATION', False):
-            with caplog.at_level(logging.INFO):
-                await harness._dismiss_stale_escalations()
+        with patch('orchestrator.harness.HAS_ESCALATION', False), caplog.at_level(logging.INFO):
+            await harness._dismiss_stale_escalations()
 
         assert 'dismissed' not in caplog.text.lower()
 

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from escalation.models import Escalation
 
@@ -48,10 +49,8 @@ class EscalationQueue:
             os.rename(tmp_path, str(path))
         except Exception:
             # Clean up tmp on failure
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass
             raise
 
         logger.info(f'Escalation submitted: {escalation.id} [{escalation.severity}]')
@@ -81,9 +80,8 @@ class EscalationQueue:
         for path in self.queue_dir.glob('esc-*.json'):
             try:
                 esc = Escalation.from_json(path.read_text())
-                if esc.task_id == task_id:
-                    if status is None or esc.status == status:
-                        results.append(esc)
+                if esc.task_id == task_id and (status is None or esc.status == status):
+                    results.append(esc)
             except (json.JSONDecodeError, KeyError):
                 continue
         return results
@@ -120,10 +118,8 @@ class EscalationQueue:
                 f.write(esc.to_json())
             os.rename(tmp_path, str(path))
         except Exception:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass
             raise
 
         logger.info(f'Escalation {escalation_id} {esc.status}: {resolution[:100]}')
