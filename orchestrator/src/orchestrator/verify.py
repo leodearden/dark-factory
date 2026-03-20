@@ -43,6 +43,58 @@ def _scope_command(cmd: str | None, tool_keyword: str, files: list[str]) -> str 
     return ' '.join(parts)
 
 
+def _is_test_file(path: str) -> bool:
+    """Return True when *path* looks like a test file."""
+    name = path.rsplit('/', 1)[-1]
+    return (
+        name.startswith('test_')
+        or name.endswith('_test.py')
+        or name == 'conftest.py'
+        or '/tests/' in path
+        or path.startswith('tests/')
+    )
+
+
+def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig:
+    """Narrow *mc*'s commands to the specific *task_files* it covers.
+
+    Filters *task_files* to those matching ``mc.prefix + '/'``, strips the
+    prefix, then calls :func:`_scope_command` to replace broad path args with
+    the specific files.
+
+    Returns the original *mc* when no ``.py`` files from *task_files* fall
+    under the prefix.
+    """
+    prefix = mc.prefix + '/'
+    # Strip prefix and filter to .py files
+    scoped: list[str] = []
+    for f in task_files:
+        if f.startswith(prefix):
+            stripped = f[len(prefix):]
+            if stripped.endswith('.py'):
+                scoped.append(stripped)
+
+    if not scoped:
+        return mc
+
+    test_files = [f for f in scoped if _is_test_file(f)]
+
+    # Build scoped commands; None when no applicable files exist
+    lint_cmd = _scope_command(mc.lint_command, 'ruff check', scoped)
+    type_cmd = _scope_command(mc.type_check_command, 'pyright', scoped)
+    test_cmd = _scope_command(mc.test_command, 'pytest', test_files) if test_files else None
+
+    return ModuleConfig(
+        prefix=mc.prefix,
+        lint_command=lint_cmd,
+        type_check_command=type_cmd,
+        test_command=test_cmd,
+        lock_depth=mc.lock_depth,
+        max_per_module=mc.max_per_module,
+        module_overrides=mc.module_overrides,
+    )
+
+
 @dataclass
 class VerifyResult:
     passed: bool
