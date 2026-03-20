@@ -177,10 +177,19 @@ class TestIterationLog:
         assert len(corrupted) == 3
 
 
+VALID_PLAN_WITH_STEPS = {
+    'task_id': 'task-1',
+    'title': 'Test Task',
+    'steps': [
+        {'id': 'step-1', 'type': 'test', 'description': 'Write test', 'status': 'pending'},
+    ],
+}
+
+
 class TestPlanProvenance:
     def test_stamp_plan_provenance_adds_session_id_and_created_at(self, artifacts: TaskArtifacts):
-        plan = {'task_id': 'task-1', 'steps': []}
-        artifacts.write_plan(plan)
+        # Must use a valid plan with at least one step (empty steps raises ValueError)
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
         updated = artifacts.read_plan()
         assert updated['_session_id'] == 'session-abc123'
@@ -200,22 +209,50 @@ class TestPlanProvenance:
         assert len(updated['steps']) == 1
 
     def test_validate_plan_owner_true_for_matching_session(self, artifacts: TaskArtifacts):
-        plan = {'task_id': 'task-1', 'steps': []}
-        artifacts.write_plan(plan)
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
         assert artifacts.validate_plan_owner('session-abc123') is True
 
     def test_validate_plan_owner_false_for_mismatched_session(self, artifacts: TaskArtifacts):
-        plan = {'task_id': 'task-1', 'steps': []}
-        artifacts.write_plan(plan)
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
         assert artifacts.validate_plan_owner('session-different') is False
 
     def test_validate_plan_owner_false_when_no_provenance(self, artifacts: TaskArtifacts):
-        plan = {'task_id': 'task-1', 'steps': []}
-        artifacts.write_plan(plan)
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
         # Not stamped — no _session_id in plan
         assert artifacts.validate_plan_owner('session-abc123') is False
+
+    def test_stamp_plan_provenance_raises_on_missing_plan(self, artifacts: TaskArtifacts):
+        """stamp_plan_provenance() must raise ValueError if plan.json does not exist."""
+        # Ensure plan.json does not exist
+        plan_path = artifacts.root / 'plan.json'
+        assert not plan_path.exists()
+
+        with pytest.raises(ValueError, match='valid plan'):
+            artifacts.stamp_plan_provenance('session-abc123')
+
+    def test_stamp_plan_provenance_raises_on_empty_plan(self, artifacts: TaskArtifacts):
+        """stamp_plan_provenance() must raise ValueError if plan.json has no steps key."""
+        # Write a plan with no 'steps' key at all
+        (artifacts.root / 'plan.json').write_text('{}')
+
+        with pytest.raises(ValueError, match='valid plan'):
+            artifacts.stamp_plan_provenance('session-abc123')
+
+    def test_stamp_plan_provenance_raises_on_provenance_only_stub(self, artifacts: TaskArtifacts):
+        """stamp_plan_provenance() must raise ValueError on a provenance-only stub.
+
+        A stub with only _session_id/_created_at (no steps) passes bool() checks but
+        has no actual plan content — stamping it silently would hide data loss.
+        """
+        stub = {'_session_id': 'old-session', '_created_at': '2026-01-01T00:00:00+00:00'}
+        (artifacts.root / 'plan.json').write_text(
+            __import__('json').dumps(stub)
+        )
+
+        with pytest.raises(ValueError, match='valid plan'):
+            artifacts.stamp_plan_provenance('session-abc123')
 
     def test_validate_plan_owner_returns_false_on_corrupt_plan_json(
         self, artifacts: TaskArtifacts
