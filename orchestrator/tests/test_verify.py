@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from orchestrator.config import ModuleConfig
 from orchestrator.verify import (
+    _build_fallback_config,
     _run_cmd,
     _scope_command,
     run_scoped_verification,
@@ -420,3 +421,53 @@ class TestScopeModuleConfig:
         assert 'src/orchestrator/verify.py' in result.lint_command
         assert 'tests/test_verify.py' in result.lint_command
         assert 'tests/test_verify.py' in result.test_command
+
+
+# ---------------------------------------------------------------------------
+# _build_fallback_config: synthetic ModuleConfig from task file list
+# ---------------------------------------------------------------------------
+
+
+class TestBuildFallbackConfig:
+    """Tests for _build_fallback_config(task_files)."""
+
+    def test_source_and_test_files_all_commands(self):
+        """Source + test .py files → ModuleConfig with all three commands."""
+        task_files = [
+            'orchestrator/src/orchestrator/verify.py',
+            'orchestrator/tests/test_verify.py',
+        ]
+        result = _build_fallback_config(task_files)
+        assert result is not None
+        assert result.prefix == '__fallback__'
+        assert result.lint_command is not None
+        assert 'ruff check' in result.lint_command
+        assert 'orchestrator/src/orchestrator/verify.py' in result.lint_command
+        assert 'orchestrator/tests/test_verify.py' in result.lint_command
+        assert result.type_check_command is not None
+        assert 'pyright' in result.type_check_command
+        assert result.test_command is not None
+        assert 'pytest' in result.test_command
+        assert 'orchestrator/tests/test_verify.py' in result.test_command
+        # Source file should NOT appear in pytest command
+        assert 'orchestrator/src/orchestrator/verify.py' not in result.test_command
+
+    def test_only_source_files_no_test_command(self):
+        """Only source .py files → test_command is None."""
+        task_files = ['orchestrator/src/orchestrator/verify.py']
+        result = _build_fallback_config(task_files)
+        assert result is not None
+        assert result.test_command is None
+        assert result.lint_command is not None
+        assert result.type_check_command is not None
+
+    def test_empty_list_returns_none(self):
+        """Empty list → None."""
+        result = _build_fallback_config([])
+        assert result is None
+
+    def test_only_non_py_files_returns_none(self):
+        """Only .yaml and .md files → None (no .py to check)."""
+        task_files = ['orchestrator/orchestrator.yaml', 'README.md']
+        result = _build_fallback_config(task_files)
+        assert result is None
