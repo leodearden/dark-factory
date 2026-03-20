@@ -252,9 +252,9 @@ class AgentLoop:
                             'tool_call_id': block['tool_use_id'],
                             'content': block['content'],
                         })
-                    elif hasattr(block, 'type') and block.type == 'text':
+                    elif isinstance(block, _TextBlock):
                         openai_messages.append({'role': role, 'content': block.text})
-                    elif hasattr(block, 'type') and block.type == 'tool_use':
+                    elif isinstance(block, _ToolUseBlock):
                         openai_messages.append({
                             'role': 'assistant',
                             'tool_calls': [{
