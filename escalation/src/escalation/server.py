@@ -17,6 +17,11 @@ CATEGORIES = [
     'risk_identified',
     'infra_issue',
     'task_failure',
+    # Reconciliation categories
+    'recon_failure',
+    'recon_backlog_overflow',
+    'recon_stale_run',
+    'recon_integrity_issue',
 ]
 
 

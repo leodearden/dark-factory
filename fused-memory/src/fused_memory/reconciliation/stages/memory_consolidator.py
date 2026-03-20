@@ -10,63 +10,26 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
-from fused_memory.reconciliation.agent_loop import ToolDefinition
+from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
 
 if TYPE_CHECKING:
-    from fused_memory.reconciliation.verify import CodebaseVerifier
+    pass
 
 
 class MemoryConsolidator(BaseStage):
     """Stage 1: Review and consolidate memories across Graphiti and Mem0."""
 
-    verifier: CodebaseVerifier | None = None
+    # Tier limits — set by harness before run()
+    episode_limit: int = 500
+    memory_limit: int = 1000
 
     def get_system_prompt(self) -> str:
         return STAGE1_SYSTEM_PROMPT
 
-    def get_tools(self) -> dict[str, ToolDefinition]:
-        tools = {}
-        tools.update(self._memory_read_tools())
-        tools.update(self._memory_write_tools())
-
-        if self.verifier:
-            tools['verify_against_codebase'] = self._verify_tool()
-
-        return tools
-
-    def _verify_tool(self) -> ToolDefinition:
-        verifier = self.verifier
-
-        async def verify(claim: str, context: str = '', scope_hints: list[str] | None = None):
-            result = await verifier.verify(
-                claim=claim, context=context, scope_hints=scope_hints, project_id=self.project_id
-            )
-            return result.model_dump()
-
-        return ToolDefinition(
-            name='verify_against_codebase',
-            description=(
-                'Verify a factual claim against the codebase. Spawns a read-only explore agent '
-                'that checks files and git history. Use when you encounter conflicting factual '
-                'claims about the codebase.'
-            ),
-            parameters={
-                'type': 'object',
-                'properties': {
-                    'claim': {'type': 'string', 'description': 'The factual claim to verify'},
-                    'context': {'type': 'string', 'description': 'Additional context'},
-                    'scope_hints': {
-                        'type': 'array',
-                        'items': {'type': 'string'},
-                        'description': 'File paths or directories to focus on',
-                    },
-                },
-                'required': ['claim'],
-            },
-            function=verify,
-        )
+    def get_disallowed_tools(self) -> list[str]:
+        return STAGE1_DISALLOWED
 
     async def assemble_payload(
         self,
@@ -75,7 +38,12 @@ class MemoryConsolidator(BaseStage):
         prior_reports: list[StageReport],
     ) -> str:
         # 1. Episodes since last reconciliation
-        episodes = await self.memory.get_episodes(project_id=self.project_id, last_n=500)
+        try:
+            episodes = await self.memory.get_episodes(
+                project_id=self.project_id, last_n=self.episode_limit
+            )
+        except Exception:
+            episodes = []
         new_episodes = episodes
         if watermark.last_episode_timestamp:
             wm_str = str(watermark.last_episode_timestamp)
@@ -88,7 +56,7 @@ class MemoryConsolidator(BaseStage):
         from fused_memory.models.scope import Scope
         scope = Scope(project_id=self.project_id)
         try:
-            all_memories = await self.memory.mem0.get_all(scope, limit=1000)
+            all_memories = await self.memory.mem0.get_all(scope, limit=self.memory_limit)
             mem0_memories = all_memories.get('results', [])
         except Exception:
             mem0_memories = []
@@ -126,9 +94,10 @@ Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
 2. Within Graphiti: review entity consistency, superseded temporal facts.
 3. Cross-store: check for contradictions between stores. Promote solidified patterns.
-4. If you encounter conflicting factual claims about the codebase, use verify_against_codebase.
-5. Flag any items that are relevant to task planning for Stage 2.
-6. Call stage_complete with your report when done.
+4. Flag any items that are relevant to task planning for Stage 2.
+5. When you have completed your work, produce your final structured report as your response.
+
+Always pass project_id="{self.project_id}" when calling fused-memory MCP tools.
 """
 
 

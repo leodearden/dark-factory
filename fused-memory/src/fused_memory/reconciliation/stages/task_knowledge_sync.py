@@ -1,66 +1,31 @@
-"""Stage 2: Task-Knowledge Sync — reconcile task state against memory state."""
+"""Stage 2: Task-Knowledge Sync — reconcile task state against memory state.
+Stage 3: Cross-System Integrity Check — read-only verification."""
 
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
 
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageReport,
     Watermark,
 )
-from fused_memory.reconciliation.agent_loop import ToolDefinition
+from fused_memory.reconciliation.cli_stage_runner import (
+    STAGE2_DISALLOWED,
+    STAGE3_DISALLOWED,
+)
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
-
-if TYPE_CHECKING:
-    from fused_memory.reconciliation.verify import CodebaseVerifier
 
 
 class TaskKnowledgeSync(BaseStage):
     """Stage 2: Reconcile tasks against memory, attach hints, fix inconsistencies."""
 
-    verifier: CodebaseVerifier | None = None
-
     def get_system_prompt(self) -> str:
         return STAGE2_SYSTEM_PROMPT
 
-    def get_tools(self) -> dict[str, ToolDefinition]:
-        tools = {}
-        tools.update(self._memory_read_tools())
-        tools.update(self._memory_write_tools())
-        tools.update(self._task_read_tools())
-        tools.update(self._task_write_tools())
-
-        if self.verifier:
-            tools['verify_against_codebase'] = self._verify_tool()
-
-        return tools
-
-    def _verify_tool(self) -> ToolDefinition:
-        verifier = self.verifier
-
-        async def verify(claim: str, context: str = '', scope_hints: list[str] | None = None):
-            result = await verifier.verify(
-                claim=claim, context=context, scope_hints=scope_hints, project_id=self.project_id
-            )
-            return result.model_dump()
-
-        return ToolDefinition(
-            name='verify_against_codebase',
-            description='Verify a factual claim against the codebase via read-only explore agent.',
-            parameters={
-                'type': 'object',
-                'properties': {
-                    'claim': {'type': 'string'},
-                    'context': {'type': 'string'},
-                    'scope_hints': {'type': 'array', 'items': {'type': 'string'}},
-                },
-                'required': ['claim'],
-            },
-            function=verify,
-        )
+    def get_disallowed_tools(self) -> list[str]:
+        return STAGE2_DISALLOWED
 
     async def assemble_payload(
         self,
@@ -107,8 +72,8 @@ class TaskKnowledgeSync(BaseStage):
 
 ## Your Task
 Reconcile task state against memory:
-1. For completed tasks: verify knowledge was captured. If sparse, use verify_against_codebase \
-to check repo state, then write appropriate memories.
+1. For completed tasks: verify knowledge was captured. If sparse, search for related memories \
+to check context, then write appropriate memories.
 2. For tasks whose assumptions were invalidated by Stage 1 findings: modify, re-scope, or \
 delete tasks. Update dependent tasks.
 3. For AI-generated tasks: cross-reference against knowledge graph for factual consistency.
@@ -116,54 +81,22 @@ delete tasks. Update dependent tasks.
 Use entity references + semantic queries, NOT inline content.
 5. Check if any knowledge implies new tasks should be created or existing tasks unblocked.
 6. Hints on completed tasks are static — don't update them.
-7. Call stage_complete with your report when done.
+7. When you have completed your work, produce your final structured report as your response.
+
+Always pass project_id="{self.project_id}" when calling fused-memory MCP tools.
+Use project_root="/home/leo/src/dark-factory" for all task operations.
 """
 
 
 class IntegrityCheck(BaseStage):
     """Stage 3: Read-only cross-system consistency verification."""
 
-    # Defined here alongside Stage 2 for import convenience; re-exported from stages/__init__
-
-    verifier: CodebaseVerifier | None = None
-
     def get_system_prompt(self) -> str:
         from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
         return STAGE3_SYSTEM_PROMPT
 
-    def get_tools(self) -> dict[str, ToolDefinition]:
-        tools = {}
-        tools.update(self._memory_read_tools())
-        tools.update(self._task_read_tools())
-
-        if self.verifier:
-            tools['verify_against_codebase'] = self._verify_tool()
-
-        return tools
-
-    def _verify_tool(self) -> ToolDefinition:
-        verifier = self.verifier
-
-        async def verify(claim: str, context: str = '', scope_hints: list[str] | None = None):
-            result = await verifier.verify(
-                claim=claim, context=context, scope_hints=scope_hints, project_id=self.project_id
-            )
-            return result.model_dump()
-
-        return ToolDefinition(
-            name='verify_against_codebase',
-            description='Verify a factual claim against the codebase via read-only explore agent.',
-            parameters={
-                'type': 'object',
-                'properties': {
-                    'claim': {'type': 'string'},
-                    'context': {'type': 'string'},
-                    'scope_hints': {'type': 'array', 'items': {'type': 'string'}},
-                },
-                'required': ['claim'],
-            },
-            function=verify,
-        )
+    def get_disallowed_tools(self) -> list[str]:
+        return STAGE3_DISALLOWED
 
     async def assemble_payload(
         self,
@@ -197,10 +130,11 @@ Verify consistency across all three systems:
 1. Spot-check: do recently modified tasks align with current memory state?
 2. Spot-check: do recently written memories align with task state?
 3. For flagged items: investigate and classify as consistent/inconsistent.
-4. Use verify_against_codebase for any factual disputes.
-5. Report all findings. Inconsistencies found here will be addressed in the next cycle's \
+4. Report all findings. Inconsistencies found here will be addressed in the next cycle's \
 Stage 1 and Stage 2.
-6. Call stage_complete with your report.
+5. When you have completed your work, produce your final structured report as your response.
+
+Always pass project_id="{self.project_id}" when calling fused-memory MCP tools.
 """
 
 

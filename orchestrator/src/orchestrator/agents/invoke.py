@@ -1,4 +1,9 @@
-"""Multi-backend agent invocation: Claude Code, Codex, and Gemini CLIs."""
+"""Multi-backend agent invocation: Claude Code, Codex, and Gemini CLIs.
+
+Claude-specific invocation is delegated to ``shared.cli_invoke`` so that
+other subsystems (e.g. fused-memory reconciliation) can reuse it without
+depending on the orchestrator package.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,15 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+# Re-export shared Claude invocation primitives for backwards compatibility
+from shared.cli_invoke import (  # noqa: F401
+    AgentResult,
+    _SubprocessResult,
+    _parse_claude_output,
+    _run_subprocess,
+    invoke_claude_agent,
+)
 
 if TYPE_CHECKING:
     from shared.usage_gate import UsageGate
@@ -28,81 +42,12 @@ _MODEL_COSTS: dict[str, dict[str, float]] = {
 }
 
 
-@dataclass
-class AgentResult:
-    success: bool
-    output: str
-    cost_usd: float = 0.0
-    duration_ms: int = 0
-    turns: int = 0
-    session_id: str = ''
-    structured_output: Any = None
-    subtype: str = ''
-    stderr: str = ''
-
-
-@dataclass
-class _SubprocessResult:
-    stdout: str
-    stderr: str
-    returncode: int
-    duration_ms: int
-
-
-async def invoke_agent(
-    prompt: str,
-    system_prompt: str,
-    cwd: Path,
-    model: str = 'opus',
-    max_turns: int = 50,
-    max_budget_usd: float = 5.0,
-    allowed_tools: list[str] | None = None,
-    disallowed_tools: list[str] | None = None,
-    mcp_config: dict | None = None,
-    output_schema: dict | None = None,
-    permission_mode: str = 'bypassPermissions',
-    sandbox_modules: list[str] | None = None,
-    effort: str | None = None,
-    backend: str = 'claude',
-    oauth_token: str | None = None,
-) -> AgentResult:
-    """Invoke an agent via CLI and return structured result.
-
-    Dispatches to the appropriate backend (claude, codex, gemini).
-    *oauth_token*, when set, overrides the Claude CLI's default credentials
-    via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
-    """
-    if backend == 'claude':
-        return await _invoke_claude(
-            prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
-            max_turns=max_turns, max_budget_usd=max_budget_usd,
-            allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
-            mcp_config=mcp_config, output_schema=output_schema,
-            permission_mode=permission_mode, sandbox_modules=sandbox_modules,
-            effort=effort, oauth_token=oauth_token,
-        )
-    elif backend == 'codex':
-        return await _invoke_codex(
-            prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
-            max_budget_usd=max_budget_usd, mcp_config=mcp_config,
-            sandbox_modules=sandbox_modules, effort=effort,
-        )
-    elif backend == 'gemini':
-        return await _invoke_gemini(
-            prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
-            max_budget_usd=max_budget_usd, mcp_config=mcp_config,
-            sandbox_modules=sandbox_modules, effort=effort,
-        )
-    else:
-        raise ValueError(f'Unknown backend: {backend!r}')
-
-
 async def invoke_with_cap_retry(
     usage_gate: UsageGate | None,
     label: str,
     **invoke_kwargs,
 ) -> AgentResult:
-    """Invoke an agent, retrying on usage-cap hits with account failover.
+    """Invoke a multi-backend agent, retrying on usage-cap hits with account failover.
 
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
@@ -135,11 +80,59 @@ async def invoke_with_cap_retry(
     return result
 
 
+async def invoke_agent(
+    prompt: str,
+    system_prompt: str,
+    cwd: Path,
+    model: str = 'opus',
+    max_turns: int = 50,
+    max_budget_usd: float = 5.0,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
+    mcp_config: dict | None = None,
+    output_schema: dict | None = None,
+    permission_mode: str = 'bypassPermissions',
+    sandbox_modules: list[str] | None = None,
+    effort: str | None = None,
+    backend: str = 'claude',
+    oauth_token: str | None = None,
+) -> AgentResult:
+    """Invoke an agent via CLI and return structured result.
+
+    Dispatches to the appropriate backend (claude, codex, gemini).
+    *oauth_token*, when set, overrides the Claude CLI's default credentials
+    via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
+    """
+    if backend == 'claude':
+        return await _invoke_claude_with_sandbox(
+            prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
+            max_turns=max_turns, max_budget_usd=max_budget_usd,
+            allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+            mcp_config=mcp_config, output_schema=output_schema,
+            permission_mode=permission_mode, sandbox_modules=sandbox_modules,
+            effort=effort, oauth_token=oauth_token,
+        )
+    elif backend == 'codex':
+        return await _invoke_codex(
+            prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
+            max_budget_usd=max_budget_usd, mcp_config=mcp_config,
+            sandbox_modules=sandbox_modules, effort=effort,
+        )
+    elif backend == 'gemini':
+        return await _invoke_gemini(
+            prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
+            max_budget_usd=max_budget_usd, mcp_config=mcp_config,
+            sandbox_modules=sandbox_modules, effort=effort,
+        )
+    else:
+        raise ValueError(f'Unknown backend: {backend!r}')
+
+
 # ---------------------------------------------------------------------------
-# Claude backend
+# Claude backend — thin wrapper adding sandbox support over shared.cli_invoke
 # ---------------------------------------------------------------------------
 
-async def _invoke_claude(
+async def _invoke_claude_with_sandbox(
     prompt: str,
     system_prompt: str,
     cwd: Path,
@@ -155,106 +148,63 @@ async def _invoke_claude(
     effort: str | None,
     oauth_token: str | None = None,
 ) -> AgentResult:
-    """Invoke Claude Code CLI."""
-    cmd = ['claude', '--print', '--output-format', 'json']
+    """Invoke Claude Code CLI with optional bwrap sandboxing.
 
-    cmd.extend(['--model', model])
-    cmd.extend(['--max-budget-usd', str(max_budget_usd)])
-    cmd.extend(['--system-prompt', system_prompt])
-    cmd.extend(['--permission-mode', permission_mode])
-
-    if effort:
-        cmd.extend(['--effort', effort])
-
-    if allowed_tools:
-        cmd.extend(['--allowed-tools', *allowed_tools])
-    if disallowed_tools:
-        cmd.extend(['--disallowed-tools', *disallowed_tools])
-
-    mcp_config_path = None
-    if mcp_config:
-        fd, mcp_config_path = tempfile.mkstemp(suffix='.json', prefix='mcp_')
-        with open(fd, 'w') as f:
-            json.dump(mcp_config, f)
-        cmd.extend(['--mcp-config', mcp_config_path])
-
-    if output_schema:
-        cmd.extend(['--json-schema', json.dumps(output_schema)])
-
-    cmd.extend(['--', prompt])
-
+    Delegates to shared.cli_invoke for the core invocation; adds
+    orchestrator-specific sandbox wrapping.
+    """
+    # For sandboxed invocations we need to build the command ourselves
+    # and use the lower-level shared primitives
     if sandbox_modules is not None:
         from orchestrator.agents.sandbox import build_bwrap_command, is_bwrap_available
         if is_bwrap_available():
+            # Build command manually to wrap with bwrap
+            cmd = ['claude', '--print', '--output-format', 'json']
+            cmd.extend(['--model', model])
+            cmd.extend(['--max-budget-usd', str(max_budget_usd)])
+            cmd.extend(['--system-prompt', system_prompt])
+            cmd.extend(['--permission-mode', permission_mode])
+            cmd.extend(['--max-turns', str(max_turns)])
+            if effort:
+                cmd.extend(['--effort', effort])
+            if allowed_tools:
+                cmd.extend(['--allowed-tools', *allowed_tools])
+            if disallowed_tools:
+                cmd.extend(['--disallowed-tools', *disallowed_tools])
+
+            mcp_config_path = None
+            if mcp_config:
+                fd, mcp_config_path = tempfile.mkstemp(suffix='.json', prefix='mcp_')
+                with open(fd, 'w') as f:
+                    json.dump(mcp_config, f)
+                cmd.extend(['--mcp-config', mcp_config_path])
+            if output_schema:
+                cmd.extend(['--json-schema', json.dumps(output_schema)])
+            cmd.extend(['--', prompt])
+
             cmd = build_bwrap_command(cmd, cwd, sandbox_modules)
+
+            env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+            if oauth_token:
+                env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
+
+            try:
+                result = await _run_subprocess(cmd, cwd, env, model)
+                return _parse_claude_output(result)
+            finally:
+                if mcp_config_path:
+                    Path(mcp_config_path).unlink(missing_ok=True)
         else:
             logger.warning('Sandbox requested but bwrap unavailable — running unsandboxed')
 
-    # Strip ANTHROPIC_API_KEY so `claude` falls back to OAuth
-    env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
-    # Multi-account failover: inject per-invocation OAuth token
-    if oauth_token:
-        env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
-
-    try:
-        result = await _run_subprocess(cmd, cwd, env, 'claude', model, max_budget_usd)
-        return _parse_claude_output(result)
-    finally:
-        if mcp_config_path:
-            Path(mcp_config_path).unlink(missing_ok=True)
-
-
-def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
-    """Parse Claude Code JSON output into AgentResult."""
-    if not result.stdout.strip():
-        return AgentResult(
-            success=False,
-            output='Agent produced no output',
-            subtype='error_empty_output',
-            stderr=result.stderr,
-        )
-
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return AgentResult(
-            success=result.returncode == 0,
-            output=result.stdout,
-            subtype='text_output',
-            stderr=result.stderr,
-        )
-
-    cost = data.get('cost_usd', data.get('total_cost_usd', 0.0))
-    duration = data.get('duration_ms', 0)
-    turns = data.get('num_turns', 0)
-    session_id = data.get('session_id', '')
-    subtype = data.get('subtype', '')
-    structured = data.get('structured_output')
-
-    output_text = data.get('result', '')
-    if not output_text and isinstance(data.get('messages'), list):
-        parts = []
-        for msg in data['messages']:
-            if msg.get('type') == 'assistant':
-                for block in msg.get('content', []):
-                    if isinstance(block, dict) and block.get('type') == 'text':
-                        parts.append(block['text'])
-                    elif isinstance(block, str):
-                        parts.append(block)
-        output_text = '\n'.join(parts)
-
-    is_success = subtype == 'success' or result.returncode == 0
-
-    return AgentResult(
-        success=is_success,
-        output=output_text,
-        cost_usd=cost,
-        duration_ms=duration,
-        turns=turns,
-        session_id=session_id,
-        structured_output=structured,
-        subtype=subtype,
-        stderr=result.stderr,
+    # No sandbox or bwrap unavailable — use shared invocation
+    return await invoke_claude_agent(
+        prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
+        max_turns=max_turns, max_budget_usd=max_budget_usd,
+        allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+        mcp_config=mcp_config, output_schema=output_schema,
+        permission_mode=permission_mode, effort=effort,
+        oauth_token=oauth_token,
     )
 
 
@@ -306,7 +256,7 @@ async def _invoke_codex(
         # Strip OPENAI_API_KEY if using OAuth
         env = dict(os.environ)
 
-        result = await _run_subprocess(cmd, cwd, env, 'codex', model, max_budget_usd)
+        result = await _run_subprocess_local(cmd, cwd, env, 'codex', model, max_budget_usd)
         return _parse_codex_output(result, model)
 
     finally:
@@ -469,7 +419,7 @@ async def _invoke_gemini(
 
         env = dict(os.environ)
 
-        result = await _run_subprocess(cmd, cwd, env, 'gemini', model, max_budget_usd)
+        result = await _run_subprocess_local(cmd, cwd, env, 'gemini', model, max_budget_usd)
         return _parse_gemini_output(result, model)
 
     finally:
@@ -554,10 +504,10 @@ def _write_gemini_settings(
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers
+# Shared helpers (orchestrator-local, for non-Claude backends)
 # ---------------------------------------------------------------------------
 
-async def _run_subprocess(
+async def _run_subprocess_local(
     cmd: list[str],
     cwd: Path,
     env: dict[str, str],

@@ -78,13 +78,25 @@ reconciliation:
   agent_llm_provider: "claude_cli"
   agent_llm_model: "sonnet"
   agent_max_steps: 50
-  tool_timeout_seconds: ${RECON_TOOL_TIMEOUT:30}
-  stage_timeout_seconds: ${RECON_STAGE_TIMEOUT:600}
-  cycle_timeout_seconds: ${RECON_CYCLE_TIMEOUT:1800}
+  tool_timeout_seconds: ${RECON_TOOL_TIMEOUT:120}
+  stage_timeout_seconds: ${RECON_STAGE_TIMEOUT:3600}
+  cycle_timeout_seconds: ${RECON_CYCLE_TIMEOUT:21600}
   judge_enabled: true
   judge_llm_provider: "claude_cli"
   judge_llm_model: "sonnet"
   explore_codebase_root: "${PROJECT_ROOT:.}"
+  # Escalation
+  escalation_port: ${RECON_ESCALATION_PORT:8103}
+  escalation_host: "127.0.0.1"
+  escalation_queue_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}/escalations"
+  # Tiered models
+  sonnet_model: "sonnet"
+  opus_model: "opus"
+  opus_threshold_ratio: 1.5
+  sonnet_episode_limit: 125
+  sonnet_memory_limit: 250
+  opus_episode_limit: 500
+  opus_memory_limit: 1000
   usage_cap:
     enabled: true
     pause_threshold: 0.96

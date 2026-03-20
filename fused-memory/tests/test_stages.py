@@ -1,187 +1,159 @@
-"""Tests for BaseStage tool closures using correct identifiers."""
+"""Tests for reconciliation stage configuration (CLI-native MCP execution)."""
 
-from unittest.mock import AsyncMock
+import json
 
 import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageId
-from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.cli_stage_runner import (
+    DISALLOW_BUILTIN,
+    DISALLOW_MEMORY_WRITES,
+    DISALLOW_TASK_WRITES,
+    STAGE1_DISALLOWED,
+    STAGE2_DISALLOWED,
+    STAGE3_DISALLOWED,
+    STAGE_REPORT_SCHEMA,
+)
+from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    IntegrityCheck,
+    TaskKnowledgeSync,
+)
 
 
-@pytest.fixture
-def mock_memory_service():
-    svc = AsyncMock()
-    svc.search = AsyncMock(return_value=[])
-    svc.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
-    svc.get_episodes = AsyncMock(return_value=[])
-    svc.get_status = AsyncMock(return_value={'ok': True})
-    svc.add_memory = AsyncMock(return_value=AsyncMock(model_dump=lambda: {}))
-    svc.delete_memory = AsyncMock(return_value={'deleted': True})
-    return svc
+class TestDisallowedToolLists:
+    """Verify per-stage disallowed tool lists are correct."""
+
+    def test_stage1_disallows_task_writes_and_builtins(self):
+        assert set(DISALLOW_TASK_WRITES).issubset(set(STAGE1_DISALLOWED))
+        assert set(DISALLOW_BUILTIN).issubset(set(STAGE1_DISALLOWED))
+
+    def test_stage1_allows_memory_writes(self):
+        for tool in DISALLOW_MEMORY_WRITES:
+            assert tool not in STAGE1_DISALLOWED
+
+    def test_stage2_only_disallows_builtins(self):
+        assert STAGE2_DISALLOWED == DISALLOW_BUILTIN
+
+    def test_stage3_disallows_all_writes(self):
+        assert set(DISALLOW_TASK_WRITES).issubset(set(STAGE3_DISALLOWED))
+        assert set(DISALLOW_MEMORY_WRITES).issubset(set(STAGE3_DISALLOWED))
+        assert set(DISALLOW_BUILTIN).issubset(set(STAGE3_DISALLOWED))
+
+    def test_all_disallowed_have_mcp_prefix(self):
+        """All MCP tools in disallowed lists should use the mcp__ naming convention."""
+        for tool in DISALLOW_TASK_WRITES + DISALLOW_MEMORY_WRITES:
+            assert tool.startswith('mcp__fused-memory__'), f'{tool} missing MCP prefix'
+
+    def test_builtin_disallowed_are_claude_native(self):
+        """Builtin disallowed should be Claude Code native tools."""
+        for tool in DISALLOW_BUILTIN:
+            assert not tool.startswith('mcp__'), f'{tool} should not have MCP prefix'
 
 
-@pytest.fixture
-def mock_taskmaster():
-    tm = AsyncMock()
-    tm.get_tasks = AsyncMock(return_value={'tasks': []})
-    tm.get_task = AsyncMock(return_value={'id': '1', 'title': 'Test'})
-    tm.set_task_status = AsyncMock(return_value={'success': True})
-    tm.update_task = AsyncMock(return_value={'success': True})
-    tm.add_task = AsyncMock(return_value={'id': '2'})
-    tm.add_subtask = AsyncMock(return_value={'id': '1.1'})
-    tm.remove_task = AsyncMock(return_value={'success': True})
-    tm.add_dependency = AsyncMock(return_value={'success': True})
-    tm.remove_dependency = AsyncMock(return_value={'success': True})
-    return tm
+class TestStageSubclasses:
+    """Each stage subclass returns the correct disallowed list."""
 
-
-@pytest.fixture
-def config():
-    return ReconciliationConfig(
-        enabled=True,
-        explore_codebase_root='/tmp/test',
-        agent_llm_provider='anthropic',
-        agent_llm_model='claude-sonnet-4-20250514',
-    )
-
-
-@pytest.fixture
-def stage(mock_memory_service, mock_taskmaster, config):
-    journal = AsyncMock()
-    s = BaseStage(StageId.memory_consolidator, mock_memory_service, mock_taskmaster, journal, config)
-    s.project_id = 'dark_factory'
-    s.project_root = '/home/leo/src/dark-factory'
-    return s
-
-
-class TestMemoryReadToolsUseProjectId:
-    """Memory read tools should use self.project_id (logical)."""
-
-    @pytest.mark.asyncio
-    async def test_search_uses_project_id(self, stage, mock_memory_service):
-        tools = stage._memory_read_tools()
-        await tools['search'].function(query='test query')
-        mock_memory_service.search.assert_called_once()
-        assert mock_memory_service.search.call_args.kwargs['project_id'] == 'dark_factory'
-
-    @pytest.mark.asyncio
-    async def test_get_entity_uses_project_id(self, stage, mock_memory_service):
-        tools = stage._memory_read_tools()
-        await tools['get_entity'].function(name='TestEntity')
-        mock_memory_service.get_entity.assert_called_once()
-        assert mock_memory_service.get_entity.call_args.kwargs['project_id'] == 'dark_factory'
-
-    @pytest.mark.asyncio
-    async def test_get_episodes_uses_project_id(self, stage, mock_memory_service):
-        tools = stage._memory_read_tools()
-        await tools['get_episodes'].function()
-        mock_memory_service.get_episodes.assert_called_once()
-        assert mock_memory_service.get_episodes.call_args.kwargs['project_id'] == 'dark_factory'
-
-
-class TestMemoryWriteToolsUseProjectId:
-    """Memory write tools should use self.project_id (logical)."""
-
-    @pytest.mark.asyncio
-    async def test_add_memory_uses_project_id(self, stage, mock_memory_service):
-        tools = stage._memory_write_tools()
-        await tools['add_memory'].function(content='test content')
-        mock_memory_service.add_memory.assert_called_once()
-        assert mock_memory_service.add_memory.call_args.kwargs['project_id'] == 'dark_factory'
-
-    @pytest.mark.asyncio
-    async def test_delete_memory_uses_project_id(self, stage, mock_memory_service):
-        tools = stage._memory_write_tools()
-        await tools['delete_memory'].function(memory_id='m1', store='mem0')
-        mock_memory_service.delete_memory.assert_called_once()
-        assert mock_memory_service.delete_memory.call_args.kwargs['project_id'] == 'dark_factory'
-
-
-class TestTaskReadToolsUseProjectRoot:
-    """Task read tools should use self.project_root (filesystem path)."""
-
-    @pytest.mark.asyncio
-    async def test_get_tasks_uses_project_root(self, stage, mock_taskmaster):
-        tools = stage._task_read_tools()
-        await tools['get_tasks'].function()
-        mock_taskmaster.get_tasks.assert_called_once_with(
-            project_root='/home/leo/src/dark-factory'
+    @pytest.fixture
+    def config(self):
+        return ReconciliationConfig(
+            enabled=True,
+            explore_codebase_root='/tmp/test',
         )
 
-    @pytest.mark.asyncio
-    async def test_get_task_uses_project_root(self, stage, mock_taskmaster):
-        tools = stage._task_read_tools()
-        await tools['get_task'].function(id='1')
-        mock_taskmaster.get_task.assert_called_once_with(
-            task_id='1', project_root='/home/leo/src/dark-factory'
+    @pytest.fixture
+    def mock_deps(self, config):
+        from unittest.mock import AsyncMock
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def test_memory_consolidator_disallowed(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        assert stage.get_disallowed_tools() == STAGE1_DISALLOWED
+
+    def test_task_knowledge_sync_disallowed(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        assert stage.get_disallowed_tools() == STAGE2_DISALLOWED
+
+    def test_integrity_check_disallowed(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        assert stage.get_disallowed_tools() == STAGE3_DISALLOWED
+
+
+class TestStageReportSchema:
+    """Output schema for stage reports."""
+
+    def test_schema_has_required_summary(self):
+        assert 'summary' in STAGE_REPORT_SCHEMA['required']
+
+    def test_schema_is_valid_json_schema(self):
+        """Basic structure validation."""
+        assert STAGE_REPORT_SCHEMA['type'] == 'object'
+        assert 'properties' in STAGE_REPORT_SCHEMA
+        # Should be JSON-serializable (for --json-schema flag)
+        json.dumps(STAGE_REPORT_SCHEMA)
+
+
+class TestMcpConfig:
+    """BaseStage._build_mcp_config() produces valid MCP server config."""
+
+    @pytest.fixture
+    def stage(self):
+        from unittest.mock import AsyncMock
+        from fused_memory.models.reconciliation import StageId
+        from fused_memory.reconciliation.stages.base import BaseStage
+        config = ReconciliationConfig(explore_codebase_root='/tmp/test')
+        return BaseStage(
+            StageId.memory_consolidator,
+            AsyncMock(), AsyncMock(), AsyncMock(), config,
         )
 
+    def test_mcp_config_has_fused_memory(self, stage):
+        config = stage._build_mcp_config()
+        assert 'mcpServers' in config
+        assert 'fused-memory' in config['mcpServers']
 
-class TestTaskWriteToolsUseProjectRoot:
-    """Task write tools should use self.project_root (filesystem path)."""
+    def test_mcp_config_no_escalation_by_default(self, stage):
+        config = stage._build_mcp_config()
+        assert 'escalation' not in config['mcpServers']
 
-    @pytest.mark.asyncio
-    async def test_set_task_status_uses_project_root(self, stage, mock_taskmaster):
-        tools = stage._task_write_tools()
-        await tools['set_task_status'].function(id='1', status='done')
-        mock_taskmaster.set_task_status.assert_called_once_with(
-            task_id='1', status='done', project_root='/home/leo/src/dark-factory'
+    def test_mcp_config_with_escalation_url(self, stage):
+        stage._escalation_url = 'http://127.0.0.1:8103/mcp'
+        config = stage._build_mcp_config()
+        assert 'escalation' in config['mcpServers']
+        assert config['mcpServers']['escalation']['url'] == 'http://127.0.0.1:8103/mcp'
+
+
+class TestTierConfig:
+    """MemoryConsolidator respects tier limits."""
+
+    def test_default_limits(self):
+        from unittest.mock import AsyncMock
+        from fused_memory.models.reconciliation import StageId
+        config = ReconciliationConfig()
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator,
+            AsyncMock(), AsyncMock(), AsyncMock(), config,
         )
+        assert stage.episode_limit == 500
+        assert stage.memory_limit == 1000
 
-    @pytest.mark.asyncio
-    async def test_update_task_uses_project_root(self, stage, mock_taskmaster):
-        tools = stage._task_write_tools()
-        await tools['update_task'].function(id='1', prompt='new prompt')
-        mock_taskmaster.update_task.assert_called_once_with(
-            task_id='1', prompt='new prompt', metadata=None,
-            project_root='/home/leo/src/dark-factory'
+    def test_sonnet_tier_limits(self):
+        from unittest.mock import AsyncMock
+        from fused_memory.models.reconciliation import StageId
+        config = ReconciliationConfig()
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator,
+            AsyncMock(), AsyncMock(), AsyncMock(), config,
         )
-
-    @pytest.mark.asyncio
-    async def test_add_task_uses_project_root(self, stage, mock_taskmaster):
-        tools = stage._task_write_tools()
-        await tools['add_task'].function(title='New Task')
-        mock_taskmaster.add_task.assert_called_once_with(
-            prompt=None, title='New Task', project_root='/home/leo/src/dark-factory'
-        )
-
-    @pytest.mark.asyncio
-    async def test_remove_task_uses_project_root(self, stage, mock_taskmaster):
-        tools = stage._task_write_tools()
-        await tools['remove_task'].function(id='1')
-        mock_taskmaster.remove_task.assert_called_once_with(
-            task_id='1', project_root='/home/leo/src/dark-factory'
-        )
-
-
-class TestUpdateTaskMetadataCoercion:
-    """update_task should coerce dict metadata to JSON string before forwarding."""
-
-    @pytest.mark.asyncio
-    async def test_update_task_dict_metadata_coerced_to_json_string(
-        self, stage, mock_taskmaster
-    ):
-        tools = stage._task_write_tools()
-        await tools['update_task'].function(id='1', metadata={'key': 'value'})
-        mock_taskmaster.update_task.assert_called_once_with(
-            task_id='1', prompt=None, metadata='{"key": "value"}',
-            project_root='/home/leo/src/dark-factory'
-        )
-
-    @pytest.mark.asyncio
-    async def test_update_task_string_metadata_passed_through(
-        self, stage, mock_taskmaster
-    ):
-        tools = stage._task_write_tools()
-        await tools['update_task'].function(id='1', metadata='{"key": "value"}')
-        mock_taskmaster.update_task.assert_called_once_with(
-            task_id='1', prompt=None, metadata='{"key": "value"}',
-            project_root='/home/leo/src/dark-factory'
-        )
-
-    def test_update_task_schema_accepts_string_and_object(self, stage):
-        tools = stage._task_write_tools()
-        tool_def = tools['update_task']
-        metadata_schema = tool_def.parameters['properties']['metadata']
-        assert metadata_schema['type'] == ['string', 'object']
+        stage.episode_limit = 125
+        stage.memory_limit = 250
+        assert stage.episode_limit == 125
+        assert stage.memory_limit == 250

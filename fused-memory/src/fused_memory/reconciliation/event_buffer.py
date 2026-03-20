@@ -312,6 +312,54 @@ class EventBuffer:
             ))
         return events
 
+    async def drain_oldest_chunk(
+        self, project_id: str, limit: int,
+    ) -> list[ReconciliationEvent]:
+        """Drain the oldest `limit` buffered events for a project."""
+        db = self._require_db()
+        async with db.execute(
+            """SELECT * FROM event_buffer
+               WHERE project_id = ? AND status = 'buffered'
+               ORDER BY timestamp ASC
+               LIMIT ?""",
+            (project_id, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        if not rows:
+            return []
+
+        ids = [row['id'] for row in rows]
+        placeholders = ','.join('?' for _ in ids)
+        await db.execute(
+            f"UPDATE event_buffer SET status = 'drained' WHERE id IN ({placeholders})",
+            ids,
+        )
+        await db.commit()
+
+        events = []
+        for row in rows:
+            events.append(ReconciliationEvent(
+                id=row['id'],
+                project_id=row['project_id'],
+                type=EventType(row['event_type']),
+                source=EventSource(row['event_source']),
+                agent_id=row['agent_id'],
+                timestamp=datetime.fromisoformat(row['timestamp']),
+                payload=json.loads(row['payload']),
+            ))
+        return events
+
+    async def count_buffered(self, project_id: str) -> int:
+        """Return count of buffered events for a project."""
+        db = self._require_db()
+        async with db.execute(
+            "SELECT COUNT(*) as cnt FROM event_buffer WHERE project_id = ? AND status = 'buffered'",
+            (project_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row['cnt'] if row else 0
+
     # ── Run locking ────────────────────────────────────────────────────
 
     async def mark_run_active(self, project_id: str) -> bool:

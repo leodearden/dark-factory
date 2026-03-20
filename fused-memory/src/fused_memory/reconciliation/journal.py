@@ -92,6 +92,16 @@ CREATE TABLE IF NOT EXISTS burst_state (
     last_write_at TEXT NOT NULL,
     burst_started_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS chunk_boundaries (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    run_id TEXT,
+    events_count INTEGER,
+    status TEXT DEFAULT 'processing',
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_chunk_project ON chunk_boundaries(project_id);
 """
 
 
@@ -358,6 +368,89 @@ class ReconciliationJournal:
             )
             for row in rows
         ]
+
+    # ── Stale-run recovery ──────────────────────────────────────────────
+
+    async def get_stale_runs(self, cutoff_seconds: float) -> list[ReconciliationRun]:
+        """Return runs still marked 'running' whose started_at is older than cutoff."""
+        db = self._require_db()
+        cutoff_dt = datetime.fromtimestamp(
+            datetime.now(UTC).timestamp() - cutoff_seconds,
+            tz=UTC,
+        )
+        async with db.execute(
+            "SELECT * FROM runs WHERE status = 'running' AND started_at < ?",
+            (cutoff_dt.isoformat(),),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        runs = []
+        for row in rows:
+            reports_raw = json.loads(row['stage_reports'] or '{}')
+            stage_reports: dict[str, StageReport | dict] = {}
+            for k, v in reports_raw.items():
+                if isinstance(v, dict) and 'stage' in v:
+                    stage_reports[k] = StageReport(**v)
+                else:
+                    stage_reports[k] = v
+            runs.append(
+                ReconciliationRun(
+                    id=row['id'],
+                    project_id=row['project_id'],
+                    run_type=row['run_type'],
+                    trigger_reason=row['trigger_reason'],
+                    started_at=datetime.fromisoformat(row['started_at']),
+                    completed_at=_parse_dt(row['completed_at']),
+                    events_processed=row['events_processed'],
+                    stage_reports=stage_reports,
+                    status=row['status'],
+                )
+            )
+        return runs
+
+    # ── Chunk boundaries ─────────────────────────────────────────────
+
+    async def record_chunk_boundary(
+        self,
+        project_id: str,
+        chunk_id: str,
+        events_count: int,
+        run_id: str | None = None,
+    ) -> None:
+        """Record a backlog chunk processing boundary."""
+        db = self._require_db()
+        await db.execute(
+            """INSERT INTO chunk_boundaries
+               (id, project_id, run_id, events_count, status, created_at)
+               VALUES (?, ?, ?, ?, 'processing', ?)""",
+            (
+                chunk_id,
+                project_id,
+                run_id,
+                events_count,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        await db.commit()
+
+    async def get_last_completed_chunk(self, project_id: str) -> dict | None:
+        """Get the most recently completed chunk for resume-on-failure."""
+        db = self._require_db()
+        async with db.execute(
+            """SELECT * FROM chunk_boundaries
+               WHERE project_id = ? AND status = 'completed'
+               ORDER BY created_at DESC LIMIT 1""",
+            (project_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            'id': row['id'],
+            'project_id': row['project_id'],
+            'run_id': row['run_id'],
+            'events_count': row['events_count'],
+            'created_at': row['created_at'],
+        }
 
     # ── Dashboard stats ────────────────────────────────────────────────
 

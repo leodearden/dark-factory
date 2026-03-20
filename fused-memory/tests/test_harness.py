@@ -167,7 +167,7 @@ async def test_full_cycle_extracts_project_root_from_events(journal, event_buffe
     for stage in harness.stages:
         original_stage = stage
 
-        async def mock_run(events, watermark, prior_reports, run_id, _s=original_stage):
+        async def mock_run(events, watermark, prior_reports, run_id, model=None, _s=original_stage):
             # Capture state at call time
             captured_stages.append({
                 'project_id': _s.project_id,
