@@ -71,6 +71,8 @@ class ServerConfig(BaseModel):
     transport: str = Field(default='http', description='Transport: http, stdio, or sse')
     host: str = Field(default='0.0.0.0', description='Server host')
     port: int = Field(default=8000, description='Server port')
+    stateless_http: bool = Field(default=False, description='Stateless HTTP mode (no sessions)')
+    json_response: bool = Field(default=False, description='JSON responses instead of SSE')
 
 
 # --- LLM ---
@@ -215,13 +217,27 @@ class ReconciliationConfig(BaseModel):
     stale_lock_seconds: float = Field(default=7200.0)
 
     # Timeouts
-    tool_timeout_seconds: float = Field(default=30.0)
-    stage_timeout_seconds: int = Field(default=600)
-    cycle_timeout_seconds: int = Field(default=1800)
+    tool_timeout_seconds: float = Field(default=120.0)
+    stage_timeout_seconds: int = Field(default=3600)
+    cycle_timeout_seconds: int = Field(default=21600)
 
     # Safety
     max_mutations_per_stage: int = Field(default=50)
     halt_on_judge_serious: bool = Field(default=True)
+
+    # Escalation
+    escalation_port: int = Field(default=8103)
+    escalation_host: str = Field(default='127.0.0.1')
+    escalation_queue_dir: str = Field(default='./data/reconciliation/escalations')
+
+    # Tiered models
+    sonnet_model: str = Field(default='sonnet')
+    opus_model: str = Field(default='opus')
+    opus_threshold_ratio: float = Field(default=1.5)
+    sonnet_episode_limit: int = Field(default=125)
+    sonnet_memory_limit: int = Field(default=250)
+    opus_episode_limit: int = Field(default=500)
+    opus_memory_limit: int = Field(default=1000)
 
     # Usage cap detection and multi-account failover
     usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)

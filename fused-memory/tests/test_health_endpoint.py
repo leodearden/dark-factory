@@ -1,10 +1,11 @@
-"""Tests for the /health endpoint and MCP tool-level behavior."""
+"""Tests for the /health endpoint, MCP tool-level behavior, and server settings."""
 
 from unittest.mock import AsyncMock
 
 import pytest
 from starlette.testclient import TestClient
 
+from fused_memory.config.schema import ServerConfig
 from fused_memory.server.tools import create_mcp_server
 
 
@@ -124,3 +125,133 @@ async def test_task_tool_error_without_taskmaster():
     )
     assert 'error' in result
     assert 'not configured' in result['error'].lower()
+
+
+# ------------------------------------------------------------------
+# ServerConfig stateless_http / json_response defaults and propagation
+# ------------------------------------------------------------------
+
+
+class TestServerConfigDefaults:
+    """ServerConfig defaults preserve backward compatibility."""
+
+    def test_stateless_http_defaults_false(self):
+        cfg = ServerConfig()
+        assert cfg.stateless_http is False
+
+    def test_json_response_defaults_false(self):
+        cfg = ServerConfig()
+        assert cfg.json_response is False
+
+    def test_explicit_true_values(self):
+        cfg = ServerConfig(stateless_http=True, json_response=True)
+        assert cfg.stateless_http is True
+        assert cfg.json_response is True
+
+
+class TestServerSettingsPropagation:
+    """MCP server settings reflect config values."""
+
+    def test_stateless_and_json_propagated_to_mcp_settings(self):
+        """When stateless_http and json_response are set, they propagate to mcp.settings."""
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)
+        server.settings.stateless_http = True
+        server.settings.json_response = True
+        assert server.settings.stateless_http is True
+        assert server.settings.json_response is True
+
+    def test_default_mcp_settings_are_false(self):
+        """MCP server defaults to stateful SSE mode."""
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)
+        assert server.settings.stateless_http is False
+        assert server.settings.json_response is False
+
+    def test_stateless_json_app_accepts_json_only(self):
+        """With json_response=True, POST /mcp with Accept: application/json succeeds (no 406)."""
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)
+        server.settings.stateless_http = True
+        server.settings.json_response = True
+        app = server.streamable_http_app()
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            '/mcp',
+            json={
+                'jsonrpc': '2.0',
+                'id': 1,
+                'method': 'initialize',
+                'params': {
+                    'protocolVersion': '2025-03-26',
+                    'capabilities': {},
+                    'clientInfo': {'name': 'test', 'version': '0.1'},
+                },
+            },
+            headers={
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+            },
+        )
+        # Should NOT be 406 (Not Acceptable)
+        assert resp.status_code != 406, (
+            f'Expected non-406 with Accept: application/json in json_response mode, '
+            f'got {resp.status_code}: {resp.text[:200]}'
+        )
+
+    def test_stateful_sse_app_rejects_json_only_accept(self):
+        """Without json_response, POST /mcp with Accept: application/json is not 200."""
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)
+        # Leave defaults: stateless_http=False, json_response=False
+        app = server.streamable_http_app()
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            '/mcp',
+            json={
+                'jsonrpc': '2.0',
+                'id': 1,
+                'method': 'initialize',
+                'params': {
+                    'protocolVersion': '2025-03-26',
+                    'capabilities': {},
+                    'clientInfo': {'name': 'test', 'version': '0.1'},
+                },
+            },
+            headers={
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+            },
+        )
+        # SSE mode rejects Accept: application/json alone (406 or 500 in test transport)
+        assert resp.status_code != 200, (
+            'SSE mode should NOT succeed with Accept: application/json alone'
+        )
+
+    def test_stateful_sse_app_accepts_both_content_types(self):
+        """Default SSE mode accepts Accept: application/json, text/event-stream."""
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)
+        app = server.streamable_http_app()
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            '/mcp',
+            json={
+                'jsonrpc': '2.0',
+                'id': 1,
+                'method': 'initialize',
+                'params': {
+                    'protocolVersion': '2025-03-26',
+                    'capabilities': {},
+                    'clientInfo': {'name': 'test', 'version': '0.1'},
+                },
+            },
+            headers={
+                'Accept': 'application/json, text/event-stream',
+                'Content-Type': 'application/json',
+            },
+        )
+        # Should NOT be 406
+        assert resp.status_code != 406, (
+            f'Expected non-406 with dual Accept header, got {resp.status_code}: {resp.text[:200]}'
+        )

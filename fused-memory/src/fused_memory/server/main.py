@@ -53,6 +53,14 @@ async def run_server():
         '--transport', choices=['stdio', 'sse', 'http'],
         help='Transport override',
     )
+    parser.add_argument(
+        '--stateless', action='store_true', default=None,
+        help='Enable stateless HTTP mode (no session tracking)',
+    )
+    parser.add_argument(
+        '--json-response', action='store_true', default=None,
+        help='Return JSON instead of SSE for HTTP transport',
+    )
     args = parser.parse_args()
 
     # Set CONFIG_PATH for the settings source — prefer explicit --config,
@@ -65,6 +73,10 @@ async def run_server():
     config = FusedMemoryConfig()
     if args.transport:
         config.server.transport = args.transport
+    if args.stateless is True:
+        config.server.stateless_http = True
+    if args.json_response is True:
+        config.server.json_response = True
 
     logger.info('Fused Memory MCP Server starting')
     logger.info(f'  LLM: {config.llm.provider}/{config.llm.model}')
@@ -145,6 +157,8 @@ async def run_server():
     mcp = create_mcp_server(memory_service, task_interceptor)
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.port
+    mcp.settings.stateless_http = config.server.stateless_http
+    mcp.settings.json_response = config.server.json_response
 
     # Run transport
     transport = config.server.transport

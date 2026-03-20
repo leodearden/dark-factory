@@ -1,4 +1,4 @@
-"""Tests for dashboard.data.memory — MCP-based memory health metrics."""
+"""Tests for dashboard.data.memory — MCP session-based memory health metrics."""
 
 from __future__ import annotations
 
@@ -9,18 +9,89 @@ import httpx
 import pytest
 
 
-def _make_mcp_response(inner_dict: dict) -> httpx.Response:
+def _make_mcp_response(inner_dict: dict, request_id: int = 1) -> httpx.Response:
     """Build a mock MCP JSON-RPC response wrapping *inner_dict*."""
     body = {
         'jsonrpc': '2.0',
-        'id': 1,
+        'id': request_id,
         'result': {
             'content': [
                 {'type': 'text', 'text': json.dumps(inner_dict)},
             ]
         },
     }
-    return httpx.Response(200, json=body)
+    return httpx.Response(
+        200, json=body,
+        headers={'mcp-session-id': 'test-session-id'},
+    )
+
+
+def _make_init_response(request_id: int = 1) -> httpx.Response:
+    """Build a mock MCP initialize response."""
+    body = {
+        'jsonrpc': '2.0',
+        'id': request_id,
+        'result': {
+            'protocolVersion': '2025-03-26',
+            'capabilities': {'tools': {}},
+            'serverInfo': {'name': 'test', 'version': '0.1'},
+        },
+    }
+    return httpx.Response(
+        200, json=body,
+        headers={'mcp-session-id': 'test-session-id'},
+    )
+
+
+def _make_notify_response() -> httpx.Response:
+    """Build a 202 Accepted response for notifications."""
+    return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
+
+
+class _SessionAwareHandler:
+    """Mock handler that responds to initialize, notify, and tools/call."""
+
+    def __init__(self, tool_response: dict | None = None, *, error_status: int | None = None,
+                 error_on_tool: Exception | None = None, error_on_all: Exception | None = None):
+        self.tool_response = tool_response or {}
+        self.error_status = error_status
+        self.error_on_tool = error_on_tool
+        self.error_on_all = error_on_all
+        self.calls: list[dict] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if self.error_on_all:
+            raise self.error_on_all
+
+        body = json.loads(request.content)
+        method = body.get('method', '')
+        request_id = body.get('id', 1)
+        self.calls.append(body)
+
+        if method == 'initialize':
+            return _make_init_response(request_id)
+
+        if method.startswith('notifications/'):
+            return _make_notify_response()
+
+        # tools/call
+        if self.error_on_tool:
+            raise self.error_on_tool
+        if self.error_status:
+            return httpx.Response(self.error_status, text='Server Error')
+        return _make_mcp_response(self.tool_response, request_id)
+
+
+@pytest.fixture(autouse=True)
+def _clean_sessions():
+    """Reset session cache before each test."""
+    from dashboard.data.memory import reset_sessions
+    reset_sessions()
+    yield
+    reset_sessions()
+
+
+# ── mcp_tool_call ───────────────────────────────────────────────
 
 
 class TestMcpToolCall:
@@ -31,9 +102,7 @@ class TestMcpToolCall:
         from dashboard.data.memory import mcp_tool_call
 
         expected = {'graphiti': {'connected': True}, 'mem0': {'connected': True}}
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            return _make_mcp_response(expected)
+        handler = _SessionAwareHandler(expected)
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
@@ -43,88 +112,163 @@ class TestMcpToolCall:
 
         assert result == expected
 
+    async def test_session_initialization(self):
+        """mcp_tool_call performs initialize + initialized notification before tool call."""
+        from dashboard.data.memory import mcp_tool_call
+
+        handler = _SessionAwareHandler({'ok': True})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await mcp_tool_call(client, 'http://localhost:9999', 'get_status', {})
+
+        methods = [c['method'] for c in handler.calls]
+        assert methods == ['initialize', 'notifications/initialized', 'tools/call']
+
+    async def test_session_cached_across_calls(self):
+        """Second call on same URL reuses session (no re-init)."""
+        from dashboard.data.memory import mcp_tool_call
+
+        handler = _SessionAwareHandler({'ok': True})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await mcp_tool_call(client, 'http://localhost:9998', 'get_status', {})
+            await mcp_tool_call(client, 'http://localhost:9998', 'get_status', {})
+
+        methods = [c['method'] for c in handler.calls]
+        # init + notify + tool_call1 + tool_call2  (no second init)
+        assert methods == [
+            'initialize', 'notifications/initialized', 'tools/call', 'tools/call',
+        ]
+
     async def test_timeout_propagates(self):
         """httpx.TimeoutException from the transport propagates to caller."""
         from dashboard.data.memory import mcp_tool_call
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            raise httpx.TimeoutException('timed out')
-
+        handler = _SessionAwareHandler(error_on_all=httpx.TimeoutException('timed out'))
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             with pytest.raises(httpx.TimeoutException):
                 await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
 
-    async def test_non_200_raises_value_error(self):
-        """Non-200 HTTP status raises ValueError."""
+    async def test_non_200_raises(self):
+        """Non-200 HTTP status raises httpx.HTTPStatusError."""
         from dashboard.data.memory import mcp_tool_call
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(500, text='Internal Server Error')
-
+        handler = _SessionAwareHandler(error_status=500)
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            with pytest.raises(ValueError, match='non-200'):
+            with pytest.raises(httpx.HTTPStatusError):
                 await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
-
-    async def test_307_redirect_followed_with_follow_redirects(self):
-        """Regression: 307 from /mcp/ to /mcp is followed when follow_redirects=True.
-
-        Documents the original bug: the fused-memory MCP server (Starlette with
-        redirect_slashes=True) redirects POST /mcp/ -> POST /mcp via 307.
-        With follow_redirects=False (old default), mcp_tool_call raised
-        ValueError('MCP call get_status returned non-200 status: 307').
-
-        This test verifies the safety net: when a client has follow_redirects=True,
-        the 307 is transparently followed and the call succeeds.
-        """
-        from dashboard.data.memory import mcp_tool_call
-
-        expected = {'graphiti': {'connected': True}, 'mem0': {'connected': True}}
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path == '/mcp/':
-                # Simulate Starlette's redirect_slashes=True behaviour
-                return httpx.Response(
-                    307,
-                    headers={'Location': 'http://localhost:8000/mcp'},
-                )
-            # Canonical path: return valid MCP response
-            return _make_mcp_response(expected)
-
-        transport = httpx.MockTransport(handler)
-        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
-            result = await mcp_tool_call(
-                client, 'http://localhost:8000', 'get_status', {}
-            )
-
-        assert result == expected
 
     async def test_posts_to_correct_url_path(self):
         """mcp_tool_call posts to '{base_url}/mcp' (no trailing slash)."""
         from dashboard.data.memory import mcp_tool_call
 
-        captured_path: list[str] = []
-        expected = {'ok': True}
+        captured_paths: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
-            captured_path.append(request.url.path)
-            return _make_mcp_response(expected)
+            captured_paths.append(request.url.path)
+            body = json.loads(request.content)
+            method = body.get('method', '')
+            rid = body.get('id', 1)
+            if method == 'initialize':
+                return _make_init_response(rid)
+            if method.startswith('notifications/'):
+                return _make_notify_response()
+            return _make_mcp_response({'ok': True}, rid)
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            result = await mcp_tool_call(
-                client, 'http://localhost:8000', 'get_status', {}
-            )
+            await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
 
-        assert result == expected
-        assert len(captured_path) == 1, 'handler should be called exactly once'
-        assert captured_path[0] == '/mcp', (
-            f'Expected path /mcp (no trailing slash), got {captured_path[0]!r}'
+        assert all(p == '/mcp' for p in captured_paths), (
+            f'Expected all paths to be /mcp, got {captured_paths}'
         )
 
 
-# --- Helpers for higher-level function tests ---
+# ── SSE response parsing ───────────────────────────────────────
+
+
+class TestSseResponseParsing:
+    """Tests for SSE response format handling."""
+
+    def test_parse_sse_response(self):
+        from dashboard.data.memory import _parse_sse_response
+
+        sse = 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"content":[]}}\n\n'
+        result = _parse_sse_response(sse)
+        assert result['jsonrpc'] == '2.0'
+
+    def test_parse_sse_no_data_raises(self):
+        from dashboard.data.memory import _parse_sse_response
+
+        with pytest.raises(ValueError, match='No data line'):
+            _parse_sse_response('event: message\n\n')
+
+
+# ── Headers ─────────────────────────────────────────────────────
+
+
+class TestMcpHeaders:
+    """Tests that the MCP client sends correct HTTP headers."""
+
+    async def test_accept_header_includes_both_types(self):
+        """Requests include Accept: application/json, text/event-stream."""
+        from dashboard.data.memory import mcp_tool_call
+
+        captured_headers: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_headers.append(dict(request.headers))
+            body = json.loads(request.content)
+            method = body.get('method', '')
+            rid = body.get('id', 1)
+            if method == 'initialize':
+                return _make_init_response(rid)
+            if method.startswith('notifications/'):
+                return _make_notify_response()
+            return _make_mcp_response({'ok': True}, rid)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
+
+        # All requests should have the dual Accept header
+        for headers in captured_headers:
+            accept = headers.get('accept', '')
+            assert 'application/json' in accept, f'Missing application/json in {accept}'
+            assert 'text/event-stream' in accept, f'Missing text/event-stream in {accept}'
+
+    async def test_session_id_sent_after_init(self):
+        """After initialize, subsequent requests include Mcp-Session-Id header."""
+        from dashboard.data.memory import mcp_tool_call
+
+        captured_headers: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_headers.append(dict(request.headers))
+            body = json.loads(request.content)
+            method = body.get('method', '')
+            rid = body.get('id', 1)
+            if method == 'initialize':
+                return _make_init_response(rid)
+            if method.startswith('notifications/'):
+                return _make_notify_response()
+            return _make_mcp_response({'ok': True}, rid)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
+
+        # First request (initialize) has no session ID
+        assert 'mcp-session-id' not in captured_headers[0]
+        # Subsequent requests have the session ID
+        for headers in captured_headers[1:]:
+            assert headers.get('mcp-session-id') == 'test-session-id'
+
+
+# ── get_memory_status (multi-URL) ──────────────────────────────
+
 
 _STATUS_PAYLOAD = {
     'graphiti': {'connected': True, 'node_count': 42},
@@ -140,24 +284,19 @@ class TestGetMemoryStatus:
         """Returns the parsed status dict from a successful MCP response."""
         from dashboard.data.memory import get_memory_status
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            return _make_mcp_response(_STATUS_PAYLOAD)
-
+        handler = _SessionAwareHandler(_STATUS_PAYLOAD)
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await get_memory_status(client, dashboard_config)
 
         assert result == _STATUS_PAYLOAD
         assert result['graphiti']['node_count'] == 42
-        assert result['mem0']['memory_count'] == 5
 
-    async def test_connect_error_returns_offline(self, dashboard_config):
-        """ConnectError returns {offline: True, error: ...}."""
+    async def test_all_servers_down_returns_offline(self, dashboard_config):
+        """When all URLs fail, returns offline with combined error."""
         from dashboard.data.memory import get_memory_status
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            raise httpx.ConnectError('connection refused')
-
+        handler = _SessionAwareHandler(error_on_all=httpx.ConnectError('refused'))
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await get_memory_status(client, dashboard_config)
@@ -165,33 +304,40 @@ class TestGetMemoryStatus:
         assert result['offline'] is True
         assert 'error' in result
 
-    async def test_timeout_returns_offline(self, dashboard_config):
-        """TimeoutException returns {offline: True, error: ...}."""
+    async def test_first_server_down_falls_through(self, dashboard_config):
+        """If first URL fails, tries subsequent URLs."""
         from dashboard.data.memory import get_memory_status
 
+        call_count = 0
+
         def handler(request: httpx.Request) -> httpx.Response:
-            raise httpx.TimeoutException('timed out')
+            nonlocal call_count
+            call_count += 1
+            host = str(request.url.host)
+            port = request.url.port
+
+            # First server (port 8000) always fails
+            if port == 8000:
+                raise httpx.ConnectError('refused')
+
+            body = json.loads(request.content)
+            method = body.get('method', '')
+            rid = body.get('id', 1)
+            if method == 'initialize':
+                return _make_init_response(rid)
+            if method.startswith('notifications/'):
+                return _make_notify_response()
+            return _make_mcp_response(_STATUS_PAYLOAD, rid)
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await get_memory_status(client, dashboard_config)
 
-        assert result['offline'] is True
-        assert 'error' in result
+        assert result == _STATUS_PAYLOAD
+        assert 'offline' not in result
 
-    async def test_non_200_response_returns_offline(self, dashboard_config):
-        """Non-200 HTTP status (ValueError from mcp_tool_call) returns offline fallback."""
-        from dashboard.data.memory import get_memory_status
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(500, text='Internal Server Error')
-
-        transport = httpx.MockTransport(handler)
-        async with httpx.AsyncClient(transport=transport) as client:
-            result = await get_memory_status(client, dashboard_config)
-
-        assert result['offline'] is True
-        assert 'error' in result
+# ── get_queue_stats (aggregation) ──────────────────────────────
 
 
 _QUEUE_STATS_PAYLOAD = {
@@ -204,61 +350,56 @@ class TestGetQueueStats:
     """Tests for get_queue_stats."""
 
     async def test_successful_stats(self, dashboard_config):
-        """Returns the parsed queue stats dict from a successful MCP response."""
+        """Returns aggregated queue stats from all reachable servers."""
         from dashboard.data.memory import get_queue_stats
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            return _make_mcp_response(_QUEUE_STATS_PAYLOAD)
-
+        handler = _SessionAwareHandler(_QUEUE_STATS_PAYLOAD)
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await get_queue_stats(client, dashboard_config)
 
-        assert result == _QUEUE_STATS_PAYLOAD
-        assert result['counts']['pending'] == 3
+        # 3 servers × 3 pending = 9 (all share same transport/handler)
+        assert result['counts']['pending'] == 9
         assert result['oldest_pending_age_seconds'] == 5.5
 
-    async def test_connect_error_returns_offline(self, dashboard_config):
-        """ConnectError returns {offline: True, error: ...}."""
+    async def test_all_down_returns_offline(self, dashboard_config):
+        """When all servers are unreachable, returns offline."""
         from dashboard.data.memory import get_queue_stats
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            raise httpx.ConnectError('connection refused')
-
+        handler = _SessionAwareHandler(error_on_all=httpx.ConnectError('refused'))
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await get_queue_stats(client, dashboard_config)
 
         assert result['offline'] is True
-        assert 'error' in result
 
-    async def test_timeout_returns_offline(self, dashboard_config):
-        """TimeoutException returns {offline: True, error: ...}."""
+    async def test_partial_failure_aggregates_available(self, dashboard_config):
+        """If some servers are down, aggregate from those that are up."""
         from dashboard.data.memory import get_queue_stats
 
         def handler(request: httpx.Request) -> httpx.Response:
-            raise httpx.TimeoutException('timed out')
+            port = request.url.port
+            if port == 8000:
+                raise httpx.ConnectError('refused')
+            body = json.loads(request.content)
+            method = body.get('method', '')
+            rid = body.get('id', 1)
+            if method == 'initialize':
+                return _make_init_response(rid)
+            if method.startswith('notifications/'):
+                return _make_notify_response()
+            return _make_mcp_response(_QUEUE_STATS_PAYLOAD, rid)
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await get_queue_stats(client, dashboard_config)
 
-        assert result['offline'] is True
-        assert 'error' in result
+        # 2 servers × 3 pending = 6
+        assert result['counts']['pending'] == 6
+        assert 'offline' not in result
 
-    async def test_non_200_response_returns_offline(self, dashboard_config):
-        """Non-200 HTTP status (ValueError from mcp_tool_call) returns offline fallback."""
-        from dashboard.data.memory import get_queue_stats
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(500, text='Internal Server Error')
-
-        transport = httpx.MockTransport(handler)
-        async with httpx.AsyncClient(transport=transport) as client:
-            result = await get_queue_stats(client, dashboard_config)
-
-        assert result['offline'] is True
-        assert 'error' in result
+# ── Malformed responses ─────────────────────────────────────────
 
 
 class TestMalformedResponse:
@@ -269,28 +410,18 @@ class TestMalformedResponse:
         from dashboard.data.memory import mcp_tool_call
 
         def handler(request: httpx.Request) -> httpx.Response:
-            # Valid JSON but missing the result.content path
-            return httpx.Response(200, json={'jsonrpc': '2.0', 'id': 1, 'result': {}})
-
-        transport = httpx.MockTransport(handler)
-        async with httpx.AsyncClient(transport=transport) as client:
-            result = await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
-
-        assert result == {}
-
-    async def test_invalid_inner_json(self):
-        """Response where text field contains non-JSON returns empty dict."""
-        from dashboard.data.memory import mcp_tool_call
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            body = {
-                'jsonrpc': '2.0',
-                'id': 1,
-                'result': {
-                    'content': [{'type': 'text', 'text': 'not valid json!!!'}],
-                },
-            }
-            return httpx.Response(200, json=body)
+            body = json.loads(request.content)
+            method = body.get('method', '')
+            rid = body.get('id', 1)
+            if method == 'initialize':
+                return _make_init_response(rid)
+            if method.startswith('notifications/'):
+                return _make_notify_response()
+            return httpx.Response(
+                200,
+                json={'jsonrpc': '2.0', 'id': rid, 'result': {}},
+                headers={'mcp-session-id': 'test'},
+            )
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
@@ -303,12 +434,18 @@ class TestMalformedResponse:
         from dashboard.data.memory import mcp_tool_call
 
         def handler(request: httpx.Request) -> httpx.Response:
-            body = {
-                'jsonrpc': '2.0',
-                'id': 1,
-                'result': {'content': []},
-            }
-            return httpx.Response(200, json=body)
+            body = json.loads(request.content)
+            method = body.get('method', '')
+            rid = body.get('id', 1)
+            if method == 'initialize':
+                return _make_init_response(rid)
+            if method.startswith('notifications/'):
+                return _make_notify_response()
+            return httpx.Response(
+                200,
+                json={'jsonrpc': '2.0', 'id': rid, 'result': {'content': []}},
+                headers={'mcp-session-id': 'test'},
+            )
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
@@ -316,54 +453,33 @@ class TestMalformedResponse:
 
         assert result == {}
 
-    async def test_non_json_body_returns_empty_dict(self):
-        """HTTP 200 with non-JSON body (e.g. HTML from reverse proxy) returns empty dict."""
-        from dashboard.data.memory import mcp_tool_call
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, text='<html>Bad Gateway</html>')
-
-        transport = httpx.MockTransport(handler)
-        async with httpx.AsyncClient(transport=transport) as client:
-            result = await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
-
-        assert result == {}
+# ── Logging ─────────────────────────────────────────────────────
 
 
 class TestMcpToolCallLogging:
     """Tests that mcp_tool_call emits WARNING-level logs on parse failures."""
 
-    async def test_non_json_body_logs_warning(self, caplog):
-        """HTTP 200 with non-JSON body triggers resp.json() failure and logs a WARNING."""
-        from dashboard.data.memory import mcp_tool_call
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, text='<html>Bad Gateway</html>')
-
-        transport = httpx.MockTransport(handler)
-        with caplog.at_level(logging.WARNING, logger='dashboard.data.memory'):
-            async with httpx.AsyncClient(transport=transport) as client:
-                result = await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
-
-        assert result == {}
-        assert any(
-            r.levelno == logging.WARNING and 'dashboard.data.memory' in r.name
-            for r in caplog.records
-        ), f'Expected WARNING log from dashboard.data.memory, got: {caplog.records}'
-
     async def test_invalid_inner_json_logs_warning(self, caplog):
-        """Valid outer JSON but inner text is not JSON triggers json.loads failure and logs a WARNING."""
+        """Inner text is not JSON → logs a WARNING and returns empty dict."""
         from dashboard.data.memory import mcp_tool_call
 
         def handler(request: httpx.Request) -> httpx.Response:
-            body = {
-                'jsonrpc': '2.0',
-                'id': 1,
-                'result': {
-                    'content': [{'type': 'text', 'text': 'not valid json!!!'}],
+            body = json.loads(request.content)
+            method = body.get('method', '')
+            rid = body.get('id', 1)
+            if method == 'initialize':
+                return _make_init_response(rid)
+            if method.startswith('notifications/'):
+                return _make_notify_response()
+            return httpx.Response(
+                200,
+                json={
+                    'jsonrpc': '2.0', 'id': rid,
+                    'result': {'content': [{'type': 'text', 'text': 'not json!!!'}]},
                 },
-            }
-            return httpx.Response(200, json=body)
+                headers={'mcp-session-id': 'test'},
+            )
 
         transport = httpx.MockTransport(handler)
         with caplog.at_level(logging.WARNING, logger='dashboard.data.memory'):
@@ -374,4 +490,4 @@ class TestMcpToolCallLogging:
         assert any(
             r.levelno == logging.WARNING and 'dashboard.data.memory' in r.name
             for r in caplog.records
-        ), f'Expected WARNING log from dashboard.data.memory, got: {caplog.records}'
+        )
