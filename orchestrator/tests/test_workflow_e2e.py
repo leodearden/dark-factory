@@ -395,7 +395,7 @@ class TestHappyPath:
             'orchestrator.agents.invoke.invoke_agent', stub.invoke_agent
         )
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='OK', lint_output='',
                 type_output='', summary='All checks passed',
@@ -415,7 +415,7 @@ class TestHappyPath:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='', lint_output='',
                 type_output='', summary='All checks passed',
@@ -435,7 +435,7 @@ class TestHappyPath:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='', lint_output='',
                 type_output='', summary='All checks passed',
@@ -464,7 +464,7 @@ class TestHappyPath:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='', lint_output='',
                 type_output='', summary='All checks passed',
@@ -487,7 +487,7 @@ class TestHappyPath:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='', lint_output='',
                 type_output='', summary='All checks passed',
@@ -508,7 +508,7 @@ class TestHappyPath:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='', lint_output='',
                 type_output='', summary='All checks passed',
@@ -543,7 +543,7 @@ class TestVerifyDebugfixLoop:
         # First verify fails, second passes
         call_count = 0
 
-        async def verify_sequence(worktree, cfg, module_cfg=None):
+        async def verify_sequence(worktree, cfg, module_configs=None):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -559,7 +559,7 @@ class TestVerifyDebugfixLoop:
                     type_output='', summary='All checks passed',
                 )
 
-        monkeypatch.setattr('orchestrator.workflow.run_verification', verify_sequence)
+        monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify_sequence)
 
         outcome = await workflow.run()
 
@@ -582,7 +582,7 @@ class TestVerifyDebugfixLoop:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=False, test_output='FAILED', lint_output='',
                 type_output='', summary='tests failed',
@@ -689,7 +689,7 @@ class TestReviewLoop:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='', lint_output='',
                 type_output='', summary='All checks passed',
@@ -724,7 +724,7 @@ class TestPostMergeFailure:
 
         verify_call = 0
 
-        async def verify_fn(cwd, cfg, module_cfg=None):
+        async def verify_fn(cwd, cfg, module_configs=None):
             nonlocal verify_call
             verify_call += 1
             if cwd == config.project_root:
@@ -740,7 +740,7 @@ class TestPostMergeFailure:
                 type_output='', summary='All checks passed',
             )
 
-        monkeypatch.setattr('orchestrator.workflow.run_verification', verify_fn)
+        monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify_fn)
 
         outcome = await workflow.run()
 
@@ -781,7 +781,7 @@ class TestBlastRadiusExpansion:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='', lint_output='',
                 type_output='', summary='All checks passed',
@@ -825,7 +825,7 @@ class TestBlastRadiusExpansion:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='', lint_output='',
                 type_output='', summary='All checks passed',
@@ -854,7 +854,7 @@ class TestArtifactsIntegrity:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='', lint_output='',
                 type_output='', summary='All checks passed',
@@ -888,7 +888,7 @@ class TestArtifactsIntegrity:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='', lint_output='',
                 type_output='', summary='All checks passed',
@@ -957,7 +957,7 @@ class TestTaskFailureEscalation:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=False, test_output='FAILED', lint_output='',
                 type_output='', summary='tests failed',
@@ -1002,7 +1002,7 @@ class TestTaskFailureEscalation:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='', lint_output='',
                 type_output='', summary='ok',
@@ -1029,7 +1029,7 @@ class TestTaskFailureEscalation:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=False, test_output='FAILED', lint_output='',
                 type_output='', summary='tests failed',
@@ -1079,7 +1079,7 @@ class TestCorruptedIterationLogEscalation:
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
-            'orchestrator.workflow.run_verification',
+            'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='', lint_output='',
                 type_output='', summary='All checks passed',

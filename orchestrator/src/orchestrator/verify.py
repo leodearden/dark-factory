@@ -56,18 +56,31 @@ async def run_verification(
     config: OrchestratorConfig,
     module_config: ModuleConfig | None = None,
 ) -> VerifyResult:
-    """Run test suite, linter, and type checker. Return structured result."""
-    test_cmd = (module_config and module_config.test_command) or config.test_command
-    lint_cmd = (module_config and module_config.lint_command) or config.lint_command
-    type_cmd = (module_config and module_config.type_check_command) or config.type_check_command
+    """Run test suite, linter, and type checker. Return structured result.
 
-    # Run all three in parallel
-    test_task = _run_cmd(test_cmd, worktree)
-    lint_task = _run_cmd(lint_cmd, worktree)
-    type_task = _run_cmd(type_cmd, worktree)
+    When *module_config* is provided, a ``None`` command means "skip that check"
+    (the subproject doesn't define it).  When *module_config* is ``None``,
+    global config commands are used for every check.
+    """
+    if module_config is not None:
+        # Scoped: use module command; None → skip
+        test_cmd = module_config.test_command
+        lint_cmd = module_config.lint_command
+        type_cmd = module_config.type_check_command
+    else:
+        # Global fallback
+        test_cmd = config.test_command
+        lint_cmd = config.lint_command
+        type_cmd = config.type_check_command
+
+    # Run non-None checks in parallel
+    async def _run_or_skip(cmd: str | None) -> tuple[int, str]:
+        if cmd is None:
+            return 0, ''
+        return await _run_cmd(cmd, worktree)
 
     (test_rc, test_out), (lint_rc, lint_out), (type_rc, type_out) = await asyncio.gather(
-        test_task, lint_task, type_task
+        _run_or_skip(test_cmd), _run_or_skip(lint_cmd), _run_or_skip(type_cmd)
     )
 
     passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
@@ -93,3 +106,51 @@ async def run_verification(
 
     logger.info(f'Verification {"passed" if passed else "failed"}: {summary}')
     return result
+
+
+def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
+    """Merge per-subproject VerifyResults into one."""
+    if len(results) == 1:
+        return results[0]
+
+    passed = all(r.passed for r in results)
+    test_output = '\n'.join(r.test_output for r in results if r.test_output)
+    lint_output = '\n'.join(r.lint_output for r in results if r.lint_output)
+    type_output = '\n'.join(r.type_output for r in results if r.type_output)
+
+    parts = []
+    if any('tests failed' in r.summary for r in results):
+        parts.append('tests failed')
+    if any('lint issues' in r.summary for r in results):
+        parts.append('lint issues')
+    if any('type errors' in r.summary for r in results):
+        parts.append('type errors')
+
+    summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
+
+    return VerifyResult(
+        passed=passed,
+        test_output=test_output,
+        lint_output=lint_output,
+        type_output=type_output,
+        summary=summary,
+    )
+
+
+async def run_scoped_verification(
+    worktree: Path,
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+) -> VerifyResult:
+    """Run verification scoped to specific subprojects.
+
+    If *module_configs* is empty, falls back to global ``run_verification``.
+    Otherwise runs ``run_verification`` per ModuleConfig and aggregates.
+    """
+    if not module_configs:
+        return await run_verification(worktree, config)
+
+    results = await asyncio.gather(
+        *(run_verification(worktree, config, mc) for mc in module_configs)
+    )
+    return _aggregate_results(list(results))

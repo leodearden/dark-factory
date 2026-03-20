@@ -1,0 +1,6 @@
+# Escalation orchestrator configuration
+# Scopes verification to escalation's own venv.
+
+# Verification commands
+test_command: "uv run --project escalation --directory escalation pytest tests/ --tb=short -q"
+lint_command: "uv run --project escalation --directory escalation ruff check src/ tests/"

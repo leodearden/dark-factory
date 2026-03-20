@@ -24,7 +24,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment, files_to_modules
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
-from orchestrator.verify import run_verification
+from orchestrator.verify import run_scoped_verification
 
 if TYPE_CHECKING:
     from orchestrator.usage_gate import UsageGate
@@ -138,8 +138,8 @@ class TaskWorkflow:
         self.initial_plan = initial_plan
         self.metrics = WorkflowMetrics()
 
-        # Per-module config for verification/scheduling
-        self._module_config = self._resolve_module_config()
+        # Per-module configs for scoped verification
+        self._module_configs = self._resolve_module_configs()
 
         # Escalation support
         self.escalation_queue = escalation_queue
@@ -169,6 +169,10 @@ class TaskWorkflow:
                 )
                 stdout, _ = await proc.communicate()
                 base_commit = stdout.decode().strip()
+            # Sync per-worktree venvs so imports resolve from worktree source
+            if not self._worktree_external:
+                await self._sync_worktree_venvs()
+
             self.artifacts = TaskArtifacts(self.worktree)
             self.artifacts.init(
                 self.task_id,
@@ -229,7 +233,7 @@ class TaskWorkflow:
                     return merge_outcome
 
                 # POST-MERGE VERIFY
-                post_merge = await run_verification(self.config.project_root, self.config, self._module_config)
+                post_merge = await run_scoped_verification(self.config.project_root, self.config, self._module_configs)
                 if not post_merge.passed:
                     logger.error(f'Task {self.task_id}: post-merge verification failed')
                     await self.git_ops.revert_last_merge(self.config.project_root)
@@ -262,27 +266,74 @@ class TaskWorkflow:
             if self.state == WorkflowState.DONE and self.worktree and not self._worktree_external:
                 await self.git_ops.cleanup_worktree(self.worktree, branch_name)
 
-    def _resolve_module_config(self) -> ModuleConfig | None:
-        """Pick ModuleConfig for this task's modules.
+    def _resolve_module_configs(self) -> list[ModuleConfig]:
+        """Collect ModuleConfigs for this task's modules.
 
-        If all modules share the same subproject prefix, use that config.
-        If modules span multiple subprojects, fall back to global (None).
+        Groups modules by subproject prefix and returns one ModuleConfig per
+        subproject that has an ``orchestrator.yaml``.  Warns for subprojects
+        without configs.  Returns an empty list when no modules are assigned
+        (triggers global fallback in ``run_scoped_verification``).
         """
         if not self.modules:
-            return None
-        prefixes = set()
+            return []
+        seen: dict[str, ModuleConfig] = {}
+        missing: set[str] = set()
         for m in self.modules:
             mc = self.config.for_module(m)
             if mc:
-                prefixes.add(mc.prefix)
-        if len(prefixes) == 1:
-            return self.config.for_module(self.modules[0])
-        if len(prefixes) > 1:
+                seen[mc.prefix] = mc
+            else:
+                prefix = m.strip('/').split('/')[0]
+                missing.add(prefix)
+        if missing:
             logger.warning(
-                'Task %s spans subprojects %s — using global verification config',
-                self.task_id, prefixes,
+                'Task %s: subprojects without orchestrator.yaml: %s — '
+                'these will use global verification config',
+                self.task_id, missing,
             )
-        return None
+        return list(seen.values())
+
+    async def _sync_worktree_venvs(self) -> None:
+        """Run ``uv sync`` for task subprojects in the worktree.
+
+        Creates per-worktree venvs so Python imports resolve from the
+        worktree's source code rather than the main tree's editable installs.
+        Local ``[tool.uv.sources]`` dependencies (e.g. ``shared``) are
+        pulled in automatically via relative editable paths.
+        """
+        assert self.worktree is not None
+
+        # Derive unique subproject prefixes from task modules
+        prefixes: set[str] = set()
+        for m in self.modules:
+            prefix = m.strip('/').split('/')[0]
+            if (self.worktree / prefix / 'pyproject.toml').exists():
+                prefixes.add(prefix)
+
+        if not prefixes:
+            return
+
+        worktree = self.worktree  # bind for closure (narrowed to Path)
+
+        # Sync subprojects in parallel
+        async def _sync(prefix: str) -> None:
+            project_dir = str(worktree / prefix)
+            proc = await asyncio.create_subprocess_exec(
+                'uv', 'sync', '--project', project_dir,
+                cwd=str(self.worktree),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode != 0:
+                logger.warning(
+                    'Task %s: uv sync failed for %s: %s',
+                    self.task_id, prefix, stdout.decode()[:500],
+                )
+            else:
+                logger.info('Task %s: synced venv for %s', self.task_id, prefix)
+
+        await asyncio.gather(*(_sync(p) for p in sorted(prefixes)))
 
     async def _plan(self) -> WorkflowOutcome:
         """Invoke the architect to produce a plan."""
@@ -320,7 +371,7 @@ class TaskWorkflow:
             if not expanded:
                 return WorkflowOutcome.REQUEUED
             self.modules = plan_modules
-            self._module_config = self._resolve_module_config()
+            self._module_configs = self._resolve_module_configs()
 
         # Write plan decisions to memory
         await self._write_decisions_to_memory()
@@ -454,7 +505,7 @@ class TaskWorkflow:
         verify_attempt = 0
 
         while True:
-            result = await run_verification(self.worktree, self.config, self._module_config)
+            result = await run_scoped_verification(self.worktree, self.config, self._module_configs)
             if result.passed:
                 return WorkflowOutcome.DONE
 
@@ -614,7 +665,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         if merger_result.success and 'BLOCKED' not in merger_result.output.upper():
             # Verify the merge resolution
-            verify = await run_verification(self.config.project_root, self.config, self._module_config)
+            verify = await run_scoped_verification(self.config.project_root, self.config, self._module_configs)
             if verify.passed:
                 return WorkflowOutcome.DONE
             else:

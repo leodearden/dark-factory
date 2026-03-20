@@ -1,0 +1,7 @@
+# Orchestrator orchestrator configuration
+# Scopes verification to orchestrator's own venv.
+
+# Verification commands
+test_command: "uv run --project orchestrator --directory orchestrator pytest tests/ --tb=short -q"
+lint_command: "uv run --project orchestrator --directory orchestrator ruff check src/ tests/"
+type_check_command: "uv run --project orchestrator --directory orchestrator pyright src/ tests/"
