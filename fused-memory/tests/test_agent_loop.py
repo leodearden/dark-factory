@@ -12,6 +12,7 @@ from fused_memory.reconciliation.agent_loop import (
     CircuitBreakerError,
     ToolDefinition,
     _CLIResponseAdapter,
+    _OpenAIResponseAdapter,
 )
 
 
@@ -53,6 +54,50 @@ class FakeUsage:
 class FakeResponse:
     content: list = field(default_factory=list)
     usage: FakeUsage = field(default_factory=FakeUsage)
+
+
+# --- Fake OpenAI SDK response dataclasses ---
+
+
+@dataclass
+class FakeOpenAIFunction:
+    """Fake function object nested inside a tool call."""
+    name: str
+    arguments: str  # JSON string
+
+
+@dataclass
+class FakeOpenAIToolCall:
+    """Fake tool_call object on an OpenAI message."""
+    id: str
+    type: str
+    function: FakeOpenAIFunction
+
+
+@dataclass
+class FakeOpenAIMessage:
+    """Fake message object from OpenAI chat completion choice."""
+    content: str | None
+    tool_calls: list | None = None
+
+
+@dataclass
+class FakeOpenAIChoice:
+    """Fake single choice in an OpenAI response."""
+    message: FakeOpenAIMessage
+
+
+@dataclass
+class FakeOpenAIUsage:
+    """Fake usage stats for OpenAI response."""
+    total_tokens: int = 150
+
+
+@dataclass
+class FakeOpenAIResponse:
+    """Fake OpenAI chat completion response."""
+    choices: list = field(default_factory=list)
+    usage: FakeOpenAIUsage = field(default_factory=FakeOpenAIUsage)
 
 
 @pytest.mark.asyncio
@@ -290,6 +335,447 @@ async def test_no_tool_calls_ends_loop():
     result, entries = await agent.run('test')
     assert result.get('warning') == 'no_tool_calls'
     assert 'I am done thinking.' in result.get('text', '')
+
+
+# --- _OpenAIResponseAdapter tests ---
+
+
+def test_openai_adapter_text_only():
+    """_OpenAIResponseAdapter with text content and no tool_calls produces one _TextBlock."""
+    response = FakeOpenAIResponse(
+        choices=[
+            FakeOpenAIChoice(
+                message=FakeOpenAIMessage(content='Hello, world!', tool_calls=None)
+            )
+        ],
+        usage=FakeOpenAIUsage(total_tokens=42),
+    )
+    adapter = _OpenAIResponseAdapter(response)
+
+    assert len(adapter.content) == 1
+    block = adapter.content[0]
+    assert block.type == 'text'
+    assert block.text == 'Hello, world!'
+
+
+def test_openai_adapter_tool_calls_only():
+    """_OpenAIResponseAdapter with tool_calls and no content produces _ToolUseBlock objects."""
+    tc1 = FakeOpenAIToolCall(
+        id='call_abc',
+        type='function',
+        function=FakeOpenAIFunction(name='add_memory', arguments='{"content": "test"}'),
+    )
+    tc2 = FakeOpenAIToolCall(
+        id='call_def',
+        type='function',
+        function=FakeOpenAIFunction(name='stage_complete', arguments='{"report": {}}'),
+    )
+    response = FakeOpenAIResponse(
+        choices=[
+            FakeOpenAIChoice(
+                message=FakeOpenAIMessage(content=None, tool_calls=[tc1, tc2])
+            )
+        ],
+    )
+    adapter = _OpenAIResponseAdapter(response)
+
+    assert len(adapter.content) == 2
+
+    b0 = adapter.content[0]
+    assert b0.type == 'tool_use'
+    assert b0.id == 'call_abc'
+    assert b0.name == 'add_memory'
+    assert b0.input == {'content': 'test'}
+
+    b1 = adapter.content[1]
+    assert b1.type == 'tool_use'
+    assert b1.id == 'call_def'
+    assert b1.name == 'stage_complete'
+    assert b1.input == {'report': {}}
+
+
+def test_openai_adapter_mixed_text_and_tool_calls():
+    """_OpenAIResponseAdapter with both content and tool_calls produces text + tool_use blocks."""
+    tc = FakeOpenAIToolCall(
+        id='call_xyz',
+        type='function',
+        function=FakeOpenAIFunction(
+            name='search_memory',
+            arguments='{"query": "recent facts", "limit": 10}',
+        ),
+    )
+    response = FakeOpenAIResponse(
+        choices=[
+            FakeOpenAIChoice(
+                message=FakeOpenAIMessage(
+                    content='Let me search for that.',
+                    tool_calls=[tc],
+                )
+            )
+        ],
+    )
+    adapter = _OpenAIResponseAdapter(response)
+
+    assert len(adapter.content) == 2
+
+    text_blocks = [b for b in adapter.content if b.type == 'text']
+    tool_blocks = [b for b in adapter.content if b.type == 'tool_use']
+
+    assert len(text_blocks) == 1
+    assert text_blocks[0].text == 'Let me search for that.'
+
+    assert len(tool_blocks) == 1
+    assert tool_blocks[0].id == 'call_xyz'
+    assert tool_blocks[0].name == 'search_memory'
+    assert tool_blocks[0].input == {'query': 'recent facts', 'limit': 10}
+
+
+def test_openai_adapter_tool_arguments_json_parsed():
+    """_OpenAIResponseAdapter parses tool arguments JSON string into a dict."""
+    tc = FakeOpenAIToolCall(
+        id='call_1',
+        type='function',
+        function=FakeOpenAIFunction(
+            name='write_entity',
+            arguments='{"entity": "Project", "fact": "Active", "nested": {"key": "value"}}',
+        ),
+    )
+    response = FakeOpenAIResponse(
+        choices=[FakeOpenAIChoice(message=FakeOpenAIMessage(content=None, tool_calls=[tc]))],
+    )
+    adapter = _OpenAIResponseAdapter(response)
+
+    block = adapter.content[0]
+    assert isinstance(block.input, dict)
+    assert block.input['entity'] == 'Project'
+    assert block.input['nested'] == {'key': 'value'}
+
+
+# --- OpenAI provider _call_openai tests ---
+
+
+@pytest.mark.asyncio
+async def test_openai_tool_schema_conversion():
+    """_call_openai converts Anthropic tool schemas (input_schema) to OpenAI format (parameters)."""
+    config = _make_config(agent_llm_provider='openai', agent_llm_model='gpt-4o')
+
+    async def noop(**kwargs):
+        return {'ok': True}
+
+    tools = {
+        'search_memory': ToolDefinition(
+            name='search_memory',
+            description='Search memories by query',
+            parameters={
+                'type': 'object',
+                'properties': {'query': {'type': 'string'}, 'limit': {'type': 'integer'}},
+                'required': ['query'],
+            },
+            function=noop,
+        ),
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete the stage',
+            parameters={'type': 'object', 'properties': {'report': {'type': 'object'}}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='You are a test agent.',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+
+    # Response triggers immediate terminal result
+    captured = {}
+
+    async def fake_create(**kwargs):
+        captured['messages'] = kwargs['messages']
+        captured['tools'] = kwargs['tools']
+        return FakeOpenAIResponse(
+            choices=[
+                FakeOpenAIChoice(
+                    message=FakeOpenAIMessage(
+                        content=None,
+                        tool_calls=[
+                            FakeOpenAIToolCall(
+                                id='tc1',
+                                type='function',
+                                function=FakeOpenAIFunction(
+                                    name='stage_complete',
+                                    arguments='{"report": {}}',
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=FakeOpenAIUsage(total_tokens=100),
+        )
+
+    mock_completions = MagicMock()
+    mock_completions.create = fake_create
+
+    mock_chat = MagicMock()
+    mock_chat.completions = mock_completions
+
+    mock_client = MagicMock()
+    mock_client.chat = mock_chat
+
+    with patch('openai.AsyncOpenAI', return_value=mock_client):
+        result, entries = await agent.run('initial payload')
+
+    assert result == {'report': {}}
+
+    # Verify OpenAI tool schema format
+    sent_tools = captured['tools']
+    assert len(sent_tools) == 2
+    by_name = {t['function']['name']: t for t in sent_tools}
+
+    # Anthropic input_schema → OpenAI parameters
+    search_tool = by_name['search_memory']
+    assert search_tool['type'] == 'function'
+    assert 'parameters' in search_tool['function']
+    assert 'input_schema' not in search_tool['function']
+    assert search_tool['function']['parameters']['properties']['query']['type'] == 'string'
+    assert search_tool['function']['description'] == 'Search memories by query'
+
+    # System prompt is first message with role='system'
+    sent_messages = captured['messages']
+    assert sent_messages[0]['role'] == 'system'
+    assert sent_messages[0]['content'] == 'You are a test agent.'
+
+
+@pytest.mark.asyncio
+async def test_openai_message_conversion():
+    """_call_openai correctly converts all Anthropic message formats to OpenAI messages."""
+    config = _make_config(agent_llm_provider='openai', agent_llm_model='gpt-4o')
+
+    async def noop(**kwargs):
+        return {'ok': True}
+
+    tools = {
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete',
+            parameters={'type': 'object', 'properties': {}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='System prompt here.',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+
+    # Build a messages list that exercises all conversion branches:
+    # 1. String content (initial user message)
+    # 2. List with text block (assistant thinking)
+    # 3. List with tool_use block (assistant tool call)
+    # 4. List with tool_result dicts (user follow-up)
+    messages = [
+        {'role': 'user', 'content': 'initial payload string'},
+        {'role': 'assistant', 'content': [
+            FakeText(text='Thinking about this...'),
+            FakeToolUse(id='call_a', name='noop', input={'x': 1}),
+        ]},
+        {'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': 'call_a', 'content': '{"ok": true}'},
+        ]},
+    ]
+
+    captured = {}
+
+    async def fake_create(**kwargs):
+        captured['messages'] = list(kwargs['messages'])
+        return FakeOpenAIResponse(
+            choices=[
+                FakeOpenAIChoice(
+                    message=FakeOpenAIMessage(
+                        content=None,
+                        tool_calls=[
+                            FakeOpenAIToolCall(
+                                id='tc_final',
+                                type='function',
+                                function=FakeOpenAIFunction(
+                                    name='stage_complete',
+                                    arguments='{}',
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=FakeOpenAIUsage(total_tokens=50),
+        )
+
+    mock_completions = MagicMock()
+    mock_completions.create = fake_create
+    mock_chat = MagicMock()
+    mock_chat.completions = mock_completions
+    mock_client = MagicMock()
+    mock_client.chat = mock_chat
+
+    with patch('openai.AsyncOpenAI', return_value=mock_client):
+        await agent._call_openai(messages, [])
+
+    sent = captured['messages']
+
+    # Index 0: system prompt injected by _call_openai
+    assert sent[0] == {'role': 'system', 'content': 'System prompt here.'}
+
+    # Index 1: string content → passthrough
+    assert sent[1] == {'role': 'user', 'content': 'initial payload string'}
+
+    # Indices 2 and 3: text block and tool_use block from assistant message
+    # text block → role=assistant, content=text
+    text_msg = next(m for m in sent[2:] if m.get('role') == 'assistant' and 'content' in m
+                    and isinstance(m.get('content'), str))
+    assert text_msg['content'] == 'Thinking about this...'
+
+    # tool_use block → role=assistant, tool_calls=[{id, type, function}]
+    tool_call_msg = next(
+        m for m in sent[2:] if m.get('role') == 'assistant' and 'tool_calls' in m
+    )
+    assert tool_call_msg['tool_calls'][0]['id'] == 'call_a'
+    assert tool_call_msg['tool_calls'][0]['type'] == 'function'
+    assert tool_call_msg['tool_calls'][0]['function']['name'] == 'noop'
+    assert json.loads(tool_call_msg['tool_calls'][0]['function']['arguments']) == {'x': 1}
+
+    # tool_result dict → role=tool, tool_call_id, content
+    tool_result_msg = next(m for m in sent if m.get('role') == 'tool')
+    assert tool_result_msg['tool_call_id'] == 'call_a'
+    assert tool_result_msg['content'] == '{"ok": true}'
+
+
+@pytest.mark.asyncio
+async def test_openai_round_trip_two_turns():
+    """Full AgentLoop round-trip with OpenAI provider: tool call then terminal.
+
+    Verifies:
+    - Agent executes the tool function on first response
+    - Tool results are sent back in OpenAI tool format on second call
+    - Terminal result is returned correctly
+    - llm_call_count and token_count are updated
+    """
+    config = _make_config(agent_llm_provider='openai', agent_llm_model='gpt-4o')
+
+    executed_calls = []
+
+    async def my_tool(value: int = 0):
+        executed_calls.append(value)
+        return {'doubled': value * 2}
+
+    tools = {
+        'my_tool': ToolDefinition(
+            name='my_tool',
+            description='Doubles a number',
+            parameters={
+                'type': 'object',
+                'properties': {'value': {'type': 'integer'}},
+                'required': ['value'],
+            },
+            function=my_tool,
+        ),
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete',
+            parameters={'type': 'object', 'properties': {'report': {'type': 'object'}}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='You are a round-trip test agent.',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+
+    call_count = 0
+    second_call_messages: list[dict] | None = None
+
+    async def fake_create(**kwargs):
+        nonlocal call_count, second_call_messages
+        call_count += 1
+        if call_count == 1:
+            # First call: request my_tool
+            return FakeOpenAIResponse(
+                choices=[
+                    FakeOpenAIChoice(
+                        message=FakeOpenAIMessage(
+                            content=None,
+                            tool_calls=[
+                                FakeOpenAIToolCall(
+                                    id='call_tool_1',
+                                    type='function',
+                                    function=FakeOpenAIFunction(
+                                        name='my_tool',
+                                        arguments='{"value": 7}',
+                                    ),
+                                )
+                            ],
+                        )
+                    )
+                ],
+                usage=FakeOpenAIUsage(total_tokens=80),
+            )
+        else:
+            # Second call: terminal
+            second_call_messages = list(kwargs['messages'])
+            return FakeOpenAIResponse(
+                choices=[
+                    FakeOpenAIChoice(
+                        message=FakeOpenAIMessage(
+                            content=None,
+                            tool_calls=[
+                                FakeOpenAIToolCall(
+                                    id='call_terminal',
+                                    type='function',
+                                    function=FakeOpenAIFunction(
+                                        name='stage_complete',
+                                        arguments='{"report": {"doubled": 14}}',
+                                    ),
+                                )
+                            ],
+                        )
+                    )
+                ],
+                usage=FakeOpenAIUsage(total_tokens=60),
+            )
+
+    mock_completions = MagicMock()
+    mock_completions.create = fake_create
+    mock_chat = MagicMock()
+    mock_chat.completions = mock_completions
+    mock_client = MagicMock()
+    mock_client.chat = mock_chat
+
+    with patch('openai.AsyncOpenAI', return_value=mock_client):
+        result, entries = await agent.run('run the test')
+
+    # Agent returned terminal tool input
+    assert result == {'report': {'doubled': 14}}
+    assert len(entries) == 0  # my_tool is not a mutation
+
+    # Tool was actually executed
+    assert executed_calls == [7]
+
+    # LLM was called twice
+    assert agent.llm_call_count == 2
+    assert agent.token_count == 80 + 60
+
+    # Second call messages include a 'tool' role message with tool results
+    assert second_call_messages is not None
+    tool_result_msgs = [m for m in second_call_messages if m.get('role') == 'tool']
+    assert len(tool_result_msgs) == 1
+    assert tool_result_msgs[0]['tool_call_id'] == 'call_tool_1'
+    result_content = json.loads(tool_result_msgs[0]['content'])
+    assert result_content['doubled'] == 14
 
 
 # --- Claude CLI provider tests ---
