@@ -337,6 +337,120 @@ async def test_no_tool_calls_ends_loop():
     assert 'I am done thinking.' in result.get('text', '')
 
 
+# --- _OpenAIResponseAdapter tests ---
+
+
+def test_openai_adapter_text_only():
+    """_OpenAIResponseAdapter with text content and no tool_calls produces one _TextBlock."""
+    response = FakeOpenAIResponse(
+        choices=[
+            FakeOpenAIChoice(
+                message=FakeOpenAIMessage(content='Hello, world!', tool_calls=None)
+            )
+        ],
+        usage=FakeOpenAIUsage(total_tokens=42),
+    )
+    adapter = _OpenAIResponseAdapter(response)
+
+    assert len(adapter.content) == 1
+    block = adapter.content[0]
+    assert block.type == 'text'
+    assert block.text == 'Hello, world!'
+
+
+def test_openai_adapter_tool_calls_only():
+    """_OpenAIResponseAdapter with tool_calls and no content produces _ToolUseBlock objects."""
+    tc1 = FakeOpenAIToolCall(
+        id='call_abc',
+        type='function',
+        function=FakeOpenAIFunction(name='add_memory', arguments='{"content": "test"}'),
+    )
+    tc2 = FakeOpenAIToolCall(
+        id='call_def',
+        type='function',
+        function=FakeOpenAIFunction(name='stage_complete', arguments='{"report": {}}'),
+    )
+    response = FakeOpenAIResponse(
+        choices=[
+            FakeOpenAIChoice(
+                message=FakeOpenAIMessage(content=None, tool_calls=[tc1, tc2])
+            )
+        ],
+    )
+    adapter = _OpenAIResponseAdapter(response)
+
+    assert len(adapter.content) == 2
+
+    b0 = adapter.content[0]
+    assert b0.type == 'tool_use'
+    assert b0.id == 'call_abc'
+    assert b0.name == 'add_memory'
+    assert b0.input == {'content': 'test'}
+
+    b1 = adapter.content[1]
+    assert b1.type == 'tool_use'
+    assert b1.id == 'call_def'
+    assert b1.name == 'stage_complete'
+    assert b1.input == {'report': {}}
+
+
+def test_openai_adapter_mixed_text_and_tool_calls():
+    """_OpenAIResponseAdapter with both content and tool_calls produces text + tool_use blocks."""
+    tc = FakeOpenAIToolCall(
+        id='call_xyz',
+        type='function',
+        function=FakeOpenAIFunction(
+            name='search_memory',
+            arguments='{"query": "recent facts", "limit": 10}',
+        ),
+    )
+    response = FakeOpenAIResponse(
+        choices=[
+            FakeOpenAIChoice(
+                message=FakeOpenAIMessage(
+                    content='Let me search for that.',
+                    tool_calls=[tc],
+                )
+            )
+        ],
+    )
+    adapter = _OpenAIResponseAdapter(response)
+
+    assert len(adapter.content) == 2
+
+    text_blocks = [b for b in adapter.content if b.type == 'text']
+    tool_blocks = [b for b in adapter.content if b.type == 'tool_use']
+
+    assert len(text_blocks) == 1
+    assert text_blocks[0].text == 'Let me search for that.'
+
+    assert len(tool_blocks) == 1
+    assert tool_blocks[0].id == 'call_xyz'
+    assert tool_blocks[0].name == 'search_memory'
+    assert tool_blocks[0].input == {'query': 'recent facts', 'limit': 10}
+
+
+def test_openai_adapter_tool_arguments_json_parsed():
+    """_OpenAIResponseAdapter parses tool arguments JSON string into a dict."""
+    tc = FakeOpenAIToolCall(
+        id='call_1',
+        type='function',
+        function=FakeOpenAIFunction(
+            name='write_entity',
+            arguments='{"entity": "Project", "fact": "Active", "nested": {"key": "value"}}',
+        ),
+    )
+    response = FakeOpenAIResponse(
+        choices=[FakeOpenAIChoice(message=FakeOpenAIMessage(content=None, tool_calls=[tc]))],
+    )
+    adapter = _OpenAIResponseAdapter(response)
+
+    block = adapter.content[0]
+    assert isinstance(block.input, dict)
+    assert block.input['entity'] == 'Project'
+    assert block.input['nested'] == {'key': 'value'}
+
+
 # --- Claude CLI provider tests ---
 
 
