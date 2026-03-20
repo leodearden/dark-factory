@@ -314,14 +314,19 @@ class MemoryService:
         self,
         source_project_id: str,
         target_project_id: str | None = None,
+        limit: int | None = None,
     ) -> int:
-        """Fetch all memories from Mem0 and enqueue each for Graphiti write.
+        """Fetch memories from Mem0 and enqueue each for Graphiti write.
+
+        Args:
+            limit: Max memories to replay. None = all (up to 1000).
 
         Returns the count of items queued.
         """
         target = target_project_id or source_project_id
         scope = Scope(project_id=source_project_id)
-        all_mems = await self.mem0.get_all(scope, limit=1000)
+        fetch_limit = limit if limit else 1000
+        all_mems = await self.mem0.get_all(scope, limit=fetch_limit)
         memories = all_mems.get('results', [])
         if not memories:
             return 0
@@ -633,10 +638,11 @@ class MemoryService:
         # Graphiti health
         try:
             client = self.graphiti._require_client()
-            async with client.driver.session() as session:
-                result = await session.run('MATCH (n) RETURN count(n) as count')
-                records = [record async for record in result]
-                node_count = records[0]['count'] if records else 0
+            result = await client.driver.execute_query(
+                'MATCH (n) RETURN count(n) as count'
+            )
+            records = result[0] if result else []
+            node_count = records[0]['count'] if records else 0
             status['graphiti'] = {'connected': True, 'node_count': node_count}
         except Exception as e:
             status['graphiti'] = {'connected': False, 'error': str(e)}

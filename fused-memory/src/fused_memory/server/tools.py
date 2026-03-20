@@ -343,6 +343,7 @@ def create_mcp_server(
     async def replay_to_graphiti(
         project_id: str,
         source_store: str = 'mem0',
+        limit: int | None = None,
     ) -> dict[str, Any]:
         """Replay memories from Mem0 into Graphiti via the durable write queue.
 
@@ -353,10 +354,12 @@ def create_mcp_server(
         Args:
             project_id: Project whose memories to replay
             source_store: Source store to replay from (currently only "mem0")
+            limit: Max memories to replay (None = all)
         """
         try:
             count = await memory_service.replay_from_store(
                 source_project_id=project_id,
+                limit=limit,
             )
             return {'status': 'queued', 'items_queued': count, 'project_id': project_id}
         except Exception as e:
