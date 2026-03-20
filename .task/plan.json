@@ -1,0 +1,83 @@
+{
+  "task_id": "48",
+  "title": "Auto-dismiss stale escalations on orchestrator startup",
+  "files": [
+    "escalation/src/escalation/queue.py",
+    "escalation/tests/test_queue.py",
+    "orchestrator/src/orchestrator/harness.py",
+    "orchestrator/tests/test_stale_escalation_cleanup.py"
+  ],
+  "modules": [
+    "escalation/src/escalation",
+    "escalation/tests",
+    "orchestrator/src/orchestrator",
+    "orchestrator/tests"
+  ],
+  "analysis": "When a new orchestrator run starts, stale escalations from prior runs persist in the filesystem queue and block current-run tasks. The fix has two parts:\n\n1. **EscalationQueue.dismiss_all_pending()** — a new method on the queue that bulk-dismisses all pending escalations with a given resolution message. This is a clean, testable primitive on the queue itself.\n\n2. **Harness._dismiss_stale_escalations()** — called in `Harness.run()` right after `_start_escalation_server()` and before the task loop. It calls `dismiss_all_pending()` on the queue, logging how many were dismissed. This ensures every orchestrator run starts clean.\n\nThe approach is simpler than the proposed fix's per-task/per-timestamp filtering because ALL pending escalations at startup are by definition stale — the prior run ended (or crashed) without resolving them. A new run should never inherit unresolved escalations. This is consistent with how `_recover_crashed_tasks()` resets in-progress tasks to pending.\n\nNo config changes needed. No new dependencies.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write tests for EscalationQueue.dismiss_all_pending() — verifies it bulk-dismisses all pending escalations with a resolution message, returns count, leaves already-resolved/dismissed escalations untouched, and handles empty queue gracefully.",
+      "status": "done",
+      "commit": "0d14a2c"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Implement EscalationQueue.dismiss_all_pending(resolution: str) -> int — iterates get_pending(), calls resolve() with dismiss=True on each, returns count of dismissed.",
+      "status": "done",
+      "commit": "92f1714"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write tests for Harness._dismiss_stale_escalations() — verifies: (a) when queue has pending escalations, all are dismissed with correct message and count is logged; (b) when queue is empty, method is a no-op; (c) when escalation package is not installed (HAS_ESCALATION=False), method is a no-op; (d) method is called during run() after _start_escalation_server() but before task loop.",
+      "status": "done",
+      "commit": "b5fc4d1"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Implement Harness._dismiss_stale_escalations() and wire it into Harness.run() after _start_escalation_server(). The method calls self._escalation_queue.dismiss_all_pending() if the queue exists, logs the count.",
+      "status": "done",
+      "commit": "ba0b33f"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Dismiss ALL pending escalations at startup, not just those matching done tasks or old timestamps",
+      "rationale": "All pending escalations at orchestrator startup are inherently stale — the prior run either completed or crashed. There is no scenario where a pending escalation from a prior run should block a new run. Per-task or per-timestamp filtering adds complexity without benefit. This mirrors the existing pattern in _recover_crashed_tasks() which unconditionally resets all in-progress tasks to pending."
+    },
+    {
+      "decision": "Add dismiss_all_pending() as a method on EscalationQueue rather than only in the harness",
+      "rationale": "The queue is the right abstraction layer for bulk operations on its contents. This keeps the harness thin (just calls queue.dismiss_all_pending()) and makes the operation independently testable without mocking the filesystem. It also makes the primitive reusable if other callers (e.g. CLI) need it."
+    },
+    {
+      "decision": "Use dismiss=True (status='dismissed') rather than status='resolved' for stale escalations",
+      "rationale": "Dismissed semantically means 'no longer relevant' which is exactly the case for stale escalations. Resolved implies someone investigated and took action. This distinction is already in the queue.resolve() API and matches how the user manually resolved them via resolve_issue(terminate=true)."
+    },
+    {
+      "decision": "Place cleanup call after _start_escalation_server() but before _recover_crashed_tasks()",
+      "rationale": "The escalation queue must be initialized before we can dismiss from it (happens in _start_escalation_server). Doing it before crash recovery and the task loop ensures no stale escalations can interfere with the new run. The ordering is: start servers → clean stale escalations → recover crashes → populate tasks → run."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "EscalationQueue.get_pending() and EscalationQueue.resolve()",
+      "where": "escalation/src/escalation/queue.py",
+      "how": "dismiss_all_pending() composes these two existing methods — get_pending() to find stale escalations, resolve(id, resolution, dismiss=True) to dismiss each one."
+    },
+    {
+      "what": "Harness test fixture pattern from test_crash_recovery.py",
+      "where": "orchestrator/tests/test_crash_recovery.py",
+      "how": "Reuse the same pattern of creating a Harness with mocked McpLifecycle, Scheduler, BriefingAssembler, then replacing internals with AsyncMock. The harness fixture and conftest.py patterns are directly applicable."
+    },
+    {
+      "what": "Escalation model and queue from escalation package",
+      "where": "escalation/src/escalation/models.py, escalation/src/escalation/queue.py",
+      "how": "All escalation data structures and filesystem operations already exist. No new model fields or schema changes needed."
+    }
+  ]
+}
