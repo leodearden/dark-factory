@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -137,3 +138,60 @@ class TestDismissAllPending:
         assert queue.get('esc-3-1').status == 'resolved'  # type: ignore[union-attr]
         assert queue.get('esc-4-1').status == 'dismissed'  # type: ignore[union-attr]
         assert queue.get('esc-4-1').resolution == 'dismissed already'  # type: ignore[union-attr]
+
+
+class TestDismissAllPendingResilience:
+    """EscalationQueue.dismiss_all_pending() is resilient to per-item resolve() failures."""
+
+    def test_resolve_failure_does_not_abort_loop(self, tmp_path: Path):
+        """If resolve() raises on one item, the remaining items are still dismissed."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+        queue.submit(_make_escalation('esc-2-1', task_id='2'))
+        queue.submit(_make_escalation('esc-3-1', task_id='3'))
+
+        # Patch resolve() so it raises OSError for esc-2-1, succeeds for others
+        original_resolve = queue.resolve
+
+        def patched_resolve(esc_id: str, resolution: str, dismiss: bool = False):
+            if esc_id == 'esc-2-1':
+                raise OSError('disk full')
+            return original_resolve(esc_id, resolution, dismiss=dismiss)
+
+        with patch.object(queue, 'resolve', side_effect=patched_resolve):
+            count = queue.dismiss_all_pending('Stale from prior run')
+
+        # Only 2 of 3 succeeded (esc-2-1 failed)
+        assert count == 2
+
+    def test_resolve_failure_count_reflects_successes_only(self, tmp_path: Path):
+        """Returned count only reflects successfully dismissed escalations."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+        queue.submit(_make_escalation('esc-2-1', task_id='2'))
+
+        original_resolve = queue.resolve
+
+        def patched_resolve(esc_id: str, resolution: str, dismiss: bool = False):
+            if esc_id == 'esc-1-1':
+                raise OSError('permission denied')
+            return original_resolve(esc_id, resolution, dismiss=dismiss)
+
+        with patch.object(queue, 'resolve', side_effect=patched_resolve):
+            count = queue.dismiss_all_pending('Stale from prior run')
+
+        assert count == 1  # only esc-2-1 succeeded
+
+    def test_resolve_failure_does_not_propagate(self, tmp_path: Path):
+        """An OSError from resolve() does not propagate to the caller."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        def always_fail(esc_id: str, resolution: str, dismiss: bool = False):
+            raise OSError('disk full')
+
+        with patch.object(queue, 'resolve', side_effect=always_fail):
+            # Must not raise
+            count = queue.dismiss_all_pending('Stale from prior run')
+
+        assert count == 0
