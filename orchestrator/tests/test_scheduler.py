@@ -296,6 +296,193 @@ class TestModuleLockWithModuleConfig:
         assert not lt.try_acquire('t3', ['dashboard'])
 
 
+class TestStatusTransitionGuard:
+    """Scheduler.set_task_status must reject transitions from terminal states."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_rejects_done_to_blocked(self, scheduler: Scheduler, monkeypatch):
+        """Once a task is DONE, subsequent set_task_status('blocked') is silently dropped."""
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('1', 'in-progress')
+        await scheduler.set_task_status('1', 'done')
+        await scheduler.set_task_status('1', 'blocked')
+
+        # Only in-progress and done should have triggered MCP calls
+        assert mock.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_rejects_done_to_in_progress(self, scheduler: Scheduler, monkeypatch):
+        """done->in-progress is rejected (duplicate workflow start)."""
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('1', 'done')
+        call_count_after_done = mock.call_count
+        await scheduler.set_task_status('1', 'in-progress')
+
+        assert mock.call_count == call_count_after_done  # no new MCP call
+
+    @pytest.mark.asyncio
+    async def test_allows_done_to_done_idempotent(self, scheduler: Scheduler, monkeypatch):
+        """Idempotent done->done transitions must be allowed."""
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('1', 'done')
+        await scheduler.set_task_status('1', 'done')
+
+        assert mock.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_allows_normal_flow(self, scheduler: Scheduler, monkeypatch):
+        """in-progress->done is a valid transition and must go through."""
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('2', 'in-progress')
+        await scheduler.set_task_status('2', 'done')
+
+        assert mock.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_fail_open_unknown_task(self, scheduler: Scheduler, monkeypatch):
+        """First-ever set_task_status for an unknown task always calls mcp_call."""
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('unknown-99', 'blocked')
+
+        assert mock.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_cache_survives_release(self, scheduler: Scheduler, monkeypatch):
+        """Status cache persists beyond lock release so stale workflows are still blocked."""
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('1', 'done')
+        scheduler.release('1')  # clears _dispatched and module lock, NOT status cache
+        call_count_before = mock.call_count
+
+        await scheduler.set_task_status('1', 'blocked')
+
+        # Cache still shows 'done', so blocked is rejected
+        assert mock.call_count == call_count_before
+
+
+class TestGetTasksSeedsCache:
+    """get_tasks() should populate the _status_cache so pre-existing terminal tasks are guarded."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_seeds_status_cache(self, scheduler: Scheduler, monkeypatch):
+        """After get_tasks(), set_task_status for a 'done' task is rejected without MCP call."""
+        tasks_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [{"id": "42", "status": "done", "title": "T"}]}',
+                    }
+                ]
+            }
+        }
+        mcp_mock = AsyncMock(return_value=tasks_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+
+        await scheduler.get_tasks()  # seeds cache from tasks response
+
+        call_count_after_seed = mcp_mock.call_count
+
+        # Now try to set blocked on the done task
+        await scheduler.set_task_status('42', 'blocked')
+
+        # Cache was seeded: the blocked call must be rejected (no new MCP call)
+        assert mcp_mock.call_count == call_count_after_seed
+
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_does_not_downgrade_terminal_cache(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """get_tasks() must NOT overwrite a terminal cache entry with stale taskmaster data."""
+        # Step 1: Populate cache with terminal status via set_task_status
+        set_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', set_mock)
+        await scheduler.set_task_status('42', 'done')
+        assert scheduler._status_cache.get('42') == 'done'
+
+        # Step 2: Simulate stale taskmaster data — task 42 shows 'in-progress'
+        stale_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [{"id": "42", "status": "in-progress", "title": "T"}]}',
+                    }
+                ]
+            }
+        }
+        get_mock = AsyncMock(return_value=stale_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', get_mock)
+
+        # Step 3: get_tasks() must NOT downgrade the terminal cache entry
+        await scheduler.get_tasks()
+        assert scheduler._status_cache.get('42') == 'done', (
+            'get_tasks() must not downgrade terminal status to stale in-progress'
+        )
+
+        # Step 4: set_task_status('blocked') must still be rejected
+        call_count_before = get_mock.call_count
+        await scheduler.set_task_status('42', 'blocked')
+        assert get_mock.call_count == call_count_before, (
+            'set_task_status(blocked) must be rejected after get_tasks() seeding'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_updates_non_terminal_cache(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """get_tasks() should update cache entries that are not yet terminal."""
+        # Pre-populate cache with a non-terminal status
+        set_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', set_mock)
+        await scheduler.set_task_status('42', 'in-progress')
+        assert scheduler._status_cache.get('42') == 'in-progress'
+
+        # Simulate taskmaster reporting a different non-terminal status ('blocked')
+        update_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [{"id": "42", "status": "blocked", "title": "T"}]}',
+                    }
+                ]
+            }
+        }
+        get_mock = AsyncMock(return_value=update_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', get_mock)
+
+        await scheduler.get_tasks()
+
+        # Non-terminal cache entry SHOULD be updated
+        assert scheduler._status_cache.get('42') == 'blocked', (
+            'get_tasks() should update non-terminal cache entries'
+        )
+
+
 class TestAcquireNextNoDuplicates:
     """acquire_next() must not return the same task twice while its locks are held."""
 

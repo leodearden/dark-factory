@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.mcp_lifecycle import mcp_call
+from orchestrator.task_status import TERMINAL_STATUSES, is_valid_transition
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,7 @@ class Scheduler:
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
         self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
+        self._status_cache: dict[str, str] = {}
 
     async def get_tasks(self) -> list[dict]:
         """Fetch all tasks from fused-memory/taskmaster."""
@@ -178,14 +180,34 @@ class Scheduler:
                     data = json.loads(block['text'])
                     # Handle taskmaster's nested response format: {data: {tasks: [...]}}
                     if 'data' in data and isinstance(data['data'], dict):
-                        return data['data'].get('tasks', [])
-                    return data.get('tasks', [])
+                        tasks = data['data'].get('tasks', [])
+                    else:
+                        tasks = data.get('tasks', [])
+                    # Seed status cache from task list.
+                    # Never downgrade a terminal status — stale taskmaster data
+                    # (e.g., 'in-progress') must not reopen the terminal guard window
+                    # for a task the cache already knows is 'done' or 'cancelled'.
+                    for t in tasks:
+                        tid = str(t.get('id', ''))
+                        s = t.get('status', '')
+                        if tid and s and (
+                            tid not in self._status_cache
+                            or self._status_cache[tid] not in TERMINAL_STATUSES
+                        ):
+                            self._status_cache[tid] = s
+                    return tasks
         except Exception as e:
             logger.error(f'Failed to fetch tasks: {e}')
         return []
 
     async def set_task_status(self, task_id: str, status: str) -> None:
         """Update task status via fused-memory."""
+        cached = self._status_cache.get(task_id)
+        if not is_valid_transition(cached, status):
+            logger.warning(
+                'Task %s: rejecting %s->%s (terminal state guard)', task_id, cached, status
+            )
+            return
         try:
             await mcp_call(
                 f'{self._memory_url}/mcp',
@@ -200,6 +222,7 @@ class Scheduler:
                 },
                 timeout=15,
             )
+            self._status_cache[task_id] = status
         except Exception as e:
             logger.error(f'Failed to set task {task_id} status to {status}: {e}')
 

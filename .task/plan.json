@@ -1,0 +1,188 @@
+{
+  "task_id": "47",
+  "title": "Prevent duplicate workflow from overriding completed task status",
+  "files": [
+    "orchestrator/src/orchestrator/task_status.py",
+    "orchestrator/tests/test_task_status.py",
+    "orchestrator/src/orchestrator/scheduler.py",
+    "orchestrator/tests/test_scheduler.py",
+    "orchestrator/src/orchestrator/workflow.py",
+    "orchestrator/tests/test_workflow_e2e.py",
+    "fused-memory/src/fused_memory/middleware/task_interceptor.py",
+    "fused-memory/tests/test_task_interceptor.py"
+  ],
+  "modules": [
+    "orchestrator/src/orchestrator",
+    "orchestrator/tests",
+    "fused-memory/src/fused_memory/middleware",
+    "fused-memory/tests"
+  ],
+  "analysis": "The bug: when a duplicate workflow fires (task 42's root cause), the real workflow completes and sets DONE, but the duplicate crashes later and calls _mark_blocked() which calls scheduler.set_task_status(task_id, 'blocked'), overwriting the correct DONE status. Last writer wins because there is no guard.\n\nCritical architectural insight: both workflows share the same Scheduler instance (harness.py line 84 creates one Scheduler, _run_slot line 484 passes it to each TaskWorkflow). This means an in-memory _status_cache on the Scheduler correctly reflects Workflow A's DONE when Workflow B later tries BLOCKED — no extra MCP round-trip needed.\n\nThe duplicate workflow also calls set_task_status('in-progress') at the start of run() (workflow.py line 156), which would override 'done' to 'in-progress' before the crash. The guard must block done->in-progress too.\n\nFour layers of defense:\n1. **task_status.py FSM module** — New module defining TERMINAL_STATUSES (done, cancelled) and is_valid_transition(). Permissive design: only terminal states are guarded, all other transitions allowed. This avoids breaking legitimate flows like blocked->done (manual fix) or in-progress->pending (crash recovery).\n2. **Scheduler-level cache guard** (primary, shared across all workflow instances): _status_cache populated on set_task_status calls and seeded from get_tasks(). Before each MCP call, check is_valid_transition. If invalid, log warning and skip. This catches cross-instance races. IMPORTANT: get_tasks() cache seeding must never downgrade a terminal status — stale taskmaster data showing 'in-progress' for a task the cache already knows is 'done' must be ignored (see steps 11-12).\n3. **workflow.py _mark_blocked guard** (secondary, per-instance): Check self.state == WorkflowState.DONE before transitioning. Catches within-workflow edge cases (exception after DONE set on line 246 but before return on line 253, falling into except block on line 259). Returns WorkflowOutcome.DONE since the task IS actually done.\n4. **TaskInterceptor guard** (defense in depth at the fused-memory layer): The interceptor already fetches before-state (line 81) and extracts old_status (line 87). Add validation: if old_status is terminal and new_status differs, reject. This protects all clients, not just the orchestrator.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write unit tests for task_status FSM module in new file orchestrator/tests/test_task_status.py. Tests: (1) is_valid_transition rejects done->blocked, done->pending, done->in-progress (all return False); (2) cancelled->pending, cancelled->blocked return False (cancelled also terminal); (3) done->done returns True (idempotent); (4) cancelled->cancelled returns True (idempotent); (5) in-progress->done, in-progress->blocked, pending->in-progress, blocked->pending all return True; (6) None->anything returns True (unknown from_status is fail-open); (7) TERMINAL_STATUSES contains 'done' and 'cancelled' but not 'blocked' or 'pending'.",
+      "status": "done",
+      "commit": "ddd469b"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Create orchestrator/src/orchestrator/task_status.py: TERMINAL_STATUSES = frozenset({'done', 'cancelled'}). Function is_valid_transition(from_status: str | None, to_status: str) -> bool: if from_status is None return True (fail-open); if from_status == to_status return True (idempotent); if from_status in TERMINAL_STATUSES return False; return True (permissive for non-terminal).",
+      "status": "done",
+      "commit": "4f835ed"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write tests in test_scheduler.py (new TestStatusTransitionGuard class) for Scheduler.set_task_status cache guard. Mock mcp_call at module level. Tests: (1) test_rejects_done_to_blocked — call set_task_status(id,'in-progress'), set_task_status(id,'done'), then set_task_status(id,'blocked'); verify mcp_call was called for first two but NOT the third; (2) test_allows_done_to_done_idempotent — set_task_status(id,'done') twice, both MCP calls go through; (3) test_allows_normal_flow — in-progress->done proceeds normally; (4) test_fail_open_unknown_task — first-ever set_task_status for unknown task always calls mcp_call; (5) test_cache_survives_release — after set_task_status(id,'done') then scheduler.release(id), set_task_status(id,'blocked') is still rejected.",
+      "status": "done",
+      "commit": "56ec911"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Modify Scheduler in scheduler.py: (1) Add self._status_cache: dict[str, str] = {} in __init__. (2) At top of file, import is_valid_transition from task_status. (3) In set_task_status(), before the try/mcp_call block: cached = self._status_cache.get(task_id); if not is_valid_transition(cached, status): log warning 'Task {task_id}: rejecting {cached}->{status} (terminal state guard)' and return. After the mcp_call succeeds (inside the try, after the await), set self._status_cache[task_id] = status. (4) Do NOT clear cache in release() — status must persist beyond lock release.",
+      "status": "done",
+      "commit": "a5a39a4"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write test in test_scheduler.py: test_get_tasks_seeds_status_cache — mock mcp_call to return tasks with statuses including one 'done' task, call get_tasks(), then call set_task_status on the done task with 'blocked'; verify mcp_call for set_task_status was NOT called (cache was seeded from get_tasks response).",
+      "status": "done",
+      "commit": "b01a510"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Update Scheduler.get_tasks() in scheduler.py: after parsing the tasks list (after 'return data.get(\"tasks\", [])' paths), iterate the result and populate self._status_cache[str(t.get('id', ''))] = t.get('status', '') for each task before returning. Ensure this happens on all return paths that produce a task list.",
+      "status": "done",
+      "commit": "eab4d74"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write tests in test_workflow_e2e.py (new TestDoneIsTerminal class) for _mark_blocked workflow guard. Tests: (1) test_mark_blocked_skipped_when_done — create workflow via _build_workflow, manually set workflow.state = WorkflowState.DONE, call await workflow._mark_blocked('late error'), assert return is WorkflowOutcome.DONE, assert FakeScheduler.statuses[task_id] does NOT contain 'blocked'; (2) test_mark_blocked_skips_escalation_when_done — use _build_workflow_with_escalation, set state to DONE, call _mark_blocked, assert escalation queue has no entries for this task; (3) test_mark_blocked_works_normally_when_not_done — call _mark_blocked without DONE state, verify 'blocked' appears in statuses and escalation is created.",
+      "status": "done",
+      "commit": "0f4b483"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Modify _mark_blocked in workflow.py: at the top of the method, before self.state = WorkflowState.BLOCKED, add guard: if self.state == WorkflowState.DONE: logger.warning('Task %s: already DONE, ignoring late blocked transition: %s', self.task_id, reason); return WorkflowOutcome.DONE. This skips set_task_status('blocked'), escalation entry creation, and returns DONE since the task is actually done (merged to main).",
+      "status": "done",
+      "commit": "5feacc8"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write tests in fused-memory/tests/test_task_interceptor.py for terminal status guard (defense in depth). Tests: (1) test_set_task_status_rejects_done_to_blocked — set taskmaster.get_task to return {'id':'1','status':'done','title':'T'}, call interceptor.set_task_status('1','blocked','/project'), verify taskmaster.set_task_status was NOT called, result contains 'error', and event_buffer has no new events; (2) test_set_task_status_allows_done_to_done — same setup with status='done', verify call passes through; (3) test_set_task_status_allows_inprogress_to_blocked — get_task returns status='in-progress', call with 'blocked', verify taskmaster.set_task_status IS called.",
+      "status": "done",
+      "commit": "7dbe913"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Modify TaskInterceptor.set_task_status in task_interceptor.py: after line 87 (old_status = _extract_status(before)), add guard: _TERMINAL = frozenset({'done', 'cancelled'}); if old_status in _TERMINAL and status != old_status: logger.warning('Task %s: rejecting %s->%s (terminal state)', task_id, old_status, status); return {'success': False, 'error': f'Cannot transition from terminal status {old_status!r} to {status!r}', 'task_id': task_id}. Place the guard before the actual set_task_status call (line 84) and before event emission (line 88+). Move old_status extraction before the set_task_status call.",
+      "status": "done",
+      "commit": "2ab82d5"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write test in test_scheduler.py (in TestGetTasksSeedsCache class): test_get_tasks_does_not_downgrade_terminal_cache — (1) set up scheduler, monkeypatch mcp_call; (2) call set_task_status('42', 'done') to populate cache with terminal status; (3) reset mcp_mock to return get_tasks response where task 42 has status 'in-progress' (simulating stale taskmaster data due to propagation lag); (4) call get_tasks(); (5) assert scheduler._status_cache['42'] == 'done' (cache NOT downgraded); (6) call set_task_status('42', 'blocked'); (7) assert no new MCP call was made for set_task_status (terminal guard still active). Also add test_get_tasks_updates_non_terminal_cache — verify that non-terminal cache entries (e.g., 'in-progress') ARE updated when get_tasks returns a different non-terminal status (e.g., 'blocked'), confirming the guard is narrowly scoped.",
+      "status": "done",
+      "commit": "9acc0ce"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Fix Scheduler.get_tasks() cache seeding in scheduler.py lines 186-192 to never downgrade terminal statuses: (1) Add TERMINAL_STATUSES to the import from task_status (change line 12 to: from orchestrator.task_status import TERMINAL_STATUSES, is_valid_transition). (2) Replace unconditional cache write 'self._status_cache[tid] = s' with guarded version: 'if tid not in self._status_cache or self._status_cache[tid] not in TERMINAL_STATUSES: self._status_cache[tid] = s'. This ensures that if a task is already marked terminal in the cache (e.g., set by set_task_status after a workflow completes), stale taskmaster data from get_tasks() cannot silently reopen the terminal-state guard window.",
+      "status": "done",
+      "commit": "e59e486"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Separate task_status.py module rather than inlining in scheduler.py",
+      "rationale": "The FSM logic (TERMINAL_STATUSES, is_valid_transition) is reusable across modules and independently testable. A dedicated ~20-line module is cleaner than duplicating the constants. The interceptor uses its own inline constant since it's in a different subproject (fused-memory) and shouldn't depend on orchestrator."
+    },
+    {
+      "decision": "Permissive FSM — only terminal states are guarded, all other transitions allowed",
+      "rationale": "A strict FSM (explicit valid-transition table) would break legitimate flows: blocked->done (manual fix used in the incident), in-progress->pending (crash recovery in harness.py:453). The bug ONLY manifests when DONE gets overwritten, so guarding terminal states provides maximum safety with zero disruption to existing behavior."
+    },
+    {
+      "decision": "DONE and CANCELLED are both terminal statuses",
+      "rationale": "The task mandates DONE as terminal. CANCELLED is semantically equivalent — a cancelled task shouldn't be re-blocked by a stale workflow. Manual overrides can use the taskmaster CLI directly (bypassing interceptor) if truly needed."
+    },
+    {
+      "decision": "In-memory _status_cache on shared Scheduler rather than MCP query before each transition",
+      "rationale": "Both workflows share one Scheduler instance (Harness.__init__ line 84 creates it, _run_slot passes it to all TaskWorkflows). When Workflow A sets 'done', the cache updates. When duplicate Workflow B tries 'blocked', the cache rejects. Zero MCP overhead. Cache is also seeded by get_tasks() during acquire_next(), so it knows about pre-existing terminal statuses."
+    },
+    {
+      "decision": "Fail-open when task is not in _status_cache (from_status is None)",
+      "rationale": "If a task was never seen by get_tasks() or set_task_status(), blocking transitions would break legitimate first-time workflows. Allow the transition and populate the cache. The guard activates on subsequent calls."
+    },
+    {
+      "decision": "Do NOT clear _status_cache entries in Scheduler.release()",
+      "rationale": "Status must persist beyond lock release. After Workflow A completes and release() is called (harness.py:511), the cache must still show 'done' to block a stale Workflow B's _mark_blocked(). The _dispatched set is cleared in release() (for re-dispatch), but status cache is independent."
+    },
+    {
+      "decision": "_mark_blocked returns WorkflowOutcome.DONE when self.state is already DONE",
+      "rationale": "If the workflow already reached DONE (merged to main), the task IS done. Returning BLOCKED would cause the harness TaskReport to show the task as BLOCKED, which is exactly the symptom this task fixes. Returning DONE ensures the harness report accurately reflects reality."
+    },
+    {
+      "decision": "Interceptor uses inline _TERMINAL constant, not import from orchestrator",
+      "rationale": "fused-memory and orchestrator are separate subprojects with independent dependency graphs. The interceptor shouldn't depend on the orchestrator package. A 1-line frozenset constant is cheaper than a cross-project dependency."
+    },
+    {
+      "decision": "get_tasks() cache seeding must never downgrade terminal statuses",
+      "rationale": "get_tasks() fetches the task list from taskmaster, which may return stale data due to propagation lag. If set_task_status() has already marked task 42 as 'done' in _status_cache, but taskmaster still reports 'in-progress', unconditional cache seeding would silently downgrade the cache, reopening the terminal-state guard window and allowing the exact done->blocked race this PR prevents. The fix: skip cache updates for entries already marked terminal (check tid not in cache OR cache[tid] not in TERMINAL_STATUSES before writing). Non-terminal entries are always updated since they carry no safety invariant."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "FakeScheduler test double (unchanged)",
+      "where": "orchestrator/tests/test_workflow_e2e.py lines 304-319",
+      "how": "Reuse unchanged for workflow _mark_blocked guard tests. The guard checks self.state (WorkflowState.DONE), not the scheduler, so FakeScheduler doesn't need FSM logic."
+    },
+    {
+      "what": "_build_workflow() and _build_workflow_with_escalation() helpers",
+      "where": "orchestrator/tests/test_workflow_e2e.py lines 359-375, 922-942",
+      "how": "Use existing helpers to wire up TaskWorkflow with fakes for _mark_blocked guard tests. Create workflow, manually set state to DONE, call _mark_blocked directly."
+    },
+    {
+      "what": "TestAcquireNextNoDuplicates fixture pattern",
+      "where": "orchestrator/tests/test_scheduler.py lines 299-305",
+      "how": "New TestStatusTransitionGuard follows same pattern: create Scheduler with OrchestratorConfig, monkeypatch mcp_call at the module level to track invocations."
+    },
+    {
+      "what": "TaskInterceptor's existing before-state fetch (already extracts old_status)",
+      "where": "fused-memory/src/fused_memory/middleware/task_interceptor.py lines 81, 87",
+      "how": "old_status is already extracted via _extract_status(before). Add terminal check immediately after — zero extra I/O cost. Reorder so extraction happens before the set call."
+    },
+    {
+      "what": "Existing interceptor test fixtures (taskmaster, reconciler, event_buffer, interceptor)",
+      "where": "fused-memory/tests/test_task_interceptor.py lines 14-48",
+      "how": "Reuse all fixtures; override taskmaster.get_task return value per-test to simulate terminal state scenarios."
+    },
+    {
+      "what": "EscalationQueue for testing escalation skip",
+      "where": "orchestrator/tests/test_workflow_e2e.py TestTaskFailureEscalation class",
+      "how": "Reuse _build_workflow_with_escalation helper to verify no escalation is created when _mark_blocked is called on an already-DONE workflow."
+    },
+    {
+      "what": "TestGetTasksSeedsCache class and fixture pattern",
+      "where": "orchestrator/tests/test_scheduler.py lines 380-412",
+      "how": "New tests (step-11) extend this existing class with the same Scheduler fixture and mcp_mock pattern. The existing test_get_tasks_seeds_status_cache validates the happy path; new tests validate the terminal-status downgrade guard."
+    },
+    {
+      "what": "TERMINAL_STATUSES constant from task_status.py",
+      "where": "orchestrator/src/orchestrator/task_status.py line 10",
+      "how": "Import TERMINAL_STATUSES alongside is_valid_transition in scheduler.py to use in get_tasks() cache seeding guard. Avoids duplicating the terminal status set."
+    }
+  ]
+}
