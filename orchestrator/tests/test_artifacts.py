@@ -177,6 +177,36 @@ class TestIterationLog:
         assert len(corrupted) == 3
 
 
+class TestPlanLock:
+    def test_is_plan_locked_false_initially(self, artifacts: TaskArtifacts):
+        assert artifacts.is_plan_locked() is False
+
+    def test_lock_plan_creates_file_returns_true(self, artifacts: TaskArtifacts):
+        result = artifacts.lock_plan('session-abc123')
+        assert result is True
+        assert (artifacts.root / 'plan.lock').exists()
+
+    def test_is_plan_locked_true_after_lock(self, artifacts: TaskArtifacts):
+        artifacts.lock_plan('session-abc123')
+        assert artifacts.is_plan_locked() is True
+
+    def test_lock_plan_returns_false_when_already_locked(self, artifacts: TaskArtifacts):
+        first = artifacts.lock_plan('session-abc123')
+        second = artifacts.lock_plan('session-different')
+        assert first is True
+        assert second is False
+
+    def test_read_plan_lock_returns_session_and_timestamp(self, artifacts: TaskArtifacts):
+        artifacts.lock_plan('session-abc123')
+        lock_data = artifacts.read_plan_lock()
+        assert lock_data is not None
+        assert lock_data['session_id'] == 'session-abc123'
+        assert 'locked_at' in lock_data
+
+    def test_read_plan_lock_returns_none_when_not_locked(self, artifacts: TaskArtifacts):
+        assert artifacts.read_plan_lock() is None
+
+
 class TestReviews:
     def test_write_and_read_reviews(self, artifacts: TaskArtifacts):
         artifacts.write_review('test_analyst', {
