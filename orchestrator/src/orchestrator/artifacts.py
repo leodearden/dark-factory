@@ -205,9 +205,22 @@ class TaskArtifacts:
         self._write_json(self.root / 'plan.json', plan)
 
     def validate_plan_owner(self, session_id: str) -> bool:
-        """Return True if plan.json's _session_id matches the given session_id."""
-        plan = self.read_plan()
-        return plan.get('_session_id') == session_id
+        """Return True if plan.json's _session_id matches the given session_id.
+
+        Returns False on any read or parse error (JSONDecodeError, OSError, etc.)
+        so that a corrupt or unreadable plan.json triggers the ownership-mismatch
+        escalation path rather than a generic BLOCKED error.
+        """
+        try:
+            plan_path = self.root / 'plan.json'
+            data = json.loads(plan_path.read_text())
+            return data.get('_session_id') == session_id
+        except Exception as exc:
+            logger.warning(
+                'validate_plan_owner: failed to read/parse plan.json — treating as mismatch: %s',
+                exc,
+            )
+            return False
 
     def lock_plan(self, session_id: str) -> bool:
         """Atomically acquire the plan lock.
