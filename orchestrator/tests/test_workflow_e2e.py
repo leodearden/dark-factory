@@ -958,6 +958,40 @@ class TestPlanLockAndProvenance:
         assert '_created_at' in workflow.plan
         assert workflow.plan['_session_id'] == workflow.session_id
 
+    async def test_plan_phase_skips_architect_when_plan_locked(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """When plan.lock already exists, architect is never invoked."""
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        # Pre-create the worktree, plan.json, and plan.lock
+        worktree, base_commit = await git_ops.create_worktree(task_assignment.task_id)
+        workflow.worktree = worktree
+
+        # Write .task/ artifacts directly
+        from orchestrator.artifacts import TaskArtifacts
+        arts = TaskArtifacts(worktree)
+        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=base_commit)
+        arts.write_plan(PLAN)
+        arts.stamp_plan_provenance('pre-existing-session')
+        arts.lock_plan('pre-existing-session')
+
+        outcome = await workflow.run()
+        assert outcome == WorkflowOutcome.DONE
+
+        # Architect should never have been called (plan was already locked)
+        assert 'architect' not in stub.calls
+
     async def test_plan_phase_creates_lock_and_stamps_provenance_captured(
         self, config, git_ops, task_assignment, monkeypatch
     ):
