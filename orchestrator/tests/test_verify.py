@@ -10,6 +10,7 @@ from orchestrator.verify import (
     _scope_command,
     run_scoped_verification,
     run_verification,
+    scope_module_config,
 )
 
 # ---------------------------------------------------------------------------
@@ -334,3 +335,88 @@ class TestScopeCommand:
         cmd = 'echo hello world'
         result = _scope_command(cmd, 'ruff check', ['src/foo.py'])
         assert result == cmd
+
+
+# ---------------------------------------------------------------------------
+# scope_module_config: narrow ModuleConfig commands to task files
+# ---------------------------------------------------------------------------
+
+
+class TestScopeModuleConfig:
+    """Tests for scope_module_config(mc, task_files)."""
+
+    def _make_mc(self) -> ModuleConfig:
+        return ModuleConfig(
+            prefix='orchestrator',
+            lint_command='uv run --project orchestrator --directory orchestrator ruff check src/ tests/',
+            type_check_command='uv run --project orchestrator --directory orchestrator pyright src/ tests/',
+            test_command='uv run --project orchestrator --directory orchestrator pytest tests/ --tb=short -q',
+        )
+
+    def test_strips_prefix_and_scopes_files(self):
+        """Task files with matching prefix are stripped of prefix before scoping."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/src/orchestrator/verify.py'])
+        # The command should contain the stripped path
+        assert 'src/orchestrator/verify.py' in result.lint_command
+        # Should NOT contain the original directory args
+        assert 'src/ tests/' not in result.lint_command
+
+    def test_classifies_test_files_by_test_prefix(self):
+        """Files with test_ prefix are classified as test files."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/tests/test_verify.py'])
+        assert result.test_command is not None
+        assert 'tests/test_verify.py' in result.test_command
+
+    def test_classifies_test_files_by_suffix(self):
+        """Files ending in _test.py are classified as test files."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/tests/verify_test.py'])
+        assert result.test_command is not None
+        assert 'tests/verify_test.py' in result.test_command
+
+    def test_classifies_conftest_as_test_file(self):
+        """conftest.py is classified as a test file."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/tests/conftest.py'])
+        assert result.test_command is not None
+        assert 'tests/conftest.py' in result.test_command
+
+    def test_classifies_tests_dir_as_test_file(self):
+        """Files under /tests/ directory are classified as test files."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/tests/helpers/util.py'])
+        assert result.test_command is not None
+        assert 'tests/helpers/util.py' in result.test_command
+
+    def test_test_command_none_when_no_test_files(self):
+        """No test files in task_files → test_command is None."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/src/orchestrator/verify.py'])
+        assert result.test_command is None
+
+    def test_returns_original_when_no_files_match_prefix(self):
+        """task_files that don't match prefix → original ModuleConfig returned."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['fused-memory/src/foo.py'])
+        assert result is mc
+
+    def test_non_py_files_excluded(self):
+        """Non-.py files (yaml, json, md) are not passed to ruff/pyright/pytest."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/orchestrator.yaml', 'orchestrator/README.md'])
+        # No .py files match → returns original
+        assert result is mc
+
+    def test_mixed_source_and_test_files(self):
+        """Mixed source and test files both appear in their respective commands."""
+        mc = self._make_mc()
+        task_files = [
+            'orchestrator/src/orchestrator/verify.py',
+            'orchestrator/tests/test_verify.py',
+        ]
+        result = scope_module_config(mc, task_files)
+        assert 'src/orchestrator/verify.py' in result.lint_command
+        assert 'tests/test_verify.py' in result.lint_command
+        assert 'tests/test_verify.py' in result.test_command
