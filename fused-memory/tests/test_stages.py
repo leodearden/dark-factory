@@ -107,6 +107,7 @@ class TestMcpConfig:
     @pytest.fixture
     def stage(self):
         from unittest.mock import AsyncMock
+
         from fused_memory.models.reconciliation import StageId
         from fused_memory.reconciliation.stages.base import BaseStage
         config = ReconciliationConfig(explore_codebase_root='/tmp/test')
@@ -136,6 +137,7 @@ class TestTierConfig:
 
     def test_default_limits(self):
         from unittest.mock import AsyncMock
+
         from fused_memory.models.reconciliation import StageId
         config = ReconciliationConfig()
         stage = MemoryConsolidator(
@@ -147,6 +149,7 @@ class TestTierConfig:
 
     def test_sonnet_tier_limits(self):
         from unittest.mock import AsyncMock
+
         from fused_memory.models.reconciliation import StageId
         config = ReconciliationConfig()
         stage = MemoryConsolidator(

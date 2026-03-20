@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 from dataclasses import dataclass
 
@@ -201,8 +203,12 @@ class Scheduler:
         except Exception as e:
             logger.error(f'Failed to set task {task_id} status to {status}: {e}')
 
-    async def update_task(self, task_id: str, metadata: str) -> bool:
+    async def update_task(self, task_id: str, metadata: str | dict) -> bool:
         """Update task metadata via fused-memory. Returns True on success."""
+        # MCP transport auto-parses JSON strings → pass metadata as a dict
+        if isinstance(metadata, str):
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                metadata = json.loads(metadata)
         try:
             result = await mcp_call(
                 f'{self._memory_url}/mcp',

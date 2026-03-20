@@ -170,7 +170,7 @@ class ReconciliationHarness:
         if not HAS_ESCALATION or self._escalation_queue is None:
             return
         try:
-            queue: EscalationQueue = self._escalation_queue  # type: ignore[assignment]
+            queue = self._escalation_queue
             esc = Escalation(  # type: ignore[possibly-undefined]
                 id=queue.make_id(f'recon-{run_id[:8]}'),
                 task_id=f'recon-{run_id[:8]}',

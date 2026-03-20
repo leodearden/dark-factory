@@ -28,6 +28,7 @@ dark-factory-shared = { path = "../shared", editable = true }
 
 [tool.pyright]
 include = ["src", "tests"]
+extraPaths = ["src", "../shared/src", "../escalation/src"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 # Suppress pre-existing issues in reconciliation agent loop / judge

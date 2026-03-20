@@ -313,7 +313,6 @@ class TestGetMemoryStatus:
         def handler(request: httpx.Request) -> httpx.Response:
             nonlocal call_count
             call_count += 1
-            host = str(request.url.host)
             port = request.url.port
 
             # First server (port 8000) always fails

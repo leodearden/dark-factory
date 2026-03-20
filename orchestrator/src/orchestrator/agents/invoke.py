@@ -13,16 +13,15 @@ import logging
 import os
 import tempfile
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 # Re-export shared Claude invocation primitives for backwards compatibility
 from shared.cli_invoke import (  # noqa: F401
     AgentResult,
-    _SubprocessResult,
     _parse_claude_output,
     _run_subprocess,
+    _SubprocessResult,
     invoke_claude_agent,
 )
 
