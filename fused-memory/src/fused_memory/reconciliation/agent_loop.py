@@ -267,11 +267,13 @@ class AgentLoop:
                             }],
                         })
 
-        response = await client.chat.completions.create(
-            model=self.config.agent_llm_model,
-            messages=openai_messages,
-            tools=openai_tools if openai_tools else None,
-        )
+        create_kwargs: dict[str, Any] = {
+            'model': self.config.agent_llm_model,
+            'messages': openai_messages,
+        }
+        if openai_tools:
+            create_kwargs['tools'] = openai_tools
+        response = await client.chat.completions.create(**create_kwargs)
 
         self.llm_call_count += 1
         if response.usage:

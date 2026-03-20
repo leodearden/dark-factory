@@ -32,13 +32,13 @@
       "type": "test",
       "description": "Write test_openai_tools_omitted_when_empty: Create an AgentLoop with provider='openai'. Mock AsyncOpenAI and capture kwargs passed to chat.completions.create(). Call agent._call_openai with tool_schemas=[]. Assert that 'tools' key is NOT in captured kwargs. This test FAILS with current code (line 273 passes tools=None when openai_tools is empty).",
       "status": "done",
-      "commit": null
+      "commit": "ec6a110"
     },
     {
       "id": "step-4",
       "type": "impl",
       "description": "Fix line 270-274: Replace direct create() call with conditional kwargs. Build `create_kwargs: dict[str, Any] = {'model': self.config.agent_llm_model, 'messages': openai_messages}`, then `if openai_tools: create_kwargs['tools'] = openai_tools`, then `response = await client.chat.completions.create(**create_kwargs)`. This avoids passing tools=None and eliminates the type error.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
