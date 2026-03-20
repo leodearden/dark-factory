@@ -232,7 +232,7 @@ class GraphitiBackend:
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
         client = self._require_client()
-        all_graphs = await client.driver.client.list_graphs()
+        all_graphs = await cast(Any, client.driver).client.list_graphs()
         return [g for g in all_graphs if g != 'default_db' and not g.endswith('_db')]
 
     async def node_count(self, graph_name: str) -> int:
