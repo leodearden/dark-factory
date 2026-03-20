@@ -13,7 +13,7 @@
     "orchestrator/src/orchestrator",
     "orchestrator/tests"
   ],
-  "analysis": "When a new orchestrator run starts, stale escalations from prior runs persist in the filesystem queue and block current-run tasks. The fix has two parts:\n\n1. **EscalationQueue.dismiss_all_pending()** — a new method on the queue that bulk-dismisses all pending escalations with a given resolution message. This is a clean, testable primitive on the queue itself.\n\n2. **Harness._dismiss_stale_escalations()** — called in `Harness.run()` right after `_start_escalation_server()` and before the task loop. It calls `dismiss_all_pending()` on the queue, logging how many were dismissed. This ensures every orchestrator run starts clean.\n\nThe approach is simpler than the proposed fix's per-task/per-timestamp filtering because ALL pending escalations at startup are by definition stale — the prior run ended (or crashed) without resolving them. A new run should never inherit unresolved escalations. This is consistent with how `_recover_crashed_tasks()` resets in-progress tasks to pending.\n\nNo config changes needed. No new dependencies.",
+  "analysis": "When a new orchestrator run starts, stale escalations from prior runs persist in the filesystem queue and block current-run tasks. The fix has two parts:\n\n1. **EscalationQueue.dismiss_all_pending()** — a new method on the queue that bulk-dismisses all pending escalations with a given resolution message. This is a clean, testable primitive on the queue itself.\n\n2. **Harness._dismiss_stale_escalations()** — called in `Harness.run()` right after `_start_escalation_server()` and before the task loop. It calls `dismiss_all_pending()` on the queue, logging how many were dismissed. This ensures every orchestrator run starts clean.\n\nThe approach is simpler than the proposed fix's per-task/per-timestamp filtering because ALL pending escalations at startup are by definition stale — the prior run ended (or crashed) without resolving them. A new run should never inherit unresolved escalations. This is consistent with how `_recover_crashed_tasks()` resets in-progress tasks to pending.\n\nNo config changes needed. No new dependencies.\n\n**Review fixes (steps 5-8):**\n\n- **Resource leak (harness.py:111):** `_dismiss_stale_escalations()` is called BEFORE the try/finally block. If it raises (e.g. filesystem error from resolve()'s atomic write), the finally block never runs, leaking the escalation server asyncio.Task and the fused-memory MCP HTTP server. Fix: move the call inside the try block so the finally block always executes.\n\n- **Error handling (queue.py:136-138):** `dismiss_all_pending()` calls `resolve()` in a bare loop. A single `resolve()` failure (disk full, permission error, tempfile.mkstemp failure) aborts the entire loop, leaving remaining escalations un-dismissed and propagating the exception upward. Fix: wrap `resolve()` in a per-item try/except that logs a warning and continues, so partial failure is graceful.",
   "prerequisites": [],
   "steps": [
     {
@@ -43,6 +43,34 @@
       "description": "Implement Harness._dismiss_stale_escalations() and wire it into Harness.run() after _start_escalation_server(). The method calls self._escalation_queue.dismiss_all_pending() if the queue exists, logs the count.",
       "status": "done",
       "commit": "ba0b33f"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write test for dismiss_all_pending() resilience to per-item resolve() failures. In test_queue.py, add a test that monkeypatches resolve() to raise OSError on a specific escalation ID mid-loop. Verify: (a) remaining escalations after the failure are still dismissed, (b) the returned count reflects only successful dismissals, (c) no exception propagates to the caller.",
+      "status": "done",
+      "commit": "0efe323"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "In queue.py dismiss_all_pending(), wrap the self.resolve() call in a per-item try/except Exception block. On failure: log a warning with the escalation ID and exception, continue to the next item. The returned count reflects only successful dismissals.",
+      "status": "done",
+      "commit": "88da752"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write test for _dismiss_stale_escalations() being non-fatal in the harness. In test_stale_escalation_cleanup.py, add tests: (a) test_dismiss_failure_does_not_prevent_finally — mock _dismiss_stale_escalations to raise an OSError, run harness.run(), verify _stop_escalation_server() and mcp.stop() are still called (finally block runs); (b) test_dismiss_failure_logged_as_warning — verify the exception is logged as a warning, not re-raised.",
+      "status": "done",
+      "commit": "350524c"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "In harness.py run(), move the `await self._dismiss_stale_escalations()` call from line 111 (before the try block) to inside the try block (after line 113, before the usage cap check). This ensures the finally block always runs even if dismissal fails. The method is startup cleanup and should never be fatal.",
+      "status": "done",
+      "commit": "0a23650"
     }
   ],
   "design_decisions": [
@@ -61,6 +89,14 @@
     {
       "decision": "Place cleanup call after _start_escalation_server() but before _recover_crashed_tasks()",
       "rationale": "The escalation queue must be initialized before we can dismiss from it (happens in _start_escalation_server). Doing it before crash recovery and the task loop ensures no stale escalations can interfere with the new run. The ordering is: start servers → clean stale escalations → recover crashes → populate tasks → run."
+    },
+    {
+      "decision": "Per-item try/except in dismiss_all_pending() rather than catching at the caller",
+      "rationale": "resolve() can fail on filesystem errors (disk full, permission denied, tempfile.mkstemp failure). Catching per-item means as many escalations as possible are dismissed even under partial failure — a single bad file doesn't abort the entire cleanup. The count returned reflects only successes, giving the caller accurate information."
+    },
+    {
+      "decision": "Move _dismiss_stale_escalations() inside the try block rather than wrapping it in its own try/except before the block",
+      "rationale": "The reviewer suggested either approach. Moving it inside the try block is cleaner — it's a startup operation that belongs with other startup work (usage cap check, task population, crash recovery), and the existing finally block already handles all cleanup. This avoids a separate try/except wrapper that would add nesting. The dismiss_all_pending() method itself is already resilient to per-item failures (step-6), so the try block placement is a defense-in-depth measure for truly unexpected failures."
     }
   ],
   "reuse": [
@@ -78,6 +114,11 @@
       "what": "Escalation model and queue from escalation package",
       "where": "escalation/src/escalation/models.py, escalation/src/escalation/queue.py",
       "how": "All escalation data structures and filesystem operations already exist. No new model fields or schema changes needed."
+    },
+    {
+      "what": "Existing test_stale_escalation_cleanup.py harness fixture",
+      "where": "orchestrator/tests/test_stale_escalation_cleanup.py",
+      "how": "The harness fixture (lines 26-45) with mocked McpLifecycle/Scheduler/BriefingAssembler is reused for the new step-7 tests. The call-ordering test pattern (lines 105-172) is the model for verifying _dismiss_stale_escalations() runs inside the try block."
     }
   ]
 }
