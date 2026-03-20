@@ -23,6 +23,4 @@ def is_valid_transition(from_status: str | None, to_status: str) -> bool:
         return True
     if from_status == to_status:
         return True
-    if from_status in TERMINAL_STATUSES:
-        return False
-    return True
+    return from_status not in TERMINAL_STATUSES

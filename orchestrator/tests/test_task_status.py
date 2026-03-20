@@ -1,7 +1,5 @@
 """Unit tests for the task_status FSM module."""
 
-import pytest
-
 from orchestrator.task_status import TERMINAL_STATUSES, is_valid_transition
 
 
