@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -192,6 +193,77 @@ class TaskArtifacts:
             suggestions=suggestions,
             reviews=reviews,
         )
+
+    def stamp_plan_provenance(self, session_id: str) -> None:
+        """Stamp _session_id and _created_at into plan.json.
+
+        Reads current plan.json, adds provenance fields, writes back.
+
+        Raises:
+            ValueError: if plan.json is missing or does not contain a 'steps' list.
+                This prevents silently creating a provenance-only stub that passes
+                bool() checks but has no actual plan content.
+        """
+        plan = self.read_plan()
+        if not plan.get('steps'):
+            raise ValueError(
+                'stamp_plan_provenance called before plan.json contains a valid plan '
+                '(missing or empty steps). '
+                'Ensure the architect has written a complete plan before stamping provenance.'
+            )
+        plan['_session_id'] = session_id
+        plan['_created_at'] = datetime.now(UTC).isoformat()
+        self._write_json(self.root / 'plan.json', plan)
+
+    def validate_plan_owner(self, session_id: str) -> bool:
+        """Return True if plan.json's _session_id matches the given session_id.
+
+        Returns False on any read or parse error (JSONDecodeError, OSError, etc.)
+        so that a corrupt or unreadable plan.json triggers the ownership-mismatch
+        escalation path rather than a generic BLOCKED error.
+        """
+        try:
+            plan_path = self.root / 'plan.json'
+            data = json.loads(plan_path.read_text())
+            return data.get('_session_id') == session_id
+        except Exception as exc:
+            logger.warning(
+                'validate_plan_owner: failed to read/parse plan.json — treating as mismatch: %s',
+                exc,
+            )
+            return False
+
+    def lock_plan(self, session_id: str) -> bool:
+        """Atomically acquire the plan lock.
+
+        Uses O_CREAT|O_EXCL for atomic exclusive creation (POSIX).
+        Returns True if the lock was acquired, False if already locked.
+        """
+        lock_path = self.root / 'plan.lock'
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return False
+        try:
+            data = json.dumps({
+                'session_id': session_id,
+                'locked_at': datetime.now(UTC).isoformat(),
+            })
+            os.write(fd, data.encode())
+        finally:
+            os.close(fd)
+        return True
+
+    def is_plan_locked(self) -> bool:
+        """Return True if plan.lock exists."""
+        return (self.root / 'plan.lock').exists()
+
+    def read_plan_lock(self) -> dict | None:
+        """Read plan.lock contents. Returns dict or None if not locked."""
+        lock_path = self.root / 'plan.lock'
+        if not lock_path.exists():
+            return None
+        return json.loads(lock_path.read_text())
 
     def _write_json(self, path: Path, data: dict) -> None:
         path.write_text(json.dumps(data, indent=2) + '\n')

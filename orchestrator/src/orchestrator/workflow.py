@@ -6,6 +6,7 @@ import asyncio
 import enum
 import json
 import logging
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -148,6 +149,9 @@ class TaskWorkflow:
         # Usage cap gate
         self.usage_gate = usage_gate
 
+        # Unique session identifier for plan ownership (format: {task_id}-{uuid_hex[:8]})
+        self.session_id = f'{self.task_id}-{uuid.uuid4().hex[:8]}'
+
     @property
     def _task_files(self) -> list[str] | None:
         """Return the file list from the current plan, or None if unavailable/empty."""
@@ -190,7 +194,9 @@ class TaskWorkflow:
             # PLAN (skip if initial_plan was provided — eval mode)
             if self.initial_plan:
                 self.artifacts.write_plan(self.initial_plan)
-                self.plan = self.initial_plan
+                self.artifacts.stamp_plan_provenance(self.session_id)
+                self.artifacts.lock_plan(self.session_id)
+                self.plan = self.artifacts.read_plan()
                 logger.info(
                     f'Task {self.task_id}: using provided plan '
                     f'({len(self.plan.get("steps", []))} steps)'
@@ -344,6 +350,20 @@ class TaskWorkflow:
     async def _plan(self) -> WorkflowOutcome:
         """Invoke the architect to produce a plan."""
         assert self.worktree is not None and self.artifacts is not None
+
+        # Defense-in-depth: if plan.lock already exists, this is a duplicate workflow.
+        # Return REQUEUED so run() exits immediately — the original lock-holder retains
+        # ownership. Do NOT re-stamp provenance (that would hijack the first workflow's
+        # session_id and cause its validate_plan_owner() checks to fail).
+        if self.artifacts.is_plan_locked() and self.artifacts.read_plan():
+            lock_data = self.artifacts.read_plan_lock()
+            lock_owner = lock_data.get('session_id', 'unknown') if lock_data else 'unknown'
+            logger.info(
+                f'Task {self.task_id}: plan.lock is held by session {lock_owner!r}, '
+                f'skipping architect — requeuing to avoid duplicate execution'
+            )
+            return WorkflowOutcome.REQUEUED
+
         prompt = await self.briefing.build_architect_prompt(self.task, worktree=self.worktree)
         result = await self._invoke(ARCHITECT, prompt, self.worktree)
 
@@ -357,6 +377,11 @@ class TaskWorkflow:
         if not self.plan:
             logger.error(f'Task {self.task_id}: architect produced no plan.json')
             return WorkflowOutcome.BLOCKED
+
+        # Stamp provenance and acquire lock
+        self.artifacts.stamp_plan_provenance(self.session_id)
+        self.artifacts.lock_plan(self.session_id)
+        self.plan = self.artifacts.read_plan()
 
         # Derive modules from plan's file list (deterministic) or fall back to
         # the plan's module list (heuristic).
@@ -431,6 +456,10 @@ class TaskWorkflow:
                 f'{len(reviews.blocking_issues)} blocking issues'
             )
             await self._replan(reviews)
+            # Re-stamp provenance — architect may have overwritten plan.json
+            assert self.artifacts is not None
+            self.artifacts.stamp_plan_provenance(self.session_id)
+            self.plan = self.artifacts.read_plan()
             self.metrics.review_cycles += 1
 
     async def _execute_iterations(self) -> WorkflowOutcome:
@@ -438,6 +467,15 @@ class TaskWorkflow:
         assert self.worktree is not None and self.artifacts is not None
         while self.artifacts.get_pending_steps():
             if self.metrics.execute_iterations >= self.config.max_execute_iterations:
+                return WorkflowOutcome.BLOCKED
+
+            # Validate plan ownership before each implementer invocation
+            if not self.artifacts.validate_plan_owner(self.session_id):
+                logger.error(
+                    f'Task {self.task_id}: plan.json ownership mismatch — '
+                    f'expected session {self.session_id}, plan has different _session_id'
+                )
+                self._escalate_plan_overwrite()
                 return WorkflowOutcome.BLOCKED
 
             self.plan = self.artifacts.read_plan()
@@ -496,6 +534,15 @@ class TaskWorkflow:
                 'summary': summary,
                 'source': 'orchestrator',
             })
+
+            # Validate plan ownership after implementer (detect post-write tamper)
+            if not self.artifacts.validate_plan_owner(self.session_id):
+                logger.error(
+                    f'Task {self.task_id}: plan.json ownership mismatch after implementer — '
+                    f'expected session {self.session_id}'
+                )
+                self._escalate_plan_overwrite()
+                return WorkflowOutcome.BLOCKED
 
             if not result.success:
                 logger.warning(
@@ -819,6 +866,34 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
         stdout, _ = await proc.communicate()
         return stdout.decode().strip()
+
+    def _escalate_plan_overwrite(self) -> None:
+        """Submit a blocking escalation when plan.json is overwritten by a foreign session."""
+        summary = f'plan.json overwrite detected for task {self.task_id}'
+        detail = (
+            f'Expected _session_id={self.session_id} but plan.json contains a different value. '
+            f'A duplicate workflow may have overwritten plan.json.'
+        )
+        logger.error(f'Task {self.task_id}: {summary}')
+
+        if not self.escalation_queue:
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=summary,
+            detail=detail,
+            suggested_action='investigate_and_retry',
+            worktree=str(self.worktree) if self.worktree else None,
+            workflow_state=self.state.value,
+        )
+        self.escalation_queue.submit(esc)
 
     def _escalate_corruption(self, corrupted: list[str]) -> None:
         """Submit an info-severity escalation for corrupted iteration log lines."""

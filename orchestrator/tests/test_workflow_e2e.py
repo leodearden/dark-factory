@@ -915,6 +915,269 @@ class TestArtifactsIntegrity:
 
 
 # ---------------------------------------------------------------------------
+# Tests: Plan Lock and Provenance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPlanLockAndProvenance:
+    """Workflow acquires plan.lock and stamps provenance after planning."""
+
+    async def test_workflow_has_unique_session_id(
+        self, config, git_ops, task_assignment
+    ):
+        """TaskWorkflow generates a unique session_id in __init__."""
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+        assert hasattr(workflow, 'session_id')
+        assert workflow.session_id.startswith('42-')
+        assert len(workflow.session_id) > 4  # more than just task_id
+
+    async def test_plan_phase_creates_lock_and_stamps_provenance(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """After _plan() completes, plan.lock exists and plan.json has provenance."""
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+        assert outcome == WorkflowOutcome.DONE
+
+        # Worktree is cleaned up on success — capture artifacts before run
+        # We can check via the workflow's plan (stamped in-memory)
+        assert '_session_id' in workflow.plan
+        assert '_created_at' in workflow.plan
+        assert workflow.plan['_session_id'] == workflow.session_id
+
+    async def test_execute_detects_plan_overwrite_and_blocks(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """Simulate plan overwrite: implementer stub overwrites plan.json with
+        a different _session_id mid-execution. Workflow should return BLOCKED
+        and create an escalation with category 'infra_issue'."""
+        queue_dir = tmp_path / 'escalation_queue'
+        from escalation.queue import EscalationQueue
+        queue = EscalationQueue(queue_dir)
+
+        class OverwritingImplementerStub(AgentStub):
+            async def _implementer(self, cwd: Path) -> AgentResult:
+                # First call: complete real work
+                result = await super()._implementer(cwd)
+                # Then overwrite plan.json with a different session_id
+                from orchestrator.artifacts import TaskArtifacts
+                arts = TaskArtifacts(cwd)
+                plan = arts.read_plan()
+                plan['_session_id'] = 'hijacked-session-id'
+                (cwd / '.task' / 'plan.json').write_text(
+                    __import__('json').dumps(plan, indent=2) + '\n'
+                )
+                return result
+
+        stub = OverwritingImplementerStub()
+        scheduler = FakeScheduler()
+        workflow = TaskWorkflow(
+            assignment=task_assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=scheduler,  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=FakeMcp(),  # type: ignore[arg-type]
+            escalation_queue=queue,
+        )
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        # Check escalation was created with infra_issue category
+        escalations = queue.get_by_task('42')
+        infra_escs = [e for e in escalations if e.category == 'infra_issue']
+        assert len(infra_escs) >= 1
+        esc = infra_escs[0]
+        assert 'overwrite' in esc.summary.lower() or 'plan' in esc.summary.lower()
+
+    async def test_plan_phase_skips_architect_when_plan_locked(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """When plan.lock already exists, architect is never invoked and workflow requeues."""
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        # Pre-create the worktree, plan.json, and plan.lock
+        worktree, base_commit = await git_ops.create_worktree(task_assignment.task_id)
+        workflow.worktree = worktree
+
+        # Write .task/ artifacts directly
+        from orchestrator.artifacts import TaskArtifacts
+        arts = TaskArtifacts(worktree)
+        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=base_commit)
+        arts.write_plan(PLAN)
+        arts.stamp_plan_provenance('pre-existing-session')
+        arts.lock_plan('pre-existing-session')
+
+        outcome = await workflow.run()
+        # A duplicate workflow finding an existing lock should REQUEUE (not continue executing)
+        assert outcome == WorkflowOutcome.REQUEUED
+
+        # Architect should never have been called (plan was already locked)
+        assert 'architect' not in stub.calls
+
+    async def test_duplicate_workflow_returns_requeued_when_plan_locked(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Second workflow that finds plan.lock (owned by different session) returns REQUEUED.
+
+        This prevents the duplicate workflow from hijacking ownership and entering
+        the execute loop. The original lock-holder retains ownership.
+        """
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        # Pre-create the worktree with plan.json (valid steps) stamped with a DIFFERENT session
+        worktree, base_commit = await git_ops.create_worktree(task_assignment.task_id)
+        workflow.worktree = worktree
+
+        from orchestrator.artifacts import TaskArtifacts
+        arts = TaskArtifacts(worktree)
+        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=base_commit)
+        arts.write_plan(PLAN)
+        original_session = 'original-owner-session'
+        arts.stamp_plan_provenance(original_session)
+        arts.lock_plan(original_session)
+
+        # This is the second (duplicate) workflow — it has a different session_id
+        assert workflow.session_id != original_session
+
+        outcome = await workflow.run()
+
+        # Duplicate workflow must REQUEUE, not continue executing
+        assert outcome == WorkflowOutcome.REQUEUED
+        # Architect must not have been invoked
+        assert 'architect' not in stub.calls
+
+    async def test_duplicate_workflow_does_not_restamp_provenance(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Second workflow that finds plan.lock must NOT overwrite _session_id.
+
+        If the duplicate re-stamps provenance with its own session_id, the original
+        workflow's subsequent validate_plan_owner() checks will fail with a spurious
+        BLOCKED outcome. The original session_id must be preserved.
+        """
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        # Pre-create the worktree with plan.json owned by a different session
+        worktree, base_commit = await git_ops.create_worktree(task_assignment.task_id)
+        workflow.worktree = worktree
+
+        from orchestrator.artifacts import TaskArtifacts
+        arts = TaskArtifacts(worktree)
+        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=base_commit)
+        arts.write_plan(PLAN)
+        original_session = 'original-owner-session'
+        arts.stamp_plan_provenance(original_session)
+        arts.lock_plan(original_session)
+
+        # Run the duplicate workflow
+        outcome = await workflow.run()
+        assert outcome == WorkflowOutcome.REQUEUED
+
+        # plan.json's _session_id must still be the original owner's session
+        plan_after = arts.read_plan()
+        assert plan_after.get('_session_id') == original_session, (
+            f"Duplicate workflow must not overwrite _session_id. "
+            f"Expected {original_session!r}, got {plan_after.get('_session_id')!r}"
+        )
+
+    async def test_plan_phase_creates_lock_and_stamps_provenance_captured(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Capture plan before cleanup to verify lock file and provenance."""
+        stub = AgentStub()
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        captured_plan: dict = {}
+        lock_existed: list[bool] = []
+
+        original_cleanup = git_ops.cleanup_worktree
+
+        async def capture_then_cleanup(worktree, branch):
+            nonlocal captured_plan
+            from orchestrator.artifacts import TaskArtifacts
+            arts = TaskArtifacts(worktree)
+            captured_plan = arts.read_plan()
+            lock_existed.append(arts.is_plan_locked())
+            await original_cleanup(worktree, branch)
+
+        git_ops.cleanup_worktree = capture_then_cleanup
+
+        outcome = await workflow.run()
+        assert outcome == WorkflowOutcome.DONE
+
+        # plan.lock must have been created
+        assert lock_existed == [True]
+
+        # plan.json must contain provenance matching workflow session_id
+        assert captured_plan.get('_session_id') == workflow.session_id
+        assert '_created_at' in captured_plan
+
+
+# ---------------------------------------------------------------------------
 # Tests: Task Failure Escalation
 # ---------------------------------------------------------------------------
 

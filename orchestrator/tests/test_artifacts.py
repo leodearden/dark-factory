@@ -177,6 +177,139 @@ class TestIterationLog:
         assert len(corrupted) == 3
 
 
+VALID_PLAN_WITH_STEPS = {
+    'task_id': 'task-1',
+    'title': 'Test Task',
+    'steps': [
+        {'id': 'step-1', 'type': 'test', 'description': 'Write test', 'status': 'pending'},
+    ],
+}
+
+
+class TestPlanProvenance:
+    def test_stamp_plan_provenance_adds_session_id_and_created_at(self, artifacts: TaskArtifacts):
+        # Must use a valid plan with at least one step (empty steps raises ValueError)
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('session-abc123')
+        updated = artifacts.read_plan()
+        assert updated['_session_id'] == 'session-abc123'
+        assert '_created_at' in updated
+
+    def test_stamp_plan_provenance_preserves_existing_plan_data(self, artifacts: TaskArtifacts):
+        plan = {
+            'task_id': 'task-1',
+            'analysis': 'Some analysis',
+            'steps': [{'id': 'step-1', 'status': 'pending'}],
+        }
+        artifacts.write_plan(plan)
+        artifacts.stamp_plan_provenance('session-abc123')
+        updated = artifacts.read_plan()
+        assert updated['task_id'] == 'task-1'
+        assert updated['analysis'] == 'Some analysis'
+        assert len(updated['steps']) == 1
+
+    def test_validate_plan_owner_true_for_matching_session(self, artifacts: TaskArtifacts):
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('session-abc123')
+        assert artifacts.validate_plan_owner('session-abc123') is True
+
+    def test_validate_plan_owner_false_for_mismatched_session(self, artifacts: TaskArtifacts):
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('session-abc123')
+        assert artifacts.validate_plan_owner('session-different') is False
+
+    def test_validate_plan_owner_false_when_no_provenance(self, artifacts: TaskArtifacts):
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        # Not stamped — no _session_id in plan
+        assert artifacts.validate_plan_owner('session-abc123') is False
+
+    def test_stamp_plan_provenance_raises_on_missing_plan(self, artifacts: TaskArtifacts):
+        """stamp_plan_provenance() must raise ValueError if plan.json does not exist."""
+        # Ensure plan.json does not exist
+        plan_path = artifacts.root / 'plan.json'
+        assert not plan_path.exists()
+
+        with pytest.raises(ValueError, match='valid plan'):
+            artifacts.stamp_plan_provenance('session-abc123')
+
+    def test_stamp_plan_provenance_raises_on_empty_plan(self, artifacts: TaskArtifacts):
+        """stamp_plan_provenance() must raise ValueError if plan.json has no steps key."""
+        # Write a plan with no 'steps' key at all
+        (artifacts.root / 'plan.json').write_text('{}')
+
+        with pytest.raises(ValueError, match='valid plan'):
+            artifacts.stamp_plan_provenance('session-abc123')
+
+    def test_stamp_plan_provenance_raises_on_provenance_only_stub(self, artifacts: TaskArtifacts):
+        """stamp_plan_provenance() must raise ValueError on a provenance-only stub.
+
+        A stub with only _session_id/_created_at (no steps) passes bool() checks but
+        has no actual plan content — stamping it silently would hide data loss.
+        """
+        stub = {'_session_id': 'old-session', '_created_at': '2026-01-01T00:00:00+00:00'}
+        (artifacts.root / 'plan.json').write_text(
+            __import__('json').dumps(stub)
+        )
+
+        with pytest.raises(ValueError, match='valid plan'):
+            artifacts.stamp_plan_provenance('session-abc123')
+
+    def test_validate_plan_owner_returns_false_on_corrupt_plan_json(
+        self, artifacts: TaskArtifacts
+    ):
+        """Corrupt (non-JSON) plan.json must return False, not raise JSONDecodeError."""
+        plan_path = artifacts.root / 'plan.json'
+        plan_path.write_text('this is not valid json }{}{')
+
+        # Must return False without raising any exception
+        result = artifacts.validate_plan_owner('session-abc123')
+        assert result is False
+
+    def test_validate_plan_owner_returns_false_on_unreadable_plan(
+        self, artifacts: TaskArtifacts
+    ):
+        """Unreadable plan.json (chmod 000) must return False, not raise OSError."""
+        plan_path = artifacts.root / 'plan.json'
+        plan_path.write_text('{"_session_id": "session-abc123"}')
+        plan_path.chmod(0o000)
+        try:
+            result = artifacts.validate_plan_owner('session-abc123')
+            assert result is False
+        finally:
+            # Restore permissions so cleanup works
+            plan_path.chmod(0o644)
+
+
+class TestPlanLock:
+    def test_is_plan_locked_false_initially(self, artifacts: TaskArtifacts):
+        assert artifacts.is_plan_locked() is False
+
+    def test_lock_plan_creates_file_returns_true(self, artifacts: TaskArtifacts):
+        result = artifacts.lock_plan('session-abc123')
+        assert result is True
+        assert (artifacts.root / 'plan.lock').exists()
+
+    def test_is_plan_locked_true_after_lock(self, artifacts: TaskArtifacts):
+        artifacts.lock_plan('session-abc123')
+        assert artifacts.is_plan_locked() is True
+
+    def test_lock_plan_returns_false_when_already_locked(self, artifacts: TaskArtifacts):
+        first = artifacts.lock_plan('session-abc123')
+        second = artifacts.lock_plan('session-different')
+        assert first is True
+        assert second is False
+
+    def test_read_plan_lock_returns_session_and_timestamp(self, artifacts: TaskArtifacts):
+        artifacts.lock_plan('session-abc123')
+        lock_data = artifacts.read_plan_lock()
+        assert lock_data is not None
+        assert lock_data['session_id'] == 'session-abc123'
+        assert 'locked_at' in lock_data
+
+    def test_read_plan_lock_returns_none_when_not_locked(self, artifacts: TaskArtifacts):
+        assert artifacts.read_plan_lock() is None
+
+
 class TestReviews:
     def test_write_and_read_reviews(self, artifacts: TaskArtifacts):
         artifacts.write_review('test_analyst', {
