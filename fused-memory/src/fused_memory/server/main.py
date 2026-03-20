@@ -116,6 +116,7 @@ async def run_server():
         await journal.initialize()
 
         db_path = Path(config.reconciliation.data_dir) / 'reconciliation.db'
+        assert memory_service.durable_queue is not None  # set by initialize()
         event_buffer = EventBuffer(
             db_path=db_path,
             buffer_size_threshold=config.reconciliation.buffer_size_threshold,

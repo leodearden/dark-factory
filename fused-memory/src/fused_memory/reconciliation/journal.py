@@ -210,7 +210,7 @@ class ReconciliationJournal:
         db = self._require_db()
         serialized = {}
         for k, v in stage_reports.items():
-            serialized[k] = v.model_dump(mode='json') if hasattr(v, 'model_dump') else v
+            serialized[k] = v.model_dump(mode='json') if isinstance(v, StageReport) else v
         await db.execute(
             'UPDATE runs SET stage_reports = ? WHERE id = ?',
             (json.dumps(serialized), run_id),
@@ -224,7 +224,7 @@ class ReconciliationJournal:
         if row is None:
             return None
         reports_raw = json.loads(row['stage_reports'] or '{}')
-        stage_reports = {}
+        stage_reports: dict[str, StageReport | dict] = {}
         for k, v in reports_raw.items():
             stage_reports[k] = StageReport(**v)
         return ReconciliationRun(
@@ -251,7 +251,9 @@ class ReconciliationJournal:
         runs = []
         for row in rows:
             reports_raw = json.loads(row['stage_reports'] or '{}')
-            stage_reports = {k: StageReport(**v) for k, v in reports_raw.items()}
+            stage_reports: dict[str, StageReport | dict] = {
+                k: StageReport(**v) for k, v in reports_raw.items()
+            }
             runs.append(
                 ReconciliationRun(
                     id=row['id'],

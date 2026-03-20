@@ -340,6 +340,7 @@ class AgentLoop:
                 '--tools', '',
             ]
 
+            assert self._cli_session_id is not None
             if is_first_call:
                 cmd.extend(['--system-prompt', self._build_cli_system_prompt(tool_schemas)])
                 cmd.extend(['--session-id', self._cli_session_id])

@@ -6,6 +6,7 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.models.reconciliation import VerificationResult
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -95,9 +96,9 @@ async def test_on_task_done_sparse_knowledge(reconciler, mock_memory_service):
 async def test_on_task_done_rich_knowledge(reconciler, mock_memory_service):
     """When task is done and knowledge is rich, should not verify."""
     mock_memory_service.search = AsyncMock(return_value=[
-        MemoryResult(id='1', content='test', source_store='mem0'),
-        MemoryResult(id='2', content='test2', source_store='mem0'),
-        MemoryResult(id='3', content='test3', source_store='graphiti'),
+        MemoryResult(id='1', content='test', source_store=SourceStore.mem0),
+        MemoryResult(id='2', content='test2', source_store=SourceStore.mem0),
+        MemoryResult(id='3', content='test3', source_store=SourceStore.graphiti),
     ])
 
     await reconciler.reconcile_task(
@@ -132,7 +133,7 @@ async def test_on_task_done_checks_dependents(reconciler, mock_taskmaster):
 async def test_on_task_blocked_attaches_hints(reconciler, mock_memory_service, mock_taskmaster):
     """Blocked task should get memory hints attached."""
     mock_memory_service.search = AsyncMock(return_value=[
-        MemoryResult(id='1', content='relevant info', source_store='mem0', entities=['EntityA']),
+        MemoryResult(id='1', content='relevant info', source_store=SourceStore.mem0, entities=['EntityA']),
     ])
 
     result = await reconciler.reconcile_task(
@@ -168,7 +169,7 @@ async def test_on_task_cancelled_checks_subtasks(reconciler, mock_taskmaster):
 async def test_on_task_deferred_same_as_blocked(reconciler, mock_memory_service, mock_taskmaster):
     """Deferred should behave like blocked (attach hints)."""
     mock_memory_service.search = AsyncMock(return_value=[
-        MemoryResult(id='1', content='info', source_store='mem0', entities=['X']),
+        MemoryResult(id='1', content='info', source_store=SourceStore.mem0, entities=['X']),
     ])
 
     result = await reconciler.reconcile_task(
@@ -241,7 +242,7 @@ async def test_done_task_ops_use_project_root(reconciler, mock_taskmaster):
 async def test_blocked_task_update_uses_project_root(reconciler, mock_memory_service, mock_taskmaster):
     """Hints attachment via taskmaster.update_task should use project_root."""
     mock_memory_service.search = AsyncMock(return_value=[
-        MemoryResult(id='1', content='info', source_store='mem0', entities=['EntityA']),
+        MemoryResult(id='1', content='info', source_store=SourceStore.mem0, entities=['EntityA']),
     ])
 
     await reconciler.reconcile_task(
@@ -267,7 +268,7 @@ async def test_bulk_reconcile_separates_ids(reconciler, mock_memory_service, moc
         ]
     })
     mock_memory_service.search = AsyncMock(return_value=[
-        MemoryResult(id='m1', content='info', source_store='mem0', entities=['E1']),
+        MemoryResult(id='m1', content='info', source_store=SourceStore.mem0, entities=['E1']),
     ])
 
     await reconciler.reconcile_bulk_tasks(

@@ -295,6 +295,7 @@ class TestFailureRecovery:
         await asyncio.sleep(1.5)
 
         # The recovered item should have been processed by svc2
+        assert svc2.durable_queue is not None
         stats = await svc2.durable_queue.get_stats()
         assert stats['counts'].get('completed', 0) >= 1
         svc2.graphiti.add_episode.assert_called()

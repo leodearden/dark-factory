@@ -234,6 +234,7 @@ async def test_burst_cooldown_exits_bursting(tmp_path):
             "SELECT state FROM burst_state WHERE agent_id = 'agent-1'"
         ) as cursor:
             row = await cursor.fetchone()
+        assert row is not None
         assert row['state'] == 'idle'
     finally:
         await buf.close()
@@ -462,6 +463,7 @@ async def test_agent_id_none_excluded_from_burst(tmp_path):
         db = buf._require_db()
         async with db.execute('SELECT COUNT(*) as cnt FROM burst_state') as cursor:
             row = await cursor.fetchone()
+        assert row is not None
         assert row['cnt'] == 0
     finally:
         await buf.close()
@@ -490,6 +492,7 @@ async def test_cleanup_drained(tmp_path):
             "SELECT COUNT(*) as cnt FROM event_buffer WHERE status = 'drained'"
         ) as cursor:
             row = await cursor.fetchone()
+        assert row is not None
         assert row['cnt'] == 1
     finally:
         await buf.close()

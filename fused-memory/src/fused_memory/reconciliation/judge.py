@@ -145,7 +145,8 @@ Review this run and provide your verdict as JSON.
                 system=JUDGE_SYSTEM_PROMPT,
                 messages=[{'role': 'user', 'content': prompt}],
             )
-            return response.content[0].text if response.content else ''
+            text_blocks = [b for b in response.content if b.type == 'text']
+            return text_blocks[0].text if text_blocks else ''
         else:
             from openai import AsyncOpenAI
 

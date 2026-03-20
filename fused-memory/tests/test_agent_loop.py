@@ -1,7 +1,7 @@
 """Tests for the agent loop."""
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -51,14 +51,8 @@ class FakeUsage:
 
 @dataclass
 class FakeResponse:
-    content: list = None
-    usage: FakeUsage = None
-
-    def __post_init__(self):
-        if self.content is None:
-            self.content = []
-        if self.usage is None:
-            self.usage = FakeUsage()
+    content: list = field(default_factory=list)
+    usage: FakeUsage = field(default_factory=FakeUsage)
 
 
 @pytest.mark.asyncio

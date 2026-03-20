@@ -434,8 +434,8 @@ class EventBuffer:
         count = row['cnt'] if row else 0
         oldest_str = row['oldest'] if row else None
 
-        if count == 0:
-            return {'size': 0, 'oldest_event_age_seconds': None}
+        if count == 0 or not oldest_str:
+            return {'size': count, 'oldest_event_age_seconds': None}
 
         oldest = datetime.fromisoformat(oldest_str)
         if oldest.tzinfo is None:

@@ -294,6 +294,7 @@ class TestRecovery:
 
         # Manually insert an in_flight item (simulating crash)
         import time
+        assert q._db is not None
         await q._db.execute(
             'INSERT INTO write_queue '
             '(group_id, operation, payload, status, attempts, max_attempts, '
