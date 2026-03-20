@@ -269,3 +269,52 @@ async def test_ensure_taskmaster_error_propagates(event_buffer):
 
     with pytest.raises(RuntimeError, match='reconnection failed'):
         await interceptor.get_tasks('/project')
+
+
+# ── Tests for terminal status guard (defense in depth) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_rejects_done_to_blocked(taskmaster, reconciler, event_buffer):
+    """Interceptor rejects done->blocked transitions without calling taskmaster."""
+    taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'blocked', '/project')
+
+    # Taskmaster.set_task_status must NOT have been called
+    taskmaster.set_task_status.assert_not_called()
+    # Result contains an error indicator
+    assert result.get('success') is False
+    assert 'error' in result
+    # No event should be buffered
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 0
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_allows_done_to_done(taskmaster, reconciler, event_buffer):
+    """Idempotent done->done transitions pass through normally."""
+    taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    # Taskmaster should be called (idempotent)
+    taskmaster.set_task_status.assert_called_once()
+    # No error in result
+    assert 'error' not in result
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_allows_inprogress_to_blocked(taskmaster, reconciler, event_buffer):
+    """Normal in-progress->blocked transitions pass through."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'in-progress', 'title': 'T'}
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'blocked', '/project')
+
+    taskmaster.set_task_status.assert_called_once()
+    assert 'error' not in result
