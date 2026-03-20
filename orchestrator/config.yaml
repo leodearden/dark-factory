@@ -56,8 +56,8 @@ backends:
 
 # Verification commands
 test_command: "pytest"
-lint_command: "ruff check"
-type_check_command: "pyright"
+lint_command: "ruff check shared escalation fused-memory orchestrator dashboard"
+type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright"
 
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
