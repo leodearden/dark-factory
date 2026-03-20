@@ -10,7 +10,11 @@ import uuid as uuid_mod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from anthropic.types import ToolParam
+    from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import JournalEntry
@@ -54,7 +58,7 @@ class ToolDefinition:
     target_system: str = ''  # 'graphiti', 'mem0', 'taskmaster'
     get_before_state: Callable | None = None
 
-    def to_anthropic_schema(self) -> dict:
+    def to_anthropic_schema(self) -> ToolParam:
         return {
             'name': self.name,
             'description': self.description,
@@ -86,7 +90,7 @@ class AgentLoop:
 
     async def run(self, initial_payload: str) -> tuple[dict, list[JournalEntry]]:
         """Execute agent loop. Returns (terminal_tool_args, journal_entries)."""
-        messages: list[dict] = [
+        messages: list[dict[str, Any]] = [
             {'role': 'user', 'content': initial_payload},
         ]
 
@@ -193,7 +197,7 @@ class AgentLoop:
 
         return result
 
-    async def _call_llm(self, messages: list[dict], tool_schemas: list[dict]) -> Any:
+    async def _call_llm(self, messages: list[dict[str, Any]], tool_schemas: list[dict[str, Any]]) -> Any:
         """Call the configured LLM provider."""
         import anthropic
 
@@ -218,14 +222,14 @@ class AgentLoop:
         else:
             raise ValueError(f'Unsupported agent LLM provider: {provider}')
 
-    async def _call_openai(self, messages: list[dict], tool_schemas: list[dict]) -> Any:
+    async def _call_openai(self, messages: list[dict[str, Any]], tool_schemas: list[dict[str, Any]]) -> Any:
         """Call OpenAI and convert response to Anthropic-like format."""
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI()
 
         # Convert Anthropic tool schemas to OpenAI format
-        openai_tools = []
+        openai_tools: list[ChatCompletionToolParam] = []
         for schema in tool_schemas:
             openai_tools.append({
                 'type': 'function',
@@ -237,7 +241,7 @@ class AgentLoop:
             })
 
         # Convert messages: flatten Anthropic content blocks to OpenAI format
-        openai_messages = [{'role': 'system', 'content': self.system_prompt}]
+        openai_messages: list[ChatCompletionMessageParam] = [{'role': 'system', 'content': self.system_prompt}]
         for msg in messages:
             role = msg['role']
             content = msg['content']
@@ -316,7 +320,7 @@ class AgentLoop:
                 )
         return '\n\n'.join(parts)
 
-    async def _call_claude_cli(self, messages: list[dict], tool_schemas: list[dict]) -> Any:
+    async def _call_claude_cli(self, messages: list[dict[str, Any]], tool_schemas: list[dict[str, Any]]) -> Any:
         """Call Claude via CLI subprocess with --resume for multi-turn.
 
         Includes: stdin isolation, stdout+stderr error reading, and usage-cap

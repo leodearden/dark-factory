@@ -46,13 +46,13 @@
       "type": "test",
       "description": "Write test_to_anthropic_schema_returns_tool_param_shape: Create a ToolDefinition, call to_anthropic_schema(), and assert the returned dict has exactly the keys ToolParam requires: 'name' (str), 'input_schema' (dict), 'description' (str). Validates structural compatibility. Test passes immediately (locks in contract before type annotation change).",
       "status": "done",
-      "commit": null
+      "commit": "82d3e85"
     },
     {
       "id": "step-6",
       "type": "impl",
       "description": "Add TYPE_CHECKING imports and type annotations: (1) Add `from typing import TYPE_CHECKING` and guard block importing ToolParam from anthropic.types, and ChatCompletionMessageParam/ChatCompletionToolParam from openai.types.chat. (2) Change to_anthropic_schema() return type from `dict` to `ToolParam`. (3) Change _call_llm, _call_openai, _call_claude_cli message/tool_schemas params from `list[dict]` to `list[dict[str, Any]]`. (4) Annotate openai_messages and openai_tools local variables in _call_openai with the OpenAI SDK TypedDicts. (5) Change run() local `messages: list[dict]` to `list[dict[str, Any]]`. All annotations use string form via `from __future__ import annotations` already at line 3. Run tests to verify no regressions.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
