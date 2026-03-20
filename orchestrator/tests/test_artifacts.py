@@ -217,6 +217,32 @@ class TestPlanProvenance:
         # Not stamped — no _session_id in plan
         assert artifacts.validate_plan_owner('session-abc123') is False
 
+    def test_validate_plan_owner_returns_false_on_corrupt_plan_json(
+        self, artifacts: TaskArtifacts
+    ):
+        """Corrupt (non-JSON) plan.json must return False, not raise JSONDecodeError."""
+        plan_path = artifacts.root / 'plan.json'
+        plan_path.write_text('this is not valid json }{}{')
+
+        # Must return False without raising any exception
+        result = artifacts.validate_plan_owner('session-abc123')
+        assert result is False
+
+    def test_validate_plan_owner_returns_false_on_unreadable_plan(
+        self, artifacts: TaskArtifacts
+    ):
+        """Unreadable plan.json (chmod 000) must return False, not raise OSError."""
+        import os
+        plan_path = artifacts.root / 'plan.json'
+        plan_path.write_text('{"_session_id": "session-abc123"}')
+        plan_path.chmod(0o000)
+        try:
+            result = artifacts.validate_plan_owner('session-abc123')
+            assert result is False
+        finally:
+            # Restore permissions so cleanup works
+            plan_path.chmod(0o644)
+
 
 class TestPlanLock:
     def test_is_plan_locked_false_initially(self, artifacts: TaskArtifacts):
