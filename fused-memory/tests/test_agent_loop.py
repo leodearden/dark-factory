@@ -548,6 +548,110 @@ async def test_openai_tool_schema_conversion():
     assert sent_messages[0]['content'] == 'You are a test agent.'
 
 
+@pytest.mark.asyncio
+async def test_openai_message_conversion():
+    """_call_openai correctly converts all Anthropic message formats to OpenAI messages."""
+    config = _make_config(agent_llm_provider='openai', agent_llm_model='gpt-4o')
+
+    async def noop(**kwargs):
+        return {'ok': True}
+
+    tools = {
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete',
+            parameters={'type': 'object', 'properties': {}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='System prompt here.',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+
+    # Build a messages list that exercises all conversion branches:
+    # 1. String content (initial user message)
+    # 2. List with text block (assistant thinking)
+    # 3. List with tool_use block (assistant tool call)
+    # 4. List with tool_result dicts (user follow-up)
+    messages = [
+        {'role': 'user', 'content': 'initial payload string'},
+        {'role': 'assistant', 'content': [
+            FakeText(text='Thinking about this...'),
+            FakeToolUse(id='call_a', name='noop', input={'x': 1}),
+        ]},
+        {'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': 'call_a', 'content': '{"ok": true}'},
+        ]},
+    ]
+
+    captured = {}
+
+    async def fake_create(**kwargs):
+        captured['messages'] = list(kwargs['messages'])
+        return FakeOpenAIResponse(
+            choices=[
+                FakeOpenAIChoice(
+                    message=FakeOpenAIMessage(
+                        content=None,
+                        tool_calls=[
+                            FakeOpenAIToolCall(
+                                id='tc_final',
+                                type='function',
+                                function=FakeOpenAIFunction(
+                                    name='stage_complete',
+                                    arguments='{}',
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=FakeOpenAIUsage(total_tokens=50),
+        )
+
+    mock_completions = MagicMock()
+    mock_completions.create = fake_create
+    mock_chat = MagicMock()
+    mock_chat.completions = mock_completions
+    mock_client = MagicMock()
+    mock_client.chat = mock_chat
+
+    with patch('openai.AsyncOpenAI', return_value=mock_client):
+        await agent._call_openai(messages, [])
+
+    sent = captured['messages']
+
+    # Index 0: system prompt injected by _call_openai
+    assert sent[0] == {'role': 'system', 'content': 'System prompt here.'}
+
+    # Index 1: string content → passthrough
+    assert sent[1] == {'role': 'user', 'content': 'initial payload string'}
+
+    # Indices 2 and 3: text block and tool_use block from assistant message
+    # text block → role=assistant, content=text
+    text_msg = next(m for m in sent[2:] if m.get('role') == 'assistant' and 'content' in m
+                    and isinstance(m.get('content'), str))
+    assert text_msg['content'] == 'Thinking about this...'
+
+    # tool_use block → role=assistant, tool_calls=[{id, type, function}]
+    tool_call_msg = next(
+        m for m in sent[2:] if m.get('role') == 'assistant' and 'tool_calls' in m
+    )
+    assert tool_call_msg['tool_calls'][0]['id'] == 'call_a'
+    assert tool_call_msg['tool_calls'][0]['type'] == 'function'
+    assert tool_call_msg['tool_calls'][0]['function']['name'] == 'noop'
+    assert json.loads(tool_call_msg['tool_calls'][0]['function']['arguments']) == {'x': 1}
+
+    # tool_result dict → role=tool, tool_call_id, content
+    tool_result_msg = next(m for m in sent if m.get('role') == 'tool')
+    assert tool_result_msg['tool_call_id'] == 'call_a'
+    assert tool_result_msg['content'] == '{"ok": true}'
+
+
 # --- Claude CLI provider tests ---
 
 
