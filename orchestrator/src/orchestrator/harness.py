@@ -522,6 +522,7 @@ Output JSON matching the schema. Every task must appear in the output.
             queue_dir = self.config.project_root / queue_dir
         self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-undefined]
         self._escalation_queue.set_notify_callback(self._on_escalation)
+        self._escalation_queue.set_resolve_callback(self._on_escalation_resolved)
 
         mcp_server = create_server(self._escalation_queue)  # type: ignore[possibly-undefined]
         host = self.config.escalation.host
@@ -553,3 +554,9 @@ Output JSON matching the schema. Every task must appear in the output.
             event = self._escalation_events.get(escalation.task_id)
             if event:
                 event.set()
+
+    def _on_escalation_resolved(self, escalation) -> None:
+        """Callback when an escalation is resolved — wake the waiting workflow."""
+        event = self._escalation_events.get(escalation.task_id)
+        if event:
+            event.set()

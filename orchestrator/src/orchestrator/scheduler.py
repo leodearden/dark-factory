@@ -157,6 +157,7 @@ class Scheduler:
         self._dispatched: set[str] = set()
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
+        self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
 
     async def get_tasks(self) -> list[dict]:
         """Fetch all tasks from fused-memory/taskmaster."""
@@ -324,12 +325,14 @@ class Scheduler:
         logger.warning(
             f'Task {task_id} needs modules {needed} but locks unavailable. Requeuing.'
         )
+        # Cache expanded modules in memory so _get_modules uses them on retry
+        self._module_cache[task_id] = needed_normalized
         import json
         updated = await self.update_task(task_id, json.dumps({'modules': needed}))
         if not updated:
-            logger.error(
-                f'Task {task_id}: metadata update failed — task will retry with '
-                f'original modules and may cycle. Check TASK_MASTER_ALLOW_METADATA_UPDATES.'
+            logger.warning(
+                f'Task {task_id}: metadata update failed (non-critical — '
+                f'using in-memory module cache for scheduling).'
             )
         await self.set_task_status(task_id, 'pending')
         self.lock_table.release(task_id)
@@ -343,9 +346,13 @@ class Scheduler:
     def _get_modules(self, task: dict) -> list[str]:
         """Extract module list from task metadata, normalized for locking.
 
-        Priority: metadata.files (deterministic) > metadata.modules (heuristic).
+        Priority: in-memory cache > metadata.files > metadata.modules > fallback.
         """
+        task_id = str(task.get('id', ''))
         depth = self.config.lock_depth
+        # Check in-memory cache first (survives metadata update failures)
+        if task_id in self._module_cache:
+            return self._module_cache[task_id]
         metadata = task.get('metadata', {})
         if isinstance(metadata, dict):
             # Prefer file-derived modules (most accurate)
@@ -359,4 +366,4 @@ class Scheduler:
             if isinstance(modules, list) and modules:
                 return [normalize_lock(m, depth) for m in modules]
         # Fallback: use a generic module name based on task id
-        return [f'task-{task.get("id", "unknown")}']
+        return [f'task-{task_id or "unknown"}']
