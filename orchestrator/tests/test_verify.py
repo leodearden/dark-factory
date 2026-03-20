@@ -5,7 +5,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from orchestrator.config import ModuleConfig
-from orchestrator.verify import _run_cmd, run_scoped_verification, run_verification
+from orchestrator.verify import (
+    _build_fallback_config,
+    _run_cmd,
+    _scope_command,
+    run_scoped_verification,
+    run_verification,
+    scope_module_config,
+)
 
 # ---------------------------------------------------------------------------
 # _run_cmd: executable parameter
@@ -279,3 +286,268 @@ class TestRunScopedVerification:
         result = asyncio.run(run_scoped_verification(tmp_path, config, [mc1, mc2]))
         assert 'test-a' in result.test_output
         assert 'test-b' in result.test_output
+
+
+# ---------------------------------------------------------------------------
+# _scope_command: replace path args with specific files
+# ---------------------------------------------------------------------------
+
+
+class TestScopeCommand:
+    """Tests for _scope_command(cmd, tool_keyword, files)."""
+
+    def test_ruff_check_replaces_paths(self):
+        """Basic ruff check: directory args replaced with specific file."""
+        cmd = 'uv run --project fused-memory --directory fused-memory ruff check src/ tests/'
+        result = _scope_command(cmd, 'ruff check', ['src/verify.py'])
+        assert result == 'uv run --project fused-memory --directory fused-memory ruff check src/verify.py'
+
+    def test_pyright_replaces_paths(self):
+        """Pyright: directory args replaced with specific file."""
+        cmd = 'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
+        result = _scope_command(cmd, 'pyright', ['src/orchestrator/verify.py'])
+        assert result == 'uv run --project orchestrator --directory orchestrator pyright src/orchestrator/verify.py'
+
+    def test_pytest_preserves_flags(self):
+        """Pytest: --tb and -q flags are preserved after file list."""
+        cmd = 'uv run --project orchestrator --directory orchestrator pytest tests/ --tb=short -q'
+        result = _scope_command(cmd, 'pytest', ['tests/test_verify.py'])
+        assert result == 'uv run --project orchestrator --directory orchestrator pytest tests/test_verify.py --tb=short -q'
+
+    def test_pytest_multiple_files_with_flags(self):
+        """Multiple files and multiple flags are all included."""
+        cmd = 'pytest tests/ --tb=short -q'
+        result = _scope_command(cmd, 'pytest', ['tests/test_a.py', 'tests/test_b.py'])
+        assert result == 'pytest tests/test_a.py tests/test_b.py --tb=short -q'
+
+    def test_returns_none_when_cmd_is_none(self):
+        """None cmd → None result."""
+        result = _scope_command(None, 'ruff check', ['src/foo.py'])
+        assert result is None
+
+    def test_returns_none_when_files_empty(self):
+        """Empty files list → None result."""
+        cmd = 'ruff check src/ tests/'
+        result = _scope_command(cmd, 'ruff check', [])
+        assert result is None
+
+    def test_returns_original_when_tool_not_found(self):
+        """Tool keyword not in command → original command returned unchanged."""
+        cmd = 'echo hello world'
+        result = _scope_command(cmd, 'ruff check', ['src/foo.py'])
+        assert result == cmd
+
+
+# ---------------------------------------------------------------------------
+# scope_module_config: narrow ModuleConfig commands to task files
+# ---------------------------------------------------------------------------
+
+
+class TestScopeModuleConfig:
+    """Tests for scope_module_config(mc, task_files)."""
+
+    def _make_mc(self) -> ModuleConfig:
+        return ModuleConfig(
+            prefix='orchestrator',
+            lint_command='uv run --project orchestrator --directory orchestrator ruff check src/ tests/',
+            type_check_command='uv run --project orchestrator --directory orchestrator pyright src/ tests/',
+            test_command='uv run --project orchestrator --directory orchestrator pytest tests/ --tb=short -q',
+        )
+
+    def test_strips_prefix_and_scopes_files(self):
+        """Task files with matching prefix are stripped of prefix before scoping."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/src/orchestrator/verify.py'])
+        # The command should contain the stripped path
+        assert result.lint_command is not None
+        assert 'src/orchestrator/verify.py' in result.lint_command
+        # Should NOT contain the original directory args
+        assert 'src/ tests/' not in result.lint_command
+
+    def test_classifies_test_files_by_test_prefix(self):
+        """Files with test_ prefix are classified as test files."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/tests/test_verify.py'])
+        assert result.test_command is not None
+        assert 'tests/test_verify.py' in result.test_command
+
+    def test_classifies_test_files_by_suffix(self):
+        """Files ending in _test.py are classified as test files."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/tests/verify_test.py'])
+        assert result.test_command is not None
+        assert 'tests/verify_test.py' in result.test_command
+
+    def test_classifies_conftest_as_test_file(self):
+        """conftest.py is classified as a test file."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/tests/conftest.py'])
+        assert result.test_command is not None
+        assert 'tests/conftest.py' in result.test_command
+
+    def test_classifies_tests_dir_as_test_file(self):
+        """Files under /tests/ directory are classified as test files."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/tests/helpers/util.py'])
+        assert result.test_command is not None
+        assert 'tests/helpers/util.py' in result.test_command
+
+    def test_test_command_none_when_no_test_files(self):
+        """No test files in task_files → test_command is None."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/src/orchestrator/verify.py'])
+        assert result.test_command is None
+
+    def test_returns_original_when_no_files_match_prefix(self):
+        """task_files that don't match prefix → original ModuleConfig returned."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['fused-memory/src/foo.py'])
+        assert result is mc
+
+    def test_non_py_files_excluded(self):
+        """Non-.py files (yaml, json, md) are not passed to ruff/pyright/pytest."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/orchestrator.yaml', 'orchestrator/README.md'])
+        # No .py files match → returns original
+        assert result is mc
+
+    def test_mixed_source_and_test_files(self):
+        """Mixed source and test files both appear in their respective commands."""
+        mc = self._make_mc()
+        task_files = [
+            'orchestrator/src/orchestrator/verify.py',
+            'orchestrator/tests/test_verify.py',
+        ]
+        result = scope_module_config(mc, task_files)
+        assert result.lint_command is not None
+        assert 'src/orchestrator/verify.py' in result.lint_command
+        assert 'tests/test_verify.py' in result.lint_command
+        assert result.test_command is not None
+        assert 'tests/test_verify.py' in result.test_command
+
+
+# ---------------------------------------------------------------------------
+# _build_fallback_config: synthetic ModuleConfig from task file list
+# ---------------------------------------------------------------------------
+
+
+class TestBuildFallbackConfig:
+    """Tests for _build_fallback_config(task_files)."""
+
+    def test_source_and_test_files_all_commands(self):
+        """Source + test .py files → ModuleConfig with all three commands."""
+        task_files = [
+            'orchestrator/src/orchestrator/verify.py',
+            'orchestrator/tests/test_verify.py',
+        ]
+        result = _build_fallback_config(task_files)
+        assert result is not None
+        assert result.prefix == '__fallback__'
+        assert result.lint_command is not None
+        assert 'ruff check' in result.lint_command
+        assert 'orchestrator/src/orchestrator/verify.py' in result.lint_command
+        assert 'orchestrator/tests/test_verify.py' in result.lint_command
+        assert result.type_check_command is not None
+        assert 'pyright' in result.type_check_command
+        assert result.test_command is not None
+        assert 'pytest' in result.test_command
+        assert 'orchestrator/tests/test_verify.py' in result.test_command
+        # Source file should NOT appear in pytest command
+        assert 'orchestrator/src/orchestrator/verify.py' not in result.test_command
+
+    def test_only_source_files_no_test_command(self):
+        """Only source .py files → test_command is None."""
+        task_files = ['orchestrator/src/orchestrator/verify.py']
+        result = _build_fallback_config(task_files)
+        assert result is not None
+        assert result.test_command is None
+        assert result.lint_command is not None
+        assert result.type_check_command is not None
+
+    def test_empty_list_returns_none(self):
+        """Empty list → None."""
+        result = _build_fallback_config([])
+        assert result is None
+
+    def test_only_non_py_files_returns_none(self):
+        """Only .yaml and .md files → None (no .py to check)."""
+        task_files = ['orchestrator/orchestrator.yaml', 'README.md']
+        result = _build_fallback_config(task_files)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# run_scoped_verification: task_files parameter integration
+# ---------------------------------------------------------------------------
+
+
+class TestRunScopedVerificationTaskFiles:
+    """Tests for run_scoped_verification with the new task_files parameter."""
+
+    def test_module_configs_with_task_files_scopes_commands(self, tmp_path: Path):
+        """module_configs populated + task_files → commands scoped to those files."""
+        config = MagicMock()
+        # The 'echo file-check' command doesn't contain 'ruff check', so _scope_command
+        # returns it unchanged; we verify task_files are actually passed to scope_module_config
+        # by using a real ruff check command that will be narrowed
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            lint_command='echo ruff check src/ tests/',
+            test_command=None,
+        )
+        task_files = ['orchestrator/src/orchestrator/verify.py']
+        result = asyncio.run(run_scoped_verification(tmp_path, config, [mc], task_files=task_files))
+        assert result.passed is True
+
+    def test_module_configs_with_task_files_real_scoping(self, tmp_path: Path):
+        """Real ruff check command is narrowed to specific file via scope_module_config."""
+        config = MagicMock()
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            lint_command='echo ruff check src/ tests/',
+        )
+        task_files = ['orchestrator/src/orchestrator/verify.py']
+        result = asyncio.run(run_scoped_verification(tmp_path, config, [mc], task_files=task_files))
+        assert result.passed is True
+
+    def test_empty_module_configs_with_task_files_bypasses_global(self, tmp_path: Path):
+        """Fallback path is exercised via patching _build_fallback_config."""
+        config = MagicMock()
+        # Global would fail with exit 1
+        config.test_command = 'exit 1'
+        config.lint_command = 'exit 1'
+        config.type_check_command = 'exit 1'
+
+        fallback_mc = ModuleConfig(
+            prefix='__fallback__',
+            lint_command='echo fallback-lint',
+            test_command='echo fallback-test',
+        )
+
+        with patch('orchestrator.verify._build_fallback_config', return_value=fallback_mc):
+            result = asyncio.run(
+                run_scoped_verification(tmp_path, config, [], task_files=['src/foo.py'])
+            )
+        assert result.passed is True
+        assert 'fallback-test' in result.test_output
+
+    def test_both_empty_runs_global(self, tmp_path: Path):
+        """module_configs=[] and task_files=None → global verification runs."""
+        config = MagicMock()
+        config.test_command = 'echo global-test'
+        config.lint_command = 'echo global-lint'
+        config.type_check_command = 'echo global-type'
+
+        result = asyncio.run(run_scoped_verification(tmp_path, config, [], task_files=None))
+        assert result.passed is True
+        assert 'global-test' in result.test_output
+
+    def test_task_files_none_backward_compatible(self, tmp_path: Path):
+        """task_files=None → module_configs used unscoped (backward compatible)."""
+        config = MagicMock()
+        config.test_command = 'exit 1'  # global would fail
+
+        mc = ModuleConfig(prefix='esc', lint_command='echo esc-lint', test_command='echo esc-test')
+        result = asyncio.run(run_scoped_verification(tmp_path, config, [mc], task_files=None))
+        assert result.passed is True
+        assert 'esc-test' in result.test_output

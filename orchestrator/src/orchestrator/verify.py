@@ -10,6 +10,119 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 logger = logging.getLogger(__name__)
 
 
+def _scope_command(cmd: str | None, tool_keyword: str, files: list[str]) -> str | None:
+    """Narrow *cmd* to operate on *files* instead of whole directories.
+
+    Finds *tool_keyword* in *cmd*, keeps everything up to and including it as
+    the prefix, extracts any dash-prefixed flags from the remainder, and
+    rebuilds the command as ``'{prefix} {files} {flags}'``.
+
+    Returns:
+        ``None`` when *cmd* is ``None`` or *files* is empty.
+        The original *cmd* unchanged when *tool_keyword* is not found.
+        The scoped command otherwise.
+    """
+    if cmd is None:
+        return None
+    if not files:
+        return None
+
+    idx = cmd.find(tool_keyword)
+    if idx == -1:
+        return cmd
+
+    prefix = cmd[: idx + len(tool_keyword)]
+    remainder = cmd[idx + len(tool_keyword):]
+
+    # Preserve any dash-prefixed flags from the original remainder
+    flags = [tok for tok in remainder.split() if tok.startswith('-')]
+
+    parts = [prefix] + files
+    if flags:
+        parts += flags
+    return ' '.join(parts)
+
+
+def _is_test_file(path: str) -> bool:
+    """Return True when *path* looks like a test file."""
+    name = path.rsplit('/', 1)[-1]
+    return (
+        name.startswith('test_')
+        or name.endswith('_test.py')
+        or name == 'conftest.py'
+        or '/tests/' in path
+        or path.startswith('tests/')
+    )
+
+
+def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig:
+    """Narrow *mc*'s commands to the specific *task_files* it covers.
+
+    Filters *task_files* to those matching ``mc.prefix + '/'``, strips the
+    prefix, then calls :func:`_scope_command` to replace broad path args with
+    the specific files.
+
+    Returns the original *mc* when no ``.py`` files from *task_files* fall
+    under the prefix.
+    """
+    prefix = mc.prefix + '/'
+    # Strip prefix and filter to .py files
+    scoped: list[str] = []
+    for f in task_files:
+        if f.startswith(prefix):
+            stripped = f[len(prefix):]
+            if stripped.endswith('.py'):
+                scoped.append(stripped)
+
+    if not scoped:
+        return mc
+
+    test_files = [f for f in scoped if _is_test_file(f)]
+
+    # Build scoped commands; None when no applicable files exist
+    lint_cmd = _scope_command(mc.lint_command, 'ruff check', scoped)
+    type_cmd = _scope_command(mc.type_check_command, 'pyright', scoped)
+    test_cmd = _scope_command(mc.test_command, 'pytest', test_files) if test_files else None
+
+    return ModuleConfig(
+        prefix=mc.prefix,
+        lint_command=lint_cmd,
+        type_check_command=type_cmd,
+        test_command=test_cmd,
+        lock_depth=mc.lock_depth,
+        max_per_module=mc.max_per_module,
+        module_overrides=mc.module_overrides,
+    )
+
+
+def _build_fallback_config(task_files: list[str]) -> ModuleConfig | None:
+    """Build a synthetic ModuleConfig from *task_files* when no module configs match.
+
+    Filters to ``.py`` files, classifies into source vs test, and builds bare
+    ``ruff check``/``pyright``/``pytest`` commands (no ``uv run`` wrapper —
+    callers run these in the worktree root where venvs aren't needed for the
+    fallback path).
+
+    Returns ``None`` when no ``.py`` files are found.
+    """
+    py_files = [f for f in task_files if f.endswith('.py')]
+    if not py_files:
+        return None
+
+    test_files = [f for f in py_files if _is_test_file(f)]
+
+    lint_cmd = 'ruff check ' + ' '.join(py_files)
+    type_cmd = 'pyright ' + ' '.join(py_files)
+    test_cmd = ('pytest ' + ' '.join(test_files)) if test_files else None
+
+    return ModuleConfig(
+        prefix='__fallback__',
+        lint_command=lint_cmd,
+        type_check_command=type_cmd,
+        test_command=test_cmd,
+    )
+
+
 @dataclass
 class VerifyResult:
     passed: bool
@@ -141,16 +254,42 @@ async def run_scoped_verification(
     worktree: Path,
     config: OrchestratorConfig,
     module_configs: list[ModuleConfig],
+    task_files: list[str] | None = None,
 ) -> VerifyResult:
-    """Run verification scoped to specific subprojects.
+    """Run verification scoped to specific subprojects and optionally to task files.
 
-    If *module_configs* is empty, falls back to global ``run_verification``.
-    Otherwise runs ``run_verification`` per ModuleConfig and aggregates.
+    Scoping modes (in priority order):
+
+    1. **File-scoped within subprojects** — when *module_configs* is non-empty
+       and *task_files* is provided, each ModuleConfig's commands are narrowed
+       to the specific files via :func:`scope_module_config`.
+    2. **Fallback-scoped** — when *module_configs* is empty and *task_files* is
+       provided, a synthetic ModuleConfig is built via
+       :func:`_build_fallback_config`, bypassing the global commands entirely.
+    3. **Global** — when *task_files* is ``None`` (or falsy) with no
+       module_configs, or when fallback returns ``None`` (no .py files).
     """
-    if not module_configs:
-        return await run_verification(worktree, config)
+    if module_configs:
+        # Apply file-level scoping within each subproject when task_files given
+        if task_files:
+            scoped = [scope_module_config(mc, task_files) for mc in module_configs]
+            n_files = len(task_files)
+            n_mods = len(scoped)
+            logger.info('Verification mode: file-scoped (%d files across %d subprojects)', n_files, n_mods)
+        else:
+            scoped = module_configs
+            logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
+        results = await asyncio.gather(
+            *(run_verification(worktree, config, mc) for mc in scoped)
+        )
+        return _aggregate_results(list(results))
 
-    results = await asyncio.gather(
-        *(run_verification(worktree, config, mc) for mc in module_configs)
-    )
-    return _aggregate_results(list(results))
+    # No module_configs — try fallback or global
+    if task_files:
+        fallback = _build_fallback_config(task_files)
+        if fallback is not None:
+            logger.info('Verification mode: fallback-scoped (%d files)', len(task_files))
+            return await run_verification(worktree, config, fallback)
+
+    logger.info('Verification mode: global (no scope info)')
+    return await run_verification(worktree, config)
