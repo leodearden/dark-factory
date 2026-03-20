@@ -15,20 +15,8 @@
       "url": "http://127.0.0.1:8102/mcp"
     },
     "fused-memory": {
-      "type": "stdio",
-      "command": "uv",
-      "args": [
-        "run", "--directory", "fused-memory",
-        "python", "-m", "fused_memory.server.main",
-        "--transport", "stdio"
-      ],
-      "env": {
-        "CONFIG_PATH": "/home/leo/src/dark-factory/fused-memory/config/config.yaml",
-        "PROJECT_ROOT": "/home/leo/src/dark-factory",
-        "TASKMASTER_DIR": "/home/leo/src/dark-factory/taskmaster-ai",
-        "OPENAI_API_KEY": "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",
-        "ANTHROPIC_API_KEY": "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"
-      }
+      "type": "http",
+      "url": "http://localhost:8002/mcp"
     }
   }
 }

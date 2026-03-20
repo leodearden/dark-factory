@@ -137,25 +137,29 @@ class BaseStage:
     def _build_mcp_config(self) -> dict:
         """Assemble MCP server config for Claude CLI.
 
-        Includes the fused-memory stdio server, and optionally the escalation
-        HTTP server if an escalation URL is configured.
+        Includes the fused-memory server (HTTP or stdio), and optionally
+        the escalation HTTP server if an escalation URL is configured.
         """
-        # Locate fused-memory server entry point
-        fused_memory_server = _find_fused_memory_server()
+        fm_config = _find_fused_memory_server()
 
-        # Build env — start with whatever the .mcp.json specifies, then
-        # ensure OPENAI_API_KEY is present (needed for embeddings)
-        fm_env = dict(fused_memory_server.get('env', {}))
-        if 'OPENAI_API_KEY' not in fm_env:
-            fm_env['OPENAI_API_KEY'] = os.environ.get('OPENAI_API_KEY', '')
-
-        servers: dict = {
-            'fused-memory': {
-                'command': fused_memory_server['command'],
-                'args': fused_memory_server['args'],
+        if fm_config.get('type') == 'http':
+            # HTTP: just a URL, no env needed (server has its own env)
+            fm_entry: dict = {
+                'type': 'http',
+                'url': fm_config['url'],
+            }
+        else:
+            # Stdio: command + args + env
+            fm_env = dict(fm_config.get('env', {}))
+            if 'OPENAI_API_KEY' not in fm_env:
+                fm_env['OPENAI_API_KEY'] = os.environ.get('OPENAI_API_KEY', '')
+            fm_entry = {
+                'command': fm_config['command'],
+                'args': fm_config['args'],
                 'env': fm_env,
-            },
-        }
+            }
+
+        servers: dict = {'fused-memory': fm_entry}
 
         # Add escalation server if URL is available
         if self._escalation_url:
@@ -168,13 +172,12 @@ class BaseStage:
 
 
 def _find_fused_memory_server() -> dict:
-    """Locate the fused-memory MCP server command.
+    """Locate the fused-memory MCP server config.
 
-    Prefers reading from the project's .mcp.json if available,
-    otherwise uses a sensible default.  Returns dict with keys:
-    command, args, env (optional).
+    Reads from .mcp.json — supports both HTTP and stdio transport types.
+    Returns dict with either ``{type, url}`` for HTTP or
+    ``{command, args, env?}`` for stdio.
     """
-    # Try reading .mcp.json from the project root
     for candidate in [
         Path('/home/leo/src/dark-factory/.mcp.json'),
         Path.cwd() / '.mcp.json',
@@ -183,6 +186,12 @@ def _find_fused_memory_server() -> dict:
             try:
                 mcp_data = json.loads(candidate.read_text())
                 fm_config = mcp_data.get('mcpServers', {}).get('fused-memory', {})
+
+                # HTTP transport
+                if fm_config.get('type') == 'http' and fm_config.get('url'):
+                    return {'type': 'http', 'url': fm_config['url']}
+
+                # Stdio transport
                 if fm_config.get('command'):
                     result: dict = {
                         'command': fm_config['command'],
@@ -194,7 +203,7 @@ def _find_fused_memory_server() -> dict:
             except (json.JSONDecodeError, KeyError):
                 pass
 
-    # Default: assume uv-managed fused-memory
+    # Default: assume uv-managed fused-memory stdio
     return {
         'command': 'uv',
         'args': [
