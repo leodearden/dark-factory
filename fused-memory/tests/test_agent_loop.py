@@ -697,7 +697,7 @@ async def test_openai_round_trip_two_turns():
     )
 
     call_count = 0
-    second_call_messages = None
+    second_call_messages: list[dict] | None = None
 
     async def fake_create(**kwargs):
         nonlocal call_count, second_call_messages
