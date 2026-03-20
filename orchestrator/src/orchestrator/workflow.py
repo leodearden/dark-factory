@@ -148,6 +148,12 @@ class TaskWorkflow:
         # Usage cap gate
         self.usage_gate = usage_gate
 
+    @property
+    def _task_files(self) -> list[str] | None:
+        """Return the file list from the current plan, or None if unavailable/empty."""
+        files = self.plan.get('files', [])
+        return files if files else None
+
     async def run(self) -> WorkflowOutcome:
         """Execute the full state machine."""
         branch_name = self.task_id
@@ -233,7 +239,7 @@ class TaskWorkflow:
                     return merge_outcome
 
                 # POST-MERGE VERIFY
-                post_merge = await run_scoped_verification(self.config.project_root, self.config, self._module_configs)
+                post_merge = await run_scoped_verification(self.config.project_root, self.config, self._module_configs, task_files=self._task_files)
                 if not post_merge.passed:
                     logger.error(f'Task {self.task_id}: post-merge verification failed')
                     await self.git_ops.revert_last_merge(self.config.project_root)
@@ -505,7 +511,7 @@ class TaskWorkflow:
         verify_attempt = 0
 
         while True:
-            result = await run_scoped_verification(self.worktree, self.config, self._module_configs)
+            result = await run_scoped_verification(self.worktree, self.config, self._module_configs, task_files=self._task_files)
             if result.passed:
                 return WorkflowOutcome.DONE
 
@@ -665,7 +671,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         if merger_result.success and 'BLOCKED' not in merger_result.output.upper():
             # Verify the merge resolution
-            verify = await run_scoped_verification(self.config.project_root, self.config, self._module_configs)
+            verify = await run_scoped_verification(self.config.project_root, self.config, self._module_configs, task_files=self._task_files)
             if verify.passed:
                 return WorkflowOutcome.DONE
             else:
