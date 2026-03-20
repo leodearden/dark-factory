@@ -198,8 +198,19 @@ class TaskArtifacts:
         """Stamp _session_id and _created_at into plan.json.
 
         Reads current plan.json, adds provenance fields, writes back.
+
+        Raises:
+            ValueError: if plan.json is missing or does not contain a 'steps' list.
+                This prevents silently creating a provenance-only stub that passes
+                bool() checks but has no actual plan content.
         """
         plan = self.read_plan()
+        if not plan.get('steps'):
+            raise ValueError(
+                'stamp_plan_provenance called before plan.json contains a valid plan '
+                f'(missing or empty steps). '
+                f'Ensure the architect has written a complete plan before stamping provenance.'
+            )
         plan['_session_id'] = session_id
         plan['_created_at'] = datetime.now(UTC).isoformat()
         self._write_json(self.root / 'plan.json', plan)
