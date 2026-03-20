@@ -194,6 +194,21 @@ class TaskArtifacts:
             reviews=reviews,
         )
 
+    def stamp_plan_provenance(self, session_id: str) -> None:
+        """Stamp _session_id and _created_at into plan.json.
+
+        Reads current plan.json, adds provenance fields, writes back.
+        """
+        plan = self.read_plan()
+        plan['_session_id'] = session_id
+        plan['_created_at'] = datetime.now(UTC).isoformat()
+        self._write_json(self.root / 'plan.json', plan)
+
+    def validate_plan_owner(self, session_id: str) -> bool:
+        """Return True if plan.json's _session_id matches the given session_id."""
+        plan = self.read_plan()
+        return plan.get('_session_id') == session_id
+
     def lock_plan(self, session_id: str) -> bool:
         """Atomically acquire the plan lock.
 
