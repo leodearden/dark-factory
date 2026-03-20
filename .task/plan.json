@@ -39,13 +39,13 @@
       "type": "impl",
       "description": "Fix line 270-274: Replace direct create() call with conditional kwargs. Build `create_kwargs: dict[str, Any] = {'model': self.config.agent_llm_model, 'messages': openai_messages}`, then `if openai_tools: create_kwargs['tools'] = openai_tools`, then `response = await client.chat.completions.create(**create_kwargs)`. This avoids passing tools=None and eliminates the type error.",
       "status": "done",
-      "commit": null
+      "commit": "31c2057"
     },
     {
       "id": "step-5",
       "type": "test",
       "description": "Write test_to_anthropic_schema_returns_tool_param_shape: Create a ToolDefinition, call to_anthropic_schema(), and assert the returned dict has exactly the keys ToolParam requires: 'name' (str), 'input_schema' (dict), 'description' (str). Validates structural compatibility. Test passes immediately (locks in contract before type annotation change).",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {

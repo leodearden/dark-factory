@@ -431,6 +431,37 @@ async def test_no_tool_calls_ends_loop():
     assert 'I am done thinking.' in result.get('text', '')
 
 
+def test_to_anthropic_schema_returns_tool_param_shape():
+    """to_anthropic_schema() returns a dict with exactly the keys ToolParam requires.
+
+    Validates structural compatibility before type annotation is tightened to ToolParam.
+    """
+    tool = ToolDefinition(
+        name='search_memory',
+        description='Search for memories by query string.',
+        parameters={
+            'type': 'object',
+            'properties': {'query': {'type': 'string'}, 'limit': {'type': 'integer'}},
+            'required': ['query'],
+        },
+        function=lambda **kw: kw,
+    )
+
+    schema = tool.to_anthropic_schema()
+
+    # Must have exactly the three keys ToolParam requires
+    assert isinstance(schema, dict)
+    assert 'name' in schema
+    assert 'description' in schema
+    assert 'input_schema' in schema
+
+    # Correct values
+    assert schema['name'] == 'search_memory'
+    assert schema['description'] == 'Search for memories by query string.'
+    assert schema['input_schema'] == tool.parameters
+    assert isinstance(schema['input_schema'], dict)
+
+
 @pytest.mark.asyncio
 async def test_openai_tools_omitted_when_empty():
     """When tool_schemas=[], 'tools' key must NOT appear in kwargs to create().
