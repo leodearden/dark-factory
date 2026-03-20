@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.mcp_lifecycle import mcp_call
-from orchestrator.task_status import is_valid_transition
+from orchestrator.task_status import TERMINAL_STATUSES, is_valid_transition
 
 logger = logging.getLogger(__name__)
 
@@ -183,12 +183,19 @@ class Scheduler:
                         tasks = data['data'].get('tasks', [])
                     else:
                         tasks = data.get('tasks', [])
-                    # Seed status cache from task list
+                    # Seed status cache from task list.
+                    # Never downgrade a terminal status — stale taskmaster data
+                    # (e.g., 'in-progress') must not reopen the terminal guard window
+                    # for a task the cache already knows is 'done' or 'cancelled'.
                     for t in tasks:
                         tid = str(t.get('id', ''))
                         s = t.get('status', '')
                         if tid and s:
-                            self._status_cache[tid] = s
+                            if (
+                                tid not in self._status_cache
+                                or self._status_cache[tid] not in TERMINAL_STATUSES
+                            ):
+                                self._status_cache[tid] = s
                     return tasks
         except Exception as e:
             logger.error(f'Failed to fetch tasks: {e}')
