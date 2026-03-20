@@ -165,3 +165,71 @@ async def test_judge_call_llm_anthropic_mixed_content(mock_journal):
 
     # Only first text block's text is returned
     assert result == 'First text block'
+
+
+# --- Judge._call_llm openai/else branch tests ---
+
+
+@pytest.mark.asyncio
+async def test_judge_call_llm_openai_normal(mock_journal):
+    """_call_llm with openai provider returns message.content string."""
+    config = _make_judge_config(
+        judge_llm_provider='openai',
+        judge_llm_model='gpt-4o',
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    verdict_text = '{"severity": "minor", "findings": [], "summary": "Minor issues."}'
+    fake_response = FakeJudgeOpenAIResponse(
+        choices=[
+            FakeJudgeOpenAIChoice(
+                message=FakeJudgeOpenAIMessage(content=verdict_text)
+            )
+        ],
+    )
+
+    mock_completions = MagicMock()
+    mock_completions.create = AsyncMock(return_value=fake_response)
+    mock_chat = MagicMock()
+    mock_chat.completions = mock_completions
+    mock_client = MagicMock()
+    mock_client.chat = mock_chat
+
+    with patch('openai.AsyncOpenAI', return_value=mock_client):
+        result = await judge._call_llm('Evaluate this run.')
+
+    assert result == verdict_text
+
+    # Verify call args: system message with JUDGE_SYSTEM_PROMPT and user message with prompt
+    call_kwargs = mock_completions.create.call_args.kwargs
+    assert call_kwargs['model'] == 'gpt-4o'
+    messages = call_kwargs['messages']
+    assert messages[0] == {'role': 'system', 'content': JUDGE_SYSTEM_PROMPT}
+    assert messages[1] == {'role': 'user', 'content': 'Evaluate this run.'}
+
+
+@pytest.mark.asyncio
+async def test_judge_call_llm_openai_none_content(mock_journal):
+    """_call_llm with openai provider returns empty string when message.content is None."""
+    config = _make_judge_config(judge_llm_provider='openai', judge_llm_model='gpt-4o-mini')
+    judge = Judge(config=config, journal=mock_journal)
+
+    fake_response = FakeJudgeOpenAIResponse(
+        choices=[
+            FakeJudgeOpenAIChoice(
+                message=FakeJudgeOpenAIMessage(content=None)
+            )
+        ],
+    )
+
+    mock_completions = MagicMock()
+    mock_completions.create = AsyncMock(return_value=fake_response)
+    mock_chat = MagicMock()
+    mock_chat.completions = mock_completions
+    mock_client = MagicMock()
+    mock_client.chat = mock_chat
+
+    with patch('openai.AsyncOpenAI', return_value=mock_client):
+        result = await judge._call_llm('Evaluate this run.')
+
+    assert result == ''
