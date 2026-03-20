@@ -510,29 +510,6 @@ class TestRunScopedVerificationTaskFiles:
         result = asyncio.run(run_scoped_verification(tmp_path, config, [mc], task_files=task_files))
         assert result.passed is True
 
-    def test_empty_module_configs_with_task_files_uses_fallback(self, tmp_path: Path):
-        """Empty module_configs + task_files → fallback config, global NOT used."""
-        config = MagicMock()
-        # Global commands use 'exit 1' — if they run, the test fails
-        config.test_command = 'exit 1'
-        config.lint_command = 'exit 1'
-        config.type_check_command = 'exit 1'
-
-        task_files = ['src/foo.py', 'tests/test_foo.py']
-        asyncio.run(run_scoped_verification(tmp_path, config, [], task_files=task_files))
-        # Fallback builds 'ruff check src/foo.py tests/test_foo.py' — these files don't
-        # exist so ruff/pyright might fail; use echo commands via the echo trick: the key
-        # assertion is that the global 'exit 1' was NOT executed (if it were, every check fails)
-        # We cannot guarantee fallback passes, but we CAN verify it used fallback path by
-        # checking the global exit 1 was not the cause — actually easier: use echo-based fallback.
-        # Reset to see that global is bypassed:
-        # Since fallback config runs bare 'ruff check ...' commands and tmp_path has no files,
-        # ruff may or may not pass. The real test is that global exit 1 was bypassed.
-        # We verify this indirectly: if global ran, result would fail with empty output
-        # from exit 1. The fallback DOES try to lint, so we only check global is skipped.
-        # Better approach: patch _build_fallback_config to return a known good config.
-        pass  # Covered by the patch-based test below
-
     def test_empty_module_configs_with_task_files_bypasses_global(self, tmp_path: Path):
         """Fallback path is exercised via patching _build_fallback_config."""
         config = MagicMock()
@@ -552,7 +529,7 @@ class TestRunScopedVerificationTaskFiles:
                 run_scoped_verification(tmp_path, config, [], task_files=['src/foo.py'])
             )
         assert result.passed is True
-        assert 'fallback-lint' in result.lint_output or result.passed
+        assert 'fallback-test' in result.test_output
 
     def test_both_empty_runs_global(self, tmp_path: Path):
         """module_configs=[] and task_files=None → global verification runs."""
