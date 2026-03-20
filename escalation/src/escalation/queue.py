@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from escalation.models import Escalation
 
@@ -26,9 +27,13 @@ class EscalationQueue:
         self.queue_dir.mkdir(parents=True, exist_ok=True)
         self._seq = 0
         self._notify_callback: Callable[[Escalation], None] | None = None
+        self._resolve_callback: Callable[[Escalation], None] | None = None
 
     def set_notify_callback(self, callback: Callable[[Escalation], None]) -> None:
         self._notify_callback = callback
+
+    def set_resolve_callback(self, callback: Callable[[Escalation], None]) -> None:
+        self._resolve_callback = callback
 
     def _next_seq(self) -> int:
         self._seq += 1
@@ -48,10 +53,8 @@ class EscalationQueue:
             os.rename(tmp_path, str(path))
         except Exception:
             # Clean up tmp on failure
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass
             raise
 
         logger.info(f'Escalation submitted: {escalation.id} [{escalation.severity}]')
@@ -81,9 +84,8 @@ class EscalationQueue:
         for path in self.queue_dir.glob('esc-*.json'):
             try:
                 esc = Escalation.from_json(path.read_text())
-                if esc.task_id == task_id:
-                    if status is None or esc.status == status:
-                        results.append(esc)
+                if esc.task_id == task_id and (status is None or esc.status == status):
+                    results.append(esc)
             except (json.JSONDecodeError, KeyError):
                 continue
         return results
@@ -120,13 +122,18 @@ class EscalationQueue:
                 f.write(esc.to_json())
             os.rename(tmp_path, str(path))
         except Exception:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass
             raise
 
         logger.info(f'Escalation {escalation_id} {esc.status}: {resolution[:100]}')
+
+        if self._resolve_callback:
+            try:
+                self._resolve_callback(esc)
+            except Exception as e:
+                logger.warning(f'Resolve callback failed for {escalation_id}: {e}')
+
         return esc
 
     def make_id(self, task_id: str) -> str:
