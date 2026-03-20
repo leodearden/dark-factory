@@ -102,10 +102,10 @@ usage_cap:
   max_probe_interval_secs: 1800  # 30 min max backoff
   # Multi-account failover
   accounts:
-    - name: max-a
-      oauth_token_env: CLAUDE_OAUTH_TOKEN_A
     - name: max-b
       oauth_token_env: CLAUDE_OAUTH_TOKEN_B
+    - name: max-a
+      oauth_token_env: CLAUDE_OAUTH_TOKEN_A
 
 # Project root (absolute path)
 project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"
