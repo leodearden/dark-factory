@@ -1,0 +1,168 @@
+{
+  "task_id": "45",
+  "title": "Scope verification to task modules instead of full repo",
+  "files": [
+    "orchestrator/src/orchestrator/verify.py",
+    "orchestrator/tests/test_verify.py",
+    "orchestrator/src/orchestrator/workflow.py",
+    "orchestrator/tests/test_workflow_e2e.py"
+  ],
+  "modules": [
+    "orchestrator/src",
+    "orchestrator/tests"
+  ],
+  "analysis": "The verify step has two scoping layers, both of which need improvement:\n\n**Layer 1 — Per-subproject scoping (already exists, needs file-level refinement):** When module_configs is populated (from */orchestrator.yaml), run_scoped_verification runs per-subproject commands like 'uv run --project fused-memory --directory fused-memory ruff check src/ tests/'. This correctly isolates subprojects from each other, but still checks ALL files within the subproject. A task touching only fused-memory/src/fused_memory/reconciliation/stage2.py gets lint errors from fused-memory/src/fused_memory/server/main.py. Fix: add scope_module_config() to narrow subproject commands to the task's specific files by replacing the path arguments after the tool keyword (ruff check, pyright, pytest).\n\n**Layer 2 — Global fallback (the main budget drain):** When module_configs is empty (no orchestrator.yaml match, or no modules assigned), run_scoped_verification falls back to run_verification(worktree, config) which runs the global commands: full-repo ruff/pyright/pytest. This is the path that burned $8-15/task during the 2026-03-19 run. Fix: add _build_fallback_config() to construct a synthetic ModuleConfig from the task's file list, bypassing the global commands entirely.\n\nBoth fixes are gated by a new task_files parameter on run_scoped_verification. Workflow.py passes plan.get('files', []) from the task plan. The parameter defaults to None for full backward compatibility — AsyncMock-based tests need no changes; only 2 custom async mock functions in test_workflow_e2e.py need **kwargs added.\n\nThe _scope_command() helper handles the three tools uniformly: find tool keyword in command string, keep the prefix, replace path arguments with the task's files, preserve dash-prefixed flags (critical for pytest --tb=short -q).",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing tests for _scope_command(cmd, tool_keyword, files) in test_verify.py: (a) basic ruff check replacement — 'uv run --project P --directory P ruff check src/ tests/' + tool='ruff check' + files=['src/verify.py'] → replaces paths with file; (b) pyright replacement — same pattern with tool='pyright'; (c) pytest with flag preservation — 'pytest tests/ --tb=short -q' preserves --tb=short and -q after the file list; (d) returns None when cmd is None; (e) returns None when files list is empty; (f) returns original cmd unchanged when tool keyword not found in command string.",
+      "status": "done",
+      "commit": "62c9d83"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Implement _scope_command(cmd: str | None, tool_keyword: str, files: list[str]) -> str | None in verify.py. Uses str.find(tool_keyword) to locate tool in command, keeps prefix up to and including tool_keyword, extracts dash-prefixed tokens from remainder as flags, rebuilds as '{prefix} {files} {flags}'. Returns None when cmd is None or files is empty. Returns original cmd when tool_keyword not found.",
+      "status": "done",
+      "commit": "192274d"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing tests for scope_module_config(mc, task_files) in test_verify.py: (a) filters task files to subproject prefix and strips prefix — files=['orchestrator/src/orchestrator/verify.py'] with prefix='orchestrator' → uses 'src/orchestrator/verify.py'; (b) classifies test files correctly — test_ prefix, _test.py suffix, conftest.py, and /tests/ directory all classified as test files; (c) builds scoped lint/type/test commands via _scope_command; (d) returns original ModuleConfig when no task files match the prefix; (e) test_command is None when task files contain no test files; (f) non-.py files are excluded from commands.",
+      "status": "done",
+      "commit": "dd15670"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Implement scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig in verify.py. Filters task_files to those starting with mc.prefix + '/', strips prefix, filters to .py files, classifies into source vs test (test_ prefix, _test.py suffix, conftest.py, /tests/ path), builds scoped commands via _scope_command('ruff check', all_py_files), _scope_command('pyright', all_py_files), _scope_command('pytest', test_files). Returns original mc when no .py files match prefix.",
+      "status": "done",
+      "commit": "636bba2"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing tests for _build_fallback_config(task_files) in test_verify.py: (a) source + test .py files → returns ModuleConfig with prefix='__fallback__', lint_command='ruff check file1 file2', type_check_command='pyright file1 file2', test_command='pytest test_file1'; (b) only source .py files → test_command is None; (c) empty list → returns None; (d) only non-.py files (.yaml, .md) → returns None.",
+      "status": "done",
+      "commit": "d2d09f6"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Implement _build_fallback_config(task_files: list[str]) -> ModuleConfig | None in verify.py. Filters to .py files, classifies into source vs test, builds ruff check/pyright commands from all .py files and pytest from test files. Returns None when no .py files found. Uses prefix='__fallback__'.",
+      "status": "done",
+      "commit": "917748a"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing tests for run_scoped_verification with task_files parameter: (a) module_configs populated + task_files provided → commands are file-scoped within subprojects (use echo-based commands to verify file args appear in output); (b) module_configs empty + task_files provided → fallback config used instead of global commands (global config uses 'exit 1' to prove it's bypassed); (c) both empty → global fallback runs (existing behavior preserved); (d) task_files=None → backward compatible, module_configs used as-is.",
+      "status": "done",
+      "commit": "0bcb84a"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Add task_files: list[str] | None = None parameter to run_scoped_verification. When task_files is provided and module_configs non-empty: apply scope_module_config to each. When module_configs empty and task_files provided: call _build_fallback_config, delegate to run_verification if it returns a config. Log scoping mode at info level: 'file-scoped (N files across M subprojects)', 'fallback-scoped (N files)', or 'global (no scope info)'.",
+      "status": "done",
+      "commit": "72d221a"
+    },
+    {
+      "id": "step-9",
+      "type": "impl",
+      "description": "Update workflow.py: (a) add a _task_files property that returns self.plan.get('files') or None (converts empty list to None); (b) in _verify_debugfix_loop, pass task_files=self._task_files to run_scoped_verification; (c) in run() post-merge verification, pass task_files=self._task_files; (d) in _merge() conflict-resolution verification, pass task_files=self._task_files.",
+      "status": "done",
+      "commit": "7b0ba9a"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Update the 2 custom async mock functions in test_workflow_e2e.py (verify_sequence at ~line 546 and verify_fn at ~line 727) to add **kwargs to their signatures so they accept the new task_files keyword argument without TypeError. AsyncMock-based patches need no changes.",
+      "status": "done",
+      "commit": "83eedbe"
+    },
+    {
+      "id": "step-11",
+      "type": "impl",
+      "description": "Fix review issue [dead_test_no_assertions]: Delete test_empty_module_configs_with_task_files_uses_fallback entirely (lines 513-534 in test_verify.py). This test has zero assertions — it ends with `pass` after a comment deferring to the patch-based test. The patch-based test_empty_module_configs_with_task_files_bypasses_global already covers the same fallback-bypasses-global behavior with proper assertions.",
+      "status": "done",
+      "commit": "5a123e1"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Fix review issue [tautological_assertion]: In test_empty_module_configs_with_task_files_bypasses_global (line 555), change `assert 'fallback-lint' in result.lint_output or result.passed` to `assert 'fallback-lint' in result.lint_output`. The `or result.passed` makes the disjunction trivially True since the previous line already asserts `result.passed is True`, so the lint-output check is never actually evaluated. Removing it ensures the test genuinely verifies the fallback echo command was executed.",
+      "status": "done",
+      "commit": "5a123e1"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Two-layer scoping: file-level within subprojects + fallback for missing module configs",
+      "rationale": "The per-subproject scoping via orchestrator.yaml already isolates cross-subproject failures. But within a subproject, pre-existing issues in unrelated files still cause false failures. File-level scoping (layer 1) handles this. The fallback (layer 2) handles the case when no orchestrator.yaml matches — the original root cause of the $8-15/task budget waste."
+    },
+    {
+      "decision": "String-level command scoping via tool keyword replacement, not structured parsing",
+      "rationale": "All orchestrator.yaml commands follow a consistent pattern: 'uv run --project P --directory P <tool> <paths> [flags]'. Finding the tool keyword (ruff check / pyright / pytest) and replacing everything after it with specific files + preserved flags is simple, testable, and handles all three tools uniformly. shlex/argparse parsing would be over-engineered for this pattern."
+    },
+    {
+      "decision": "scope_module_config creates a new ModuleConfig rather than modifying the original",
+      "rationale": "ModuleConfig is a dataclass with no mutability constraints, but creating new instances is safer (no shared state) and allows the original to be reused as fallback when no task files match the subproject."
+    },
+    {
+      "decision": "task_files defaults to None, not empty list, for backward compatibility",
+      "rationale": "None means 'no file info available, use existing behavior'. Empty list [] could mean 'task touches no files' which is semantically different. None preserves exact backward compatibility — all existing callers and mocks continue unchanged."
+    },
+    {
+      "decision": "When module_configs is populated and task_files provided, scope within subprojects rather than ignoring module_configs",
+      "rationale": "The prior plan would ignore module_configs when task_files is provided. But module_configs provide critical uv run --project isolation for venv resolution. Scoping WITHIN them (replacing paths in their commands) gets the best of both: proper venv isolation + file-level precision."
+    },
+    {
+      "decision": "Non-.py files filtered out of verification commands",
+      "rationale": "Plan files can include .yaml, .json, .md. Running ruff/pyright on these produces errors or is meaningless. Filtering to .py keeps commands clean and avoids spurious failures."
+    },
+    {
+      "decision": "Warn-only full-repo fallback deferred to follow-up",
+      "rationale": "The task says 'consider' a warn-but-don't-block full-repo check. The file-level scoping eliminates the root cause. A parallel full-repo check would double verification time and add complexity. Deferring is appropriate — if needed, it can be added as a separate opt-in config flag."
+    },
+    {
+      "decision": "Delete dead test rather than rewrite it",
+      "rationale": "test_empty_module_configs_with_task_files_uses_fallback attempted a non-patching approach but couldn't make meaningful assertions (ruff on nonexistent files has unpredictable results). The patch-based test_empty_module_configs_with_task_files_bypasses_global fully covers the same behavior with deterministic assertions. Keeping a rewritten duplicate adds maintenance cost for zero coverage gain."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "ModuleConfig dataclass",
+      "where": "orchestrator/src/orchestrator/config.py",
+      "how": "Both scope_module_config and _build_fallback_config return ModuleConfig instances. run_verification already handles ModuleConfig — no new types needed."
+    },
+    {
+      "what": "run_verification with module_config parameter",
+      "where": "orchestrator/src/orchestrator/verify.py",
+      "how": "File-scoped and fallback configs are standard ModuleConfigs passed to run_verification. All execution, timeout, and result-building logic is reused unchanged."
+    },
+    {
+      "what": "_aggregate_results",
+      "where": "orchestrator/src/orchestrator/verify.py",
+      "how": "Multi-subproject aggregation works identically since scope_module_config produces standard ModuleConfig objects."
+    },
+    {
+      "what": "Test patterns from existing test_verify.py",
+      "where": "orchestrator/tests/test_verify.py",
+      "how": "New tests use identical patterns: MagicMock config with echo commands, tmp_path for cwd, asyncio.run() wrapper, assertions on result.passed/summary/output."
+    },
+    {
+      "what": "plan.get('files') access pattern",
+      "where": "orchestrator/src/orchestrator/workflow.py _plan() method",
+      "how": "Already used at line ~357 for blast radius expansion. Same dict access reused at verification call sites."
+    },
+    {
+      "what": "orchestrator.yaml command convention",
+      "where": "*/orchestrator.yaml (5 files)",
+      "how": "_scope_command relies on the established 'uv run --project P --directory P <tool> <paths>' pattern to find tool keywords and replace path arguments. No changes to orchestrator.yaml files needed."
+    }
+  ]
+}
