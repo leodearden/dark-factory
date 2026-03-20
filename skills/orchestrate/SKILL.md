@@ -134,21 +134,27 @@ uv run --project orchestrator orchestrator run --prd <path-to-prd>
 
 The orchestrator manages its own fused-memory HTTP server lifecycle — it starts the server before work begins and stops it when done. You don't need to start it manually.
 
-The orchestrator also starts an **escalation MCP server** on port 8100. Agents use this to escalate issues. The interactive session connects to the same server to resolve escalations.
+The orchestrator also starts an **escalation MCP server** on port 8102 (configurable). Agents use this to escalate issues. The interactive session connects to the same server to resolve escalations — it's pre-configured in `.mcp.json` as the `escalation` server, so escalation tools (`mcp__escalation__resolve_issue`, etc.) are available in the interactive session during a run.
 
 ### What happens during a run
 
 The orchestrator will:
-1. Start fused-memory HTTP server
-2. Call `parse_prd` (no-op if tasks already exist in Taskmaster)
-3. Tag tasks with code modules if not already tagged
-4. Execute up to 3 tasks concurrently (configurable), each following:
-   **PLAN** (architect) → **EXECUTE** (implementer, TDD) → **VERIFY** (pytest/ruff/pyright) → **REVIEW** (5 specialist reviewers) → **MERGE** (to main)
-5. If an agent encounters a problem outside its scope, it **escalates** rather than retrying.
+1. Start fused-memory HTTP server and escalation MCP server
+2. Check usage cap status (multi-account failover if cap hit at startup)
+3. Recover crashed tasks from surviving worktrees — if a prior run crashed mid-task, it resumes from the last completed plan step rather than starting over
+4. Call `parse_prd` (no-op if tasks already exist in Taskmaster)
+5. Tag tasks with code modules via a classifier agent (if not already tagged)
+6. Execute tasks concurrently (default 12, configurable via `max_concurrent_tasks`), each following:
+   **PLAN** (architect) → **EXECUTE** (implementer, TDD) → **VERIFY** (pytest/ruff/pyright) → if verify fails: **DEBUG** (up to 5 cycles) → **REVIEW** (5 specialist reviewers) → **MERGE** (to main, with post-merge verification)
+7. If an agent encounters a problem outside its scope, it **escalates** rather than retrying.
    Escalations are pushed to the handler session via a background watcher. See [Handle Escalations](#handle-escalations).
-6. Print a summary report with per-task outcomes and costs
+8. Print a summary report with per-task outcomes and costs
 
 Each task gets its own git worktree and branch (`task/<id>`). Merges use `--no-ff` to preserve history.
+
+The **debugger** is a distinct agent role invoked automatically on each verify failure. It receives the failure report (test output, lint errors, type errors) and makes targeted fixes. The verify→debug loop repeats up to `max_verify_attempts` times (default 5) before the task blocks.
+
+After merge, **post-merge verification** re-runs the full verification suite on main. If it fails, the merge is automatically reverted and the task blocks — this catches integration issues that only appear after combining with other tasks' changes.
 
 ### Interpreting the output
 
@@ -210,7 +216,7 @@ Tasks block at specific workflow stages. The approach depends on where it got st
 |-------|---------|------------|
 | **PLAN** | "architect failed" or no `plan.json` | Task description may be too vague. Update the task with more detail via `update_task`, reset to pending, and re-run. |
 | **EXECUTE** | "Execution iterations exhausted" | Implementer couldn't complete all plan steps in 10 iterations. Check `iterations.jsonl` for where it got stuck. May need to simplify the task or split it. |
-| **VERIFY** | "Verification attempts exhausted" | Tests/lint/typecheck fail persistently. Check the worktree for the actual failures: `cd <worktree> && pytest` / `ruff check` / `pyright`. Fix manually or update the task. |
+| **VERIFY** | "Verification attempts exhausted" | Tests/lint/typecheck fail persistently. Check the worktree for the actual failures: `cd <worktree> && pytest` / `ruff check` / `pyright`. Fix manually or update the task. **Caveat**: verification currently runs repo-wide commands by default — pre-existing errors in unrelated modules can block tasks. Check whether the failures are in the task's own modules or elsewhere. |
 | **REVIEW** | "Review cycles exhausted" with blocking issues | Reviewers found design problems the architect couldn't resolve in 2 replan cycles. Read `.task/reviews/*.json` for the specific issues. May need architectural guidance written to memory. |
 | **MERGE** | "Merge conflicts" / "Post-merge verification failed" | Another task modified the same code. Check `git log --oneline main` for recent merges. May need to rebase the task branch manually. |
 
@@ -254,34 +260,56 @@ add_memory(
 
 During an orchestrator run, agents can escalate issues they can't solve at their scope. Unlike blocks (which are detected post-run), escalations are **pushed in real-time** — you'll be notified as they happen.
 
+### Dismissing stale escalations
+
+Escalations from prior runs persist on disk and can block tasks in new runs. Before starting a new run, check for and dismiss stale escalations:
+
+```
+get_pending_escalations()
+```
+
+If there are pending escalations from a prior session (check timestamps), dismiss them:
+
+```
+resolve_issue(escalation_id="<id>", resolution="Stale from prior run", terminate=true)
+```
+
 ### Setting up the escalation watcher
 
-After launching the orchestrator, start the watcher in the background:
+After launching the orchestrator, start the watcher as a background task:
 
 ```bash
 uv run --project escalation python -m escalation.watcher \
   --queue-dir /home/leo/src/dark-factory/data/escalations &
 ```
 
-This watches for new escalations. When one arrives, the background task completes and you'll be notified with the escalation content. After handling it, re-arm the watcher:
+The watcher uses inotify to wait (zero CPU) for new escalation files. When one arrives, it prints the escalation JSON to stdout and exits — this triggers a background task completion notification in Claude Code, which is your signal to handle it. After resolving, re-arm the watcher with the same command.
 
-```bash
-uv run --project escalation python -m escalation.watcher \
-  --queue-dir /home/leo/src/dark-factory/data/escalations &
-```
+**Watcher options:**
+- `--task-id <id>` — filter to a specific task
+- `--loop` — keep watching instead of exiting after first match (useful with `--ntfy-url` for passive monitoring, but for interactive sessions the one-shot pattern is better since the task completion is the notification)
+- `--ntfy-url <url>` — send push notifications via ntfy.sh (for AFK monitoring)
 
 ### Reading an escalation
 
 Each escalation includes:
+- **id** — format `esc-{task_id}-{seq}` (e.g., `esc-42-1`)
 - **task_id** — which task's agent escalated
 - **severity** — `blocking` (task paused, waiting for you) or `info` (FYI, agent continued)
-- **category** — `scope_violation`, `design_concern`, `cleanup_needed`, `dependency_discovered`, `risk_identified`, `infra_issue`
+- **category** — `scope_violation`, `design_concern`, `cleanup_needed`, `dependency_discovered`, `risk_identified`, `infra_issue`, or `task_failure` (auto-escalation when workflow hits iteration/verify/review limits)
 - **summary** / **detail** — what the agent found
 - **suggested_action** — what the agent thinks should happen
+- **worktree** — path to the task's worktree (useful for diagnosis)
+- **workflow_state** — what stage the agent was in when it escalated
+
+You can also fetch a specific escalation by ID:
+```
+get_escalation(escalation_id="esc-42-1")
+```
 
 ### Resolving an escalation
 
-Once you understand the issue, resolve it via the escalation MCP tools:
+These are MCP tools on the escalation server (prefixed `mcp__escalation__` in Claude Code). The server is pre-configured in `.mcp.json`, so these tools are available in the interactive session during a run.
 
 ```
 resolve_issue(
@@ -320,6 +348,7 @@ get_pending_escalations(task_id="7")
 | `design_concern` | Agent found a design issue outside task scope | Assess severity. Create a follow-up task if needed, resolve with "proceed, this is tracked in task N". |
 | `dependency_discovered` | Task depends on code from an unfinished task | Check if the dependency task is in progress. If so, resolve with "wait" or requeue. If not, may need to add a dependency. |
 | `infra_issue` | Test framework, build tool, or environment problem | Fix the infrastructure issue, then resolve with instructions for the agent. |
+| `task_failure` | Auto-escalation: workflow hit iteration/verify/review limits | Check the worktree artifacts to understand why. Either fix the issue and resolve, or terminate if the task needs to be redesigned. |
 
 ---
 
@@ -348,24 +377,58 @@ Once the task tree is accurate, jump to [Execute Tasks](#execute-tasks). The orc
 
 ## Configuration
 
-The default config lives at `orchestrator/config.yaml`. Key knobs:
+The default config lives at `orchestrator/config.yaml`. Config is auto-discovered: if no `--config` flag is passed, the CLI checks `cwd/config.yaml`, then `cwd/orchestrator/config.yaml`. YAML values support `${VAR_NAME}` and `${VAR_NAME:default}` environment variable expansion.
 
-| Setting | Default | What it controls |
-|---------|---------|-----------------|
-| `max_concurrent_tasks` | 3 | Parallel task workflows |
+### Core settings
+
+| Setting | config.yaml | What it controls |
+|---------|-------------|-----------------|
+| `max_concurrent_tasks` | 12 | Parallel task workflows |
 | `max_per_module` | 1 | Tasks per code module (serialization) |
 | `max_execute_iterations` | 10 | Implementer retries before blocking |
 | `max_verify_attempts` | 5 | Debug-fix cycles before blocking |
 | `max_review_cycles` | 2 | Review-replan loops before blocking |
-| `models.architect` | opus | Model for planning |
-| `models.implementer` | opus | Model for coding |
-| `models.reviewer` | sonnet | Model for code review |
-| `budgets.implementer` | $10 | Max spend per implementer invocation |
+| `lock_depth` | 4 | Module path depth for lock normalization |
 | `test_command` | pytest | Verification test runner |
-| `lint_command` | ruff check | Verification linter |
-| `lock_depth` | 2 | Module path depth for lock normalization |
-| `escalation.port` | 8100 | Escalation MCP server port |
+| `lint_command` | ruff check ... | Verification linter |
+| `type_check_command` | pyright (per-package) | Verification type checker |
+| `escalation.port` | 8102 | Escalation MCP server port |
 | `escalation.queue_dir` | data/escalations | Escalation queue directory |
-| `sandbox.enabled` | true | Enable bwrap filesystem sandbox |
+| `sandbox.enabled` | false | Enable bwrap filesystem sandbox |
+
+### Per-role settings
+
+Each role has model, budget, max turns, reasoning effort, and backend:
+
+| Role | Model | Budget | Turns | Effort | Backend |
+|------|-------|--------|-------|--------|---------|
+| architect | opus | $5 | 50 | max | claude |
+| implementer | sonnet | $10 | 80 | max | claude |
+| debugger | sonnet | $5 | 50 | max | claude |
+| reviewer | sonnet | $2 | 30 | medium | claude |
+| merger | opus | $5 | 50 | max | claude |
+| module_tagger | (sonnet) | ($2) | (30) | medium | claude |
+
+### Module overrides
+
+Subprojects can override verification commands by placing an `orchestrator.yaml` in their directory (e.g., `fused-memory/orchestrator.yaml`). This scopes `test_command`, `lint_command`, and `type_check_command` to that subproject when tasks touch its modules.
+
+### Multi-account failover
+
+The `usage_cap` section configures automatic failover between Max subscription accounts when usage caps are hit. Accounts are tried in order; when one is capped, the orchestrator switches to the next and starts a background probe to detect when the capped account resets.
 
 Override via YAML file (`--config`) or environment variables (`ORCH_MAX_CONCURRENT_TASKS=5`, `ORCH_MODELS__ARCHITECT=sonnet`).
+
+---
+
+## Known Issues & Workarounds
+
+These are active issues that may affect orchestrator runs. Check the task tree for fix status.
+
+### Verification runs repo-wide (task 45)
+
+The verify step runs `ruff check`, `pyright`, and `pytest` with repo-wide scope by default. Pre-existing lint/type errors in modules outside a task's scope cause verification to fail even when the task's own code is clean. **Workaround**: ensure main is clean before starting a run (`ruff check && pyright` should pass). Module-scoped verification is planned but not yet implemented.
+
+### Worktree imports resolve from main tree (task 46)
+
+Worktrees share the main tree's `.venv`. Python imports resolve from the installed (main) package, not the worktree's modified source. New methods or changed signatures in worktree code fail at test time with `AttributeError` or assertion mismatches. **Workaround**: if a task blocks at verify with import errors for code it just wrote, manually verify the code is correct, merge to main, and confirm tests pass post-merge.
