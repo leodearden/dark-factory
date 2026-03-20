@@ -1,3 +1,5 @@
 .env
 .mcp.json
 .task/
+__pycache__/
+*.pyc
