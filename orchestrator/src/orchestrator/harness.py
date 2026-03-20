@@ -108,7 +108,13 @@ class Harness:
         await self._start_escalation_server()
 
         try:
-            # 1c. Usage cap startup check
+            # 1c. Dismiss stale escalations from prior runs (non-fatal)
+            try:
+                await self._dismiss_stale_escalations()
+            except Exception as e:
+                logger.warning(f'Failed to dismiss stale escalations: {e}')
+
+            # 1d. Usage cap startup check
             if self.usage_gate:
                 logger.info('Checking usage cap status...')
                 await self.usage_gate.check_at_startup()
@@ -538,6 +544,25 @@ Output JSON matching the schema. Every task must appear in the output.
         logger.info(f'Escalation MCP server starting on {host}:{port}')
         # Give the server a moment to bind
         await asyncio.sleep(0.5)
+
+    async def _dismiss_stale_escalations(self) -> None:
+        """Dismiss all pending escalations left over from prior orchestrator runs.
+
+        Called right after _start_escalation_server() so that any escalations
+        persisted in the queue directory from a previous (crashed or completed)
+        run are cleared before the new run begins.  All pending escalations at
+        startup are by definition stale — a new run should never inherit
+        unresolved escalations from a prior one.
+        """
+        if self._escalation_queue is None:
+            return
+
+        resolution = (
+            'Auto-dismissed: orchestrator restarted — stale from prior run'
+        )
+        count = self._escalation_queue.dismiss_all_pending(resolution)
+        if count:
+            logger.info(f'Dismissed {count} stale escalation(s) from prior run')
 
     async def _stop_escalation_server(self) -> None:
         """Stop the escalation server."""
