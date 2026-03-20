@@ -170,3 +170,36 @@ class Mem0Backend:
             instance.delete(memory_id),
             timeout=self._write_timeout,
         )
+
+    async def count(self, scope: Scope) -> int:
+        """Count memories using native Qdrant count API."""
+        instance = await self._get_instance(scope)
+        loop = asyncio.get_event_loop()
+        result = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: instance.vector_store.client.count(
+                    collection_name=instance.collection_name,
+                    exact=True,
+                ),
+            ),
+            timeout=self._read_timeout,
+        )
+        return result.count
+
+    def list_projects(self) -> list[tuple[str, str]]:
+        """Enumerate projects by scanning Qdrant collections matching the prefix.
+
+        Returns list of (project_id, collection_name) tuples.
+        """
+        from qdrant_client import QdrantClient
+
+        client = QdrantClient(url=self.config.mem0.qdrant_url)
+        prefix = f'{self.config.mem0.collection_prefix}_'
+        result = []
+        for c in client.get_collections().collections:
+            if c.name.startswith(prefix):
+                project_id = c.name[len(prefix):]
+                if project_id:
+                    result.append((project_id, c.name))
+        return result

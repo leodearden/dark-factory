@@ -271,8 +271,11 @@ class TestMcpHeaders:
 
 
 _STATUS_PAYLOAD = {
-    'graphiti': {'connected': True, 'node_count': 42},
-    'mem0': {'connected': True, 'memory_count': 5},
+    'graphiti': {'connected': True},
+    'mem0': {'connected': True},
+    'projects': {
+        'dark_factory': {'graphiti_nodes': 42, 'mem0_memories': 5},
+    },
     'queue': {'counts': {'pending': 1, 'completed': 8}, 'oldest_pending_age_seconds': 1.2},
 }
 
@@ -290,7 +293,7 @@ class TestGetMemoryStatus:
             result = await get_memory_status(client, dashboard_config)
 
         assert result == _STATUS_PAYLOAD
-        assert result['graphiti']['node_count'] == 42
+        assert result['projects']['dark_factory']['graphiti_nodes'] == 42
 
     async def test_all_servers_down_returns_offline(self, dashboard_config):
         """When all URLs fail, returns offline with combined error."""

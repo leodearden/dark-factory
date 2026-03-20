@@ -185,10 +185,7 @@ async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) 
     errors: list[str] = []
     for url in config.fused_memory_urls:
         try:
-            return await mcp_tool_call(
-                client, url, 'get_status',
-                {'project_id': config.fused_memory_project_id},
-            )
+            return await mcp_tool_call(client, url, 'get_status', {})
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
                 ValueError) as e:
             logger.debug('get_status failed for %s: %s', url, e)

@@ -5,9 +5,12 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 _ONLINE_STATUS = {
-    'graphiti': {'connected': True, 'node_count': 42},
-    'mem0': {'connected': True, 'memory_count': 128},
+    'graphiti': {'connected': True},
+    'mem0': {'connected': True},
     'taskmaster': {'connected': True},
+    'projects': {
+        'dark_factory': {'graphiti_nodes': 42, 'mem0_memories': 128},
+    },
 }
 
 _ONLINE_QUEUE = {
@@ -51,7 +54,7 @@ class TestMemoryPartialOnline:
             assert '<h2' in html
             assert 'Memory' in html
 
-    def test_online_contains_card_labels(self, client):
+    def test_online_contains_infra_labels(self, client):
         with (
             patch(
                 'dashboard.data.memory.get_memory_status',
@@ -68,9 +71,9 @@ class TestMemoryPartialOnline:
             assert 'Graphiti' in html
             assert 'Mem0' in html
             assert 'Taskmaster' in html
-            assert 'Write Queue' in html
+            assert 'Queue' in html
 
-    def test_online_graphiti_count(self, client):
+    def test_online_project_graphiti_count(self, client):
         with (
             patch(
                 'dashboard.data.memory.get_memory_status',
@@ -85,9 +88,9 @@ class TestMemoryPartialOnline:
         ):
             html = client.get('/partials/memory').text
             assert '42' in html
-            assert 'knowledge graph nodes' in html
+            assert 'graph nodes' in html
 
-    def test_online_mem0_count(self, client):
+    def test_online_project_mem0_count(self, client):
         with (
             patch(
                 'dashboard.data.memory.get_memory_status',
@@ -104,7 +107,7 @@ class TestMemoryPartialOnline:
             assert '128' in html
             assert 'vector memories' in html
 
-    def test_online_taskmaster_connected(self, client):
+    def test_online_project_name_shown(self, client):
         with (
             patch(
                 'dashboard.data.memory.get_memory_status',
@@ -118,7 +121,34 @@ class TestMemoryPartialOnline:
             ),
         ):
             html = client.get('/partials/memory').text
-            assert 'Connected' in html
+            assert 'dark_factory' in html
+
+    def test_multiple_projects_shown(self, client):
+        status = {
+            'graphiti': {'connected': True},
+            'mem0': {'connected': True},
+            'projects': {
+                'dark_factory': {'graphiti_nodes': 42, 'mem0_memories': 128},
+                'reify': {'graphiti_nodes': 100, 'mem0_memories': 50},
+            },
+        }
+        with (
+            patch(
+                'dashboard.data.memory.get_memory_status',
+                new_callable=AsyncMock,
+                return_value=status,
+            ),
+            patch(
+                'dashboard.data.memory.get_queue_stats',
+                new_callable=AsyncMock,
+                return_value=_ONLINE_QUEUE,
+            ),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'dark_factory' in html
+            assert 'reify' in html
+            assert '42' in html
+            assert '100' in html
 
 
 _OFFLINE_STATUS = {'offline': True, 'error': 'Connection refused'}
@@ -144,14 +174,15 @@ class TestMemoryPartialOffline:
             html = resp.text
             assert 'Fused Memory Server Offline' in html
             assert 'Connection refused' in html
-            assert 'knowledge graph nodes' not in html
+            assert 'graph nodes' not in html
 
 
 class TestMemoryPartialDots:
     def test_graphiti_green_when_connected(self, client):
         status = {
-            'graphiti': {'connected': True, 'node_count': 10},
-            'mem0': {'connected': True, 'memory_count': 5},
+            'graphiti': {'connected': True},
+            'mem0': {'connected': True},
+            'projects': {'test': {'graphiti_nodes': 10, 'mem0_memories': 5}},
         }
         queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
         with (
@@ -163,8 +194,9 @@ class TestMemoryPartialDots:
 
     def test_graphiti_red_when_disconnected(self, client):
         status = {
-            'graphiti': {'connected': False, 'node_count': 0},
-            'mem0': {'connected': True, 'memory_count': 5},
+            'graphiti': {'connected': False},
+            'mem0': {'connected': True},
+            'projects': {},
         }
         queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
         with (
@@ -176,8 +208,9 @@ class TestMemoryPartialDots:
 
     def test_mem0_red_when_disconnected(self, client):
         status = {
-            'graphiti': {'connected': True, 'node_count': 10},
-            'mem0': {'connected': False, 'memory_count': 0},
+            'graphiti': {'connected': True},
+            'mem0': {'connected': False},
+            'projects': {},
         }
         queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
         with (
@@ -193,14 +226,15 @@ class TestMemoryPartialDots:
             patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=_ONLINE_QUEUE),
         ):
             html = client.get('/partials/memory').text
-            # All 4 cards should have green dots when everything is connected
+            # Graphiti, Mem0, Taskmaster, Queue — all 4 should be green
             assert html.count('bg-green-500') >= 3
 
     def test_taskmaster_red_when_disconnected(self, client):
         status = {
-            'graphiti': {'connected': True, 'node_count': 10},
-            'mem0': {'connected': True, 'memory_count': 5},
+            'graphiti': {'connected': True},
+            'mem0': {'connected': True},
             'taskmaster': {'connected': False},
+            'projects': {'test': {'graphiti_nodes': 10, 'mem0_memories': 5}},
         }
         queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
         with (
@@ -209,25 +243,12 @@ class TestMemoryPartialDots:
         ):
             html = client.get('/partials/memory').text
             assert 'bg-red-500' in html
-
-    def test_taskmaster_shows_disconnected_text(self, client):
-        status = {
-            'graphiti': {'connected': True, 'node_count': 10},
-            'mem0': {'connected': True, 'memory_count': 5},
-            'taskmaster': {'connected': False},
-        }
-        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
-        with (
-            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=status),
-            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
-        ):
-            html = client.get('/partials/memory').text
-            assert 'Disconnected' in html
 
     def test_taskmaster_defaults_disconnected_when_key_missing(self, client):
         status = {
-            'graphiti': {'connected': True, 'node_count': 10},
-            'mem0': {'connected': True, 'memory_count': 5},
+            'graphiti': {'connected': True},
+            'mem0': {'connected': True},
+            'projects': {'test': {'graphiti_nodes': 10, 'mem0_memories': 5}},
         }
         queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
         with (
@@ -236,7 +257,6 @@ class TestMemoryPartialDots:
         ):
             html = client.get('/partials/memory').text
             assert 'bg-red-500' in html
-            assert 'Disconnected' in html
 
 
 class TestWriteQueueCard:
@@ -247,7 +267,7 @@ class TestWriteQueueCard:
             patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
         ):
             html = client.get('/partials/memory').text
-            # All dots should be green (4 cards, all connected, all zero counts)
+            # All infra dots should be green (4 items in health row)
             assert html.count('bg-green-500') == 4
 
     def test_queue_dot_yellow_pending(self, client):
@@ -275,9 +295,9 @@ class TestWriteQueueCard:
             patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
         ):
             html = client.get('/partials/memory').text
-            assert '3 pending' in html
-            assert '1 retry' in html
-            assert '0 dead' in html
+            assert '3p/' in html
+            assert '1r/' in html
+            assert '0d' in html
 
 
 class TestWriteQueueConditionalStyling:
@@ -288,16 +308,7 @@ class TestWriteQueueConditionalStyling:
             patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
         ):
             html = client.get('/partials/memory').text
-            assert 'text-red-' in html
-
-    def test_dead_zero_no_red_text(self, client):
-        queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
-        with (
-            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
-            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
-        ):
-            html = client.get('/partials/memory').text
-            assert 'text-red-400' not in html
+            assert 'bg-red-500' in html
 
     def test_oldest_age_shown_over_60(self, client):
         queue = {'counts': {'pending': 1, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': 120}
@@ -306,7 +317,7 @@ class TestWriteQueueConditionalStyling:
             patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
         ):
             html = client.get('/partials/memory').text
-            assert 'oldest:' in html
+            assert 'oldest' in html
             assert '2m ago' in html
             assert 'text-yellow-' in html
 
@@ -317,7 +328,7 @@ class TestWriteQueueConditionalStyling:
             patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
         ):
             html = client.get('/partials/memory').text
-            assert 'oldest:' not in html
+            assert 'oldest' not in html
 
     def test_oldest_age_hidden_none(self, client):
         queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
@@ -326,7 +337,7 @@ class TestWriteQueueConditionalStyling:
             patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
         ):
             html = client.get('/partials/memory').text
-            assert 'oldest:' not in html
+            assert 'oldest' not in html
 
 
 _SPLIT_BRAIN_QUEUE = {'offline': True, 'error': 'Connection reset'}
@@ -349,9 +360,9 @@ class TestSplitBrainQueueOffline:
             patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=_SPLIT_BRAIN_QUEUE),
         ):
             html = client.get('/partials/memory').text
-            assert 'oldest:' not in html
+            assert 'oldest' not in html
 
-    def test_status_online_queue_offline_shows_cards(self, client):
+    def test_status_online_queue_offline_shows_infra_labels(self, client):
         with (
             patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
             patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=_SPLIT_BRAIN_QUEUE),
@@ -360,7 +371,7 @@ class TestSplitBrainQueueOffline:
             assert 'Graphiti' in html
             assert 'Mem0' in html
             assert 'Taskmaster' in html
-            assert 'Write Queue' in html
+            assert 'Queue' in html
 
     def test_status_online_queue_offline_queue_metrics_default(self, client):
         with (
@@ -368,9 +379,9 @@ class TestSplitBrainQueueOffline:
             patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=_SPLIT_BRAIN_QUEUE),
         ):
             html = client.get('/partials/memory').text
-            assert '0 pending' in html
-            assert '0 retry' in html
-            assert '0 dead' in html
+            assert '0p/' in html
+            assert '0r/' in html
+            assert '0d' in html
 
 
 class TestMemoryDotAriaLabels:
@@ -386,9 +397,10 @@ class TestMemoryDotAriaLabels:
 
     def test_graphiti_dot_aria_label_connected(self, client):
         status = {
-            'graphiti': {'connected': True, 'node_count': 10},
-            'mem0': {'connected': True, 'memory_count': 5},
+            'graphiti': {'connected': True},
+            'mem0': {'connected': True},
             'taskmaster': {'connected': True},
+            'projects': {'test': {'graphiti_nodes': 10, 'mem0_memories': 5}},
         }
         queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
         with (
@@ -400,9 +412,10 @@ class TestMemoryDotAriaLabels:
 
     def test_graphiti_dot_aria_label_disconnected(self, client):
         status = {
-            'graphiti': {'connected': False, 'node_count': 0},
-            'mem0': {'connected': True, 'memory_count': 5},
+            'graphiti': {'connected': False},
+            'mem0': {'connected': True},
             'taskmaster': {'connected': True},
+            'projects': {},
         }
         queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
         with (
@@ -414,9 +427,10 @@ class TestMemoryDotAriaLabels:
 
     def test_mem0_dot_aria_label_connected(self, client):
         status = {
-            'graphiti': {'connected': True, 'node_count': 10},
-            'mem0': {'connected': True, 'memory_count': 5},
+            'graphiti': {'connected': True},
+            'mem0': {'connected': True},
             'taskmaster': {'connected': True},
+            'projects': {'test': {'graphiti_nodes': 10, 'mem0_memories': 5}},
         }
         queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
         with (
@@ -428,9 +442,10 @@ class TestMemoryDotAriaLabels:
 
     def test_mem0_dot_aria_label_disconnected(self, client):
         status = {
-            'graphiti': {'connected': True, 'node_count': 10},
-            'mem0': {'connected': False, 'memory_count': 0},
+            'graphiti': {'connected': True},
+            'mem0': {'connected': False},
             'taskmaster': {'connected': True},
+            'projects': {},
         }
         queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
         with (
@@ -450,9 +465,10 @@ class TestMemoryDotAriaLabels:
 
     def test_taskmaster_dot_aria_label_disconnected(self, client):
         status = {
-            'graphiti': {'connected': True, 'node_count': 10},
-            'mem0': {'connected': True, 'memory_count': 5},
+            'graphiti': {'connected': True},
+            'mem0': {'connected': True},
             'taskmaster': {'connected': False},
+            'projects': {'test': {'graphiti_nodes': 10, 'mem0_memories': 5}},
         }
         queue = {'counts': {'pending': 0, 'retry': 0, 'dead': 0}, 'oldest_pending_age_seconds': None}
         with (
@@ -516,7 +532,7 @@ class TestMemoryCardLayout:
             html = client.get('/partials/memory').text
             assert 'flex flex-wrap gap-4' in html
 
-    def test_cards_have_min_width(self, client):
+    def test_project_cards_have_min_width(self, client):
         with (
             patch(
                 'dashboard.data.memory.get_memory_status',
@@ -530,7 +546,8 @@ class TestMemoryCardLayout:
             ),
         ):
             html = client.get('/partials/memory').text
-            assert html.count('min-w-[200px]') == 4
+            # One project card = one min-w-[200px]
+            assert html.count('min-w-[200px]') == 1
 
     def test_offline_no_flex_wrap_container(self, client):
         with (

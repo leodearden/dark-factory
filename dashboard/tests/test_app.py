@@ -110,8 +110,11 @@ class TestMemoryPartialIntegration:
 
     def test_memory_online(self, client):
         mock_status = {
-            'graphiti': {'connected': True, 'node_count': 42},
-            'mem0': {'connected': True, 'memory_count': 128},
+            'graphiti': {'connected': True},
+            'mem0': {'connected': True},
+            'projects': {
+                'dark_factory': {'graphiti_nodes': 42, 'mem0_memories': 128},
+            },
         }
         mock_queue = {
             'counts': {'pending': 0, 'retry': 0, 'dead': 0},

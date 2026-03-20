@@ -7,9 +7,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 _DEFAULT_FUSED_MEMORY_URLS = [
+    'http://localhost:8002',
     'http://localhost:8000',
     'http://localhost:8001',
-    'http://localhost:8002',
 ]
 
 
@@ -21,7 +21,6 @@ class DashboardConfig:
     port: int = 8080
     project_root: Path = field(default_factory=lambda: Path('/home/leo/src/dark-factory'))
     fused_memory_urls: list[str] = field(default_factory=lambda: list(_DEFAULT_FUSED_MEMORY_URLS))
-    fused_memory_project_id: str = 'dark_factory'
 
     @property
     def reconciliation_db(self) -> Path:
@@ -51,6 +50,4 @@ class DashboardConfig:
             kwargs['project_root'] = Path(root)
         if (urls := os.environ.get('DASHBOARD_FUSED_MEMORY_URLS')) is not None:
             kwargs['fused_memory_urls'] = [u.strip() for u in urls.split(',') if u.strip()]
-        if (pid := os.environ.get('DASHBOARD_FUSED_MEMORY_PROJECT_ID')) is not None:
-            kwargs['fused_memory_project_id'] = pid
         return cls(**kwargs)

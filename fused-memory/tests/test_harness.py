@@ -37,7 +37,7 @@ def mock_memory_service():
     svc = AsyncMock()
     svc.search = AsyncMock(return_value=[])
     svc.get_episodes = AsyncMock(return_value=[])
-    svc.get_status = AsyncMock(return_value={'graphiti': {}, 'mem0': {}})
+    svc.get_status = AsyncMock(return_value={'graphiti': {'connected': True}, 'mem0': {'connected': True}, 'projects': {}})
     svc.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
     svc.mem0 = AsyncMock()
     svc.mem0.get_all = AsyncMock(return_value={'results': []})

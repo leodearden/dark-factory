@@ -861,41 +861,56 @@ class MemoryService:
     # ------------------------------------------------------------------
 
     async def get_status(self, project_id: str | None = None) -> dict:
-        """Health check and statistics for both backends."""
+        """Health check and per-project statistics for both backends."""
         status: dict[str, Any] = {}
 
-        # Graphiti health
+        # Graphiti connectivity + project discovery
+        graphiti_counts: dict[str, int] = {}
         try:
-            client = self.graphiti._require_client()
-            result = await client.driver.execute_query(
-                'MATCH (n) RETURN count(n) as count'
-            )
-            records = result[0] if result else []
-            node_count = records[0]['count'] if records else 0
-            status['graphiti'] = {'connected': True, 'node_count': node_count}
+            graphs = await self.graphiti.list_graphs()
+            for graph_name in graphs:
+                try:
+                    graphiti_counts[graph_name] = await self.graphiti.node_count(graph_name)
+                except Exception:
+                    graphiti_counts[graph_name] = -1
+            status['graphiti'] = {'connected': True}
         except Exception as e:
             status['graphiti'] = {'connected': False, 'error': str(e)}
 
-        # Mem0 health
+        # Mem0 connectivity + project discovery
+        mem0_counts: dict[str, int] = {}
         try:
-            if project_id:
-                scope = Scope(project_id=project_id)
-                all_mems = await self.mem0.get_all(scope, limit=1)
-                mem_count = len(all_mems.get('results', []))
-                status['mem0'] = {'connected': True, 'memory_count': mem_count}
-            else:
-                status['mem0'] = {'connected': True, 'memory_count': 'unknown (no project_id)'}
+            mem0_projects = self.mem0.list_projects()
+            for pid, _collection_name in mem0_projects:
+                try:
+                    scope = Scope(project_id=pid)
+                    mem0_counts[pid] = await self.mem0.count(scope)
+                except Exception:
+                    mem0_counts[pid] = -1
+            status['mem0'] = {'connected': True}
         except Exception as e:
             status['mem0'] = {'connected': False, 'error': str(e)}
 
-        # Queue stats
+        # Merge into per-project dict
+        all_project_ids = sorted(set(graphiti_counts) | set(mem0_counts))
+        if project_id:
+            all_project_ids = [p for p in all_project_ids if p == project_id]
+        projects: dict[str, dict] = {}
+        for pid in all_project_ids:
+            projects[pid] = {
+                'graphiti_nodes': graphiti_counts.get(pid, 0),
+                'mem0_memories': mem0_counts.get(pid, 0),
+            }
+        status['projects'] = projects
+
+        # Queue stats (unchanged)
         if self.durable_queue:
             try:
                 status['queue'] = await self.durable_queue.get_stats()
             except Exception as e:
                 status['queue'] = {'error': str(e)}
 
-        # Taskmaster status
+        # Taskmaster status (unchanged)
         status['taskmaster'] = {'connected': self.taskmaster_connected}
 
         return status
