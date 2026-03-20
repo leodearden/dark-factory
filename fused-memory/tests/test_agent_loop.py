@@ -652,6 +652,132 @@ async def test_openai_message_conversion():
     assert tool_result_msg['content'] == '{"ok": true}'
 
 
+@pytest.mark.asyncio
+async def test_openai_round_trip_two_turns():
+    """Full AgentLoop round-trip with OpenAI provider: tool call then terminal.
+
+    Verifies:
+    - Agent executes the tool function on first response
+    - Tool results are sent back in OpenAI tool format on second call
+    - Terminal result is returned correctly
+    - llm_call_count and token_count are updated
+    """
+    config = _make_config(agent_llm_provider='openai', agent_llm_model='gpt-4o')
+
+    executed_calls = []
+
+    async def my_tool(value: int = 0):
+        executed_calls.append(value)
+        return {'doubled': value * 2}
+
+    tools = {
+        'my_tool': ToolDefinition(
+            name='my_tool',
+            description='Doubles a number',
+            parameters={
+                'type': 'object',
+                'properties': {'value': {'type': 'integer'}},
+                'required': ['value'],
+            },
+            function=my_tool,
+        ),
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete',
+            parameters={'type': 'object', 'properties': {'report': {'type': 'object'}}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='You are a round-trip test agent.',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+
+    call_count = 0
+    second_call_messages = None
+
+    async def fake_create(**kwargs):
+        nonlocal call_count, second_call_messages
+        call_count += 1
+        if call_count == 1:
+            # First call: request my_tool
+            return FakeOpenAIResponse(
+                choices=[
+                    FakeOpenAIChoice(
+                        message=FakeOpenAIMessage(
+                            content=None,
+                            tool_calls=[
+                                FakeOpenAIToolCall(
+                                    id='call_tool_1',
+                                    type='function',
+                                    function=FakeOpenAIFunction(
+                                        name='my_tool',
+                                        arguments='{"value": 7}',
+                                    ),
+                                )
+                            ],
+                        )
+                    )
+                ],
+                usage=FakeOpenAIUsage(total_tokens=80),
+            )
+        else:
+            # Second call: terminal
+            second_call_messages = list(kwargs['messages'])
+            return FakeOpenAIResponse(
+                choices=[
+                    FakeOpenAIChoice(
+                        message=FakeOpenAIMessage(
+                            content=None,
+                            tool_calls=[
+                                FakeOpenAIToolCall(
+                                    id='call_terminal',
+                                    type='function',
+                                    function=FakeOpenAIFunction(
+                                        name='stage_complete',
+                                        arguments='{"report": {"doubled": 14}}',
+                                    ),
+                                )
+                            ],
+                        )
+                    )
+                ],
+                usage=FakeOpenAIUsage(total_tokens=60),
+            )
+
+    mock_completions = MagicMock()
+    mock_completions.create = fake_create
+    mock_chat = MagicMock()
+    mock_chat.completions = mock_completions
+    mock_client = MagicMock()
+    mock_client.chat = mock_chat
+
+    with patch('openai.AsyncOpenAI', return_value=mock_client):
+        result, entries = await agent.run('run the test')
+
+    # Agent returned terminal tool input
+    assert result == {'report': {'doubled': 14}}
+    assert len(entries) == 0  # my_tool is not a mutation
+
+    # Tool was actually executed
+    assert executed_calls == [7]
+
+    # LLM was called twice
+    assert agent.llm_call_count == 2
+    assert agent.token_count == 80 + 60
+
+    # Second call messages include a 'tool' role message with tool results
+    assert second_call_messages is not None
+    tool_result_msgs = [m for m in second_call_messages if m.get('role') == 'tool']
+    assert len(tool_result_msgs) == 1
+    assert tool_result_msgs[0]['tool_call_id'] == 'call_tool_1'
+    result_content = json.loads(tool_result_msgs[0]['content'])
+    assert result_content['doubled'] == 14
+
+
 # --- Claude CLI provider tests ---
 
 
