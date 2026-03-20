@@ -11,7 +11,7 @@
     "orchestrator/src/orchestrator",
     "orchestrator/tests"
   ],
-  "analysis": "The problem: when duplicate workflows run for the same task (a bug mitigated by task 42's _dispatched guard), a second architect overwrites plan.json in the same worktree, causing step ID mismatches for the implementer. This task adds defense-in-depth at the artifact layer.\n\nCurrent state:\n- TaskArtifacts.write_plan() writes plan.json with no concurrency protection\n- The architect agent writes plan.json directly to disk (not via TaskArtifacts.write_plan())\n- The workflow reads plan.json back via self.artifacts.read_plan()\n- update_step_status() has no ownership validation\n\nApproach: Two complementary mechanisms:\n1. Lock file (.task/plan.lock) — atomic exclusive creation prevents concurrent overwrites. The workflow acquires the lock after the architect writes plan.json. Subsequent architect invocations check for the lock and skip.\n2. Provenance header (_session_id, _created_at) — stamped into plan.json by the workflow. The execute phase validates that the plan's session_id matches the workflow's session_id before proceeding. Mismatch triggers escalation.\n\nKey insight: The architect agent doesn't know about locks — the workflow layer manages the lock lifecycle. The provenance is stamped by the workflow AFTER reading the architect's output, and re-stamped after re-planning.",
+  "analysis": "The problem: when duplicate workflows run for the same task (a bug mitigated by task 42's _dispatched guard), a second architect overwrites plan.json in the same worktree, causing step ID mismatches for the implementer. This task adds defense-in-depth at the artifact layer.\n\nCurrent state:\n- TaskArtifacts.write_plan() writes plan.json with no concurrency protection\n- The architect agent writes plan.json directly to disk (not via TaskArtifacts.write_plan())\n- The workflow reads plan.json back via self.artifacts.read_plan()\n- update_step_status() has no ownership validation\n\nApproach: Two complementary mechanisms:\n1. Lock file (.task/plan.lock) — atomic exclusive creation prevents concurrent overwrites. The workflow acquires the lock after the architect writes plan.json. Subsequent architect invocations check for the lock and skip.\n2. Provenance header (_session_id, _created_at) — stamped into plan.json by the workflow. The execute phase validates that the plan's session_id matches the workflow's session_id before proceeding. Mismatch triggers escalation.\n\nKey insight: The architect agent doesn't know about locks — the workflow layer manages the lock lifecycle. The provenance is stamped by the workflow AFTER reading the architect's output, and re-stamped after re-planning.\n\nReview fixes (steps 11-16): Three blocking issues found in review:\n1. race_condition_logic_inversion: _plan() re-stamps provenance and returns DONE when lock is held — the second workflow hijacks ownership from the first. Fix: return REQUEUED without re-stamping.\n2. uncaught_exception_in_hot_path: validate_plan_owner() propagates JSONDecodeError/OSError from corrupt plan.json, causing generic BLOCKED instead of informative ownership-mismatch escalation. Fix: catch exceptions, return False.\n3. data_loss_on_missing_plan: stamp_plan_provenance() silently creates a provenance-only stub if plan.json is missing/empty, which passes the bool() check and causes silent downstream failures. Fix: require plan to have 'steps' before stamping.",
   "prerequisites": [],
   "steps": [
     {
@@ -83,6 +83,48 @@
       "description": "Add provenance validation at the start of _execute_iterations(): before each implementer invocation, call validate_plan_owner(self.session_id). If mismatch, log error, create escalation, and return WorkflowOutcome.BLOCKED.",
       "status": "done",
       "commit": "fca6680"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write failing tests for review fix #1 (race_condition_logic_inversion). In test_workflow_e2e.py: test_duplicate_workflow_returns_requeued_when_plan_locked — pre-create plan.json (with valid steps and a DIFFERENT session's _session_id) and plan.lock, run _plan(), assert it returns WorkflowOutcome.REQUEUED (not DONE). Also test_duplicate_workflow_does_not_restamp_provenance — verify plan.json's _session_id is unchanged after the second workflow's _plan() returns (the original owner's session_id is preserved). Update the existing test_plan_phase_skips_architect_when_plan_locked to expect REQUEUED instead of DONE if it currently asserts DONE.",
+      "status": "done",
+      "commit": "c5cf86f"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Fix the duplicate-workflow guard in _plan() (workflow.py ~line 344-357). Remove the stamp_plan_provenance() call and the plan read. Change the return from WorkflowOutcome.DONE to WorkflowOutcome.REQUEUED. The locked path should simply: log that plan.lock is held by another session, then return REQUEUED so run() exits early and the original lock-holder retains ownership.",
+      "status": "done",
+      "commit": "fcd7c6b"
+    },
+    {
+      "id": "step-13",
+      "type": "test",
+      "description": "Write failing tests for review fix #2 (uncaught_exception_in_hot_path). In test_artifacts.py: test_validate_plan_owner_returns_false_on_corrupt_plan_json — write garbage (non-JSON) to plan.json, call validate_plan_owner(), assert it returns False (not raises). test_validate_plan_owner_returns_false_on_unreadable_plan — make plan.json unreadable (chmod 000), call validate_plan_owner(), assert it returns False. Both tests verify the method logs a warning.",
+      "status": "done",
+      "commit": "3cd0fde"
+    },
+    {
+      "id": "step-14",
+      "type": "impl",
+      "description": "Fix validate_plan_owner() in artifacts.py. Wrap the body in try/except Exception: on any error (JSONDecodeError, OSError, etc.), log a warning with the exception details and return False. This ensures corrupt or unreadable plan.json triggers the ownership-mismatch escalation path rather than a generic BLOCKED error.",
+      "status": "done",
+      "commit": "5ee9c76"
+    },
+    {
+      "id": "step-15",
+      "type": "test",
+      "description": "Write failing tests for review fix #3 (data_loss_on_missing_plan). In test_artifacts.py: test_stamp_plan_provenance_raises_on_missing_plan — call stamp_plan_provenance() when plan.json does not exist, assert ValueError is raised with message about missing valid plan. test_stamp_plan_provenance_raises_on_empty_plan — write plan.json with {} (no steps), call stamp_plan_provenance(), assert ValueError. test_stamp_plan_provenance_raises_on_provenance_only_stub — write plan.json with only _session_id/_created_at (no steps key), assert ValueError. Existing test_stamp_plan_provenance_adds_session_id_and_created_at must be updated to pre-populate plan.json with a valid plan containing a 'steps' list.",
+      "status": "done",
+      "commit": "e4d9b8f"
+    },
+    {
+      "id": "step-16",
+      "type": "impl",
+      "description": "Fix stamp_plan_provenance() in artifacts.py. After reading the plan, assert it is non-trivially populated before stamping: if not plan.get('steps'), raise ValueError('stamp_plan_provenance called before plan.json contains a valid plan'). This makes the failure loud rather than silently overwriting with a provenance-only stub.",
+      "status": "done",
+      "commit": "c7f7c5f"
     }
   ],
   "design_decisions": [
@@ -107,8 +149,16 @@
       "rationale": "The architect writes plan.json directly during re-planning, which may overwrite provenance fields. Re-stamping after ensures ownership is maintained throughout the workflow lifecycle."
     },
     {
-      "decision": "Skip architect when plan is locked (not error)",
-      "rationale": "Defense-in-depth scenario: if a duplicate workflow gets past the _dispatched guard, the second architect should silently reuse the existing plan rather than failing. The first workflow's implementer is already running against that plan."
+      "decision": "Duplicate workflow returns REQUEUED, not DONE (review fix #1)",
+      "rationale": "DONE falls through run()'s short-circuit checks (which only exit on REQUEUED and BLOCKED), causing the second workflow to enter the execute loop. REQUEUED causes run() to exit immediately, preserving the original lock-holder's ownership. The second workflow must NOT re-stamp provenance — doing so overwrites the first workflow's session_id, causing its validate_plan_owner checks to fail."
+    },
+    {
+      "decision": "validate_plan_owner returns False on read errors instead of propagating exceptions (review fix #2)",
+      "rationale": "This method is called in a hot path before every implementer iteration. If plan.json becomes corrupt (concurrent write truncation, disk error), an uncaught exception would surface as a generic BLOCKED status instead of the informative ownership-mismatch escalation. Returning False triggers the escalation path which provides diagnostic context."
+    },
+    {
+      "decision": "stamp_plan_provenance raises ValueError if plan has no steps (review fix #3)",
+      "rationale": "read_plan() returns {} if plan.json doesn't exist. Stamping provenance on an empty dict creates a stub that passes bool() checks (since it now has _session_id and _created_at keys) but has no actual plan content. Raising loudly prevents silent data loss and makes the caller aware of the sequencing violation."
     }
   ],
   "reuse": [
