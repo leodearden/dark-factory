@@ -208,8 +208,8 @@ class TaskArtifacts:
         if not plan.get('steps'):
             raise ValueError(
                 'stamp_plan_provenance called before plan.json contains a valid plan '
-                f'(missing or empty steps). '
-                f'Ensure the architect has written a complete plan before stamping provenance.'
+                '(missing or empty steps). '
+                'Ensure the architect has written a complete plan before stamping provenance.'
             )
         plan['_session_id'] = session_id
         plan['_created_at'] = datetime.now(UTC).isoformat()

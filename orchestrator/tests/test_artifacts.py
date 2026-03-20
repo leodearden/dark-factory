@@ -269,7 +269,6 @@ class TestPlanProvenance:
         self, artifacts: TaskArtifacts
     ):
         """Unreadable plan.json (chmod 000) must return False, not raise OSError."""
-        import os
         plan_path = artifacts.root / 'plan.json'
         plan_path.write_text('{"_session_id": "session-abc123"}')
         plan_path.chmod(0o000)
