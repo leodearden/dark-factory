@@ -1,0 +1,141 @@
+{
+  "task_id": "49",
+  "title": "Protect plan.json from concurrent overwrites by duplicate workflows",
+  "files": [
+    "orchestrator/src/orchestrator/artifacts.py",
+    "orchestrator/tests/test_artifacts.py",
+    "orchestrator/src/orchestrator/workflow.py",
+    "orchestrator/tests/test_workflow_e2e.py"
+  ],
+  "modules": [
+    "orchestrator/src/orchestrator",
+    "orchestrator/tests"
+  ],
+  "analysis": "The problem: when duplicate workflows run for the same task (a bug mitigated by task 42's _dispatched guard), a second architect overwrites plan.json in the same worktree, causing step ID mismatches for the implementer. This task adds defense-in-depth at the artifact layer.\n\nCurrent state:\n- TaskArtifacts.write_plan() writes plan.json with no concurrency protection\n- The architect agent writes plan.json directly to disk (not via TaskArtifacts.write_plan())\n- The workflow reads plan.json back via self.artifacts.read_plan()\n- update_step_status() has no ownership validation\n\nApproach: Two complementary mechanisms:\n1. Lock file (.task/plan.lock) — atomic exclusive creation prevents concurrent overwrites. The workflow acquires the lock after the architect writes plan.json. Subsequent architect invocations check for the lock and skip.\n2. Provenance header (_session_id, _created_at) — stamped into plan.json by the workflow. The execute phase validates that the plan's session_id matches the workflow's session_id before proceeding. Mismatch triggers escalation.\n\nKey insight: The architect agent doesn't know about locks — the workflow layer manages the lock lifecycle. The provenance is stamped by the workflow AFTER reading the architect's output, and re-stamped after re-planning.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing tests for plan lock file operations in test_artifacts.py: test_is_plan_locked_false_initially, test_lock_plan_creates_file_returns_true, test_is_plan_locked_true_after_lock, test_lock_plan_returns_false_when_already_locked (atomic exclusion), test_read_plan_lock_returns_session_and_timestamp",
+      "status": "done",
+      "commit": "c5f09f8"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Implement lock_plan(session_id), is_plan_locked(), and read_plan_lock() in artifacts.py. lock_plan uses os.open with O_CREAT|O_EXCL for atomic creation, writes JSON with session_id and locked_at timestamp. Returns True if lock acquired, False if already locked. read_plan_lock() returns dict or None.",
+      "status": "done",
+      "commit": "2428bb2"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing tests for plan provenance operations in test_artifacts.py: test_stamp_plan_provenance_adds_session_id_and_created_at, test_stamp_plan_provenance_preserves_existing_plan_data, test_validate_plan_owner_true_for_matching_session, test_validate_plan_owner_false_for_mismatched_session, test_validate_plan_owner_false_when_no_provenance",
+      "status": "done",
+      "commit": "551c91b"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Implement stamp_plan_provenance(session_id) and validate_plan_owner(session_id) in artifacts.py. stamp reads plan.json, adds _session_id and _created_at fields, writes back. validate reads plan.json and compares _session_id. Returns True if match, False otherwise.",
+      "status": "done",
+      "commit": "43f65b7"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing test in test_workflow_e2e.py: test_plan_phase_creates_lock_and_stamps_provenance — verifies that after _plan() completes, plan.lock exists, and plan.json contains _session_id and _created_at fields matching the workflow's session_id. Also verify workflow generates a unique session_id in __init__.",
+      "status": "done",
+      "commit": "8b07aff"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Add session_id generation (uuid4 hex[:8] prefixed with task_id) to TaskWorkflow.__init__. In _plan(), after reading the architect's plan, call artifacts.stamp_plan_provenance(self.session_id) and artifacts.lock_plan(self.session_id). Also stamp provenance after _replan() and when initial_plan is provided.",
+      "status": "done",
+      "commit": "ca177bb"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing test in test_workflow_e2e.py: test_plan_phase_skips_architect_when_plan_locked — pre-create plan.json and plan.lock before running workflow, verify the architect is never invoked, and workflow proceeds using existing plan.",
+      "status": "done",
+      "commit": "9f36072"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Add lock-check guard at the start of _plan(): if is_plan_locked() and plan.json exists, read existing plan and skip architect invocation. Log that planning was skipped due to existing lock.",
+      "status": "done",
+      "commit": "287fe36"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write failing test in test_workflow_e2e.py: test_execute_detects_plan_overwrite_and_blocks — simulate plan overwrite by having the implementer stub overwrite plan.json with a different _session_id mid-execution. Verify workflow returns BLOCKED and creates an escalation with category 'infra_issue' mentioning plan overwrite.",
+      "status": "done",
+      "commit": "a9c7982"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Add provenance validation at the start of _execute_iterations(): before each implementer invocation, call validate_plan_owner(self.session_id). If mismatch, log error, create escalation, and return WorkflowOutcome.BLOCKED.",
+      "status": "done",
+      "commit": "fca6680"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use os.open with O_CREAT|O_EXCL for atomic lock file creation",
+      "rationale": "This is the standard POSIX mechanism for atomic file creation — it fails if the file already exists, preventing TOCTOU races between concurrent workflows checking and creating the lock."
+    },
+    {
+      "decision": "Lock and provenance managed by workflow layer, not architect agent",
+      "rationale": "The architect is a Claude agent that writes plan.json via the Write tool — it has no knowledge of the lock protocol. The workflow orchestrates the lifecycle: invoke architect → read plan → stamp provenance → acquire lock."
+    },
+    {
+      "decision": "Session ID format: {task_id}-{uuid4_hex[:8]}",
+      "rationale": "Unique per workflow invocation (uuid ensures no collisions), includes task_id for human debugging. Short enough to be readable in logs and plan.json."
+    },
+    {
+      "decision": "Provenance validation is soft (escalate + block) not hard (raise exception)",
+      "rationale": "Matching the existing escalation pattern used throughout workflow.py. This allows the orchestrator to surface the issue for human resolution rather than crashing."
+    },
+    {
+      "decision": "Re-stamp provenance after _replan() calls",
+      "rationale": "The architect writes plan.json directly during re-planning, which may overwrite provenance fields. Re-stamping after ensures ownership is maintained throughout the workflow lifecycle."
+    },
+    {
+      "decision": "Skip architect when plan is locked (not error)",
+      "rationale": "Defense-in-depth scenario: if a duplicate workflow gets past the _dispatched guard, the second architect should silently reuse the existing plan rather than failing. The first workflow's implementer is already running against that plan."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "TaskArtifacts class and _write_json helper",
+      "where": "orchestrator/src/orchestrator/artifacts.py",
+      "how": "Extend with new lock/provenance methods following the existing pattern of reading/writing JSON to .task/ subdirectory"
+    },
+    {
+      "what": "AgentStub, FakeScheduler, FakeBriefing, FakeMcp test infrastructure",
+      "where": "orchestrator/tests/test_workflow_e2e.py",
+      "how": "Reuse existing test doubles for workflow integration tests — extend AgentStub for plan overwrite simulation"
+    },
+    {
+      "what": "Escalation pattern (_mark_blocked, _escalate_corruption)",
+      "where": "orchestrator/src/orchestrator/workflow.py",
+      "how": "Follow the same escalation pattern for plan overwrite detection — create Escalation with appropriate category and severity"
+    },
+    {
+      "what": "worktree fixture and _init_repo helper",
+      "where": "orchestrator/tests/test_workflow_e2e.py and test_artifacts.py",
+      "how": "Reuse existing test fixtures for creating temporary worktrees with git repos"
+    },
+    {
+      "what": "uuid4 for session IDs",
+      "where": "Python stdlib uuid module",
+      "how": "Generate unique session identifiers — same approach used in escalation ID generation"
+    }
+  ]
+}
