@@ -10,6 +10,39 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 logger = logging.getLogger(__name__)
 
 
+def _scope_command(cmd: str | None, tool_keyword: str, files: list[str]) -> str | None:
+    """Narrow *cmd* to operate on *files* instead of whole directories.
+
+    Finds *tool_keyword* in *cmd*, keeps everything up to and including it as
+    the prefix, extracts any dash-prefixed flags from the remainder, and
+    rebuilds the command as ``'{prefix} {files} {flags}'``.
+
+    Returns:
+        ``None`` when *cmd* is ``None`` or *files* is empty.
+        The original *cmd* unchanged when *tool_keyword* is not found.
+        The scoped command otherwise.
+    """
+    if cmd is None:
+        return None
+    if not files:
+        return None
+
+    idx = cmd.find(tool_keyword)
+    if idx == -1:
+        return cmd
+
+    prefix = cmd[: idx + len(tool_keyword)]
+    remainder = cmd[idx + len(tool_keyword):]
+
+    # Preserve any dash-prefixed flags from the original remainder
+    flags = [tok for tok in remainder.split() if tok.startswith('-')]
+
+    parts = [prefix] + files
+    if flags:
+        parts += flags
+    return ' '.join(parts)
+
+
 @dataclass
 class VerifyResult:
     passed: bool
