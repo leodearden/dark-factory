@@ -12,6 +12,7 @@ from fused_memory.reconciliation.agent_loop import (
     CircuitBreakerError,
     ToolDefinition,
     _CLIResponseAdapter,
+    _OpenAIResponseAdapter,
 )
 
 
@@ -53,6 +54,50 @@ class FakeUsage:
 class FakeResponse:
     content: list = field(default_factory=list)
     usage: FakeUsage = field(default_factory=FakeUsage)
+
+
+# --- Fake OpenAI SDK response dataclasses ---
+
+
+@dataclass
+class FakeOpenAIFunction:
+    """Fake function object nested inside a tool call."""
+    name: str
+    arguments: str  # JSON string
+
+
+@dataclass
+class FakeOpenAIToolCall:
+    """Fake tool_call object on an OpenAI message."""
+    id: str
+    type: str
+    function: FakeOpenAIFunction
+
+
+@dataclass
+class FakeOpenAIMessage:
+    """Fake message object from OpenAI chat completion choice."""
+    content: str | None
+    tool_calls: list | None = None
+
+
+@dataclass
+class FakeOpenAIChoice:
+    """Fake single choice in an OpenAI response."""
+    message: FakeOpenAIMessage
+
+
+@dataclass
+class FakeOpenAIUsage:
+    """Fake usage stats for OpenAI response."""
+    total_tokens: int = 150
+
+
+@dataclass
+class FakeOpenAIResponse:
+    """Fake OpenAI chat completion response."""
+    choices: list = field(default_factory=list)
+    usage: FakeOpenAIUsage = field(default_factory=FakeOpenAIUsage)
 
 
 @pytest.mark.asyncio
