@@ -451,6 +451,103 @@ def test_openai_adapter_tool_arguments_json_parsed():
     assert block.input['nested'] == {'key': 'value'}
 
 
+# --- OpenAI provider _call_openai tests ---
+
+
+@pytest.mark.asyncio
+async def test_openai_tool_schema_conversion():
+    """_call_openai converts Anthropic tool schemas (input_schema) to OpenAI format (parameters)."""
+    config = _make_config(agent_llm_provider='openai', agent_llm_model='gpt-4o')
+
+    async def noop(**kwargs):
+        return {'ok': True}
+
+    tools = {
+        'search_memory': ToolDefinition(
+            name='search_memory',
+            description='Search memories by query',
+            parameters={
+                'type': 'object',
+                'properties': {'query': {'type': 'string'}, 'limit': {'type': 'integer'}},
+                'required': ['query'],
+            },
+            function=noop,
+        ),
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete the stage',
+            parameters={'type': 'object', 'properties': {'report': {'type': 'object'}}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='You are a test agent.',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+
+    # Response triggers immediate terminal result
+    captured = {}
+
+    async def fake_create(**kwargs):
+        captured['messages'] = kwargs['messages']
+        captured['tools'] = kwargs['tools']
+        return FakeOpenAIResponse(
+            choices=[
+                FakeOpenAIChoice(
+                    message=FakeOpenAIMessage(
+                        content=None,
+                        tool_calls=[
+                            FakeOpenAIToolCall(
+                                id='tc1',
+                                type='function',
+                                function=FakeOpenAIFunction(
+                                    name='stage_complete',
+                                    arguments='{"report": {}}',
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=FakeOpenAIUsage(total_tokens=100),
+        )
+
+    mock_completions = MagicMock()
+    mock_completions.create = fake_create
+
+    mock_chat = MagicMock()
+    mock_chat.completions = mock_completions
+
+    mock_client = MagicMock()
+    mock_client.chat = mock_chat
+
+    with patch('openai.AsyncOpenAI', return_value=mock_client):
+        result, entries = await agent.run('initial payload')
+
+    assert result == {'report': {}}
+
+    # Verify OpenAI tool schema format
+    sent_tools = captured['tools']
+    assert len(sent_tools) == 2
+    by_name = {t['function']['name']: t for t in sent_tools}
+
+    # Anthropic input_schema → OpenAI parameters
+    search_tool = by_name['search_memory']
+    assert search_tool['type'] == 'function'
+    assert 'parameters' in search_tool['function']
+    assert 'input_schema' not in search_tool['function']
+    assert search_tool['function']['parameters']['properties']['query']['type'] == 'string'
+    assert search_tool['function']['description'] == 'Search memories by query'
+
+    # System prompt is first message with role='system'
+    sent_messages = captured['messages']
+    assert sent_messages[0]['role'] == 'system'
+    assert sent_messages[0]['content'] == 'You are a test agent.'
+
+
 # --- Claude CLI provider tests ---
 
 
