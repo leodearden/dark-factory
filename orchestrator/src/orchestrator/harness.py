@@ -123,7 +123,11 @@ class Harness:
 
             # 2. Parse PRD into tasks
             logger.info(f'Parsing PRD: {prd_path}')
+            pre_ids = {str(t.get('id', '')) for t in await self.scheduler.get_tasks()}
             await self._populate_tasks(prd_path)
+
+            # 2a. Tag newly-created tasks with PRD source
+            await self._tag_prd_metadata(prd_path, pre_ids)
 
             # 2b. Tag tasks with code modules for concurrency locking
             logger.info('Tagging tasks with code modules...')
@@ -229,6 +233,28 @@ class Harness:
             logger.info(f'PRD parsed: {text[:200]}')
         except Exception as e:
             raise RuntimeError(f'Failed to parse PRD: {e}') from e
+
+    async def _tag_prd_metadata(self, prd_path: Path, pre_parse_ids: set[str]) -> None:
+        """Tag tasks with the PRD they were created from."""
+        resolved_prd = str(prd_path.resolve())
+        tasks = await self.scheduler.get_tasks()
+        new_ids = {str(t.get('id', '')) for t in tasks} - pre_parse_ids
+
+        tagged = 0
+        for t in tasks:
+            tid = str(t.get('id', ''))
+            if not tid:
+                continue
+            metadata = t.get('metadata') or {}
+            if metadata.get('prd'):
+                continue  # already tagged
+            if new_ids and tid not in new_ids:
+                continue  # existed before parse_prd
+            await self.scheduler.update_task(tid, {'prd': resolved_prd})
+            tagged += 1
+
+        if tagged:
+            logger.info(f'Tagged {tagged} tasks with PRD: {resolved_prd}')
 
     async def _tag_task_modules(self) -> None:
         """Invoke a Claude agent to tag each task with the code modules it touches.

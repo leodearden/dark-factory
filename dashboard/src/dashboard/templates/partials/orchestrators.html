@@ -7,7 +7,7 @@
 
   {% if orchestrators %}
     {% for orch in orchestrators %}
-      <div x-data="{ open: false }" class="bg-gray-800 rounded-lg p-6 mb-4">
+      <div x-data="{ open: false }" id="orch-{{ orch.prd | replace('/', '-') | replace('.', '-') }}" class="bg-gray-800 rounded-lg p-6 mb-4">
         <div class="flex items-center gap-3">
           {% if orch.pids|length > 1 %}<span class="text-gray-100 font-semibold">PIDs {{ orch.pids|join(", ") }}</span>{% else %}<span class="text-gray-100 font-semibold">PID {{ orch.pids[0] }}</span>{% endif %}
           {{ status_badge('running' if orch.running else 'completed', aria_label='Orchestrator status', color='bg-green-600' if orch.running else 'bg-gray-600') }}

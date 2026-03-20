@@ -20,6 +20,36 @@ from dashboard.config import DashboardConfig
 logger = logging.getLogger(__name__)
 
 
+def _resolve_project_root(prd: str, default_root: Path) -> Path:
+    """Find the project root for an orchestrator by walking up from its PRD path.
+
+    Looks for a ``.taskmaster/`` directory starting from the PRD's parent.
+    Falls back to *default_root* (the dashboard's own project root) if no
+    ``.taskmaster/`` is found or the PRD path is relative.
+    """
+    p = Path(prd)
+    if not p.is_absolute():
+        p = default_root / p
+    p = p.resolve()
+
+    for ancestor in p.parents:
+        if (ancestor / '.taskmaster').is_dir():
+            return ancestor
+    return default_root
+
+
+def _scan_worktrees(worktrees_dir: Path) -> dict[str, dict]:
+    """Scan a .worktrees/ directory and return {task_id: artifact_data}."""
+    worktrees: dict[str, dict] = {}
+    if worktrees_dir.is_dir():
+        for subdir in sorted(worktrees_dir.iterdir()):
+            if subdir.is_dir():
+                task_id = _extract_task_id(subdir.name)
+                if task_id is not None:
+                    worktrees[task_id] = read_task_artifacts(subdir)
+    return worktrees
+
+
 def _extract_task_id(dirname: str) -> str | None:
     """Normalise a worktree directory name to a numeric task ID string.
 
@@ -225,35 +255,36 @@ def discover_orchestrators(config: DashboardConfig) -> list[dict]:
     if not processes:
         return []
 
-    tasks = load_task_tree(config.tasks_json)
-
-    # Scan worktrees
-    worktrees: dict[str, dict] = {}
-    worktrees_dir = config.worktrees_dir
-    if worktrees_dir.is_dir():
-        for subdir in sorted(worktrees_dir.iterdir()):
-            if subdir.is_dir():
-                task_id = _extract_task_id(subdir.name)
-                if task_id is not None:
-                    worktrees[task_id] = read_task_artifacts(subdir)
-
-    # Compute summary stats from task tree
-    summary = {
-        'total': len(tasks),
-        'done': sum(1 for t in tasks if t.get('status') == 'done'),
-        'in_progress': sum(1 for t in tasks if t.get('status') == 'in-progress'),
-        'blocked': sum(1 for t in tasks if t.get('status') == 'blocked'),
-        'pending': sum(1 for t in tasks if t.get('status') == 'pending'),
-    }
-
     # Group processes by PRD path — multiple PIDs targeting the same PRD
     # are merged into a single entry with a 'pids' list.
     groups: dict[str, list[dict]] = {}
     for proc in processes:
         groups.setdefault(proc['prd'], []).append(proc)
 
+    # Cache per-project data so we don't re-read the same tasks.json
+    # when multiple PRDs share a project root.
+    project_cache: dict[Path, tuple[list[dict], dict[str, dict]]] = {}
+
     result: list[dict] = []
     for prd, group in groups.items():
+        project_root = _resolve_project_root(prd, config.project_root)
+
+        if project_root not in project_cache:
+            tasks_json = project_root / '.taskmaster' / 'tasks' / 'tasks.json'
+            worktrees_dir = project_root / '.worktrees'
+            project_cache[project_root] = (
+                load_task_tree(tasks_json),
+                _scan_worktrees(worktrees_dir),
+            )
+
+        tasks, worktrees = project_cache[project_root]
+        summary = {
+            'total': len(tasks),
+            'done': sum(1 for t in tasks if t.get('status') == 'done'),
+            'in_progress': sum(1 for t in tasks if t.get('status') == 'in-progress'),
+            'blocked': sum(1 for t in tasks if t.get('status') == 'blocked'),
+            'pending': sum(1 for t in tasks if t.get('status') == 'pending'),
+        }
         result.append({
             'pids': [p['pid'] for p in group],
             'prd': prd,

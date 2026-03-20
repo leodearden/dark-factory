@@ -11,73 +11,91 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-18T06:54:14.059Z"
+        "updatedAt": "2026-03-18T06:54:14.059Z",
+        "metadata": {
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 12,
         "title": "Bug: Verify step fails with `source: not found` on dash-based systems",
-        "description": "verify.py uses asyncio.create_subprocess_shell() which invokes /bin/sh. On systems where /bin/sh is dash (e.g. Ubuntu), the `source` builtin doesn't exist — only `.` works. Verification commands like `source ~/.cargo/env && cargo test` fail with `/bin/sh: 1: source: not found`, causing tasks to exhaust verify attempts and block even when the code is correct.",
+        "description": "verify.py uses asyncio.create_subprocess_shell() which invokes /bin/sh. On systems where /bin/sh is dash (e.g. Ubuntu), the `source` builtin doesn't exist \u2014 only `.` works. Verification commands like `source ~/.cargo/env && cargo test` fail with `/bin/sh: 1: source: not found`, causing tasks to exhaust verify attempts and block even when the code is correct.",
         "details": "Fix options: (1) Use `. ` instead of `source` in config commands (user-side workaround, already applied to reify config). (2) Pass executable='/bin/bash' to create_subprocess_shell in verify.py. (3) Document that verify commands must be POSIX-compatible. Option 2 is the proper fix since it doesn't burden config authors with shell compatibility knowledge.",
         "testStrategy": "",
         "status": "done",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-18T06:54:14.060Z"
+        "updatedAt": "2026-03-18T06:54:14.060Z",
+        "metadata": {
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 13,
         "title": "Bug: Reviewers receive empty diff, rubber-stamp PASS",
-        "description": "During the review stage, `git diff main...HEAD` sometimes returns an empty diff. All 5 reviewers then report \"PASS — empty diff, no issues\" which defeats the purpose of review. Observed on task 4 (reify-geometry) during reify M1 run.",
+        "description": "During the review stage, `git diff main...HEAD` sometimes returns an empty diff. All 5 reviewers then report \"PASS \u2014 empty diff, no issues\" which defeats the purpose of review. Observed on task 4 (reify-geometry) during reify M1 run.",
         "details": "Likely cause: the merge-base calculation `main...HEAD` returns nothing when the worktree branch has already been fast-forwarded or when main has moved. The review happens after verification passes, but if the worktree was rebased or the diff reference is stale, the diff is empty. Fix: compute the diff at worktree creation time (store the base commit in .task/metadata.json) and use that as the diff base, e.g. `git diff <base-sha>...HEAD`.",
         "testStrategy": "",
         "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-18T06:54:14.070Z"
+        "updatedAt": "2026-03-18T06:54:14.070Z",
+        "metadata": {
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 14,
         "title": "Bug: git add -A in worktrees commits .task/ artifacts",
         "description": "The orchestrator's git_ops.commit() runs `git add -A` which stages .task/plan.json, .task/iterations.jsonl, and .task/reviews/*.json. These internal orchestrator artifacts get committed to the task branch and merged to main. Workaround: add `.task/` to project .gitignore. Proper fix: exclude .task/ in git_ops.commit() or use a more targeted staging approach.",
-        "details": "In git_ops.py line 61: `await _run(['git', 'add', '-A'], cwd=worktree)`. Fix options: (1) Add .task/ to a .gitignore that's created in the worktree during TaskArtifacts.init(). (2) Change git add -A to explicit file staging. (3) Run `git reset HEAD .task/` after `git add -A`. Option 1 is simplest — have artifacts.init() write a .task/.gitignore containing `*`.",
+        "details": "In git_ops.py line 61: `await _run(['git', 'add', '-A'], cwd=worktree)`. Fix options: (1) Add .task/ to a .gitignore that's created in the worktree during TaskArtifacts.init(). (2) Change git add -A to explicit file staging. (3) Run `git reset HEAD .task/` after `git add -A`. Option 1 is simplest \u2014 have artifacts.init() write a .task/.gitignore containing `*`.",
         "testStrategy": "",
         "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-18T06:54:14.073Z"
+        "updatedAt": "2026-03-18T06:54:14.073Z",
+        "metadata": {
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 15,
         "title": "Bug: Fused-memory task tools missing from Claude Code due to config path",
         "description": "When Claude Code connects to fused-memory via stdio, the default config (fused-memory/config/config.yaml) resolves the Taskmaster path as ./taskmaster-ai relative to the fused-memory directory, but taskmaster-ai lives at dark-factory/taskmaster-ai. Taskmaster init silently fails, causing all 11 task proxy tools to not be registered. The server logs a warning but the client has no way to know task tools are absent vs nonexistent.",
-        "details": "The fix has two parts: (1) Project .mcp.json files should set CONFIG_PATH to a project-specific config with absolute Taskmaster paths, or set TASKMASTER_DIR env var. (2) The server should surface Taskmaster connection status to clients — e.g. include `taskmaster_connected: false` in get_status output, or mention it in the server instructions/capabilities so clients can detect the gap. Currently the failure is completely silent from the client's perspective.",
+        "details": "The fix has two parts: (1) Project .mcp.json files should set CONFIG_PATH to a project-specific config with absolute Taskmaster paths, or set TASKMASTER_DIR env var. (2) The server should surface Taskmaster connection status to clients \u2014 e.g. include `taskmaster_connected: false` in get_status output, or mention it in the server instructions/capabilities so clients can detect the gap. Currently the failure is completely silent from the client's perspective.",
         "testStrategy": "",
         "status": "done",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-18T06:54:14.075Z"
+        "updatedAt": "2026-03-18T06:54:14.075Z",
+        "metadata": {
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 16,
         "title": "Project scaffold, config, and app skeleton",
         "description": "Create the dashboard project structure under dashboard/ with all foundational files needed by subsequent tasks.",
-        "details": "Create the following files:\n\n1. `dashboard/pyproject.toml` — hatchling build, dependencies: fastapi>=0.115, uvicorn[standard]>=0.34, jinja2>=3.1, httpx>=0.28, aiosqlite>=0.21. Dev extras: pytest>=8, pytest-asyncio>=0.25, httpx.\n\n2. `dashboard/src/dashboard/__init__.py` — empty.\n\n3. `dashboard/src/dashboard/config.py` — DashboardConfig dataclass with fields: host=\"127.0.0.1\", port=8080, project_root=Path(\"/home/leo/src/dark-factory\"), fused_memory_url=\"http://localhost:8000\", fused_memory_project_id=\"dark_factory\". Properties for derived paths: reconciliation_db (project_root/\"fused-memory\"/\"data\"/\"reconciliation\"/\"reconciliation.db\"), write_queue_db (project_root/\"fused-memory\"/\"data\"/\"queue\"/\"write_queue.db\"), tasks_json (project_root/\".taskmaster\"/\"tasks\"/\"tasks.json\"), worktrees_dir (project_root/\".worktrees\"). Support env var overrides prefixed DASHBOARD_ (e.g. DASHBOARD_PORT).\n\n4. `dashboard/src/dashboard/app.py` — FastAPI app with: Jinja2Templates pointing to templates dir, StaticFiles mount at /static, lifespan context manager (creates httpx.AsyncClient stored in app.state), GET /api/health returning {\"status\": \"ok\"}. Do NOT add other routes yet — those come in tasks 5-8.\n\n5. `dashboard/src/dashboard/data/__init__.py` — empty.\n\n6. `dashboard/src/dashboard/templates/base.html` — Jinja2 base template. Dark theme (bg-gray-900, text-gray-100). Head includes: Tailwind CSS CDN (script tag), htmx CDN (script tag), Alpine.js CDN (script tag), link to /static/style.css. Body has a container div with {% block content %}{% endblock %}. Header with \"Dark Factory\" title.\n\n7. `dashboard/src/dashboard/static/style.css` — minimal custom styles if needed beyond Tailwind utilities.\n\n8. `dashboard/tests/__init__.py` — empty.\n\n9. `dashboard/tests/conftest.py` — shared pytest fixtures: a fixture that creates a DashboardConfig with temp paths, a fixture for FastAPI TestClient.\n\nTest strategy: Run `cd dashboard && uv sync && uv run pytest tests/ -x` — verify project installs cleanly and conftest fixtures work. Write a minimal test in conftest or a test_scaffold.py that imports dashboard.config and dashboard.app and asserts the health endpoint returns 200.",
+        "details": "Create the following files:\n\n1. `dashboard/pyproject.toml` \u2014 hatchling build, dependencies: fastapi>=0.115, uvicorn[standard]>=0.34, jinja2>=3.1, httpx>=0.28, aiosqlite>=0.21. Dev extras: pytest>=8, pytest-asyncio>=0.25, httpx.\n\n2. `dashboard/src/dashboard/__init__.py` \u2014 empty.\n\n3. `dashboard/src/dashboard/config.py` \u2014 DashboardConfig dataclass with fields: host=\"127.0.0.1\", port=8080, project_root=Path(\"/home/leo/src/dark-factory\"), fused_memory_url=\"http://localhost:8000\", fused_memory_project_id=\"dark_factory\". Properties for derived paths: reconciliation_db (project_root/\"fused-memory\"/\"data\"/\"reconciliation\"/\"reconciliation.db\"), write_queue_db (project_root/\"fused-memory\"/\"data\"/\"queue\"/\"write_queue.db\"), tasks_json (project_root/\".taskmaster\"/\"tasks\"/\"tasks.json\"), worktrees_dir (project_root/\".worktrees\"). Support env var overrides prefixed DASHBOARD_ (e.g. DASHBOARD_PORT).\n\n4. `dashboard/src/dashboard/app.py` \u2014 FastAPI app with: Jinja2Templates pointing to templates dir, StaticFiles mount at /static, lifespan context manager (creates httpx.AsyncClient stored in app.state), GET /api/health returning {\"status\": \"ok\"}. Do NOT add other routes yet \u2014 those come in tasks 5-8.\n\n5. `dashboard/src/dashboard/data/__init__.py` \u2014 empty.\n\n6. `dashboard/src/dashboard/templates/base.html` \u2014 Jinja2 base template. Dark theme (bg-gray-900, text-gray-100). Head includes: Tailwind CSS CDN (script tag), htmx CDN (script tag), Alpine.js CDN (script tag), link to /static/style.css. Body has a container div with {% block content %}{% endblock %}. Header with \"Dark Factory\" title.\n\n7. `dashboard/src/dashboard/static/style.css` \u2014 minimal custom styles if needed beyond Tailwind utilities.\n\n8. `dashboard/tests/__init__.py` \u2014 empty.\n\n9. `dashboard/tests/conftest.py` \u2014 shared pytest fixtures: a fixture that creates a DashboardConfig with temp paths, a fixture for FastAPI TestClient.\n\nTest strategy: Run `cd dashboard && uv sync && uv run pytest tests/ -x` \u2014 verify project installs cleanly and conftest fixtures work. Write a minimal test in conftest or a test_scaffold.py that imports dashboard.config and dashboard.app and asserts the health endpoint returns 200.",
         "testStrategy": "",
         "status": "done",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-18T07:05:44.066Z"
+        "updatedAt": "2026-03-18T07:05:44.066Z",
+        "metadata": {
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 17,
         "title": "Memory data module",
-        "description": "Create data/memory.py — the data access layer for memory health metrics from the fused-memory MCP HTTP server.",
-        "details": "Create `dashboard/src/dashboard/data/memory.py` with:\n\n1. `async def mcp_tool_call(client: httpx.AsyncClient, base_url: str, tool_name: str, arguments: dict) -> dict` — POST JSON-RPC to `{base_url}/mcp` with body `{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/call\", \"params\": {\"name\": tool_name, \"arguments\": arguments}}`. Parse response: extract `result.content[0].text`, json.loads it, return dict. Timeout: 10s.\n\n2. `async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) -> dict` — call MCP tool `get_status` with `{\"project_id\": config.fused_memory_project_id}`. Returns dict with keys: graphiti (connected, node_count), mem0 (connected, memory_count), queue (counts dict, oldest_pending_age_seconds), taskmaster (connected). On httpx.ConnectError or httpx.TimeoutException, return `{\"offline\": True, \"error\": str(e)}`.\n\n3. `async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) -> dict` — call MCP tool `get_queue_stats` with `{}`. Returns dict with counts (pending, in_flight, retry, completed, dead) and oldest_pending_age_seconds. Same error handling as above.\n\nCreate `dashboard/tests/test_memory.py` with tests:\n- Test successful get_memory_status: mock httpx to return a valid MCP response, verify parsed output matches expected structure.\n- Test successful get_queue_stats: same pattern.\n- Test offline fallback: mock httpx to raise ConnectError, verify returns {\"offline\": True, ...}.\n- Test malformed response: mock httpx to return unexpected JSON, verify graceful handling (returns empty dict or raises clear error).\n\nUse httpx's MockTransport or pytest-httpx for mocking.",
+        "description": "Create data/memory.py \u2014 the data access layer for memory health metrics from the fused-memory MCP HTTP server.",
+        "details": "Create `dashboard/src/dashboard/data/memory.py` with:\n\n1. `async def mcp_tool_call(client: httpx.AsyncClient, base_url: str, tool_name: str, arguments: dict) -> dict` \u2014 POST JSON-RPC to `{base_url}/mcp` with body `{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/call\", \"params\": {\"name\": tool_name, \"arguments\": arguments}}`. Parse response: extract `result.content[0].text`, json.loads it, return dict. Timeout: 10s.\n\n2. `async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) -> dict` \u2014 call MCP tool `get_status` with `{\"project_id\": config.fused_memory_project_id}`. Returns dict with keys: graphiti (connected, node_count), mem0 (connected, memory_count), queue (counts dict, oldest_pending_age_seconds), taskmaster (connected). On httpx.ConnectError or httpx.TimeoutException, return `{\"offline\": True, \"error\": str(e)}`.\n\n3. `async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) -> dict` \u2014 call MCP tool `get_queue_stats` with `{}`. Returns dict with counts (pending, in_flight, retry, completed, dead) and oldest_pending_age_seconds. Same error handling as above.\n\nCreate `dashboard/tests/test_memory.py` with tests:\n- Test successful get_memory_status: mock httpx to return a valid MCP response, verify parsed output matches expected structure.\n- Test successful get_queue_stats: same pattern.\n- Test offline fallback: mock httpx to raise ConnectError, verify returns {\"offline\": True, ...}.\n- Test malformed response: mock httpx to return unexpected JSON, verify graceful handling (returns empty dict or raises clear error).\n\nUse httpx's MockTransport or pytest-httpx for mocking.",
         "testStrategy": "",
         "status": "done",
         "dependencies": [
@@ -85,13 +103,16 @@
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-19T06:58:53.904Z"
+        "updatedAt": "2026-03-19T06:58:53.904Z",
+        "metadata": {
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 18,
         "title": "Reconciliation data module",
-        "description": "Create data/reconciliation.py — async SQLite queries for reconciliation metrics from reconciliation.db (read-only).",
-        "details": "Create `dashboard/src/dashboard/data/reconciliation.py` with:\n\nAll functions open the database read-only: `aiosqlite.connect(f\"file:{db_path}?mode=ro\", uri=True)`.\nAll functions accept a `db_path: Path` parameter and handle FileNotFoundError by returning empty defaults.\n\n1. `async def get_recent_runs(db_path: Path, limit: int = 5) -> list[dict]` — query: `SELECT id, run_type, trigger_reason, started_at, completed_at, events_processed, status FROM runs ORDER BY started_at DESC LIMIT ?`. Return list of dicts. Calculate duration_seconds from completed_at - started_at for each run (both are ISO 8601 strings).\n\n2. `async def get_watermarks(db_path: Path, project_id: str = \"dark_factory\") -> dict` — query: `SELECT * FROM watermarks WHERE project_id = ?`. Return dict with last_full_run_completed, last_episode_timestamp, last_memory_timestamp, last_task_change_timestamp. Return empty dict if no row.\n\n3. `async def get_buffer_stats(db_path: Path) -> dict` — queries: `SELECT COUNT(*) FROM event_buffer WHERE status = 'buffered'` and `SELECT MIN(timestamp) FROM event_buffer WHERE status = 'buffered'`. Return `{\"buffered_count\": int, \"oldest_event_age_seconds\": float|None}`. Calculate age from oldest timestamp vs now.\n\n4. `async def get_burst_state(db_path: Path) -> list[dict]` — query: `SELECT agent_id, state, last_write_at, burst_started_at FROM burst_state`. Return list of dicts.\n\n5. `async def get_latest_verdict(db_path: Path) -> dict | None` — query: `SELECT run_id, severity, action_taken, reviewed_at FROM judge_verdicts ORDER BY reviewed_at DESC LIMIT 1`. Return dict or None.\n\nCreate `dashboard/tests/test_reconciliation.py`:\n- Fixture: create an in-memory SQLite db, execute CREATE TABLE statements matching the reconciliation.db schema (watermarks, runs, event_buffer, burst_state, judge_verdicts tables — see PRD for exact schemas), insert sample rows.\n- Test each query function against the fixture DB.\n- Test missing database file returns empty defaults.\n- Test empty tables return empty lists/dicts/None.\n\nSQLite schemas for the fixture (from the actual codebase):\n- `CREATE TABLE watermarks (project_id TEXT PRIMARY KEY, last_full_run_id TEXT, last_full_run_completed TEXT, last_episode_timestamp TEXT, last_memory_timestamp TEXT, last_task_change_timestamp TEXT)`\n- `CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, run_type TEXT NOT NULL, trigger_reason TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, events_processed INTEGER DEFAULT 0, stage_reports TEXT DEFAULT '{}', status TEXT DEFAULT 'running')`\n- `CREATE TABLE event_buffer (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, event_type TEXT NOT NULL, event_source TEXT NOT NULL, agent_id TEXT, timestamp TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'buffered')`\n- `CREATE TABLE burst_state (agent_id TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'idle', last_write_at TEXT NOT NULL, burst_started_at TEXT)`\n- `CREATE TABLE judge_verdicts (run_id TEXT PRIMARY KEY, reviewed_at TEXT NOT NULL, severity TEXT NOT NULL, findings TEXT DEFAULT '[]', action_taken TEXT DEFAULT 'none')`",
+        "description": "Create data/reconciliation.py \u2014 async SQLite queries for reconciliation metrics from reconciliation.db (read-only).",
+        "details": "Create `dashboard/src/dashboard/data/reconciliation.py` with:\n\nAll functions open the database read-only: `aiosqlite.connect(f\"file:{db_path}?mode=ro\", uri=True)`.\nAll functions accept a `db_path: Path` parameter and handle FileNotFoundError by returning empty defaults.\n\n1. `async def get_recent_runs(db_path: Path, limit: int = 5) -> list[dict]` \u2014 query: `SELECT id, run_type, trigger_reason, started_at, completed_at, events_processed, status FROM runs ORDER BY started_at DESC LIMIT ?`. Return list of dicts. Calculate duration_seconds from completed_at - started_at for each run (both are ISO 8601 strings).\n\n2. `async def get_watermarks(db_path: Path, project_id: str = \"dark_factory\") -> dict` \u2014 query: `SELECT * FROM watermarks WHERE project_id = ?`. Return dict with last_full_run_completed, last_episode_timestamp, last_memory_timestamp, last_task_change_timestamp. Return empty dict if no row.\n\n3. `async def get_buffer_stats(db_path: Path) -> dict` \u2014 queries: `SELECT COUNT(*) FROM event_buffer WHERE status = 'buffered'` and `SELECT MIN(timestamp) FROM event_buffer WHERE status = 'buffered'`. Return `{\"buffered_count\": int, \"oldest_event_age_seconds\": float|None}`. Calculate age from oldest timestamp vs now.\n\n4. `async def get_burst_state(db_path: Path) -> list[dict]` \u2014 query: `SELECT agent_id, state, last_write_at, burst_started_at FROM burst_state`. Return list of dicts.\n\n5. `async def get_latest_verdict(db_path: Path) -> dict | None` \u2014 query: `SELECT run_id, severity, action_taken, reviewed_at FROM judge_verdicts ORDER BY reviewed_at DESC LIMIT 1`. Return dict or None.\n\nCreate `dashboard/tests/test_reconciliation.py`:\n- Fixture: create an in-memory SQLite db, execute CREATE TABLE statements matching the reconciliation.db schema (watermarks, runs, event_buffer, burst_state, judge_verdicts tables \u2014 see PRD for exact schemas), insert sample rows.\n- Test each query function against the fixture DB.\n- Test missing database file returns empty defaults.\n- Test empty tables return empty lists/dicts/None.\n\nSQLite schemas for the fixture (from the actual codebase):\n- `CREATE TABLE watermarks (project_id TEXT PRIMARY KEY, last_full_run_id TEXT, last_full_run_completed TEXT, last_episode_timestamp TEXT, last_memory_timestamp TEXT, last_task_change_timestamp TEXT)`\n- `CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, run_type TEXT NOT NULL, trigger_reason TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, events_processed INTEGER DEFAULT 0, stage_reports TEXT DEFAULT '{}', status TEXT DEFAULT 'running')`\n- `CREATE TABLE event_buffer (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, event_type TEXT NOT NULL, event_source TEXT NOT NULL, agent_id TEXT, timestamp TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'buffered')`\n- `CREATE TABLE burst_state (agent_id TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'idle', last_write_at TEXT NOT NULL, burst_started_at TEXT)`\n- `CREATE TABLE judge_verdicts (run_id TEXT PRIMARY KEY, reviewed_at TEXT NOT NULL, severity TEXT NOT NULL, findings TEXT DEFAULT '[]', action_taken TEXT DEFAULT 'none')`",
         "testStrategy": "",
         "status": "done",
         "dependencies": [
@@ -99,13 +120,16 @@
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-18T13:01:05.460Z"
+        "updatedAt": "2026-03-18T13:01:05.460Z",
+        "metadata": {
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 19,
         "title": "Orchestrator discovery module",
-        "description": "Create data/orchestrator.py — process scanning, task tree parsing, and worktree artifact reading for orchestrator status.",
-        "details": "Create `dashboard/src/dashboard/data/orchestrator.py` with:\n\n1. `def find_running_orchestrators() -> list[dict]` — run `subprocess.run([\"ps\", \"aux\"], capture_output=True, text=True)`. For each line containing \"orchestrator\" and \"--prd\", extract PID (field 1), start time (fields 8-9), and PRD path (regex `--prd\\s+(\\S+)`). Return list of `{\"pid\": int, \"prd\": str, \"running\": True, \"started\": str}`. Filter out the grep/ps process itself.\n\n2. `def load_task_tree(tasks_json_path: Path) -> list[dict]` — read and parse `.taskmaster/tasks/tasks.json`. Extract `data[\"master\"][\"tasks\"]` (or `data[\"tasks\"]` — handle both formats). Return list of task dicts with keys: id, title, status, priority, dependencies, and metadata (if present, includes modules). Handle FileNotFoundError → return []. Handle malformed JSON → log warning, return [].\n\n3. `def read_task_artifacts(worktree_path: Path) -> dict` — Read orchestrator artifacts from a worktree's `.task/` directory:\n   - `.task/metadata.json`: parse for task_id, title, base_commit, created_at\n   - `.task/plan.json`: parse steps array, count done vs total → derive phase (PLAN if no plan, EXECUTE/VERIFY/REVIEW/MERGE based on step progress, DONE if all done)\n   - `.task/iterations.jsonl`: count lines (don't parse each line)\n   - `.task/reviews/*.json`: glob, parse each, count PASS vs ISSUES_FOUND → return summary like \"3/5 PASS\"\n   All wrapped in try/except, return None/0/\"—\" for missing files.\n   Returns: `{\"metadata\": dict|None, \"phase\": str, \"plan_progress\": {\"done\": int, \"total\": int}, \"iteration_count\": int, \"review_summary\": str}`.\n\n4. `def discover_orchestrators(config: DashboardConfig) -> list[dict]` — combine process scan + worktree scan:\n   - Get running orchestrators from find_running_orchestrators()\n   - Get task tree from load_task_tree(config.tasks_json)\n   - Scan config.worktrees_dir for subdirectories, read artifacts from each\n   - For each running orchestrator: attach the task tree and per-task artifacts\n   - Compute summary stats: total, done, in_progress, blocked, pending counts\n   - Return list of orchestrator dicts with all combined data\n\nCreate `dashboard/tests/test_orchestrator.py`:\n- Test find_running_orchestrators: mock subprocess.run to return canned ps output with orchestrator lines. Verify PID and PRD extraction.\n- Test load_task_tree: create a temp tasks.json with sample data. Verify parsing. Test missing file. Test malformed JSON.\n- Test read_task_artifacts: create temp dir with .task/ subdirectory containing sample metadata.json, plan.json (with mix of done/pending steps), iterations.jsonl (3 lines), reviews/reviewer-1.json (PASS), reviews/reviewer-2.json (ISSUES_FOUND). Verify all fields parsed correctly.\n- Test discover_orchestrators: mock process scan, create temp worktrees dir with one worktree containing artifacts. Verify combined output.",
+        "description": "Create data/orchestrator.py \u2014 process scanning, task tree parsing, and worktree artifact reading for orchestrator status.",
+        "details": "Create `dashboard/src/dashboard/data/orchestrator.py` with:\n\n1. `def find_running_orchestrators() -> list[dict]` \u2014 run `subprocess.run([\"ps\", \"aux\"], capture_output=True, text=True)`. For each line containing \"orchestrator\" and \"--prd\", extract PID (field 1), start time (fields 8-9), and PRD path (regex `--prd\\s+(\\S+)`). Return list of `{\"pid\": int, \"prd\": str, \"running\": True, \"started\": str}`. Filter out the grep/ps process itself.\n\n2. `def load_task_tree(tasks_json_path: Path) -> list[dict]` \u2014 read and parse `.taskmaster/tasks/tasks.json`. Extract `data[\"master\"][\"tasks\"]` (or `data[\"tasks\"]` \u2014 handle both formats). Return list of task dicts with keys: id, title, status, priority, dependencies, and metadata (if present, includes modules). Handle FileNotFoundError \u2192 return []. Handle malformed JSON \u2192 log warning, return [].\n\n3. `def read_task_artifacts(worktree_path: Path) -> dict` \u2014 Read orchestrator artifacts from a worktree's `.task/` directory:\n   - `.task/metadata.json`: parse for task_id, title, base_commit, created_at\n   - `.task/plan.json`: parse steps array, count done vs total \u2192 derive phase (PLAN if no plan, EXECUTE/VERIFY/REVIEW/MERGE based on step progress, DONE if all done)\n   - `.task/iterations.jsonl`: count lines (don't parse each line)\n   - `.task/reviews/*.json`: glob, parse each, count PASS vs ISSUES_FOUND \u2192 return summary like \"3/5 PASS\"\n   All wrapped in try/except, return None/0/\"\u2014\" for missing files.\n   Returns: `{\"metadata\": dict|None, \"phase\": str, \"plan_progress\": {\"done\": int, \"total\": int}, \"iteration_count\": int, \"review_summary\": str}`.\n\n4. `def discover_orchestrators(config: DashboardConfig) -> list[dict]` \u2014 combine process scan + worktree scan:\n   - Get running orchestrators from find_running_orchestrators()\n   - Get task tree from load_task_tree(config.tasks_json)\n   - Scan config.worktrees_dir for subdirectories, read artifacts from each\n   - For each running orchestrator: attach the task tree and per-task artifacts\n   - Compute summary stats: total, done, in_progress, blocked, pending counts\n   - Return list of orchestrator dicts with all combined data\n\nCreate `dashboard/tests/test_orchestrator.py`:\n- Test find_running_orchestrators: mock subprocess.run to return canned ps output with orchestrator lines. Verify PID and PRD extraction.\n- Test load_task_tree: create a temp tasks.json with sample data. Verify parsing. Test missing file. Test malformed JSON.\n- Test read_task_artifacts: create temp dir with .task/ subdirectory containing sample metadata.json, plan.json (with mix of done/pending steps), iterations.jsonl (3 lines), reviews/reviewer-1.json (PASS), reviews/reviewer-2.json (ISSUES_FOUND). Verify all fields parsed correctly.\n- Test discover_orchestrators: mock process scan, create temp worktrees dir with one worktree containing artifacts. Verify combined output.",
         "testStrategy": "",
         "status": "done",
         "dependencies": [
@@ -113,13 +137,16 @@
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-19T07:44:10.200Z"
+        "updatedAt": "2026-03-19T07:44:10.200Z",
+        "metadata": {
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 20,
         "title": "Memory health cards partial and route",
         "description": "Create the memory health cards HTML partial template and its FastAPI route, wiring data from the memory data module.",
-        "details": "Create `dashboard/src/dashboard/templates/partials/memory.html`:\n\nFour cards in a horizontal flex row (flex, gap-4). Each card: bg-gray-800, rounded-lg, p-6, shadow.\n\n1. **Graphiti card**: Status dot (green if connected, red if not — use a 3x3 rounded-full div with bg-green-500/bg-red-500). \"Graphiti\" label (text-sm text-gray-400). Node count as large number (text-3xl font-bold text-white). Subtitle \"knowledge graph nodes\" (text-xs text-gray-500).\n\n2. **Mem0 card**: Same pattern. Memory count. Subtitle \"vector memories\".\n\n3. **Taskmaster card**: Same dot pattern. \"Taskmaster\" label. Text \"Connected\" or \"Disconnected\" (instead of a number).\n\n4. **Write Queue card**: Tri-state dot: green if all counts are 0, yellow if pending > 0, red if dead > 0. \"Write Queue\" label. Show three metrics inline: \"N pending · N retry · N dead\" with dead count in red text if > 0. If oldest_pending_age_seconds is not None and > 60, show \"oldest: Xm ago\" in yellow text.\n\nIf the data has `offline: True`, show a single full-width card: \"Fused Memory Server Offline\" with red styling and the error message.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/memory` async route: get httpx client from request.app.state, call get_memory_status() and get_queue_stats() from dashboard.data.memory, render templates/partials/memory.html with the data as template context, return HTMLResponse.\n- Import the data functions at the top of app.py.\n\nTest strategy: verify the route returns 200 with text/html content-type. Test with mock data module returning both online and offline states. Check that the HTML contains expected elements (e.g., \"Graphiti\", \"Mem0\", node count value).",
+        "details": "Create `dashboard/src/dashboard/templates/partials/memory.html`:\n\nFour cards in a horizontal flex row (flex, gap-4). Each card: bg-gray-800, rounded-lg, p-6, shadow.\n\n1. **Graphiti card**: Status dot (green if connected, red if not \u2014 use a 3x3 rounded-full div with bg-green-500/bg-red-500). \"Graphiti\" label (text-sm text-gray-400). Node count as large number (text-3xl font-bold text-white). Subtitle \"knowledge graph nodes\" (text-xs text-gray-500).\n\n2. **Mem0 card**: Same pattern. Memory count. Subtitle \"vector memories\".\n\n3. **Taskmaster card**: Same dot pattern. \"Taskmaster\" label. Text \"Connected\" or \"Disconnected\" (instead of a number).\n\n4. **Write Queue card**: Tri-state dot: green if all counts are 0, yellow if pending > 0, red if dead > 0. \"Write Queue\" label. Show three metrics inline: \"N pending \u00b7 N retry \u00b7 N dead\" with dead count in red text if > 0. If oldest_pending_age_seconds is not None and > 60, show \"oldest: Xm ago\" in yellow text.\n\nIf the data has `offline: True`, show a single full-width card: \"Fused Memory Server Offline\" with red styling and the error message.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/memory` async route: get httpx client from request.app.state, call get_memory_status() and get_queue_stats() from dashboard.data.memory, render templates/partials/memory.html with the data as template context, return HTMLResponse.\n- Import the data functions at the top of app.py.\n\nTest strategy: verify the route returns 200 with text/html content-type. Test with mock data module returning both online and offline states. Check that the HTML contains expected elements (e.g., \"Graphiti\", \"Mem0\", node count value).",
         "testStrategy": "",
         "status": "done",
         "dependencies": [
@@ -127,13 +154,16 @@
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-19T08:19:56.055Z"
+        "updatedAt": "2026-03-19T08:19:56.055Z",
+        "metadata": {
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 21,
         "title": "Reconciliation panel partial and route",
         "description": "Create the reconciliation panel HTML partial template and its FastAPI route, wiring data from the reconciliation data module.",
-        "details": "Create `dashboard/src/dashboard/templates/partials/recon.html`:\n\nTwo-column grid layout (grid grid-cols-2 gap-6). Dark themed cards (bg-gray-800 rounded-lg p-6).\n\n**Left column — Current State:**\n\n- **Event Buffer** section: Show \"N events buffered\". If oldest_event_age_seconds is not None, show \"oldest: Xm Xs ago\". Use yellow text if age > 300s.\n\n- **Burst State** table: columns agent_id, state. State \"bursting\" in orange badge, \"idle\" in gray badge. Show \"No agents\" if empty.\n\n- **Watermarks** section: Show each timestamp as relative time (implement a Jinja2 filter `timeago` that converts ISO 8601 to \"Xm ago\" / \"Xh ago\" / \"Xd ago\" relative to now). Fields: Last full run, Last episode, Last memory, Last task change. Use text-gray-400 for labels, text-white for values.\n\n- **Latest Verdict**: Severity badge — bg-green-600 for \"ok\", bg-yellow-600 for \"minor\", bg-orange-600 for \"moderate\", bg-red-600 for \"serious\". Show action_taken next to it. Show \"No verdicts yet\" if None.\n\n**Right column — Recent Runs (last 5):**\n\nTable with columns: Trigger, Type, Status, Events, Duration, When.\n- Status badges: bg-green-600=completed, bg-blue-600=running, bg-red-600=failed, bg-orange-600=rolled_back, bg-purple-600=circuit_breaker.\n- Duration: show in seconds or \"—\" if still running.\n- When: relative time (timeago filter).\n- Show \"No reconciliation runs yet\" if empty.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/recon` async route: call all 5 reconciliation query functions (get_recent_runs, get_watermarks, get_buffer_stats, get_burst_state, get_latest_verdict) with config.reconciliation_db and render the partial.\n- Register the `timeago` Jinja2 filter on the templates environment.\n\nThe `timeago` filter: accept an ISO 8601 string, parse with datetime.fromisoformat, compute delta from now (UTC), return human string like \"3m ago\", \"2h ago\", \"1d ago\". Handle None → return \"never\".\n\nTest strategy: verify route returns 200. Test with mock reconciliation data. Check HTML contains expected badges and table structure.",
+        "details": "Create `dashboard/src/dashboard/templates/partials/recon.html`:\n\nTwo-column grid layout (grid grid-cols-2 gap-6). Dark themed cards (bg-gray-800 rounded-lg p-6).\n\n**Left column \u2014 Current State:**\n\n- **Event Buffer** section: Show \"N events buffered\". If oldest_event_age_seconds is not None, show \"oldest: Xm Xs ago\". Use yellow text if age > 300s.\n\n- **Burst State** table: columns agent_id, state. State \"bursting\" in orange badge, \"idle\" in gray badge. Show \"No agents\" if empty.\n\n- **Watermarks** section: Show each timestamp as relative time (implement a Jinja2 filter `timeago` that converts ISO 8601 to \"Xm ago\" / \"Xh ago\" / \"Xd ago\" relative to now). Fields: Last full run, Last episode, Last memory, Last task change. Use text-gray-400 for labels, text-white for values.\n\n- **Latest Verdict**: Severity badge \u2014 bg-green-600 for \"ok\", bg-yellow-600 for \"minor\", bg-orange-600 for \"moderate\", bg-red-600 for \"serious\". Show action_taken next to it. Show \"No verdicts yet\" if None.\n\n**Right column \u2014 Recent Runs (last 5):**\n\nTable with columns: Trigger, Type, Status, Events, Duration, When.\n- Status badges: bg-green-600=completed, bg-blue-600=running, bg-red-600=failed, bg-orange-600=rolled_back, bg-purple-600=circuit_breaker.\n- Duration: show in seconds or \"\u2014\" if still running.\n- When: relative time (timeago filter).\n- Show \"No reconciliation runs yet\" if empty.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/recon` async route: call all 5 reconciliation query functions (get_recent_runs, get_watermarks, get_buffer_stats, get_burst_state, get_latest_verdict) with config.reconciliation_db and render the partial.\n- Register the `timeago` Jinja2 filter on the templates environment.\n\nThe `timeago` filter: accept an ISO 8601 string, parse with datetime.fromisoformat, compute delta from now (UTC), return human string like \"3m ago\", \"2h ago\", \"1d ago\". Handle None \u2192 return \"never\".\n\nTest strategy: verify route returns 200. Test with mock reconciliation data. Check HTML contains expected badges and table structure.",
         "testStrategy": "",
         "status": "done",
         "dependencies": [
@@ -141,13 +171,16 @@
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-19T07:35:39.236Z"
+        "updatedAt": "2026-03-19T07:35:39.236Z",
+        "metadata": {
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 22,
         "title": "Orchestrator list and task detail partials and routes",
         "description": "Create the orchestrator list and task detail HTML partial templates and their FastAPI routes, wiring data from the orchestrator discovery module.",
-        "details": "Create `dashboard/src/dashboard/templates/partials/orchestrators.html`:\n\n**Header**: \"Orchestrators\" (text-xl font-bold) + count of running instances as badge (bg-blue-600 rounded-full px-2 text-sm).\n\n**Per-orchestrator card** (bg-gray-800 rounded-lg p-6 mb-4):\n- **Header line**: PID with green \"running\" badge (bg-green-600 text-xs rounded px-2 py-0.5) or gray \"completed\" badge. PRD filename (extracted from path, text-gray-400).\n- **Progress bar**: Full-width bar (h-3 rounded-full bg-gray-700 overflow-hidden). Colored segments inside as flex children: green (done), blue (in-progress), yellow (pending), red (blocked). Width proportional to count/total.\n- **Stats row**: Flex with gap, each stat: count + label. \"N done · N in-progress · N blocked · N pending\" with matching colors.\n- **Expand button**: \"Show tasks\" / \"Hide tasks\" toggle using Alpine.js `@click=\"open = !open\"` and `x-show=\"open\"`. Wrap card in `<div x-data=\"{ open: false }\">`.\n\nCreate `dashboard/src/dashboard/templates/partials/tasks.html`:\n\n**Task table** (inside the expandable section, rendered per orchestrator):\n- Table with classes: w-full text-sm text-left text-gray-300.\n- Header row: ID, Title, Status, Phase, Iterations, Reviews, Modules (bg-gray-700 text-gray-400 text-xs uppercase).\n- Data rows: \n  - **Status** as badge: bg-green-600=done, bg-blue-600=in-progress, bg-yellow-600=pending, bg-red-600=blocked, bg-gray-600=cancelled/deferred.\n  - **Phase**: short label (PLAN/EXEC/VERIFY/REVIEW/MERGE/DONE/—) with muted color.\n  - **Iterations**: number or \"—\".\n  - **Reviews**: e.g. \"3/5 PASS\" or \"—\".\n  - **Modules**: comma-joined, text-xs text-gray-500, truncated with `truncate max-w-[200px]`.\n\nIf no orchestrators found, show a centered message: \"No orchestrators detected\" with gray text.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/orchestrators` async route: call discover_orchestrators(config), render orchestrators.html with the orchestrator list. The tasks.html partial is included inline within orchestrators.html (use Jinja2 include or render tasks directly in the template loop).\n\nTest strategy: verify route returns 200. Test with mock discover_orchestrators returning both empty list and a list with one running + one completed orchestrator. Check HTML contains progress bar, stats, task table elements.",
+        "details": "Create `dashboard/src/dashboard/templates/partials/orchestrators.html`:\n\n**Header**: \"Orchestrators\" (text-xl font-bold) + count of running instances as badge (bg-blue-600 rounded-full px-2 text-sm).\n\n**Per-orchestrator card** (bg-gray-800 rounded-lg p-6 mb-4):\n- **Header line**: PID with green \"running\" badge (bg-green-600 text-xs rounded px-2 py-0.5) or gray \"completed\" badge. PRD filename (extracted from path, text-gray-400).\n- **Progress bar**: Full-width bar (h-3 rounded-full bg-gray-700 overflow-hidden). Colored segments inside as flex children: green (done), blue (in-progress), yellow (pending), red (blocked). Width proportional to count/total.\n- **Stats row**: Flex with gap, each stat: count + label. \"N done \u00b7 N in-progress \u00b7 N blocked \u00b7 N pending\" with matching colors.\n- **Expand button**: \"Show tasks\" / \"Hide tasks\" toggle using Alpine.js `@click=\"open = !open\"` and `x-show=\"open\"`. Wrap card in `<div x-data=\"{ open: false }\">`.\n\nCreate `dashboard/src/dashboard/templates/partials/tasks.html`:\n\n**Task table** (inside the expandable section, rendered per orchestrator):\n- Table with classes: w-full text-sm text-left text-gray-300.\n- Header row: ID, Title, Status, Phase, Iterations, Reviews, Modules (bg-gray-700 text-gray-400 text-xs uppercase).\n- Data rows: \n  - **Status** as badge: bg-green-600=done, bg-blue-600=in-progress, bg-yellow-600=pending, bg-red-600=blocked, bg-gray-600=cancelled/deferred.\n  - **Phase**: short label (PLAN/EXEC/VERIFY/REVIEW/MERGE/DONE/\u2014) with muted color.\n  - **Iterations**: number or \"\u2014\".\n  - **Reviews**: e.g. \"3/5 PASS\" or \"\u2014\".\n  - **Modules**: comma-joined, text-xs text-gray-500, truncated with `truncate max-w-[200px]`.\n\nIf no orchestrators found, show a centered message: \"No orchestrators detected\" with gray text.\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /partials/orchestrators` async route: call discover_orchestrators(config), render orchestrators.html with the orchestrator list. The tasks.html partial is included inline within orchestrators.html (use Jinja2 include or render tasks directly in the template loop).\n\nTest strategy: verify route returns 200. Test with mock discover_orchestrators returning both empty list and a list with one running + one completed orchestrator. Check HTML contains progress bar, stats, task table elements.",
         "testStrategy": "",
         "status": "done",
         "dependencies": [
@@ -155,13 +188,16 @@
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-19T08:50:12.235Z"
+        "updatedAt": "2026-03-19T08:50:12.235Z",
+        "metadata": {
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 23,
         "title": "Full page assembly, entry point, and integration tests",
         "description": "Create index.html combining all partials with htmx polling, add __main__.py entry point, and write integration tests for all routes.",
-        "details": "Create `dashboard/src/dashboard/templates/index.html`:\n\nExtends base.html. Content block contains 4 sections stacked vertically (space-y-8 max-w-7xl mx-auto p-6):\n\n1. **Memory Health** section: `<div hx-get=\"/partials/memory\" hx-trigger=\"load, every 10s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n2. **Reconciliation** section: `<div hx-get=\"/partials/recon\" hx-trigger=\"load, every 15s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n3. **Orchestrators** section: `<div hx-get=\"/partials/orchestrators\" hx-trigger=\"load, every 10s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n4. **Footer**: Small text \"Dark Factory Dashboard\" with current time (updated via Alpine.js `x-text` with a setInterval, or just static).\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /` route: render index.html (no data needed — partials load themselves via htmx).\n\nCreate `dashboard/src/dashboard/__main__.py`:\n```python\n\"\"\"Entry point: python -m dashboard.app\"\"\"\nimport uvicorn\nfrom dashboard.config import DashboardConfig\n\nconfig = DashboardConfig()\nuvicorn.run(\"dashboard.app:app\", host=config.host, port=config.port, reload=True)\n```\n\nCreate `dashboard/tests/test_app.py` — integration tests using FastAPI TestClient:\n\n1. **Test GET /** — returns 200, content-type text/html, body contains \"Dark Factory\", contains hx-get=\"/partials/memory\", hx-get=\"/partials/recon\", hx-get=\"/partials/orchestrators\".\n\n2. **Test GET /partials/memory** — mock dashboard.data.memory functions to return sample data. Returns 200, text/html, contains \"Graphiti\", \"Mem0\", \"Taskmaster\", \"Write Queue\".\n\n3. **Test GET /partials/memory offline** — mock to return {\"offline\": True}. Returns 200, contains \"Offline\".\n\n4. **Test GET /partials/recon** — mock dashboard.data.reconciliation functions. Returns 200, contains expected table elements.\n\n5. **Test GET /partials/recon no data** — mock to return empty defaults. Returns 200, contains \"No reconciliation runs\".\n\n6. **Test GET /partials/orchestrators** — mock dashboard.data.orchestrator.discover_orchestrators to return a sample orchestrator with tasks. Returns 200, contains progress bar elements, task table.\n\n7. **Test GET /partials/orchestrators empty** — mock to return []. Returns 200, contains \"No orchestrators detected\".\n\n8. **Test GET /api/health** — returns 200, application/json, body is {\"status\": \"ok\"}.\n\nUse `unittest.mock.patch` or `monkeypatch` to mock the data modules. Import the app and create TestClient in a fixture.\n\nTest strategy: `cd dashboard && uv run pytest tests/ -x -v`. All 8+ tests should pass. Also manually verify by running `cd dashboard && uv run python -m dashboard.app` and opening http://127.0.0.1:8080 in a browser.",
+        "details": "Create `dashboard/src/dashboard/templates/index.html`:\n\nExtends base.html. Content block contains 4 sections stacked vertically (space-y-8 max-w-7xl mx-auto p-6):\n\n1. **Memory Health** section: `<div hx-get=\"/partials/memory\" hx-trigger=\"load, every 10s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n2. **Reconciliation** section: `<div hx-get=\"/partials/recon\" hx-trigger=\"load, every 15s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n3. **Orchestrators** section: `<div hx-get=\"/partials/orchestrators\" hx-trigger=\"load, every 10s\" hx-swap=\"innerHTML\">Loading...</div>`\n\n4. **Footer**: Small text \"Dark Factory Dashboard\" with current time (updated via Alpine.js `x-text` with a setInterval, or just static).\n\nAdd to `dashboard/src/dashboard/app.py`:\n- `GET /` route: render index.html (no data needed \u2014 partials load themselves via htmx).\n\nCreate `dashboard/src/dashboard/__main__.py`:\n```python\n\"\"\"Entry point: python -m dashboard.app\"\"\"\nimport uvicorn\nfrom dashboard.config import DashboardConfig\n\nconfig = DashboardConfig()\nuvicorn.run(\"dashboard.app:app\", host=config.host, port=config.port, reload=True)\n```\n\nCreate `dashboard/tests/test_app.py` \u2014 integration tests using FastAPI TestClient:\n\n1. **Test GET /** \u2014 returns 200, content-type text/html, body contains \"Dark Factory\", contains hx-get=\"/partials/memory\", hx-get=\"/partials/recon\", hx-get=\"/partials/orchestrators\".\n\n2. **Test GET /partials/memory** \u2014 mock dashboard.data.memory functions to return sample data. Returns 200, text/html, contains \"Graphiti\", \"Mem0\", \"Taskmaster\", \"Write Queue\".\n\n3. **Test GET /partials/memory offline** \u2014 mock to return {\"offline\": True}. Returns 200, contains \"Offline\".\n\n4. **Test GET /partials/recon** \u2014 mock dashboard.data.reconciliation functions. Returns 200, contains expected table elements.\n\n5. **Test GET /partials/recon no data** \u2014 mock to return empty defaults. Returns 200, contains \"No reconciliation runs\".\n\n6. **Test GET /partials/orchestrators** \u2014 mock dashboard.data.orchestrator.discover_orchestrators to return a sample orchestrator with tasks. Returns 200, contains progress bar elements, task table.\n\n7. **Test GET /partials/orchestrators empty** \u2014 mock to return []. Returns 200, contains \"No orchestrators detected\".\n\n8. **Test GET /api/health** \u2014 returns 200, application/json, body is {\"status\": \"ok\"}.\n\nUse `unittest.mock.patch` or `monkeypatch` to mock the data modules. Import the app and create TestClient in a fixture.\n\nTest strategy: `cd dashboard && uv run pytest tests/ -x -v`. All 8+ tests should pass. Also manually verify by running `cd dashboard && uv run python -m dashboard.app` and opening http://127.0.0.1:8080 in a browser.",
         "testStrategy": "",
         "status": "done",
         "dependencies": [
@@ -171,7 +207,10 @@
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-19T09:28:27.034Z"
+        "updatedAt": "2026-03-19T09:28:27.034Z",
+        "metadata": {
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 24,
@@ -188,7 +227,8 @@
             "fused-memory/src/fused_memory/reconciliation",
             "fused-memory/src/fused_memory/models",
             "fused-memory/tests"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
         "updatedAt": "2026-03-19T11:01:40.058Z"
@@ -207,7 +247,8 @@
             "fused-memory/src/fused_memory/services",
             "fused-memory/src/fused_memory/backends",
             "fused-memory/tests"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
         "updatedAt": "2026-03-19T10:44:42.699Z"
@@ -227,7 +268,8 @@
             "fused-memory/src/fused_memory/server",
             "fused-memory/src/fused_memory/models",
             "fused-memory/tests"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
         "updatedAt": "2026-03-19T11:22:09.141Z"
@@ -246,7 +288,8 @@
             "fused-memory/src/fused_memory/reconciliation",
             "fused-memory/src/fused_memory/services",
             "fused-memory/tests"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
         "updatedAt": "2026-03-19T11:37:11.993Z"
@@ -255,7 +298,7 @@
         "id": 28,
         "title": "Fix HTMX polling destroying Alpine.js state on orchestrators panel",
         "description": "The orchestrators partial uses hx-swap=\"innerHTML\" with every-10s polling. Each HTMX refresh re-initializes Alpine.js x-data=\"{ open: false }\" components, causing any expanded \"Show tasks\" accordion to collapse every 10 seconds. This makes the only interactive element on the dashboard completely broken in practice.\n\nThe fix must preserve Alpine.js component state across HTMX partial refreshes. Options:\n1. Use the HTMX idiomorph extension (hx-swap=\"morph:innerHTML\") which diffs the DOM and preserves Alpine state.\n2. Move the toggle state out of Alpine into a URL hash or localStorage, and restore it on HTMX swap.\n3. Use hx-swap=\"outerHTML\" with hx-select to swap only data elements, keeping the Alpine container intact.\n\nOption 1 (idiomorph) is the simplest and most maintainable. It requires adding the idiomorph extension script tag to base.html and changing the hx-swap attribute on the orchestrators section in index.html.\n\nThe fix should also apply to the other polling sections (memory, recon) for consistency, even though they don't currently use Alpine.",
-        "details": "Files to modify:\n- dashboard/src/dashboard/templates/base.html — add idiomorph extension script tag\n- dashboard/src/dashboard/templates/index.html — change hx-swap=\"innerHTML\" to hx-swap=\"morph:innerHTML\" on all three polling sections\n\nThe idiomorph extension CDN: https://unpkg.com/idiomorph@0.3.0/dist/idiomorph-ext.min.js (pin the version). Add hx-ext=\"morph\" to the body tag or to each section.\n\nTest: After the fix, expanding \"Show tasks\" on an orchestrator card should survive HTMX poll cycles without collapsing. Verify by running the dashboard, clicking Show tasks, and waiting >10s.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/templates/base.html \u2014 add idiomorph extension script tag\n- dashboard/src/dashboard/templates/index.html \u2014 change hx-swap=\"innerHTML\" to hx-swap=\"morph:innerHTML\" on all three polling sections\n\nThe idiomorph extension CDN: https://unpkg.com/idiomorph@0.3.0/dist/idiomorph-ext.min.js (pin the version). Add hx-ext=\"morph\" to the body tag or to each section.\n\nTest: After the fix, expanding \"Show tasks\" on an orchestrator card should survive HTMX poll cycles without collapsing. Verify by running the dashboard, clicking Show tasks, and waiting >10s.",
         "testStrategy": "Write a test that renders the orchestrators partial twice with different data and verifies the HTML structure is morph-compatible (stable element IDs/structure). Also verify the idiomorph script tag is present in base.html output.",
         "status": "done",
         "dependencies": [],
@@ -263,7 +306,8 @@
         "metadata": {
           "modules": [
             "dashboard/src/dashboard"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
         "updatedAt": "2026-03-19T14:29:36.485Z"
@@ -272,7 +316,7 @@
         "id": 29,
         "title": "Fix httpx not following redirects for fused-memory MCP calls",
         "description": "The dashboard shows \"Fused Memory Server Offline\" with error \"MCP call get_status returned non-200 status: 307\" even when the fused-memory server is running. This is because httpx.AsyncClient() defaults to follow_redirects=False, and the MCP server returns a 307 redirect (likely trailing-slash normalization from /mcp/ to /mcp or vice versa).\n\nFix: Either set follow_redirects=True on the httpx.AsyncClient in app.py's lifespan, or remove the trailing slash from the URL in memory.py's mcp_tool_call (currently posts to {base_url}/mcp/).\n\nBoth fixes should be applied: follow_redirects=True as a safety net, and correct the URL to avoid the redirect entirely.",
-        "details": "Files to modify:\n- dashboard/src/dashboard/app.py line 57 — change httpx.AsyncClient() to httpx.AsyncClient(follow_redirects=True)\n- dashboard/src/dashboard/data/memory.py line 34 — verify the URL path matches what the fused-memory HTTP server expects (check if it's /mcp or /mcp/)\n\nTest by curling the fused-memory server directly to determine the correct URL:\n  curl -v -X POST http://localhost:8000/mcp/ vs http://localhost:8000/mcp",
+        "details": "Files to modify:\n- dashboard/src/dashboard/app.py line 57 \u2014 change httpx.AsyncClient() to httpx.AsyncClient(follow_redirects=True)\n- dashboard/src/dashboard/data/memory.py line 34 \u2014 verify the URL path matches what the fused-memory HTTP server expects (check if it's /mcp or /mcp/)\n\nTest by curling the fused-memory server directly to determine the correct URL:\n  curl -v -X POST http://localhost:8000/mcp/ vs http://localhost:8000/mcp",
         "testStrategy": "Add a test that verifies httpx.AsyncClient is created with follow_redirects=True. Add a test that mocks a 307 response and verifies the client follows it rather than returning offline status.",
         "status": "done",
         "dependencies": [],
@@ -280,7 +324,8 @@
         "metadata": {
           "modules": [
             "dashboard/src/dashboard"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
         "updatedAt": "2026-03-19T14:29:36.488Z"
@@ -288,8 +333,8 @@
       {
         "id": 30,
         "title": "Make recon panel responsive and truncate raw trigger timestamps",
-        "description": "Two related layout issues in the reconciliation panel:\n\n1. The grid-cols-2 layout in recon.html is hardcoded and doesn't stack on mobile. At 480px the left column (Event Buffer, Burst State, Watermarks, Verdict) gets crushed to ~200px and the Recent Runs table overflows horizontally.\n\n2. The Trigger column in the Recent Runs table displays raw trigger_reason strings like \"max_staleness:2026-03-19T06:59:04.491867+00:00\" which are very long ISO timestamps that cause horizontal overflow even on desktop.\n\nFix the grid to be responsive (grid-cols-1 lg:grid-cols-2). Add a Jinja2 filter or inline logic to format trigger_reason strings — extract the trigger type and convert the timestamp to relative time, e.g. \"max_staleness (1h ago)\" or just \"staleness\" with the timestamp as a tooltip.",
-        "details": "Files to modify:\n- dashboard/src/dashboard/templates/partials/recon.html line 1 — change grid-cols-2 to grid-cols-1 lg:grid-cols-2\n- dashboard/src/dashboard/templates/partials/recon.html trigger column — add truncation/formatting for trigger_reason values\n- dashboard/src/dashboard/app.py — add a trigger_format Jinja2 filter if needed\n\nThe trigger_reason format is \"type:value\" where type is one of: quiescent, buffer_size, max_staleness, manual. For max_staleness, the value is an ISO timestamp. For quiescent and buffer_size, the value is a number. Format as:\n- \"quiescent:6\" → \"quiescent (6)\"\n- \"buffer_size:10\" → \"buffer (10)\"\n- \"max_staleness:2026-03-19T...\" → \"staleness (1h ago)\"\n- \"manual\" → \"manual\"\n\nAlso add overflow-x-auto to the Recent Runs table container as a fallback.",
+        "description": "Two related layout issues in the reconciliation panel:\n\n1. The grid-cols-2 layout in recon.html is hardcoded and doesn't stack on mobile. At 480px the left column (Event Buffer, Burst State, Watermarks, Verdict) gets crushed to ~200px and the Recent Runs table overflows horizontally.\n\n2. The Trigger column in the Recent Runs table displays raw trigger_reason strings like \"max_staleness:2026-03-19T06:59:04.491867+00:00\" which are very long ISO timestamps that cause horizontal overflow even on desktop.\n\nFix the grid to be responsive (grid-cols-1 lg:grid-cols-2). Add a Jinja2 filter or inline logic to format trigger_reason strings \u2014 extract the trigger type and convert the timestamp to relative time, e.g. \"max_staleness (1h ago)\" or just \"staleness\" with the timestamp as a tooltip.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/templates/partials/recon.html line 1 \u2014 change grid-cols-2 to grid-cols-1 lg:grid-cols-2\n- dashboard/src/dashboard/templates/partials/recon.html trigger column \u2014 add truncation/formatting for trigger_reason values\n- dashboard/src/dashboard/app.py \u2014 add a trigger_format Jinja2 filter if needed\n\nThe trigger_reason format is \"type:value\" where type is one of: quiescent, buffer_size, max_staleness, manual. For max_staleness, the value is an ISO timestamp. For quiescent and buffer_size, the value is a number. Format as:\n- \"quiescent:6\" \u2192 \"quiescent (6)\"\n- \"buffer_size:10\" \u2192 \"buffer (10)\"\n- \"max_staleness:2026-03-19T...\" \u2192 \"staleness (1h ago)\"\n- \"manual\" \u2192 \"manual\"\n\nAlso add overflow-x-auto to the Recent Runs table container as a fallback.",
         "testStrategy": "Test the trigger_format filter with all four trigger types. Verify the recon partial HTML contains responsive grid classes. Visual verification at 480px and 768px widths.",
         "status": "done",
         "dependencies": [],
@@ -297,7 +342,8 @@
         "metadata": {
           "modules": [
             "dashboard/src/dashboard"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
         "updatedAt": "2026-03-19T14:59:42.382Z"
@@ -306,7 +352,7 @@
         "id": 31,
         "title": "Add section headings, loading skeletons, and fix timeago edge case",
         "description": "Three minor UX issues grouped together:\n\n1. No section headings for Memory and Reconciliation panels. Only \"Orchestrators\" has a visible heading. The page structure is unclear at a glance. Add \"Memory\" and \"Reconciliation\" headings to match the Orchestrators pattern.\n\n2. When partials are loading, the user sees bare gray \"Loading...\" text with no visual indicator. Replace with a pulsing skeleton placeholder (Tailwind animate-pulse with gray placeholder boxes).\n\n3. The timeago filter returns \"0m ago\" when total_minutes is 0 (event happened <60 seconds ago). Should return \"just now\" or \"<1m ago\" instead.",
-        "details": "Files to modify:\n- dashboard/src/dashboard/templates/index.html — add section headings above each hx-get div, replace \"Loading...\" with skeleton HTML\n- dashboard/src/dashboard/app.py timeago filter — handle the 0-minute case\n\nFor skeletons, use something like:\n<div class=\"animate-pulse space-y-4\">\n  <div class=\"h-4 bg-gray-700 rounded w-1/3\"></div>\n  <div class=\"h-32 bg-gray-800 rounded\"></div>\n</div>\n\nFor timeago: if total_minutes == 0, return \"just now\".",
+        "details": "Files to modify:\n- dashboard/src/dashboard/templates/index.html \u2014 add section headings above each hx-get div, replace \"Loading...\" with skeleton HTML\n- dashboard/src/dashboard/app.py timeago filter \u2014 handle the 0-minute case\n\nFor skeletons, use something like:\n<div class=\"animate-pulse space-y-4\">\n  <div class=\"h-4 bg-gray-700 rounded w-1/3\"></div>\n  <div class=\"h-32 bg-gray-800 rounded\"></div>\n</div>\n\nFor timeago: if total_minutes == 0, return \"just now\".",
         "testStrategy": "Test timeago filter with a timestamp from 30 seconds ago, verify it returns \"just now\". Test index.html contains section headings and animate-pulse classes.",
         "status": "done",
         "dependencies": [],
@@ -314,7 +360,8 @@
         "metadata": {
           "modules": [
             "dashboard/src/dashboard"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
         "updatedAt": "2026-03-19T14:59:42.447Z"
@@ -323,7 +370,7 @@
         "id": 32,
         "title": "Add HTMX error and timeout fallback for partial endpoints",
         "description": "If a partial endpoint hangs or returns a server error, the HTMX section stays at \"Loading...\" permanently with no indication of failure. HTMX doesn't surface errors by default.\n\nAdd error handling so that failed partial loads show a visible error state rather than silent failure. Use HTMX's hx-on::after-request event or the htmx:responseError event to detect failures and show an error message in the target element.",
-        "details": "Files to modify:\n- dashboard/src/dashboard/templates/base.html or index.html — add HTMX event listener for htmx:responseError and htmx:timeout that replaces the target with an error card\n- dashboard/src/dashboard/templates/index.html — add hx-timeout attribute to polling sections (e.g. 8s for a 10s poll interval)\n\nExample error handler:\n<script>\n  document.addEventListener('htmx:responseError', function(evt) {\n    evt.detail.target.innerHTML = '<div class=\"bg-red-900/30 border border-red-800 rounded-lg p-4 text-red-300 text-sm\">Failed to load — retrying...</div>';\n  });\n</script>\n\nThis ensures a visual indicator appears on failure while HTMX continues to poll and will recover on the next successful response.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/templates/base.html or index.html \u2014 add HTMX event listener for htmx:responseError and htmx:timeout that replaces the target with an error card\n- dashboard/src/dashboard/templates/index.html \u2014 add hx-timeout attribute to polling sections (e.g. 8s for a 10s poll interval)\n\nExample error handler:\n<script>\n  document.addEventListener('htmx:responseError', function(evt) {\n    evt.detail.target.innerHTML = '<div class=\"bg-red-900/30 border border-red-800 rounded-lg p-4 text-red-300 text-sm\">Failed to load \u2014 retrying...</div>';\n  });\n</script>\n\nThis ensures a visual indicator appears on failure while HTMX continues to poll and will recover on the next successful response.",
         "testStrategy": "Test that the error handler script is present in the base template. Integration test: mock a partial endpoint to return 500 and verify the HTMX error handling is wired up (check for the event listener in rendered HTML).",
         "status": "done",
         "dependencies": [
@@ -333,7 +380,8 @@
         "metadata": {
           "modules": [
             "dashboard/src/dashboard"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
         "updatedAt": "2026-03-19T17:01:07.873Z"
@@ -342,7 +390,7 @@
         "id": 33,
         "title": "Fix worktree artifact lookup key mismatch with task IDs",
         "description": "In tasks.html line 16, the template does orch.worktrees.get(tid, {}) where tid is the task ID as a string. But discover_orchestrators() in orchestrator.py keys worktrees by subdir.name (the directory name under .worktrees/). These only match if the worktree directory is named exactly as the task ID string.\n\nThe orchestrator names worktrees as \"task-{id}\" (e.g. \"task-7\"), not just \"{id}\". So the lookup always fails and every task shows dashes for Phase, Iterations, Reviews, and Modules columns.\n\nFix the key to match the orchestrator's naming convention, or normalize the worktree keys during discovery.",
-        "details": "Files to modify:\n- dashboard/src/dashboard/data/orchestrator.py discover_orchestrators() — when building the worktrees dict, either:\n  (a) Key by the task ID extracted from the directory name (strip \"task-\" prefix), or\n  (b) Key by the raw directory name and update the template to use the correct key format\n\nOption (a) is better — extract the task ID from worktree directory names like \"task-7\" → \"7\" and key the dict by \"7\".\n\nAlso check the actual worktree directory naming convention by looking at git_ops.py or the orchestrator's worktree creation code.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/data/orchestrator.py discover_orchestrators() \u2014 when building the worktrees dict, either:\n  (a) Key by the task ID extracted from the directory name (strip \"task-\" prefix), or\n  (b) Key by the raw directory name and update the template to use the correct key format\n\nOption (a) is better \u2014 extract the task ID from worktree directory names like \"task-7\" \u2192 \"7\" and key the dict by \"7\".\n\nAlso check the actual worktree directory naming convention by looking at git_ops.py or the orchestrator's worktree creation code.",
         "testStrategy": "Test discover_orchestrators with a temp worktrees dir containing a \"task-7\" subdirectory. Verify the returned worktrees dict is keyed by \"7\" (the task ID), not \"task-7\".",
         "status": "done",
         "dependencies": [],
@@ -351,7 +399,8 @@
           "modules": [
             "dashboard/src/dashboard/data",
             "dashboard/src/dashboard/templates/partials"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
         "updatedAt": "2026-03-19T12:20:00.000Z"
@@ -359,8 +408,8 @@
       {
         "id": 34,
         "title": "Pin CDN dependencies with SRI hashes and add favicon",
-        "description": "Three issues with external dependencies and assets:\n\n1. Alpine.js is loaded from alpinejs@3.x.x which auto-resolves to any 3.x version — could break without warning on a minor release.\n\n2. HTMX is pinned to 2.0.4 but loaded from unpkg.com with no Subresource Integrity (SRI) hash, leaving it vulnerable to CDN compromise.\n\n3. No favicon is served, causing a 404 console error on every page load.\n\nPin Alpine.js to a specific version (e.g. 3.14.8), add SRI integrity attributes to all CDN script tags, and add a minimal favicon (can be a simple SVG inline or a static file).",
-        "details": "Files to modify:\n- dashboard/src/dashboard/templates/base.html — pin Alpine version, add integrity and crossorigin attributes to all CDN script tags\n- dashboard/src/dashboard/static/ — add a favicon.ico or favicon.svg\n- dashboard/src/dashboard/templates/base.html — add <link rel=\"icon\"> in head\n\nTo generate SRI hashes: curl the CDN URL and pipe through `openssl dgst -sha384 -binary | openssl base64 -A`\n\nFor the favicon, a minimal SVG works:\n<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏭</text></svg>\">\n\nOr create a simple static favicon.",
+        "description": "Three issues with external dependencies and assets:\n\n1. Alpine.js is loaded from alpinejs@3.x.x which auto-resolves to any 3.x version \u2014 could break without warning on a minor release.\n\n2. HTMX is pinned to 2.0.4 but loaded from unpkg.com with no Subresource Integrity (SRI) hash, leaving it vulnerable to CDN compromise.\n\n3. No favicon is served, causing a 404 console error on every page load.\n\nPin Alpine.js to a specific version (e.g. 3.14.8), add SRI integrity attributes to all CDN script tags, and add a minimal favicon (can be a simple SVG inline or a static file).",
+        "details": "Files to modify:\n- dashboard/src/dashboard/templates/base.html \u2014 pin Alpine version, add integrity and crossorigin attributes to all CDN script tags\n- dashboard/src/dashboard/static/ \u2014 add a favicon.ico or favicon.svg\n- dashboard/src/dashboard/templates/base.html \u2014 add <link rel=\"icon\"> in head\n\nTo generate SRI hashes: curl the CDN URL and pipe through `openssl dgst -sha384 -binary | openssl base64 -A`\n\nFor the favicon, a minimal SVG works:\n<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>\ud83c\udfed</text></svg>\">\n\nOr create a simple static favicon.",
         "testStrategy": "Test that base.html contains integrity attributes on all CDN script tags. Test that GET /favicon.ico returns 200 (or that the inline SVG favicon link is present in the HTML head).",
         "status": "done",
         "dependencies": [],
@@ -369,7 +418,8 @@
           "modules": [
             "dashboard/src/dashboard/templates",
             "dashboard/src/dashboard/static"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
         "updatedAt": "2026-03-19T17:06:56.740Z"
@@ -377,20 +427,21 @@
       {
         "id": 35,
         "title": "Deduplicate identical orchestrator cards when sharing task tree",
-        "description": "When multiple orchestrator processes are running against the same PRD, discover_orchestrators() loads the task tree once and attaches the identical data to all processes. The dashboard then shows two (or more) visually identical cards with the same task list, progress bar, and stats — confusing for users who expect each card to represent distinct work.\n\nThe fix should either:\n1. Group orchestrators by PRD and show a single card with a note about multiple PIDs, or\n2. Scope each orchestrator's task view to its actual working set (if the orchestrator's task assignment is tracked somewhere), or\n3. At minimum, add visual differentiation (show all PIDs in the card header, note that they share the same task tree).\n\nOption 3 is the simplest and most honest — show all PIDs sharing the same task tree in a single card.",
-        "details": "Files to modify:\n- dashboard/src/dashboard/data/orchestrator.py discover_orchestrators() — group processes by PRD path, merge PIDs into a single entry\n- dashboard/src/dashboard/templates/partials/orchestrators.html — show multiple PIDs in the header when grouped\n\nIn discover_orchestrators: after getting processes, group by proc['prd']. For each unique PRD, create one orchestrator entry with a 'pids' list instead of a single 'pid'. Attach the shared task tree and worktrees once.\n\nIn the template: show \"PIDs 2109809, 2109812\" instead of separate cards.",
+        "description": "When multiple orchestrator processes are running against the same PRD, discover_orchestrators() loads the task tree once and attaches the identical data to all processes. The dashboard then shows two (or more) visually identical cards with the same task list, progress bar, and stats \u2014 confusing for users who expect each card to represent distinct work.\n\nThe fix should either:\n1. Group orchestrators by PRD and show a single card with a note about multiple PIDs, or\n2. Scope each orchestrator's task view to its actual working set (if the orchestrator's task assignment is tracked somewhere), or\n3. At minimum, add visual differentiation (show all PIDs in the card header, note that they share the same task tree).\n\nOption 3 is the simplest and most honest \u2014 show all PIDs sharing the same task tree in a single card.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/data/orchestrator.py discover_orchestrators() \u2014 group processes by PRD path, merge PIDs into a single entry\n- dashboard/src/dashboard/templates/partials/orchestrators.html \u2014 show multiple PIDs in the header when grouped\n\nIn discover_orchestrators: after getting processes, group by proc['prd']. For each unique PRD, create one orchestrator entry with a 'pids' list instead of a single 'pid'. Attach the shared task tree and worktrees once.\n\nIn the template: show \"PIDs 2109809, 2109812\" instead of separate cards.",
         "testStrategy": "Test discover_orchestrators with mock ps output containing two processes with the same PRD. Verify the result contains one entry with both PIDs. Test the template renders multiple PIDs correctly.",
-        "status": "blocked",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data",
             "dashboard/src/dashboard/templates/partials"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
-        "updatedAt": "2026-03-19T17:57:44.750Z"
+        "updatedAt": "2026-03-19T21:16:20.283Z"
       },
       {
         "id": 36,
@@ -404,15 +455,16 @@
         "metadata": {
           "modules": [
             "dashboard/src/dashboard"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
         "updatedAt": "2026-03-19T14:34:41.839Z"
       },
       {
         "id": 37,
-        "title": "Taskmaster card hardcoded to 'Connected' — ignores actual status",
-        "description": "The Taskmaster card in memory.html (line 32-35) always renders a green dot and 'Connected' text regardless of the actual taskmaster connection status. The MCP get_status response includes a taskmaster.connected boolean, but the template doesn't reference it.\n\nThis means when Taskmaster is down, the dashboard still shows it as connected — directly misleading for the monitoring use case.",
+        "title": "Taskmaster card hardcoded to 'Connected' \u2014 ignores actual status",
+        "description": "The Taskmaster card in memory.html (line 32-35) always renders a green dot and 'Connected' text regardless of the actual taskmaster connection status. The MCP get_status response includes a taskmaster.connected boolean, but the template doesn't reference it.\n\nThis means when Taskmaster is down, the dashboard still shows it as connected \u2014 directly misleading for the monitoring use case.",
         "details": "File: dashboard/src/dashboard/templates/partials/memory.html lines 30-36\n\nCurrent (hardcoded):\n```html\n<div class=\"w-3 h-3 rounded-full bg-green-500\"></div>\n...\n<div class=\"text-3xl font-bold text-white\">Connected</div>\n```\n\nShould conditionally check status.taskmaster.connected like the Graphiti and Mem0 cards do:\n```html\n<div class=\"w-3 h-3 rounded-full {% if status.taskmaster.connected|default(false) %}bg-green-500{% else %}bg-red-500{% endif %}\"></div>\n...\n<div class=\"text-3xl font-bold text-white\">{% if status.taskmaster.connected|default(false) %}Connected{% else %}Disconnected{% endif %}</div>\n```\n\nAlso add a test in test_memory_partial.py that verifies the card reflects actual taskmaster status.",
         "testStrategy": "Add test cases for taskmaster connected=true and connected=false. Verify the HTML contains the correct dot color and text for each state.",
         "status": "done",
@@ -421,7 +473,8 @@
         "metadata": {
           "modules": [
             "dashboard/src/dashboard"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
         "updatedAt": "2026-03-19T14:47:52.662Z"
@@ -429,23 +482,24 @@
       {
         "id": 38,
         "title": "Narrow broad exception handlers and add logging for silent failures",
-        "description": "Three data modules silently swallow errors, making production debugging difficult:\n\n1. orchestrator.py:35 catches bare `except Exception` on subprocess.run — this also catches KeyboardInterrupt and SystemExit. Should be `except (OSError, subprocess.TimeoutExpired)`.\n\n2. memory.py:52-53 and 65-66 silently return empty dicts on JSON parse failures with no logging. Malformed MCP responses vanish without a trace.\n\n3. reconciliation.py has 5 identical try/except blocks catching FileNotFoundError and sqlite3.OperationalError with no logging.\n\nAll three should log at WARNING level when catching errors, and the orchestrator exception should be narrowed to specific types.",
-        "details": "Files to modify:\n- dashboard/src/dashboard/data/orchestrator.py:35 — change `except Exception:` to `except (OSError, subprocess.TimeoutExpired):`\n- dashboard/src/dashboard/data/memory.py:52,65 — add `logger.warning('MCP response parse error', exc_info=True)` before returning {}\n- dashboard/src/dashboard/data/reconciliation.py — add logger and log at debug level in each except block\n\nAll three modules already import logging or can trivially add it. The key is to not change behavior (still return defaults) but make failures visible in logs.",
+        "description": "Three data modules silently swallow errors, making production debugging difficult:\n\n1. orchestrator.py:35 catches bare `except Exception` on subprocess.run \u2014 this also catches KeyboardInterrupt and SystemExit. Should be `except (OSError, subprocess.TimeoutExpired)`.\n\n2. memory.py:52-53 and 65-66 silently return empty dicts on JSON parse failures with no logging. Malformed MCP responses vanish without a trace.\n\n3. reconciliation.py has 5 identical try/except blocks catching FileNotFoundError and sqlite3.OperationalError with no logging.\n\nAll three should log at WARNING level when catching errors, and the orchestrator exception should be narrowed to specific types.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/data/orchestrator.py:35 \u2014 change `except Exception:` to `except (OSError, subprocess.TimeoutExpired):`\n- dashboard/src/dashboard/data/memory.py:52,65 \u2014 add `logger.warning('MCP response parse error', exc_info=True)` before returning {}\n- dashboard/src/dashboard/data/reconciliation.py \u2014 add logger and log at debug level in each except block\n\nAll three modules already import logging or can trivially add it. The key is to not change behavior (still return defaults) but make failures visible in logs.",
         "testStrategy": "Test that narrowed orchestrator exception still handles OSError. Test that a malformed MCP response triggers a log warning (use caplog fixture).",
-        "status": "blocked",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
-        "updatedAt": "2026-03-19T17:22:42.771Z"
+        "updatedAt": "2026-03-19T21:16:20.285Z"
       },
       {
         "id": 39,
-        "title": "Memory cards don't wrap on narrow viewports — horizontal overflow",
+        "title": "Memory cards don't wrap on narrow viewports \u2014 horizontal overflow",
         "description": "The memory health cards use `flex gap-4` without `flex-wrap`, so the four cards (Graphiti, Mem0, Taskmaster, Write Queue) are always side-by-side. On viewports narrower than ~900px, the cards get crushed below readable widths. The PRD lists mobile as a non-goal, but the cards should at least wrap gracefully on smaller desktop/laptop windows.\n\nFix: add `flex-wrap` to the flex container and set `min-w-[200px]` on each card so they wrap to 2x2 or 1-column naturally.",
         "details": "File: dashboard/src/dashboard/templates/partials/memory.html line 8\n\nCurrent: `<div class=\"flex gap-4\">`\nFix: `<div class=\"flex flex-wrap gap-4\">`\n\nAlso add `min-w-[200px]` to each card div to ensure they wrap before becoming unreadably narrow.\n\nThis is visible in the audit screenshots at tablet (768px) and mobile (480px) widths where the Write Queue card text gets truncated.",
         "testStrategy": "Visual verification at 768px and 480px widths. Test that the memory partial HTML contains flex-wrap class.",
@@ -455,7 +509,8 @@
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/templates/partials"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
         "updatedAt": "2026-03-19T13:30:00.000Z"
@@ -463,84 +518,109 @@
       {
         "id": 40,
         "title": "Add ARIA labels to status indicator dots and auto-updating sections",
-        "description": "Status indicator dots (colored circles showing connected/disconnected) throughout the dashboard are purely visual — they have no aria-label, role, or screen-reader text. This means accessibility tools see empty divs.\n\nAlso, the three auto-polling sections (memory, recon, orchestrators) lack aria-live attributes, so screen readers won't announce updates.\n\nFix: add role='status' and aria-label to indicator dots, and aria-live='polite' to each polling section.",
-        "details": "Files to modify:\n- dashboard/src/dashboard/templates/partials/memory.html — add aria-label to each status dot div (e.g., aria-label='Graphiti connected' or 'Graphiti disconnected')\n- dashboard/src/dashboard/templates/partials/recon.html — add aria-label to status badges\n- dashboard/src/dashboard/templates/index.html — add aria-live='polite' to each hx-get section\n\nExample for memory.html:\n```html\n<div class=\"w-3 h-3 rounded-full bg-green-500\" role=\"status\" aria-label=\"Graphiti connected\"></div>\n```\n\nUse Jinja2 conditionals to set the label dynamically:\n```html\naria-label=\"Graphiti {% if status.graphiti.connected|default(false) %}connected{% else %}disconnected{% endif %}\"\n```",
+        "description": "Status indicator dots (colored circles showing connected/disconnected) throughout the dashboard are purely visual \u2014 they have no aria-label, role, or screen-reader text. This means accessibility tools see empty divs.\n\nAlso, the three auto-polling sections (memory, recon, orchestrators) lack aria-live attributes, so screen readers won't announce updates.\n\nFix: add role='status' and aria-label to indicator dots, and aria-live='polite' to each polling section.",
+        "details": "Files to modify:\n- dashboard/src/dashboard/templates/partials/memory.html \u2014 add aria-label to each status dot div (e.g., aria-label='Graphiti connected' or 'Graphiti disconnected')\n- dashboard/src/dashboard/templates/partials/recon.html \u2014 add aria-label to status badges\n- dashboard/src/dashboard/templates/index.html \u2014 add aria-live='polite' to each hx-get section\n\nExample for memory.html:\n```html\n<div class=\"w-3 h-3 rounded-full bg-green-500\" role=\"status\" aria-label=\"Graphiti connected\"></div>\n```\n\nUse Jinja2 conditionals to set the label dynamically:\n```html\naria-label=\"Graphiti {% if status.graphiti.connected|default(false) %}connected{% else %}disconnected{% endif %}\"\n```",
         "testStrategy": "Test that rendered HTML contains aria-label attributes on status dots and aria-live on polling sections.",
-        "status": "blocked",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/templates/partials",
             "dashboard/src/dashboard/templates"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
-        "updatedAt": "2026-03-19T17:22:00.719Z"
+        "updatedAt": "2026-03-19T21:16:51.768Z"
       },
       {
         "id": 41,
         "title": "Extract duplicated badge color logic into Jinja2 macros",
-        "description": "Status badge HTML and color-mapping logic is duplicated 15+ times across four partial templates. Each template independently maps status strings to Tailwind color classes (e.g., 'done' → bg-green-600, 'blocked' → bg-red-600). Changes require updating every template, and inconsistencies are easy to introduce.\n\nExtract a Jinja2 macro file with reusable badge components: status_badge(status), severity_badge(severity), and indicator_dot(connected).",
+        "description": "Status badge HTML and color-mapping logic is duplicated 15+ times across four partial templates. Each template independently maps status strings to Tailwind color classes (e.g., 'done' \u2192 bg-green-600, 'blocked' \u2192 bg-red-600). Changes require updating every template, and inconsistencies are easy to introduce.\n\nExtract a Jinja2 macro file with reusable badge components: status_badge(status), severity_badge(severity), and indicator_dot(connected).",
         "details": "Create dashboard/src/dashboard/templates/macros/badges.html:\n```html\n{% macro status_badge(status) %}\n  {% set colors = {'done': 'bg-green-600', 'in-progress': 'bg-blue-600', 'pending': 'bg-yellow-600', 'blocked': 'bg-red-600', 'cancelled': 'bg-gray-600', 'deferred': 'bg-gray-600', 'running': 'bg-blue-600', 'completed': 'bg-green-600', 'failed': 'bg-red-600'} %}\n  <span class=\"inline-block px-2 py-0.5 text-xs font-medium rounded {{ colors.get(status, 'bg-gray-600') }} text-white\">{{ status }}</span>\n{% endmacro %}\n```\n\nThen replace inline badge HTML in orchestrators.html, tasks.html, recon.html with:\n```html\n{% from 'macros/badges.html' import status_badge %}\n{{ status_badge(task.status) }}\n```\n\nThis reduces ~60 lines of duplicated HTML to ~15 lines in one macro file.",
         "testStrategy": "Verify all partial templates render the same badge colors as before. Run existing test suite to ensure no visual regression.",
-        "status": "blocked",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/templates/macros",
             "dashboard/src/dashboard/templates/partials"
-          ]
+          ],
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
         },
         "subtasks": [],
-        "updatedAt": "2026-03-19T17:42:58.840Z"
+        "updatedAt": "2026-03-19T21:16:51.770Z"
       },
       {
         "id": 42,
         "title": "Bug: Harness starts duplicate workflow for each task",
-        "description": "Every task's workflow is started twice by the harness — visible as duplicate \"Starting workflow\" and \"acquired locks\" log lines. The second workflow races the first through the pipeline. When the first completes and cleans the worktree, the second crashes trying to write review files (e.g. `reviewer_test_analyst.json` ENOENT), producing false blocking escalations that require manual resolution.\n\nObserved on every task during the dashboard PRD run (tasks 33, 35, 38, 39, 40, 41). The real workflow completes and merges correctly, but the duplicate causes noise and blocks the orchestrator's final report (exit code 1).",
-        "details": "Root cause is likely in the harness's main loop where `scheduler.acquire_next()` is called and `asyncio.Task` objects are created. The acquire_next → workflow creation path probably runs twice before the task status transitions to in-progress.\n\nFiles to investigate:\n- orchestrator/src/orchestrator/harness.py — the `while True` loop around `scheduler.acquire_next()` (lines ~145-170)\n- orchestrator/src/orchestrator/scheduler.py — `acquire_next()` may return the same task twice if the status update hasn't propagated\n\nFix should ensure a task is only dispatched once, either by:\n1. Tracking dispatched task IDs in a set and skipping duplicates\n2. Atomically transitioning task status to in-progress before yielding from acquire_next\n3. Using the module lock table as a guard (if task already holds locks, skip)\n\nTest: Run orchestrator with 2+ tasks and verify each task appears exactly once in \"Starting workflow\" log lines.",
+        "description": "Every task's workflow is started twice by the harness \u2014 visible as duplicate \"Starting workflow\" and \"acquired locks\" log lines. The second workflow races the first through the pipeline. When the first completes and cleans the worktree, the second crashes trying to write review files (e.g. `reviewer_test_analyst.json` ENOENT), producing false blocking escalations that require manual resolution.\n\nObserved on every task during the dashboard PRD run (tasks 33, 35, 38, 39, 40, 41). The real workflow completes and merges correctly, but the duplicate causes noise and blocks the orchestrator's final report (exit code 1).",
+        "details": "Root cause is likely in the harness's main loop where `scheduler.acquire_next()` is called and `asyncio.Task` objects are created. The acquire_next \u2192 workflow creation path probably runs twice before the task status transitions to in-progress.\n\nFiles to investigate:\n- orchestrator/src/orchestrator/harness.py \u2014 the `while True` loop around `scheduler.acquire_next()` (lines ~145-170)\n- orchestrator/src/orchestrator/scheduler.py \u2014 `acquire_next()` may return the same task twice if the status update hasn't propagated\n\nFix should ensure a task is only dispatched once, either by:\n1. Tracking dispatched task IDs in a set and skipping duplicates\n2. Atomically transitioning task status to in-progress before yielding from acquire_next\n3. Using the module lock table as a guard (if task already holds locks, skip)\n\nTest: Run orchestrator with 2+ tasks and verify each task appears exactly once in \"Starting workflow\" log lines.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "blocked",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-19T21:21:28.835Z",
+        "metadata": {
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Bug: Harness starts duplicate workflow for each task"
+            ]
+          },
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 43,
         "title": "Bug: FusedMemoryConfig defaults assume orchestrator/ cwd",
-        "description": "The `FusedMemoryConfig` class in `orchestrator/src/orchestrator/config.py` has defaults that only work if cwd is the orchestrator subdirectory:\n- `url` defaults to `http://localhost:8000` (should match the project's port scheme)\n- `config_path` defaults to `../fused-memory/config/config.yaml`\n- `server_command` includes `--project ../fused-memory`\n\nWhen running from the repo root without `--config` (common case), these resolve incorrectly. In a multi-project setup, the wrong port can connect to another project's fused-memory server — during the dashboard run, the orchestrator connected to reify's server on port 8000 and saw 0 pending tasks.",
-        "details": "Files to modify:\n- orchestrator/src/orchestrator/config.py — FusedMemoryConfig class (line ~126)\n\nOptions:\n1. Change defaults to be repo-root-relative: `url=\"http://localhost:8002\"`, `config_path=\"fused-memory/config/config.yaml\"`, `server_command` with `--project fused-memory`\n2. Remove defaults entirely and require explicit config (fail fast with a clear error)\n3. Derive defaults from project_root at config load time\n\nOption 1 is simplest but hardcodes the dark-factory port. Option 3 is most robust — compute paths relative to project_root in a model_validator.\n\nAlso consider: the CLI's `settings_customise_sources` defaults to loading `config.yaml` from cwd. If no `--config` is passed and no `config.yaml` exists in cwd, it silently uses all defaults. Should it search upward or require explicit config?\n\nTest: Run `orchestrator run --prd <prd>` from repo root without `--config` and verify it either uses correct defaults or fails with a helpful error.",
+        "description": "The `FusedMemoryConfig` class in `orchestrator/src/orchestrator/config.py` has defaults that only work if cwd is the orchestrator subdirectory:\n- `url` defaults to `http://localhost:8000` (should match the project's port scheme)\n- `config_path` defaults to `../fused-memory/config/config.yaml`\n- `server_command` includes `--project ../fused-memory`\n\nWhen running from the repo root without `--config` (common case), these resolve incorrectly. In a multi-project setup, the wrong port can connect to another project's fused-memory server \u2014 during the dashboard run, the orchestrator connected to reify's server on port 8000 and saw 0 pending tasks.",
+        "details": "Files to modify:\n- orchestrator/src/orchestrator/config.py \u2014 FusedMemoryConfig class (line ~126)\n\nOptions:\n1. Change defaults to be repo-root-relative: `url=\"http://localhost:8002\"`, `config_path=\"fused-memory/config/config.yaml\"`, `server_command` with `--project fused-memory`\n2. Remove defaults entirely and require explicit config (fail fast with a clear error)\n3. Derive defaults from project_root at config load time\n\nOption 1 is simplest but hardcodes the dark-factory port. Option 3 is most robust \u2014 compute paths relative to project_root in a model_validator.\n\nAlso consider: the CLI's `settings_customise_sources` defaults to loading `config.yaml` from cwd. If no `--config` is passed and no `config.yaml` exists in cwd, it silently uses all defaults. Should it search upward or require explicit config?\n\nTest: Run `orchestrator run --prd <prd>` from repo root without `--config` and verify it either uses correct defaults or fails with a helpful error.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "blocked",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-19T21:17:58.969Z",
+        "metadata": {
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Bug: FusedMemoryConfig defaults assume orchestrator/ cwd"
+            ]
+          },
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       },
       {
         "id": 44,
         "title": "Bug: update_task metadata parameter rejects dict/object values",
         "description": "The fused-memory MCP tool `update_task` declares its `metadata` parameter as `string | null` in the Pydantic schema. Callers (including Claude Code's MCP tool invocation) naturally pass structured objects like `{\"modules\": [\"a\", \"b\"]}`, which get rejected with a validation error: \"Input should be a valid string\".\n\nThis forces workarounds like editing tasks.json directly or JSON-encoding the metadata before passing it, which is error-prone and defeats the purpose of the MCP tool abstraction.",
-        "details": "Files to modify:\n- fused-memory/src/fused_memory/server/tools.py — the update_task tool's parameter definition for `metadata`\n\nThe parameter should accept `dict | str | null` — if a dict is passed, use it directly; if a string is passed, JSON-parse it first. This matches how callers naturally want to use it.\n\nCheck if other task tools (add_task, add_subtask) have the same issue with metadata parameters.\n\nTest: Call update_task via MCP with metadata as both a dict and a JSON string. Verify both work and the task's metadata is updated correctly.",
+        "details": "Files to modify:\n- fused-memory/src/fused_memory/server/tools.py \u2014 the update_task tool's parameter definition for `metadata`\n\nThe parameter should accept `dict | str | null` \u2014 if a dict is passed, use it directly; if a string is passed, JSON-parse it first. This matches how callers naturally want to use it.\n\nCheck if other task tools (add_task, add_subtask) have the same issue with metadata parameters.\n\nTest: Call update_task via MCP with metadata as both a dict and a JSON string. Verify both work and the task's metadata is updated correctly.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-19T21:15:54.173Z",
+        "metadata": {
+          "prd": "/home/leo/src/dark-factory/dashboard/prd.md"
+        }
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-19T17:57:44.750Z",
-      "taskCount": 31,
-      "completedCount": 27,
+      "lastModified": "2026-03-19T21:21:28.835Z",
+      "taskCount": 34,
+      "completedCount": 32,
       "tags": [
         "master"
       ],
-      "created": "2026-03-19T19:55:31.369Z",
-      "description": "Tasks for master context",
-      "updated": "2026-03-19T19:55:50.689Z"
+      "created": "2026-03-19T21:21:29.023Z",
+      "description": "Tasks for master context"
     }
   }
 }

@@ -478,7 +478,7 @@ class TestDiscoverOrchestrators:
 
         config = DashboardConfig(project_root=tmp_path)
 
-        # Create tasks.json with 5 tasks of varying statuses
+        # Create tasks.json with 5 tasks of varying statuses + a worktree task
         tasks_dir = tmp_path / '.taskmaster' / 'tasks'
         tasks_dir.mkdir(parents=True)
         tasks = [
@@ -487,6 +487,7 @@ class TestDiscoverOrchestrators:
             {'id': '3', 'title': 'Test', 'status': 'in-progress', 'priority': 'medium', 'dependencies': ['2'], 'metadata': {}},
             {'id': '4', 'title': 'Review', 'status': 'blocked', 'priority': 'medium', 'dependencies': ['3'], 'metadata': {}},
             {'id': '5', 'title': 'Deploy', 'status': 'pending', 'priority': 'low', 'dependencies': ['4'], 'metadata': {}},
+            {'id': '7', 'title': 'Widget', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}},
         ]
         (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
 
@@ -499,20 +500,21 @@ class TestDiscoverOrchestrators:
         steps = [{'id': 'step-1', 'status': 'done'}, {'id': 'step-2', 'status': 'pending'}]
         (task_dir / 'plan.json').write_text(json.dumps({'steps': steps}))
 
-        # Mock one running orchestrator
-        mock_procs = [{'pid': 1234, 'prd': '/home/leo/prd.md', 'running': True, 'started': 'Mar18'}]
+        # Mock one running orchestrator — PRD inside tmp_path so project root resolves
+        prd_path = str(tmp_path / 'prd.md')
+        mock_procs = [{'pid': 1234, 'prd': prd_path, 'running': True, 'started': 'Mar18'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
 
         assert len(result) == 1
         entry = result[0]
         assert 1234 in entry['pids']
-        assert entry['prd'] == '/home/leo/prd.md'
+        assert entry['prd'] == prd_path
         assert entry['running'] is True
-        assert len(entry['tasks']) == 5
+        assert len(entry['tasks']) == 6
         assert '7' in entry['worktrees']
         assert entry['worktrees']['7']['phase'] == 'EXECUTE'
-        assert entry['summary'] == {'total': 5, 'done': 2, 'in_progress': 1, 'blocked': 1, 'pending': 1}
+        assert entry['summary'] == {'total': 6, 'done': 2, 'in_progress': 2, 'blocked': 1, 'pending': 1}
 
     def test_no_running_orchestrators(self, tmp_path):
         """Empty process list returns empty result."""
@@ -537,7 +539,8 @@ class TestDiscoverOrchestrators:
 
         config = DashboardConfig(project_root=tmp_path)
 
-        mock_procs = [{'pid': 5678, 'prd': '/prd.md', 'running': True, 'started': '10:30'}]
+        # PRD inside tmp_path but no .taskmaster — falls back to config.project_root
+        mock_procs = [{'pid': 5678, 'prd': str(tmp_path / 'prd.md'), 'running': True, 'started': '10:30'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
 
@@ -556,6 +559,12 @@ class TestDiscoverOrchestrators:
 
         config = DashboardConfig(project_root=tmp_path)
 
+        # Create tasks.json with a task whose id matches the worktree
+        tasks_dir = tmp_path / '.taskmaster' / 'tasks'
+        tasks_dir.mkdir(parents=True)
+        tasks = [{'id': '7', 'title': 'Widget', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}}]
+        (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
+
         # Create worktree directory using 'task-7' naming convention
         wt_dir = tmp_path / '.worktrees' / 'task-7'
         wt_dir.mkdir(parents=True)
@@ -564,7 +573,8 @@ class TestDiscoverOrchestrators:
         steps = [{'id': 'step-1', 'status': 'done'}, {'id': 'step-2', 'status': 'pending'}]
         (task_dir / 'plan.json').write_text(json.dumps({'steps': steps}))
 
-        mock_procs = [{'pid': 9000, 'prd': '/prd.md', 'running': True, 'started': 'Mar19'}]
+        prd_path = str(tmp_path / 'prd.md')
+        mock_procs = [{'pid': 9000, 'prd': prd_path, 'running': True, 'started': 'Mar19'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
 
@@ -577,12 +587,23 @@ class TestDiscoverOrchestrators:
 
     def test_non_task_worktree_dirs_excluded(self, tmp_path):
         """Non-task directories (e.g. 'tmp-backup') are excluded; plain and 'task-' numeric dirs included."""
+        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
         from dashboard.data.orchestrator import discover_orchestrators
 
         config = DashboardConfig(project_root=tmp_path)
+
+        # Create tasks.json with tasks matching the worktree IDs
+        tasks_dir = tmp_path / '.taskmaster' / 'tasks'
+        tasks_dir.mkdir(parents=True)
+        tasks = [
+            {'id': '3', 'title': 'T3', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
+            {'id': '5', 'title': 'T5', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
+        ]
+        (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
+
         worktrees_dir = tmp_path / '.worktrees'
         worktrees_dir.mkdir()
 
@@ -591,7 +612,8 @@ class TestDiscoverOrchestrators:
             d = worktrees_dir / name
             d.mkdir()
 
-        mock_procs = [{'pid': 1111, 'prd': '/prd.md', 'running': True, 'started': 'Mar19'}]
+        prd_path = str(tmp_path / 'prd.md')
+        mock_procs = [{'pid': 1111, 'prd': prd_path, 'running': True, 'started': 'Mar19'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
 
@@ -644,9 +666,10 @@ class TestDiscoverOrchestrators:
         wt_dir.mkdir(parents=True)
 
         # Two processes with identical PRD path but different PIDs
+        prd_path = str(tmp_path / 'prd.md')
         mock_procs = [
-            {'pid': 1234, 'prd': '/home/leo/prd.md', 'running': True, 'started': 'Mar18'},
-            {'pid': 5678, 'prd': '/home/leo/prd.md', 'running': False, 'started': 'Mar18'},
+            {'pid': 1234, 'prd': prd_path, 'running': True, 'started': 'Mar18'},
+            {'pid': 5678, 'prd': prd_path, 'running': False, 'started': 'Mar18'},
         ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
@@ -721,3 +744,205 @@ class TestDiscoverOrchestrators:
 
         assert len(result) == 1
         assert result[0]['running'] is False
+
+
+class TestResolveProjectRoot:
+    """Tests for _resolve_project_root — finds project root from PRD path."""
+
+    def test_finds_taskmaster_dir(self, tmp_path):
+        """Walks up from PRD and finds ancestor with .taskmaster/."""
+        from pathlib import Path
+
+        from dashboard.data.orchestrator import _resolve_project_root
+
+        (tmp_path / '.taskmaster').mkdir()
+        prd = str(tmp_path / 'docs' / 'prd.md')
+        assert _resolve_project_root(prd, Path('/fallback')) == tmp_path
+
+    def test_relative_prd_resolved_against_default(self, tmp_path):
+        """Relative PRD is resolved against default_root before walking up."""
+        from dashboard.data.orchestrator import _resolve_project_root
+
+        (tmp_path / '.taskmaster').mkdir()
+        assert _resolve_project_root('docs/prd.md', tmp_path) == tmp_path
+
+    def test_falls_back_to_default(self, tmp_path):
+        """Returns default_root when no .taskmaster/ found in any ancestor."""
+        from dashboard.data.orchestrator import _resolve_project_root
+
+        default = tmp_path / 'default'
+        default.mkdir()
+        assert _resolve_project_root('/nowhere/prd.md', default) == default
+
+    def test_dotdot_in_path(self, tmp_path):
+        """Paths with .. are canonicalized before walking."""
+        from pathlib import Path
+
+        from dashboard.data.orchestrator import _resolve_project_root
+
+        (tmp_path / '.taskmaster').mkdir()
+        prd = str(tmp_path / 'docs' / '..' / 'docs' / 'prd.md')
+        assert _resolve_project_root(prd, Path('/fallback')) == tmp_path
+
+
+class TestScanWorktrees:
+    """Tests for _scan_worktrees — reads worktree artifacts from a directory."""
+
+    def test_scans_task_dirs(self, tmp_path):
+        from dashboard.data.orchestrator import _scan_worktrees
+
+        wt_dir = tmp_path / '.worktrees'
+        wt_dir.mkdir()
+        (wt_dir / '5').mkdir()
+        (wt_dir / 'task-7').mkdir()
+        (wt_dir / 'tmp-backup').mkdir()
+
+        result = _scan_worktrees(wt_dir)
+        assert '5' in result
+        assert '7' in result
+        assert 'tmp-backup' not in result
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        from dashboard.data.orchestrator import _scan_worktrees
+
+        assert _scan_worktrees(tmp_path / 'nonexistent') == {}
+
+
+class TestDiscoverOrchestratorsPerProject:
+    """Tests for per-project task loading in discover_orchestrators."""
+
+    def test_different_projects_get_own_tasks(self, tmp_path):
+        """Two orchestrators in different projects each see their own task tree."""
+        import json
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        # Project A
+        proj_a = tmp_path / 'proj_a'
+        (proj_a / '.taskmaster' / 'tasks').mkdir(parents=True)
+        (proj_a / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+            {'id': '1', 'title': 'A1', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+            {'id': '2', 'title': 'A2', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
+        ]}))
+
+        # Project B
+        proj_b = tmp_path / 'proj_b'
+        (proj_b / '.taskmaster' / 'tasks').mkdir(parents=True)
+        (proj_b / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+            {'id': '10', 'title': 'B1', 'status': 'pending', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+        ]}))
+
+        mock_procs = [
+            {'pid': 1000, 'prd': str(proj_a / 'docs' / 'prd.md'), 'running': True, 'started': 'Mar18'},
+            {'pid': 2000, 'prd': str(proj_b / 'docs' / 'prd.md'), 'running': True, 'started': 'Mar18'},
+        ]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        by_prd = {e['prd']: e for e in result}
+
+        a_entry = by_prd[str(proj_a / 'docs' / 'prd.md')]
+        assert len(a_entry['tasks']) == 2
+        assert a_entry['summary']['total'] == 2
+        assert a_entry['summary']['done'] == 1
+
+        b_entry = by_prd[str(proj_b / 'docs' / 'prd.md')]
+        assert len(b_entry['tasks']) == 1
+        assert b_entry['summary']['total'] == 1
+        assert b_entry['summary']['pending'] == 1
+
+    def test_same_project_prds_share_task_tree(self, tmp_path):
+        """Two PRDs in the same project see the same task tree."""
+        import json
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        (tmp_path / '.taskmaster' / 'tasks').mkdir(parents=True)
+        (tmp_path / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+            {'id': '1', 'title': 'T1', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+        ]}))
+
+        mock_procs = [
+            {'pid': 1000, 'prd': str(tmp_path / 'prd1.md'), 'running': True, 'started': 'Mar18'},
+            {'pid': 2000, 'prd': str(tmp_path / 'prd2.md'), 'running': True, 'started': 'Mar18'},
+        ]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        # Both see the same task tree
+        assert len(result) == 2
+        for entry in result:
+            assert len(entry['tasks']) == 1
+
+    def test_worktrees_loaded_per_project(self, tmp_path):
+        """Each orchestrator sees worktrees from its own project."""
+        import json
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        # Project A with worktree for task 3
+        proj_a = tmp_path / 'proj_a'
+        (proj_a / '.taskmaster' / 'tasks').mkdir(parents=True)
+        (proj_a / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+            {'id': '3', 'title': 'A-task', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+        ]}))
+        wt_a = proj_a / '.worktrees' / '3' / '.task'
+        wt_a.mkdir(parents=True)
+        (wt_a / 'plan.json').write_text(json.dumps({'steps': [{'id': 's1', 'status': 'done'}]}))
+
+        # Project B with worktree for task 5
+        proj_b = tmp_path / 'proj_b'
+        (proj_b / '.taskmaster' / 'tasks').mkdir(parents=True)
+        (proj_b / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+            {'id': '5', 'title': 'B-task', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+        ]}))
+        wt_b = proj_b / '.worktrees' / '5' / '.task'
+        wt_b.mkdir(parents=True)
+        (wt_b / 'plan.json').write_text(json.dumps({'steps': [{'id': 's1', 'status': 'pending'}]}))
+
+        mock_procs = [
+            {'pid': 1000, 'prd': str(proj_a / 'prd.md'), 'running': True, 'started': 'Mar18'},
+            {'pid': 2000, 'prd': str(proj_b / 'prd.md'), 'running': True, 'started': 'Mar18'},
+        ]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        by_prd = {e['prd']: e for e in result}
+        assert set(by_prd[str(proj_a / 'prd.md')]['worktrees'].keys()) == {'3'}
+        assert by_prd[str(proj_a / 'prd.md')]['worktrees']['3']['phase'] == 'DONE'
+        assert set(by_prd[str(proj_b / 'prd.md')]['worktrees'].keys()) == {'5'}
+        assert by_prd[str(proj_b / 'prd.md')]['worktrees']['5']['phase'] == 'EXECUTE'
+
+    def test_fallback_to_config_project_root(self, tmp_path):
+        """When PRD path has no .taskmaster/ ancestor, falls back to config project_root."""
+        import json
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        (tmp_path / '.taskmaster' / 'tasks').mkdir(parents=True)
+        (tmp_path / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+            {'id': '1', 'title': 'T', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+        ]}))
+
+        mock_procs = [{'pid': 1000, 'prd': '/nonexistent/prd.md', 'running': True, 'started': 'Mar18'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        assert len(result[0]['tasks']) == 1
