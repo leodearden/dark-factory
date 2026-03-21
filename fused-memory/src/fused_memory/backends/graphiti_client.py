@@ -21,6 +21,14 @@ from fused_memory.config.schema import FusedMemoryConfig
 logger = logging.getLogger(__name__)
 
 
+class NodeNotFoundError(Exception):
+    """Raised when a node UUID is not found in FalkorDB."""
+
+
+class EdgeNotFoundError(Exception):
+    """Raised when an edge UUID is not found in FalkorDB."""
+
+
 class GraphitiBackend:
     """Owns the Graphiti client lifecycle."""
 
@@ -231,6 +239,131 @@ class GraphitiBackend:
             client.build_communities(group_ids=group_ids),
             timeout=self._write_timeout,
         )
+
+    async def query_stale_node_embeddings(
+        self, expected_dim: int
+    ) -> list[tuple[str, str, int]]:
+        """Return (uuid, name, dim) for Entity nodes whose embedding dim != expected_dim."""
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH (n:Entity) '
+            'WHERE n.name_embedding IS NOT NULL '
+            'AND size(n.name_embedding) <> $dim '
+            'RETURN n.uuid, n.name, size(n.name_embedding) AS dim'
+        )
+        result = await graph.query(cypher, {'dim': expected_dim})
+        return [
+            (row[0], row[1], row[2])
+            for row in (result.result_set or [])
+        ]
+
+    async def query_stale_edge_embeddings(
+        self, expected_dim: int
+    ) -> list[tuple[str, str, int]]:
+        """Return (uuid, name, dim) for RELATES_TO edges whose embedding dim != expected_dim."""
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH (n)-[e:RELATES_TO]->(m) '
+            'WHERE e.fact_embedding IS NOT NULL '
+            'AND size(e.fact_embedding) <> $dim '
+            'RETURN e.uuid, e.name, size(e.fact_embedding) AS dim'
+        )
+        result = await graph.query(cypher, {'dim': expected_dim})
+        return [
+            (row[0], row[1], row[2])
+            for row in (result.result_set or [])
+        ]
+
+    async def get_node_text(self, uuid: str) -> tuple[str, str]:
+        """Return (name, summary) for the Entity node with the given UUID.
+
+        Raises:
+            NodeNotFoundError: if no node with that UUID exists.
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH (n:Entity {uuid: $uuid}) '
+            'RETURN n.name, n.summary'
+        )
+        result = await graph.query(cypher, {'uuid': uuid})
+        if not result.result_set:
+            raise NodeNotFoundError(f'Entity node not found: {uuid}')
+        row = result.result_set[0]
+        return (row[0], row[1] or '')
+
+    async def get_edge_text(self, uuid: str) -> tuple[str, str]:
+        """Return (name, fact) for the RELATES_TO edge with the given UUID.
+
+        Raises:
+            EdgeNotFoundError: if no edge with that UUID exists.
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
+            'RETURN e.name, e.fact'
+        )
+        result = await graph.query(cypher, {'uuid': uuid})
+        if not result.result_set:
+            raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
+        row = result.result_set[0]
+        return (row[0] or '', row[1] or '')
+
+    async def update_node_embedding(self, uuid: str, embedding: list[float]) -> None:
+        """Update the name_embedding vector for an Entity node using vecf32()."""
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH (n:Entity {uuid: $uuid}) '
+            'SET n.name_embedding = vecf32($embedding)'
+        )
+        await graph.query(cypher, {'uuid': uuid, 'embedding': embedding})
+
+    async def update_edge_embedding(self, uuid: str, embedding: list[float]) -> None:
+        """Update the fact_embedding vector for a RELATES_TO edge using vecf32()."""
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
+            'SET e.fact_embedding = vecf32($embedding)'
+        )
+        await graph.query(cypher, {'uuid': uuid, 'embedding': embedding})
+
+    async def list_indices(self) -> list[dict]:
+        """Return parsed index records from the graph.
+
+        Each record is a dict with keys: label, field, type, entity_type.
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        result = await graph.query('CALL db.indexes()')
+        indices = []
+        for row in (result.result_set or []):
+            indices.append({
+                'label': row[0],
+                'field': row[1],
+                'type': row[2],
+                'entity_type': row[3],
+            })
+        return indices
+
+    async def drop_index(self, label: str, field: str) -> None:
+        """Drop an index on the given label and field (FalkorDB syntax)."""
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = f'DROP INDEX ON :{label}({field})'
+        await graph.query(cypher)
 
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
