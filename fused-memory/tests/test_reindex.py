@@ -227,3 +227,79 @@ class TestGetEdgeText:
         args, kwargs = call_kwargs
         params = args[1] if len(args) > 1 else kwargs.get('params', {})
         assert params.get('uuid') == 'specific-edge-uuid'
+
+
+# ---------------------------------------------------------------------------
+# step-5: update_node_embedding / update_edge_embedding
+# ---------------------------------------------------------------------------
+
+class TestUpdateNodeEmbedding:
+    """GraphitiBackend.update_node_embedding(uuid, embedding) stores new vector."""
+
+    @pytest.mark.asyncio
+    async def test_calls_set_with_embedding(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        embedding = [0.1] * 1536
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.update_node_embedding('uuid-1', embedding)
+        assert graph.query.called
+
+    @pytest.mark.asyncio
+    async def test_passes_uuid_and_embedding_to_query(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        embedding = [0.5] * 128
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.update_node_embedding('my-uuid', embedding)
+        call_args = graph.query.call_args
+        args, kwargs = call_args
+        params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        assert params.get('uuid') == 'my-uuid'
+        assert params.get('embedding') == embedding
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.update_node_embedding('uuid-1', [0.1] * 10)
+
+
+class TestUpdateEdgeEmbedding:
+    """GraphitiBackend.update_edge_embedding(uuid, embedding) stores new vector."""
+
+    @pytest.mark.asyncio
+    async def test_calls_set_with_embedding(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        embedding = [0.2] * 1536
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.update_edge_embedding('edge-uuid', embedding)
+        assert graph.query.called
+
+    @pytest.mark.asyncio
+    async def test_passes_uuid_and_embedding_to_query(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        embedding = [0.7] * 64
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.update_edge_embedding('edge-uuid-99', embedding)
+        call_args = graph.query.call_args
+        args, kwargs = call_args
+        params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        assert params.get('uuid') == 'edge-uuid-99'
+        assert params.get('embedding') == embedding
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.update_edge_embedding('edge-uuid', [0.1] * 10)
