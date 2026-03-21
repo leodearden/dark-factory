@@ -72,6 +72,71 @@ STAGE_REPORT_SCHEMA: dict[str, Any] = {
     'required': ['summary'],
 }
 
+# Structured schema for individual finding items (Stage 3)
+FINDING_ITEM_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'properties': {
+        'description': {
+            'type': 'string',
+            'description': 'What the inconsistency is, with specific IDs and evidence',
+        },
+        'severity': {
+            'type': 'string',
+            'enum': ['minor', 'moderate', 'serious'],
+            'description': 'Severity level of the finding',
+        },
+        'actionable': {
+            'type': 'boolean',
+            'description': 'True if Stage 1/Stage 2 can fix it automatically',
+        },
+        'category': {
+            'type': 'string',
+            'enum': [
+                'memory_stale',
+                'memory_duplicate',
+                'memory_contradiction',
+                'task_memory_mismatch',
+                'missing_knowledge',
+                'cross_store_inconsistency',
+                'systemic_pattern',
+                'other',
+            ],
+            'description': 'Category of the finding',
+        },
+        'affected_ids': {
+            'type': 'array',
+            'items': {'type': 'string'},
+            'description': 'Memory IDs, entity names, or task IDs involved',
+        },
+        'suggested_action': {
+            'type': 'string',
+            'description': 'What the remediation stage should do to fix this finding',
+        },
+    },
+    'required': ['description', 'severity'],
+}
+
+# Stage 3-specific report schema with structured finding items
+STAGE3_REPORT_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'properties': {
+        'flagged_items': {
+            'type': 'array',
+            'items': FINDING_ITEM_SCHEMA,
+            'description': 'Findings from the integrity check',
+        },
+        'stats': {
+            'type': 'object',
+            'description': 'Counts and metrics from this stage',
+        },
+        'summary': {
+            'type': 'string',
+            'description': 'Human-readable summary of what was done',
+        },
+    },
+    'required': ['summary'],
+}
+
 
 @dataclass
 class StageResult:
