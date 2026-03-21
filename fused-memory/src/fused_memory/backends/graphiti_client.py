@@ -21,6 +21,14 @@ from fused_memory.config.schema import FusedMemoryConfig
 logger = logging.getLogger(__name__)
 
 
+class NodeNotFoundError(Exception):
+    """Raised when a node UUID is not found in FalkorDB."""
+
+
+class EdgeNotFoundError(Exception):
+    """Raised when an edge UUID is not found in FalkorDB."""
+
+
 class GraphitiBackend:
     """Owns the Graphiti client lifecycle."""
 
@@ -269,6 +277,44 @@ class GraphitiBackend:
             (row[0], row[1], row[2])
             for row in (result.result_set or [])
         ]
+
+    async def get_node_text(self, uuid: str) -> tuple[str, str]:
+        """Return (name, summary) for the Entity node with the given UUID.
+
+        Raises:
+            NodeNotFoundError: if no node with that UUID exists.
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH (n:Entity {uuid: $uuid}) '
+            'RETURN n.name, n.summary'
+        )
+        result = await graph.query(cypher, {'uuid': uuid})
+        if not result.result_set:
+            raise NodeNotFoundError(f'Entity node not found: {uuid}')
+        row = result.result_set[0]
+        return (row[0], row[1] or '')
+
+    async def get_edge_text(self, uuid: str) -> tuple[str, str]:
+        """Return (name, fact) for the RELATES_TO edge with the given UUID.
+
+        Raises:
+            EdgeNotFoundError: if no edge with that UUID exists.
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
+            'RETURN e.name, e.fact'
+        )
+        result = await graph.query(cypher, {'uuid': uuid})
+        if not result.result_set:
+            raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
+        row = result.result_set[0]
+        return (row[0] or '', row[1] or '')
 
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
