@@ -13,6 +13,7 @@ from fused_memory.models.reconciliation import (
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
+    STAGE3_REPORT_SCHEMA,
 )
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
@@ -108,6 +109,9 @@ class IntegrityCheck(BaseStage):
 
     def get_disallowed_tools(self) -> list[str]:
         return STAGE3_DISALLOWED
+
+    def get_report_schema(self) -> dict:
+        return STAGE3_REPORT_SCHEMA
 
     async def assemble_payload(
         self,

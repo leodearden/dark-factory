@@ -1,148 +1,142 @@
 {
-  "task_id": "79",
-  "title": "Fix module tagger metadata serialization \u2014 update_task expects string, gets dict",
+  "task_id": "80",
+  "title": "Fix Stage 3 reporter: finding fields serialized as '?' placeholder",
   "files": [
-    "orchestrator/src/orchestrator/scheduler.py",
-    "orchestrator/tests/test_scheduler.py"
+    "fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py",
+    "fused-memory/src/fused_memory/reconciliation/stages/base.py",
+    "fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py",
+    "fused-memory/src/fused_memory/reconciliation/prompts/stage3.py",
+    "fused-memory/tests/test_stages.py"
   ],
   "modules": [
-    "orchestrator/src/orchestrator",
-    "orchestrator/tests"
+    "fused-memory/src/fused_memory/reconciliation",
+    "fused-memory/src/fused_memory/reconciliation/stages",
+    "fused-memory/src/fused_memory/reconciliation/prompts",
+    "fused-memory/tests"
   ],
-  "analysis": "The write-side serialization bug (dict passed where string expected) is ALREADY FIXED in scheduler.update_task() at line 229-233 \u2014 it accepts `str | dict` and json.dumps dicts before the MCP call. The fused-memory server's update_task tool (tools.py:700-732) also independently coerces dicts, and has tests for it (test_health_endpoint.py:60-85). Callers: harness._tag_task_modules already pre-serializes (line 381), harness._tag_prd_metadata passes a dict (line 259) which the scheduler handles, handle_blast_radius_expansion pre-serializes (line 375) with a redundant `import json` (line 374, json is already imported at line 5).\n\nThe REAL remaining bug is on the READ SIDE: _get_modules() (line 390-413) only handles dict metadata (`isinstance(metadata, dict)`). Taskmaster stores metadata as a string internally \u2014 the taskmaster_client.update_task signature is `metadata: str | None` (line 211). When get_tasks() returns tasks, metadata may come back as a JSON string like '{\"modules\": [\"backend\"]}'. In that case, _get_modules falls through to the `task-<id>` fallback silently, defeating the entire concurrency locking system.\n\nAdditionally, the fallback to `task-<id>` is completely silent \u2014 no log output indicates when module extraction fails and generic locks are used. This makes the degradation invisible in production logs.\n\nPlan: (1) Add tests + fix for _get_modules to parse JSON string metadata, (2) Add warning log for fallback, (3) Add regression tests for the write-side serialization, (4) Clean up redundant import.\n\n--- POST-REVIEW ADDENDUM ---\nReview identified log_flooding issue: the fallback WARNING in _get_modules fires on every poll cycle for every untagged task (thousands of times per run). Fix: add a `self._fallback_warned: set[str]` on the Scheduler instance and gate the warning to fire only once per task ID.",
+  "analysis": "Stage 3 (IntegrityCheck) runs as a Claude CLI subprocess that outputs a structured JSON report. The report schema (STAGE_REPORT_SCHEMA) defines flagged_items as an array of generic objects ({type: object}) with no required properties on the items. Meanwhile, the Stage 3 system prompt instructs the LLM to produce 'findings' with specific fields (description, severity, actionable, category, affected_ids, suggested_action) but never mentions the key 'flagged_items'. This prompt/schema disconnect causes two failure modes: (1) the LLM puts real findings under a 'findings' key instead of 'flagged_items', so report_data.get('flagged_items', []) gets empty stubs; (2) even when items land in 'flagged_items', the generic schema doesn't enforce field structure, so the LLM outputs placeholder values. Downstream, _format_findings() uses .get('description', '?') etc., producing the observed '?' output in serialized stage_reports. The BaseStage.run() method at line 120 maps report_data['flagged_items'] to StageReport.items_flagged, and run_stage_via_cli hardcodes STAGE_REPORT_SCHEMA. Fix requires: normalization in _extract_report (remap findings\u2192flagged_items, filter placeholders), a Stage 3-specific schema with finding item structure, per-stage schema via get_report_schema() override, and prompt alignment.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing test `test_get_modules_extracts_modules_from_json_string_metadata`: create a Scheduler, call _get_modules with a task dict where metadata is a JSON string '{\"modules\": [\"backend\", \"server\"]}'. Assert it returns the normalized module list, NOT the task-<id> fallback. This will FAIL because _get_modules only handles dict metadata (isinstance check on line 401).",
+      "description": "Write test test_extract_report_normalizes_findings_to_flagged_items in test_stages.py: create an AgentResult with structured_output={'findings': [{'description': 'stale edge', 'severity': 'moderate'}], 'summary': 'done'} (no flagged_items key). Call _extract_report and assert the returned dict has 'flagged_items' containing the finding, not 'findings'. Also test that when both 'findings' and 'flagged_items' exist, flagged_items is preserved as-is.",
       "status": "done",
-      "commit": "1b4e366"
+      "commit": "23d38cf"
     },
     {
       "id": "step-2",
-      "type": "test",
-      "description": "Write failing test `test_get_modules_extracts_files_from_json_string_metadata`: create a Scheduler, call _get_modules with a task dict where metadata is a JSON string '{\"files\": [\"src/server/app.py\", \"src/server/routes.py\"]}'. Assert it returns files_to_modules-derived modules, NOT the fallback. This will also FAIL for the same reason.",
+      "type": "impl",
+      "description": "Add _normalize_report(report: dict) -> dict function in cli_stage_runner.py that: (1) if report has 'findings' but not 'flagged_items', moves 'findings' to 'flagged_items'; (2) if both exist and 'flagged_items' is empty, uses 'findings'. Call _normalize_report at the end of _extract_report before returning the dict.",
       "status": "done",
-      "commit": "1b4e366"
+      "commit": "6d3af6c"
     },
     {
       "id": "step-3",
-      "type": "impl",
-      "description": "Fix _get_modules() in scheduler.py: before the `isinstance(metadata, dict)` check, add a block that parses JSON string metadata: `if isinstance(metadata, str): try: metadata = json.loads(metadata) except (json.JSONDecodeError, TypeError): pass`. This allows both dict and string metadata to flow into the existing files/modules extraction logic. Both step-1 and step-2 tests should now pass.",
+      "type": "test",
+      "description": "Write test test_normalize_filters_placeholder_findings: pass findings where all of description/severity/category are '?' or missing to _normalize_report and assert they are filtered out. Pass a mix of valid and placeholder findings and assert only valid ones survive. A finding is valid if description is present and not '?'.",
       "status": "done",
-      "commit": "3113182"
+      "commit": "d93b6cd"
     },
     {
       "id": "step-4",
-      "type": "test",
-      "description": "Write test `test_get_modules_handles_malformed_json_string_metadata`: call _get_modules with metadata='not valid json'. Assert it returns the task-<id> fallback gracefully (no exception raised). This should PASS with the try/except from step-3, but confirms graceful degradation.",
+      "type": "impl",
+      "description": "Add placeholder-filtering logic to _normalize_report: after key remapping, iterate flagged_items and drop any finding dict where description is missing, empty, or '?'. Log a warning with the count of filtered findings.",
       "status": "done",
-      "commit": "699e633"
+      "commit": "6d3af6c"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write failing test `test_get_modules_logs_warning_on_fallback`: call _get_modules with a task that has no metadata (empty dict). Use caplog to assert a WARNING-level log is emitted mentioning the task ID and 'fallback'. This will FAIL because the current fallback path at line 413 has no logging.",
-      "status": "done",
-      "commit": "f0a8bd0"
+      "description": "Write test test_stage3_report_schema_has_finding_item_properties: import STAGE3_REPORT_SCHEMA from cli_stage_runner and assert its flagged_items.items has 'properties' containing description, severity, actionable, category, affected_ids, suggested_action, and 'required' includes at least description and severity.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Add a warning log to the fallback path in _get_modules() (line 413): `logger.warning('Task %s: no module metadata found \u2014 using fallback lock task-%s', task_id, task_id)` before the return statement. Step-5 test should now pass.",
-      "status": "done",
-      "commit": "1aee8ac"
+      "description": "Define FINDING_ITEM_SCHEMA dict in cli_stage_runner.py with type: object and properties: description (string), severity (string, enum: minor/moderate/serious), actionable (boolean), category (string, enum of valid categories), affected_ids (array of strings), suggested_action (string). Required: [description, severity]. Define STAGE3_REPORT_SCHEMA by deep-copying STAGE_REPORT_SCHEMA and replacing flagged_items.items with FINDING_ITEM_SCHEMA.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-7",
       "type": "test",
-      "description": "Write regression test `test_update_task_serializes_dict_to_json_string`: monkeypatch mcp_call, call scheduler.update_task('1', {'modules': ['backend']}), assert the MCP call's arguments dict has metadata as a JSON string (not a dict). This should PASS immediately \u2014 it's a regression guard for the existing fix at line 232.",
-      "status": "done",
-      "commit": "42d8d38"
+      "description": "Write test test_integrity_check_uses_stage3_report_schema: instantiate IntegrityCheck and MemoryConsolidator with mock deps. Assert IntegrityCheck.get_report_schema() returns STAGE3_REPORT_SCHEMA while MemoryConsolidator.get_report_schema() returns STAGE_REPORT_SCHEMA.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-8",
-      "type": "test",
-      "description": "Write regression test `test_update_task_passes_string_metadata_through`: monkeypatch mcp_call, call scheduler.update_task('1', '{\"modules\": [\"backend\"]}'), assert the MCP call's arguments dict has the same string. Verifies string metadata is not double-serialized.",
-      "status": "done",
-      "commit": "42d8d38"
+      "type": "impl",
+      "description": "Add get_report_schema(self) -> dict method to BaseStage returning STAGE_REPORT_SCHEMA (import it). Override in IntegrityCheck to return STAGE3_REPORT_SCHEMA. Add output_schema: dict | None = None parameter to run_stage_via_cli (defaults to STAGE_REPORT_SCHEMA when None). In BaseStage.run(), pass output_schema=self.get_report_schema() to run_stage_via_cli.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-9",
-      "type": "impl",
-      "description": "Clean up redundant `import json` at line 374 inside handle_blast_radius_expansion() \u2014 json is already imported at file top (line 5). Also simplify the call on line 375 from `json.dumps({'modules': needed})` to just `{'modules': needed}` since update_task handles dict serialization. All existing tests should remain green.",
-      "status": "done",
-      "commit": "d90bc9d"
+      "type": "test",
+      "description": "Write test test_stage3_prompt_references_flagged_items: import STAGE3_SYSTEM_PROMPT and assert it contains 'flagged_items' at least once, ensuring the LLM is explicitly told to use the correct output key.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-10",
-      "type": "test",
-      "description": "Write failing test `test_get_modules_fallback_warning_emitted_only_once`: create a Scheduler, call _get_modules TWICE with the same task (id='9', metadata={}). Use caplog to assert the WARNING mentioning task 9 appears exactly ONCE in the log records (not twice). This will FAIL because the current implementation logs unconditionally on every call \u2014 there is no dedup guard.",
-      "status": "done",
-      "commit": "5ae6a03"
-    },
-    {
-      "id": "step-11",
       "type": "impl",
-      "description": "Add `self._fallback_warned: set[str] = set()` to Scheduler.__init__ (after _status_cache). In _get_modules(), gate the logger.warning call: only emit if `task_id not in self._fallback_warned`, then add `self._fallback_warned.add(task_id)` after logging. This ensures the fallback warning fires at most once per task ID per Scheduler lifetime. Step-10 test should now pass, and step-5's existing test (single call) remains green.",
-      "status": "done",
-      "commit": "73b854e"
+      "description": "Update STAGE3_SYSTEM_PROMPT in prompts/stage3.py: add an '## Output Format' section at the end that explicitly instructs the LLM to put all findings in the `flagged_items` array of its structured JSON output (not a `findings` key), and reiterates that each item must include description, severity, actionable, category, affected_ids, and suggested_action.",
+      "status": "pending",
+      "commit": null
     }
   ],
   "design_decisions": [
     {
-      "decision": "Fix the read side (_get_modules) rather than only the write side (update_task)",
-      "rationale": "The write-side fix (scheduler.update_task dict\u2192JSON coercion) is already in place. But _get_modules only handles dict metadata. Taskmaster stores metadata as a string internally (taskmaster_client.update_task has `metadata: str | None`), so when tasks are read back, metadata may be a JSON string. Fixing only the write side leaves the read side broken \u2014 modules are persisted correctly but can't be extracted, so locks still fall back to task-<id>."
+      "decision": "Normalize report in _extract_report rather than BaseStage.run()",
+      "rationale": "_extract_report is the single extraction point for all stage outputs. Normalizing here means all stages benefit from the findings\u2192flagged_items key mapping, and the fix is contained in one function rather than scattered across the call chain."
     },
     {
-      "decision": "Parse string metadata in _get_modules rather than in get_tasks",
-      "rationale": "_get_modules is the single consumer of metadata.files and metadata.modules. Parsing at the consumption point is more robust (handles both dict and string regardless of transport) and doesn't risk side effects in the general-purpose get_tasks method. Keeps the fix localized."
+      "decision": "Filter placeholder findings based on description content, not all fields",
+      "rationale": "A finding is meaningful if it has a real description. Checking only description (not missing and not '?') is the minimal gate that filters LLM placeholder output while being tolerant of partially-populated findings that still carry useful info."
     },
     {
-      "decision": "Keep task-<id> fallback as intentional safe degradation, but add WARNING log",
-      "rationale": "The task-<id> fallback is safe \u2014 it over-serializes (no two tasks run concurrently on the same generic lock) rather than under-serializing. This is correct defensive behavior. However, silent fallback made the bug invisible in production. A WARNING log makes the degradation visible without changing the safety behavior."
+      "decision": "Per-stage report schema via get_report_schema() override rather than config",
+      "rationale": "Follows the existing pattern where stages override get_system_prompt() and get_disallowed_tools(). Adding get_report_schema() is consistent and doesn't require config changes. Stage 3 gets a specific schema with finding item structure; other stages keep the generic schema."
     },
     {
-      "decision": "Deduplicate fallback warning with per-instance _fallback_warned set",
-      "rationale": "_get_modules() is called on every scheduler poll cycle for every pending task. Without dedup, tasks that legitimately lack module metadata (pre-convention tasks, failed update_task calls) emit the warning thousands of times per run, drowning out genuine warnings. A set[str] on the Scheduler instance tracks which task IDs have been warned; the warning fires once per task ID per Scheduler lifetime. This preserves the diagnostic value (first occurrence is logged) while eliminating log flooding."
+      "decision": "Add output_schema parameter to run_stage_via_cli with backward-compatible default",
+      "rationale": "Currently STAGE_REPORT_SCHEMA is hardcoded in run_stage_via_cli. Making it a parameter with default=None (falling back to STAGE_REPORT_SCHEMA) is backward-compatible and allows per-stage schemas without breaking existing callers."
     },
     {
-      "decision": "Do not change harness._tag_prd_metadata caller to pre-serialize",
-      "rationale": "The harness passes a dict {'prd': resolved_prd} to scheduler.update_task, which handles serialization. Changing the harness for 'consistency' would require updating test_harness_prd_tagging.py assertions and adds no safety value since both scheduler.update_task AND the fused-memory server handle dict coercion. The existing defense-in-depth (double coercion at scheduler + server) is sufficient."
-    },
-    {
-      "decision": "Simplify handle_blast_radius_expansion to pass dict instead of pre-serialized JSON string",
-      "rationale": "Removes the redundant `import json` (line 374) and makes the calling convention consistent: all callers pass dicts, scheduler.update_task handles serialization. The pre-serialization was a workaround for the original bug; with the scheduler fix in place, it's unnecessary indirection."
+      "decision": "Update Stage 3 prompt to explicitly mention flagged_items key",
+      "rationale": "The root cause is the disconnect between the prompt (which says 'findings') and the output schema (which uses 'flagged_items'). Even with normalization as a safety net, aligning the prompt with the schema key is the primary fix \u2014 it tells the LLM exactly where to put the data."
     }
   ],
   "reuse": [
     {
-      "what": "Existing Scheduler fixture pattern (OrchestratorConfig(max_per_module=1))",
-      "where": "orchestrator/tests/test_scheduler.py \u2014 TestStatusTransitionGuard, TestAcquireNextNoDuplicates, etc.",
-      "how": "Reuse the same pattern: create OrchestratorConfig(max_per_module=1), instantiate Scheduler(config). Used in all scheduler test classes."
+      "what": "STAGE_REPORT_SCHEMA base structure",
+      "where": "fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py",
+      "how": "STAGE3_REPORT_SCHEMA extends the base schema by replacing flagged_items.items with FINDING_ITEM_SCHEMA. The base schema structure (summary, stats, flagged_items) is preserved."
     },
     {
-      "what": "AsyncMock + monkeypatch pattern for mcp_call",
-      "where": "orchestrator/tests/test_scheduler.py \u2014 TestStatusTransitionGuard (line 311)",
-      "how": "monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value={})) \u2014 intercepts MCP calls to verify arguments without network."
+      "what": "BaseStage override pattern (get_system_prompt, get_disallowed_tools)",
+      "where": "fused-memory/src/fused_memory/reconciliation/stages/base.py",
+      "how": "get_report_schema() follows the same pattern \u2014 default implementation in BaseStage, override in IntegrityCheck. Consistent with existing stage customization hooks."
     },
     {
-      "what": "caplog fixture for log assertion",
-      "where": "orchestrator/tests/test_scheduler.py \u2014 TestDepsSatisfiedLogging (line 867)",
-      "how": "Use caplog.at_level(logging.WARNING, logger='orchestrator.scheduler') to capture and assert warning log messages in the fallback path."
+      "what": "Existing test fixtures and patterns in test_stages.py",
+      "where": "fused-memory/tests/test_stages.py",
+      "how": "New tests use existing TestStageSubclasses.mock_deps fixture and TestStageReportSchema class structure. _extract_report tests create AgentResult objects directly (from shared.cli_invoke)."
     },
     {
-      "what": "scheduler.update_task dict\u2192JSON coercion (already implemented)",
-      "where": "orchestrator/src/orchestrator/scheduler.py lines 229-233",
-      "how": "The existing `isinstance(metadata, dict) \u2192 json.dumps` pattern is the template for the analogous fix in _get_modules (string \u2192 json.loads)."
+      "what": "_make_s3_findings() test helper field structure",
+      "where": "fused-memory/tests/test_harness.py",
+      "how": "Reference for what well-formed findings look like. The same field structure (description, severity, actionable, category, affected_ids, suggested_action) is codified in FINDING_ITEM_SCHEMA."
     },
     {
-      "what": "fused-memory server-side dict coercion pattern and tests",
-      "where": "fused-memory/src/fused_memory/server/tools.py lines 720-721, fused-memory/tests/test_health_endpoint.py lines 60-85",
-      "how": "The server already handles dict metadata coercion with tests. This is defense-in-depth \u2014 both client (scheduler) and server handle the conversion."
+      "what": "Finding field access pattern from _format_findings and harness._maybe_remediate",
+      "where": "fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py lines 180-195, harness.py lines 480-488",
+      "how": "These downstream consumers use .get('description', '?'), .get('actionable', False) etc. The FINDING_ITEM_SCHEMA required fields match exactly what these consumers expect, ensuring findings that pass validation will work downstream."
     }
   ],
-  "_session_id": "79-eb2cd416",
-  "_created_at": "2026-03-21T08:20:35.032590+00:00"
+  "_session_id": "80-4d3928ff",
+  "_created_at": "2026-03-21T08:22:49.922901+00:00"
 }
