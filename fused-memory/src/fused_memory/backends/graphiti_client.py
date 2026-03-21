@@ -232,6 +232,44 @@ class GraphitiBackend:
             timeout=self._write_timeout,
         )
 
+    async def query_stale_node_embeddings(
+        self, expected_dim: int
+    ) -> list[tuple[str, str, int]]:
+        """Return (uuid, name, dim) for Entity nodes whose embedding dim != expected_dim."""
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH (n:Entity) '
+            'WHERE n.name_embedding IS NOT NULL '
+            'AND size(n.name_embedding) <> $dim '
+            'RETURN n.uuid, n.name, size(n.name_embedding) AS dim'
+        )
+        result = await graph.query(cypher, {'dim': expected_dim})
+        return [
+            (row[0], row[1], row[2])
+            for row in (result.result_set or [])
+        ]
+
+    async def query_stale_edge_embeddings(
+        self, expected_dim: int
+    ) -> list[tuple[str, str, int]]:
+        """Return (uuid, name, dim) for RELATES_TO edges whose embedding dim != expected_dim."""
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH (n)-[e:RELATES_TO]->(m) '
+            'WHERE e.fact_embedding IS NOT NULL '
+            'AND size(e.fact_embedding) <> $dim '
+            'RETURN e.uuid, e.name, size(e.fact_embedding) AS dim'
+        )
+        result = await graph.query(cypher, {'dim': expected_dim})
+        return [
+            (row[0], row[1], row[2])
+            for row in (result.result_set or [])
+        ]
+
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
         client = self._require_client()
