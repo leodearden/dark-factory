@@ -379,3 +379,132 @@ class TestDropIndex:
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.drop_index('Entity', 'name_embedding')
+
+
+# ---------------------------------------------------------------------------
+# step-9: ReindexManager
+# ---------------------------------------------------------------------------
+
+class TestReindexManager:
+    """ReindexManager.reindex() orchestrates stale-embedding detection and re-embedding."""
+
+    def _make_manager(self, backend, embedder, expected_dim=1536):
+        from fused_memory.maintenance.reindex import ReindexManager
+        return ReindexManager(backend=backend, embedder=embedder, expected_dim=expected_dim)
+
+    @pytest.mark.asyncio
+    async def test_reindex_processes_stale_nodes_and_edges(self):
+        """Finds 2 stale nodes and 1 stale edge, re-embeds each, updates embeddings."""
+        from fused_memory.maintenance.reindex import ReindexManager
+
+        backend = MagicMock()
+        backend.query_stale_node_embeddings = AsyncMock(return_value=[
+            ('node-uuid-1', 'Alice', 1024),
+            ('node-uuid-2', 'Bob', 1024),
+        ])
+        backend.query_stale_edge_embeddings = AsyncMock(return_value=[
+            ('edge-uuid-1', 'knows', 1024),
+        ])
+        backend.get_node_text = AsyncMock(side_effect=[
+            ('Alice', 'Alice is a person'),
+            ('Bob', 'Bob is a developer'),
+        ])
+        backend.get_edge_text = AsyncMock(return_value=('knows', 'Alice knows Bob'))
+        backend.update_node_embedding = AsyncMock()
+        backend.update_edge_embedding = AsyncMock()
+
+        embedder = MagicMock()
+        new_embedding = [0.1] * 1536
+        embedder.create = AsyncMock(return_value=new_embedding)
+
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=1536)
+        result = await manager.reindex()
+
+        assert result.nodes_updated == 2
+        assert result.edges_updated == 1
+        assert result.errors == 0
+        assert backend.get_node_text.call_count == 2
+        assert backend.get_edge_text.call_count == 1
+        assert backend.update_node_embedding.call_count == 2
+        assert backend.update_edge_embedding.call_count == 1
+        assert embedder.create.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_reindex_with_no_stale_items_returns_zeros(self):
+        """reindex() with no stale items returns ReindexResult(0, 0, 0) immediately."""
+        from fused_memory.maintenance.reindex import ReindexManager
+
+        backend = MagicMock()
+        backend.query_stale_node_embeddings = AsyncMock(return_value=[])
+        backend.query_stale_edge_embeddings = AsyncMock(return_value=[])
+        embedder = MagicMock()
+
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=1536)
+        result = await manager.reindex()
+
+        assert result.nodes_updated == 0
+        assert result.edges_updated == 0
+        assert result.errors == 0
+        embedder.create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reindex_passes_expected_dim_to_queries(self):
+        """query_stale_node/edge_embeddings receive the expected_dim from config."""
+        from fused_memory.maintenance.reindex import ReindexManager
+
+        backend = MagicMock()
+        backend.query_stale_node_embeddings = AsyncMock(return_value=[])
+        backend.query_stale_edge_embeddings = AsyncMock(return_value=[])
+        embedder = MagicMock()
+
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=768)
+        await manager.reindex()
+
+        backend.query_stale_node_embeddings.assert_called_once_with(expected_dim=768)
+        backend.query_stale_edge_embeddings.assert_called_once_with(expected_dim=768)
+
+    @pytest.mark.asyncio
+    async def test_reindex_node_text_combined_for_embedding(self):
+        """Embedder receives name + space + summary as text."""
+        from fused_memory.maintenance.reindex import ReindexManager
+
+        backend = MagicMock()
+        backend.query_stale_node_embeddings = AsyncMock(return_value=[
+            ('node-uuid-1', 'Node', 1024),
+        ])
+        backend.query_stale_edge_embeddings = AsyncMock(return_value=[])
+        backend.get_node_text = AsyncMock(return_value=('My Node', 'A summary'))
+        backend.update_node_embedding = AsyncMock()
+
+        embedder = MagicMock()
+        embedder.create = AsyncMock(return_value=[0.1] * 1536)
+
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=1536)
+        await manager.reindex()
+
+        embed_call_text = embedder.create.call_args[0][0]
+        assert 'My Node' in embed_call_text
+        assert 'A summary' in embed_call_text
+
+    @pytest.mark.asyncio
+    async def test_reindex_edge_text_combined_for_embedding(self):
+        """Embedder receives name + space + fact as text for edges."""
+        from fused_memory.maintenance.reindex import ReindexManager
+
+        backend = MagicMock()
+        backend.query_stale_node_embeddings = AsyncMock(return_value=[])
+        backend.query_stale_edge_embeddings = AsyncMock(return_value=[
+            ('edge-uuid-1', 'knows', 1024),
+        ])
+        backend.get_edge_text = AsyncMock(return_value=('knows', 'Alice knows Bob'))
+        backend.update_edge_embedding = AsyncMock()
+
+        embedder = MagicMock()
+        embedder.create = AsyncMock(return_value=[0.1] * 1536)
+
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=1536)
+        await manager.reindex()
+
+        embed_call_text = embedder.create.call_args[0][0]
+        assert 'knows' in embed_call_text
+        assert 'Alice knows Bob' in embed_call_text
