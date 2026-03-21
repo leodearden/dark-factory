@@ -3,3 +3,4 @@
 
 # Verification commands
 lint_command: "uv run --project shared --directory shared ruff check src/"
+test_command: "uv run --project shared --directory shared pytest tests/ --tb=short -q"
