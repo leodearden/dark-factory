@@ -104,7 +104,7 @@ reconciliation:
     probe_interval_secs: 300
     max_probe_interval_secs: 1800
     accounts:
-      - name: max-a
-        oauth_token_env: CLAUDE_OAUTH_TOKEN_A
       - name: max-b
         oauth_token_env: CLAUDE_OAUTH_TOKEN_B
+      - name: max-a
+        oauth_token_env: CLAUDE_OAUTH_TOKEN_A
