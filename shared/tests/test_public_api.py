@@ -91,3 +91,16 @@ class TestInitAllCompleteness:
             assert private == [], (
                 f'{name}.__all__ must not contain private symbols: {private}'
             )
+
+
+class TestPEP561:
+    """Verify PEP 561 py.typed marker is present."""
+
+    def test_pep561_py_typed(self):
+        py_typed = (
+            Path(__file__).resolve().parent.parent / 'src' / 'shared' / 'py.typed'
+        )
+        assert py_typed.exists(), (
+            f'PEP 561 marker missing: {py_typed}\n'
+            'Create an empty shared/src/shared/py.typed file.'
+        )
