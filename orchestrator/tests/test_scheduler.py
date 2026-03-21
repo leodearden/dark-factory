@@ -924,3 +924,15 @@ class TestGetModulesJsonStringMetadata:
         )
         assert len(result) > 0
         assert 'task-6' not in result
+
+    def test_get_modules_handles_malformed_json_string_metadata(
+        self, scheduler: Scheduler
+    ):
+        """_get_modules gracefully degrades to task-<id> fallback on malformed JSON string."""
+        task = {
+            'id': '7',
+            'metadata': 'not valid json',
+        }
+        # Should not raise — must degrade gracefully to fallback
+        result = scheduler._get_modules(task)
+        assert result == ['task-7']
