@@ -101,6 +101,59 @@ class TestStageReportSchema:
         json.dumps(STAGE_REPORT_SCHEMA)
 
 
+class TestExtractReportNormalization:
+    """_extract_report normalizes findings key to flagged_items."""
+
+    def _make_result(self, structured_output=None, output=None):
+        from shared.cli_invoke import AgentResult
+        return AgentResult(
+            success=True,
+            output=output or '',
+            structured_output=structured_output,
+        )
+
+    def test_findings_remapped_to_flagged_items(self):
+        from fused_memory.reconciliation.cli_stage_runner import _extract_report
+        result = self._make_result(structured_output={
+            'findings': [{'description': 'stale edge', 'severity': 'moderate'}],
+            'summary': 'done',
+        })
+        report = _extract_report(result)
+        assert 'flagged_items' in report
+        assert report['flagged_items'] == [{'description': 'stale edge', 'severity': 'moderate'}]
+        assert 'findings' not in report
+
+    def test_flagged_items_preserved_when_no_findings(self):
+        from fused_memory.reconciliation.cli_stage_runner import _extract_report
+        result = self._make_result(structured_output={
+            'flagged_items': [{'description': 'real finding', 'severity': 'serious'}],
+            'summary': 'ok',
+        })
+        report = _extract_report(result)
+        assert report['flagged_items'] == [{'description': 'real finding', 'severity': 'serious'}]
+
+    def test_flagged_items_preferred_over_findings_when_both_present(self):
+        from fused_memory.reconciliation.cli_stage_runner import _extract_report
+        result = self._make_result(structured_output={
+            'findings': [{'description': 'from findings'}],
+            'flagged_items': [{'description': 'from flagged_items'}],
+            'summary': 'both',
+        })
+        report = _extract_report(result)
+        # flagged_items is non-empty → keep it, ignore findings
+        assert report['flagged_items'] == [{'description': 'from flagged_items'}]
+
+    def test_findings_used_when_flagged_items_is_empty(self):
+        from fused_memory.reconciliation.cli_stage_runner import _extract_report
+        result = self._make_result(structured_output={
+            'findings': [{'description': 'fallback finding'}],
+            'flagged_items': [],
+            'summary': 'empty fi',
+        })
+        report = _extract_report(result)
+        assert report['flagged_items'] == [{'description': 'fallback finding'}]
+
+
 class TestMcpConfig:
     """BaseStage._build_mcp_config() produces valid MCP server config."""
 
