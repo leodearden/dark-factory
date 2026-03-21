@@ -12,6 +12,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE1_DISALLOWED,
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
+    STAGE3_REPORT_SCHEMA,
     STAGE_REPORT_SCHEMA,
 )
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
@@ -242,6 +243,37 @@ class TestNormalizePlaceholderFiltering:
         }
         result = self._normalize(report)
         assert result['flagged_items'] == []
+
+
+class TestPerStageReportSchema:
+    """Each stage returns the correct report schema via get_report_schema()."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        from unittest.mock import AsyncMock
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def test_integrity_check_returns_stage3_schema(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        assert stage.get_report_schema() is STAGE3_REPORT_SCHEMA
+
+    def test_memory_consolidator_returns_base_schema(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        assert stage.get_report_schema() is STAGE_REPORT_SCHEMA
+
+    def test_task_knowledge_sync_returns_base_schema(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        assert stage.get_report_schema() is STAGE_REPORT_SCHEMA
 
 
 class TestMcpConfig:
