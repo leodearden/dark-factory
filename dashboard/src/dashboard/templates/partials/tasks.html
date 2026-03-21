@@ -12,7 +12,7 @@
     </tr>
   </thead>
   <tbody>
-    {% for task in orch.tasks %}
+    {% for task in orch.tasks|sort(attribute='id', reverse=true) %}
       {% set tid = task.id|string %}
       {% set wt = orch.worktrees.get(tid, {}) %}
       <tr class="border-b border-gray-700">
