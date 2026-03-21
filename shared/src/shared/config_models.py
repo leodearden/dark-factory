@@ -2,6 +2,11 @@
 
 from pydantic import BaseModel, Field
 
+__all__ = [
+    'AccountConfig',
+    'UsageCapConfig',
+]
+
 
 class AccountConfig(BaseModel):
     """A Claude Max account for failover."""
