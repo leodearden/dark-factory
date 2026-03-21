@@ -508,3 +508,96 @@ class TestReindexManager:
         embed_call_text = embedder.create.call_args[0][0]
         assert 'knows' in embed_call_text
         assert 'Alice knows Bob' in embed_call_text
+
+
+# ---------------------------------------------------------------------------
+# step-11: ReindexManager.reindex_and_replay()
+# ---------------------------------------------------------------------------
+
+class TestReindexAndReplay:
+    """ReindexManager.reindex_and_replay() calls reindex() then replays the dead-letter queue."""
+
+    @pytest.mark.asyncio
+    async def test_reindex_called_before_replay(self):
+        """reindex() is called before replay_dead()."""
+        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
+
+        call_order: list[str] = []
+
+        backend = MagicMock()
+        embedder = MagicMock()
+
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=1536)
+
+        async def fake_reindex():
+            call_order.append('reindex')
+            return ReindexResult(1, 0, 0)
+
+        async def fake_replay(group_id=None):
+            call_order.append('replay')
+            return 3
+
+        manager.reindex = fake_reindex
+
+        mock_queue = MagicMock()
+        mock_queue.replay_dead = AsyncMock(side_effect=fake_replay)
+
+        result = await manager.reindex_and_replay(mock_queue)
+
+        assert call_order == ['reindex', 'replay']
+
+    @pytest.mark.asyncio
+    async def test_returns_combined_result(self):
+        """Returns dict with reindex_result and replay_count."""
+        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
+
+        backend = MagicMock()
+        embedder = MagicMock()
+
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=1536)
+        reindex_result = ReindexResult(nodes_updated=3, edges_updated=2, errors=0)
+        manager.reindex = AsyncMock(return_value=reindex_result)
+
+        mock_queue = MagicMock()
+        mock_queue.replay_dead = AsyncMock(return_value=5)
+
+        result = await manager.reindex_and_replay(mock_queue)
+
+        assert result['reindex_result'] is reindex_result
+        assert result['replay_count'] == 5
+
+    @pytest.mark.asyncio
+    async def test_passes_group_id_to_replay(self):
+        """group_id parameter is forwarded to durable_queue.replay_dead()."""
+        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
+
+        backend = MagicMock()
+        embedder = MagicMock()
+
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=1536)
+        manager.reindex = AsyncMock(return_value=ReindexResult())
+
+        mock_queue = MagicMock()
+        mock_queue.replay_dead = AsyncMock(return_value=0)
+
+        await manager.reindex_and_replay(mock_queue, group_id='test-group')
+
+        mock_queue.replay_dead.assert_awaited_once_with(group_id='test-group')
+
+    @pytest.mark.asyncio
+    async def test_default_group_id_is_none(self):
+        """Default group_id=None replays all dead-letter items."""
+        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
+
+        backend = MagicMock()
+        embedder = MagicMock()
+
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=1536)
+        manager.reindex = AsyncMock(return_value=ReindexResult())
+
+        mock_queue = MagicMock()
+        mock_queue.replay_dead = AsyncMock(return_value=0)
+
+        await manager.reindex_and_replay(mock_queue)
+
+        mock_queue.replay_dead.assert_awaited_once_with(group_id=None)
