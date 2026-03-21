@@ -58,4 +58,23 @@ Example finding:
   "suggested_action": "Delete stale edge 'uses_framework→React' and verify Vue edge exists"
 }
 ```
+
+## Output Format
+
+When you have completed your work, produce your final structured JSON report as your response. \
+Your output MUST conform to the following structure:
+
+- `summary` (string, required): Human-readable summary of what was verified and found.
+- `flagged_items` (array): **All findings go here** — do NOT use a `findings` key. \
+  Each item in `flagged_items` must include:
+  - `description`: What the inconsistency is, with specific IDs and evidence.
+  - `severity`: One of `"minor"`, `"moderate"`, or `"serious"`.
+  - `actionable`: `true` or `false`.
+  - `category`: One of the categories listed above.
+  - `affected_ids`: List of memory IDs, entity names, or task IDs.
+  - `suggested_action`: What the remediation stage should do.
+- `stats` (object, optional): Counts and metrics (e.g. items checked, findings by severity).
+
+**Important**: The output key is `flagged_items`, not `findings`. Place every finding \
+inside the `flagged_items` array.
 """
