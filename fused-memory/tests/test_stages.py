@@ -154,6 +154,62 @@ class TestExtractReportNormalization:
         assert report['flagged_items'] == [{'description': 'fallback finding'}]
 
 
+class TestNormalizePlaceholderFiltering:
+    """_normalize_report filters out placeholder findings."""
+
+    def _normalize(self, report):
+        from fused_memory.reconciliation.cli_stage_runner import _normalize_report
+        return _normalize_report(report)
+
+    def test_filters_missing_description(self):
+        report = {'flagged_items': [{'severity': 'minor'}], 'summary': 'x'}
+        result = self._normalize(report)
+        assert result['flagged_items'] == []
+
+    def test_filters_question_mark_description(self):
+        report = {'flagged_items': [{'description': '?', 'severity': 'moderate'}], 'summary': 'x'}
+        result = self._normalize(report)
+        assert result['flagged_items'] == []
+
+    def test_filters_empty_description(self):
+        report = {'flagged_items': [{'description': '', 'severity': 'minor'}], 'summary': 'x'}
+        result = self._normalize(report)
+        assert result['flagged_items'] == []
+
+    def test_keeps_valid_findings(self):
+        report = {
+            'flagged_items': [{'description': 'real issue', 'severity': 'serious'}],
+            'summary': 'x',
+        }
+        result = self._normalize(report)
+        assert len(result['flagged_items']) == 1
+        assert result['flagged_items'][0]['description'] == 'real issue'
+
+    def test_mixed_valid_and_placeholder(self):
+        report = {
+            'flagged_items': [
+                {'description': '?', 'severity': 'minor'},
+                {'description': 'real', 'severity': 'moderate'},
+                {'severity': 'serious'},  # no description
+            ],
+            'summary': 'x',
+        }
+        result = self._normalize(report)
+        assert len(result['flagged_items']) == 1
+        assert result['flagged_items'][0]['description'] == 'real'
+
+    def test_all_placeholder_findings_removed(self):
+        report = {
+            'flagged_items': [
+                {'description': '?'},
+                {'description': '?', 'severity': 'serious'},
+            ],
+            'summary': 'x',
+        }
+        result = self._normalize(report)
+        assert result['flagged_items'] == []
+
+
 class TestMcpConfig:
     """BaseStage._build_mcp_config() produces valid MCP server config."""
 
