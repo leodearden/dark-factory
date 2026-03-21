@@ -20,6 +20,14 @@ class BriefingAssembler:
         self.memory_url = config.fused_memory.url
         self.project_id = config.fused_memory.project_id
 
+    def _agent_identity(self, task_id: str | None, role: str) -> str:
+        agent_id = f'claude-task-{task_id}-{role}' if task_id else f'claude-{role}'
+        return (
+            f'## Agent Identity\n\n'
+            f'- **agent_id:** `{agent_id}`\n'
+            f'- **project_id:** `{self.project_id}`\n'
+        )
+
     async def build_architect_prompt(
         self, task: dict, worktree: Path | None = None, context: str | None = None
     ) -> str:
@@ -28,12 +36,15 @@ class BriefingAssembler:
             context = await self._get_memory_context(task.get('id'))
 
         task_block = self._format_task(task)
+        identity = self._agent_identity(task.get('id'), 'architect')
 
         # Use absolute path so the agent's Write tool targets the correct location
         plan_path = str(worktree / '.task' / 'plan.json') if worktree else '.task/plan.json'
 
         return f"""\
 {context}
+
+{identity}
 
 # Task
 
@@ -55,6 +66,8 @@ class BriefingAssembler:
         if context is None:
             context = await self._get_memory_context(plan.get('task_id'))
 
+        identity = self._agent_identity(plan.get('task_id'), 'implementer')
+
         completed = [s for s in plan.get('steps', []) if s.get('status') == 'done']
         pending = [s for s in plan.get('steps', []) if s.get('status') == 'pending']
         pre_completed = [s for s in plan.get('prerequisites', []) if s.get('status') == 'done']
@@ -74,6 +87,8 @@ class BriefingAssembler:
 
         return f"""\
 {context}
+
+{identity}
 
 # Plan Overview
 
@@ -106,8 +121,12 @@ Execute the next pending steps in TDD order. Commit after each step. Update plan
         if context is None:
             context = await self._get_memory_context(plan.get('task_id'))
 
+        identity = self._agent_identity(plan.get('task_id'), 'debugger')
+
         return f"""\
 {context}
+
+{identity}
 
 # Task Context
 

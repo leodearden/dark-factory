@@ -791,13 +791,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if self.config.sandbox.enabled and role.name in ('implementer', 'debugger'):
             sandbox_modules = self.modules
 
-        # Build MCP config with escalation server if available
+        # Build MCP config — fused-memory always, escalation when available
         mcp_config = None
-        if self.escalation_queue and role.name in ('architect', 'implementer', 'debugger', 'merger'):
-            esc = self.config.escalation
-            mcp_config = self.mcp.mcp_config_json(
-                escalation_url=f'http://{esc.host}:{esc.port}/mcp'
-            )
+        if role.name in ('architect', 'implementer', 'debugger', 'merger'):
+            escalation_url = None
+            if self.escalation_queue:
+                esc = self.config.escalation
+                escalation_url = f'http://{esc.host}:{esc.port}/mcp'
+            mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
 
         result = await invoke_with_cap_retry(
             usage_gate=self.usage_gate,

@@ -43,6 +43,46 @@ Use escalation when:
 - The verify/debug loop won't converge due to an external dependency
 """
 
+_MEMORY_TOOLS = [
+    'mcp__fused-memory__add_memory',
+    'mcp__fused-memory__search',
+    'mcp__fused-memory__get_entity',
+]
+
+_MEMORY_INSTRUCTIONS = """
+## Memory
+
+You have access to the project's shared memory system via fused-memory MCP tools.
+
+### Writing memories (`add_memory`)
+
+Write when you discover something that will help future agents:
+- **Conventions** — naming patterns, code style rules, project norms you observed
+- **Gotchas** — library quirks, environment issues, non-obvious behaviors
+- **Procedural knowledge** — workflows, build steps, processes you figured out
+
+Do NOT write:
+- Progress updates (the iteration log handles that)
+- Design decisions (captured automatically from the plan)
+- Speculative or uncertain observations
+- Anything already obvious from the code itself
+
+Parameters:
+- `content`: Clear, self-contained statement (1-3 sentences)
+- `category`: One of `observations_and_summaries`, `procedural_knowledge`, or `preferences_and_norms`
+- `project_id`: Use the project_id from your Agent Identity section
+- `agent_id`: Use the agent_id from your Agent Identity section
+
+Write immediately when you discover something — don't batch until the end.
+
+### Reading memories (`search`, `get_entity`)
+
+Use when you need context not in your briefing:
+- Before making assumptions about conventions or patterns
+- When encountering unfamiliar code or entities
+- When you need context about prior decisions
+"""
+
 
 ARCHITECT = AgentRole(
     name='architect',
@@ -92,8 +132,8 @@ You MUST produce a JSON plan written to the path specified in the prompt's Actio
 - The plan structure is IMMUTABLE after creation. Only `status` and `commit` fields change during execution.
 - Write the plan to the path specified in the prompt using the Write tool. You MUST use the Write tool — do not just describe the plan in your response.
 - If the task requires touching modules beyond what was originally specified, list ALL needed modules in the `modules` field.
-""" + _ESCALATION_INSTRUCTIONS,
-    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', 'Write', *_ESCALATION_TOOLS],
+""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', 'Write', *_ESCALATION_TOOLS, *_MEMORY_TOOLS],
     disallowed_tools=['Edit'],
     default_model='opus',
     default_budget=5.0,
@@ -136,8 +176,8 @@ expansion rather than trying to work around the restriction.
 - Run tests frequently to verify your work.
 - If you encounter an unexpected issue that the plan doesn't account for, note it and stop. Do NOT modify the plan.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
-""" + _ESCALATION_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS],
+""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS],
     default_model='opus',
     default_budget=10.0,
     default_max_turns=80,
@@ -177,8 +217,8 @@ expansion rather than trying to work around the restriction.
 
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
-""" + _ESCALATION_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS],
+""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS],
     default_model='opus',
     default_budget=5.0,
     default_max_turns=50,
