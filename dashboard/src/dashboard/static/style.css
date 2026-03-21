@@ -1,5 +1,8 @@
 /* Dark Factory dashboard — custom styles beyond Tailwind utilities */
 
+/* Hide Alpine-cloaked elements before Alpine initializes */
+[x-cloak] { display: none !important; }
+
 /* Smooth transitions for htmx swaps */
 .htmx-settling {
     opacity: 0.8;

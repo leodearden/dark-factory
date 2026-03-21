@@ -132,6 +132,7 @@ class TestOrchestratorRouteBasics:
         assert 'x-data' in html
         assert 'x-show' in html
         assert '@click' in html
+        assert '$store.panels' in html
 
     def test_show_tasks_button(self, client):
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
