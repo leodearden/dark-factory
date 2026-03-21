@@ -6,6 +6,7 @@ and returns structured data. Missing database files return empty defaults.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from datetime import UTC, datetime
@@ -19,19 +20,21 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BURST_COOLDOWN = 150
 
 
-async def get_recent_runs(db_path: Path, *, limit: int = 10) -> list[dict]:
+async def get_recent_runs(db_path: Path, *, limit: int = 50) -> list[dict]:
     """Return recent reconciliation runs ordered by started_at DESC.
 
     Each dict contains: id, project_id, run_type, trigger_reason, started_at,
-    completed_at, events_processed, status, duration_seconds.
+    completed_at, events_processed, status, duration_seconds, journal_entry_count.
     """
     try:
         async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                'SELECT id, project_id, run_type, trigger_reason, started_at,'
-                ' completed_at, events_processed, status'
-                ' FROM runs ORDER BY started_at DESC LIMIT ?',
+                'SELECT r.id, r.project_id, r.run_type, r.trigger_reason,'
+                ' r.started_at, r.completed_at, r.events_processed, r.status,'
+                ' (SELECT COUNT(*) FROM journal_entries je'
+                '  WHERE je.run_id = r.id) AS journal_entry_count'
+                ' FROM runs r ORDER BY r.started_at DESC LIMIT ?',
                 (limit,),
             ) as cursor:
                 rows = await cursor.fetchall()
@@ -58,8 +61,64 @@ async def get_recent_runs(db_path: Path, *, limit: int = 10) -> list[dict]:
                 'events_processed': row['events_processed'],
                 'status': row['status'],
                 'duration_seconds': duration,
+                'journal_entry_count': row['journal_entry_count'],
             }
         )
+    return results
+
+
+async def get_journal_entries(db_path: Path, run_id: str) -> list[dict]:
+    """Return journal entries for a specific run, ordered by timestamp.
+
+    Each dict contains: id, stage, timestamp, operation, target_system,
+    before_state, after_state, reasoning, evidence.
+    """
+    try:
+        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                'SELECT id, stage, timestamp, operation, target_system,'
+                ' before_state, after_state, reasoning, evidence'
+                ' FROM journal_entries WHERE run_id = ? ORDER BY timestamp',
+                (run_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+    except (FileNotFoundError, sqlite3.OperationalError):
+        logger.debug('get_journal_entries: DB unavailable at %s', db_path, exc_info=True)
+        return []
+
+    results = []
+    for row in rows:
+        before_state = None
+        after_state = None
+        evidence = []
+        try:
+            if row['before_state']:
+                before_state = json.loads(row['before_state'])
+        except (json.JSONDecodeError, TypeError):
+            before_state = row['before_state']
+        try:
+            if row['after_state']:
+                after_state = json.loads(row['after_state'])
+        except (json.JSONDecodeError, TypeError):
+            after_state = row['after_state']
+        try:
+            if row['evidence']:
+                evidence = json.loads(row['evidence'])
+        except (json.JSONDecodeError, TypeError):
+            evidence = []
+
+        results.append({
+            'id': row['id'],
+            'stage': row['stage'],
+            'timestamp': row['timestamp'],
+            'operation': row['operation'],
+            'target_system': row['target_system'],
+            'before_state': before_state,
+            'after_state': after_state,
+            'reasoning': row['reasoning'] or '',
+            'evidence': evidence,
+        })
     return results
 
 
@@ -177,7 +236,8 @@ async def get_burst_state(
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 'SELECT agent_id, state, last_write_at, burst_started_at'
-                ' FROM burst_state',
+                ' FROM burst_state'
+                ' ORDER BY last_write_at DESC',
             ) as cursor:
                 rows = await cursor.fetchall()
     except (FileNotFoundError, sqlite3.OperationalError):

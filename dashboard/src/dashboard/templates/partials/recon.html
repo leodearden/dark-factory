@@ -107,10 +107,10 @@
   </div>
 
   <!-- Right column: Recent Runs table -->
-  <div class="bg-gray-800 rounded-lg p-6">
+  <div class="bg-gray-800 rounded-lg p-6 flex flex-col">
     <h3 class="text-lg font-semibold text-gray-100 mb-4">Recent Runs</h3>
     {% if runs %}
-      <div class="overflow-x-auto">
+      <div class="overflow-x-auto flex-1 overflow-y-auto">
       <table class="w-full text-sm">
         <thead>
           <tr class="text-gray-400 border-b border-gray-700">
@@ -123,10 +123,12 @@
             <th class="text-left pb-2">Events</th>
             <th class="text-left pb-2">Duration</th>
             <th class="text-left pb-2">When</th>
+            <th class="text-left pb-2">Detail</th>
           </tr>
         </thead>
-        <tbody>
-          {% for run in runs %}
+        {% set col_count = 8 if multi_project_runs else 7 %}
+        {% for run in runs %}
+          <tbody x-data="{ open: false }" id="run-{{ run.id }}">
             <tr class="border-b border-gray-700">
               {% if multi_project_runs %}
                 <td class="py-2 text-gray-300">{{ run.project_id }}</td>
@@ -145,9 +147,23 @@
                 {% endif %}
               </td>
               <td class="py-2 text-gray-400">{{ run.started_at | timeago }}</td>
+              <td class="py-2">
+                {% if run.journal_entry_count > 0 %}
+                  <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-900 text-blue-200 cursor-pointer" @click="open = !open" data-testid="journal-badge">
+                    {{ run.journal_entry_count }}
+                  </span>
+                {% endif %}
+              </td>
             </tr>
-          {% endfor %}
-        </tbody>
+            <tr x-show="open" x-cloak>
+              <td colspan="{{ col_count }}" class="p-4 bg-gray-900/50">
+                <div hx-get="/partials/recon/run/{{ run.id }}" hx-trigger="revealed" hx-swap="innerHTML">
+                  <span class="text-xs text-gray-500">Loading...</span>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        {% endfor %}
       </table>
       </div>
     {% else %}
