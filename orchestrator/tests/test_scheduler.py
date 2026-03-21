@@ -853,3 +853,30 @@ class TestAcquireNextDependencyGating:
         # No more tasks
         result = await scheduler.acquire_next()
         assert result is None
+
+
+class TestDepsSatisfiedLogging:
+    """_deps_satisfied emits a debug log identifying the blocking dependency."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def test_deps_satisfied_logs_blocking_reason(
+        self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
+    ):
+        """_deps_satisfied emits a debug log with dep ID and current status when blocked."""
+        import logging
+
+        task = {'id': '99', 'dependencies': [{'id': '42'}]}
+        status_map = {'42': 'in-progress'}
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.scheduler'):
+            result = scheduler._deps_satisfied(task, status_map)
+
+        assert result is False
+        assert any(
+            '42' in record.message and 'in-progress' in record.message
+            for record in caplog.records
+        ), f'Expected log about dep 42 being in-progress. Got: {[r.message for r in caplog.records]}'
