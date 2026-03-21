@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -9,6 +10,7 @@ import pytest
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
+from orchestrator.scheduler import Scheduler
 
 
 @pytest.fixture
@@ -119,3 +121,37 @@ async def test_skips_already_tagged_tasks(harness, tmp_path):
     await harness._tag_prd_metadata(prd, pre_ids)
 
     harness.scheduler.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_prd_metadata_roundtrips_through_scheduler(harness, tmp_path, monkeypatch):
+    """Full harness→scheduler→MCP path: PRD metadata arrives as a JSON string."""
+    prd = tmp_path / 'feature.prd'
+    prd.touch()
+    pre_ids: set[str] = set()  # all tasks are new
+
+    tasks = [_task('7')]  # one untagged new task
+    captured_args: list[dict] = []
+
+    async def mock_mcp_call(url, method, payload, **kwargs):
+        captured_args.append(payload)
+        return {}
+
+    # Wire harness to a real Scheduler so serialization logic runs
+    real_scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+    real_scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler = real_scheduler
+
+    monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+    await harness._tag_prd_metadata(prd, pre_ids)
+
+    # Exactly one MCP update_task call should have been made
+    assert len(captured_args) == 1
+    arguments = captured_args[0]['arguments']
+    metadata = arguments['metadata']
+    # Must arrive as a JSON string, not a raw dict
+    assert isinstance(metadata, str), f'Expected str metadata, got {type(metadata)}: {metadata}'
+    # Must round-trip to the correct PRD path
+    parsed = json.loads(metadata)
+    assert parsed == {'prd': str(prd.resolve())}
