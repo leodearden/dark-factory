@@ -953,6 +953,31 @@ class TestGetModulesJsonStringMetadata:
             for record in caplog.records
         ), f'Expected fallback warning mentioning task 8. Got: {[r.message for r in caplog.records]}'
 
+    def test_get_modules_fallback_warning_emitted_only_once(
+        self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
+    ):
+        """_get_modules emits the fallback WARNING at most once per task ID.
+
+        When _get_modules is called multiple times with the same task that has
+        no module metadata, the WARNING must appear exactly once — not on every call.
+        This prevents log flooding in the scheduler poll loop.
+        """
+        import logging
+
+        task = {'id': '9', 'metadata': {}}
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            scheduler._get_modules(task)
+            scheduler._get_modules(task)
+
+        matching = [
+            r for r in caplog.records
+            if '9' in r.message and 'fallback' in r.message.lower()
+        ]
+        assert len(matching) == 1, (
+            f'Expected exactly 1 fallback warning for task 9, got {len(matching)}. '
+            f'Messages: {[r.message for r in caplog.records]}'
+        )
+
 
 class TestUpdateTaskMetadataSerialization:
     """Regression tests for update_task dict->JSON string coercion."""
