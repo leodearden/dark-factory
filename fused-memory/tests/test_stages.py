@@ -101,6 +101,40 @@ class TestStageReportSchema:
         json.dumps(STAGE_REPORT_SCHEMA)
 
 
+class TestStage3ReportSchema:
+    """STAGE3_REPORT_SCHEMA has structured finding item properties."""
+
+    def test_stage3_schema_importable(self):
+        from fused_memory.reconciliation.cli_stage_runner import STAGE3_REPORT_SCHEMA
+        assert STAGE3_REPORT_SCHEMA is not None
+
+    def test_stage3_flagged_items_has_item_properties(self):
+        from fused_memory.reconciliation.cli_stage_runner import STAGE3_REPORT_SCHEMA
+        items_schema = STAGE3_REPORT_SCHEMA['properties']['flagged_items']['items']
+        assert 'properties' in items_schema
+        props = items_schema['properties']
+        for field in ('description', 'severity', 'actionable', 'category', 'affected_ids', 'suggested_action'):
+            assert field in props, f"Expected '{field}' in flagged_items.items.properties"
+
+    def test_stage3_finding_item_required_includes_description_and_severity(self):
+        from fused_memory.reconciliation.cli_stage_runner import STAGE3_REPORT_SCHEMA
+        items_schema = STAGE3_REPORT_SCHEMA['properties']['flagged_items']['items']
+        assert 'required' in items_schema
+        assert 'description' in items_schema['required']
+        assert 'severity' in items_schema['required']
+
+    def test_stage3_schema_is_json_serializable(self):
+        from fused_memory.reconciliation.cli_stage_runner import STAGE3_REPORT_SCHEMA
+        json.dumps(STAGE3_REPORT_SCHEMA)
+
+    def test_stage3_schema_preserves_base_structure(self):
+        from fused_memory.reconciliation.cli_stage_runner import STAGE3_REPORT_SCHEMA
+        assert STAGE3_REPORT_SCHEMA['type'] == 'object'
+        assert 'summary' in STAGE3_REPORT_SCHEMA['required']
+        assert 'flagged_items' in STAGE3_REPORT_SCHEMA['properties']
+        assert 'stats' in STAGE3_REPORT_SCHEMA['properties']
+
+
 class TestExtractReportNormalization:
     """_extract_report normalizes findings key to flagged_items."""
 

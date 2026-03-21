@@ -1,125 +1,142 @@
 {
-  "task_id": "52",
-  "title": "Bug: Scheduler dispatches tasks with in-progress dependencies (premature dispatch)",
+  "task_id": "80",
+  "title": "Fix Stage 3 reporter: finding fields serialized as '?' placeholder",
   "files": [
-    "orchestrator/src/orchestrator/scheduler.py",
-    "orchestrator/tests/test_scheduler.py"
+    "fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py",
+    "fused-memory/src/fused_memory/reconciliation/stages/base.py",
+    "fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py",
+    "fused-memory/src/fused_memory/reconciliation/prompts/stage3.py",
+    "fused-memory/tests/test_stages.py"
   ],
   "modules": [
-    "orchestrator/src/orchestrator",
-    "orchestrator/tests"
+    "fused-memory/src/fused_memory/reconciliation",
+    "fused-memory/src/fused_memory/reconciliation/stages",
+    "fused-memory/src/fused_memory/reconciliation/prompts",
+    "fused-memory/tests"
   ],
-  "analysis": "The scheduler's acquire_next() method in scheduler.py has an inline dependency check at lines 286-289 that verifies all dependencies have status == 'done' before dispatching. While the literal check appears correct (== 'done' rejects in-progress, pending, blocked, etc.), the test suite has ZERO tests covering dependency gating behavior \u2014 a critical gap that allowed a premature dispatch bug (tasks 47 and 49) to go undetected. The fix has three parts: (1) Extract the inline dependency check into a named _deps_satisfied() method for testability and clarity, (2) Add comprehensive tests for all dependency states, and (3) Add diagnostic logging when a task is blocked on unsatisfied dependencies (aids debugging when premature dispatch is suspected). The existing test file covers module locking, dispatch guards, status transition guards, and cache seeding, but dependency gating is completely untested.",
+  "analysis": "Stage 3 (IntegrityCheck) runs as a Claude CLI subprocess that outputs a structured JSON report. The report schema (STAGE_REPORT_SCHEMA) defines flagged_items as an array of generic objects ({type: object}) with no required properties on the items. Meanwhile, the Stage 3 system prompt instructs the LLM to produce 'findings' with specific fields (description, severity, actionable, category, affected_ids, suggested_action) but never mentions the key 'flagged_items'. This prompt/schema disconnect causes two failure modes: (1) the LLM puts real findings under a 'findings' key instead of 'flagged_items', so report_data.get('flagged_items', []) gets empty stubs; (2) even when items land in 'flagged_items', the generic schema doesn't enforce field structure, so the LLM outputs placeholder values. Downstream, _format_findings() uses .get('description', '?') etc., producing the observed '?' output in serialized stage_reports. The BaseStage.run() method at line 120 maps report_data['flagged_items'] to StageReport.items_flagged, and run_stage_via_cli hardcodes STAGE_REPORT_SCHEMA. Fix requires: normalization in _extract_report (remap findings\u2192flagged_items, filter placeholders), a Stage 3-specific schema with finding item structure, per-stage schema via get_report_schema() override, and prompt alignment.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing test for _deps_satisfied method: test that the Scheduler class exposes a _deps_satisfied(task, status_map) method that returns False when any dependency has status 'in-progress'. This test will fail because the method does not exist yet.",
+      "description": "Write test test_extract_report_normalizes_findings_to_flagged_items in test_stages.py: create an AgentResult with structured_output={'findings': [{'description': 'stale edge', 'severity': 'moderate'}], 'summary': 'done'} (no flagged_items key). Call _extract_report and assert the returned dict has 'flagged_items' containing the finding, not 'findings'. Also test that when both 'findings' and 'flagged_items' exist, flagged_items is preserved as-is.",
       "status": "done",
-      "commit": "377c071"
+      "commit": "23d38cf"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Extract inline dependency check from acquire_next() lines 285-291 into a new _deps_satisfied(self, task, status_map) -> bool method on the Scheduler class. The method checks that every dependency ID in task['dependencies'] resolves to status 'done' in the status_map. No logic change \u2014 pure refactor of existing inline code. acquire_next() calls self._deps_satisfied(t, status_map) instead of the inline all() expression.",
+      "description": "Add _normalize_report(report: dict) -> dict function in cli_stage_runner.py that: (1) if report has 'findings' but not 'flagged_items', moves 'findings' to 'flagged_items'; (2) if both exist and 'flagged_items' is empty, uses 'findings'. Call _normalize_report at the end of _extract_report before returning the dict.",
       "status": "done",
-      "commit": "63eb269"
+      "commit": "6d3af6c"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write test test_acquire_next_blocks_on_in_progress_dependency: mock get_tasks to return two tasks \u2014 task A (status 'in-progress', no deps) and task B (status 'pending', depends on A). Assert acquire_next() returns None because B's dependency A is in-progress, and A itself is not pending so it's not a candidate.",
+      "description": "Write test test_normalize_filters_placeholder_findings: pass findings where all of description/severity/category are '?' or missing to _normalize_report and assert they are filtered out. Pass a mix of valid and placeholder findings and assert only valid ones survive. A finding is valid if description is present and not '?'.",
       "status": "done",
-      "commit": "e95a6d8"
+      "commit": "d93b6cd"
     },
     {
       "id": "step-4",
-      "type": "test",
-      "description": "Write test test_acquire_next_blocks_on_pending_dependency: mock get_tasks to return task A (status 'pending', no deps, modules ['backend']) and task B (status 'pending', depends on A, modules ['frontend']). Dispatch task A first via acquire_next(), then assert a second acquire_next() returns None because B's dependency A is not yet done (still pending/in-dispatched).",
+      "type": "impl",
+      "description": "Add placeholder-filtering logic to _normalize_report: after key remapping, iterate flagged_items and drop any finding dict where description is missing, empty, or '?'. Log a warning with the count of filtered findings.",
       "status": "done",
-      "commit": "392b399"
+      "commit": "6d3af6c"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write test test_acquire_next_dispatches_when_all_deps_done: mock get_tasks to return task A (status 'done') and task B (status 'pending', depends on A). Assert acquire_next() returns task B because its only dependency A has status 'done'.",
-      "status": "done",
-      "commit": "ee98e03"
+      "description": "Write test test_stage3_report_schema_has_finding_item_properties: import STAGE3_REPORT_SCHEMA from cli_stage_runner and assert its flagged_items.items has 'properties' containing description, severity, actionable, category, affected_ids, suggested_action, and 'required' includes at least description and severity.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-6",
-      "type": "test",
-      "description": "Write test test_acquire_next_blocks_on_mixed_dep_statuses: mock get_tasks to return tasks A (done), B (in-progress), and C (pending, depends on both A and B). Assert acquire_next() returns None for C because dep B is not done, even though dep A is done.",
-      "status": "done",
-      "commit": "c394bcc"
+      "type": "impl",
+      "description": "Define FINDING_ITEM_SCHEMA dict in cli_stage_runner.py with type: object and properties: description (string), severity (string, enum: minor/moderate/serious), actionable (boolean), category (string, enum of valid categories), affected_ids (array of strings), suggested_action (string). Required: [description, severity]. Define STAGE3_REPORT_SCHEMA by deep-copying STAGE_REPORT_SCHEMA and replacing flagged_items.items with FINDING_ITEM_SCHEMA.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-7",
       "type": "test",
-      "description": "Write test test_acquire_next_handles_dict_and_int_dependency_formats: mock get_tasks to return tasks with dependencies in different formats \u2014 integer IDs [1], string IDs ['1'], and dict format [{'id': 1}]. Verify that all formats are correctly resolved against the status_map and block when deps are not done.",
-      "status": "done",
-      "commit": "4a439fa"
+      "description": "Write test test_integrity_check_uses_stage3_report_schema: instantiate IntegrityCheck and MemoryConsolidator with mock deps. Assert IntegrityCheck.get_report_schema() returns STAGE3_REPORT_SCHEMA while MemoryConsolidator.get_report_schema() returns STAGE_REPORT_SCHEMA.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-8",
-      "type": "test",
-      "description": "Write failing test test_deps_satisfied_logs_blocking_reason: verify that when _deps_satisfied returns False, a debug log message is emitted indicating which dependency ID and its current status blocked the task. Use caplog fixture to capture log output. This will fail because no such logging exists yet.",
-      "status": "done",
-      "commit": "049dd9e"
+      "type": "impl",
+      "description": "Add get_report_schema(self) -> dict method to BaseStage returning STAGE_REPORT_SCHEMA (import it). Override in IntegrityCheck to return STAGE3_REPORT_SCHEMA. Add output_schema: dict | None = None parameter to run_stage_via_cli (defaults to STAGE_REPORT_SCHEMA when None). In BaseStage.run(), pass output_schema=self.get_report_schema() to run_stage_via_cli.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-9",
+      "type": "test",
+      "description": "Write test test_stage3_prompt_references_flagged_items: import STAGE3_SYSTEM_PROMPT and assert it contains 'flagged_items' at least once, ensuring the LLM is explicitly told to use the correct output key.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-10",
       "type": "impl",
-      "description": "Add debug-level logging to _deps_satisfied() method: when a dependency is not done, log which dep_id blocked and what its current status is (e.g. 'Task {task_id} blocked: dep {dep_id} has status {status}, need done'). This aids diagnosis of premature dispatch issues without adding runtime overhead (debug level).",
-      "status": "done",
-      "commit": "13688aa"
+      "description": "Update STAGE3_SYSTEM_PROMPT in prompts/stage3.py: add an '## Output Format' section at the end that explicitly instructs the LLM to put all findings in the `flagged_items` array of its structured JSON output (not a `findings` key), and reiterates that each item must include description, severity, actionable, category, affected_ids, and suggested_action.",
+      "status": "pending",
+      "commit": null
     }
   ],
   "design_decisions": [
     {
-      "decision": "Extract _deps_satisfied() as a named method rather than keeping inline",
-      "rationale": "The inline all() expression at lines 286-289 is hard to unit-test in isolation and hard to read due to the nested dict/int dependency ID parsing. A named method enables direct unit testing, clearer docstring, and a single point to add logging."
+      "decision": "Normalize report in _extract_report rather than BaseStage.run()",
+      "rationale": "_extract_report is the single extraction point for all stage outputs. Normalizing here means all stages benefit from the findings\u2192flagged_items key mapping, and the fix is contained in one function rather than scattered across the call chain."
     },
     {
-      "decision": "Keep _deps_satisfied() as an instance method on Scheduler (not a free function)",
-      "rationale": "It needs access to self for logging context (task_id attribution). Making it a method keeps it colocated with acquire_next() and enables future access to _status_cache if deeper defense-in-depth is needed."
+      "decision": "Filter placeholder findings based on description content, not all fields",
+      "rationale": "A finding is meaningful if it has a real description. Checking only description (not missing and not '?') is the minimal gate that filters LLM placeholder output while being tolerant of partially-populated findings that still carry useful info."
     },
     {
-      "decision": "Add debug-level logging for blocked dependencies, not warning-level",
-      "rationale": "Dependency blocking is expected behavior during normal operation. Debug level avoids log noise in production while providing diagnostic information when investigating premature dispatch issues via --log-level=DEBUG."
+      "decision": "Per-stage report schema via get_report_schema() override rather than config",
+      "rationale": "Follows the existing pattern where stages override get_system_prompt() and get_disallowed_tools(). Adding get_report_schema() is consistent and doesn't require config changes. Stage 3 gets a specific schema with finding item structure; other stages keep the generic schema."
     },
     {
-      "decision": "Test multiple dependency formats (int, str, dict) in a dedicated test",
-      "rationale": "Taskmaster's dependency format has varied across versions. The inline d.get('id', d) if isinstance(d, dict) else d expression handles multiple formats but lacks test coverage. A dedicated test prevents regressions if the format changes."
+      "decision": "Add output_schema parameter to run_stage_via_cli with backward-compatible default",
+      "rationale": "Currently STAGE_REPORT_SCHEMA is hardcoded in run_stage_via_cli. Making it a parameter with default=None (falling back to STAGE_REPORT_SCHEMA) is backward-compatible and allows per-stage schemas without breaking existing callers."
     },
     {
-      "decision": "Do not overlay _status_cache onto status_map for dependency checks",
-      "rationale": "Analysis shows this would not add practical safety: get_tasks() already seeds _status_cache from the same taskmaster response used to build status_map, so they always agree. The == 'done' check is inherently safe against stale data (any non-done status blocks). Adding cache overlay would add complexity without preventing the observed bug class."
+      "decision": "Update Stage 3 prompt to explicitly mention flagged_items key",
+      "rationale": "The root cause is the disconnect between the prompt (which says 'findings') and the output schema (which uses 'flagged_items'). Even with normalization as a safety net, aligning the prompt with the schema key is the primary fix \u2014 it tells the LLM exactly where to put the data."
     }
   ],
   "reuse": [
     {
-      "what": "Existing TestAcquireNextNoDuplicates test patterns",
-      "where": "orchestrator/tests/test_scheduler.py lines 486-651",
-      "how": "Reuse the same pattern of mocking scheduler.get_tasks as AsyncMock(return_value=[...]) with task dicts containing id, status, dependencies, metadata fields. Follow identical fixture setup (OrchestratorConfig(max_per_module=1) scheduler fixture)."
+      "what": "STAGE_REPORT_SCHEMA base structure",
+      "where": "fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py",
+      "how": "STAGE3_REPORT_SCHEMA extends the base schema by replacing flagged_items.items with FINDING_ITEM_SCHEMA. The base schema structure (summary, stats, flagged_items) is preserved."
     },
     {
-      "what": "AsyncMock pattern for mocking get_tasks",
-      "where": "orchestrator/tests/test_scheduler.py line 504",
-      "how": "scheduler.get_tasks = AsyncMock(return_value=[task_list]) \u2014 used throughout existing tests for acquire_next testing."
+      "what": "BaseStage override pattern (get_system_prompt, get_disallowed_tools)",
+      "where": "fused-memory/src/fused_memory/reconciliation/stages/base.py",
+      "how": "get_report_schema() follows the same pattern \u2014 default implementation in BaseStage, override in IntegrityCheck. Consistent with existing stage customization hooks."
     },
     {
-      "what": "Existing OrchestratorConfig test fixture",
-      "where": "orchestrator/tests/test_scheduler.py lines 13-17",
-      "how": "Use the same config fixture pattern for new test classes, or create scheduler fixtures with OrchestratorConfig(max_per_module=1)."
+      "what": "Existing test fixtures and patterns in test_stages.py",
+      "where": "fused-memory/tests/test_stages.py",
+      "how": "New tests use existing TestStageSubclasses.mock_deps fixture and TestStageReportSchema class structure. _extract_report tests create AgentResult objects directly (from shared.cli_invoke)."
     },
     {
-      "what": "Dependency ID parsing logic (dict/int/str formats)",
-      "where": "orchestrator/src/orchestrator/scheduler.py line 287",
-      "how": "The existing inline expression str(d.get('id', d) if isinstance(d, dict) else d) handles all three formats. Extract this into _deps_satisfied() without changing the parsing logic."
+      "what": "_make_s3_findings() test helper field structure",
+      "where": "fused-memory/tests/test_harness.py",
+      "how": "Reference for what well-formed findings look like. The same field structure (description, severity, actionable, category, affected_ids, suggested_action) is codified in FINDING_ITEM_SCHEMA."
+    },
+    {
+      "what": "Finding field access pattern from _format_findings and harness._maybe_remediate",
+      "where": "fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py lines 180-195, harness.py lines 480-488",
+      "how": "These downstream consumers use .get('description', '?'), .get('actionable', False) etc. The FINDING_ITEM_SCHEMA required fields match exactly what these consumers expect, ensuring findings that pass validation will work downstream."
     }
   ],
-  "_session_id": "52-3884d75c",
-  "_created_at": "2026-03-21T07:58:24.246283+00:00"
+  "_session_id": "80-4d3928ff",
+  "_created_at": "2026-03-21T08:22:49.922901+00:00"
 }
