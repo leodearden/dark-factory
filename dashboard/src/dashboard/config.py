@@ -24,11 +24,15 @@ class DashboardConfig:
 
     @property
     def reconciliation_db(self) -> Path:
-        return self.project_root / 'fused-memory' / 'data' / 'reconciliation' / 'reconciliation.db'
+        return self.project_root / 'data' / 'reconciliation' / 'reconciliation.db'
 
     @property
     def write_queue_db(self) -> Path:
-        return self.project_root / 'fused-memory' / 'data' / 'queue' / 'write_queue.db'
+        return self.project_root / 'data' / 'queue' / 'write_queue.db'
+
+    @property
+    def write_journal_db(self) -> Path:
+        return self.project_root / 'data' / 'reconciliation' / 'write_journal.db'
 
     @property
     def tasks_json(self) -> Path:

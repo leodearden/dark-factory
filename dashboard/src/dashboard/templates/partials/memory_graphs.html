@@ -1,0 +1,125 @@
+<div>
+  <h3 class="text-sm font-semibold text-gray-300 mb-4">Operations — last 24 h</h3>
+
+  <!-- Time series -->
+  <div class="bg-gray-800 rounded-lg p-4 mb-4" style="height:180px">
+    <canvas id="memoryTimeseriesChart"></canvas>
+  </div>
+
+  <!-- Pie charts row -->
+  <div class="grid grid-cols-2 gap-4">
+    <div class="bg-gray-800 rounded-lg p-4" style="height:200px">
+      <div class="text-xs text-gray-400 mb-2 text-center">By operation</div>
+      <canvas id="memoryOpsChart"></canvas>
+    </div>
+    <div class="bg-gray-800 rounded-lg p-4" style="height:200px">
+      <div class="text-xs text-gray-400 mb-2 text-center">By agent</div>
+      <canvas id="memoryAgentChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  var tsData   = {{ timeseries | tojson }};
+  var opsData  = {{ operations | tojson }};
+  var agentData = {{ agents | tojson }};
+
+  var palette = [
+    '#60a5fa','#34d399','#fbbf24','#f87171','#a78bfa',
+    '#fb923c','#38bdf8','#4ade80','#e879f9','#94a3b8'
+  ];
+
+  // Destroy any existing chart on a canvas before re-creating
+  function getOrDestroyChart(canvasId) {
+    var el = document.getElementById(canvasId);
+    if (!el) return null;
+    var existing = Chart.getChart(el);
+    if (existing) existing.destroy();
+    return el;
+  }
+
+  function renderAll() {
+    var tsEl = getOrDestroyChart('memoryTimeseriesChart');
+    if (tsEl) {
+      new Chart(tsEl, {
+        type: 'line',
+        data: {
+          labels: tsData.labels,
+          datasets: [
+            {
+              label: 'Reads',
+              data: tsData.reads,
+              borderColor: '#60a5fa',
+              backgroundColor: 'rgba(96,165,250,0.1)',
+              fill: true,
+              tension: 0.3,
+              pointRadius: 2,
+            },
+            {
+              label: 'Writes',
+              data: tsData.writes,
+              borderColor: '#34d399',
+              backgroundColor: 'rgba(52,211,153,0.1)',
+              fill: true,
+              tension: 0.3,
+              pointRadius: 2,
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'index', intersect: false },
+          scales: {
+            x: {
+              ticks: { color: '#9ca3af', maxRotation: 0, autoSkip: true, maxTicksAllowed: 12 },
+              grid: { color: 'rgba(75,85,99,0.3)' }
+            },
+            y: {
+              beginAtZero: true,
+              ticks: { color: '#9ca3af', precision: 0 },
+              grid: { color: 'rgba(75,85,99,0.3)' }
+            }
+          },
+          plugins: {
+            legend: { labels: { color: '#d1d5db', boxWidth: 12 } }
+          }
+        }
+      });
+    }
+
+    ['memoryOpsChart', 'memoryAgentChart'].forEach(function(id) {
+      var d = id === 'memoryOpsChart' ? opsData : agentData;
+      var el = getOrDestroyChart(id);
+      if (!el) return;
+      new Chart(el, {
+        type: 'doughnut',
+        data: {
+          labels: d.labels,
+          datasets: [{
+            data: d.values,
+            backgroundColor: d.labels.map(function(_, i) { return palette[i % palette.length]; }),
+            borderWidth: 0
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: {
+              position: 'right',
+              labels: { color: '#d1d5db', boxWidth: 10, font: { size: 11 } }
+            }
+          }
+        }
+      });
+    });
+  }
+
+  // Wait for browser layout before initializing charts
+  requestAnimationFrame(function() {
+    requestAnimationFrame(renderAll);
+  });
+})();
+</script>

@@ -30,6 +30,16 @@
         </div>
     </section>
 
+    <!-- Memory Graphs -->
+    <section
+        hx-get="/partials/memory-graphs"
+        hx-trigger="load, every 60s"
+        hx-swap="innerHTML"
+        hx-request='{"timeout": 10000}'
+    >
+        <div class="animate-pulse h-48 bg-gray-800 rounded"></div>
+    </section>
+
     <!-- Reconciliation -->
     <section
         hx-get="/partials/recon"

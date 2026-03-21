@@ -18,10 +18,16 @@ from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.reconciliation import (
     get_buffer_stats,
     get_burst_state,
+    get_journal_entries,
     get_last_attempted_run,
     get_latest_verdict,
     get_recent_runs,
     get_watermarks,
+)
+from dashboard.data.write_journal import (
+    get_agent_breakdown,
+    get_memory_timeseries,
+    get_operations_breakdown,
 )
 
 _pkg_dir = Path(__file__).parent
@@ -118,6 +124,26 @@ async def memory_partial(request: Request):
     )
 
 
+@app.get('/partials/memory-graphs')
+async def memory_graphs_partial(request: Request):
+    """Render the memory graphs partial (htmx fragment)."""
+    config = request.app.state.config
+    db = config.write_journal_db
+    timeseries, operations, agents = await asyncio.gather(
+        get_memory_timeseries(db),
+        get_operations_breakdown(db),
+        get_agent_breakdown(db),
+    )
+    return templates.TemplateResponse(
+        request, 'partials/memory_graphs.html',
+        context={
+            'timeseries': timeseries,
+            'operations': operations,
+            'agents': agents,
+        },
+    )
+
+
 @app.get('/partials/recon')
 async def partials_recon(request: Request):
     """Render the reconciliation panel partial (htmx fragment)."""
@@ -161,6 +187,17 @@ async def partials_recon(request: Request):
             'runs': runs,
             'multi_project_runs': len(run_project_ids) > 1,
         },
+    )
+
+
+@app.get('/partials/recon/run/{run_id}')
+async def partials_recon_run_detail(request: Request, run_id: str):
+    """Render journal entries for a specific reconciliation run (htmx fragment)."""
+    config = request.app.state.config
+    entries = await get_journal_entries(config.reconciliation_db, run_id)
+    return templates.TemplateResponse(
+        request, 'partials/recon_run_detail.html',
+        context={'entries': entries},
     )
 
 

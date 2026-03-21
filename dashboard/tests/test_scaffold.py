@@ -24,9 +24,13 @@ class TestConfigDefaults:
         root = cfg.project_root
         assert (
             cfg.reconciliation_db
-            == root / 'fused-memory' / 'data' / 'reconciliation' / 'reconciliation.db'
+            == root / 'data' / 'reconciliation' / 'reconciliation.db'
         )
-        assert cfg.write_queue_db == root / 'fused-memory' / 'data' / 'queue' / 'write_queue.db'
+        assert cfg.write_queue_db == root / 'data' / 'queue' / 'write_queue.db'
+        assert (
+            cfg.write_journal_db
+            == root / 'data' / 'reconciliation' / 'write_journal.db'
+        )
         assert cfg.tasks_json == root / '.taskmaster' / 'tasks' / 'tasks.json'
         assert cfg.worktrees_dir == root / '.worktrees'
 
@@ -52,7 +56,7 @@ class TestConfigEnvOverrides:
         monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', '/tmp/test')
         cfg = DashboardConfig.from_env()
         assert cfg.reconciliation_db == Path(
-            '/tmp/test/fused-memory/data/reconciliation/reconciliation.db'
+            '/tmp/test/data/reconciliation/reconciliation.db'
         )
         assert cfg.worktrees_dir == Path('/tmp/test/.worktrees')
 
