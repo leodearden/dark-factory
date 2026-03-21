@@ -7,7 +7,7 @@ import logging
 import uuid as uuid_mod
 from typing import TYPE_CHECKING, Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from fused_memory.services.memory_service import MemoryService
 
@@ -92,6 +92,41 @@ def _extract_causation(
     return causation_id, source, cleaned
 
 
+def _resolve_identity(
+    agent_id: str | None,
+    session_id: str | None,
+    ctx: Context[Any, Any, Any] | None,
+) -> tuple[str | None, str | None]:
+    """Derive agent_id/session_id from MCP Context when not explicitly set.
+
+    - agent_id ← ctx.session.client_params.clientInfo.name
+    - session_id ← mcp-session-id HTTP request header
+
+    Explicit caller values always take precedence. Gracefully returns
+    originals on stdio transport, stateless HTTP, or missing context.
+    """
+    if ctx is None:
+        return agent_id, session_id
+
+    if agent_id is None:
+        client_params = getattr(ctx.session, 'client_params', None)
+        client_info = getattr(client_params, 'clientInfo', None)
+        name = getattr(client_info, 'name', None)
+        if isinstance(name, str):
+            agent_id = name
+
+    if session_id is None:
+        req_ctx = getattr(ctx, 'request_context', None)
+        request = getattr(req_ctx, 'request', None)
+        headers = getattr(request, 'headers', None)
+        if headers is not None:
+            val = headers.get('mcp-session-id')
+            if isinstance(val, str):
+                session_id = val
+
+    return agent_id, session_id
+
+
 def create_mcp_server(
     memory_service: MemoryService,
     task_interceptor: TaskInterceptor | None = None,
@@ -158,6 +193,7 @@ def create_mcp_server(
         source_description: str = '',
         metadata: dict | None = None,
         temporal_context: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add an episode to memory. Full ingestion pipeline: raw content is processed
         through Graphiti's extraction pipeline, then classified facts are dual-written
@@ -167,8 +203,8 @@ def create_mcp_server(
             content: Raw text, conversation, or JSON to ingest
             project_id: Project scope (required)
             source: Source type — "text", "json", or "message"
-            agent_id: Which agent is writing (optional)
-            session_id: Session context (optional)
+            agent_id: Which agent is writing (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
             source_description: E.g. "pair programming session"
             metadata: Optional key-value pairs (may contain _causation_id for recon)
             temporal_context: Optional temporal framing — one of "retrospective",
@@ -176,6 +212,7 @@ def create_mcp_server(
                 source_description as '[temporal:X] ' so downstream readers can
                 infer the time-frame of the episode without parsing content.
         """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         if temporal_context is not None and temporal_context not in _VALID_TEMPORAL_CONTEXTS:
             return {
                 'error': (
@@ -210,6 +247,7 @@ def create_mcp_server(
         session_id: str | None = None,
         metadata: dict | None = None,
         dual_write: bool = False,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add a classified memory directly. Skips the extraction pipeline.
         Use when the agent has already identified a specific, discrete memory.
@@ -220,11 +258,12 @@ def create_mcp_server(
             category: One of: entities_and_relations, temporal_facts, decisions_and_rationale,
                       preferences_and_norms, procedural_knowledge, observations_and_summaries.
                       If omitted, the system classifies automatically.
-            agent_id: Which agent is writing (optional)
-            session_id: Session context (optional)
+            agent_id: Which agent is writing (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
             metadata: Arbitrary key-value pairs (optional)
             dual_write: Force write to both stores (default: false)
         """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         try:
             causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
             result = await memory_service.add_memory(
@@ -256,6 +295,7 @@ def create_mcp_server(
         limit: int = 10,
         agent_id: str | None = None,
         session_id: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Search across both memory stores with automatic routing.
 
@@ -275,9 +315,10 @@ def create_mcp_server(
             categories: Filter to specific taxonomy categories (optional)
             stores: Force "graphiti" and/or "mem0" (optional, default: auto)
             limit: Max results (default: 10)
-            agent_id: Filter by authoring agent (optional)
-            session_id: Filter by session (optional)
+            agent_id: Filter by authoring agent (optional, auto-derived from MCP context)
+            session_id: Filter by session (optional, auto-derived from MCP context)
         """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         try:
             results = await memory_service.search(
                 query=query,
@@ -317,6 +358,7 @@ def create_mcp_server(
         project_id: str,
         agent_id: str | None = None,
         session_id: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Look up an entity in the knowledge graph by name (fuzzy matched).
 
@@ -327,9 +369,10 @@ def create_mcp_server(
         Args:
             name: Entity name (fuzzy matched — partial or approximate names work)
             project_id: Project scope (required)
-            agent_id: Which agent is reading (optional)
-            session_id: Session context (optional)
+            agent_id: Which agent is reading (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
         """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         try:
             result = await memory_service.get_entity(name=name, project_id=project_id)
             await _log_read(
@@ -363,6 +406,7 @@ def create_mcp_server(
         last_n: int = 10,
         agent_id: str | None = None,
         session_id: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Retrieve raw episodes from the knowledge graph. Episodes are the original
         ingested content chunks — each represents one add_episode call with its
@@ -372,9 +416,10 @@ def create_mcp_server(
         Args:
             project_id: Project scope (required)
             last_n: Number of most recent episodes to return (default: 10)
-            agent_id: Which agent is reading (optional)
-            session_id: Session context (optional)
+            agent_id: Which agent is reading (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
         """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         try:
             episodes = await memory_service.get_episodes(
                 project_id=project_id, last_n=last_n
@@ -410,7 +455,10 @@ def create_mcp_server(
         memory_id: str,
         store: str,
         project_id: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
         metadata: dict | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Delete a specific memory from a store. IRREVERSIBLE.
 
@@ -426,12 +474,16 @@ def create_mcp_server(
             memory_id: The memory ID (from search results)
             store: "graphiti" or "mem0" (from search results)
             project_id: Project scope (required)
+            agent_id: Which agent is deleting (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         try:
-            causation_id, source, _ = _extract_causation(metadata, None)
+            causation_id, source, _ = _extract_causation(metadata, agent_id)
             return await memory_service.delete_memory(
                 memory_id=memory_id, store=store, project_id=project_id,
+                agent_id=agent_id, session_id=session_id,
                 causation_id=causation_id, _source=source,
             )
         except Exception as e:
@@ -443,7 +495,10 @@ def create_mcp_server(
         episode_id: str,
         project_id: str,
         cascade: bool = True,
+        agent_id: str | None = None,
+        session_id: str | None = None,
         metadata: dict | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Delete a Graphiti episode. IRREVERSIBLE.
 
@@ -455,12 +510,16 @@ def create_mcp_server(
             episode_id: Graphiti episode UUID
             project_id: Project scope (required)
             cascade: Also delete exclusive entities/edges (default: true)
+            agent_id: Which agent is deleting (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         try:
-            causation_id, source, _ = _extract_causation(metadata, None)
+            causation_id, source, _ = _extract_causation(metadata, agent_id)
             return await memory_service.delete_episode(
                 episode_id=episode_id, project_id=project_id, cascade=cascade,
+                agent_id=agent_id, session_id=session_id,
                 causation_id=causation_id, _source=source,
             )
         except Exception as e:
