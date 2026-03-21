@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
@@ -398,10 +399,8 @@ class Scheduler:
             return self._module_cache[task_id]
         metadata = task.get('metadata', {})
         if isinstance(metadata, str):
-            try:
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
                 metadata = json.loads(metadata)
-            except (json.JSONDecodeError, TypeError):
-                pass
         if isinstance(metadata, dict):
             # Prefer file-derived modules (most accurate)
             files = metadata.get('files', [])
