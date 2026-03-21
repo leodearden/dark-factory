@@ -5,7 +5,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.backends.graphiti_client import (
+    EdgeNotFoundError,
+    GraphitiBackend,
+    NodeNotFoundError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -131,3 +135,95 @@ class TestQueryStaleEdgeEmbeddings:
         args, kwargs = call_kwargs
         cypher_args = args[1] if len(args) > 1 else kwargs.get('params', {})
         assert cypher_args.get('dim') == 768
+
+
+# ---------------------------------------------------------------------------
+# step-3: get_node_text / get_edge_text
+# ---------------------------------------------------------------------------
+
+class TestGetNodeText:
+    """GraphitiBackend.get_node_text(uuid) returns (name, summary) tuple."""
+
+    @pytest.mark.asyncio
+    async def test_returns_name_and_summary(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([['Alice', 'Alice is a person']])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            name, summary = await backend.get_node_text('uuid-1')
+        assert name == 'Alice'
+        assert summary == 'Alice is a person'
+
+    @pytest.mark.asyncio
+    async def test_raises_node_not_found(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([])  # empty result
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            with pytest.raises(NodeNotFoundError):
+                await backend.get_node_text('missing-uuid')
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.get_node_text('uuid-1')
+
+    @pytest.mark.asyncio
+    async def test_passes_uuid_to_query(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([['Node', 'Summary']])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.get_node_text('specific-uuid')
+        call_kwargs = graph.query.call_args
+        args, kwargs = call_kwargs
+        params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        assert params.get('uuid') == 'specific-uuid'
+
+
+class TestGetEdgeText:
+    """GraphitiBackend.get_edge_text(uuid) returns (name, fact) tuple."""
+
+    @pytest.mark.asyncio
+    async def test_returns_name_and_fact(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([['edge-name', 'Some fact about the edge']])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            name, fact = await backend.get_edge_text('edge-uuid-1')
+        assert name == 'edge-name'
+        assert fact == 'Some fact about the edge'
+
+    @pytest.mark.asyncio
+    async def test_raises_edge_not_found(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            with pytest.raises(EdgeNotFoundError):
+                await backend.get_edge_text('missing-edge-uuid')
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.get_edge_text('edge-uuid-1')
+
+    @pytest.mark.asyncio
+    async def test_passes_uuid_to_query(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([['name', 'fact']])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.get_edge_text('specific-edge-uuid')
+        call_kwargs = graph.query.call_args
+        args, kwargs = call_kwargs
+        params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        assert params.get('uuid') == 'specific-edge-uuid'
