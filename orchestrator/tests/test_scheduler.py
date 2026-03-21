@@ -799,3 +799,57 @@ class TestAcquireNextDependencyGating:
         result = await scheduler.acquire_next()
         # A is done, B is in-progress (not pending), C is blocked by B — nothing to dispatch
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_handles_dict_and_int_dependency_formats(
+        self, scheduler: Scheduler
+    ):
+        """_deps_satisfied correctly resolves dict, int, and str dependency ID formats."""
+        # Task with integer dep ID
+        task_int = {
+            'id': '10',
+            'title': 'Task int dep',
+            'status': 'pending',
+            'dependencies': [1],  # integer format
+            'metadata': {'modules': ['backend']},
+        }
+        # Task with string dep ID
+        task_str = {
+            'id': '11',
+            'title': 'Task str dep',
+            'status': 'pending',
+            'dependencies': ['1'],  # string format
+            'metadata': {'modules': ['frontend']},
+        }
+        # Task with dict dep ID
+        task_dict = {
+            'id': '12',
+            'title': 'Task dict dep',
+            'status': 'pending',
+            'dependencies': [{'id': 1}],  # dict format
+            'metadata': {'modules': ['ops']},
+        }
+        dep_done = {
+            'id': '1',
+            'title': 'Dep task',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {'modules': []},
+        }
+        scheduler.get_tasks = AsyncMock(
+            return_value=[dep_done, task_int, task_str, task_dict]
+        )
+
+        dispatched_ids: set[str] = set()
+        for _ in range(3):
+            result = await scheduler.acquire_next()
+            assert result is not None, 'Expected to dispatch one of the dependent tasks'
+            dispatched_ids.add(result.task_id)
+
+        assert dispatched_ids == {'10', '11', '12'}, (
+            'All three dependency-format variants should be dispatchable when dep is done'
+        )
+
+        # No more tasks
+        result = await scheduler.acquire_next()
+        assert result is None
