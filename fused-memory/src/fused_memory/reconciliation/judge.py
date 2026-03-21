@@ -179,7 +179,6 @@ Review this run and provide your verdict as JSON.
                 '--model', self.config.judge_llm_model,
                 '--system-prompt', JUDGE_SYSTEM_PROMPT,
                 '--permission-mode', 'bypassPermissions',
-                '--tools', '',
                 '--', prompt,
             ]
 
@@ -202,10 +201,10 @@ Review this run and provide your verdict as JSON.
                 ) from exc
 
             try:
-                stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=120)
+                stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=600)
             except TimeoutError as exc:
                 proc.kill()
-                raise RuntimeError('Claude CLI timed out after 120 seconds') from exc
+                raise RuntimeError('Claude CLI timed out after 600 seconds') from exc
 
             stdout_text = stdout.decode()
             stderr_text = stderr.decode()

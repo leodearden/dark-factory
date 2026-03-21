@@ -61,6 +61,14 @@ class MemoryConsolidator(BaseStage):
         except Exception:
             mem0_memories = []
 
+        new_memories = mem0_memories
+        if watermark.last_memory_timestamp:
+            wm_str = str(watermark.last_memory_timestamp)
+            new_memories = [
+                m for m in mem0_memories
+                if (m.get('created_at') or m.get('updated_at') or '') > wm_str
+            ]
+
         # 3. Store stats
         try:
             status = await self.memory.get_status(project_id=self.project_id)
@@ -80,8 +88,8 @@ class MemoryConsolidator(BaseStage):
 ### New Episodes Since Last Reconciliation ({len(new_episodes)})
 {_format_episodes(new_episodes[:200])}
 
-### Recent Mem0 Memories ({len(mem0_memories)})
-{_format_memories(mem0_memories[:200])}
+### New Mem0 Memories Since Last Reconciliation ({len(new_memories)})
+{_format_memories(new_memories[:200])}
 
 ### Store Status
 {json.dumps(status, indent=2, default=str)}

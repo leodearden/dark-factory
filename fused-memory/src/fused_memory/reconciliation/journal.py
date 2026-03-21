@@ -250,7 +250,10 @@ class ReconciliationJournal:
         reports_raw = json.loads(row['stage_reports'] or '{}')
         stage_reports: dict[str, StageReport | dict] = {}
         for k, v in reports_raw.items():
-            stage_reports[k] = StageReport(**v)
+            if isinstance(v, dict) and 'stage' in v:
+                stage_reports[k] = StageReport(**v)
+            else:
+                stage_reports[k] = v  # Keep _error and other raw entries as-is
         return ReconciliationRun(
             id=row['id'],
             project_id=row['project_id'],
@@ -275,9 +278,12 @@ class ReconciliationJournal:
         runs = []
         for row in rows:
             reports_raw = json.loads(row['stage_reports'] or '{}')
-            stage_reports: dict[str, StageReport | dict] = {
-                k: StageReport(**v) for k, v in reports_raw.items()
-            }
+            stage_reports: dict[str, StageReport | dict] = {}
+            for k, v in reports_raw.items():
+                if isinstance(v, dict) and 'stage' in v:
+                    stage_reports[k] = StageReport(**v)
+                else:
+                    stage_reports[k] = v  # Keep _error and other raw entries as-is
             runs.append(
                 ReconciliationRun(
                     id=row['id'],
