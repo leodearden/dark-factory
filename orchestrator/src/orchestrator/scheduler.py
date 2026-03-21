@@ -260,6 +260,21 @@ class Scheduler:
             logger.error(f'Failed to update task {task_id}: {e}')
             return False
 
+    def _deps_satisfied(self, task: dict, status_map: dict[str, str]) -> bool:
+        """Return True if every dependency of *task* has status 'done'.
+
+        Handles three dependency formats:
+          - dict with 'id' key: ``{'id': 1}`` or ``{'id': '1'}``
+          - integer: ``1``
+          - string: ``'1'``
+        """
+        deps = task.get('dependencies', [])
+        for d in deps:
+            dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
+            if status_map.get(dep_id) != 'done':
+                return False
+        return True
+
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task: pending, deps done, module locks available.
 
@@ -282,12 +297,7 @@ class Scheduler:
                 continue
             if str(t.get('id', '')) in self._dispatched:
                 continue
-            deps = t.get('dependencies', [])
-            deps_done = all(
-                status_map.get(str(d.get('id', d) if isinstance(d, dict) else d)) == 'done'
-                for d in deps
-            )
-            if not deps_done:
+            if not self._deps_satisfied(t, status_map):
                 continue
             candidates.append(t)
 
