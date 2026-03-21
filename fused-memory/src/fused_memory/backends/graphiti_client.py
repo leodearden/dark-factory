@@ -118,10 +118,13 @@ class GraphitiBackend:
         reference_time: datetime | None = None,
         entity_types: dict | None = None,
         uuid: str | None = None,
+        temporal_context: str | None = None,
     ) -> Any:
         """Add an episode to Graphiti and return the result."""
         client = self._require_client()
         ref_time = reference_time or datetime.now(UTC)
+        if temporal_context is not None:
+            source_description = f'[temporal:{temporal_context}] {source_description}'
         return await asyncio.wait_for(
             client.add_episode(
                 name=name,
