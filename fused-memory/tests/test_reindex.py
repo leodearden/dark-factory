@@ -11,7 +11,6 @@ from fused_memory.backends.graphiti_client import (
     NodeNotFoundError,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -161,9 +160,11 @@ class TestGetNodeText:
         graph = _make_graph_mock([])  # empty result
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            with pytest.raises(NodeNotFoundError):
-                await backend.get_node_text('missing-uuid')
+        with (
+            patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target),
+            pytest.raises(NodeNotFoundError),
+        ):
+            await backend.get_node_text('missing-uuid')
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
@@ -205,9 +206,11 @@ class TestGetEdgeText:
         graph = _make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            with pytest.raises(EdgeNotFoundError):
-                await backend.get_edge_text('missing-edge-uuid')
+        with (
+            patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target),
+            pytest.raises(EdgeNotFoundError),
+        ):
+            await backend.get_edge_text('missing-edge-uuid')
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
@@ -542,7 +545,7 @@ class TestReindexAndReplay:
         mock_queue = MagicMock()
         mock_queue.replay_dead = AsyncMock(side_effect=fake_replay)
 
-        result = await manager.reindex_and_replay(mock_queue)
+        await manager.reindex_and_replay(mock_queue)
 
         assert call_order == ['reindex', 'replay']
 
@@ -625,15 +628,17 @@ class TestRunReindex:
 
         mock_result = {'reindex_result': ReindexResult(2, 1, 0), 'replay_count': 5}
 
-        with patch('fused_memory.maintenance.reindex.FusedMemoryConfig', return_value=mock_config):
-            with patch('fused_memory.maintenance.reindex.MemoryService', return_value=mock_service):
-                with patch('fused_memory.maintenance.reindex.OpenAIEmbedder'):
-                    with patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls:
-                        mock_mgr = MagicMock()
-                        mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
-                        mock_mgr_cls.return_value = mock_mgr
+        with (
+            patch('fused_memory.maintenance.reindex.FusedMemoryConfig', return_value=mock_config),
+            patch('fused_memory.maintenance.reindex.MemoryService', return_value=mock_service),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
 
-                        result = await run_reindex()
+            result = await run_reindex()
 
         mock_service.initialize.assert_awaited_once()
         mock_mgr.reindex_and_replay.assert_awaited_once_with(mock_service.durable_queue)
@@ -654,15 +659,17 @@ class TestRunReindex:
 
         mock_result = {'reindex_result': ReindexResult(), 'replay_count': 0}
 
-        with patch('fused_memory.maintenance.reindex.FusedMemoryConfig', return_value=mock_config):
-            with patch('fused_memory.maintenance.reindex.MemoryService', return_value=mock_service):
-                with patch('fused_memory.maintenance.reindex.OpenAIEmbedder'):
-                    with patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls:
-                        mock_mgr = MagicMock()
-                        mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
-                        mock_mgr_cls.return_value = mock_mgr
+        with (
+            patch('fused_memory.maintenance.reindex.FusedMemoryConfig', return_value=mock_config),
+            patch('fused_memory.maintenance.reindex.MemoryService', return_value=mock_service),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
 
-                        await run_reindex()
+            await run_reindex()
 
         mock_service.close.assert_awaited_once()
 
@@ -679,18 +686,20 @@ class TestRunReindex:
         mock_service = AsyncMock()
         mock_service.durable_queue = MagicMock()
 
-        with patch('fused_memory.maintenance.reindex.FusedMemoryConfig', return_value=mock_config):
-            with patch('fused_memory.maintenance.reindex.MemoryService', return_value=mock_service):
-                with patch('fused_memory.maintenance.reindex.OpenAIEmbedder'):
-                    with patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls:
-                        mock_mgr = MagicMock()
-                        mock_mgr.reindex_and_replay = AsyncMock(
-                            side_effect=RuntimeError('embedding service unavailable')
-                        )
-                        mock_mgr_cls.return_value = mock_mgr
+        with (
+            patch('fused_memory.maintenance.reindex.FusedMemoryConfig', return_value=mock_config),
+            patch('fused_memory.maintenance.reindex.MemoryService', return_value=mock_service),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.reindex_and_replay = AsyncMock(
+                side_effect=RuntimeError('embedding service unavailable')
+            )
+            mock_mgr_cls.return_value = mock_mgr
 
-                        with pytest.raises(RuntimeError, match='embedding service unavailable'):
-                            await run_reindex()
+            with pytest.raises(RuntimeError, match='embedding service unavailable'):
+                await run_reindex()
 
         mock_service.close.assert_awaited_once()
 
@@ -709,16 +718,18 @@ class TestRunReindex:
 
         mock_result = {'reindex_result': ReindexResult(), 'replay_count': 0}
 
-        with patch('fused_memory.maintenance.reindex.FusedMemoryConfig', return_value=mock_config):
-            with patch('fused_memory.maintenance.reindex.MemoryService', return_value=mock_service):
-                with patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig') as mock_cfg_cls:
-                    with patch('fused_memory.maintenance.reindex.OpenAIEmbedder'):
-                        with patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls:
-                            mock_mgr = MagicMock()
-                            mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
-                            mock_mgr_cls.return_value = mock_mgr
+        with (
+            patch('fused_memory.maintenance.reindex.FusedMemoryConfig', return_value=mock_config),
+            patch('fused_memory.maintenance.reindex.MemoryService', return_value=mock_service),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig') as mock_cfg_cls,
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
 
-                            await run_reindex()
+            await run_reindex()
 
         # Verify OpenAIEmbedderConfig was constructed with the right dimension
         mock_cfg_cls.assert_called_once()

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from graphiti_core.embedder import OpenAIEmbedder
 from graphiti_core.embedder.openai import OpenAIEmbedderConfig
@@ -140,8 +140,12 @@ async def run_reindex(config_path: str | None = None) -> dict:
 
     # Build a dedicated embedder for re-embedding stale content.
     emb_cfg = config.embedder
+    openai_provider = emb_cfg.providers.openai
+    openai_api_key: str | None = None
+    if openai_provider is not None:
+        openai_api_key = openai_provider.api_key
     embedder_config = OpenAIEmbedderConfig(
-        api_key=emb_cfg.providers.openai.api_key,
+        api_key=openai_api_key,
         embedding_model=emb_cfg.model,
         embedding_dim=emb_cfg.dimensions,
     )
