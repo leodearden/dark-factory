@@ -316,6 +316,28 @@ class GraphitiBackend:
         row = result.result_set[0]
         return (row[0] or '', row[1] or '')
 
+    async def update_node_embedding(self, uuid: str, embedding: list[float]) -> None:
+        """Update the name_embedding vector for an Entity node using vecf32()."""
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH (n:Entity {uuid: $uuid}) '
+            'SET n.name_embedding = vecf32($embedding)'
+        )
+        await graph.query(cypher, {'uuid': uuid, 'embedding': embedding})
+
+    async def update_edge_embedding(self, uuid: str, embedding: list[float]) -> None:
+        """Update the fact_embedding vector for a RELATES_TO edge using vecf32()."""
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
+            'SET e.fact_embedding = vecf32($embedding)'
+        )
+        await graph.query(cypher, {'uuid': uuid, 'embedding': embedding})
+
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
         client = self._require_client()
