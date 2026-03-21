@@ -880,3 +880,47 @@ class TestDepsSatisfiedLogging:
             '42' in record.message and 'in-progress' in record.message
             for record in caplog.records
         ), f'Expected log about dep 42 being in-progress. Got: {[r.message for r in caplog.records]}'
+
+
+class TestGetModulesJsonStringMetadata:
+    """_get_modules must parse JSON string metadata, not just dict metadata."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def test_get_modules_extracts_modules_from_json_string_metadata(
+        self, scheduler: Scheduler
+    ):
+        """_get_modules returns normalized module list when metadata is a JSON string with 'modules'."""
+        task = {
+            'id': '5',
+            'metadata': '{"modules": ["backend", "server"]}',
+        }
+        result = scheduler._get_modules(task)
+        # Should NOT fall back to task-5 — must extract modules from JSON string
+        assert result != ['task-5'], (
+            f'Expected modules from JSON string, got fallback: {result}'
+        )
+        # Should have normalized module entries
+        assert len(result) > 0
+        assert all(isinstance(m, str) for m in result)
+        # Verify neither entry is the fallback
+        assert 'task-5' not in result
+
+    def test_get_modules_extracts_files_from_json_string_metadata(
+        self, scheduler: Scheduler
+    ):
+        """_get_modules returns file-derived modules when metadata is a JSON string with 'files'."""
+        task = {
+            'id': '6',
+            'metadata': '{"files": ["src/server/app.py", "src/server/routes.py"]}',
+        }
+        result = scheduler._get_modules(task)
+        # Should NOT fall back to task-6 — must extract from JSON string
+        assert result != ['task-6'], (
+            f'Expected file-derived modules from JSON string, got fallback: {result}'
+        )
+        assert len(result) > 0
+        assert 'task-6' not in result
