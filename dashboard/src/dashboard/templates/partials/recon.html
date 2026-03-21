@@ -107,10 +107,11 @@
   </div>
 
   <!-- Right column: Recent Runs table -->
-  <div class="bg-gray-800 rounded-lg p-6 flex flex-col">
+  <div class="min-h-[400px] lg:relative">
+  <div class="bg-gray-800 rounded-lg p-6 flex flex-col lg:absolute lg:inset-0">
     <h3 class="text-lg font-semibold text-gray-100 mb-4">Recent Runs</h3>
     {% if runs %}
-      <div class="overflow-x-auto flex-1 overflow-y-auto">
+      <div class="overflow-x-auto flex-1 overflow-y-auto min-h-0">
       <table class="w-full text-sm">
         <thead>
           <tr class="text-gray-400 border-b border-gray-700">
@@ -169,5 +170,6 @@
     {% else %}
       <p class="text-gray-400">No reconciliation runs yet</p>
     {% endif %}
+  </div>
   </div>
 </div>
