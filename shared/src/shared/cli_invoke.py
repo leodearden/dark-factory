@@ -17,6 +17,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    'AgentResult',
+    'invoke_claude_agent',
+    'invoke_with_cap_retry',
+]
+
 
 @dataclass
 class AgentResult:

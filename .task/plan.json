@@ -1,142 +1,179 @@
 {
-  "task_id": "80",
-  "title": "Fix Stage 3 reporter: finding fields serialized as '?' placeholder",
+  "task_id": "82",
+  "title": "Extract shared/cli_invoke as installable package for cross-project reuse",
   "files": [
-    "fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py",
-    "fused-memory/src/fused_memory/reconciliation/stages/base.py",
-    "fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py",
-    "fused-memory/src/fused_memory/reconciliation/prompts/stage3.py",
-    "fused-memory/tests/test_stages.py"
+    "shared/pyproject.toml",
+    "shared/orchestrator.yaml",
+    "shared/src/shared/__init__.py",
+    "shared/src/shared/cli_invoke.py",
+    "shared/src/shared/usage_gate.py",
+    "shared/src/shared/config_models.py",
+    "shared/src/shared/py.typed",
+    "shared/tests/__init__.py",
+    "shared/tests/conftest.py",
+    "shared/tests/test_public_api.py"
   ],
   "modules": [
-    "fused-memory/src/fused_memory/reconciliation",
-    "fused-memory/src/fused_memory/reconciliation/stages",
-    "fused-memory/src/fused_memory/reconciliation/prompts",
-    "fused-memory/tests"
+    "shared"
   ],
-  "analysis": "Stage 3 (IntegrityCheck) runs as a Claude CLI subprocess that outputs a structured JSON report. The report schema (STAGE_REPORT_SCHEMA) defines flagged_items as an array of generic objects ({type: object}) with no required properties on the items. Meanwhile, the Stage 3 system prompt instructs the LLM to produce 'findings' with specific fields (description, severity, actionable, category, affected_ids, suggested_action) but never mentions the key 'flagged_items'. This prompt/schema disconnect causes two failure modes: (1) the LLM puts real findings under a 'findings' key instead of 'flagged_items', so report_data.get('flagged_items', []) gets empty stubs; (2) even when items land in 'flagged_items', the generic schema doesn't enforce field structure, so the LLM outputs placeholder values. Downstream, _format_findings() uses .get('description', '?') etc., producing the observed '?' output in serialized stage_reports. The BaseStage.run() method at line 120 maps report_data['flagged_items'] to StageReport.items_flagged, and run_stage_via_cli hardcodes STAGE_REPORT_SCHEMA. Fix requires: normalization in _extract_report (remap findings\u2192flagged_items, filter placeholders), a Stage 3-specific schema with finding item structure, per-stage schema via get_report_schema() override, and prompt alignment.",
-  "prerequisites": [],
+  "analysis": "shared/ already has a proper pyproject.toml (name=dark-factory-shared, hatchling build, src layout) and is consumed by orchestrator and fused-memory via uv.sources editable paths. However, __init__.py is empty \u2014 no public API surface is defined. Each module (cli_invoke, usage_gate, config_models) lacks __all__. There are no tests within shared/ itself (tests live in orchestrator/tests/test_usage_gate.py). There is no py.typed marker for PEP 561. The code itself is complete and working \u2014 this task is purely about packaging hygiene: define a clear public API via __init__.py re-exports and __all__, add a py.typed marker, create in-package tests verifying the API contract, and add dev dependencies for self-contained testing. No code logic changes needed.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Create shared/tests/ directory with __init__.py and conftest.py (following project convention: prepend src/ to sys.path)",
+      "status": "done",
+      "commit": "eb69e82",
+      "tests": []
+    },
+    {
+      "id": "pre-2",
+      "description": "Add [dependency-groups] dev = [pytest, pytest-asyncio, ruff] to shared/pyproject.toml",
+      "status": "done",
+      "commit": "eb69e82",
+      "tests": []
+    },
+    {
+      "id": "pre-3",
+      "description": "Update shared/orchestrator.yaml to add test_command alongside existing lint_command",
+      "status": "done",
+      "commit": "eb69e82",
+      "tests": []
+    }
+  ],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write test test_extract_report_normalizes_findings_to_flagged_items in test_stages.py: create an AgentResult with structured_output={'findings': [{'description': 'stale edge', 'severity': 'moderate'}], 'summary': 'done'} (no flagged_items key). Call _extract_report and assert the returned dict has 'flagged_items' containing the finding, not 'findings'. Also test that when both 'findings' and 'flagged_items' exist, flagged_items is preserved as-is.",
+      "description": "Write failing test_public_api.py::test_top_level_imports \u2014 asserts that 'from shared import invoke_claude_agent, invoke_with_cap_retry, AgentResult, UsageGate, UsageCapConfig, AccountConfig, AccountState, SessionBudgetExhausted' all resolve and are not None. Will fail because __init__.py is empty.",
       "status": "done",
-      "commit": "23d38cf"
+      "commit": "dac4967"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Add _normalize_report(report: dict) -> dict function in cli_stage_runner.py that: (1) if report has 'findings' but not 'flagged_items', moves 'findings' to 'flagged_items'; (2) if both exist and 'flagged_items' is empty, uses 'findings'. Call _normalize_report at the end of _extract_report before returning the dict.",
+      "description": "Update shared/src/shared/__init__.py: add re-exports from cli_invoke (AgentResult, invoke_claude_agent, invoke_with_cap_retry), config_models (AccountConfig, UsageCapConfig), and usage_gate (UsageGate, AccountState, SessionBudgetExhausted). Define __all__ listing all 8 symbols.",
       "status": "done",
-      "commit": "6d3af6c"
+      "commit": "563c590"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write test test_normalize_filters_placeholder_findings: pass findings where all of description/severity/category are '?' or missing to _normalize_report and assert they are filtered out. Pass a mix of valid and placeholder findings and assert only valid ones survive. A finding is valid if description is present and not '?'.",
+      "description": "Write failing test_public_api.py::test_module_level_all \u2014 asserts that cli_invoke.__all__, usage_gate.__all__, and config_models.__all__ each exist and contain exactly the expected public symbols. cli_invoke: [AgentResult, invoke_claude_agent, invoke_with_cap_retry]. usage_gate: [UsageGate, AccountState, SessionBudgetExhausted]. config_models: [AccountConfig, UsageCapConfig]. Will fail because no module defines __all__.",
       "status": "done",
-      "commit": "d93b6cd"
+      "commit": "7ae91b9"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Add placeholder-filtering logic to _normalize_report: after key remapping, iterate flagged_items and drop any finding dict where description is missing, empty, or '?'. Log a warning with the count of filtered findings.",
+      "description": "Add __all__ to cli_invoke.py (AgentResult, invoke_claude_agent, invoke_with_cap_retry), usage_gate.py (UsageGate, AccountState, SessionBudgetExhausted), and config_models.py (AccountConfig, UsageCapConfig).",
       "status": "done",
-      "commit": "6d3af6c"
+      "commit": "ea4fb6e"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write test test_stage3_report_schema_has_finding_item_properties: import STAGE3_REPORT_SCHEMA from cli_stage_runner and assert its flagged_items.items has 'properties' containing description, severity, actionable, category, affected_ids, suggested_action, and 'required' includes at least description and severity.",
-      "status": "pending",
-      "commit": null
+      "description": "Write failing test_public_api.py::test_init_all_completeness \u2014 asserts shared.__all__ covers the union of all module __all__ entries. Also asserts no underscore-prefixed symbols appear in any __all__. Validates the public API contract is consistent across layers.",
+      "status": "done",
+      "commit": "d77a282"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Define FINDING_ITEM_SCHEMA dict in cli_stage_runner.py with type: object and properties: description (string), severity (string, enum: minor/moderate/serious), actionable (boolean), category (string, enum of valid categories), affected_ids (array of strings), suggested_action (string). Required: [description, severity]. Define STAGE3_REPORT_SCHEMA by deep-copying STAGE_REPORT_SCHEMA and replacing flagged_items.items with FINDING_ITEM_SCHEMA.",
-      "status": "pending",
-      "commit": null
+      "description": "Verify step-5 test passes with existing implementations from step-2 and step-4. Fix any inconsistencies between __init__.__all__ and module-level __all__ if found.",
+      "status": "done",
+      "commit": "b0e656d"
     },
     {
       "id": "step-7",
       "type": "test",
-      "description": "Write test test_integrity_check_uses_stage3_report_schema: instantiate IntegrityCheck and MemoryConsolidator with mock deps. Assert IntegrityCheck.get_report_schema() returns STAGE3_REPORT_SCHEMA while MemoryConsolidator.get_report_schema() returns STAGE_REPORT_SCHEMA.",
-      "status": "pending",
-      "commit": null
+      "description": "Write failing test_public_api.py::test_pep561_py_typed \u2014 asserts that (Path(__file__).resolve().parent.parent.parent / 'src' / 'shared' / 'py.typed').exists(), confirming the PEP 561 marker is present. Will fail because the file doesn't exist yet.",
+      "status": "done",
+      "commit": "2c5b5a9"
     },
     {
       "id": "step-8",
       "type": "impl",
-      "description": "Add get_report_schema(self) -> dict method to BaseStage returning STAGE_REPORT_SCHEMA (import it). Override in IntegrityCheck to return STAGE3_REPORT_SCHEMA. Add output_schema: dict | None = None parameter to run_stage_via_cli (defaults to STAGE_REPORT_SCHEMA when None). In BaseStage.run(), pass output_schema=self.get_report_schema() to run_stage_via_cli.",
-      "status": "pending",
-      "commit": null
+      "description": "Create shared/src/shared/py.typed empty marker file for PEP 561 compliance.",
+      "status": "done",
+      "commit": "b068074"
     },
     {
       "id": "step-9",
       "type": "test",
-      "description": "Write test test_stage3_prompt_references_flagged_items: import STAGE3_SYSTEM_PROMPT and assert it contains 'flagged_items' at least once, ensuring the LLM is explicitly told to use the correct output key.",
-      "status": "pending",
-      "commit": null
+      "description": "Write failing test_public_api.py::test_package_metadata \u2014 uses importlib.metadata.metadata('dark-factory-shared') to verify package name is 'dark-factory-shared', version is '0.1.0', and Requires-Dist includes httpx and pydantic. Also asserts shared.__version__ == '0.1.0'.",
+      "status": "done",
+      "commit": "d28d5e6"
     },
     {
       "id": "step-10",
       "type": "impl",
-      "description": "Update STAGE3_SYSTEM_PROMPT in prompts/stage3.py: add an '## Output Format' section at the end that explicitly instructs the LLM to put all findings in the `flagged_items` array of its structured JSON output (not a `findings` key), and reiterates that each item must include description, severity, actionable, category, affected_ids, and suggested_action.",
-      "status": "pending",
-      "commit": null
+      "description": "Add __version__ = '0.1.0' to shared/src/shared/__init__.py for programmatic version access. Verify importlib.metadata picks up the installed package correctly.",
+      "status": "done",
+      "commit": "154e3b2"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write test_public_api.py::test_editable_install_location \u2014 verifies that importlib.metadata finds 'dark-factory-shared' and its location resolves under shared/src, confirming the editable install is working correctly for the current environment.",
+      "status": "done",
+      "commit": "bdd040c"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Run full test suite (uv run --project shared --directory shared pytest tests/ -v) and lint (ruff check src/ tests/). Fix any issues. Validates the complete packaging is correct end-to-end.",
+      "status": "done",
+      "commit": "4999541"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Normalize report in _extract_report rather than BaseStage.run()",
-      "rationale": "_extract_report is the single extraction point for all stage outputs. Normalizing here means all stages benefit from the findings\u2192flagged_items key mapping, and the fix is contained in one function rather than scattered across the call chain."
+      "decision": "Re-export public API from __init__.py rather than requiring deep imports",
+      "rationale": "External consumers (autopilot-video) should write 'from shared import invoke_claude_agent' not 'from shared.cli_invoke import invoke_claude_agent'. The top-level re-export is the standard Python packaging pattern and decouples the public API from internal module structure."
     },
     {
-      "decision": "Filter placeholder findings based on description content, not all fields",
-      "rationale": "A finding is meaningful if it has a real description. Checking only description (not missing and not '?') is the minimal gate that filters LLM placeholder output while being tolerant of partially-populated findings that still carry useful info."
+      "decision": "Only export 8 symbols in public API: AgentResult, invoke_claude_agent, invoke_with_cap_retry, UsageGate, AccountState, SessionBudgetExhausted, AccountConfig, UsageCapConfig",
+      "rationale": "These are the symbols consumers actually need. Internal helpers (_parse_claude_output, _run_subprocess, _SubprocessResult, _parse_resets_at) are underscore-prefixed implementation details. The orchestrator uses some of these internally but that's fine \u2014 it imports from shared.cli_invoke directly, not from shared.__init__."
     },
     {
-      "decision": "Per-stage report schema via get_report_schema() override rather than config",
-      "rationale": "Follows the existing pattern where stages override get_system_prompt() and get_disallowed_tools(). Adding get_report_schema() is consistent and doesn't require config changes. Stage 3 gets a specific schema with finding item structure; other stages keep the generic schema."
+      "decision": "Add __all__ to every module, not just __init__.py",
+      "rationale": "Module-level __all__ documents the public contract of each module independently. This prevents 'from shared.cli_invoke import *' from pulling in private names, and makes the API contract testable at each level."
     },
     {
-      "decision": "Add output_schema parameter to run_stage_via_cli with backward-compatible default",
-      "rationale": "Currently STAGE_REPORT_SCHEMA is hardcoded in run_stage_via_cli. Making it a parameter with default=None (falling back to STAGE_REPORT_SCHEMA) is backward-compatible and allows per-stage schemas without breaking existing callers."
+      "decision": "Keep tests inside shared/tests/ rather than only in orchestrator",
+      "rationale": "The existing tests in orchestrator/tests/test_usage_gate.py test behavior. The new tests in shared/tests/ test the packaging contract (exports, metadata, py.typed). These are distinct concerns. A self-contained test suite is essential for an installable package \u2014 external consumers need confidence the package is well-formed without running the orchestrator's tests."
     },
     {
-      "decision": "Update Stage 3 prompt to explicitly mention flagged_items key",
-      "rationale": "The root cause is the disconnect between the prompt (which says 'findings') and the output schema (which uses 'flagged_items'). Even with normalization as a safety net, aligning the prompt with the schema key is the primary fix \u2014 it tells the LLM exactly where to put the data."
+      "decision": "Add py.typed marker for PEP 561",
+      "rationale": "shared uses Pydantic models and dataclasses with type annotations. Without py.typed, type checkers in consuming projects won't discover the type information. This is especially important for autopilot-video which will use these types."
+    },
+    {
+      "decision": "No changes to existing import paths in orchestrator or fused-memory",
+      "rationale": "Existing consumers import directly from submodules (shared.cli_invoke, shared.usage_gate, shared.config_models). Adding re-exports to __init__.py is purely additive \u2014 it provides a convenience layer without breaking any existing imports."
     }
   ],
   "reuse": [
     {
-      "what": "STAGE_REPORT_SCHEMA base structure",
-      "where": "fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py",
-      "how": "STAGE3_REPORT_SCHEMA extends the base schema by replacing flagged_items.items with FINDING_ITEM_SCHEMA. The base schema structure (summary, stats, flagged_items) is preserved."
+      "what": "conftest.py sys.path pattern",
+      "where": "orchestrator/tests/conftest.py, fused-memory/tests/conftest.py",
+      "how": "Copy the same pattern for shared/tests/conftest.py: prepend src/ to sys.path so tests can import the package without installing it"
     },
     {
-      "what": "BaseStage override pattern (get_system_prompt, get_disallowed_tools)",
-      "where": "fused-memory/src/fused_memory/reconciliation/stages/base.py",
-      "how": "get_report_schema() follows the same pattern \u2014 default implementation in BaseStage, override in IntegrityCheck. Consistent with existing stage customization hooks."
+      "what": "pyproject.toml structure and conventions",
+      "where": "orchestrator/pyproject.toml, escalation/pyproject.toml",
+      "how": "Follow the same [dependency-groups] dev pattern, same ruff config, same hatchling build config already present in shared/pyproject.toml"
     },
     {
-      "what": "Existing test fixtures and patterns in test_stages.py",
-      "where": "fused-memory/tests/test_stages.py",
-      "how": "New tests use existing TestStageSubclasses.mock_deps fixture and TestStageReportSchema class structure. _extract_report tests create AgentResult objects directly (from shared.cli_invoke)."
+      "what": "orchestrator.yaml verification commands",
+      "where": "orchestrator/orchestrator.yaml, escalation/orchestrator.yaml",
+      "how": "Add test_command following the same 'uv run --project shared --directory shared pytest tests/ --tb=short -q' pattern"
     },
     {
-      "what": "_make_s3_findings() test helper field structure",
-      "where": "fused-memory/tests/test_harness.py",
-      "how": "Reference for what well-formed findings look like. The same field structure (description, severity, actionable, category, affected_ids, suggested_action) is codified in FINDING_ITEM_SCHEMA."
-    },
-    {
-      "what": "Finding field access pattern from _format_findings and harness._maybe_remediate",
-      "where": "fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py lines 180-195, harness.py lines 480-488",
-      "how": "These downstream consumers use .get('description', '?'), .get('actionable', False) etc. The FINDING_ITEM_SCHEMA required fields match exactly what these consumers expect, ensuring findings that pass validation will work downstream."
+      "what": "Existing shared/pyproject.toml",
+      "where": "shared/pyproject.toml",
+      "how": "The package is already properly configured with hatchling build, src layout, and correct metadata. Only needs dev dependency group added."
     }
   ],
-  "_session_id": "80-4d3928ff",
-  "_created_at": "2026-03-21T08:22:49.922901+00:00"
+  "_session_id": "82-c5ef6921",
+  "_created_at": "2026-03-21T09:41:28.055777+00:00"
 }

@@ -24,6 +24,12 @@ from shared.config_models import UsageCapConfig
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    'UsageGate',
+    'AccountState',
+    'SessionBudgetExhausted',
+]
+
 # Patterns that indicate a usage cap has been hit (from Claude Code CLI output)
 CAP_HIT_PREFIXES = [
     "You've hit your",
