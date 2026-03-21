@@ -104,3 +104,25 @@ class TestPEP561:
             f'PEP 561 marker missing: {py_typed}\n'
             'Create an empty shared/src/shared/py.typed file.'
         )
+
+
+class TestPackageMetadata:
+    """Verify importlib.metadata picks up correct package metadata."""
+
+    def test_package_metadata(self):
+        import importlib.metadata as meta
+
+        m = meta.metadata('dark-factory-shared')
+        assert m['Name'] == 'dark-factory-shared'
+        assert m['Version'] == '0.1.0'
+
+        requires = m.get_all('Requires-Dist') or []
+        dist_names = {r.split('>=')[0].split('[')[0].strip() for r in requires}
+        assert 'httpx' in dist_names, f'httpx missing from Requires-Dist: {requires}'
+        assert 'pydantic' in dist_names, f'pydantic missing from Requires-Dist: {requires}'
+
+    def test_shared_version_attribute(self):
+        import shared
+
+        assert hasattr(shared, '__version__'), 'shared must expose __version__'
+        assert shared.__version__ == '0.1.0'
