@@ -154,6 +154,7 @@ class MemoryService:
         # Extract journal metadata from payload (injected at enqueue time)
         causation_id = payload.pop('_causation_id', None)
         write_op_id = payload.pop('_write_op_id', None)
+        temporal_context = payload.pop('temporal_context', None)
 
         result = await self._journaled_backend_call(
             write_op_id=write_op_id,
@@ -168,6 +169,7 @@ class MemoryService:
                 group_id=payload['group_id'],
                 source_description=payload.get('source_description', ''),
                 uuid=payload.get('uuid'),
+                temporal_context=temporal_context,
             ),
         )
         return result
