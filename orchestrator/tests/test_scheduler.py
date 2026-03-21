@@ -742,3 +742,28 @@ class TestAcquireNextDependencyGating:
         # B's dep A is still pending (mock status unchanged) — B must be blocked
         second = await scheduler.acquire_next()
         assert second is None, 'B should be blocked because dep A is not done'
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_dispatches_when_all_deps_done(
+        self, scheduler: Scheduler
+    ):
+        """acquire_next returns task B when its dependency A has status 'done'."""
+        task_a = {
+            'id': 'A',
+            'title': 'Task A',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {'modules': ['backend']},
+        }
+        task_b = {
+            'id': 'B',
+            'title': 'Task B',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}],
+            'metadata': {'modules': ['frontend']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        result = await scheduler.acquire_next()
+        assert result is not None
+        assert result.task_id == 'B'
