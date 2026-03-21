@@ -200,6 +200,7 @@ class MemoryService:
         reference_time: datetime | None = None,
         source_description: str = '',
         causation_id: str | None = None,
+        temporal_context: str | None = None,
         _source: str = 'mcp_tool',
     ) -> AddEpisodeResponse:
         """Full ingestion pipeline — durably enqueue episode, return immediately."""
@@ -235,6 +236,7 @@ class MemoryService:
                     # Journal metadata (popped by _execute_graphiti_write)
                     '_causation_id': causation_id,
                     '_write_op_id': write_op_id,
+                    'temporal_context': temporal_context,
                 },
                 callback_type='dual_write_episode',
             )
