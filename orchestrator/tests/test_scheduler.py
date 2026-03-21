@@ -1033,3 +1033,29 @@ class TestUpdateTaskMetadataSerialization:
         metadata = arguments['metadata']
         # Must be the same string — no double-serialization
         assert metadata == '{"modules": ["backend"]}'
+
+    @pytest.mark.asyncio
+    async def test_update_task_serializes_prd_metadata_dict(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """update_task converts a PRD dict metadata to a JSON string before the MCP call."""
+        import json
+
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        await scheduler.update_task('42', {'prd': '/abs/path/to/feature.prd'})
+
+        assert len(captured_args) == 1
+        arguments = captured_args[0]['arguments']
+        metadata = arguments['metadata']
+        # Must be a string, not a dict
+        assert isinstance(metadata, str), f'Expected str metadata, got {type(metadata)}: {metadata}'
+        # Must be valid JSON that round-trips correctly
+        parsed = json.loads(metadata)
+        assert parsed == {'prd': '/abs/path/to/feature.prd'}
