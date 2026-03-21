@@ -161,6 +161,7 @@ async def run_stage_via_cli(
     usage_gate: UsageGate | None = None,
     model: str | None = None,
     cwd: Path | None = None,
+    output_schema: dict | None = None,
 ) -> StageResult:
     """Invoke a reconciliation stage via Claude CLI with MCP tools.
 
@@ -184,7 +185,7 @@ async def run_stage_via_cli(
             max_budget_usd=5.0,
             disallowed_tools=disallowed_tools,
             mcp_config=mcp_config,
-            output_schema=STAGE_REPORT_SCHEMA,
+            output_schema=output_schema if output_schema is not None else STAGE_REPORT_SCHEMA,
             permission_mode='bypassPermissions',
             timeout_seconds=float(config.stage_timeout_seconds),
         )

@@ -17,6 +17,7 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.reconciliation.cli_stage_runner import (
+    STAGE_REPORT_SCHEMA,
     run_stage_via_cli,
 )
 
@@ -61,6 +62,13 @@ class BaseStage:
     def get_system_prompt(self) -> str:
         """Override in subclass."""
         raise NotImplementedError
+
+    def get_report_schema(self) -> dict:
+        """Return the JSON schema for this stage's output report.
+
+        Override in subclass to use a stage-specific schema.
+        """
+        return STAGE_REPORT_SCHEMA
 
     async def assemble_payload(
         self,
@@ -108,6 +116,7 @@ class BaseStage:
             usage_gate=self._usage_gate,
             model=model,
             cwd=Path(self.config.explore_codebase_root),
+            output_schema=self.get_report_schema(),
         )
 
         completed = datetime.now(UTC)
