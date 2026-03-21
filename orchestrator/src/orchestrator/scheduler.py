@@ -415,4 +415,9 @@ class Scheduler:
             if isinstance(modules, list) and modules:
                 return [normalize_lock(m, depth) for m in modules]
         # Fallback: use a generic module name based on task id
+        logger.warning(
+            'Task %s: no module metadata found — using fallback lock task-%s',
+            task_id,
+            task_id or 'unknown',
+        )
         return [f'task-{task_id or "unknown"}']
