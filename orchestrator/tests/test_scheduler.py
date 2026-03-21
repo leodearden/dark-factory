@@ -880,3 +880,156 @@ class TestDepsSatisfiedLogging:
             '42' in record.message and 'in-progress' in record.message
             for record in caplog.records
         ), f'Expected log about dep 42 being in-progress. Got: {[r.message for r in caplog.records]}'
+
+
+class TestGetModulesJsonStringMetadata:
+    """_get_modules must parse JSON string metadata, not just dict metadata."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def test_get_modules_extracts_modules_from_json_string_metadata(
+        self, scheduler: Scheduler
+    ):
+        """_get_modules returns normalized module list when metadata is a JSON string with 'modules'."""
+        task = {
+            'id': '5',
+            'metadata': '{"modules": ["backend", "server"]}',
+        }
+        result = scheduler._get_modules(task)
+        # Should NOT fall back to task-5 — must extract modules from JSON string
+        assert result != ['task-5'], (
+            f'Expected modules from JSON string, got fallback: {result}'
+        )
+        # Should have normalized module entries
+        assert len(result) > 0
+        assert all(isinstance(m, str) for m in result)
+        # Verify neither entry is the fallback
+        assert 'task-5' not in result
+
+    def test_get_modules_extracts_files_from_json_string_metadata(
+        self, scheduler: Scheduler
+    ):
+        """_get_modules returns file-derived modules when metadata is a JSON string with 'files'."""
+        task = {
+            'id': '6',
+            'metadata': '{"files": ["src/server/app.py", "src/server/routes.py"]}',
+        }
+        result = scheduler._get_modules(task)
+        # Should NOT fall back to task-6 — must extract from JSON string
+        assert result != ['task-6'], (
+            f'Expected file-derived modules from JSON string, got fallback: {result}'
+        )
+        assert len(result) > 0
+        assert 'task-6' not in result
+
+    def test_get_modules_handles_malformed_json_string_metadata(
+        self, scheduler: Scheduler
+    ):
+        """_get_modules gracefully degrades to task-<id> fallback on malformed JSON string."""
+        task = {
+            'id': '7',
+            'metadata': 'not valid json',
+        }
+        # Should not raise — must degrade gracefully to fallback
+        result = scheduler._get_modules(task)
+        assert result == ['task-7']
+
+    def test_get_modules_logs_warning_on_fallback(
+        self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
+    ):
+        """_get_modules emits a WARNING when falling back to task-<id> lock."""
+        import logging
+
+        task = {'id': '8', 'metadata': {}}
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = scheduler._get_modules(task)
+
+        assert result == ['task-8']
+        assert any(
+            '8' in record.message and 'fallback' in record.message.lower()
+            for record in caplog.records
+        ), f'Expected fallback warning mentioning task 8. Got: {[r.message for r in caplog.records]}'
+
+    def test_get_modules_fallback_warning_emitted_only_once(
+        self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
+    ):
+        """_get_modules emits the fallback WARNING at most once per task ID.
+
+        When _get_modules is called multiple times with the same task that has
+        no module metadata, the WARNING must appear exactly once — not on every call.
+        This prevents log flooding in the scheduler poll loop.
+        """
+        import logging
+
+        task = {'id': '9', 'metadata': {}}
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            scheduler._get_modules(task)
+            scheduler._get_modules(task)
+
+        matching = [
+            r for r in caplog.records
+            if '9' in r.message and 'fallback' in r.message.lower()
+        ]
+        assert len(matching) == 1, (
+            f'Expected exactly 1 fallback warning for task 9, got {len(matching)}. '
+            f'Messages: {[r.message for r in caplog.records]}'
+        )
+
+
+class TestUpdateTaskMetadataSerialization:
+    """Regression tests for update_task dict->JSON string coercion."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_update_task_serializes_dict_to_json_string(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """update_task converts dict metadata to a JSON string before the MCP call."""
+        import json
+
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        await scheduler.update_task('1', {'modules': ['backend']})
+
+        assert len(captured_args) == 1
+        arguments = captured_args[0]['arguments']
+        metadata = arguments['metadata']
+        # Must be a string, not a dict
+        assert isinstance(metadata, str), f'Expected str metadata, got {type(metadata)}: {metadata}'
+        # Must be valid JSON that round-trips correctly
+        parsed = json.loads(metadata)
+        assert parsed == {'modules': ['backend']}
+
+    @pytest.mark.asyncio
+    async def test_update_task_passes_string_metadata_through(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """update_task passes string metadata unchanged — no double-serialization."""
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        await scheduler.update_task('1', '{"modules": ["backend"]}')
+
+        assert len(captured_args) == 1
+        arguments = captured_args[0]['arguments']
+        metadata = arguments['metadata']
+        # Must be the same string — no double-serialization
+        assert metadata == '{"modules": ["backend"]}'

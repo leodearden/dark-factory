@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
@@ -160,6 +161,7 @@ class Scheduler:
         self._project_root = str(config.project_root)
         self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
         self._status_cache: dict[str, str] = {}
+        self._fallback_warned: set[str] = set()  # task IDs already warned about fallback
 
     async def get_tasks(self) -> list[dict]:
         """Fetch all tasks from fused-memory/taskmaster."""
@@ -371,8 +373,7 @@ class Scheduler:
         )
         # Cache expanded modules in memory so _get_modules uses them on retry
         self._module_cache[task_id] = needed_normalized
-        import json
-        updated = await self.update_task(task_id, json.dumps({'modules': needed}))
+        updated = await self.update_task(task_id, {'modules': needed})
         if not updated:
             logger.warning(
                 f'Task {task_id}: metadata update failed (non-critical — '
@@ -398,6 +399,9 @@ class Scheduler:
         if task_id in self._module_cache:
             return self._module_cache[task_id]
         metadata = task.get('metadata', {})
+        if isinstance(metadata, str):
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                metadata = json.loads(metadata)
         if isinstance(metadata, dict):
             # Prefer file-derived modules (most accurate)
             files = metadata.get('files', [])
@@ -410,4 +414,11 @@ class Scheduler:
             if isinstance(modules, list) and modules:
                 return [normalize_lock(m, depth) for m in modules]
         # Fallback: use a generic module name based on task id
+        if task_id not in self._fallback_warned:
+            logger.warning(
+                'Task %s: no module metadata found — using fallback lock task-%s',
+                task_id,
+                task_id or 'unknown',
+            )
+            self._fallback_warned.add(task_id)
         return [f'task-{task_id or "unknown"}']
