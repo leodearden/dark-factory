@@ -9,7 +9,7 @@
     "orchestrator/src/orchestrator",
     "orchestrator/tests"
   ],
-  "analysis": "The write-side serialization bug (dict passed where string expected) is ALREADY FIXED in scheduler.update_task() at line 229-233 \u2014 it accepts `str | dict` and json.dumps dicts before the MCP call. The fused-memory server's update_task tool (tools.py:700-732) also independently coerces dicts, and has tests for it (test_health_endpoint.py:60-85). Callers: harness._tag_task_modules already pre-serializes (line 381), harness._tag_prd_metadata passes a dict (line 259) which the scheduler handles, handle_blast_radius_expansion pre-serializes (line 375) with a redundant `import json` (line 374, json is already imported at line 5).\n\nThe REAL remaining bug is on the READ SIDE: _get_modules() (line 390-413) only handles dict metadata (`isinstance(metadata, dict)`). Taskmaster stores metadata as a JSON string internally \u2014 the taskmaster_client.update_task signature is `metadata: str | None` (line 211). When get_tasks() returns tasks, metadata may come back as a JSON string like '{\"modules\": [\"backend\"]}'. In that case, _get_modules falls through to the `task-<id>` fallback silently, defeating the entire concurrency locking system.\n\nAdditionally, the fallback to `task-<id>` is completely silent \u2014 no log output indicates when module extraction fails and generic locks are used. This makes the degradation invisible in production logs.\n\nPlan: (1) Add tests + fix for _get_modules to parse JSON string metadata, (2) Add warning log for fallback, (3) Add regression tests for the write-side serialization, (4) Clean up redundant import.",
+  "analysis": "The write-side serialization bug (dict passed where string expected) is ALREADY FIXED in scheduler.update_task() at line 229-233 \u2014 it accepts `str | dict` and json.dumps dicts before the MCP call. The fused-memory server's update_task tool (tools.py:700-732) also independently coerces dicts, and has tests for it (test_health_endpoint.py:60-85). Callers: harness._tag_task_modules already pre-serializes (line 381), harness._tag_prd_metadata passes a dict (line 259) which the scheduler handles, handle_blast_radius_expansion pre-serializes (line 375) with a redundant `import json` (line 374, json is already imported at line 5).\n\nThe REAL remaining bug is on the READ SIDE: _get_modules() (line 390-413) only handles dict metadata (`isinstance(metadata, dict)`). Taskmaster stores metadata as a string internally \u2014 the taskmaster_client.update_task signature is `metadata: str | None` (line 211). When get_tasks() returns tasks, metadata may come back as a JSON string like '{\"modules\": [\"backend\"]}'. In that case, _get_modules falls through to the `task-<id>` fallback silently, defeating the entire concurrency locking system.\n\nAdditionally, the fallback to `task-<id>` is completely silent \u2014 no log output indicates when module extraction fails and generic locks are used. This makes the degradation invisible in production logs.\n\nPlan: (1) Add tests + fix for _get_modules to parse JSON string metadata, (2) Add warning log for fallback, (3) Add regression tests for the write-side serialization, (4) Clean up redundant import.\n\n--- POST-REVIEW ADDENDUM ---\nReview identified log_flooding issue: the fallback WARNING in _get_modules fires on every poll cycle for every untagged task (thousands of times per run). Fix: add a `self._fallback_warned: set[str]` on the Scheduler instance and gate the warning to fire only once per task ID.",
   "prerequisites": [],
   "steps": [
     {
@@ -74,6 +74,20 @@
       "description": "Clean up redundant `import json` at line 374 inside handle_blast_radius_expansion() \u2014 json is already imported at file top (line 5). Also simplify the call on line 375 from `json.dumps({'modules': needed})` to just `{'modules': needed}` since update_task handles dict serialization. All existing tests should remain green.",
       "status": "done",
       "commit": "d90bc9d"
+    },
+    {
+      "id": "step-10",
+      "type": "test",
+      "description": "Write failing test `test_get_modules_fallback_warning_emitted_only_once`: create a Scheduler, call _get_modules TWICE with the same task (id='9', metadata={}). Use caplog to assert the WARNING mentioning task 9 appears exactly ONCE in the log records (not twice). This will FAIL because the current implementation logs unconditionally on every call \u2014 there is no dedup guard.",
+      "status": "done",
+      "commit": "5ae6a03"
+    },
+    {
+      "id": "step-11",
+      "type": "impl",
+      "description": "Add `self._fallback_warned: set[str] = set()` to Scheduler.__init__ (after _status_cache). In _get_modules(), gate the logger.warning call: only emit if `task_id not in self._fallback_warned`, then add `self._fallback_warned.add(task_id)` after logging. This ensures the fallback warning fires at most once per task ID per Scheduler lifetime. Step-10 test should now pass, and step-5's existing test (single call) remains green.",
+      "status": "done",
+      "commit": "73b854e"
     }
   ],
   "design_decisions": [
@@ -88,6 +102,10 @@
     {
       "decision": "Keep task-<id> fallback as intentional safe degradation, but add WARNING log",
       "rationale": "The task-<id> fallback is safe \u2014 it over-serializes (no two tasks run concurrently on the same generic lock) rather than under-serializing. This is correct defensive behavior. However, silent fallback made the bug invisible in production. A WARNING log makes the degradation visible without changing the safety behavior."
+    },
+    {
+      "decision": "Deduplicate fallback warning with per-instance _fallback_warned set",
+      "rationale": "_get_modules() is called on every scheduler poll cycle for every pending task. Without dedup, tasks that legitimately lack module metadata (pre-convention tasks, failed update_task calls) emit the warning thousands of times per run, drowning out genuine warnings. A set[str] on the Scheduler instance tracks which task IDs have been warned; the warning fires once per task ID per Scheduler lifetime. This preserves the diagnostic value (first occurrence is logged) while eliminating log flooding."
     },
     {
       "decision": "Do not change harness._tag_prd_metadata caller to pre-serialize",
@@ -126,5 +144,5 @@
     }
   ],
   "_session_id": "79-eb2cd416",
-  "_created_at": "2026-03-21T08:12:41.948770+00:00"
+  "_created_at": "2026-03-21T08:20:35.032590+00:00"
 }
