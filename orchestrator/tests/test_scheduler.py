@@ -936,3 +936,19 @@ class TestGetModulesJsonStringMetadata:
         # Should not raise — must degrade gracefully to fallback
         result = scheduler._get_modules(task)
         assert result == ['task-7']
+
+    def test_get_modules_logs_warning_on_fallback(
+        self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
+    ):
+        """_get_modules emits a WARNING when falling back to task-<id> lock."""
+        import logging
+
+        task = {'id': '8', 'metadata': {}}
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = scheduler._get_modules(task)
+
+        assert result == ['task-8']
+        assert any(
+            '8' in record.message and 'fallback' in record.message.lower()
+            for record in caplog.records
+        ), f'Expected fallback warning mentioning task 8. Got: {[r.message for r in caplog.records]}'
