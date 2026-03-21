@@ -1,8 +1,15 @@
 """Maintenance utility for re-indexing stale FalkorDB vector embeddings."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
+
+from graphiti_core.embedder import OpenAIEmbedder
+from graphiti_core.embedder.openai import OpenAIEmbedderConfig
+
+from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
 
@@ -103,3 +110,63 @@ class ReindexManager:
             'reindex_result': reindex_result,
             'replay_count': replay_count,
         }
+
+
+async def run_reindex(config_path: str | None = None) -> dict:
+    """Load config, initialize service, run reindex+replay, close resources.
+
+    This is the CLI-callable entrypoint.  It:
+    1. Loads FusedMemoryConfig (honouring CONFIG_PATH env var or config_path arg).
+    2. Creates and initialises a MemoryService (which owns GraphitiBackend +
+       DurableWriteQueue).
+    3. Builds an OpenAIEmbedder with the dimension from config.
+    4. Creates a ReindexManager and runs reindex_and_replay().
+    5. Closes all resources in a finally block.
+
+    Args:
+        config_path: Optional path to the YAML config file.  When given it is
+                     set as CONFIG_PATH before constructing FusedMemoryConfig.
+
+    Returns:
+        Dict with 'reindex_result' (ReindexResult) and 'replay_count' (int).
+    """
+    import os
+
+    if config_path is not None:
+        os.environ['CONFIG_PATH'] = config_path
+
+    config = FusedMemoryConfig()
+    service = MemoryService(config)
+
+    # Build a dedicated embedder for re-embedding stale content.
+    emb_cfg = config.embedder
+    embedder_config = OpenAIEmbedderConfig(
+        api_key=emb_cfg.providers.openai.api_key,
+        embedding_model=emb_cfg.model,
+        embedding_dim=emb_cfg.dimensions,
+    )
+    embedder = OpenAIEmbedder(config=embedder_config)
+
+    manager = ReindexManager(
+        backend=service.graphiti,
+        embedder=embedder,
+        expected_dim=config.embedder.dimensions,
+    )
+
+    try:
+        await service.initialize()
+        result = await manager.reindex_and_replay(service.durable_queue)
+        ri = result['reindex_result']
+        logger.info(
+            f'run_reindex complete: nodes={ri.nodes_updated}, '
+            f'edges={ri.edges_updated}, errors={ri.errors}, '
+            f'replayed={result["replay_count"]}'
+        )
+        return result
+    finally:
+        await service.close()
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(run_reindex())
