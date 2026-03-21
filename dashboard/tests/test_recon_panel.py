@@ -145,6 +145,7 @@ MOCK_RUNS = [
         'events_processed': 7,
         'status': 'completed',
         'duration_seconds': 300.0,
+        'journal_entry_count': 3,
     }
 ]
 
@@ -298,6 +299,7 @@ class TestReconRoute:
                 'events_processed': 3,
                 'status': 'completed',
                 'duration_seconds': 300.0,
+                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_with_colon):
@@ -462,6 +464,7 @@ class TestReconBadgeAriaLabels:
                 'events_processed': 0,
                 'status': 'running',
                 'duration_seconds': None,
+                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_running):
@@ -480,6 +483,7 @@ class TestReconBadgeAriaLabels:
                 'events_processed': 0,
                 'status': 'failed',
                 'duration_seconds': 60.0,
+                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_failed):
@@ -498,6 +502,7 @@ class TestReconBadgeAriaLabels:
                 'events_processed': 0,
                 'status': 'rolled_back',
                 'duration_seconds': 60.0,
+                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_rb):
@@ -516,8 +521,83 @@ class TestReconBadgeAriaLabels:
                 'events_processed': 0,
                 'status': 'circuit_breaker',
                 'duration_seconds': 60.0,
+                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_cb):
             html = client.get('/partials/recon').text
         assert 'aria-label="Run status: circuit_breaker"' in html
+
+
+class TestReconJournalBadge:
+    """Tests for the journal entry count badge in runs table."""
+
+    def test_badge_shown_when_count_positive(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        # MOCK_RUNS has journal_entry_count=3
+        assert 'data-testid="journal-badge"' in html
+        assert '>3<' in html or '>\n                    3\n' in html or '3</span>' in html
+
+    def test_badge_hidden_when_count_zero(self, client):
+        runs_no_journal = [
+            {
+                **MOCK_RUNS[0],
+                'journal_entry_count': 0,
+            }
+        ]
+        with _patch_recon_data(runs=runs_no_journal):
+            html = client.get('/partials/recon').text
+        assert 'data-testid="journal-badge"' not in html
+
+    def test_detail_column_header_present(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert '>Detail<' in html or 'Detail</th>' in html
+
+
+class TestReconRunDetailRoute:
+    """Tests for GET /partials/recon/run/{run_id}."""
+
+    def test_returns_200(self, client):
+        with patch(
+            'dashboard.app.get_journal_entries',
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            resp = client.get('/partials/recon/run/run-001')
+        assert resp.status_code == 200
+
+    def test_entries_displayed(self, client):
+        mock_entries = [
+            {
+                'id': 'je-001',
+                'stage': 'memory_consolidation',
+                'timestamp': '2026-03-19T08:00:00+00:00',
+                'operation': 'consolidate',
+                'target_system': 'mem0',
+                'before_state': {'count': 5},
+                'after_state': {'count': 3},
+                'reasoning': 'Merged duplicate memories',
+                'evidence': [],
+            }
+        ]
+        with patch(
+            'dashboard.app.get_journal_entries',
+            new_callable=AsyncMock,
+            return_value=mock_entries,
+        ):
+            html = client.get('/partials/recon/run/run-001').text
+        assert 'consolidate' in html
+        assert 'mem0' in html
+        assert 'memory_consolidation' in html
+        assert 'Merged duplicate memories' in html
+
+    def test_empty_fallback(self, client):
+        with patch(
+            'dashboard.app.get_journal_entries',
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            html = client.get('/partials/recon/run/run-001').text
+        assert 'No journal entries for this run.' in html

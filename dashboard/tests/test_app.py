@@ -207,6 +207,7 @@ def _patch_recon_data(
                 'events_processed': 7,
                 'status': 'completed',
                 'duration_seconds': 300.0,
+                'journal_entry_count': 0,
             },
         ],
         'last_attempted': last_attempted if last_attempted is not _UNSET else {

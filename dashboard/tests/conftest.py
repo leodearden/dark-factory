@@ -82,6 +82,28 @@ CREATE TABLE IF NOT EXISTS burst_state (
     last_write_at TEXT NOT NULL,
     burst_started_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS chunk_boundaries (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    run_id TEXT,
+    events_count INTEGER,
+    status TEXT DEFAULT 'processing',
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_chunk_project ON chunk_boundaries(project_id);
+
+CREATE TABLE IF NOT EXISTS run_actions (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    target TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    detail TEXT DEFAULT '{}',
+    causation_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ra_run ON run_actions(run_id);
 """
 
 
@@ -204,6 +226,44 @@ def reconciliation_db(tmp_path):
             'idle',
             (now - timedelta(hours=1)).isoformat(),
             None,
+        ),
+    )
+
+    # Journal entries for run-001
+    conn.execute(
+        """INSERT INTO journal_entries
+           (id, run_id, stage, timestamp, operation, target_system,
+            before_state, after_state, reasoning, evidence)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            'je-001',
+            'run-001',
+            'memory_consolidation',
+            (now - timedelta(hours=1, minutes=55)).isoformat(),
+            'consolidate',
+            'mem0',
+            '{"count": 5}',
+            '{"count": 3}',
+            'Merged duplicate memories',
+            '[{"source": "mem0", "id": "m-1"}]',
+        ),
+    )
+    conn.execute(
+        """INSERT INTO journal_entries
+           (id, run_id, stage, timestamp, operation, target_system,
+            before_state, after_state, reasoning, evidence)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            'je-002',
+            'run-001',
+            'task_knowledge_sync',
+            (now - timedelta(hours=1, minutes=50)).isoformat(),
+            'sync',
+            'graphiti',
+            None,
+            '{"entities": 2}',
+            '',
+            '[]',
         ),
     )
 
