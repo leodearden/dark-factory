@@ -1,0 +1,125 @@
+{
+  "task_id": "52",
+  "title": "Bug: Scheduler dispatches tasks with in-progress dependencies (premature dispatch)",
+  "files": [
+    "orchestrator/src/orchestrator/scheduler.py",
+    "orchestrator/tests/test_scheduler.py"
+  ],
+  "modules": [
+    "orchestrator/src/orchestrator",
+    "orchestrator/tests"
+  ],
+  "analysis": "The scheduler's acquire_next() method in scheduler.py has an inline dependency check at lines 286-289 that verifies all dependencies have status == 'done' before dispatching. While the literal check appears correct (== 'done' rejects in-progress, pending, blocked, etc.), the test suite has ZERO tests covering dependency gating behavior \u2014 a critical gap that allowed a premature dispatch bug (tasks 47 and 49) to go undetected. The fix has three parts: (1) Extract the inline dependency check into a named _deps_satisfied() method for testability and clarity, (2) Add comprehensive tests for all dependency states, and (3) Add diagnostic logging when a task is blocked on unsatisfied dependencies (aids debugging when premature dispatch is suspected). The existing test file covers module locking, dispatch guards, status transition guards, and cache seeding, but dependency gating is completely untested.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing test for _deps_satisfied method: test that the Scheduler class exposes a _deps_satisfied(task, status_map) method that returns False when any dependency has status 'in-progress'. This test will fail because the method does not exist yet.",
+      "status": "done",
+      "commit": "377c071"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Extract inline dependency check from acquire_next() lines 285-291 into a new _deps_satisfied(self, task, status_map) -> bool method on the Scheduler class. The method checks that every dependency ID in task['dependencies'] resolves to status 'done' in the status_map. No logic change \u2014 pure refactor of existing inline code. acquire_next() calls self._deps_satisfied(t, status_map) instead of the inline all() expression.",
+      "status": "done",
+      "commit": "63eb269"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write test test_acquire_next_blocks_on_in_progress_dependency: mock get_tasks to return two tasks \u2014 task A (status 'in-progress', no deps) and task B (status 'pending', depends on A). Assert acquire_next() returns None because B's dependency A is in-progress, and A itself is not pending so it's not a candidate.",
+      "status": "done",
+      "commit": "e95a6d8"
+    },
+    {
+      "id": "step-4",
+      "type": "test",
+      "description": "Write test test_acquire_next_blocks_on_pending_dependency: mock get_tasks to return task A (status 'pending', no deps, modules ['backend']) and task B (status 'pending', depends on A, modules ['frontend']). Dispatch task A first via acquire_next(), then assert a second acquire_next() returns None because B's dependency A is not yet done (still pending/in-dispatched).",
+      "status": "done",
+      "commit": "392b399"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write test test_acquire_next_dispatches_when_all_deps_done: mock get_tasks to return task A (status 'done') and task B (status 'pending', depends on A). Assert acquire_next() returns task B because its only dependency A has status 'done'.",
+      "status": "done",
+      "commit": "ee98e03"
+    },
+    {
+      "id": "step-6",
+      "type": "test",
+      "description": "Write test test_acquire_next_blocks_on_mixed_dep_statuses: mock get_tasks to return tasks A (done), B (in-progress), and C (pending, depends on both A and B). Assert acquire_next() returns None for C because dep B is not done, even though dep A is done.",
+      "status": "done",
+      "commit": "c394bcc"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write test test_acquire_next_handles_dict_and_int_dependency_formats: mock get_tasks to return tasks with dependencies in different formats \u2014 integer IDs [1], string IDs ['1'], and dict format [{'id': 1}]. Verify that all formats are correctly resolved against the status_map and block when deps are not done.",
+      "status": "done",
+      "commit": "4a439fa"
+    },
+    {
+      "id": "step-8",
+      "type": "test",
+      "description": "Write failing test test_deps_satisfied_logs_blocking_reason: verify that when _deps_satisfied returns False, a debug log message is emitted indicating which dependency ID and its current status blocked the task. Use caplog fixture to capture log output. This will fail because no such logging exists yet.",
+      "status": "done",
+      "commit": "049dd9e"
+    },
+    {
+      "id": "step-9",
+      "type": "impl",
+      "description": "Add debug-level logging to _deps_satisfied() method: when a dependency is not done, log which dep_id blocked and what its current status is (e.g. 'Task {task_id} blocked: dep {dep_id} has status {status}, need done'). This aids diagnosis of premature dispatch issues without adding runtime overhead (debug level).",
+      "status": "done",
+      "commit": "13688aa"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Extract _deps_satisfied() as a named method rather than keeping inline",
+      "rationale": "The inline all() expression at lines 286-289 is hard to unit-test in isolation and hard to read due to the nested dict/int dependency ID parsing. A named method enables direct unit testing, clearer docstring, and a single point to add logging."
+    },
+    {
+      "decision": "Keep _deps_satisfied() as an instance method on Scheduler (not a free function)",
+      "rationale": "It needs access to self for logging context (task_id attribution). Making it a method keeps it colocated with acquire_next() and enables future access to _status_cache if deeper defense-in-depth is needed."
+    },
+    {
+      "decision": "Add debug-level logging for blocked dependencies, not warning-level",
+      "rationale": "Dependency blocking is expected behavior during normal operation. Debug level avoids log noise in production while providing diagnostic information when investigating premature dispatch issues via --log-level=DEBUG."
+    },
+    {
+      "decision": "Test multiple dependency formats (int, str, dict) in a dedicated test",
+      "rationale": "Taskmaster's dependency format has varied across versions. The inline d.get('id', d) if isinstance(d, dict) else d expression handles multiple formats but lacks test coverage. A dedicated test prevents regressions if the format changes."
+    },
+    {
+      "decision": "Do not overlay _status_cache onto status_map for dependency checks",
+      "rationale": "Analysis shows this would not add practical safety: get_tasks() already seeds _status_cache from the same taskmaster response used to build status_map, so they always agree. The == 'done' check is inherently safe against stale data (any non-done status blocks). Adding cache overlay would add complexity without preventing the observed bug class."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Existing TestAcquireNextNoDuplicates test patterns",
+      "where": "orchestrator/tests/test_scheduler.py lines 486-651",
+      "how": "Reuse the same pattern of mocking scheduler.get_tasks as AsyncMock(return_value=[...]) with task dicts containing id, status, dependencies, metadata fields. Follow identical fixture setup (OrchestratorConfig(max_per_module=1) scheduler fixture)."
+    },
+    {
+      "what": "AsyncMock pattern for mocking get_tasks",
+      "where": "orchestrator/tests/test_scheduler.py line 504",
+      "how": "scheduler.get_tasks = AsyncMock(return_value=[task_list]) \u2014 used throughout existing tests for acquire_next testing."
+    },
+    {
+      "what": "Existing OrchestratorConfig test fixture",
+      "where": "orchestrator/tests/test_scheduler.py lines 13-17",
+      "how": "Use the same config fixture pattern for new test classes, or create scheduler fixtures with OrchestratorConfig(max_per_module=1)."
+    },
+    {
+      "what": "Dependency ID parsing logic (dict/int/str formats)",
+      "where": "orchestrator/src/orchestrator/scheduler.py line 287",
+      "how": "The existing inline expression str(d.get('id', d) if isinstance(d, dict) else d) handles all three formats. Extract this into _deps_satisfied() without changing the parsing logic."
+    }
+  ],
+  "_session_id": "52-3884d75c",
+  "_created_at": "2026-03-21T07:58:24.246283+00:00"
+}
