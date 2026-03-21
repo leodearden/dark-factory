@@ -161,6 +161,7 @@ class Scheduler:
         self._project_root = str(config.project_root)
         self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
         self._status_cache: dict[str, str] = {}
+        self._fallback_warned: set[str] = set()  # task IDs already warned about fallback
 
     async def get_tasks(self) -> list[dict]:
         """Fetch all tasks from fused-memory/taskmaster."""
@@ -413,9 +414,11 @@ class Scheduler:
             if isinstance(modules, list) and modules:
                 return [normalize_lock(m, depth) for m in modules]
         # Fallback: use a generic module name based on task id
-        logger.warning(
-            'Task %s: no module metadata found — using fallback lock task-%s',
-            task_id,
-            task_id or 'unknown',
-        )
+        if task_id not in self._fallback_warned:
+            logger.warning(
+                'Task %s: no module metadata found — using fallback lock task-%s',
+                task_id,
+                task_id or 'unknown',
+            )
+            self._fallback_warned.add(task_id)
         return [f'task-{task_id or "unknown"}']
