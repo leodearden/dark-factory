@@ -61,3 +61,33 @@ class TestModuleLevelAll:
             'AccountConfig',
             'UsageCapConfig',
         }
+
+
+class TestInitAllCompleteness:
+    """Verify that shared.__all__ covers the union of all module __all__ entries."""
+
+    def test_init_all_covers_all_module_symbols(self):
+        import shared
+        from shared import cli_invoke, config_models, usage_gate
+
+        union = set(cli_invoke.__all__) | set(usage_gate.__all__) | set(config_models.__all__)
+        assert set(shared.__all__) == union, (
+            f'shared.__all__ must equal union of submodule __all__.\n'
+            f'Missing from shared.__all__: {union - set(shared.__all__)}\n'
+            f'Extra in shared.__all__: {set(shared.__all__) - union}'
+        )
+
+    def test_no_private_symbols_in_any_all(self):
+        import shared
+        from shared import cli_invoke, config_models, usage_gate
+
+        for module, name in [
+            (shared, 'shared'),
+            (cli_invoke, 'cli_invoke'),
+            (usage_gate, 'usage_gate'),
+            (config_models, 'config_models'),
+        ]:
+            private = [s for s in module.__all__ if s.startswith('_')]
+            assert private == [], (
+                f'{name}.__all__ must not contain private symbols: {private}'
+            )
