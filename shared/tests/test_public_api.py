@@ -126,3 +126,27 @@ class TestPackageMetadata:
 
         assert hasattr(shared, '__version__'), 'shared must expose __version__'
         assert shared.__version__ == '0.1.0'
+
+
+class TestEditableInstallLocation:
+    """Verify the editable install resolves to the local src/ tree."""
+
+    def test_editable_install_location(self):
+        import importlib.metadata as meta
+        import importlib.util
+
+        # The package must be discoverable by importlib.metadata
+        dist = meta.distribution('dark-factory-shared')
+        assert dist is not None
+
+        # The shared package must load from somewhere under shared/src
+        spec = importlib.util.find_spec('shared')
+        assert spec is not None, 'shared package not importable'
+        assert spec.origin is not None, 'shared package has no origin (namespace package?)'
+
+        origin = Path(spec.origin).resolve()
+        # Must be under a 'src/shared' directory
+        assert 'src' in origin.parts, (
+            f'shared loaded from unexpected location: {origin}\n'
+            'Expected path under shared/src/shared/'
+        )
