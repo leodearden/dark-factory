@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS write_ops (
     operation TEXT,
     project_id TEXT,
     agent_id TEXT,
+    session_id TEXT,
+    kind TEXT NOT NULL DEFAULT 'write',
     params TEXT DEFAULT '{}',
     result_summary TEXT,
     success INTEGER DEFAULT 1,
@@ -64,6 +66,7 @@ class WriteJournal:
         await self._db.execute('PRAGMA journal_mode=WAL')
         await self._db.executescript(SCHEMA_SQL)
         await self._db.commit()
+        await self._migrate()
         logger.info(f'Write journal initialized at {db_path}')
 
     async def close(self) -> None:
@@ -75,6 +78,34 @@ class WriteJournal:
             raise RuntimeError('WriteJournal not initialized — call initialize() first')
         return self._db
 
+    async def _migrate(self) -> None:
+        """Add columns introduced after initial schema (idempotent)."""
+        db = self._require_db()
+        async with db.execute('PRAGMA table_info(write_ops)') as cursor:
+            existing = {row[1] for row in await cursor.fetchall()}
+
+        if 'session_id' not in existing:
+            await db.execute('ALTER TABLE write_ops ADD COLUMN session_id TEXT')
+            logger.info('Migration: added session_id column to write_ops')
+
+        if 'kind' not in existing:
+            await db.execute(
+                "ALTER TABLE write_ops ADD COLUMN kind TEXT NOT NULL DEFAULT 'write'"
+            )
+            await db.execute(
+                "UPDATE write_ops SET kind = 'read' WHERE operation = 'search'"
+            )
+            logger.info('Migration: added kind column to write_ops, backfilled reads')
+
+        # Indexes on new columns (safe after migration ensures columns exist)
+        await db.execute(
+            'CREATE INDEX IF NOT EXISTS idx_wo_kind_time ON write_ops(kind, created_at)'
+        )
+        await db.execute(
+            'CREATE INDEX IF NOT EXISTS idx_wo_agent_time ON write_ops(agent_id, created_at)'
+        )
+        await db.commit()
+
     async def log_write_op(
         self,
         *,
@@ -85,19 +116,22 @@ class WriteJournal:
         operation: str,
         project_id: str | None = None,
         agent_id: str | None = None,
+        session_id: str | None = None,
+        kind: str = 'write',
         params: dict | None = None,
         result_summary: dict | str | None = None,
         success: bool = True,
         error: str | None = None,
     ) -> None:
-        """Log a Layer 1 write operation. Fire-and-forget — never raises."""
+        """Log a Layer 1 operation. Fire-and-forget — never raises."""
         try:
             db = self._require_db()
             await db.execute(
                 """INSERT INTO write_ops
                    (id, causation_id, source, provenance, operation,
-                    project_id, agent_id, params, result_summary, success, error, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    project_id, agent_id, session_id, kind,
+                    params, result_summary, success, error, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     write_op_id,
                     causation_id,
@@ -106,6 +140,8 @@ class WriteJournal:
                     operation,
                     project_id,
                     agent_id,
+                    session_id,
+                    kind,
                     json.dumps(params) if params else '{}',
                     json.dumps(result_summary) if isinstance(result_summary, dict) else result_summary,
                     1 if success else 0,
@@ -176,13 +212,18 @@ class WriteJournal:
         results.sort(key=lambda r: r.get('created_at', ''))
         return results
 
-    async def get_ops_since(self, since: str, limit: int = 100) -> list[dict]:
-        """Return write_ops since a timestamp."""
+    async def get_ops_since(
+        self, since: str, limit: int = 100, kind: str | None = None
+    ) -> list[dict]:
+        """Return write_ops since a timestamp, optionally filtered by kind."""
         db = self._require_db()
-        async with db.execute(
-            'SELECT * FROM write_ops WHERE created_at >= ? ORDER BY created_at LIMIT ?',
-            (since, limit),
-        ) as cursor:
+        if kind:
+            sql = 'SELECT * FROM write_ops WHERE created_at >= ? AND kind = ? ORDER BY created_at LIMIT ?'
+            params = (since, kind, limit)
+        else:
+            sql = 'SELECT * FROM write_ops WHERE created_at >= ? ORDER BY created_at LIMIT ?'
+            params = (since, limit)
+        async with db.execute(sql, params) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
     async def get_backend_ops_for_write_op(self, write_op_id: str) -> list[dict]:
@@ -192,4 +233,70 @@ class WriteJournal:
             'SELECT * FROM backend_ops WHERE write_op_id = ? ORDER BY created_at',
             (write_op_id,),
         ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_usage_stats(
+        self, since: str, project_id: str | None = None
+    ) -> dict:
+        """Aggregate read/write stats since a timestamp.
+
+        Returns {reads, writes, by_operation, by_agent}.
+        """
+        db = self._require_db()
+        where = 'WHERE created_at >= ?'
+        params: list = [since]
+        if project_id:
+            where += ' AND project_id = ?'
+            params.append(project_id)
+
+        # Totals by kind
+        async with db.execute(
+            f'SELECT kind, COUNT(*) FROM write_ops {where} GROUP BY kind', params
+        ) as cursor:
+            kind_counts = {row[0]: row[1] for row in await cursor.fetchall()}
+
+        # By operation
+        async with db.execute(
+            f'SELECT operation, COUNT(*) FROM write_ops {where} GROUP BY operation',
+            params,
+        ) as cursor:
+            by_operation = {row[0]: row[1] for row in await cursor.fetchall()}
+
+        # By agent (read/write breakdown)
+        async with db.execute(
+            f'SELECT agent_id, kind, COUNT(*) FROM write_ops {where} GROUP BY agent_id, kind',
+            params,
+        ) as cursor:
+            by_agent: dict[str, dict[str, int]] = {}
+            for row in await cursor.fetchall():
+                aid = row[0] or '_unknown'
+                if aid not in by_agent:
+                    by_agent[aid] = {'read': 0, 'write': 0}
+                by_agent[aid][row[1]] = row[2]
+
+        return {
+            'reads': kind_counts.get('read', 0),
+            'writes': kind_counts.get('write', 0),
+            'by_operation': by_operation,
+            'by_agent': by_agent,
+        }
+
+    async def get_session_ops(
+        self, agent_id: str, since: str | None = None, limit: int = 100
+    ) -> list[dict]:
+        """Return ops for a specific agent, most recent first."""
+        db = self._require_db()
+        if since:
+            sql = (
+                'SELECT * FROM write_ops WHERE agent_id = ? AND created_at >= ? '
+                'ORDER BY created_at DESC LIMIT ?'
+            )
+            params = (agent_id, since, limit)
+        else:
+            sql = (
+                'SELECT * FROM write_ops WHERE agent_id = ? '
+                'ORDER BY created_at DESC LIMIT ?'
+            )
+            params = (agent_id, limit)
+        async with db.execute(sql, params) as cursor:
             return [dict(row) for row in await cursor.fetchall()]

@@ -82,6 +82,7 @@ class EventBuffer:
         self._queue_stats_fn = queue_stats_fn
         self.instance_id = instance_id or str(uuid4())
         self._db: aiosqlite.Connection | None = None
+        self._manual_triggers: set[str] = set()
 
     async def initialize(self) -> None:
         """Open SQLite connection and ensure schema exists."""
@@ -180,6 +181,10 @@ class EventBuffer:
         # Check run lock
         if await self._is_run_locked(project_id):
             return False, ''
+
+        # Manual trigger (placed after lock check so flag is preserved when busy)
+        if self._consume_manual_trigger(project_id):
+            return True, 'manual_trigger'
 
         # Count pending events + oldest timestamp
         async with db.execute(
@@ -467,18 +472,51 @@ class EventBuffer:
     # ── Maintenance ────────────────────────────────────────────────────
 
     async def cleanup_drained(self, max_age_seconds: float = 3600.0) -> int:
-        """Delete drained events older than cutoff. Returns count deleted."""
+        """Delete drained events older than cutoff, skipping locked projects."""
         db = self._require_db()
         cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - max_age_seconds,
             tz=UTC,
         ).isoformat()
         cursor = await db.execute(
-            "DELETE FROM event_buffer WHERE status = 'drained' AND timestamp < ?",
+            """DELETE FROM event_buffer
+               WHERE status = 'drained'
+                 AND timestamp < ?
+                 AND project_id NOT IN (
+                     SELECT project_id FROM reconciliation_locks
+                 )""",
             (cutoff,),
         )
         await db.commit()
         return cursor.rowcount
+
+    async def request_trigger(self, project_id: str) -> None:
+        """Manually request a reconciliation trigger for a project.
+
+        Sets a flag consumed by should_trigger(). If the buffer is empty,
+        inserts a synthetic event so get_active_projects() returns the project.
+        """
+        self._manual_triggers.add(project_id)
+        # Ensure the project shows up in get_active_projects()
+        count = await self.count_buffered(project_id)
+        if count == 0:
+            await self.push(ReconciliationEvent(
+                id=str(uuid4()),
+                project_id=project_id,
+                type=EventType.memory_added,
+                source=EventSource.full_reconciliation,
+                agent_id=None,
+                timestamp=datetime.now(UTC),
+                payload={'_synthetic': True, '_reason': 'manual_trigger'},
+            ))
+        logger.info(f'Manual reconciliation trigger requested for {project_id}')
+
+    def _consume_manual_trigger(self, project_id: str) -> bool:
+        """Return True and clear the flag if a manual trigger was requested."""
+        if project_id in self._manual_triggers:
+            self._manual_triggers.discard(project_id)
+            return True
+        return False
 
     async def close(self) -> None:
         """Close the database connection."""

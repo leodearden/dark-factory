@@ -13,6 +13,7 @@ from fused_memory.services.memory_service import MemoryService
 
 if TYPE_CHECKING:
     from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
 
@@ -94,10 +95,41 @@ def _extract_causation(
 def create_mcp_server(
     memory_service: MemoryService,
     task_interceptor: TaskInterceptor | None = None,
+    write_journal: WriteJournal | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
+
+    async def _log_read(
+        operation: str,
+        project_id: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        params: dict | None = None,
+        result_summary: dict | str | None = None,
+        success: bool = True,
+        error: str | None = None,
+    ) -> None:
+        """Fire-and-forget read logging — mirrors write pattern."""
+        if write_journal is None:
+            return
+        try:
+            await write_journal.log_write_op(
+                write_op_id=str(uuid_mod.uuid4()),
+                source='mcp_tool',
+                operation=operation,
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                kind='read',
+                params=params,
+                result_summary=result_summary,
+                success=success,
+                error=error,
+            )
+        except Exception as e:
+            logger.warning(f'Failed to log read op: {e}')
 
     # ------------------------------------------------------------------
     # Health endpoint (used by orchestrator's McpLifecycle._wait_for_health)
@@ -241,15 +273,35 @@ def create_mcp_server(
                 agent_id=agent_id,
                 session_id=session_id,
             )
-            return {'results': [r.model_dump() for r in results]}
+            response = {'results': [r.model_dump() for r in results]}
+            await _log_read(
+                operation='search',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'query': query[:200], 'limit': limit},
+                result_summary={'count': len(results)},
+            )
+            return response
         except Exception as e:
             logger.error(f'search error: {e}')
+            await _log_read(
+                operation='search',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'query': query[:200], 'limit': limit},
+                success=False,
+                error=str(e),
+            )
             return {'error': str(e)}
 
     @mcp.tool()
     async def get_entity(
         name: str,
         project_id: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """Look up an entity in the knowledge graph by name (fuzzy matched).
 
@@ -260,17 +312,42 @@ def create_mcp_server(
         Args:
             name: Entity name (fuzzy matched — partial or approximate names work)
             project_id: Project scope (required)
+            agent_id: Which agent is reading (optional)
+            session_id: Session context (optional)
         """
         try:
-            return await memory_service.get_entity(name=name, project_id=project_id)
+            result = await memory_service.get_entity(name=name, project_id=project_id)
+            await _log_read(
+                operation='get_entity',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'name': name},
+                result_summary={
+                    'nodes': len(result.get('nodes', [])),
+                    'edges': len(result.get('edges', [])),
+                },
+            )
+            return result
         except Exception as e:
             logger.error(f'get_entity error: {e}')
+            await _log_read(
+                operation='get_entity',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'name': name},
+                success=False,
+                error=str(e),
+            )
             return {'error': str(e)}
 
     @mcp.tool()
     async def get_episodes(
         project_id: str,
         last_n: int = 10,
+        agent_id: str | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """Retrieve raw episodes from the knowledge graph. Episodes are the original
         ingested content chunks — each represents one add_episode call with its
@@ -280,14 +357,33 @@ def create_mcp_server(
         Args:
             project_id: Project scope (required)
             last_n: Number of most recent episodes to return (default: 10)
+            agent_id: Which agent is reading (optional)
+            session_id: Session context (optional)
         """
         try:
             episodes = await memory_service.get_episodes(
                 project_id=project_id, last_n=last_n
             )
+            await _log_read(
+                operation='get_episodes',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'last_n': last_n},
+                result_summary={'count': len(episodes)},
+            )
             return {'episodes': episodes}
         except Exception as e:
             logger.error(f'get_episodes error: {e}')
+            await _log_read(
+                operation='get_episodes',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'last_n': last_n},
+                success=False,
+                error=str(e),
+            )
             return {'error': str(e)}
 
     # ------------------------------------------------------------------
@@ -439,6 +535,31 @@ def create_mcp_server(
             return {'status': 'replayed', 'items_reset': count}
         except Exception as e:
             logger.error(f'replay_dead_letters error: {e}')
+            return {'error': str(e)}
+
+    # ------------------------------------------------------------------
+    # Reconciliation tools
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    async def trigger_reconciliation(project_id: str) -> dict[str, Any]:
+        """Manually trigger a full reconciliation cycle for a project.
+
+        Bypasses normal threshold/staleness logic. The reconciliation harness
+        will pick this up on its next loop iteration (~5 seconds).
+
+        Args:
+            project_id: Project to trigger reconciliation for
+        """
+        try:
+            await task_interceptor.buffer.request_trigger(project_id)  # type: ignore[union-attr]
+            return {
+                'status': 'requested',
+                'project_id': project_id,
+                'message': 'Reconciliation will trigger within ~5 seconds',
+            }
+        except Exception as e:
+            logger.error(f'trigger_reconciliation error: {e}')
             return {'error': str(e)}
 
     # ------------------------------------------------------------------

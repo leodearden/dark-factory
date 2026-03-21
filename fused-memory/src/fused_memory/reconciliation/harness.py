@@ -122,6 +122,9 @@ class ReconciliationHarness:
             }
             await self.journal.update_run_stage_reports(run.id, run.stage_reports)
             await self.journal.complete_run(run.id, 'failed')
+            restored = await self.buffer.restore_drained(run.project_id)
+            if restored:
+                logger.info(f'Restored {restored} drained events for stale run {run.id}')
             await self.buffer.mark_run_complete(run.project_id)
             self._escalate('recon_stale_run', run.id, f'Run stuck for >{cutoff}s, recovered')
 
@@ -298,6 +301,18 @@ class ReconciliationHarness:
             except Exception as e:
                 logger.warning(f'Heartbeat failed for {project_id}: {e}')
 
+    async def _run_judge(self, run_id: str) -> None:
+        """Fire-and-forget judge wrapper with error logging."""
+        try:
+            assert self.judge is not None
+            verdict = await self.judge.review_run(run_id)
+            if verdict:
+                logger.info(f'Judge verdict for {run_id}: severity={verdict.severity}')
+            else:
+                logger.warning(f'Judge returned no verdict for run {run_id}')
+        except Exception:
+            logger.error(f'Judge task failed for run {run_id}', exc_info=True)
+
     async def run_full_cycle(
         self,
         project_id: str,
@@ -363,6 +378,9 @@ class ReconciliationHarness:
             # Update watermark
             watermark.last_full_run_id = run_id
             watermark.last_full_run_completed = datetime.now(UTC)
+            watermark.last_episode_timestamp = datetime.now(UTC)
+            watermark.last_memory_timestamp = datetime.now(UTC)
+            watermark.last_task_change_timestamp = datetime.now(UTC)
             await self.journal.update_watermark(watermark)
 
             run.completed_at = datetime.now(UTC)
@@ -371,7 +389,7 @@ class ReconciliationHarness:
 
             # Async judge review
             if self.judge:
-                asyncio.create_task(self.judge.review_run(run_id))
+                asyncio.create_task(self._run_judge(run_id))
 
             logger.info(
                 'reconciliation.run_completed',
