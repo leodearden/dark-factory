@@ -154,6 +154,7 @@ class MemoryService:
         # Extract journal metadata from payload (injected at enqueue time)
         causation_id = payload.pop('_causation_id', None)
         write_op_id = payload.pop('_write_op_id', None)
+        temporal_context = payload.pop('temporal_context', None)
 
         result = await self._journaled_backend_call(
             write_op_id=write_op_id,
@@ -168,6 +169,7 @@ class MemoryService:
                 group_id=payload['group_id'],
                 source_description=payload.get('source_description', ''),
                 uuid=payload.get('uuid'),
+                temporal_context=temporal_context,
             ),
         )
         return result
@@ -198,6 +200,7 @@ class MemoryService:
         reference_time: datetime | None = None,
         source_description: str = '',
         causation_id: str | None = None,
+        temporal_context: str | None = None,
         _source: str = 'mcp_tool',
     ) -> AddEpisodeResponse:
         """Full ingestion pipeline — durably enqueue episode, return immediately."""
@@ -233,6 +236,7 @@ class MemoryService:
                     # Journal metadata (popped by _execute_graphiti_write)
                     '_causation_id': causation_id,
                     '_write_op_id': write_op_id,
+                    'temporal_context': temporal_context,
                 },
                 callback_type='dual_write_episode',
             )

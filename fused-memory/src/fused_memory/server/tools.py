@@ -146,6 +146,8 @@ def create_mcp_server(
     # Write tools
     # ------------------------------------------------------------------
 
+    _VALID_TEMPORAL_CONTEXTS = frozenset({'retrospective', 'planning', 'current'})
+
     @mcp.tool()
     async def add_episode(
         content: str,
@@ -155,6 +157,7 @@ def create_mcp_server(
         session_id: str | None = None,
         source_description: str = '',
         metadata: dict | None = None,
+        temporal_context: str | None = None,
     ) -> dict[str, Any]:
         """Add an episode to memory. Full ingestion pipeline: raw content is processed
         through Graphiti's extraction pipeline, then classified facts are dual-written
@@ -168,7 +171,18 @@ def create_mcp_server(
             session_id: Session context (optional)
             source_description: E.g. "pair programming session"
             metadata: Optional key-value pairs (may contain _causation_id for recon)
+            temporal_context: Optional temporal framing — one of "retrospective",
+                "planning", or "current". When set, the value is prepended to
+                source_description as '[temporal:X] ' so downstream readers can
+                infer the time-frame of the episode without parsing content.
         """
+        if temporal_context is not None and temporal_context not in _VALID_TEMPORAL_CONTEXTS:
+            return {
+                'error': (
+                    f'Invalid temporal_context {temporal_context!r}. '
+                    f'Must be one of {sorted(_VALID_TEMPORAL_CONTEXTS)} or None.'
+                )
+            }
         try:
             causation_id, op_source, _ = _extract_causation(metadata, agent_id)
             result = await memory_service.add_episode(
@@ -179,6 +193,7 @@ def create_mcp_server(
                 session_id=session_id,
                 source_description=source_description,
                 causation_id=causation_id,
+                temporal_context=temporal_context,
                 _source=op_source,
             )
             return result.model_dump()
