@@ -307,6 +307,21 @@ class TestMcpConfig:
         assert config['mcpServers']['escalation']['url'] == 'http://127.0.0.1:8103/mcp'
 
 
+class TestStage3PromptAlignment:
+    """STAGE3_SYSTEM_PROMPT explicitly mentions flagged_items."""
+
+    def test_stage3_prompt_references_flagged_items(self):
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+        assert 'flagged_items' in STAGE3_SYSTEM_PROMPT, (
+            "STAGE3_SYSTEM_PROMPT must instruct the LLM to use 'flagged_items' key"
+        )
+
+    def test_stage3_prompt_has_output_format_section(self):
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+        # Should have an Output Format section to guide the LLM
+        assert 'Output Format' in STAGE3_SYSTEM_PROMPT
+
+
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
