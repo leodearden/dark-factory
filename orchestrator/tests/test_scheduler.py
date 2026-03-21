@@ -952,3 +952,59 @@ class TestGetModulesJsonStringMetadata:
             '8' in record.message and 'fallback' in record.message.lower()
             for record in caplog.records
         ), f'Expected fallback warning mentioning task 8. Got: {[r.message for r in caplog.records]}'
+
+
+class TestUpdateTaskMetadataSerialization:
+    """Regression tests for update_task dict->JSON string coercion."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_update_task_serializes_dict_to_json_string(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """update_task converts dict metadata to a JSON string before the MCP call."""
+        import json
+
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        await scheduler.update_task('1', {'modules': ['backend']})
+
+        assert len(captured_args) == 1
+        arguments = captured_args[0]['arguments']
+        metadata = arguments['metadata']
+        # Must be a string, not a dict
+        assert isinstance(metadata, str), f'Expected str metadata, got {type(metadata)}: {metadata}'
+        # Must be valid JSON that round-trips correctly
+        parsed = json.loads(metadata)
+        assert parsed == {'modules': ['backend']}
+
+    @pytest.mark.asyncio
+    async def test_update_task_passes_string_metadata_through(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """update_task passes string metadata unchanged — no double-serialization."""
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        await scheduler.update_task('1', '{"modules": ["backend"]}')
+
+        assert len(captured_args) == 1
+        arguments = captured_args[0]['arguments']
+        metadata = arguments['metadata']
+        # Must be the same string — no double-serialization
+        assert metadata == '{"modules": ["backend"]}'
