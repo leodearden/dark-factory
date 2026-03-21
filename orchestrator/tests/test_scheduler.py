@@ -767,3 +767,35 @@ class TestAcquireNextDependencyGating:
         result = await scheduler.acquire_next()
         assert result is not None
         assert result.task_id == 'B'
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_blocks_on_mixed_dep_statuses(
+        self, scheduler: Scheduler
+    ):
+        """acquire_next blocks task C when one dep is done but another is in-progress."""
+        task_a = {
+            'id': 'A',
+            'title': 'Task A',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {'modules': ['backend']},
+        }
+        task_b = {
+            'id': 'B',
+            'title': 'Task B',
+            'status': 'in-progress',
+            'dependencies': [],
+            'metadata': {'modules': ['backend']},
+        }
+        task_c = {
+            'id': 'C',
+            'title': 'Task C',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}, {'id': 'B'}],
+            'metadata': {'modules': ['frontend']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b, task_c])
+
+        result = await scheduler.acquire_next()
+        # A is done, B is in-progress (not pending), C is blocked by B — nothing to dispatch
+        assert result is None
