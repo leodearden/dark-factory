@@ -371,8 +371,7 @@ class Scheduler:
         )
         # Cache expanded modules in memory so _get_modules uses them on retry
         self._module_cache[task_id] = needed_normalized
-        import json
-        updated = await self.update_task(task_id, json.dumps({'modules': needed}))
+        updated = await self.update_task(task_id, {'modules': needed})
         if not updated:
             logger.warning(
                 f'Task {task_id}: metadata update failed (non-critical — '
