@@ -267,11 +267,22 @@ class Scheduler:
           - dict with 'id' key: ``{'id': 1}`` or ``{'id': '1'}``
           - integer: ``1``
           - string: ``'1'``
+
+        Emits a DEBUG log when a dependency blocks dispatch, naming the dep
+        ID and its current status to aid diagnosis of premature-dispatch issues.
         """
         deps = task.get('dependencies', [])
+        task_id = str(task.get('id', '?'))
         for d in deps:
             dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
-            if status_map.get(dep_id) != 'done':
+            dep_status = status_map.get(dep_id, 'unknown')
+            if dep_status != 'done':
+                logger.debug(
+                    'Task %s blocked: dep %s has status %s, need done',
+                    task_id,
+                    dep_id,
+                    dep_status,
+                )
                 return False
         return True
 
