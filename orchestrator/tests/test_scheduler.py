@@ -649,3 +649,20 @@ class TestAcquireNextNoDuplicates:
         third = await scheduler.acquire_next()
         assert third is not None, 'After release(), a task should be dispatchable'
         _ = other_id  # acknowledged; exact winner depends on sort order
+
+
+class TestDepsSatisfied:
+    """Unit tests for Scheduler._deps_satisfied(task, status_map)."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def test_deps_satisfied_returns_false_when_dep_in_progress(
+        self, scheduler: Scheduler
+    ):
+        """_deps_satisfied returns False when a dependency is in-progress."""
+        task = {'id': '2', 'dependencies': [{'id': 1}]}
+        status_map = {'1': 'in-progress', '2': 'pending'}
+        assert scheduler._deps_satisfied(task, status_map) is False
