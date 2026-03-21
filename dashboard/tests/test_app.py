@@ -162,19 +162,23 @@ class TestMemoryPartialIntegration:
             assert 'Offline' in html
 
 
+_UNSET = object()
+
+
 def _patch_recon_data(
-    buffer_stats=None,
-    burst_state=None,
-    watermarks=None,
-    verdict=None,
-    runs=None,
+    buffer_stats=_UNSET,
+    burst_state=_UNSET,
+    watermarks=_UNSET,
+    verdict=_UNSET,
+    runs=_UNSET,
+    last_attempted=_UNSET,
 ):
-    """Return an ExitStack that patches all 5 recon data functions."""
+    """Return an ExitStack that patches all 6 recon data functions."""
     defaults = {
-        'buffer_stats': buffer_stats if buffer_stats is not None else {
+        'buffer_stats': buffer_stats if buffer_stats is not _UNSET else {
             'buffered_count': 3, 'oldest_event_age_seconds': 600.0,
         },
-        'burst_state': burst_state if burst_state is not None else [
+        'burst_state': burst_state if burst_state is not _UNSET else [
             {
                 'agent_id': 'agent-1',
                 'state': 'bursting',
@@ -182,13 +186,20 @@ def _patch_recon_data(
                 'burst_started_at': '2026-03-19T00:00:00+00:00',
             },
         ],
-        'watermarks': watermarks if watermarks is not None else {
-            'last_full_run_completed': '2026-03-19T10:00:00+00:00',
-        },
-        'verdict': verdict,
-        'runs': runs if runs is not None else [
+        'watermarks': watermarks if watermarks is not _UNSET else [
+            {
+                'project_id': 'dark_factory',
+                'last_full_run_completed': '2026-03-19T10:00:00+00:00',
+                'last_episode_timestamp': None,
+                'last_memory_timestamp': None,
+                'last_task_change_timestamp': None,
+            },
+        ],
+        'verdict': verdict if verdict is not _UNSET else None,
+        'runs': runs if runs is not _UNSET else [
             {
                 'id': 'run-001',
+                'project_id': 'dark_factory',
                 'run_type': 'full',
                 'trigger_reason': 'staleness_timer',
                 'started_at': '2026-03-19T08:00:00+00:00',
@@ -198,6 +209,14 @@ def _patch_recon_data(
                 'duration_seconds': 300.0,
             },
         ],
+        'last_attempted': last_attempted if last_attempted is not _UNSET else {
+            'dark_factory': {
+                'id': 'run-002',
+                'status': 'failed',
+                'started_at': '2026-03-19T09:00:00+00:00',
+                'completed_at': '2026-03-19T09:01:00+00:00',
+            },
+        },
     }
     stack = ExitStack()
     stack.enter_context(patch(
@@ -225,6 +244,11 @@ def _patch_recon_data(
         new_callable=AsyncMock,
         return_value=defaults['runs'],
     ))
+    stack.enter_context(patch(
+        'dashboard.app.get_last_attempted_run',
+        new_callable=AsyncMock,
+        return_value=defaults['last_attempted'],
+    ))
     return stack
 
 
@@ -244,8 +268,9 @@ class TestReconPartialIntegration:
         with _patch_recon_data(
             buffer_stats={'buffered_count': 0, 'oldest_event_age_seconds': None},
             burst_state=[],
-            watermarks={},
+            watermarks=[],
             runs=[],
+            last_attempted={},
         ):
             resp = client.get('/partials/recon')
             assert resp.status_code == 200

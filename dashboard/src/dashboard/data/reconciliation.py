@@ -15,19 +15,22 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
+# Default burst cooldown matches EventBuffer.burst_cooldown_seconds
+_DEFAULT_BURST_COOLDOWN = 150
+
 
 async def get_recent_runs(db_path: Path, *, limit: int = 10) -> list[dict]:
     """Return recent reconciliation runs ordered by started_at DESC.
 
-    Each dict contains: id, run_type, trigger_reason, started_at, completed_at,
-    events_processed, status, duration_seconds.
+    Each dict contains: id, project_id, run_type, trigger_reason, started_at,
+    completed_at, events_processed, status, duration_seconds.
     """
     try:
         async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                'SELECT id, run_type, trigger_reason, started_at, completed_at,'
-                ' events_processed, status'
+                'SELECT id, project_id, run_type, trigger_reason, started_at,'
+                ' completed_at, events_processed, status'
                 ' FROM runs ORDER BY started_at DESC LIMIT ?',
                 (limit,),
             ) as cursor:
@@ -47,6 +50,7 @@ async def get_recent_runs(db_path: Path, *, limit: int = 10) -> list[dict]:
         results.append(
             {
                 'id': row['id'],
+                'project_id': row['project_id'],
                 'run_type': row['run_type'],
                 'trigger_reason': row['trigger_reason'],
                 'started_at': row['started_at'],
@@ -59,59 +63,65 @@ async def get_recent_runs(db_path: Path, *, limit: int = 10) -> list[dict]:
     return results
 
 
-async def get_watermarks(db_path: Path, *, project_id: str = 'dark_factory') -> dict:
-    """Return watermark timestamps for a given project.
+async def get_watermarks(db_path: Path) -> list[dict]:
+    """Return watermark timestamps for all projects.
 
-    Returns a dict with keys: last_full_run_completed, last_episode_timestamp,
-    last_memory_timestamp, last_task_change_timestamp. Returns {} if not found.
+    Each dict contains: project_id, last_full_run_completed, last_episode_timestamp,
+    last_memory_timestamp, last_task_change_timestamp.  Returns [] if none found.
     """
     try:
         async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                'SELECT last_full_run_completed, last_episode_timestamp,'
+                'SELECT project_id, last_full_run_completed, last_episode_timestamp,'
                 ' last_memory_timestamp, last_task_change_timestamp'
-                ' FROM watermarks WHERE project_id = ?',
-                (project_id,),
+                ' FROM watermarks ORDER BY project_id',
             ) as cursor:
-                row = await cursor.fetchone()
+                rows = await cursor.fetchall()
     except (FileNotFoundError, sqlite3.OperationalError):
         logger.debug('get_watermarks: DB unavailable at %s', db_path, exc_info=True)
-        return {}
+        return []
 
-    if row is None:
-        return {}
+    return [
+        {
+            'project_id': row['project_id'],
+            'last_full_run_completed': row['last_full_run_completed'],
+            'last_episode_timestamp': row['last_episode_timestamp'],
+            'last_memory_timestamp': row['last_memory_timestamp'],
+            'last_task_change_timestamp': row['last_task_change_timestamp'],
+        }
+        for row in rows
+    ]
 
-    return {
-        'last_full_run_completed': row['last_full_run_completed'],
-        'last_episode_timestamp': row['last_episode_timestamp'],
-        'last_memory_timestamp': row['last_memory_timestamp'],
-        'last_task_change_timestamp': row['last_task_change_timestamp'],
-    }
 
+async def get_last_attempted_run(db_path: Path) -> dict[str, dict]:
+    """Return the most recent run per project, regardless of status.
 
-async def get_last_attempted_run(
-    db_path: Path, *, project_id: str = 'dark_factory',
-) -> dict | None:
-    """Return the most recent run regardless of status."""
+    Returns a dict keyed by project_id → {id, status, started_at, completed_at}.
+    """
     try:
         async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                'SELECT id, status, started_at, completed_at'
-                ' FROM runs WHERE project_id = ?'
-                ' ORDER BY started_at DESC LIMIT 1',
-                (project_id,),
+                'SELECT r.id, r.project_id, r.status, r.started_at, r.completed_at'
+                ' FROM runs r'
+                ' INNER JOIN ('
+                '   SELECT project_id, MAX(started_at) AS max_started'
+                '   FROM runs GROUP BY project_id'
+                ' ) latest ON r.project_id = latest.project_id'
+                '   AND r.started_at = latest.max_started',
             ) as cursor:
-                row = await cursor.fetchone()
+                rows = await cursor.fetchall()
     except (FileNotFoundError, sqlite3.OperationalError):
         logger.debug('get_last_attempted_run: DB unavailable at %s', db_path, exc_info=True)
-        return None
-    if row is None:
-        return None
+        return {}
+
     return {
-        'id': row['id'], 'status': row['status'],
-        'started_at': row['started_at'], 'completed_at': row['completed_at'],
+        row['project_id']: {
+            'id': row['id'], 'status': row['status'],
+            'started_at': row['started_at'], 'completed_at': row['completed_at'],
+        }
+        for row in rows
     }
 
 
@@ -150,8 +160,15 @@ async def get_buffer_stats(db_path: Path) -> dict:
     return {'buffered_count': count, 'oldest_event_age_seconds': age}
 
 
-async def get_burst_state(db_path: Path) -> list[dict]:
-    """Return current burst state for all agents.
+async def get_burst_state(
+    db_path: Path, *, burst_cooldown_seconds: int = _DEFAULT_BURST_COOLDOWN,
+) -> list[dict]:
+    """Return current burst state for all agents with cooldown applied.
+
+    Agents whose ``last_write_at`` exceeds *burst_cooldown_seconds* are
+    reported as ``idle`` regardless of the stored state — the EventBuffer
+    only expires bursts during its own trigger checks, so the dashboard
+    must compute effective state at read time.
 
     Each dict contains: agent_id, state, last_write_at, burst_started_at.
     """
@@ -167,15 +184,32 @@ async def get_burst_state(db_path: Path) -> list[dict]:
         logger.debug('get_burst_state: DB unavailable at %s', db_path, exc_info=True)
         return []
 
-    return [
-        {
+    now = datetime.now(UTC)
+    results = []
+    for row in rows:
+        state = row['state']
+        burst_started = row['burst_started_at']
+
+        # Apply cooldown: if last write is older than cooldown, agent is idle
+        if state == 'bursting':
+            try:
+                last_write = datetime.fromisoformat(row['last_write_at'])
+                if last_write.tzinfo is None:
+                    last_write = last_write.replace(tzinfo=UTC)
+                if (now - last_write).total_seconds() > burst_cooldown_seconds:
+                    state = 'idle'
+                    burst_started = None
+            except (ValueError, TypeError):
+                state = 'idle'
+                burst_started = None
+
+        results.append({
             'agent_id': row['agent_id'],
-            'state': row['state'],
+            'state': state,
             'last_write_at': row['last_write_at'],
-            'burst_started_at': row['burst_started_at'],
-        }
-        for row in rows
-    ]
+            'burst_started_at': burst_started,
+        })
+    return results
 
 
 async def get_latest_verdict(db_path: Path) -> dict | None:

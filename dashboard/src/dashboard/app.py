@@ -124,24 +124,42 @@ async def partials_recon(request: Request):
     config = request.app.state.config
     db = config.reconciliation_db
 
-    buffer_stats, burst_state, watermarks, verdict, runs, last_attempted = await asyncio.gather(
-        get_buffer_stats(db),
-        get_burst_state(db),
-        get_watermarks(db),
-        get_latest_verdict(db),
-        get_recent_runs(db),
-        get_last_attempted_run(db),
+    buffer_stats, burst_state, watermarks_list, verdict, runs, last_attempted_map = (
+        await asyncio.gather(
+            get_buffer_stats(db),
+            get_burst_state(db),
+            get_watermarks(db),
+            get_latest_verdict(db),
+            get_recent_runs(db),
+            get_last_attempted_run(db),
+        )
     )
+
+    # Build per-project view: merge watermarks + last attempted run
+    projects: dict[str, dict] = {}
+    for wm in watermarks_list:
+        pid = wm['project_id']
+        projects[pid] = {
+            'watermarks': wm,
+            'last_attempted': last_attempted_map.get(pid),
+        }
+    # Include projects that have runs but no watermarks yet
+    for pid, la in last_attempted_map.items():
+        if pid not in projects:
+            projects[pid] = {'watermarks': {}, 'last_attempted': la}
+
+    # Determine if runs span multiple project_ids (for column display)
+    run_project_ids = {r['project_id'] for r in runs}
 
     return templates.TemplateResponse(
         request, 'partials/recon.html',
         context={
             'buffer_stats': buffer_stats,
             'burst_state': burst_state,
-            'watermarks': watermarks,
+            'projects': projects,
             'verdict': verdict,
             'runs': runs,
-            'last_attempted': last_attempted,
+            'multi_project_runs': len(run_project_ids) > 1,
         },
     )
 

@@ -47,38 +47,47 @@
       {% endif %}
     </div>
 
-    <!-- Watermarks -->
+    <!-- Watermarks (per-project) -->
     <div class="bg-gray-800 rounded-lg p-6">
       <h3 class="text-lg font-semibold text-gray-100 mb-4">Watermarks</h3>
-      <div class="space-y-3">
-        <div class="flex justify-between items-center">
-          <span class="text-gray-400">Last attempted run</span>
-          <span class="text-white">
-            {% if last_attempted %}
-              {{ last_attempted.completed_at or last_attempted.started_at | timeago }}
-              {{ status_badge(last_attempted.status, aria_label='Last attempted run status') }}
-            {% else %}
-              never
-            {% endif %}
-          </span>
-        </div>
-        <div class="flex justify-between">
-          <span class="text-gray-400">Last successful run</span>
-          <span class="text-white">{{ watermarks.get('last_full_run_completed') | timeago }}</span>
-        </div>
-        <div class="flex justify-between">
-          <span class="text-gray-400">Last episode</span>
-          <span class="text-white">{{ watermarks.get('last_episode_timestamp') | timeago }}</span>
-        </div>
-        <div class="flex justify-between">
-          <span class="text-gray-400">Last memory</span>
-          <span class="text-white">{{ watermarks.get('last_memory_timestamp') | timeago }}</span>
-        </div>
-        <div class="flex justify-between">
-          <span class="text-gray-400">Last task change</span>
-          <span class="text-white">{{ watermarks.get('last_task_change_timestamp') | timeago }}</span>
-        </div>
-      </div>
+      {% if projects %}
+        {% for project_id, proj in projects.items() %}
+          {% if projects | length > 1 %}
+            <h4 class="text-sm font-medium text-gray-300 mt-{{ '0' if loop.first else '4' }} mb-2">{{ project_id }}</h4>
+          {% endif %}
+          <div class="space-y-3 {% if not loop.last and projects | length > 1 %}border-b border-gray-700 pb-4{% endif %}">
+            <div class="flex justify-between items-center">
+              <span class="text-gray-400">Last attempted run</span>
+              <span class="text-white">
+                {% if proj.last_attempted %}
+                  {{ (proj.last_attempted.completed_at or proj.last_attempted.started_at) | timeago }}
+                  {{ status_badge(proj.last_attempted.status, aria_label='Last attempted run status') }}
+                {% else %}
+                  never
+                {% endif %}
+              </span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-gray-400">Last successful run</span>
+              <span class="text-white">{{ proj.watermarks.get('last_full_run_completed') | timeago }}</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-gray-400">Last episode</span>
+              <span class="text-white">{{ proj.watermarks.get('last_episode_timestamp') | timeago }}</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-gray-400">Last memory</span>
+              <span class="text-white">{{ proj.watermarks.get('last_memory_timestamp') | timeago }}</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-gray-400">Last task change</span>
+              <span class="text-white">{{ proj.watermarks.get('last_task_change_timestamp') | timeago }}</span>
+            </div>
+          </div>
+        {% endfor %}
+      {% else %}
+        <p class="text-gray-400">No watermarks recorded</p>
+      {% endif %}
     </div>
 
     <!-- Latest Verdict -->
@@ -105,6 +114,9 @@
       <table class="w-full text-sm">
         <thead>
           <tr class="text-gray-400 border-b border-gray-700">
+            {% if multi_project_runs %}
+              <th class="text-left pb-2">Project</th>
+            {% endif %}
             <th class="text-left pb-2">Trigger</th>
             <th class="text-left pb-2">Type</th>
             <th class="text-left pb-2">Status</th>
@@ -116,6 +128,9 @@
         <tbody>
           {% for run in runs %}
             <tr class="border-b border-gray-700">
+              {% if multi_project_runs %}
+                <td class="py-2 text-gray-300">{{ run.project_id }}</td>
+              {% endif %}
               <td class="py-2 text-gray-100"><span title="{{ run.trigger_reason }}">{{ run.trigger_reason | format_trigger }}</span></td>
               <td class="py-2 text-gray-100">{{ run.run_type }}</td>
               <td class="py-2">

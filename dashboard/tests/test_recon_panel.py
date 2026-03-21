@@ -117,12 +117,15 @@ MOCK_BURST_STATE = [
     },
 ]
 
-MOCK_WATERMARKS = {
-    'last_full_run_completed': '2026-03-19T10:00:00+00:00',
-    'last_episode_timestamp': '2026-03-19T10:30:00+00:00',
-    'last_memory_timestamp': '2026-03-19T10:40:00+00:00',
-    'last_task_change_timestamp': '2026-03-19T10:50:00+00:00',
-}
+MOCK_WATERMARKS = [
+    {
+        'project_id': 'dark_factory',
+        'last_full_run_completed': '2026-03-19T10:00:00+00:00',
+        'last_episode_timestamp': '2026-03-19T10:30:00+00:00',
+        'last_memory_timestamp': '2026-03-19T10:40:00+00:00',
+        'last_task_change_timestamp': '2026-03-19T10:50:00+00:00',
+    },
+]
 
 MOCK_VERDICT = {
     'run_id': 'run-001',
@@ -134,6 +137,7 @@ MOCK_VERDICT = {
 MOCK_RUNS = [
     {
         'id': 'run-001',
+        'project_id': 'dark_factory',
         'run_type': 'full',
         'trigger_reason': 'staleness_timer',
         'started_at': '2026-03-19T08:00:00+00:00',
@@ -145,10 +149,12 @@ MOCK_RUNS = [
 ]
 
 MOCK_LAST_ATTEMPTED = {
-    'id': 'run-002',
-    'status': 'failed',
-    'started_at': '2026-03-19T09:00:00+00:00',
-    'completed_at': '2026-03-19T09:01:00+00:00',
+    'dark_factory': {
+        'id': 'run-002',
+        'status': 'failed',
+        'started_at': '2026-03-19T09:00:00+00:00',
+        'completed_at': '2026-03-19T09:01:00+00:00',
+    },
 }
 
 
@@ -241,12 +247,11 @@ class TestReconRoute:
             html = client.get('/partials/recon').text
         assert 'Last successful run' in html
 
-    def test_last_attempted_none_shows_never(self, client):
-        with _patch_recon_data(last_attempted=None):
+    def test_last_attempted_empty_shows_never(self, client):
+        with _patch_recon_data(last_attempted={}):
             html = client.get('/partials/recon').text
         assert 'Last attempted run' in html
         # The "never" text should appear in the last attempted run row
-        # Check the row contains "never"
         assert 'never' in html
 
     def test_verdict_severity_badge(self, client):
@@ -285,6 +290,7 @@ class TestReconRoute:
         runs_with_colon = [
             {
                 'id': 'run-002',
+                'project_id': 'dark_factory',
                 'run_type': 'full',
                 'trigger_reason': 'max_staleness:2026-03-19T08:00:00+00:00',
                 'started_at': '2026-03-19T08:00:00+00:00',
@@ -318,10 +324,10 @@ class TestReconRouteEmpty:
         with _patch_recon_data(
             buffer_stats=EMPTY_BUFFER_STATS,
             burst_state=[],
-            watermarks={},
+            watermarks=[],
             verdict=None,
             runs=[],
-            last_attempted=None,
+            last_attempted={},
         ):
             resp = client.get('/partials/recon')
         assert resp.status_code == 200
@@ -330,10 +336,10 @@ class TestReconRouteEmpty:
         with _patch_recon_data(
             buffer_stats=EMPTY_BUFFER_STATS,
             burst_state=[],
-            watermarks={},
+            watermarks=[],
             verdict=None,
             runs=[],
-            last_attempted=None,
+            last_attempted={},
         ):
             html = client.get('/partials/recon').text
         assert '0 events buffered' in html
@@ -342,10 +348,10 @@ class TestReconRouteEmpty:
         with _patch_recon_data(
             buffer_stats=EMPTY_BUFFER_STATS,
             burst_state=[],
-            watermarks={},
+            watermarks=[],
             verdict=None,
             runs=[],
-            last_attempted=None,
+            last_attempted={},
         ):
             html = client.get('/partials/recon').text
         assert 'No agents' in html
@@ -354,10 +360,10 @@ class TestReconRouteEmpty:
         with _patch_recon_data(
             buffer_stats=EMPTY_BUFFER_STATS,
             burst_state=[],
-            watermarks={},
+            watermarks=[],
             verdict=None,
             runs=[],
-            last_attempted=None,
+            last_attempted={},
         ):
             html = client.get('/partials/recon').text
         assert 'No verdicts yet' in html
@@ -366,10 +372,10 @@ class TestReconRouteEmpty:
         with _patch_recon_data(
             buffer_stats=EMPTY_BUFFER_STATS,
             burst_state=[],
-            watermarks={},
+            watermarks=[],
             verdict=None,
             runs=[],
-            last_attempted=None,
+            last_attempted={},
         ):
             html = client.get('/partials/recon').text
         assert 'No reconciliation runs yet' in html
@@ -378,10 +384,10 @@ class TestReconRouteEmpty:
         with _patch_recon_data(
             buffer_stats=EMPTY_BUFFER_STATS,
             burst_state=[],
-            watermarks={},
+            watermarks=[],
             verdict=None,
             runs=[],
-            last_attempted=None,
+            last_attempted={},
         ):
             html = client.get('/partials/recon').text
         assert 'bg-green-600' not in html
@@ -448,6 +454,7 @@ class TestReconBadgeAriaLabels:
         runs_running = [
             {
                 'id': 'run-002',
+                'project_id': 'dark_factory',
                 'run_type': 'full',
                 'trigger_reason': 'manual',
                 'started_at': '2026-03-19T08:00:00+00:00',
@@ -465,6 +472,7 @@ class TestReconBadgeAriaLabels:
         runs_failed = [
             {
                 'id': 'run-003',
+                'project_id': 'dark_factory',
                 'run_type': 'full',
                 'trigger_reason': 'manual',
                 'started_at': '2026-03-19T08:00:00+00:00',
@@ -482,6 +490,7 @@ class TestReconBadgeAriaLabels:
         runs_rb = [
             {
                 'id': 'run-004',
+                'project_id': 'dark_factory',
                 'run_type': 'full',
                 'trigger_reason': 'manual',
                 'started_at': '2026-03-19T08:00:00+00:00',
@@ -499,6 +508,7 @@ class TestReconBadgeAriaLabels:
         runs_cb = [
             {
                 'id': 'run-005',
+                'project_id': 'dark_factory',
                 'run_type': 'full',
                 'trigger_reason': 'manual',
                 'started_at': '2026-03-19T08:00:00+00:00',

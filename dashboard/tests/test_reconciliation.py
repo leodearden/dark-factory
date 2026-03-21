@@ -24,6 +24,7 @@ class TestGetRecentRuns:
         # Check all expected fields are present
         expected_fields = {
             'id',
+            'project_id',
             'run_type',
             'trigger_reason',
             'started_at',
@@ -34,6 +35,7 @@ class TestGetRecentRuns:
         }
         for run in runs:
             assert set(run.keys()) == expected_fields
+        assert runs[0]['project_id'] == 'dark_factory'
 
     async def test_completed_run_has_duration(self, reconciliation_db):
         """Completed runs should have duration_seconds calculated."""
@@ -81,58 +83,83 @@ class TestGetRecentRuns:
 class TestGetWatermarks:
     """Tests for get_watermarks."""
 
-    async def test_happy_path_returns_watermark_dict(self, reconciliation_db):
-        """Returns dict with watermark fields for existing project_id."""
+    async def test_happy_path_returns_watermark_list(self, reconciliation_db):
+        """Returns list of dicts with watermark fields for all projects."""
         from dashboard.data.reconciliation import get_watermarks
 
-        result = await get_watermarks(reconciliation_db, project_id='dark_factory')
+        result = await get_watermarks(reconciliation_db)
 
-        assert isinstance(result, dict)
+        assert isinstance(result, list)
+        assert len(result) == 1  # fixture only inserts dark_factory
+        wm = result[0]
         expected_keys = {
+            'project_id',
             'last_full_run_completed',
             'last_episode_timestamp',
             'last_memory_timestamp',
             'last_task_change_timestamp',
         }
-        assert set(result.keys()) == expected_keys
-        # All values should be non-None strings (timestamps were set in fixture)
-        for key in expected_keys:
-            assert result[key] is not None
-
-    async def test_nonexistent_project_id(self, reconciliation_db):
-        """Returns empty dict for a project_id not in the table."""
-        from dashboard.data.reconciliation import get_watermarks
-
-        result = await get_watermarks(reconciliation_db, project_id='nonexistent')
-        assert result == {}
+        assert set(wm.keys()) == expected_keys
+        assert wm['project_id'] == 'dark_factory'
+        # All timestamp values should be non-None strings (set in fixture)
+        for key in expected_keys - {'project_id'}:
+            assert wm[key] is not None
 
     async def test_empty_table(self, empty_reconciliation_db):
-        """Returns empty dict when watermarks table has no data."""
+        """Returns empty list when watermarks table has no data."""
         from dashboard.data.reconciliation import get_watermarks
 
-        result = await get_watermarks(empty_reconciliation_db, project_id='dark_factory')
-        assert result == {}
+        result = await get_watermarks(empty_reconciliation_db)
+        assert result == []
 
     async def test_missing_db_file(self, missing_db_path):
-        """Returns empty dict when database file does not exist."""
+        """Returns empty list when database file does not exist."""
         from dashboard.data.reconciliation import get_watermarks
 
-        result = await get_watermarks(missing_db_path, project_id='dark_factory')
-        assert result == {}
+        result = await get_watermarks(missing_db_path)
+        assert result == []
+
+    async def test_multiple_projects(self, tmp_path):
+        """Returns watermarks for all projects ordered by project_id."""
+        import sqlite3
+
+        from dashboard.data.reconciliation import get_watermarks
+        from tests.conftest import RECONCILIATION_SCHEMA
+
+        db_path = tmp_path / 'multi.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(RECONCILIATION_SCHEMA)
+        conn.execute(
+            "INSERT INTO watermarks (project_id, last_full_run_completed)"
+            " VALUES ('alpha', '2026-03-19T10:00:00+00:00')"
+        )
+        conn.execute(
+            "INSERT INTO watermarks (project_id, last_full_run_completed)"
+            " VALUES ('beta', '2026-03-19T11:00:00+00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        result = await get_watermarks(db_path)
+        assert len(result) == 2
+        assert result[0]['project_id'] == 'alpha'
+        assert result[1]['project_id'] == 'beta'
 
 
 class TestGetLastAttemptedRun:
     """Tests for get_last_attempted_run."""
 
-    async def test_happy_path_returns_most_recent_run(self, reconciliation_db):
-        """Returns the most recent run regardless of status."""
+    async def test_happy_path_returns_per_project_dict(self, reconciliation_db):
+        """Returns dict keyed by project_id with most recent run per project."""
         from dashboard.data.reconciliation import get_last_attempted_run
 
-        result = await get_last_attempted_run(reconciliation_db, project_id='dark_factory')
+        result = await get_last_attempted_run(reconciliation_db)
 
-        assert result is not None
-        assert result['id'] == 'run-002'  # Most recent by started_at
-        assert set(result.keys()) == {'id', 'status', 'started_at', 'completed_at'}
+        assert isinstance(result, dict)
+        assert 'dark_factory' in result
+        run = result['dark_factory']
+        assert run['id'] == 'run-002'  # Most recent by started_at
+        assert set(run.keys()) == {'id', 'status', 'started_at', 'completed_at'}
 
     async def test_failed_most_recent(self, tmp_path):
         """Returns a failed run when it's the most recent."""
@@ -153,23 +180,59 @@ class TestGetLastAttemptedRun:
         conn.commit()
         conn.close()
 
-        result = await get_last_attempted_run(db_path, project_id='dark_factory')
-        assert result is not None
-        assert result['status'] == 'failed'
+        result = await get_last_attempted_run(db_path)
+        assert 'dark_factory' in result
+        assert result['dark_factory']['status'] == 'failed'
+
+    async def test_multiple_projects(self, tmp_path):
+        """Returns one entry per project, each the most recent run."""
+        import sqlite3
+
+        from dashboard.data.reconciliation import get_last_attempted_run
+
+        db_path = tmp_path / 'multi.db'
+        conn = sqlite3.connect(str(db_path))
+        from tests.conftest import RECONCILIATION_SCHEMA
+        conn.executescript(RECONCILIATION_SCHEMA)
+        conn.execute(
+            "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
+            "completed_at, events_processed, status) "
+            "VALUES ('a1', 'alpha', 'full', 'test', '2026-03-19T10:00:00', "
+            "'2026-03-19T10:01:00', 2, 'completed')"
+        )
+        conn.execute(
+            "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
+            "completed_at, events_processed, status) "
+            "VALUES ('a2', 'alpha', 'full', 'test', '2026-03-19T11:00:00', "
+            "'2026-03-19T11:01:00', 3, 'failed')"
+        )
+        conn.execute(
+            "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
+            "completed_at, events_processed, status) "
+            "VALUES ('b1', 'beta', 'full', 'test', '2026-03-19T09:00:00', "
+            "'2026-03-19T09:01:00', 1, 'completed')"
+        )
+        conn.commit()
+        conn.close()
+
+        result = await get_last_attempted_run(db_path)
+        assert len(result) == 2
+        assert result['alpha']['id'] == 'a2'  # most recent for alpha
+        assert result['beta']['id'] == 'b1'
 
     async def test_empty_table(self, empty_reconciliation_db):
-        """Returns None when runs table has no data."""
+        """Returns empty dict when runs table has no data."""
         from dashboard.data.reconciliation import get_last_attempted_run
 
-        result = await get_last_attempted_run(empty_reconciliation_db, project_id='dark_factory')
-        assert result is None
+        result = await get_last_attempted_run(empty_reconciliation_db)
+        assert result == {}
 
     async def test_missing_db_file(self, missing_db_path):
-        """Returns None when database file does not exist."""
+        """Returns empty dict when database file does not exist."""
         from dashboard.data.reconciliation import get_last_attempted_run
 
-        result = await get_last_attempted_run(missing_db_path, project_id='dark_factory')
-        assert result is None
+        result = await get_last_attempted_run(missing_db_path)
+        assert result == {}
 
 
 class TestGetBufferStats:
@@ -222,12 +285,66 @@ class TestGetBurstState:
         for entry in result:
             assert set(entry.keys()) == expected_fields
 
-        # Check agent data matches fixture
+        # agent-1: last_write 2min ago, within 150s cooldown → still bursting
         by_agent = {e['agent_id']: e for e in result}
         assert by_agent['agent-1']['state'] == 'bursting'
         assert by_agent['agent-1']['burst_started_at'] is not None
         assert by_agent['agent-2']['state'] == 'idle'
         assert by_agent['agent-2']['burst_started_at'] is None
+
+    async def test_cooldown_expires_stale_burst(self, tmp_path):
+        """Agents with last_write older than cooldown are reported as idle."""
+        import sqlite3
+        from datetime import UTC, datetime, timedelta
+
+        from dashboard.data.reconciliation import get_burst_state
+        from tests.conftest import RECONCILIATION_SCHEMA
+
+        db_path = tmp_path / 'stale.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(RECONCILIATION_SCHEMA)
+        now = datetime.now(UTC)
+        # last_write_at is 10 minutes ago — well past default 150s cooldown
+        conn.execute(
+            "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
+            " VALUES (?, 'bursting', ?, ?)",
+            ('stale-agent', (now - timedelta(minutes=10)).isoformat(),
+             (now - timedelta(minutes=15)).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        result = await get_burst_state(db_path)
+        assert len(result) == 1
+        assert result[0]['state'] == 'idle'
+        assert result[0]['burst_started_at'] is None
+
+    async def test_cooldown_preserves_active_burst(self, tmp_path):
+        """Agents with recent last_write keep bursting state."""
+        import sqlite3
+        from datetime import UTC, datetime, timedelta
+
+        from dashboard.data.reconciliation import get_burst_state
+        from tests.conftest import RECONCILIATION_SCHEMA
+
+        db_path = tmp_path / 'active.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(RECONCILIATION_SCHEMA)
+        now = datetime.now(UTC)
+        # last_write_at is 30 seconds ago — within 150s cooldown
+        conn.execute(
+            "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
+            " VALUES (?, 'bursting', ?, ?)",
+            ('active-agent', (now - timedelta(seconds=30)).isoformat(),
+             (now - timedelta(seconds=60)).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        result = await get_burst_state(db_path)
+        assert len(result) == 1
+        assert result[0]['state'] == 'bursting'
+        assert result[0]['burst_started_at'] is not None
 
     async def test_empty_table(self, empty_reconciliation_db):
         """Returns empty list when burst_state table has no data."""
@@ -303,9 +420,9 @@ class TestExceptionLogging:
         conn.close()
 
         with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
-            result = await get_watermarks(db_path, project_id='dark_factory')
+            result = await get_watermarks(db_path)
 
-        assert result == {}
+        assert result == []
         assert any(
             r.levelno == logging.DEBUG and 'dashboard.data.reconciliation' in r.name
             for r in caplog.records
