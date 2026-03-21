@@ -303,3 +303,79 @@ class TestUpdateEdgeEmbedding:
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.update_edge_embedding('edge-uuid', [0.1] * 10)
+
+
+# ---------------------------------------------------------------------------
+# step-7: list_indices / drop_index
+# ---------------------------------------------------------------------------
+
+class TestListIndices:
+    """GraphitiBackend.list_indices() returns parsed index records."""
+
+    @pytest.mark.asyncio
+    async def test_returns_index_list(self, mock_config):
+        backend = _make_backend(mock_config)
+        # FalkorDB index records: [label, property, type, entity_type]
+        rows = [
+            ['Entity', 'name_embedding', 'VECTOR', 'NODE'],
+            ['Entity', 'name', 'FULLTEXT', 'NODE'],
+        ]
+        graph = _make_graph_mock(rows)
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            result = await backend.list_indices()
+        assert len(result) == 2
+        assert result[0]['label'] == 'Entity'
+        assert result[0]['field'] == 'name_embedding'
+        assert result[0]['type'] == 'VECTOR'
+        assert result[0]['entity_type'] == 'NODE'
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_no_indices(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            result = await backend.list_indices()
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.list_indices()
+
+
+class TestDropIndex:
+    """GraphitiBackend.drop_index(label, field) generates correct DROP Cypher."""
+
+    @pytest.mark.asyncio
+    async def test_drop_index_calls_query(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.drop_index('Entity', 'name_embedding')
+        assert graph.query.called
+
+    @pytest.mark.asyncio
+    async def test_drop_index_cypher_contains_label_and_field(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.drop_index('MyLabel', 'my_field')
+        call_args = graph.query.call_args
+        cypher = call_args[0][0]
+        assert 'MyLabel' in cypher
+        assert 'my_field' in cypher
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.drop_index('Entity', 'name_embedding')
