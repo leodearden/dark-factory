@@ -666,3 +666,49 @@ class TestDepsSatisfied:
         task = {'id': '2', 'dependencies': [{'id': 1}]}
         status_map = {'1': 'in-progress', '2': 'pending'}
         assert scheduler._deps_satisfied(task, status_map) is False
+
+    def test_deps_satisfied_returns_true_when_dep_done(self, scheduler: Scheduler):
+        """_deps_satisfied returns True when all dependencies are done."""
+        task = {'id': '2', 'dependencies': [{'id': 1}]}
+        status_map = {'1': 'done', '2': 'pending'}
+        assert scheduler._deps_satisfied(task, status_map) is True
+
+    def test_deps_satisfied_returns_true_when_no_deps(self, scheduler: Scheduler):
+        """_deps_satisfied returns True when there are no dependencies."""
+        task = {'id': '1', 'dependencies': []}
+        status_map = {}
+        assert scheduler._deps_satisfied(task, status_map) is True
+
+
+class TestAcquireNextDependencyGating:
+    """acquire_next() must not dispatch tasks whose dependencies are not done."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_blocks_on_in_progress_dependency(
+        self, scheduler: Scheduler
+    ):
+        """acquire_next returns None when the only candidate's dep is in-progress."""
+        task_a = {
+            'id': 'A',
+            'title': 'Task A',
+            'status': 'in-progress',
+            'dependencies': [],
+            'metadata': {'modules': ['backend']},
+        }
+        task_b = {
+            'id': 'B',
+            'title': 'Task B',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}],
+            'metadata': {'modules': ['frontend']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        result = await scheduler.acquire_next()
+        # A is in-progress (not pending), B is blocked by A — neither can be dispatched
+        assert result is None
