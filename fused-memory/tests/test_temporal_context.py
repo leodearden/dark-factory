@@ -17,7 +17,6 @@ from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import MemoryService
 
-
 # ---------------------------------------------------------------------------
 # Fixtures shared across test classes
 # ---------------------------------------------------------------------------
