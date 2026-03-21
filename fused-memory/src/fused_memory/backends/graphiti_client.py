@@ -338,6 +338,33 @@ class GraphitiBackend:
         )
         await graph.query(cypher, {'uuid': uuid, 'embedding': embedding})
 
+    async def list_indices(self) -> list[dict]:
+        """Return parsed index records from the graph.
+
+        Each record is a dict with keys: label, field, type, entity_type.
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        result = await graph.query('CALL db.indexes()')
+        indices = []
+        for row in (result.result_set or []):
+            indices.append({
+                'label': row[0],
+                'field': row[1],
+                'type': row[2],
+                'entity_type': row[3],
+            })
+        return indices
+
+    async def drop_index(self, label: str, field: str) -> None:
+        """Drop an index on the given label and field (FalkorDB syntax)."""
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = f'DROP INDEX ON :{label}({field})'
+        await graph.query(cypher)
+
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
         client = self._require_client()
