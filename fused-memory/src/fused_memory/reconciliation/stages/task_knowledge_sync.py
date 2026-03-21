@@ -21,6 +21,9 @@ from fused_memory.reconciliation.stages.base import BaseStage
 class TaskKnowledgeSync(BaseStage):
     """Stage 2: Reconcile tasks against memory, attach hints, fix inconsistencies."""
 
+    # Remediation support — set by harness for second pass
+    remediation_mode: bool = False
+
     def get_system_prompt(self) -> str:
         return STAGE2_SYSTEM_PROMPT
 
@@ -55,10 +58,18 @@ class TaskKnowledgeSync(BaseStage):
             t for t in all_tasks if isinstance(t, dict) and t.get('status') == 'done'
         ]
 
+        remediation_note = ''
+        if self.remediation_mode:
+            remediation_note = (
+                '### Remediation Mode\n'
+                'This is a focused remediation run. Address remaining task-level issues '
+                'from Stage 1. Do not perform general task-knowledge sync.\n\n'
+            )
+
         return f"""## Stage 2: Task-Knowledge Sync
 ## Project: {self.project_id}
 
-### Stage 1 Report Summary
+{remediation_note}### Stage 1 Report Summary
 {_format_report(stage1_report)}
 
 ### Stage 1 Flagged Items (Task-Relevant)
@@ -146,7 +157,6 @@ def _format_report(report: StageReport | None) -> str:
         f'Stage: {report.stage.value}\n'
         f'Duration: {duration:.1f}s | LLM calls: {report.llm_calls} | '
         f'Tokens: {report.tokens_used}\n'
-        f'Actions taken: {len(report.actions_taken)}\n'
         f'Stats: {json.dumps(report.stats, default=str)}\n'
         f'Items flagged: {len(report.items_flagged)}'
     )

@@ -35,4 +35,27 @@ divergence between stores, or knowledge gaps.
 - Classify severity: minor (cosmetic mismatch), moderate (wrong information), \
 serious (fundamentally contradictory state).
 - When you have completed your work, produce your final structured report as your response.
+
+## Finding Classification (REQUIRED)
+Each finding in your report MUST include these fields:
+- `description`: What the inconsistency is, with specific IDs and evidence.
+- `severity`: One of "minor", "moderate", or "serious".
+- `actionable`: `true` if Stage 1/Stage 2 can fix it automatically (stale edges, duplicates, \
+contradictions, task mismatches); `false` if it needs human judgment.
+- `category`: One of: `memory_stale`, `memory_duplicate`, `memory_contradiction`, \
+`task_memory_mismatch`, `missing_knowledge`, `cross_store_inconsistency`, `systemic_pattern`, `other`.
+- `affected_ids`: List of memory IDs, entity names, or task IDs involved.
+- `suggested_action`: What the remediation stage should do to fix this finding.
+
+Example finding:
+```json
+{
+  "description": "Edge 'uses_framework→React' on entity 'project_alpha' last updated 2025-01, but project switched to Vue in 2025-09",
+  "severity": "moderate",
+  "actionable": true,
+  "category": "memory_stale",
+  "affected_ids": ["edge-abc123", "project_alpha"],
+  "suggested_action": "Delete stale edge 'uses_framework→React' and verify Vue edge exists"
+}
+```
 """

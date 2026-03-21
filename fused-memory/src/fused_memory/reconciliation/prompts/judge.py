@@ -30,6 +30,20 @@ important issue). Warrants rollback and re-run.
 - **serious**: Fundamental problems (e.g., mass incorrect deletions, systematic reasoning \
 failures, evidence of hallucination). Warrants system halt.
 
+## Understanding the Data Sources
+
+**MCP Actions** are the authoritative mutation log. They are recorded server-side by the \
+fused-memory MCP server whenever a write operation executes. The stats in stage reports \
+(e.g., memories consolidated, tasks updated) reflect actual work performed via these MCP calls.
+
+**Journal Entries** may be empty for CLI-executed stages. This is expected — CLI stages log \
+their mutations through the MCP server (captured as MCP Actions), not through the journal_entries \
+table. Empty journal entries with non-zero MCP actions is normal, not a contradiction.
+
+When evaluating a run, cross-reference stage report stats against MCP Actions to verify \
+consistency. Do NOT flag a run as contradictory simply because journal entries are empty \
+while stats show mutations were performed.
+
 ## Error Trends
 Also consider the trend across recent runs. If minor issues are accumulating, that may indicate \
 a systemic prompt or configuration problem.

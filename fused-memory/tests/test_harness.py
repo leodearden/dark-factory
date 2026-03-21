@@ -11,6 +11,8 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
+    ReconciliationRun,
+    StageReport,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -214,7 +216,6 @@ async def test_full_cycle_extracts_project_root_from_events(journal, event_buffe
                 stage=_s.stage_id,
                 started_at=datetime.now(UTC),
                 completed_at=datetime.now(UTC),
-                actions_taken=[],
                 items_flagged=[],
                 stats={},
                 llm_calls=0,
@@ -229,3 +230,293 @@ async def test_full_cycle_extracts_project_root_from_events(journal, event_buffe
     for stage_state in captured_stages:
         assert stage_state['project_id'] == 'dark_factory'
         assert stage_state['project_root'] == '/home/leo/src/dark-factory'
+
+
+# ── Tests for Task 74: Stage 3 findings feedback loop ────────────────
+
+
+def _make_s3_findings():
+    """Return a mix of actionable and non-actionable Stage 3 findings."""
+    return [
+        {
+            'description': 'Stale edge: uses_framework→React on project_alpha',
+            'severity': 'moderate',
+            'actionable': True,
+            'category': 'memory_stale',
+            'affected_ids': ['edge-abc123', 'project_alpha'],
+            'suggested_action': 'Delete stale edge',
+        },
+        {
+            'description': 'Contradictory edges on deploy_target',
+            'severity': 'serious',
+            'actionable': True,
+            'category': 'memory_contradiction',
+            'affected_ids': ['edge-def456'],
+            'suggested_action': 'Delete older contradictory edge',
+        },
+        {
+            'description': 'Systemic pattern: growing divergence between stores',
+            'severity': 'moderate',
+            'actionable': False,
+            'category': 'systemic_pattern',
+            'affected_ids': [],
+            'suggested_action': 'Requires human review of store sync strategy',
+        },
+    ]
+
+
+def _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service):
+    """Build a harness with all stages mocked to return StageReports."""
+    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+    from fused_memory.reconciliation.harness import ReconciliationHarness
+
+    config = FusedMemoryConfig(
+        reconciliation=ReconciliationConfig(
+            enabled=True,
+            explore_codebase_root='/tmp/test',
+            agent_llm_provider='anthropic',
+            agent_llm_model='claude-sonnet-4-20250514',
+        )
+    )
+
+    return ReconciliationHarness(
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        journal=journal,
+        event_buffer=event_buffer,
+        config=config,
+    )
+
+
+def _mock_stage_run(stage, items_flagged=None):
+    """Replace stage.run with a mock that returns a StageReport."""
+    async def mock_run(events, watermark, prior_reports, run_id, model=None, _s=stage):
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=items_flagged or [],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+    stage.run = mock_run
+
+
+@pytest.mark.asyncio
+async def test_finding_partition_actionable_vs_non_actionable():
+    """Partition logic: actionable findings trigger remediation, non-actionable get escalated."""
+    findings = _make_s3_findings()
+    actionable = [f for f in findings if f.get('actionable', False)]
+    non_actionable = [f for f in findings if not f.get('actionable', False)]
+    assert len(actionable) == 2
+    assert len(non_actionable) == 1
+    assert non_actionable[0]['category'] == 'systemic_pattern'
+
+
+@pytest.mark.asyncio
+async def test_remediation_payload_assembly():
+    """MemoryConsolidator produces findings-only payload in remediation mode."""
+    from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+    stage = MemoryConsolidator.__new__(MemoryConsolidator)
+    stage.project_id = 'test-project'
+    stage.remediation_findings = _make_s3_findings()[:2]  # actionable only
+    stage.prior_s3_findings = None
+
+    payload = stage._assemble_remediation_payload()
+    assert 'Remediation Run' in payload
+    assert 'Targeted Memory Fixes' in payload
+    assert 'Stale edge' in payload
+    assert 'Contradictory edges' in payload
+    assert 'Do NOT perform general consolidation' in payload
+
+
+@pytest.mark.asyncio
+async def test_normal_payload_includes_prior_s3_findings(mock_memory_service):
+    """Normal assemble_payload includes prior S3 findings section when set."""
+    from fused_memory.models.reconciliation import StageId, Watermark
+    from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+    stage = MemoryConsolidator(
+        StageId.memory_consolidator,
+        mock_memory_service,
+        None,
+        AsyncMock(),
+        AsyncMock(),
+    )
+    stage.project_id = 'test-project'
+    stage.prior_s3_findings = [_make_s3_findings()[0]]
+
+    watermark = Watermark(project_id='test-project')
+    payload = await stage.assemble_payload([], watermark, [])
+
+    assert 'Prior Stage 3 Findings' in payload
+    assert 'Stale edge' in payload
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_triggers_remediation(journal, event_buffer, mock_memory_service):
+    """Full cycle with S3 actionable findings triggers a remediation pass."""
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+
+    s3_findings = _make_s3_findings()
+
+    # Mock stages: S1 and S2 return empty reports, S3 returns findings
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=s3_findings)
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+    assert run.status == 'completed'
+
+    # Verify remediation run was created
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    assert len(recent_runs) == 2  # parent + remediation
+
+    remediation_run = next(r for r in recent_runs if r.run_type == 'remediation')
+    assert remediation_run.triggered_by == run.id
+    assert remediation_run.events_processed == 0
+    assert remediation_run.status == 'completed'
+
+
+@pytest.mark.asyncio
+async def test_remediation_does_not_run_without_actionable_findings(
+    journal, event_buffer, mock_memory_service,
+):
+    """No remediation pass when S3 has only non-actionable findings."""
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+    await event_buffer.push(_make_event())
+
+    non_actionable_only = [
+        {
+            'description': 'Needs human review',
+            'severity': 'moderate',
+            'actionable': False,
+            'category': 'systemic_pattern',
+            'affected_ids': [],
+            'suggested_action': 'Human review needed',
+        },
+    ]
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=non_actionable_only)
+
+    await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    assert len(recent_runs) == 1  # Only the parent run, no remediation
+
+
+@pytest.mark.asyncio
+async def test_remediation_failure_does_not_fail_parent(
+    journal, event_buffer, mock_memory_service,
+):
+    """If remediation pass fails, parent run remains completed."""
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+    await event_buffer.push(_make_event())
+
+    s3_findings = _make_s3_findings()
+
+    # Track call count to distinguish parent vs remediation stages
+    call_count = {'s1': 0}
+
+    async def s1_run_that_fails_on_second(events, watermark, prior_reports, run_id, model=None):
+        call_count['s1'] += 1
+        if call_count['s1'] == 2:  # Remediation pass
+            raise RuntimeError('remediation exploded')
+        return StageReport(
+            stage=harness.stages[0].stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[], stats={},
+            llm_calls=0, tokens_used=0,
+        )
+
+    harness.stages[0].run = s1_run_that_fails_on_second
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=s3_findings)
+
+    # Should NOT raise — remediation failure is swallowed
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert run.status == 'completed'
+
+    # Remediation run should be marked failed
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    remediation_run = next((r for r in recent_runs if r.run_type == 'remediation'), None)
+    assert remediation_run is not None
+    assert remediation_run.status == 'failed'
+
+
+@pytest.mark.asyncio
+async def test_journal_triggered_by_roundtrip(journal):
+    """triggered_by field persists through start_run/get_run/get_recent_runs."""
+    parent_id = str(uuid.uuid4())
+    child_id = str(uuid.uuid4())
+
+    parent_run = ReconciliationRun(
+        id=parent_id,
+        project_id='test-project',
+        run_type='full',
+        trigger_reason='buffer_size:5',
+        started_at=datetime.now(UTC),
+        events_processed=5,
+        status='completed',
+    )
+    await journal.start_run(parent_run)
+
+    child_run = ReconciliationRun(
+        id=child_id,
+        project_id='test-project',
+        run_type='remediation',
+        trigger_reason='integrity_findings:2',
+        started_at=datetime.now(UTC),
+        events_processed=0,
+        status='running',
+        triggered_by=parent_id,
+    )
+    await journal.start_run(child_run)
+
+    loaded = await journal.get_run(child_id)
+    assert loaded is not None
+    assert loaded.triggered_by == parent_id
+
+    recent = await journal.get_recent_runs('test-project', limit=5)
+    child_from_recent = next(r for r in recent if r.id == child_id)
+    assert child_from_recent.triggered_by == parent_id
+
+    parent_from_recent = next(r for r in recent if r.id == parent_id)
+    assert parent_from_recent.triggered_by is None
+
+
+@pytest.mark.asyncio
+async def test_stage_state_reset_after_remediation(journal, event_buffer, mock_memory_service):
+    """Stage state (remediation_findings, remediation_mode) is reset after remediation."""
+    from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+    from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+    await event_buffer.push(_make_event())
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=_make_s3_findings())
+
+    await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    # Verify state was cleaned up
+    stage1 = harness.stages[0]
+    stage2 = harness.stages[1]
+    assert isinstance(stage1, MemoryConsolidator)
+    assert isinstance(stage2, TaskKnowledgeSync)
+    assert stage1.remediation_findings is None
+    assert stage1.prior_s3_findings is None
+    assert stage2.remediation_mode is False

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import traceback
 from contextlib import suppress
@@ -185,7 +186,7 @@ class ReconciliationHarness:
                 id=queue.make_id(f'recon-{run_id[:8]}'),
                 task_id=f'recon-{run_id[:8]}',
                 agent_role='reconciliation-harness',
-                severity='info' if category == 'recon_stale_run' else 'blocking',
+                severity='info' if category in ('recon_stale_run', 'recon_integrity_issue') else 'blocking',
                 category=category,
                 summary=summary,
                 detail=detail,
@@ -356,6 +357,9 @@ class ReconciliationHarness:
                 project_root = pr
                 break
 
+        # Load prior S3 findings from last completed run (backstop for normal pass)
+        prior_s3_findings = await self._get_prior_s3_findings(project_id)
+
         current_stage_name: str | None = None
         try:
             reports = []
@@ -364,10 +368,11 @@ class ReconciliationHarness:
                 stage.project_id = project_id
                 stage.project_root = project_root
 
-                # Apply tier limits to Stage 1
+                # Apply tier limits and prior S3 findings to Stage 1
                 if isinstance(stage, MemoryConsolidator):
                     stage.episode_limit = tier.episode_limit
                     stage.memory_limit = tier.memory_limit
+                    stage.prior_s3_findings = prior_s3_findings
 
                 report = await stage.run(
                     events, watermark, reports, run_id, model=tier.model,
@@ -390,6 +395,9 @@ class ReconciliationHarness:
             # Async judge review
             if self.judge:
                 asyncio.create_task(self._run_judge(run_id))
+
+            # Remediation pass: extract S3 findings and trigger second pass
+            await self._maybe_remediate(project_id, project_root, run_id, run, tier)
 
             logger.info(
                 'reconciliation.run_completed',
@@ -419,6 +427,197 @@ class ReconciliationHarness:
             raise
         finally:
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+            # Reset prior_s3_findings to prevent leaking into next cycle
+            for stage in self.stages:
+                if isinstance(stage, MemoryConsolidator):
+                    stage.prior_s3_findings = None
+
+    # ── Remediation support ───────────────────────────────────────────
+
+    async def _get_prior_s3_findings(self, project_id: str) -> list[dict] | None:
+        """Extract S3 findings from the last completed run's stage reports."""
+        try:
+            recent = await self.journal.get_recent_runs(project_id, limit=3)
+            for r in recent:
+                if r.status != 'completed':
+                    continue
+                s3_report = r.stage_reports.get('integrity_check')
+                if s3_report is None:
+                    continue
+                if isinstance(s3_report, dict):
+                    items = s3_report.get('items_flagged', [])
+                else:
+                    items = s3_report.items_flagged
+                if items:
+                    return items
+        except Exception as e:
+            logger.warning(f'Failed to load prior S3 findings: {e}')
+        return None
+
+    async def _maybe_remediate(
+        self,
+        project_id: str,
+        project_root: str,
+        parent_run_id: str,
+        parent_run: ReconciliationRun,
+        tier: TierConfig,
+    ) -> None:
+        """Extract Stage 3 findings from the parent run and trigger remediation if needed."""
+        try:
+            s3_report = parent_run.stage_reports.get('integrity_check')
+            if s3_report is None:
+                return
+
+            if isinstance(s3_report, dict):
+                all_findings = s3_report.get('items_flagged', [])
+            else:
+                all_findings = s3_report.items_flagged
+
+            if not all_findings:
+                return
+
+            # Partition into actionable vs escalation
+            actionable = [f for f in all_findings if f.get('actionable', False)]
+            non_actionable = [f for f in all_findings if not f.get('actionable', False)]
+
+            # Escalate non-actionable findings immediately
+            for finding in non_actionable:
+                self._escalate(
+                    'recon_integrity_issue',
+                    parent_run_id,
+                    f'Non-actionable integrity finding: {finding.get("description", "?")}',
+                    detail=json.dumps(finding, default=str),
+                )
+
+            if not actionable:
+                return
+
+            logger.info(
+                f'Remediation: {len(actionable)} actionable findings from run {parent_run_id}, '
+                f'triggering second pass'
+            )
+            await self._run_remediation_pass(
+                project_id, project_root, parent_run_id, actionable, tier,
+            )
+        except Exception as e:
+            logger.error(f'Remediation check failed for run {parent_run_id}: {e}')
+            self._escalate(
+                'recon_integrity_issue',
+                parent_run_id,
+                f'Remediation orchestration failed: {e}',
+            )
+
+    async def _run_remediation_pass(
+        self,
+        project_id: str,
+        project_root: str,
+        parent_run_id: str,
+        findings: list[dict],
+        tier: TierConfig,
+    ) -> None:
+        """Run a focused S1→S2→S3 pass to remediate actionable findings."""
+        run_id = str(uuid4())
+        run = ReconciliationRun(
+            id=run_id,
+            project_id=project_id,
+            run_type='remediation',
+            trigger_reason=f'integrity_findings:{len(findings)}',
+            started_at=datetime.now(UTC),
+            events_processed=0,
+            status='running',
+            triggered_by=parent_run_id,
+        )
+        await self.journal.start_run(run)
+
+        logger.info(
+            'reconciliation.remediation_started',
+            extra={
+                'run_id': run_id,
+                'parent_run_id': parent_run_id,
+                'project_id': project_id,
+                'findings_count': len(findings),
+            },
+        )
+
+        current_stage_name: str | None = None
+        try:
+            # Configure stages for remediation mode
+            stage1 = self.stages[0]
+            stage2 = self.stages[1]
+            assert isinstance(stage1, MemoryConsolidator)
+            assert isinstance(stage2, TaskKnowledgeSync)
+            stage1.remediation_findings = findings
+            stage2.remediation_mode = True
+
+            watermark = await self.journal.get_watermark(project_id)
+            reports = []
+            for stage in self.stages:
+                current_stage_name = stage.stage_id.value
+                stage.project_id = project_id
+                stage.project_root = project_root
+
+                report = await stage.run(
+                    [], watermark, reports, run_id, model=tier.model,
+                )
+                reports.append(report)
+                run.stage_reports[stage.stage_id.value] = report
+
+            # Do NOT update watermark — remediation processed no new episodes/events
+
+            run.completed_at = datetime.now(UTC)
+            run.status = 'completed'
+            await self.journal.complete_run(run_id, 'completed')
+
+            # Judge review for remediation run
+            if self.judge:
+                asyncio.create_task(self._run_judge(run_id))
+
+            # After second-pass S3: escalate ALL remaining findings (never a third pass)
+            s3_report = run.stage_reports.get('integrity_check')
+            if s3_report is not None:
+                if isinstance(s3_report, dict):
+                    remaining = s3_report.get('items_flagged', [])
+                else:
+                    remaining = s3_report.items_flagged
+                for finding in remaining:
+                    self._escalate(
+                        'recon_integrity_issue',
+                        run_id,
+                        f'Unresolved after remediation: {finding.get("description", "?")}',
+                        detail=json.dumps(finding, default=str),
+                    )
+
+            logger.info(
+                'reconciliation.remediation_completed',
+                extra={'run_id': run_id, 'parent_run_id': parent_run_id},
+            )
+
+        except Exception as e:
+            run.status = 'failed'
+            run.stage_reports['_error'] = {
+                'error_type': type(e).__name__,
+                'error_message': str(e),
+                'failed_stage': current_stage_name,
+            }
+            await self.journal.complete_run(run_id, 'failed')
+            # Do NOT re-raise — parent run already completed
+            # Do NOT restore events — there are none
+            logger.error(f'Remediation pass failed: {e}')
+            self._escalate(
+                'recon_integrity_issue',
+                run_id,
+                f'Remediation pass failed at {current_stage_name}: {e}',
+            )
+
+        finally:
+            await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+            # Reset stage state to prevent leaking into next cycle
+            for stage in self.stages:
+                if isinstance(stage, MemoryConsolidator):
+                    stage.remediation_findings = None
+                    stage.prior_s3_findings = None
+                if isinstance(stage, TaskKnowledgeSync):
+                    stage.remediation_mode = False
 
 
 # ── Backlog iteration ──────────────────────────────────────────────────

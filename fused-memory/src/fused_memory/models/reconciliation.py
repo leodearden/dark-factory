@@ -68,7 +68,6 @@ class StageReport(BaseModel):
     stage: StageId
     started_at: datetime
     completed_at: datetime
-    actions_taken: list[dict] = Field(default_factory=list)
     items_flagged: list[dict] = Field(default_factory=list)
     stats: dict = Field(default_factory=dict)
     llm_calls: int = 0
@@ -87,6 +86,7 @@ class ReconciliationRun(BaseModel):
     events_processed: int = 0
     stage_reports: dict[str, StageReport | dict] = Field(default_factory=dict)
     status: str = 'running'  # 'running', 'completed', 'failed', 'rolled_back', 'circuit_breaker'
+    triggered_by: str | None = None  # parent run_id for remediation runs
 
 
 class MemoryHints(BaseModel):

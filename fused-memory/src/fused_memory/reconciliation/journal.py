@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS runs (
     completed_at TEXT,
     events_processed INTEGER DEFAULT 0,
     stage_reports TEXT DEFAULT '{}',
-    status TEXT DEFAULT 'running'
+    status TEXT DEFAULT 'running',
+    triggered_by TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
@@ -143,6 +144,14 @@ class ReconciliationJournal:
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(SCHEMA_SQL)
         await self._db.commit()
+
+        # Safe migration: add triggered_by column to existing DBs
+        try:
+            await self._db.execute('ALTER TABLE runs ADD COLUMN triggered_by TEXT')
+            await self._db.commit()
+        except Exception:
+            pass  # Column already exists
+
         logger.info(f'Reconciliation journal initialized at {db_path}')
 
     async def close(self) -> None:
@@ -205,8 +214,8 @@ class ReconciliationJournal:
         await db.execute(
             """INSERT INTO runs
                (id, project_id, run_type, trigger_reason, started_at,
-                events_processed, stage_reports, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                events_processed, stage_reports, status, triggered_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run.id,
                 run.project_id,
@@ -216,6 +225,7 @@ class ReconciliationJournal:
                 run.events_processed,
                 json.dumps({}),
                 run.status,
+                run.triggered_by,
             ),
         )
         await db.commit()
@@ -264,6 +274,7 @@ class ReconciliationJournal:
             events_processed=row['events_processed'],
             stage_reports=stage_reports,
             status=row['status'],
+            triggered_by=row['triggered_by'],
         )
 
     async def get_recent_runs(
@@ -295,6 +306,7 @@ class ReconciliationJournal:
                     events_processed=row['events_processed'],
                     stage_reports=stage_reports,
                     status=row['status'],
+                    triggered_by=row['triggered_by'],
                 )
             )
         return runs
@@ -435,6 +447,7 @@ class ReconciliationJournal:
                     events_processed=row['events_processed'],
                     stage_reports=stage_reports,
                     status=row['status'],
+                    triggered_by=row['triggered_by'],
                 )
             )
         return runs

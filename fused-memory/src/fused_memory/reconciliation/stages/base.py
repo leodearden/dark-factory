@@ -117,7 +117,6 @@ class BaseStage:
             stage=self.stage_id,
             started_at=started,
             completed_at=completed,
-            actions_taken=[],  # Per-tool journaling replaced by MCP server logs
             items_flagged=report_data.get('flagged_items', []),
             stats=report_data.get('stats', {}),
             llm_calls=stage_result.llm_calls,

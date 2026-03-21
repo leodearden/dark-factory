@@ -25,6 +25,10 @@ class MemoryConsolidator(BaseStage):
     episode_limit: int = 500
     memory_limit: int = 1000
 
+    # Remediation support — set by harness for second pass
+    remediation_findings: list[dict] | None = None
+    prior_s3_findings: list[dict] | None = None
+
     def get_system_prompt(self) -> str:
         return STAGE1_SYSTEM_PROMPT
 
@@ -37,6 +41,10 @@ class MemoryConsolidator(BaseStage):
         watermark: Watermark,
         prior_reports: list[StageReport],
     ) -> str:
+        # Remediation mode: return focused payload with findings only
+        if self.remediation_findings is not None:
+            return self._assemble_remediation_payload()
+
         # 1. Episodes since last reconciliation
         try:
             episodes = await self.memory.get_episodes(
@@ -78,7 +86,17 @@ class MemoryConsolidator(BaseStage):
         # 4. Events summary
         event_summary = _format_events(events)
 
-        # 5. Format
+        # 5. Prior S3 findings (backstop from last completed run)
+        prior_s3_section = ''
+        if self.prior_s3_findings:
+            prior_s3_section = (
+                f'\n### Prior Stage 3 Findings ({len(self.prior_s3_findings)})\n'
+                f'These issues were found in the last integrity check and should be addressed '
+                f'during this consolidation pass if possible.\n'
+                f'{_format_findings(self.prior_s3_findings)}\n'
+            )
+
+        # 6. Format
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}
 
@@ -96,7 +114,7 @@ class MemoryConsolidator(BaseStage):
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-
+{prior_s3_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -104,6 +122,25 @@ Review the above data and perform memory consolidation:
 3. Cross-store: check for contradictions between stores. Promote solidified patterns.
 4. Flag any items that are relevant to task planning for Stage 2.
 5. When you have completed your work, produce your final structured report as your response.
+
+Always pass project_id="{self.project_id}" when calling fused-memory MCP tools.
+"""
+
+    def _assemble_remediation_payload(self) -> str:
+        """Focused payload for remediation runs — findings only, no full data."""
+        findings = self.remediation_findings or []
+        return f"""## Remediation Run — Stage 1: Targeted Memory Fixes
+## Project: {self.project_id}
+
+### Actionable Findings to Remediate ({len(findings)})
+{_format_findings(findings)}
+
+## Your Task
+This is a focused remediation run. Address ONLY the specific findings listed above:
+1. For each finding: investigate the affected IDs, apply the suggested action, verify the fix.
+2. If a finding cannot be resolved, flag it for Stage 2 with an explanation.
+3. Do NOT perform general consolidation — only fix the listed findings.
+4. Report each finding's resolution status in your structured report.
 
 Always pass project_id="{self.project_id}" when calling fused-memory MCP tools.
 """
@@ -137,6 +174,24 @@ def _format_memories(memories: list[dict]) -> str:
         meta = m.get('metadata', {}) or {}
         cat = meta.get('category', '?')
         lines.append(f'- [{m.get("id", "?")}] ({cat}): {content}')
+    return '\n'.join(lines)
+
+
+def _format_findings(findings: list[dict]) -> str:
+    if not findings:
+        return 'No findings.'
+    lines = []
+    for i, f in enumerate(findings, 1):
+        desc = f.get('description', '?')
+        severity = f.get('severity', '?')
+        category = f.get('category', '?')
+        action = f.get('suggested_action', '?')
+        affected = f.get('affected_ids', [])
+        lines.append(
+            f'{i}. [{severity}/{category}] {desc}\n'
+            f'   Affected: {affected}\n'
+            f'   Suggested action: {action}'
+        )
     return '\n'.join(lines)
 
 

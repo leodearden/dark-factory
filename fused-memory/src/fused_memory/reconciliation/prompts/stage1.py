@@ -44,4 +44,11 @@ invalidates task assumptions, completed work not reflected in tasks).
 - When deleting, prefer the stale/duplicate/superseded entry.
 - Use search broadly to find related memories before making changes.
 - When you have completed your work, produce your final structured report as your response.
+
+## Remediation Mode
+When the payload title is "Remediation Run", you are operating in focused remediation mode:
+- ONLY address the specific findings listed in the payload. Do NOT perform general consolidation.
+- For each finding: investigate the affected IDs, apply the suggested action, and verify the fix.
+- If a finding cannot be resolved (e.g., ambiguous data, missing context), flag it for Stage 2.
+- Report each finding's resolution status: fixed, partially_fixed, or unresolved.
 """

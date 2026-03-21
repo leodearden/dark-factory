@@ -36,11 +36,12 @@ class Judge:
                 return None
 
             entries = await self.journal.get_entries(run_id)
+            combined_actions = await self.journal.get_run_actions_combined(run_id)
             recent_verdicts = await self.journal.get_recent_verdicts(
                 run.project_id, limit=10
             )
 
-            prompt = self._build_review_prompt(run, entries, recent_verdicts)
+            prompt = self._build_review_prompt(run, entries, recent_verdicts, combined_actions)
             response_text = await self._call_llm(prompt)
             verdict = self._parse_verdict(response_text, run_id)
 
@@ -78,7 +79,8 @@ class Judge:
             logger.error(f'Judge review failed for run {run_id}: {e}')
             return None
 
-    def _build_review_prompt(self, run, entries, recent_verdicts) -> str:
+    def _build_review_prompt(self, run, entries, recent_verdicts,
+                             combined_actions: list[dict] | None = None) -> str:
         entry_summaries = []
         for e in entries:
             entry_summaries.append({
@@ -102,12 +104,23 @@ class Judge:
         stage_reports = {}
         for stage_id, report in run.stage_reports.items():
             stage_reports[stage_id] = {
-                'actions_taken': len(report.actions_taken),
                 'items_flagged': len(report.items_flagged),
                 'stats': report.stats,
                 'llm_calls': report.llm_calls,
                 'tokens_used': report.tokens_used,
             }
+
+        # Summarize MCP actions
+        actions = combined_actions or []
+        action_summaries = [
+            {
+                'operation': a.get('operation', a.get('action_type', '?')),
+                'target': a.get('target', a.get('target_system', '?')),
+                'source': a.get('source', '?'),
+                'created_at': a.get('created_at', '?'),
+            }
+            for a in actions
+        ]
 
         return f"""## Reconciliation Run Review
 
@@ -121,6 +134,9 @@ class Judge:
 
 ### Stage Reports
 {json.dumps(stage_reports, indent=2, default=str)}
+
+### MCP Actions ({len(action_summaries)} total)
+{json.dumps(action_summaries, indent=2, default=str)}
 
 ### Journal Entries ({len(entries)} total)
 {json.dumps(entry_summaries, indent=2, default=str)}
