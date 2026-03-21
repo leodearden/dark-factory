@@ -251,6 +251,7 @@ class TestPerStageReportSchema:
     @pytest.fixture
     def mock_deps(self):
         from unittest.mock import AsyncMock
+
         from fused_memory.config.schema import ReconciliationConfig
         config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
         return {

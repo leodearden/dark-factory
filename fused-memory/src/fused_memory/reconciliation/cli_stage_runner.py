@@ -226,12 +226,11 @@ def _normalize_report(report: dict) -> dict:
     findings = report.get('findings')
     flagged = report.get('flagged_items')
 
-    if findings is not None:
-        if flagged is None or (isinstance(flagged, list) and len(flagged) == 0):
-            # Remap findings → flagged_items
-            report = dict(report)
-            report['flagged_items'] = findings
-            report.pop('findings', None)
+    if findings is not None and (flagged is None or (isinstance(flagged, list) and len(flagged) == 0)):
+        # Remap findings → flagged_items
+        report = dict(report)
+        report['flagged_items'] = findings
+        report.pop('findings', None)
 
     # Filter placeholder findings
     raw_items = report.get('flagged_items', [])
