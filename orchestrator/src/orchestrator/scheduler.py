@@ -398,6 +398,11 @@ class Scheduler:
         if task_id in self._module_cache:
             return self._module_cache[task_id]
         metadata = task.get('metadata', {})
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (json.JSONDecodeError, TypeError):
+                pass
         if isinstance(metadata, dict):
             # Prefer file-derived modules (most accurate)
             files = metadata.get('files', [])
