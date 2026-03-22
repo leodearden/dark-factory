@@ -150,3 +150,84 @@ class TestBulkRemoveEdges:
         args, kwargs = call_args
         cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
         assert cypher_params.get('uuids') == uuids
+
+
+# ---------------------------------------------------------------------------
+# step-5: CleanupManager and CleanupResult
+# ---------------------------------------------------------------------------
+
+class TestCleanupManager:
+    """CleanupManager orchestrates find_stale_edges + bulk_remove_edges."""
+
+    @pytest.mark.asyncio
+    async def test_find_stale_edges_delegates_to_backend(self, mock_config):
+        from fused_memory.maintenance.cleanup_stale_edges import CleanupManager
+
+        backend = _make_backend(mock_config)
+        backend.query_edges_by_time_range = AsyncMock(return_value=[
+            {'uuid': 'u1', 'fact': 'f1', 'name': 'n1', 'valid_at': '2026-03-22T17:51:00', 'invalid_at': None},
+        ])
+        manager = CleanupManager(backend)
+        result = await manager.find_stale_edges(
+            start='2026-03-22T17:50:00', end='2026-03-22T18:15:00'
+        )
+        backend.query_edges_by_time_range.assert_awaited_once_with(
+            start='2026-03-22T17:50:00', end='2026-03-22T18:15:00'
+        )
+        assert len(result) == 1
+        assert result[0]['uuid'] == 'u1'
+
+    @pytest.mark.asyncio
+    async def test_cleanup_queries_and_deletes(self, mock_config):
+        from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult
+
+        edge_details = [
+            {'uuid': 'u1', 'fact': 'f1', 'name': 'n1', 'valid_at': '2026-03-22T17:51:00', 'invalid_at': None},
+            {'uuid': 'u2', 'fact': 'f2', 'name': 'n2', 'valid_at': '2026-03-22T18:00:00', 'invalid_at': None},
+        ]
+        backend = _make_backend(mock_config)
+        backend.query_edges_by_time_range = AsyncMock(return_value=edge_details)
+        backend.bulk_remove_edges = AsyncMock(return_value=2)
+        manager = CleanupManager(backend)
+        result = await manager.cleanup(
+            start='2026-03-22T17:50:00', end='2026-03-22T18:15:00'
+        )
+        assert isinstance(result, CleanupResult)
+        assert result.edges_found == 2
+        assert result.edges_deleted == 2
+        backend.bulk_remove_edges.assert_awaited_once_with(['u1', 'u2'])
+
+    @pytest.mark.asyncio
+    async def test_dry_run_queries_but_does_not_delete(self, mock_config):
+        from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult
+
+        edge_details = [
+            {'uuid': 'u1', 'fact': 'f1', 'name': 'n1', 'valid_at': '2026-03-22T17:51:00', 'invalid_at': None},
+        ]
+        backend = _make_backend(mock_config)
+        backend.query_edges_by_time_range = AsyncMock(return_value=edge_details)
+        backend.bulk_remove_edges = AsyncMock(return_value=0)
+        manager = CleanupManager(backend)
+        result = await manager.cleanup(
+            start='2026-03-22T17:50:00', end='2026-03-22T18:15:00', dry_run=True
+        )
+        assert isinstance(result, CleanupResult)
+        assert result.edges_found == 1
+        assert result.edges_deleted == 0
+        backend.bulk_remove_edges.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_empty_result(self, mock_config):
+        from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult
+
+        backend = _make_backend(mock_config)
+        backend.query_edges_by_time_range = AsyncMock(return_value=[])
+        backend.bulk_remove_edges = AsyncMock(return_value=0)
+        manager = CleanupManager(backend)
+        result = await manager.cleanup(
+            start='2026-03-22T17:50:00', end='2026-03-22T18:15:00'
+        )
+        assert isinstance(result, CleanupResult)
+        assert result.edges_found == 0
+        assert result.edges_deleted == 0
+        backend.bulk_remove_edges.assert_not_called()
