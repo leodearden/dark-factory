@@ -557,3 +557,44 @@ async def test_trigger_reconciliation_without_taskmaster_returns_not_configured(
     assert isinstance(result, dict)
     assert 'error' in result
     assert 'not configured' in result['error'].lower()
+
+
+# ------------------------------------------------------------------
+# error_type in exception handler responses
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_exception_includes_error_type(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """When set_task_status interceptor raises RuntimeError, result includes error_type='RuntimeError'."""
+    task_interceptor.set_task_status = AsyncMock(
+        side_effect=RuntimeError('backend unavailable')
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'set_task_status',
+        {'id': '1', 'project_root': '/project', 'status': 'done'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert 'backend unavailable' in result['error']
+    assert result.get('error_type') == 'RuntimeError'
+
+
+@pytest.mark.asyncio
+async def test_update_task_exception_includes_error_type(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """When update_task interceptor raises ValueError, result includes error_type='ValueError'."""
+    task_interceptor.update_task = AsyncMock(
+        side_effect=ValueError('invalid field')
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': '/project'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert 'invalid field' in result['error']
+    assert result.get('error_type') == 'ValueError'
