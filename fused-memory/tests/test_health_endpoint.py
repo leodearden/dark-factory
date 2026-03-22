@@ -381,12 +381,6 @@ async def test_delete_memory_rejects_invalid_store(mcp_server):
 @pytest.mark.asyncio
 async def test_delete_memory_valid_store_passes_through(mcp_server):
     """delete_memory with a valid store passes through to the service."""
-    mcp_server._tool_manager  # ensure initialized
-    # Patch the memory service to return a success dict
-    from unittest.mock import AsyncMock
-    result_mock = {'deleted': True}
-    # Access the server's underlying service mock via the closure
-    # The mcp_server fixture uses AsyncMock for the service
     # We just confirm no validation error is returned for valid stores
     for valid_store in ('graphiti', 'mem0'):
         result = await mcp_server._tool_manager.call_tool(
@@ -446,7 +440,7 @@ async def test_add_memory_valid_category_passes_through(mcp_server):
             {'content': 'fact', 'project_id': 'proj', 'category': valid_cat},
         )
         if isinstance(result, dict) and 'error' in result:
-            assert 'ValidationError' != result.get('error_type'), (
+            assert result.get('error_type') != 'ValidationError', (
                 f'Unexpected validation error for category={valid_cat!r}: {result}'
             )
 
