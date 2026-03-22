@@ -165,19 +165,21 @@ class TestRunType:
     def test_values(self):
         from fused_memory.models.reconciliation import RunType
 
-        assert set(RunType) == {RunType.full, RunType.targeted}
+        assert set(RunType) == {RunType.full, RunType.targeted, RunType.remediation}
 
     def test_string_equality(self):
         from fused_memory.models.reconciliation import RunType
 
         assert RunType.full == 'full'
         assert RunType.targeted == 'targeted'
+        assert RunType.remediation == 'remediation'
 
     def test_construction_from_string(self):
         from fused_memory.models.reconciliation import RunType
 
         assert RunType('full') == RunType.full
         assert RunType('targeted') == RunType.targeted
+        assert RunType('remediation') == RunType.remediation
 
     def test_invalid_raises(self):
         from fused_memory.models.reconciliation import RunType
@@ -323,6 +325,12 @@ class TestReconciliationRunCoercion:
         run = self._make_run(status='completed')
         assert run.status == RunStatus.completed
         assert isinstance(run.status, RunStatus)
+
+    def test_run_type_remediation_coerces(self):
+        from fused_memory.models.reconciliation import RunType
+
+        run = self._make_run(run_type='remediation')
+        assert run.run_type == RunType.remediation
 
     def test_invalid_run_type_raises(self):
         with pytest.raises(ValidationError):
