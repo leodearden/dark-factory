@@ -36,6 +36,7 @@ class TaskInterceptor:
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
         self.buffer = event_buffer
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def _ensure_taskmaster(self) -> TaskmasterBackend:
         """Return a connected TaskmasterBackend, or raise with a structured error."""
@@ -80,9 +81,13 @@ class TaskInterceptor:
         # 1. Get before-state
         before = await tm.get_task(task_id, project_root, tag)
 
-        # 2. Terminal state guard (defense in depth)
-        _TERMINAL = frozenset({'done', 'cancelled'})
+        # 2. Same-status guard: no-op if nothing changed
         old_status = _extract_status(before)
+        if status == old_status:
+            return {'success': True, 'no_op': True, 'task_id': task_id}
+
+        # 3. Terminal state guard (defense in depth)
+        _TERMINAL = frozenset({'done', 'cancelled'})
         if old_status in _TERMINAL and status != old_status:
             logger.warning(
                 'Task %s: rejecting %s->%s (terminal state)', task_id, old_status, status
@@ -93,10 +98,10 @@ class TaskInterceptor:
                 'task_id': task_id,
             }
 
-        # 3. Execute status change
+        # 4. Execute status change
         result = await tm.set_task_status(task_id, status, project_root, tag)
 
-        # 4. Emit event
+        # 5. Emit event
         event = self._make_event(
             EventType.task_status_changed,
             project_root,
@@ -104,7 +109,7 @@ class TaskInterceptor:
         )
         await self.buffer.push(event)
 
-        # 4. Targeted reconciliation for trigger statuses (fire-and-forget)
+        # 6. Targeted reconciliation for trigger statuses (fire-and-forget)
         if status in self.STATUS_TRIGGERS and self.reconciler:
             task = asyncio.create_task(
                 self.reconciler.reconcile_task(
@@ -116,6 +121,8 @@ class TaskInterceptor:
                 ),
                 name=f'targeted-recon-{task_id}-{status}',
             )
+            self._background_tasks.add(task)
+            task.add_done_callback(lambda t: self._background_tasks.discard(t))
             task.add_done_callback(self._on_reconciliation_done)
             result['reconciliation'] = {'status': 'async', 'task_id': task_id}
 
@@ -152,6 +159,8 @@ class TaskInterceptor:
                 ),
                 name=f'bulk-recon-expand-{task_id}',
             )
+            self._background_tasks.add(task)
+            task.add_done_callback(lambda t: self._background_tasks.discard(t))
             task.add_done_callback(self._on_reconciliation_done)
             result['reconciliation'] = {'status': 'async', 'task_id': task_id}
 
@@ -184,6 +193,8 @@ class TaskInterceptor:
                 ),
                 name='bulk-recon-parse-prd',
             )
+            self._background_tasks.add(task)
+            task.add_done_callback(lambda t: self._background_tasks.discard(t))
             task.add_done_callback(self._on_reconciliation_done)
             result['reconciliation'] = {'status': 'async', 'operation': 'parse_prd'}
 
