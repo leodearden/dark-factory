@@ -455,6 +455,33 @@ class TestDeleteEpisode:
         service.graphiti.remove_edge.assert_not_called()
 
 
+class TestClose:
+    @pytest.mark.asyncio
+    async def test_close_calls_all_sub_resource_close_methods(self, service):
+        """Bug 3: close() must close durable_queue, graphiti, mem0,
+        _write_journal, and _event_buffer — not just the first two.
+        """
+        # Wire up mock close() on all sub-resources
+        service.graphiti.close = AsyncMock()
+        service.mem0.close = AsyncMock()
+
+        mock_journal = MagicMock()
+        mock_journal.close = AsyncMock()
+        service._write_journal = mock_journal
+
+        mock_buffer = MagicMock()
+        mock_buffer.close = AsyncMock()
+        service._event_buffer = mock_buffer
+
+        await service.close()
+
+        service.durable_queue.close.assert_called_once()
+        service.graphiti.close.assert_called_once()
+        service.mem0.close.assert_called_once()
+        mock_journal.close.assert_called_once()
+        mock_buffer.close.assert_called_once()
+
+
 class TestGraphitiBackendRemoveEdge:
     @pytest.mark.asyncio
     async def test_graphiti_backend_remove_edge(self, mock_config):
