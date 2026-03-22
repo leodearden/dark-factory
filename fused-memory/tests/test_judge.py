@@ -268,6 +268,120 @@ async def test_build_review_prompt_handles_error_dict_entries(mock_journal):
 
 
 @pytest.mark.asyncio
+async def test_verdict_action_taken_persisted_after_mutation_moderate(mock_journal):
+    """journal.add_verdict() must be called AFTER action_taken is set to 'rollback'.
+
+    Bug 2: add_verdict is currently called before the severity-based mutation,
+    so the DB receives action_taken='none' instead of 'rollback' for moderate severity.
+    We capture action_taken at call-time via a side_effect to avoid the reference aliasing
+    that would mask the bug.
+    """
+    from datetime import UTC, datetime
+    from unittest.mock import patch
+
+    from fused_memory.models.reconciliation import (
+        ReconciliationRun,
+        StageId,
+        StageReport,
+    )
+
+    config = _make_judge_config()
+    judge = Judge(config=config, journal=mock_journal)
+
+    # Set up journal to return a run and entries
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='run-bug2-moderate',
+        project_id='test-project',
+        run_type='full',
+        trigger_reason='buffer_size:3',
+        started_at=now,
+        events_processed=3,
+        status='completed',
+        stage_reports={
+            'memory_consolidator': StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=now,
+                completed_at=now,
+                items_flagged=[],
+                stats={},
+                llm_calls=1,
+                tokens_used=50,
+            ),
+        },
+    )
+    mock_journal.get_run = AsyncMock(return_value=run)
+    mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+
+    # Capture action_taken AT CALL TIME, not after reference mutation
+    captured_action_taken = []
+
+    async def capture_verdict(verdict):
+        captured_action_taken.append(verdict.action_taken)
+
+    mock_journal.add_verdict = AsyncMock(side_effect=capture_verdict)
+
+    # LLM returns a 'moderate' severity verdict
+    moderate_response = '{"severity": "moderate", "findings": [{"issue": "bad data"}], "summary": "Moderate problems found."}'
+
+    with patch.object(judge, '_call_llm', AsyncMock(return_value=moderate_response)):
+        await judge.review_run('run-bug2-moderate')
+
+    # At call time, action_taken must already be 'rollback' (post-mutation)
+    assert len(captured_action_taken) == 1
+    assert captured_action_taken[0] == 'rollback', (
+        f"Expected action_taken='rollback' at add_verdict call time, "
+        f"but got '{captured_action_taken[0]}'. "
+        "add_verdict is being called before the severity mutation."
+    )
+
+
+@pytest.mark.asyncio
+async def test_verdict_action_taken_persisted_after_mutation_serious(mock_journal):
+    """journal.add_verdict() must be called AFTER action_taken is set to 'halt' for serious severity."""
+    from datetime import UTC, datetime
+    from unittest.mock import patch
+
+    from fused_memory.models.reconciliation import ReconciliationRun
+
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='run-bug2-serious',
+        project_id='test-project',
+        run_type='full',
+        trigger_reason='buffer_size:3',
+        started_at=now,
+        events_processed=3,
+        status='completed',
+        stage_reports={},
+    )
+    mock_journal.get_run = AsyncMock(return_value=run)
+    mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+
+    captured_action_taken = []
+
+    async def capture_verdict(verdict):
+        captured_action_taken.append(verdict.action_taken)
+
+    mock_journal.add_verdict = AsyncMock(side_effect=capture_verdict)
+
+    serious_response = '{"severity": "serious", "findings": [{"issue": "critical failure"}], "summary": "Serious problems found."}'
+
+    with patch.object(judge, '_call_llm', AsyncMock(return_value=serious_response)):
+        await judge.review_run('run-bug2-serious')
+
+    assert len(captured_action_taken) == 1
+    assert captured_action_taken[0] == 'halt', (
+        f"Expected action_taken='halt' at add_verdict call time, "
+        f"but got '{captured_action_taken[0]}'. "
+        "add_verdict is being called before the severity mutation."
+    )
+
+
+@pytest.mark.asyncio
 async def test_judge_call_llm_openai_none_content(mock_journal):
     """_call_llm with openai provider returns empty string when message.content is None."""
     config = _make_judge_config(judge_llm_provider='openai', judge_llm_model='gpt-4o-mini')
