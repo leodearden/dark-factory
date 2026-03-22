@@ -3,7 +3,6 @@
 import pytest
 from pydantic import ValidationError
 
-
 # ---------------------------------------------------------------------------
 # Step 1 & 2: frozenset immutability for GRAPHITI_PRIMARY / MEM0_PRIMARY
 # ---------------------------------------------------------------------------
@@ -127,20 +126,20 @@ class TestAddEpisodeResponseCoercion:
     def test_bare_string_queued_coerces(self):
         from fused_memory.models.memory import AddEpisodeResponse, EpisodeStatus
 
-        resp = AddEpisodeResponse(status='queued')
+        resp = AddEpisodeResponse(status='queued')  # type: ignore[arg-type]
         assert resp.status == EpisodeStatus.queued
         assert isinstance(resp.status, EpisodeStatus)
 
     def test_bare_string_processed_coerces(self):
         from fused_memory.models.memory import AddEpisodeResponse, EpisodeStatus
 
-        resp = AddEpisodeResponse(status='processed')
+        resp = AddEpisodeResponse(status='processed')  # type: ignore[arg-type]
         assert resp.status == EpisodeStatus.processed
 
     def test_bare_string_error_coerces(self):
         from fused_memory.models.memory import AddEpisodeResponse, EpisodeStatus
 
-        resp = AddEpisodeResponse(status='error')
+        resp = AddEpisodeResponse(status='error')  # type: ignore[arg-type]
         assert resp.status == EpisodeStatus.error
 
     def test_enum_value_passes_through(self):
@@ -153,7 +152,7 @@ class TestAddEpisodeResponseCoercion:
         from fused_memory.models.memory import AddEpisodeResponse
 
         with pytest.raises(ValidationError):
-            AddEpisodeResponse(status='unknown_status')
+            AddEpisodeResponse(status='unknown_status')  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
