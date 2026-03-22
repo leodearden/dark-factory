@@ -365,6 +365,38 @@ class TestMultipleGroups:
         await q.close()
 
 
+class TestEnqueueBatchRollback:
+    @pytest.mark.asyncio
+    async def test_rollback_on_mid_batch_exception(self, queue):
+        """Bug 4: enqueue_batch must roll back on a mid-batch exception.
+
+        A batch where the 2nd item is missing 'operation' (KeyError) should
+        raise, and the DB should contain 0 pending items (no partial inserts).
+        """
+        items = [
+            {'group_id': 'proj1', 'operation': 'add_episode',
+             'payload': {'content': 'good', 'group_id': 'proj1', 'name': 'ep1'}},
+            # Missing 'operation' key — triggers KeyError mid-batch
+            {'group_id': 'proj1',
+             'payload': {'content': 'bad', 'group_id': 'proj1', 'name': 'ep2'}},
+            {'group_id': 'proj1', 'operation': 'add_episode',
+             'payload': {'content': 'also good', 'group_id': 'proj1', 'name': 'ep3'}},
+        ]
+
+        with pytest.raises(KeyError):
+            await queue.enqueue_batch(items)
+
+        # Verify rollback: no items should have been persisted
+        assert queue._db is not None
+        cursor = await queue._db.execute(
+            "SELECT COUNT(*) FROM write_queue WHERE status='pending'"
+        )
+        row = await cursor.fetchone()
+        assert row[0] == 0, (
+            f'Expected 0 pending items after rollback, got {row[0]}'
+        )
+
+
 class TestCallbackFailure:
     @pytest.mark.asyncio
     async def test_callback_error_doesnt_affect_completion(self, queue, mock_execute):

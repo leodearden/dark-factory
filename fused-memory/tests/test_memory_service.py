@@ -103,6 +103,52 @@ class TestAddMemory:
         assert result.category is not None
 
 
+    @pytest.mark.asyncio
+    async def test_mem0_error_surfaced_in_response(self, service):
+        """Bug 2: mem0 errors must appear in the response message.
+
+        Currently only _graphiti_error is appended; a Mem0 failure is silent.
+        """
+        service.mem0.add = AsyncMock(side_effect=ValueError('qdrant connection refused'))
+
+        result = await service.add_memory(
+            content='Always use type hints',
+            category='preferences_and_norms',
+            project_id='test',
+        )
+
+        assert 'mem0_error' in result.message, (
+            f'Expected mem0_error in response message, got: {result.message!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_success_false_when_only_targeted_store_fails(self, service):
+        """Bug 1: success must be False when ANY targeted store errors.
+
+        For a Mem0-only write (preferences_and_norms), if mem0.add raises,
+        _graphiti_error is None and _mem0_error is set.
+        With `and`, `not (None and error)` = `not None` = True (wrong).
+        With `or`,  `not (None or error)`  = `not error` = False (correct).
+        """
+        service.mem0.add = AsyncMock(side_effect=ValueError('qdrant connection refused'))
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        service._write_journal = mock_journal
+
+        await service.add_memory(
+            content='Always use type hints',
+            category='preferences_and_norms',
+            project_id='test',
+        )
+
+        mock_journal.log_write_op.assert_called_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs['success'] is False, (
+            'Expected success=False when the only targeted store (Mem0) fails, '
+            f'but got success={call_kwargs["success"]}'
+        )
+
+
 class TestAddEpisode:
     @pytest.mark.asyncio
     async def test_episode_enqueued(self, service):
@@ -409,6 +455,33 @@ class TestDeleteEpisode:
         service.graphiti.remove_edge.assert_not_called()
 
 
+class TestClose:
+    @pytest.mark.asyncio
+    async def test_close_calls_all_sub_resource_close_methods(self, service):
+        """Bug 3: close() must close durable_queue, graphiti, mem0,
+        _write_journal, and _event_buffer — not just the first two.
+        """
+        # Wire up mock close() on all sub-resources
+        service.graphiti.close = AsyncMock()
+        service.mem0.close = AsyncMock()
+
+        mock_journal = MagicMock()
+        mock_journal.close = AsyncMock()
+        service._write_journal = mock_journal
+
+        mock_buffer = MagicMock()
+        mock_buffer.close = AsyncMock()
+        service._event_buffer = mock_buffer
+
+        await service.close()
+
+        service.durable_queue.close.assert_called_once()
+        service.graphiti.close.assert_called_once()
+        service.mem0.close.assert_called_once()
+        mock_journal.close.assert_called_once()
+        mock_buffer.close.assert_called_once()
+
+
 class TestGraphitiBackendRemoveEdge:
     @pytest.mark.asyncio
     async def test_graphiti_backend_remove_edge(self, mock_config):
@@ -436,6 +509,34 @@ class TestGraphitiBackendRemoveEdge:
                 mock_client.driver, 'test-edge-uuid'
             )
             mock_edge.delete.assert_called_once_with(mock_client.driver)
+
+
+class TestMem0BackendClose:
+    @pytest.mark.asyncio
+    async def test_close_awaits_client_close(self, mock_config):
+        """Mem0Backend.close() must await client.close() for each cached instance."""
+        from fused_memory.backends.mem0_client import Mem0Backend
+
+        backend = Mem0Backend(mock_config)
+
+        # Build a mock instance with a vector_store.client.close AsyncMock
+        mock_client = MagicMock()
+        mock_client.close = AsyncMock()
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.client = mock_client
+
+        mock_instance = MagicMock()
+        mock_instance.vector_store = mock_vector_store
+
+        backend._instances = {'test_project': mock_instance}
+
+        await backend.close()
+
+        # The close coroutine must have been awaited, not just created
+        mock_client.close.assert_awaited_once()
+        # All instances must be cleared
+        assert backend._instances == {}
 
 
 class TestGetEpisodes:

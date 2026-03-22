@@ -93,8 +93,18 @@ class MemoryService:
 
     async def close(self) -> None:
         if self.durable_queue:
-            await self.durable_queue.close()
-        await self.graphiti.close()
+            with contextlib.suppress(Exception):
+                await self.durable_queue.close()
+        with contextlib.suppress(Exception):
+            await self.graphiti.close()
+        with contextlib.suppress(Exception):
+            await self.mem0.close()
+        if self._write_journal:
+            with contextlib.suppress(Exception):
+                await self._write_journal.close()
+        if self._event_buffer:
+            with contextlib.suppress(Exception):
+                await self._event_buffer.close()
 
     # ------------------------------------------------------------------
     # Journal helper
@@ -444,7 +454,7 @@ class MemoryService:
                     'memory_ids': memory_ids,
                     'stores': [s.value for s in stores_written],
                 },
-                success=not (_graphiti_error and _mem0_error),
+                success=not (_graphiti_error or _mem0_error),
                 error=_graphiti_error or _mem0_error,
             )
 
@@ -465,6 +475,8 @@ class MemoryService:
         msg = f'Memory stored in {[s.value for s in stores_written]}'
         if _graphiti_error:
             msg += f' [graphiti_error: {_graphiti_error}]'
+        if _mem0_error:
+            msg += f' [mem0_error: {_mem0_error}]'
 
         return AddMemoryResponse(
             memory_ids=memory_ids,

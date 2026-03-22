@@ -177,7 +177,8 @@ class DurableWriteQueue:
         now = time.time()
         ids: list[int] = []
         groups_seen: set[str] = set()
-        async with self._db.execute('BEGIN'):
+        await self._db.execute('BEGIN')
+        try:
             for item in items:
                 cursor = await self._db.execute(
                     'INSERT INTO write_queue '
@@ -191,7 +192,10 @@ class DurableWriteQueue:
                 )
                 ids.append(cursor.lastrowid)  # type: ignore[arg-type]
                 groups_seen.add(item['group_id'])
-        await self._db.commit()
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
         for g in groups_seen:
             self._ensure_workers(g)
             self._signal_group(g)
