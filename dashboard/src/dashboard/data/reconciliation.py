@@ -50,45 +50,43 @@ async def get_recent_runs(db_path: Path, *, limit: int = 50) -> list[dict]:
     Each dict contains: id, project_id, run_type, trigger_reason, started_at,
     completed_at, events_processed, status, duration_seconds, journal_entry_count.
     """
-    try:
-        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                'SELECT r.id, r.project_id, r.run_type, r.trigger_reason,'
-                ' r.started_at, r.completed_at, r.events_processed, r.status,'
-                ' (SELECT COUNT(*) FROM journal_entries je'
-                '  WHERE je.run_id = r.id) AS journal_entry_count'
-                ' FROM runs r ORDER BY r.started_at DESC LIMIT ?',
-                (limit,),
-            ) as cursor:
-                rows = await cursor.fetchall()
-    except (FileNotFoundError, sqlite3.OperationalError):
-        logger.debug('get_recent_runs: DB unavailable at %s', db_path, exc_info=True)
-        return []
+    async def _query(db: aiosqlite.Connection) -> list[dict]:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            'SELECT r.id, r.project_id, r.run_type, r.trigger_reason,'
+            ' r.started_at, r.completed_at, r.events_processed, r.status,'
+            ' (SELECT COUNT(*) FROM journal_entries je'
+            '  WHERE je.run_id = r.id) AS journal_entry_count'
+            ' FROM runs r ORDER BY r.started_at DESC LIMIT ?',
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
 
-    results = []
-    for row in rows:
-        duration = None
-        if row['completed_at'] is not None:
-            started = datetime.fromisoformat(row['started_at'])
-            completed = datetime.fromisoformat(row['completed_at'])
-            duration = (completed - started).total_seconds()
+        results = []
+        for row in rows:
+            duration = None
+            if row['completed_at'] is not None:
+                started = datetime.fromisoformat(row['started_at'])
+                completed = datetime.fromisoformat(row['completed_at'])
+                duration = (completed - started).total_seconds()
 
-        results.append(
-            {
-                'id': row['id'],
-                'project_id': row['project_id'],
-                'run_type': row['run_type'],
-                'trigger_reason': row['trigger_reason'],
-                'started_at': row['started_at'],
-                'completed_at': row['completed_at'],
-                'events_processed': row['events_processed'],
-                'status': row['status'],
-                'duration_seconds': duration,
-                'journal_entry_count': row['journal_entry_count'],
-            }
-        )
-    return results
+            results.append(
+                {
+                    'id': row['id'],
+                    'project_id': row['project_id'],
+                    'run_type': row['run_type'],
+                    'trigger_reason': row['trigger_reason'],
+                    'started_at': row['started_at'],
+                    'completed_at': row['completed_at'],
+                    'events_processed': row['events_processed'],
+                    'status': row['status'],
+                    'duration_seconds': duration,
+                    'journal_entry_count': row['journal_entry_count'],
+                }
+            )
+        return results
+
+    return await _with_readonly_db(db_path, _query, [], caller='get_recent_runs')
 
 
 async def get_journal_entries(db_path: Path, run_id: str) -> list[dict]:
@@ -97,53 +95,51 @@ async def get_journal_entries(db_path: Path, run_id: str) -> list[dict]:
     Each dict contains: id, stage, timestamp, operation, target_system,
     before_state, after_state, reasoning, evidence.
     """
-    try:
-        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                'SELECT id, stage, timestamp, operation, target_system,'
-                ' before_state, after_state, reasoning, evidence'
-                ' FROM journal_entries WHERE run_id = ? ORDER BY timestamp',
-                (run_id,),
-            ) as cursor:
-                rows = await cursor.fetchall()
-    except (FileNotFoundError, sqlite3.OperationalError):
-        logger.debug('get_journal_entries: DB unavailable at %s', db_path, exc_info=True)
-        return []
+    async def _query(db: aiosqlite.Connection) -> list[dict]:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            'SELECT id, stage, timestamp, operation, target_system,'
+            ' before_state, after_state, reasoning, evidence'
+            ' FROM journal_entries WHERE run_id = ? ORDER BY timestamp',
+            (run_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
 
-    results = []
-    for row in rows:
-        before_state = None
-        after_state = None
-        evidence = []
-        try:
-            if row['before_state']:
-                before_state = json.loads(row['before_state'])
-        except (json.JSONDecodeError, TypeError):
-            before_state = row['before_state']
-        try:
-            if row['after_state']:
-                after_state = json.loads(row['after_state'])
-        except (json.JSONDecodeError, TypeError):
-            after_state = row['after_state']
-        try:
-            if row['evidence']:
-                evidence = json.loads(row['evidence'])
-        except (json.JSONDecodeError, TypeError):
+        results = []
+        for row in rows:
+            before_state = None
+            after_state = None
             evidence = []
+            try:
+                if row['before_state']:
+                    before_state = json.loads(row['before_state'])
+            except (json.JSONDecodeError, TypeError):
+                before_state = row['before_state']
+            try:
+                if row['after_state']:
+                    after_state = json.loads(row['after_state'])
+            except (json.JSONDecodeError, TypeError):
+                after_state = row['after_state']
+            try:
+                if row['evidence']:
+                    evidence = json.loads(row['evidence'])
+            except (json.JSONDecodeError, TypeError):
+                evidence = []
 
-        results.append({
-            'id': row['id'],
-            'stage': row['stage'],
-            'timestamp': row['timestamp'],
-            'operation': row['operation'],
-            'target_system': row['target_system'],
-            'before_state': before_state,
-            'after_state': after_state,
-            'reasoning': row['reasoning'] or '',
-            'evidence': evidence,
-        })
-    return results
+            results.append({
+                'id': row['id'],
+                'stage': row['stage'],
+                'timestamp': row['timestamp'],
+                'operation': row['operation'],
+                'target_system': row['target_system'],
+                'before_state': before_state,
+                'after_state': after_state,
+                'reasoning': row['reasoning'] or '',
+                'evidence': evidence,
+            })
+        return results
+
+    return await _with_readonly_db(db_path, _query, [], caller='get_journal_entries')
 
 
 async def get_watermarks(db_path: Path) -> list[dict]:
