@@ -9,7 +9,7 @@
     "fused-memory/src/fused_memory/server",
     "fused-memory/tests"
   ],
-  "analysis": "tools.py defines all MCP tool functions as closures inside create_mcp_server(). Currently, parameters like status, store, category, and limit are passed through to service/interceptor without validation, producing opaque errors deep in the stack. The existing codebase has one validation pattern to follow: temporal_context in add_episode (lines 216-222) validates against a frozenset and returns {'error': '...'} before calling the service. Error handlers consistently return {'error': str(e)} without error_type. The fallback EventBuffer (line 649) is created with db_path=None but never initialized \u2014 trigger_reconciliation (line 629) accesses the buffer directly and would hit a cryptic RuntimeError. The test file test_health_endpoint.py already tests tool-level behavior using mcp_server._tool_manager.call_tool() and has the right fixtures (mcp_server, mcp_server_with_tasks). There are ~24 exception handler return sites that need error_type added.",
+  "analysis": "tools.py defines all MCP tool functions as closures inside create_mcp_server(). Currently, parameters like status, store, category, and limit are passed through to service/interceptor without validation, producing opaque errors deep in the stack. The existing codebase has one validation pattern to follow: temporal_context in add_episode (lines 216-222) validates against a frozenset and returns {'error': '...'} before calling the service. Error handlers consistently return {'error': str(e)} without error_type. The fallback EventBuffer (line 649) is created with db_path=None but never initialized \u2014 trigger_reconciliation (line 629) accesses the buffer directly and would hit a cryptic RuntimeError. The test file test_health_endpoint.py already tests tool-level behavior using mcp_server._tool_manager.call_tool() and has the right fixtures (mcp_server, mcp_server_with_tasks). There are ~24 exception handler return sites that need error_type added.\n\n[REVIEW FIX] All three reviewers flagged that 'blocked' is absent from _VALID_TASK_STATUSES (line 187). TaskInterceptor.STATUS_TRIGGERS (task_interceptor.py:27) explicitly includes 'blocked', targeted.py:66 has an _on_task_blocked handler, and the set_task_status docstring documents 'done/blocked/cancelled/deferred' transitions. Any set_task_status(status='blocked') call would receive a ValidationError \u2014 a functional regression. Steps 15-16 fix this with a regression test and the one-line fix.",
   "prerequisites": [],
   "steps": [
     {
@@ -109,6 +109,20 @@
       "description": "Update all ~24 exception handler return statements in tools.py: change every {'error': str(e)} to {'error': str(e), 'error_type': type(e).__name__}. Covers add_episode, add_memory, search, get_entity, get_episodes, delete_memory, delete_episode, get_status, replay_to_graphiti, get_queue_stats, replay_dead_letters, trigger_reconciliation, and all 11 task proxy tools.",
       "status": "done",
       "commit": "fc34125"
+    },
+    {
+      "id": "step-15",
+      "type": "test",
+      "description": "[REVIEW FIX] Write regression test: set_task_status accepts 'blocked' as a valid status. Test that calling set_task_status with status='blocked' passes through to the interceptor (no validation error returned). This test will fail against the current code because 'blocked' is absent from _VALID_TASK_STATUSES. Use the same pattern as test_set_task_status_valid_status_passes_through but with status='blocked'. Also parametrize or add a second assertion confirming all TaskInterceptor.STATUS_TRIGGERS values ('done', 'blocked', 'cancelled', 'deferred') are accepted.",
+      "status": "done",
+      "commit": "7ab4c94"
+    },
+    {
+      "id": "step-16",
+      "type": "impl",
+      "description": "[REVIEW FIX] Add 'blocked' to _VALID_TASK_STATUSES: change frozenset({'pending', 'done', 'in-progress', 'review', 'deferred', 'cancelled'}) to frozenset({'pending', 'done', 'in-progress', 'review', 'deferred', 'cancelled', 'blocked'}). This is a one-line fix that restores 'blocked' as a valid pass-through status, matching TaskInterceptor.STATUS_TRIGGERS and the set_task_status docstring.",
+      "status": "done",
+      "commit": "9e0efab"
     }
   ],
   "design_decisions": [
@@ -135,6 +149,10 @@
     {
       "decision": "Add all validation tests to test_health_endpoint.py rather than a new file",
       "rationale": "The file header says 'Tests for the /health endpoint, MCP tool-level behavior, and server settings' \u2014 input validation is MCP tool-level behavior. The file already has the right fixtures (mcp_server, mcp_server_with_tasks) and the _tool_manager.call_tool() pattern."
+    },
+    {
+      "decision": "[REVIEW FIX] Add 'blocked' to _VALID_TASK_STATUSES as a hardcoded string rather than deriving from TaskInterceptor.STATUS_TRIGGERS",
+      "rationale": "The validation set includes non-trigger statuses too (pending, in-progress, review) so it can't be derived solely from STATUS_TRIGGERS. A TaskStatus StrEnum (as suggested by the reviewer) would be ideal long-term, but is out of scope for this task \u2014 it would require changes to models/enums.py and potentially the interceptor. The immediate fix is minimal and correct: add the missing 'blocked' string to the existing frozenset."
     }
   ],
   "reuse": [
@@ -162,8 +180,13 @@
       "what": "task_interceptor fixture (AsyncMock)",
       "where": "fused-memory/tests/test_health_endpoint.py line 20",
       "how": "Reuse for testing validation bypass (valid values) and error_type propagation (side_effect=Exception)"
+    },
+    {
+      "what": "Existing test_set_task_status_valid_status_passes_through test pattern",
+      "where": "fused-memory/tests/test_health_endpoint.py (step-1 test)",
+      "how": "Clone pattern for step-15 regression test \u2014 same fixture usage, same assertion style, but with status='blocked'"
     }
   ],
   "_session_id": "105-caba0179",
-  "_created_at": "2026-03-22T22:17:22.297641+00:00"
+  "_created_at": "2026-03-22T22:34:38.722197+00:00"
 }
