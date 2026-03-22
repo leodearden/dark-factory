@@ -465,6 +465,8 @@ class MemoryService:
         msg = f'Memory stored in {[s.value for s in stores_written]}'
         if _graphiti_error:
             msg += f' [graphiti_error: {_graphiti_error}]'
+        if _mem0_error:
+            msg += f' [mem0_error: {_mem0_error}]'
 
         return AddMemoryResponse(
             memory_ids=memory_ids,
