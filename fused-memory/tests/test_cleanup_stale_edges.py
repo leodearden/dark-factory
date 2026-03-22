@@ -108,14 +108,20 @@ class TestBulkRemoveEdges:
     @pytest.mark.asyncio
     async def test_deletes_matching_edges(self, mock_config):
         backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+        # Two calls: pre-count returns [[3]], DELETE returns empty
+        pre_count_result = MagicMock()
+        pre_count_result.result_set = [[3]]
+        delete_result = MagicMock()
+        delete_result.result_set = []
+        graph_mock = MagicMock()
+        graph_mock.query = AsyncMock(side_effect=[pre_count_result, delete_result])
         cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
+        cast_target._get_graph = MagicMock(return_value=graph_mock)
         uuids = ['uuid-1', 'uuid-2', 'uuid-3']
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
             count = await backend.bulk_remove_edges(uuids)
         assert count == 3
-        graph.query.assert_awaited_once()
+        assert graph_mock.query.await_count == 2
 
     @pytest.mark.asyncio
     async def test_handles_empty_uuid_list(self, mock_config):
@@ -138,15 +144,23 @@ class TestBulkRemoveEdges:
     @pytest.mark.asyncio
     async def test_passes_uuid_list_to_query(self, mock_config):
         backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+        # Two calls: pre-count then DELETE
+        pre_count_result = MagicMock()
+        pre_count_result.result_set = [[2]]
+        delete_result = MagicMock()
+        delete_result.result_set = []
+        graph_mock = MagicMock()
+        graph_mock.query = AsyncMock(side_effect=[pre_count_result, delete_result])
         cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
+        cast_target._get_graph = MagicMock(return_value=graph_mock)
         uuids = ['uuid-a', 'uuid-b']
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
             await backend.bulk_remove_edges(uuids)
-        call_args = graph.query.call_args
-        assert call_args is not None
-        args, kwargs = call_args
+        # Verify the DELETE call (second call) passes uuids as params
+        all_calls = graph_mock.query.call_args_list
+        assert len(all_calls) == 2
+        delete_call_args = all_calls[1]
+        args, kwargs = delete_call_args
         cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
         assert cypher_params.get('uuids') == uuids
 

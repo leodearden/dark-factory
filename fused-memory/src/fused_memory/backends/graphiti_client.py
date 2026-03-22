@@ -311,13 +311,17 @@ class GraphitiBackend:
         ]
 
     async def bulk_remove_edges(self, uuids: list[str]) -> int:
-        """Delete RELATES_TO edges by UUID list. Returns count deleted.
+        """Delete RELATES_TO edges by UUID list. Returns count of actually matched edges.
+
+        Uses a pre-count MATCH query before deletion to return the true number of
+        edges that exist (and will be deleted), rather than the input list length.
+        This is critical for irreversible operations where accuracy matters.
 
         Args:
             uuids: List of edge UUIDs to delete.
 
         Returns:
-            Number of edges deleted (0 for empty list).
+            Number of edges that matched (and were deleted). 0 for empty list.
         """
         if not uuids:
             return 0
@@ -325,13 +329,22 @@ class GraphitiBackend:
         logger.info(f'Deleting {len(uuids)} edge(s): {uuids}')
         driver = cast(Any, client.driver)
         graph = driver._get_graph(None)
-        cypher = (
+        # Pre-count: how many of the requested UUIDs actually exist as edges
+        count_cypher = (
+            'MATCH ()-[e:RELATES_TO]->() '
+            'WHERE e.uuid IN $uuids '
+            'RETURN count(e) AS found'
+        )
+        count_result = await graph.query(count_cypher, {'uuids': uuids})
+        found = int(count_result.result_set[0][0])
+        # Delete the edges
+        delete_cypher = (
             'MATCH ()-[e:RELATES_TO]->() '
             'WHERE e.uuid IN $uuids '
             'DELETE e'
         )
-        await graph.query(cypher, {'uuids': uuids})
-        return len(uuids)
+        await graph.query(delete_cypher, {'uuids': uuids})
+        return found
 
     async def get_node_text(self, uuid: str) -> tuple[str, str]:
         """Return (name, summary) for the Entity node with the given UUID.
