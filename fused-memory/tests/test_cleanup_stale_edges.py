@@ -7,7 +7,6 @@ import pytest
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
 
-
 # ---------------------------------------------------------------------------
 # Helpers (mirrored from test_reindex.py)
 # ---------------------------------------------------------------------------
