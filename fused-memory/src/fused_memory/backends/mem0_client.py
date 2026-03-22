@@ -187,6 +187,16 @@ class Mem0Backend:
         )
         return result.count
 
+    async def close(self) -> None:
+        """Close all cached AsyncMemory instances and release their connections."""
+        import contextlib
+        for instance in self._instances.values():
+            with contextlib.suppress(Exception):
+                client = getattr(getattr(instance, 'vector_store', None), 'client', None)
+                if client is not None and hasattr(client, 'close'):
+                    client.close()
+        self._instances.clear()
+
     def list_projects(self) -> list[tuple[str, str]]:
         """Enumerate projects by scanning Qdrant collections matching the prefix.
 
