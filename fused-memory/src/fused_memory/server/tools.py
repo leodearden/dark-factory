@@ -243,7 +243,7 @@ def create_mcp_server(
             return result.model_dump()
         except Exception as e:
             logger.error(f'add_episode error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def add_memory(
@@ -295,7 +295,7 @@ def create_mcp_server(
             return result.model_dump()
         except Exception as e:
             logger.error(f'add_memory error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
     # Read tools
@@ -372,7 +372,7 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def get_entity(
@@ -420,7 +420,7 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def get_episodes(
@@ -473,7 +473,7 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
     # Delete tools
@@ -525,7 +525,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'delete_memory error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def delete_episode(
@@ -561,7 +561,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'delete_episode error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
     # Management tools
@@ -580,7 +580,7 @@ def create_mcp_server(
             return await memory_service.get_status(project_id=project_id)
         except Exception as e:
             logger.error(f'get_status error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
     # Queue management tools
@@ -611,7 +611,7 @@ def create_mcp_server(
             return {'status': 'queued', 'items_queued': count, 'project_id': project_id}
         except Exception as e:
             logger.error(f'replay_to_graphiti error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def get_queue_stats() -> dict[str, Any]:
@@ -624,7 +624,7 @@ def create_mcp_server(
             return await memory_service.durable_queue.get_stats()
         except Exception as e:
             logger.error(f'get_queue_stats error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def replay_dead_letters(
@@ -646,7 +646,7 @@ def create_mcp_server(
             return {'status': 'replayed', 'items_reset': count}
         except Exception as e:
             logger.error(f'replay_dead_letters error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
     # Reconciliation tools
@@ -676,7 +676,7 @@ def create_mcp_server(
             }
         except Exception as e:
             logger.error(f'trigger_reconciliation error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
     # Task proxy tools (always registered; errors if Taskmaster unavailable)
@@ -706,7 +706,7 @@ def create_mcp_server(
             return await task_interceptor.get_tasks(project_root=project_root, tag=tag)
         except Exception as e:
             logger.error(f'get_tasks error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def get_task(
@@ -727,7 +727,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'get_task error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def set_task_status(
@@ -762,7 +762,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'set_task_status error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def add_task(
@@ -804,7 +804,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'add_task error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def update_task(
@@ -838,7 +838,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'update_task error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def add_subtask(
@@ -870,7 +870,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'add_subtask error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def remove_task(
@@ -891,7 +891,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'remove_task error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def add_dependency(
@@ -917,7 +917,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'add_dependency error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def remove_dependency(
@@ -943,7 +943,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'remove_dependency error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def expand_task(
@@ -975,7 +975,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'expand_task error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def parse_prd(
@@ -1001,6 +1001,6 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'parse_prd error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     return mcp
