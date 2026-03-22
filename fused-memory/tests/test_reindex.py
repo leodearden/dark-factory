@@ -668,6 +668,120 @@ class TestReindexAndReplay:
 
         mock_queue.replay_dead.assert_awaited_once_with(group_id=None)
 
+    @pytest.mark.asyncio
+    async def test_drops_indices_before_reindex_when_requested(self):
+        """drop_vector_indices() called before reindex() when drop_indices=True."""
+        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
+
+        call_order: list[str] = []
+
+        backend = MagicMock()
+        embedder = MagicMock()
+
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=1536)
+
+        async def fake_drop():
+            call_order.append('drop')
+            return [{'label': 'Entity', 'field': 'name_embedding'}]
+
+        async def fake_reindex():
+            call_order.append('reindex')
+            return ReindexResult(1, 0, 0)
+
+        async def fake_replay(group_id=None):
+            call_order.append('replay')
+            return 3
+
+        manager.backend.drop_vector_indices = fake_drop
+        manager.reindex = fake_reindex
+
+        mock_queue = MagicMock()
+        mock_queue.replay_dead = AsyncMock(side_effect=fake_replay)
+
+        await manager.reindex_and_replay(mock_queue, drop_indices=True)
+
+        assert call_order == ['drop', 'reindex', 'replay']
+
+    @pytest.mark.asyncio
+    async def test_skips_drop_when_drop_indices_false(self):
+        """drop_vector_indices() NOT called when drop_indices=False."""
+        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
+
+        backend = MagicMock()
+        backend.drop_vector_indices = AsyncMock(return_value=[])
+        embedder = MagicMock()
+
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=1536)
+        manager.reindex = AsyncMock(return_value=ReindexResult())
+
+        mock_queue = MagicMock()
+        mock_queue.replay_dead = AsyncMock(return_value=0)
+
+        await manager.reindex_and_replay(mock_queue, drop_indices=False)
+
+        backend.drop_vector_indices.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_default_drop_indices_is_false(self):
+        """drop_indices defaults to False (backward compatible)."""
+        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
+
+        backend = MagicMock()
+        backend.drop_vector_indices = AsyncMock(return_value=[])
+        embedder = MagicMock()
+
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=1536)
+        manager.reindex = AsyncMock(return_value=ReindexResult())
+
+        mock_queue = MagicMock()
+        mock_queue.replay_dead = AsyncMock(return_value=0)
+
+        await manager.reindex_and_replay(mock_queue)  # no drop_indices arg
+
+        backend.drop_vector_indices.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_result_includes_indices_dropped(self):
+        """Return dict includes 'indices_dropped' list from drop_vector_indices."""
+        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
+
+        dropped = [
+            {'label': 'Entity', 'field': 'name_embedding'},
+            {'label': 'RELATES_TO', 'field': 'fact_embedding'},
+        ]
+        backend = MagicMock()
+        backend.drop_vector_indices = AsyncMock(return_value=dropped)
+        embedder = MagicMock()
+
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=1536)
+        manager.reindex = AsyncMock(return_value=ReindexResult())
+
+        mock_queue = MagicMock()
+        mock_queue.replay_dead = AsyncMock(return_value=0)
+
+        result = await manager.reindex_and_replay(mock_queue, drop_indices=True)
+
+        assert result['indices_dropped'] == dropped
+
+    @pytest.mark.asyncio
+    async def test_result_indices_dropped_empty_when_skipped(self):
+        """Return dict has 'indices_dropped': [] when drop_indices=False."""
+        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
+
+        backend = MagicMock()
+        backend.drop_vector_indices = AsyncMock(return_value=[])
+        embedder = MagicMock()
+
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=1536)
+        manager.reindex = AsyncMock(return_value=ReindexResult())
+
+        mock_queue = MagicMock()
+        mock_queue.replay_dead = AsyncMock(return_value=0)
+
+        result = await manager.reindex_and_replay(mock_queue, drop_indices=False)
+
+        assert result['indices_dropped'] == []
+
 
 # ---------------------------------------------------------------------------
 # step-13: run_reindex() CLI entrypoint
