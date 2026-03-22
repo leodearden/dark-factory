@@ -103,6 +103,34 @@ class TestAddMemory:
         assert result.category is not None
 
 
+    @pytest.mark.asyncio
+    async def test_success_false_when_only_targeted_store_fails(self, service):
+        """Bug 1: success must be False when ANY targeted store errors.
+
+        For a Mem0-only write (preferences_and_norms), if mem0.add raises,
+        _graphiti_error is None and _mem0_error is set.
+        With `and`, `not (None and error)` = `not None` = True (wrong).
+        With `or`,  `not (None or error)`  = `not error` = False (correct).
+        """
+        service.mem0.add = AsyncMock(side_effect=ValueError('qdrant connection refused'))
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        service._write_journal = mock_journal
+
+        await service.add_memory(
+            content='Always use type hints',
+            category='preferences_and_norms',
+            project_id='test',
+        )
+
+        mock_journal.log_write_op.assert_called_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs['success'] is False, (
+            'Expected success=False when the only targeted store (Mem0) fails, '
+            f'but got success={call_kwargs["success"]}'
+        )
+
+
 class TestAddEpisode:
     @pytest.mark.asyncio
     async def test_episode_enqueued(self, service):
