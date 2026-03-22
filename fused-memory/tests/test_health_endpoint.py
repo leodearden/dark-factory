@@ -592,3 +592,47 @@ async def test_update_task_exception_includes_error_type(
     assert 'error' in result
     assert 'invalid field' in result['error']
     assert result.get('error_type') == 'ValueError'
+
+
+# ------------------------------------------------------------------
+# [REVIEW FIX] Regression: 'blocked' must be a valid task status
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_blocked_passes_through(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """[Regression] set_task_status with status='blocked' must pass through — not rejected.
+
+    'blocked' is a TaskInterceptor.STATUS_TRIGGERS value and is documented in the
+    set_task_status docstring. Rejecting it would be a functional regression.
+    """
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'set_task_status',
+        {'id': '1', 'project_root': '/project', 'status': 'blocked'},
+    )
+    # Must NOT be a validation error
+    assert isinstance(result, dict)
+    assert 'error' not in result, (
+        f"'blocked' should be accepted as a valid status, got error: {result.get('error')}"
+    )
+    task_interceptor.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['done', 'blocked', 'cancelled', 'deferred'])
+async def test_set_task_status_all_trigger_statuses_pass_through(
+    status, mcp_server_with_tasks, task_interceptor,
+):
+    """All TaskInterceptor.STATUS_TRIGGERS values must be accepted by validation."""
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'set_task_status',
+        {'id': '1', 'project_root': '/project', 'status': status},
+    )
+    assert isinstance(result, dict)
+    assert 'error' not in result, (
+        f"STATUS_TRIGGERS value {status!r} should be accepted, got: {result}"
+    )
