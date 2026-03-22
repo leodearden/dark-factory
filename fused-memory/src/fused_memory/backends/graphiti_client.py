@@ -365,6 +365,22 @@ class GraphitiBackend:
         cypher = f'DROP INDEX ON :{label}({field})'
         await graph.query(cypher)
 
+    async def drop_vector_indices(self) -> list[dict]:
+        """Drop all VECTOR-type indices in the graph.
+
+        Calls list_indices() to find indices with type == 'VECTOR', then calls
+        drop_index() for each.  Returns a list of {'label': ..., 'field': ...}
+        dicts for each dropped index.
+        """
+        indices = await self.list_indices()
+        dropped: list[dict] = []
+        for entry in indices:
+            if entry.get('type') == 'VECTOR':
+                await self.drop_index(entry['label'], entry['field'])
+                dropped.append({'label': entry['label'], 'field': entry['field']})
+        logger.info(f'Dropped {len(dropped)} VECTOR index(es)')
+        return dropped
+
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
         client = self._require_client()
