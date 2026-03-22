@@ -1,13 +1,13 @@
 """CLI watcher that uses inotify to watch for new escalations.
 
 Usage: python -m escalation.watcher --queue-dir <path> [--task-id <id>]
-       [--ntfy-url <url>] [--loop]
+       [--ntfy-url <url>]
 
 Watches for new .json files in the queue directory. When one appears and matches
 the optional task_id filter, prints the escalation JSON to stdout (and optionally
 sends a push notification via ntfy.sh).
 
-By default exits after the first matching escalation. Use --loop to keep watching.
+Exits after the first matching escalation.
 """
 
 from __future__ import annotations
@@ -43,7 +43,6 @@ def main() -> None:
     parser.add_argument('--queue-dir', required=True, help='Escalation queue directory')
     parser.add_argument('--task-id', default=None, help='Filter to a specific task ID')
     parser.add_argument('--ntfy-url', default=None, help='ntfy.sh topic URL for push notifications')
-    parser.add_argument('--loop', action='store_true', help='Keep watching after first escalation')
     args = parser.parse_args()
 
     queue_dir = Path(args.queue_dir)
@@ -79,8 +78,7 @@ def main() -> None:
                 except Exception as e:
                     print(f'ntfy send failed: {e}', file=sys.stderr)
 
-            if not args.loop:
-                sys.exit(0)
+            sys.exit(0)
 
 
 if __name__ == '__main__':

@@ -94,10 +94,10 @@ class TestSendNtfy:
 
 
 class TestMainLoop:
-    """CLI --loop flag controls exit behavior."""
+    """CLI exit behavior after first match."""
 
-    def test_no_loop_exits_after_first(self, tmp_path, blocking_escalation: Escalation):
-        """Without --loop, main() calls sys.exit(0) after first match."""
+    def test_exits_after_first(self, tmp_path, blocking_escalation: Escalation):
+        """main() calls sys.exit(0) after first match."""
         queue_dir = tmp_path / 'queue'
         queue_dir.mkdir()
 
@@ -126,32 +126,3 @@ class TestMainLoop:
                 main()
 
             mock_exit.assert_called_once_with(0)
-
-    def test_loop_continues_after_first(self, tmp_path, blocking_escalation: Escalation):
-        """With --loop, main() does NOT call sys.exit after first match."""
-        queue_dir = tmp_path / 'queue'
-        queue_dir.mkdir()
-
-        esc_path = queue_dir / f'{blocking_escalation.id}.json'
-        esc_path.write_text(blocking_escalation.to_json())
-
-        mock_event = MagicMock()
-        mock_event.name = f'{blocking_escalation.id}.json'
-
-        with (
-            patch('escalation.watcher.INotify') as MockINotify,
-            patch('escalation.watcher.sys.exit') as mock_exit,
-            patch('escalation.watcher.sys.argv', [
-                'watcher', '--queue-dir', str(queue_dir), '--loop',
-            ]),
-        ):
-            mock_inotify = MockINotify.return_value
-            # Two events then break
-            mock_inotify.read.side_effect = [[mock_event], KeyboardInterrupt]
-
-            from escalation.watcher import main
-
-            with contextlib.suppress(KeyboardInterrupt):
-                main()
-
-            mock_exit.assert_not_called()
