@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.services.memory_service import MemoryService
 
 if TYPE_CHECKING:
@@ -185,6 +186,8 @@ def create_mcp_server(
     _VALID_TASK_STATUSES = frozenset({
         'pending', 'done', 'in-progress', 'review', 'deferred', 'cancelled',
     })
+    _VALID_STORES = frozenset(v.value for v in SourceStore)
+    _VALID_CATEGORIES = frozenset(v.value for v in MemoryCategory)
 
     @mcp.tool()
     async def add_episode(
@@ -482,6 +485,14 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if store not in _VALID_STORES:
+            return {
+                'error': (
+                    f'Invalid store {store!r}. '
+                    f'Must be one of {sorted(_VALID_STORES)}.'
+                ),
+                'error_type': 'ValidationError',
+            }
         try:
             causation_id, source, _ = _extract_causation(metadata, agent_id)
             return await memory_service.delete_memory(
