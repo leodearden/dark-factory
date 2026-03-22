@@ -499,6 +499,67 @@ async def test_journal_triggered_by_roundtrip(journal):
 
 
 @pytest.mark.asyncio
+async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_service):
+    """run_loop() must skip run_full_cycle for projects that are halted by the judge.
+
+    Bug 3: judge.is_halted() is never called in run_loop, so halted projects keep
+    processing new cycles.  This test drives one run_loop iteration via a short
+    asyncio.wait_for and confirms run_full_cycle is never called for a halted project.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+    # Wire a real judge with the project pre-halted
+    from fused_memory.config.schema import ReconciliationConfig
+    from fused_memory.reconciliation.judge import Judge
+
+    judge_config = ReconciliationConfig(
+        enabled=True,
+        explore_codebase_root='/tmp/test',
+        agent_llm_provider='anthropic',
+        agent_llm_model='claude-sonnet-4-20250514',
+    )
+    mock_j = AsyncMock()
+    mock_j.get_run = AsyncMock(return_value=None)
+    harness.judge = Judge(config=judge_config, journal=mock_j)
+    harness.judge._halted_projects.add('test-project')  # Pre-halt the project
+
+    # Push enough events to trigger a cycle
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    # Confirm trigger would fire
+    should, _ = await event_buffer.should_trigger('test-project')
+    assert should
+
+    # Track whether run_full_cycle is called
+    run_full_cycle_called = []
+    original_rfc = harness.run_full_cycle
+
+    async def spy_rfc(*args, **kwargs):
+        run_full_cycle_called.append(args)
+        return await original_rfc(*args, **kwargs)
+
+    # Also make _recover_stale_runs a no-op
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+
+    with patch.object(harness, 'run_full_cycle', side_effect=spy_rfc):
+        try:
+            # Run loop for one sleep cycle (loop sleeps 5s; we wait 0.2s — enough for 1 iteration)
+            await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+        except (TimeoutError, asyncio.TimeoutError):
+            pass  # Expected — loop is infinite
+
+    # For a halted project, run_full_cycle must NOT have been called
+    assert len(run_full_cycle_called) == 0, (
+        f"run_full_cycle was called {len(run_full_cycle_called)} time(s) "
+        "for a halted project — Bug 3: halt check not wired into run_loop."
+    )
+
+
+@pytest.mark.asyncio
 async def test_stage_state_reset_after_remediation(journal, event_buffer, mock_memory_service):
     """Stage state (remediation_findings, remediation_mode) is reset after remediation."""
     from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
