@@ -388,3 +388,54 @@ async def test_delete_memory_valid_store_passes_through(mcp_server):
             assert 'invalid' not in result['error'].lower(), (
                 f'Unexpected validation error for store={valid_store!r}: {result}'
             )
+
+
+# ------------------------------------------------------------------
+# add_memory category validation
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_memory_rejects_invalid_category(mcp_server):
+    """add_memory with an invalid category returns an error dict."""
+    result = await mcp_server._tool_manager.call_tool(
+        'add_memory',
+        {
+            'content': 'some fact',
+            'project_id': 'proj',
+            'category': 'invalid_cat',
+        },
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert 'invalid_cat' in result['error'] or 'invalid' in result['error'].lower()
+    # Should mention all 6 valid categories
+    assert 'observations_and_summaries' in result['error'] or 'preferences_and_norms' in result['error']
+
+
+@pytest.mark.asyncio
+async def test_add_memory_none_category_passes_through(mcp_server):
+    """add_memory with no category (auto-classify) should NOT return a validation error."""
+    result = await mcp_server._tool_manager.call_tool(
+        'add_memory',
+        {'content': 'some fact', 'project_id': 'proj'},
+    )
+    # If there's an error, it shouldn't be a validation error about category
+    if isinstance(result, dict) and 'error' in result:
+        assert 'invalid' not in result['error'].lower() or 'category' not in result['error'].lower()
+
+
+@pytest.mark.asyncio
+async def test_add_memory_valid_category_passes_through(mcp_server):
+    """add_memory with a valid category should NOT return a validation error."""
+    for valid_cat in ('observations_and_summaries', 'preferences_and_norms',
+                      'procedural_knowledge', 'entities_and_relations',
+                      'temporal_facts', 'decisions_and_rationale'):
+        result = await mcp_server._tool_manager.call_tool(
+            'add_memory',
+            {'content': 'fact', 'project_id': 'proj', 'category': valid_cat},
+        )
+        if isinstance(result, dict) and 'error' in result:
+            assert 'ValidationError' != result.get('error_type'), (
+                f'Unexpected validation error for category={valid_cat!r}: {result}'
+            )
