@@ -185,7 +185,7 @@ def create_mcp_server(
 
     _VALID_TEMPORAL_CONTEXTS = frozenset({'retrospective', 'planning', 'current'})
     _VALID_TASK_STATUSES = frozenset({
-        'pending', 'done', 'in-progress', 'review', 'deferred', 'cancelled',
+        'pending', 'done', 'in-progress', 'review', 'deferred', 'cancelled', 'blocked',
     })
     _VALID_STORES = frozenset(v.value for v in SourceStore)
     _VALID_CATEGORIES = frozenset(v.value for v in MemoryCategory)
