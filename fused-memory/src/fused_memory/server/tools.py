@@ -136,6 +136,7 @@ def create_mcp_server(
     """Create and configure the FastMCP server with all tools."""
 
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
+    _taskmaster_configured = task_interceptor is not None
 
     async def _log_read(
         operation: str,
@@ -661,6 +662,11 @@ def create_mcp_server(
         Args:
             project_id: Project to trigger reconciliation for
         """
+        if not _taskmaster_configured:
+            return {
+                'error': 'Taskmaster is not configured. Cannot trigger reconciliation.',
+                'error_type': 'ConfigurationError',
+            }
         try:
             await task_interceptor.buffer.request_trigger(project_id)  # type: ignore[union-attr]
             return {
