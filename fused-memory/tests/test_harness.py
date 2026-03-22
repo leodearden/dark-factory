@@ -499,6 +499,40 @@ async def test_journal_triggered_by_roundtrip(journal):
 
 
 @pytest.mark.asyncio
+async def test_run_full_cycle_accepts_pre_drained_events(journal, event_buffer, mock_memory_service):
+    """run_full_cycle() must accept an optional 'events' param to skip drain().
+
+    Bug 4: BacklogIterator.run() drains a chunk via drain_oldest_chunk(), then calls
+    run_full_cycle() which re-drains via drain(), getting different events — the chunk
+    events are silently lost.  Fix: add optional events param to run_full_cycle so
+    BacklogIterator can pass the already-drained chunk.
+
+    This test confirms that passing events=[...] to run_full_cycle uses those events
+    without calling buffer.drain(), and that events_processed reflects the passed count.
+    """
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+    # Mock all stages to succeed
+    for stage in harness.stages:
+        _mock_stage_run(stage)
+
+    # Do NOT push any events to the buffer (drain() would return 0 events)
+    # Manually create 2 events
+    evt1 = _make_event()
+    evt2 = _make_event()
+
+    # Call run_full_cycle with pre-drained events
+    # This should fail currently because run_full_cycle doesn't accept an 'events' param
+    run = await harness.run_full_cycle('test-project', 'backlog_chunk:1:2', events=[evt1, evt2])
+
+    assert run.events_processed == 2, (
+        f"Expected events_processed=2 from pre-drained events, got {run.events_processed}. "
+        "Bug 4: run_full_cycle does not accept an 'events' parameter."
+    )
+    assert run.status == 'completed'
+
+
+@pytest.mark.asyncio
 async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_service):
     """run_loop() must skip run_full_cycle for projects that are halted by the judge.
 
