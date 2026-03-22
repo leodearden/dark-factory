@@ -679,3 +679,61 @@ async def test_stage_state_reset_after_remediation(journal, event_buffer, mock_m
     assert stage1.remediation_findings is None
     assert stage1.prior_s3_findings is None
     assert stage2.remediation_mode is False
+
+
+@pytest.mark.asyncio
+async def test_cancellation_cleanup_failure_preserves_cancelled_error(
+    journal, event_buffer, mock_memory_service,
+):
+    """Cleanup exception during CancelledError handler must not replace CancelledError.
+
+    Review issue [exception_swallowing]: If journal.complete_run raises RuntimeError
+    during the CancelledError cleanup, the exception currently replaces CancelledError
+    before the re-raise — so the caller receives RuntimeError instead of TimeoutError,
+    bypassing run_loop's timeout handler.
+
+    Fix: wrap cleanup awaits in a nested try/except Exception so CancelledError is
+    always re-raised regardless of cleanup failures.
+    """
+    import asyncio
+
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+    # Make first stage sleep forever (will be cancelled by wait_for timeout)
+    async def slow_stage_run(
+        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0],
+    ):
+        await asyncio.sleep(999)
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    harness.stages[0].run = slow_stage_run
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    # Mock complete_run to raise RuntimeError when called during cleanup (status='failed')
+    original_complete_run = journal.complete_run
+
+    async def failing_complete_run(run_id, status):
+        if status == 'failed':
+            raise RuntimeError('DB connection lost')
+        return await original_complete_run(run_id, status)
+
+    journal.complete_run = failing_complete_run
+
+    # The caller must receive TimeoutError, NOT RuntimeError from the cleanup failure.
+    # Before the fix, RuntimeError replaces CancelledError and propagates to the caller.
+    with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+        await asyncio.wait_for(
+            harness.run_full_cycle('test-project', 'buffer_size:1'),
+            timeout=0.1,
+        )
