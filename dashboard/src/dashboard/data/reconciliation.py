@@ -148,29 +148,26 @@ async def get_watermarks(db_path: Path) -> list[dict]:
     Each dict contains: project_id, last_full_run_completed, last_episode_timestamp,
     last_memory_timestamp, last_task_change_timestamp.  Returns [] if none found.
     """
-    try:
-        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                'SELECT project_id, last_full_run_completed, last_episode_timestamp,'
-                ' last_memory_timestamp, last_task_change_timestamp'
-                ' FROM watermarks ORDER BY project_id',
-            ) as cursor:
-                rows = await cursor.fetchall()
-    except (FileNotFoundError, sqlite3.OperationalError):
-        logger.debug('get_watermarks: DB unavailable at %s', db_path, exc_info=True)
-        return []
+    async def _query(db: aiosqlite.Connection) -> list[dict]:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            'SELECT project_id, last_full_run_completed, last_episode_timestamp,'
+            ' last_memory_timestamp, last_task_change_timestamp'
+            ' FROM watermarks ORDER BY project_id',
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            {
+                'project_id': row['project_id'],
+                'last_full_run_completed': row['last_full_run_completed'],
+                'last_episode_timestamp': row['last_episode_timestamp'],
+                'last_memory_timestamp': row['last_memory_timestamp'],
+                'last_task_change_timestamp': row['last_task_change_timestamp'],
+            }
+            for row in rows
+        ]
 
-    return [
-        {
-            'project_id': row['project_id'],
-            'last_full_run_completed': row['last_full_run_completed'],
-            'last_episode_timestamp': row['last_episode_timestamp'],
-            'last_memory_timestamp': row['last_memory_timestamp'],
-            'last_task_change_timestamp': row['last_task_change_timestamp'],
-        }
-        for row in rows
-    ]
+    return await _with_readonly_db(db_path, _query, [], caller='get_watermarks')
 
 
 async def get_last_attempted_run(db_path: Path) -> dict[str, dict]:
@@ -178,30 +175,27 @@ async def get_last_attempted_run(db_path: Path) -> dict[str, dict]:
 
     Returns a dict keyed by project_id → {id, status, started_at, completed_at}.
     """
-    try:
-        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                'SELECT r.id, r.project_id, r.status, r.started_at, r.completed_at'
-                ' FROM runs r'
-                ' INNER JOIN ('
-                '   SELECT project_id, MAX(started_at) AS max_started'
-                '   FROM runs GROUP BY project_id'
-                ' ) latest ON r.project_id = latest.project_id'
-                '   AND r.started_at = latest.max_started',
-            ) as cursor:
-                rows = await cursor.fetchall()
-    except (FileNotFoundError, sqlite3.OperationalError):
-        logger.debug('get_last_attempted_run: DB unavailable at %s', db_path, exc_info=True)
-        return {}
-
-    return {
-        row['project_id']: {
-            'id': row['id'], 'status': row['status'],
-            'started_at': row['started_at'], 'completed_at': row['completed_at'],
+    async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            'SELECT r.id, r.project_id, r.status, r.started_at, r.completed_at'
+            ' FROM runs r'
+            ' INNER JOIN ('
+            '   SELECT project_id, MAX(started_at) AS max_started'
+            '   FROM runs GROUP BY project_id'
+            ' ) latest ON r.project_id = latest.project_id'
+            '   AND r.started_at = latest.max_started',
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return {
+            row['project_id']: {
+                'id': row['id'], 'status': row['status'],
+                'started_at': row['started_at'], 'completed_at': row['completed_at'],
+            }
+            for row in rows
         }
-        for row in rows
-    }
+
+    return await _with_readonly_db(db_path, _query, {}, caller='get_last_attempted_run')
 
 
 _BUFFER_STATS_DEFAULT = {'buffered_count': 0, 'oldest_event_age_seconds': None}
@@ -297,24 +291,20 @@ async def get_latest_verdict(db_path: Path) -> dict | None:
 
     Returns dict with: run_id, severity, action_taken, reviewed_at.
     """
-    try:
-        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                'SELECT run_id, severity, action_taken, reviewed_at'
-                ' FROM judge_verdicts ORDER BY reviewed_at DESC LIMIT 1',
-            ) as cursor:
-                row = await cursor.fetchone()
-    except (FileNotFoundError, sqlite3.OperationalError):
-        logger.debug('get_latest_verdict: DB unavailable at %s', db_path, exc_info=True)
-        return None
+    async def _query(db: aiosqlite.Connection) -> dict | None:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            'SELECT run_id, severity, action_taken, reviewed_at'
+            ' FROM judge_verdicts ORDER BY reviewed_at DESC LIMIT 1',
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            'run_id': row['run_id'],
+            'severity': row['severity'],
+            'action_taken': row['action_taken'],
+            'reviewed_at': row['reviewed_at'],
+        }
 
-    if row is None:
-        return None
-
-    return {
-        'run_id': row['run_id'],
-        'severity': row['severity'],
-        'action_taken': row['action_taken'],
-        'reviewed_at': row['reviewed_at'],
-    }
+    return await _with_readonly_db(db_path, _query, None, caller='get_latest_verdict')
