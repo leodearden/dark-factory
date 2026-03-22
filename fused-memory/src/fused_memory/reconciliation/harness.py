@@ -238,6 +238,14 @@ class ReconciliationHarness:
                         if should:
                             acquired = await self.buffer.mark_run_active(project_id)
                             if acquired:
+                                # Skip cycle for halted projects
+                                if self.judge and self.judge.is_halted(project_id):
+                                    logger.warning(
+                                        f'Skipping cycle for halted project {project_id}'
+                                    )
+                                    await self.buffer.mark_run_complete(project_id)
+                                    continue
+
                                 # Select tier before draining
                                 tier = await self._select_tier(project_id)
 
