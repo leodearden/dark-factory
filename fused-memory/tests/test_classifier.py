@@ -1,5 +1,7 @@
 """Tests for the write classifier heuristics."""
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from fused_memory.models.enums import MemoryCategory
@@ -85,5 +87,66 @@ class TestClassifyAsync:
     async def test_no_match_falls_back_to_default(self, classifier):
         # LLM fallback disabled in mock_config, so should get default
         result = await classifier.classify('Hello world')
+        assert result.primary == MemoryCategory.observations_and_summaries
+        assert result.confidence < 0.5
+
+
+class TestLLMClassification:
+    """Test _llm_classify with a mocked OpenAI client."""
+
+    def _make_mock_client(self, content: str) -> MagicMock:
+        """Return a mock AsyncOpenAI client that yields *content* as LLM output."""
+        mock_msg = MagicMock()
+        mock_msg.content = content
+        mock_choice = MagicMock()
+        mock_choice.message = mock_msg
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        return mock_client
+
+    @pytest.mark.asyncio
+    async def test_nested_braces_in_reasoning_parsed(self, classifier):
+        """_llm_classify correctly parses JSON whose reasoning value contains nested braces."""
+        # The broken regex r'\{[^}]+\}' fails on this because it stops at the first '}'
+        # inside the nested {braces here} value, producing invalid JSON for json.loads.
+        llm_output = (
+            '{"primary": "decisions_and_rationale", "secondary": null, '
+            '"confidence": 0.9, '
+            '"reasoning": "chose PostgreSQL because {it has ACID + JSON support}"}'
+        )
+        classifier._openai_client = self._make_mock_client(llm_output)
+
+        result = await classifier._llm_classify('chose PostgreSQL')
+
+        assert result.primary == MemoryCategory.decisions_and_rationale
+        assert result.confidence == pytest.approx(0.9)
+        assert 'LLM:' in result.reasoning
+
+    @pytest.mark.asyncio
+    async def test_markdown_fence_response_parsed(self, classifier):
+        """_llm_classify correctly parses JSON wrapped in ```json...``` code fences."""
+        llm_output = (
+            '```json\n'
+            '{"primary": "temporal_facts", "secondary": null, '
+            '"confidence": 0.85, '
+            '"reasoning": "time references like {since v3.0} detected"}\n'
+            '```'
+        )
+        classifier._openai_client = self._make_mock_client(llm_output)
+
+        result = await classifier._llm_classify('The API was deprecated since v3.0')
+
+        assert result.primary == MemoryCategory.temporal_facts
+        assert result.confidence == pytest.approx(0.85)
+
+    @pytest.mark.asyncio
+    async def test_no_json_falls_back_to_default(self, classifier):
+        """_llm_classify returns the default when the LLM returns no JSON at all."""
+        classifier._openai_client = self._make_mock_client('I cannot classify this.')
+
+        result = await classifier._llm_classify('some content')
+
         assert result.primary == MemoryCategory.observations_and_summaries
         assert result.confidence < 0.5
