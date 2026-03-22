@@ -209,6 +209,65 @@ async def test_judge_call_llm_openai_normal(mock_journal):
 
 
 @pytest.mark.asyncio
+async def test_build_review_prompt_handles_error_dict_entries(mock_journal):
+    """_build_review_prompt must not crash when stage_reports contains plain dict entries.
+
+    The harness injects {'_error': {...}} dicts into stage_reports on failure
+    and during stale-run recovery.  Without the isinstance guard those dicts
+    raise AttributeError because they lack .items_flagged / .stats etc.
+    """
+    from datetime import UTC, datetime
+
+    from fused_memory.models.reconciliation import (
+        ReconciliationRun,
+        StageId,
+        StageReport,
+    )
+
+    config = _make_judge_config()
+    judge = Judge(config=config, journal=mock_journal)
+
+    # Build a run whose stage_reports contains both a real StageReport and a
+    # plain-dict _error entry (as injected by harness on failure / stale recovery)
+    now = datetime.now(UTC)
+    good_report = StageReport(
+        stage=StageId.memory_consolidator,
+        started_at=now,
+        completed_at=now,
+        items_flagged=[],
+        stats={'processed': 5},
+        llm_calls=2,
+        tokens_used=100,
+    )
+    run = ReconciliationRun(
+        id='run-bug1-test',
+        project_id='test-project',
+        run_type='full',
+        trigger_reason='buffer_size:3',
+        started_at=now,
+        events_processed=3,
+        status='failed',
+        stage_reports={
+            'memory_consolidator': good_report,
+            '_error': {
+                'error_type': 'RuntimeError',
+                'error_message': 'stage exploded',
+                'failed_stage': 'task_knowledge_sync',
+                'traceback': 'Traceback ...',
+            },
+        },
+    )
+
+    # Should NOT raise AttributeError
+    prompt = judge._build_review_prompt(run, entries=[], recent_verdicts=[])
+
+    # The prompt should contain data from the valid stage report
+    assert 'memory_consolidator' in prompt
+    # The prompt should also contain the error dict key
+    assert '_error' in prompt
+
+
+@pytest.mark.asyncio
 async def test_judge_call_llm_openai_none_content(mock_journal):
     """_call_llm with openai provider returns empty string when message.content is None."""
     config = _make_judge_config(judge_llm_provider='openai', judge_llm_model='gpt-4o-mini')
