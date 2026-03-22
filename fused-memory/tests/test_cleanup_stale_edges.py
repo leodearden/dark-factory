@@ -97,3 +97,56 @@ class TestQueryEdgesByTimeRange:
         cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
         assert cypher_params.get('start') == start
         assert cypher_params.get('end') == end
+
+
+# ---------------------------------------------------------------------------
+# step-3: GraphitiBackend.bulk_remove_edges
+# ---------------------------------------------------------------------------
+
+class TestBulkRemoveEdges:
+    """GraphitiBackend.bulk_remove_edges(uuids) deletes edges and returns count."""
+
+    @pytest.mark.asyncio
+    async def test_deletes_matching_edges(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        uuids = ['uuid-1', 'uuid-2', 'uuid-3']
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            count = await backend.bulk_remove_edges(uuids)
+        assert count == 3
+        graph.query.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_handles_empty_uuid_list(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            count = await backend.bulk_remove_edges([])
+        assert count == 0
+        # Should not query at all for empty list
+        graph.query.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        backend = GraphitiBackend(mock_config)  # client is None
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.bulk_remove_edges(['uuid-1'])
+
+    @pytest.mark.asyncio
+    async def test_passes_uuid_list_to_query(self, mock_config):
+        backend = _make_backend(mock_config)
+        graph = _make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        uuids = ['uuid-a', 'uuid-b']
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.bulk_remove_edges(uuids)
+        call_args = graph.query.call_args
+        assert call_args is not None
+        args, kwargs = call_args
+        cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        assert cypher_params.get('uuids') == uuids
