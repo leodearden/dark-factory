@@ -366,3 +366,70 @@ async def test_set_task_status_cancelled_to_cancelled_noop(taskmaster, reconcile
     assert stats['size'] == 0
     # No reconciliation should be triggered
     reconciler.reconcile_task.assert_not_called()
+
+
+# ── Tests for background task retention (step-3) ───────────────────────────
+
+
+def test_background_tasks_set_exists(taskmaster, reconciler, event_buffer):
+    """TaskInterceptor should have a _background_tasks set after init."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    assert hasattr(interceptor, '_background_tasks')
+    assert isinstance(interceptor._background_tasks, set)
+
+
+@pytest.mark.asyncio
+async def test_background_tasks_retained_during_reconciliation(taskmaster, reconciler, event_buffer):
+    """Background task should be in _background_tasks while running, removed after completion."""
+    # Use a future to control when reconcile_task finishes
+    started = asyncio.Event()
+    done_future: asyncio.Future = asyncio.get_event_loop().create_future()
+
+    async def slow_reconcile(**kwargs):
+        started.set()
+        await done_future
+        return {'actions': []}
+
+    reconciler.reconcile_task = AsyncMock(side_effect=slow_reconcile)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    await interceptor.set_task_status('1', 'done', '/project')
+
+    # Wait for the background task to start
+    await started.wait()
+    # The task should be retained in the set while running
+    assert len(interceptor._background_tasks) == 1
+
+    # Let the background task complete
+    done_future.set_result(None)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)  # Two ticks to ensure done callback fires
+
+    # Task should be removed from the set after completion
+    assert len(interceptor._background_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_background_tasks_retained_for_bulk_operations(taskmaster, reconciler, event_buffer):
+    """Background task from expand_task should be in _background_tasks during execution."""
+    started = asyncio.Event()
+    done_future: asyncio.Future = asyncio.get_event_loop().create_future()
+
+    async def slow_bulk_reconcile(**kwargs):
+        started.set()
+        await done_future
+        return {'actions': []}
+
+    reconciler.reconcile_bulk_tasks = AsyncMock(side_effect=slow_bulk_reconcile)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    await interceptor.expand_task('1', '/project')
+
+    await started.wait()
+    assert len(interceptor._background_tasks) == 1
+
+    done_future.set_result(None)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert len(interceptor._background_tasks) == 0
