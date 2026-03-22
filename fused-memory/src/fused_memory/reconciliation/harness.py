@@ -329,12 +329,21 @@ class ReconciliationHarness:
         project_id: str,
         trigger_reason: str,
         tier: TierConfig | None = None,
+        events: list | None = None,
     ) -> ReconciliationRun:
-        """Execute the three-stage pipeline for a project."""
+        """Execute the three-stage pipeline for a project.
+
+        Args:
+            events: Optional pre-drained event list.  When provided, buffer.drain()
+                    is skipped and these events are used directly.  This allows
+                    BacklogIterator to pass already-drained chunk events without
+                    a double-drain.
+        """
         tier = tier or TierConfig()
         run_id = str(uuid4())
         watermark = await self.journal.get_watermark(project_id)
-        events = await self.buffer.drain(project_id)
+        if events is None:
+            events = await self.buffer.drain(project_id)
 
         run = ReconciliationRun(
             id=run_id,
@@ -686,6 +695,7 @@ class BacklogIterator:
                     self.harness.run_full_cycle(
                         project_id, f'backlog_chunk:{chunk_num}:{len(chunk)}',
                         tier=opus_tier,
+                        events=chunk,
                     ),
                     timeout=self.config.cycle_timeout_seconds,
                 )
