@@ -499,6 +499,70 @@ async def test_journal_triggered_by_roundtrip(journal):
 
 
 @pytest.mark.asyncio
+async def test_timeout_marks_run_failed(journal, event_buffer, mock_memory_service):
+    """When asyncio.wait_for cancels run_full_cycle on timeout, the run must be marked 'failed'.
+
+    Bug 5: asyncio.wait_for timeout cancels run_full_cycle via asyncio.CancelledError.
+    CancelledError is NOT caught by 'except Exception', so complete_run(run_id, 'failed')
+    is never called, leaving the run stuck in 'running'.
+
+    This test confirms that after a timeout:
+    - The journal run has status 'failed' (not 'running')
+    - The buffer events were restored (buffer size == original event count)
+    """
+    import asyncio
+
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+    # Make first stage sleep forever (simulating a long-running stage)
+    async def slow_stage_run(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0]):
+        await asyncio.sleep(999)  # Will be cancelled by wait_for
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    harness.stages[0].run = slow_stage_run
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    # Push events so drain returns something
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+
+    # Run with a tight timeout to force cancellation
+    with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+        await asyncio.wait_for(
+            harness.run_full_cycle('test-project', 'buffer_size:2'),
+            timeout=0.1,
+        )
+
+    # Give the event loop a moment to process any cleanup
+    await asyncio.sleep(0.05)
+
+    # The run must be marked 'failed', not stuck in 'running'
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    assert len(recent_runs) >= 1
+    run = recent_runs[0]
+    assert run.status == 'failed', (
+        f"Expected run.status='failed' after timeout, got '{run.status}'. "
+        "Bug 5: CancelledError is not caught in run_full_cycle, so complete_run is never called."
+    )
+
+    # Events must have been restored to the buffer
+    stats = await event_buffer.get_buffer_stats('test-project')
+    assert stats['size'] == 2, (
+        f"Expected buffer size=2 after timeout, got {stats['size']}. "
+        "Bug 5: restore_drained is not called on CancelledError."
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_full_cycle_accepts_pre_drained_events(journal, event_buffer, mock_memory_service):
     """run_full_cycle() must accept an optional 'events' param to skip drain().
 
