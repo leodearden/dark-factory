@@ -9,6 +9,7 @@ from openai import AsyncOpenAI
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.models.memory import ClassificationResult
+from fused_memory.routing.json_extract import extract_json
 
 logger = logging.getLogger(__name__)
 
@@ -139,9 +140,9 @@ class WriteClassifier:
             )
             raw = response.choices[0].message.content or ''
 
-            # Extract JSON from the response
-            json_match = re.search(r'\{[^}]+\}', raw, re.DOTALL)
-            if not json_match:
+            # Extract JSON from the response (handles nested braces and code fences)
+            json_str = extract_json(raw)
+            if not json_str:
                 logger.warning(f'LLM classification returned no JSON: {raw[:200]}')
                 return ClassificationResult(
                     primary=MemoryCategory.observations_and_summaries,
@@ -149,7 +150,7 @@ class WriteClassifier:
                     reasoning='LLM returned non-JSON response',
                 )
 
-            data = json.loads(json_match.group())
+            data = json.loads(json_str)
             primary = MemoryCategory(data['primary'])
             secondary = MemoryCategory(data['secondary']) if data.get('secondary') else None
             confidence = float(data.get('confidence', 0.7))
