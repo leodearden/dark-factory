@@ -314,3 +314,36 @@ class TestServerSettingsPropagation:
         assert resp.status_code != 406, (
             f'Expected non-406 with dual Accept header, got {resp.status_code}: {resp.text[:200]}'
         )
+
+
+# ------------------------------------------------------------------
+# set_task_status input validation
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_rejects_invalid_status(mcp_server_with_tasks):
+    """set_task_status with an invalid status returns an error dict."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'set_task_status',
+        {'id': '1', 'project_root': '/project', 'status': 'bogus'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert 'bogus' in result['error'] or 'invalid' in result['error'].lower()
+    # Should mention valid statuses
+    assert 'done' in result['error'] or 'pending' in result['error']
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_valid_status_passes_through(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """set_task_status with a valid status passes through to the interceptor."""
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'set_task_status',
+        {'id': '1', 'project_root': '/project', 'status': 'done'},
+    )
+    task_interceptor.set_task_status.assert_called_once()
+    assert 'error' not in result
