@@ -1,150 +1,121 @@
 {
-  "task_id": "101",
-  "title": "Fix memory_service + durable_queue bugs",
+  "task_id": "52",
+  "title": "Fix: Rebuild FalkorDB vector index and replay DLQ dead letters",
   "files": [
-    "fused-memory/src/fused_memory/services/memory_service.py",
-    "fused-memory/src/fused_memory/services/durable_queue.py",
-    "fused-memory/src/fused_memory/backends/mem0_client.py",
-    "fused-memory/tests/test_memory_service.py",
-    "fused-memory/tests/test_durable_queue.py"
+    "fused-memory/src/fused_memory/backends/graphiti_client.py",
+    "fused-memory/src/fused_memory/maintenance/reindex.py",
+    "fused-memory/tests/test_reindex.py"
   ],
   "modules": [
-    "fused-memory/src/fused_memory/services",
     "fused-memory/src/fused_memory/backends",
+    "fused-memory/src/fused_memory/maintenance",
     "fused-memory/tests"
   ],
-  "analysis": "Four bugs across two service files, plus one backend file needing a new close() method.\n\nBug 1 (line 447, memory_service.py): `success=not (_graphiti_error and _mem0_error)` uses `and`, so it reports success=True when only ONE of the targeted stores errors. Python short-circuit: if _graphiti_error is None (Graphiti wasn't targeted or succeeded), `None and X` is `None`, `not None` is `True`. So a Mem0-only write that fails still reports success. Fix: change `and` to `or`.\n\nBug 2 (lines 465-467, memory_service.py): Only `_graphiti_error` is appended to the response message. If Mem0 fails, the caller sees 'Memory stored in []' with no error indication. Fix: add parallel `if _mem0_error:` block.\n\nBug 3 (lines 94-97, memory_service.py): `close()` only closes durable_queue and graphiti. It misses _write_journal (has close()), _event_buffer (has close()), and mem0 (needs new close()). Mem0Backend holds AsyncMemory instances with Qdrant connections that leak. Fix: add Mem0Backend.close() and call all three in MemoryService.close().\n\nBug 4 (lines 180-194, durable_queue.py): `enqueue_batch` starts a transaction with BEGIN but has no try/except/rollback. An exception mid-batch (e.g. a KeyError from malformed item) leaves an open transaction, potentially deadlocking subsequent operations. Fix: wrap in try/except with explicit rollback.\n\nTest patterns: Both test files already exist with good patterns \u2014 mock_config fixture from conftest.py, MagicMock/AsyncMock for backends in test_memory_service.py, and real SQLite in tmp_path for test_durable_queue.py.\n\nReview feedback (post-step-8): Mem0Backend.close() at line 197 calls client.close() without await. AsyncQdrantClient.close() is a coroutine \u2014 the unawaited call silently discards the coroutine object, never releasing the connection. The TestClose class mocks service.mem0.close at the MemoryService level so the actual Mem0Backend.close() code path is never exercised. Steps 9-10 address both issues: a dedicated backend-level unit test, then the await fix.",
+  "analysis": "The DurableWriteQueue has 81 dead letters caused by a FalkorDB vector index dimension mismatch. When FalkorDB creates a VECTOR index, its dimension is fixed at creation time. If the embedder model changes (e.g. from 1024-dim to 1536-dim), all subsequent writes fail because the new vectors don't match the index dimension. The existing `ReindexManager` has `reindex()` (re-embeds stale vectors) and `reindex_and_replay()` (reindex + replay dead letters), but it's missing the critical first step: dropping the old wrong-dimension vector indices. Without dropping them first, even re-embedded correct-dimension vectors would be rejected by the stale index.\n\nThe fix requires three code changes:\n1. A new `drop_vector_indices()` method on `GraphitiBackend` that uses existing `list_indices()` to find VECTOR-type indices and existing `drop_index()` to remove them.\n2. Enhancement of `ReindexManager.reindex_and_replay()` with a `drop_indices=True` parameter that calls `drop_vector_indices()` before re-embedding.\n3. Enhancement of `run_reindex()` CLI entrypoint to support index dropping via a `drop_indices` parameter.\n\nThe existing `list_indices()`, `drop_index()`, `query_stale_*_embeddings()`, `update_*_embedding()`, and `replay_dead()` methods are all already implemented and tested. This task composes them into the correct operational sequence: drop stale indices \u2192 re-embed all vectors \u2192 replay dead letters.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing test: add_memory success=False when single targeted store (Mem0-only) fails. In TestAddMemory, add test_success_false_when_only_targeted_store_fails: set category='preferences_and_norms' (Mem0-only, not dual_write), mock mem0.add to raise, add mock _write_journal, call add_memory, assert _write_journal.log_write_op was called with success=False. Currently passes because `not (None and error)` = `not None` = True.",
+      "description": "Write failing tests for `GraphitiBackend.drop_vector_indices()`. Add TestDropVectorIndices class in test_reindex.py with three tests: (1) test_drops_only_vector_type_indices \u2014 list_indices returns [VECTOR on Entity/name_embedding, FULLTEXT on Entity/name, VECTOR on RELATES_TO/fact_embedding], assert drop_index called exactly twice with the VECTOR entries only; (2) test_returns_list_of_dropped_indices \u2014 verify return value is a list of {'label': ..., 'field': ...} dicts for dropped indices; (3) test_no_op_when_no_vector_indices \u2014 list_indices returns only FULLTEXT/RANGE entries, assert drop_index never called and return is empty list. Follow existing test pattern: _make_backend(config), patch cast, use AsyncMock for list_indices and drop_index.",
       "status": "done",
-      "commit": "c4829c8"
+      "commit": "4941c4e"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Fix Bug 1: In memory_service.py line 447, change `success=not (_graphiti_error and _mem0_error)` to `success=not (_graphiti_error or _mem0_error)`. This ensures success=False when ANY store errors, not just when ALL stores error.",
+      "description": "Add `drop_vector_indices()` method to GraphitiBackend in graphiti_client.py. The method calls `self.list_indices()`, filters for entries where `type == 'VECTOR'`, calls `self.drop_index(label, field)` for each, and returns a list of dicts with 'label' and 'field' keys for each dropped index. Logs the count of dropped indices at INFO level.",
       "status": "done",
-      "commit": "bdd72df"
+      "commit": "993f156"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write failing test: mem0 error appears in response message. In TestAddMemory, add test_mem0_error_surfaced_in_response: set category='preferences_and_norms', mock mem0.add to raise ValueError('qdrant connection refused'), call add_memory, assert 'mem0_error' substring appears in result.message. Currently fails because only _graphiti_error is appended to msg.",
+      "description": "Write failing tests for `ReindexManager.reindex_and_replay()` with `drop_indices` parameter. Add to TestReindexAndReplay class: (1) test_drops_indices_before_reindex_when_requested \u2014 call reindex_and_replay(queue, drop_indices=True), verify backend.drop_vector_indices() called before reindex() using call_order tracking; (2) test_skips_drop_when_drop_indices_false \u2014 call reindex_and_replay(queue, drop_indices=False), verify backend.drop_vector_indices() NOT called; (3) test_default_drop_indices_is_false \u2014 call reindex_and_replay(queue) without drop_indices, verify backend.drop_vector_indices() NOT called (backward compatible). (4) test_result_includes_indices_dropped \u2014 verify return dict includes 'indices_dropped' key with the list from drop_vector_indices.",
       "status": "done",
-      "commit": "4902663"
+      "commit": "82bd5a7"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Fix Bug 2: After the existing `if _graphiti_error:` block (line 466-467), add parallel `if _mem0_error: msg += f' [mem0_error: {_mem0_error}]'` to surface Mem0 errors in the response message.",
+      "description": "Enhance `ReindexManager.reindex_and_replay()` in reindex.py. Add `drop_indices: bool = False` parameter. When True, call `self.backend.drop_vector_indices()` before `self.reindex()` and include the result in the return dict as 'indices_dropped'. When False (default), skip the drop step and set 'indices_dropped' to [] in the return dict. Log the drop operation at INFO level.",
       "status": "done",
-      "commit": "9fd0c54"
+      "commit": "4e7220f"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write failing test: close() calls all sub-resource close methods. Add new TestClose class in test_memory_service.py. Set up service with mock _write_journal (AsyncMock with close), mock _event_buffer (AsyncMock with close), and mock mem0 (AsyncMock with close). Call service.close(). Assert all five close methods called: durable_queue.close(), graphiti.close(), mem0.close(), _write_journal.close(), _event_buffer.close(). Currently fails because close() only calls first two.",
+      "description": "Write failing tests for `run_reindex()` with `drop_indices` parameter. Add to TestRunReindex: (1) test_run_reindex_passes_drop_indices_true \u2014 call run_reindex(drop_indices=True), mock ReindexManager.reindex_and_replay, verify it receives drop_indices=True; (2) test_run_reindex_default_drop_indices_false \u2014 call run_reindex() with no drop_indices argument, verify reindex_and_replay called with drop_indices=False.",
       "status": "done",
-      "commit": "4c46bcb"
+      "commit": "64c4023"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Fix Bug 3: (a) Add async def close() to Mem0Backend in mem0_client.py \u2014 iterate _instances, close each instance's vector_store.client if it has a close method, then clear _instances. (b) Update MemoryService.close() to also call self.mem0.close(), self._write_journal.close() (if set), and self._event_buffer.close() (if set). Use contextlib.suppress(Exception) around each to ensure all resources attempt cleanup.",
+      "description": "Update `run_reindex()` in reindex.py to accept `drop_indices: bool = False` parameter. Pass it through to `manager.reindex_and_replay(service.durable_queue, drop_indices=drop_indices)`. Update the __main__ block to accept --drop-indices CLI flag via argparse and pass it to run_reindex(). Log the full result including indices_dropped count.",
       "status": "done",
-      "commit": "ae38043"
-    },
-    {
-      "id": "step-7",
-      "type": "test",
-      "description": "Write failing test: enqueue_batch rolls back on mid-batch exception. Add TestEnqueueBatchRollback class in test_durable_queue.py. Enqueue a batch of 3 items where the 2nd item is missing 'operation' key (triggers KeyError). Assert the exception is raised, then check DB has 0 pending items (verifying rollback). Currently fails because no rollback leaves partial inserts.",
-      "status": "done",
-      "commit": "0ad207f"
-    },
-    {
-      "id": "step-8",
-      "type": "impl",
-      "description": "Fix Bug 4: In durable_queue.py enqueue_batch(), replace `async with self._db.execute('BEGIN'):` with explicit transaction management: `await self._db.execute('BEGIN')` then wrap the for loop + commit in try/except, calling `await self._db.rollback()` on exception before re-raising.",
-      "status": "done",
-      "commit": "e3ce3b9"
-    },
-    {
-      "id": "step-9",
-      "type": "test",
-      "description": "Write failing test for Mem0Backend.close() directly exercising the await path. Add TestMem0BackendClose class in test_memory_service.py (following TestGraphitiBackendRemoveEdge pattern). Construct a Mem0Backend(mock_config), inject a hand-rolled _instances dict containing a mock whose vector_store.client.close is an AsyncMock. Call await backend.close(). Assert client.close was awaited (assert_awaited_once). Also assert _instances is cleared afterward. This test WILL FAIL against the current code at mem0_client.py:197 because client.close() is called without await \u2014 the AsyncMock's close coroutine is created but never awaited, so assert_awaited_once will fail.",
-      "status": "done",
-      "commit": "8202d76"
-    },
-    {
-      "id": "step-10",
-      "type": "impl",
-      "description": "Fix unawaited close in Mem0Backend.close(): In mem0_client.py line 197, change `client.close()` to `await client.close()`. This follows the established async-close pattern used by GraphitiBackend.close(), WriteJournal.close(), and EventBuffer.close() \u2014 all of which use await. The await ensures AsyncQdrantClient.close() actually executes and releases the connection, rather than silently discarding the coroutine object.",
-      "status": "done",
-      "commit": "9098055"
+      "commit": "97197f0"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Use `or` instead of `and` for success logic",
-      "rationale": "success=True should only be reported when ALL targeted stores succeed. With `and`, it's True when at least one store succeeds. With `or`, it's False when any store fails \u2014 correct behavior for a composite operation."
+      "decision": "Add drop_vector_indices() to GraphitiBackend rather than to ReindexManager",
+      "rationale": "GraphitiBackend already owns list_indices() and drop_index() \u2014 the new method is a natural composition of existing backend primitives. Keeping it on GraphitiBackend lets other consumers (future MCP tools, maintenance scripts) use it independently of ReindexManager."
     },
     {
-      "decision": "Mem0Backend.close() uses defensive attribute traversal",
-      "rationale": "AsyncMemory from the mem0 library doesn't guarantee a close() interface. We traverse instance.vector_store.client to reach the Qdrant client's close(), using hasattr checks and contextlib.suppress to avoid crashes from library version changes."
+      "decision": "Use drop_indices=False as default for backward compatibility",
+      "rationale": "The existing reindex_and_replay() is used by reconciliation and other flows that don't need index dropping. Defaulting to False ensures no behavioral change for existing callers. Only the explicit fix scenario passes True."
     },
     {
-      "decision": "MemoryService.close() wraps each sub-resource close in suppress(Exception)",
-      "rationale": "close() must be best-effort \u2014 a failure closing one resource shouldn't prevent others from being cleaned up. This matches the pattern used in GraphitiBackend.close()."
+      "decision": "Filter by type == 'VECTOR' from list_indices() rather than hardcoding index names",
+      "rationale": "FalkorDB vector index names and structures could change between graphiti_core versions. Filtering by the VECTOR type from db.indexes() is robust against schema evolution \u2014 it drops all vector indices regardless of naming conventions."
     },
     {
-      "decision": "Test rollback by providing malformed batch item (missing key)",
-      "rationale": "Using a KeyError from a missing 'operation' key is a realistic failure mode (malformed input) that tests the rollback path without needing to mock internal SQLite operations. The test verifies no items persisted by querying the DB directly."
+      "decision": "Include indices_dropped in the return dict rather than just a count",
+      "rationale": "Returning the full list of dropped (label, field) pairs gives operational visibility. The operator can verify exactly which indices were rebuilt, which is critical for a dimension mismatch fix where specificity matters."
     },
     {
-      "decision": "Journal success test uses mock _write_journal rather than real SQLite",
-      "rationale": "The test_memory_service.py pattern uses fully mocked backends. Adding a real WriteJournal would complicate the fixture and test an integration path. Mocking lets us inspect the exact success= parameter passed to log_write_op."
-    },
-    {
-      "decision": "Dedicated backend-level test for Mem0Backend.close() alongside service-level TestClose",
-      "rationale": "TestClose (step-5) validates that MemoryService.close() dispatches to all 5 sub-resources, but mocks mem0.close at the service boundary. The new TestMem0BackendClose (step-9) directly exercises the Mem0Backend.close() implementation \u2014 specifically that it awaits client.close() rather than calling it synchronously. Both layers of testing are needed: service-level for orchestration coverage, backend-level for correctness of the actual cleanup logic. This follows the existing pattern where TestGraphitiBackendRemoveEdge tests GraphitiBackend directly."
+      "decision": "Keep the fix as a code enhancement rather than a one-off script",
+      "rationale": "Dimension mismatches can recur when embedding models change. Having the drop-and-rebuild sequence as a supported code path (with tests) means future occurrences can be fixed by running `python -m fused_memory.maintenance.reindex --drop-indices` rather than writing ad-hoc scripts."
     }
   ],
   "reuse": [
     {
+      "what": "GraphitiBackend.list_indices() \u2014 already returns parsed index records with label, field, type, entity_type",
+      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py lines 341-358",
+      "how": "drop_vector_indices() calls list_indices() and filters result for type=='VECTOR'. No new queries needed."
+    },
+    {
+      "what": "GraphitiBackend.drop_index(label, field) \u2014 generates DROP INDEX cypher",
+      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py lines 360-366",
+      "how": "drop_vector_indices() calls drop_index() for each VECTOR index found. The existing method handles the FalkorDB-specific syntax."
+    },
+    {
+      "what": "Test helpers _make_backend() and _make_graph_mock()",
+      "where": "fused-memory/tests/test_reindex.py lines 18-33",
+      "how": "New TestDropVectorIndices tests use the same pattern of building a GraphitiBackend with mock client and patching cast to inject graph mocks."
+    },
+    {
+      "what": "Existing TestListIndices and TestDropIndex test patterns",
+      "where": "fused-memory/tests/test_reindex.py lines 315-384",
+      "how": "The new tests follow the same structure: build backend, create graph mock, patch cast, call method, verify. The new tests compose these existing operations."
+    },
+    {
+      "what": "Existing TestReindexAndReplay test patterns with call_order tracking",
+      "where": "fused-memory/tests/test_reindex.py lines 520-606",
+      "how": "New tests use the same pattern: MagicMock backend/embedder, AsyncMock for reindex/replay_dead, call_order list to verify sequencing."
+    },
+    {
       "what": "mock_config fixture from conftest.py",
-      "where": "fused-memory/tests/conftest.py",
-      "how": "Already used by the service fixture. No changes needed \u2014 all new tests use the existing service fixture."
+      "where": "fused-memory/tests/conftest.py lines 46-77",
+      "how": "Used by TestDropVectorIndices via the existing mock_config parameter. Provides a FusedMemoryConfig that doesn't require real services."
     },
     {
-      "what": "service fixture with mocked backends",
-      "where": "fused-memory/tests/test_memory_service.py lines 13-39",
-      "how": "Reuse for Bug 1, 2, 3 tests. For Bug 1/2, need to override mem0.add to raise. For Bug 3, need to add mock close() methods on sub-resources."
-    },
-    {
-      "what": "queue fixture with real SQLite",
-      "where": "fused-memory/tests/test_durable_queue.py lines 21-35",
-      "how": "The existing fixture creates a real DurableWriteQueue in tmp_path. Can reuse for the rollback test since we need real SQLite to verify no data persisted."
-    },
-    {
-      "what": "EventBuffer.close() already exists",
-      "where": "fused-memory/src/fused_memory/reconciliation/event_buffer.py lines 521-525",
-      "how": "Already has the close pattern (check _db, close, set None). Just need to call it from MemoryService.close()."
-    },
-    {
-      "what": "WriteJournal.close() already exists",
-      "where": "fused-memory/src/fused_memory/services/write_journal.py lines 72-74",
-      "how": "Already has close(). Just need to call it from MemoryService.close()."
-    },
-    {
-      "what": "TestGraphitiBackendRemoveEdge pattern for direct backend testing",
-      "where": "fused-memory/tests/test_memory_service.py lines 485-511",
-      "how": "Provides the established pattern for constructing a backend with mock_config, injecting mock internals, and testing backend methods directly. TestMem0BackendClose (step-9) follows this same pattern."
+      "what": "Existing TestRunReindex mock patterns",
+      "where": "fused-memory/tests/test_reindex.py lines 613-738",
+      "how": "New run_reindex tests follow the exact same pattern of patching FusedMemoryConfig, MemoryService, OpenAIEmbedder, and ReindexManager to test the orchestration without real backends."
     }
   ],
-  "_session_id": "101-6b22f465",
-  "_created_at": "2026-03-22T22:18:15.596082+00:00"
+  "_session_id": "52-3a097fe4",
+  "_created_at": "2026-03-22T22:49:38.430543+00:00"
 }
