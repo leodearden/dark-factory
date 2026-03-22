@@ -104,6 +104,24 @@ class TestAddMemory:
 
 
     @pytest.mark.asyncio
+    async def test_mem0_error_surfaced_in_response(self, service):
+        """Bug 2: mem0 errors must appear in the response message.
+
+        Currently only _graphiti_error is appended; a Mem0 failure is silent.
+        """
+        service.mem0.add = AsyncMock(side_effect=ValueError('qdrant connection refused'))
+
+        result = await service.add_memory(
+            content='Always use type hints',
+            category='preferences_and_norms',
+            project_id='test',
+        )
+
+        assert 'mem0_error' in result.message, (
+            f'Expected mem0_error in response message, got: {result.message!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_success_false_when_only_targeted_store_fails(self, service):
         """Bug 1: success must be False when ANY targeted store errors.
 
