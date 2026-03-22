@@ -6,7 +6,7 @@ import os
 from datetime import UTC, datetime
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import JudgeVerdict, VerdictAction, VerdictSeverity
+from fused_memory.models.reconciliation import JudgeVerdict, StageReport, VerdictAction, VerdictSeverity
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
@@ -103,12 +103,16 @@ class Judge:
 
         stage_reports = {}
         for stage_id, report in run.stage_reports.items():
-            stage_reports[stage_id] = {
-                'items_flagged': len(report.items_flagged),
-                'stats': report.stats,
-                'llm_calls': report.llm_calls,
-                'tokens_used': report.tokens_used,
-            }
+            if isinstance(report, StageReport):
+                stage_reports[stage_id] = {
+                    'items_flagged': len(report.items_flagged),
+                    'stats': report.stats,
+                    'llm_calls': report.llm_calls,
+                    'tokens_used': report.tokens_used,
+                }
+            else:
+                # Plain dict entries (e.g. _error injected by harness on failure)
+                stage_reports[stage_id] = report
 
         # Summarize MCP actions
         actions = combined_actions or []
