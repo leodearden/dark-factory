@@ -150,6 +150,36 @@ class TestBulkRemoveEdges:
         cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
         assert cypher_params.get('uuids') == uuids
 
+    @pytest.mark.asyncio
+    async def test_returns_actual_deletion_count_not_input_length(self, mock_config):
+        """bulk_remove_edges returns the actual count of matched edges, not len(uuids).
+
+        Pass 3 UUIDs but simulate only 2 existing in FalkorDB via pre-count query.
+        The return value must be 2, not 3.
+        """
+        backend = _make_backend(mock_config)
+        cast_target = MagicMock()
+
+        # Pre-count result: 2 of 3 UUIDs exist as edges
+        pre_count_result = MagicMock()
+        pre_count_result.result_set = [[2]]
+
+        # DELETE result: empty (no RETURN clause)
+        delete_result = MagicMock()
+        delete_result.result_set = []
+
+        graph_mock = MagicMock()
+        graph_mock.query = AsyncMock(side_effect=[pre_count_result, delete_result])
+        cast_target._get_graph = MagicMock(return_value=graph_mock)
+
+        uuids = ['uuid-1', 'uuid-2', 'uuid-3']
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            count = await backend.bulk_remove_edges(uuids)
+
+        # Must return 2 (actual matched count), not 3 (input length)
+        assert count == 2
+        assert graph_mock.query.await_count == 2
+
 
 # ---------------------------------------------------------------------------
 # step-5: CleanupManager and CleanupResult
