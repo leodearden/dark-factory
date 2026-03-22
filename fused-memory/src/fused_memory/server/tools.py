@@ -333,6 +333,13 @@ def create_mcp_server(
             session_id: Filter by session (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if limit <= 0:
+            return {
+                'error': f'Invalid limit {limit!r}. Must be a positive integer.',
+                'error_type': 'ValidationError',
+            }
+        if limit > 1000:
+            limit = 1000
         try:
             results = await memory_service.search(
                 query=query,
