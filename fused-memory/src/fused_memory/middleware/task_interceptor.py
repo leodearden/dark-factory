@@ -36,6 +36,7 @@ class TaskInterceptor:
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
         self.buffer = event_buffer
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def _ensure_taskmaster(self) -> TaskmasterBackend:
         """Return a connected TaskmasterBackend, or raise with a structured error."""
@@ -120,6 +121,8 @@ class TaskInterceptor:
                 ),
                 name=f'targeted-recon-{task_id}-{status}',
             )
+            self._background_tasks.add(task)
+            task.add_done_callback(lambda t: self._background_tasks.discard(t))
             task.add_done_callback(self._on_reconciliation_done)
             result['reconciliation'] = {'status': 'async', 'task_id': task_id}
 
@@ -156,6 +159,8 @@ class TaskInterceptor:
                 ),
                 name=f'bulk-recon-expand-{task_id}',
             )
+            self._background_tasks.add(task)
+            task.add_done_callback(lambda t: self._background_tasks.discard(t))
             task.add_done_callback(self._on_reconciliation_done)
             result['reconciliation'] = {'status': 'async', 'task_id': task_id}
 
@@ -188,6 +193,8 @@ class TaskInterceptor:
                 ),
                 name='bulk-recon-parse-prd',
             )
+            self._background_tasks.add(task)
+            task.add_done_callback(lambda t: self._background_tasks.discard(t))
             task.add_done_callback(self._on_reconciliation_done)
             result['reconciliation'] = {'status': 'async', 'operation': 'parse_prd'}
 
