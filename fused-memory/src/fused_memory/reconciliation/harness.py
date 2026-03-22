@@ -439,8 +439,11 @@ class ReconciliationHarness:
                 'error_message': 'Run cancelled (timeout or external cancellation)',
                 'failed_stage': current_stage_name,
             }
-            await self.journal.complete_run(run_id, 'failed')
-            await self.buffer.restore_drained(project_id)
+            try:
+                await self.journal.complete_run(run_id, 'failed')
+                await self.buffer.restore_drained(project_id)
+            except Exception as cleanup_err:
+                logger.error(f'Cleanup failed after cancellation: {cleanup_err}')
             logger.error(
                 f'Reconciliation run {run_id} cancelled for {project_id} '
                 f'(stage: {current_stage_name})'
