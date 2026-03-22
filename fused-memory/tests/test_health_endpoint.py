@@ -494,3 +494,47 @@ async def test_search_caps_limit_at_1000(mcp_server_with_service):
     mock_service.search.assert_called_once()
     _, kwargs = mock_service.search.call_args
     assert kwargs['limit'] == 1000
+
+
+# ------------------------------------------------------------------
+# get_episodes last_n validation
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_episodes_rejects_zero_last_n(mcp_server):
+    """get_episodes with last_n=0 returns an error dict."""
+    result = await mcp_server._tool_manager.call_tool(
+        'get_episodes',
+        {'project_id': 'proj', 'last_n': 0},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert 'last_n' in result['error'].lower() or '0' in result['error']
+
+
+@pytest.mark.asyncio
+async def test_get_episodes_rejects_negative_last_n(mcp_server):
+    """get_episodes with last_n=-1 returns an error dict."""
+    result = await mcp_server._tool_manager.call_tool(
+        'get_episodes',
+        {'project_id': 'proj', 'last_n': -1},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+
+
+@pytest.mark.asyncio
+async def test_get_episodes_caps_last_n_at_1000(mcp_server_with_service):
+    """get_episodes with last_n=5000 silently caps to 1000 and calls service with last_n=1000."""
+    server, mock_service = mcp_server_with_service
+    result = await server._tool_manager.call_tool(
+        'get_episodes',
+        {'project_id': 'proj', 'last_n': 5000},
+    )
+    assert isinstance(result, dict)
+    assert 'episodes' in result
+    # Verify the service was called with capped last_n=1000
+    mock_service.get_episodes.assert_called_once()
+    _, kwargs = mock_service.get_episodes.call_args
+    assert kwargs['last_n'] == 1000
