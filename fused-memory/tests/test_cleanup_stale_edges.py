@@ -231,3 +231,118 @@ class TestCleanupManager:
         assert result.edges_found == 0
         assert result.edges_deleted == 0
         backend.bulk_remove_edges.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# step-7: run_cleanup async entrypoint
+# ---------------------------------------------------------------------------
+
+class TestRunCleanup:
+    """run_cleanup() loads config, initializes MemoryService, runs cleanup, closes."""
+
+    @pytest.mark.asyncio
+    async def test_loads_config_and_runs_cleanup(self):
+        """run_cleanup() initializes the MemoryService and calls cleanup with correct args."""
+        from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
+
+        mock_cfg = MagicMock()
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+
+        mock_result = CleanupResult(edges_found=2, edges_deleted=2)
+
+        with (
+            patch('fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig', return_value=mock_cfg),
+            patch('fused_memory.maintenance.cleanup_stale_edges.MemoryService', return_value=mock_service),
+            patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.cleanup = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
+
+            result = await run_cleanup(
+                start='2026-03-22T17:50:00',
+                end='2026-03-22T18:15:00',
+            )
+
+        mock_service.initialize.assert_awaited_once()
+        mock_mgr.cleanup.assert_awaited_once_with(
+            start='2026-03-22T17:50:00',
+            end='2026-03-22T18:15:00',
+            dry_run=False,
+        )
+        assert result == mock_result
+
+    @pytest.mark.asyncio
+    async def test_closes_service_on_success(self):
+        """run_cleanup() calls service.close() in finally block after success."""
+        from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
+
+        mock_cfg = MagicMock()
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+
+        mock_result = CleanupResult()
+
+        with (
+            patch('fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig', return_value=mock_cfg),
+            patch('fused_memory.maintenance.cleanup_stale_edges.MemoryService', return_value=mock_service),
+            patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.cleanup = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
+
+            await run_cleanup()
+
+        mock_service.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_closes_service_on_error(self):
+        """run_cleanup() calls service.close() in finally block even when cleanup raises."""
+        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
+
+        mock_cfg = MagicMock()
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+
+        with (
+            patch('fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig', return_value=mock_cfg),
+            patch('fused_memory.maintenance.cleanup_stale_edges.MemoryService', return_value=mock_service),
+            patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.cleanup = AsyncMock(side_effect=RuntimeError('falkordb unavailable'))
+            mock_mgr_cls.return_value = mock_mgr
+
+            with pytest.raises(RuntimeError, match='falkordb unavailable'):
+                await run_cleanup()
+
+        mock_service.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_passes_dry_run_flag(self):
+        """run_cleanup(dry_run=True) passes dry_run=True to cleanup."""
+        from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
+
+        mock_cfg = MagicMock()
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+
+        mock_result = CleanupResult(edges_found=3, edges_deleted=0)
+
+        with (
+            patch('fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig', return_value=mock_cfg),
+            patch('fused_memory.maintenance.cleanup_stale_edges.MemoryService', return_value=mock_service),
+            patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.cleanup = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
+
+            await run_cleanup(dry_run=True)
+
+        call_kwargs = mock_mgr.cleanup.call_args
+        assert call_kwargs is not None
+        _, kwargs = call_kwargs
+        assert kwargs.get('dry_run') is True
