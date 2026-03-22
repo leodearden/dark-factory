@@ -13,7 +13,7 @@
     "fused-memory/src/fused_memory/backends",
     "fused-memory/tests"
   ],
-  "analysis": "Four bugs across two service files, plus one backend file needing a new close() method.\n\nBug 1 (line 447, memory_service.py): `success=not (_graphiti_error and _mem0_error)` uses `and`, so it reports success=True when only ONE of the targeted stores errors. Python short-circuit: if _graphiti_error is None (Graphiti wasn't targeted or succeeded), `None and X` is `None`, `not None` is `True`. So a Mem0-only write that fails still reports success. Fix: change `and` to `or`.\n\nBug 2 (lines 465-467, memory_service.py): Only `_graphiti_error` is appended to the response message. If Mem0 fails, the caller sees 'Memory stored in []' with no error indication. Fix: add parallel `if _mem0_error:` block.\n\nBug 3 (lines 94-97, memory_service.py): `close()` only closes durable_queue and graphiti. It misses _write_journal (has close()), _event_buffer (has close()), and mem0 (needs new close()). Mem0Backend holds AsyncMemory instances with Qdrant connections that leak. Fix: add Mem0Backend.close() and call all three in MemoryService.close().\n\nBug 4 (lines 180-194, durable_queue.py): `enqueue_batch` starts a transaction with BEGIN but has no try/except/rollback. An exception mid-batch (e.g. a KeyError from malformed item) leaves an open transaction, potentially deadlocking subsequent operations. Fix: wrap in try/except with explicit rollback.\n\nTest patterns: Both test files already exist with good patterns \u2014 mock_config fixture from conftest.py, MagicMock/AsyncMock for backends in test_memory_service.py, and real SQLite in tmp_path for test_durable_queue.py.",
+  "analysis": "Four bugs across two service files, plus one backend file needing a new close() method.\n\nBug 1 (line 447, memory_service.py): `success=not (_graphiti_error and _mem0_error)` uses `and`, so it reports success=True when only ONE of the targeted stores errors. Python short-circuit: if _graphiti_error is None (Graphiti wasn't targeted or succeeded), `None and X` is `None`, `not None` is `True`. So a Mem0-only write that fails still reports success. Fix: change `and` to `or`.\n\nBug 2 (lines 465-467, memory_service.py): Only `_graphiti_error` is appended to the response message. If Mem0 fails, the caller sees 'Memory stored in []' with no error indication. Fix: add parallel `if _mem0_error:` block.\n\nBug 3 (lines 94-97, memory_service.py): `close()` only closes durable_queue and graphiti. It misses _write_journal (has close()), _event_buffer (has close()), and mem0 (needs new close()). Mem0Backend holds AsyncMemory instances with Qdrant connections that leak. Fix: add Mem0Backend.close() and call all three in MemoryService.close().\n\nBug 4 (lines 180-194, durable_queue.py): `enqueue_batch` starts a transaction with BEGIN but has no try/except/rollback. An exception mid-batch (e.g. a KeyError from malformed item) leaves an open transaction, potentially deadlocking subsequent operations. Fix: wrap in try/except with explicit rollback.\n\nTest patterns: Both test files already exist with good patterns \u2014 mock_config fixture from conftest.py, MagicMock/AsyncMock for backends in test_memory_service.py, and real SQLite in tmp_path for test_durable_queue.py.\n\nReview feedback (post-step-8): Mem0Backend.close() at line 197 calls client.close() without await. AsyncQdrantClient.close() is a coroutine \u2014 the unawaited call silently discards the coroutine object, never releasing the connection. The TestClose class mocks service.mem0.close at the MemoryService level so the actual Mem0Backend.close() code path is never exercised. Steps 9-10 address both issues: a dedicated backend-level unit test, then the await fix.",
   "prerequisites": [],
   "steps": [
     {
@@ -71,6 +71,20 @@
       "description": "Fix Bug 4: In durable_queue.py enqueue_batch(), replace `async with self._db.execute('BEGIN'):` with explicit transaction management: `await self._db.execute('BEGIN')` then wrap the for loop + commit in try/except, calling `await self._db.rollback()` on exception before re-raising.",
       "status": "done",
       "commit": "e3ce3b9"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write failing test for Mem0Backend.close() directly exercising the await path. Add TestMem0BackendClose class in test_memory_service.py (following TestGraphitiBackendRemoveEdge pattern). Construct a Mem0Backend(mock_config), inject a hand-rolled _instances dict containing a mock whose vector_store.client.close is an AsyncMock. Call await backend.close(). Assert client.close was awaited (assert_awaited_once). Also assert _instances is cleared afterward. This test WILL FAIL against the current code at mem0_client.py:197 because client.close() is called without await \u2014 the AsyncMock's close coroutine is created but never awaited, so assert_awaited_once will fail.",
+      "status": "done",
+      "commit": "8202d76"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Fix unawaited close in Mem0Backend.close(): In mem0_client.py line 197, change `client.close()` to `await client.close()`. This follows the established async-close pattern used by GraphitiBackend.close(), WriteJournal.close(), and EventBuffer.close() \u2014 all of which use await. The await ensures AsyncQdrantClient.close() actually executes and releases the connection, rather than silently discarding the coroutine object.",
+      "status": "done",
+      "commit": "9098055"
     }
   ],
   "design_decisions": [
@@ -93,6 +107,10 @@
     {
       "decision": "Journal success test uses mock _write_journal rather than real SQLite",
       "rationale": "The test_memory_service.py pattern uses fully mocked backends. Adding a real WriteJournal would complicate the fixture and test an integration path. Mocking lets us inspect the exact success= parameter passed to log_write_op."
+    },
+    {
+      "decision": "Dedicated backend-level test for Mem0Backend.close() alongside service-level TestClose",
+      "rationale": "TestClose (step-5) validates that MemoryService.close() dispatches to all 5 sub-resources, but mocks mem0.close at the service boundary. The new TestMem0BackendClose (step-9) directly exercises the Mem0Backend.close() implementation \u2014 specifically that it awaits client.close() rather than calling it synchronously. Both layers of testing are needed: service-level for orchestration coverage, backend-level for correctness of the actual cleanup logic. This follows the existing pattern where TestGraphitiBackendRemoveEdge tests GraphitiBackend directly."
     }
   ],
   "reuse": [
@@ -120,8 +138,13 @@
       "what": "WriteJournal.close() already exists",
       "where": "fused-memory/src/fused_memory/services/write_journal.py lines 72-74",
       "how": "Already has close(). Just need to call it from MemoryService.close()."
+    },
+    {
+      "what": "TestGraphitiBackendRemoveEdge pattern for direct backend testing",
+      "where": "fused-memory/tests/test_memory_service.py lines 485-511",
+      "how": "Provides the established pattern for constructing a backend with mock_config, injecting mock internals, and testing backend methods directly. TestMem0BackendClose (step-9) follows this same pattern."
     }
   ],
   "_session_id": "101-6b22f465",
-  "_created_at": "2026-03-22T22:07:43.553411+00:00"
+  "_created_at": "2026-03-22T22:18:15.596082+00:00"
 }
