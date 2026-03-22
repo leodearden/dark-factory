@@ -294,16 +294,17 @@ async def test_set_task_status_rejects_done_to_blocked(taskmaster, reconciler, e
 
 @pytest.mark.asyncio
 async def test_set_task_status_allows_done_to_done(taskmaster, reconciler, event_buffer):
-    """Idempotent done->done transitions pass through normally."""
+    """Idempotent done->done transitions are a no-op: not forwarded to taskmaster."""
     taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status('1', 'done', '/project')
 
-    # Taskmaster should be called (idempotent)
-    taskmaster.set_task_status.assert_called_once()
-    # No error in result
-    assert 'error' not in result
+    # Taskmaster.set_task_status must NOT be called for a no-op
+    taskmaster.set_task_status.assert_not_called()
+    # Result carries no_op flag
+    assert result.get('no_op') is True
+    assert result.get('success') is True
 
 
 @pytest.mark.asyncio
@@ -318,3 +319,50 @@ async def test_set_task_status_allows_inprogress_to_blocked(taskmaster, reconcil
 
     taskmaster.set_task_status.assert_called_once()
     assert 'error' not in result
+
+
+# ── Tests for same-status no-op guard (step-1) ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_done_to_done_noop(taskmaster, reconciler, event_buffer):
+    """done->done is a no-op: early return, no taskmaster call, no event, no reconciliation."""
+    taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    # Must return a no-op result
+    assert result.get('success') is True
+    assert result.get('no_op') is True
+    assert result.get('task_id') == '1'
+    # Taskmaster.set_task_status must NOT have been called
+    taskmaster.set_task_status.assert_not_called()
+    # No event should be buffered
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 0
+    # No reconciliation should be triggered
+    reconciler.reconcile_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_cancelled_to_cancelled_noop(taskmaster, reconciler, event_buffer):
+    """cancelled->cancelled is a no-op: early return, no taskmaster call, no event, no reconciliation."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '2', 'status': 'cancelled', 'title': 'T'}
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('2', 'cancelled', '/project')
+
+    # Must return a no-op result
+    assert result.get('success') is True
+    assert result.get('no_op') is True
+    assert result.get('task_id') == '2'
+    # Taskmaster.set_task_status must NOT have been called
+    taskmaster.set_task_status.assert_not_called()
+    # No event should be buffered
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 0
+    # No reconciliation should be triggered
+    reconciler.reconcile_task.assert_not_called()
