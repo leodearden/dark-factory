@@ -100,6 +100,65 @@ async def test_update_task_metadata_none_passed_through(
 
 
 # ------------------------------------------------------------------
+# update_task prompt parameter forwarding
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_task_prompt_forwarded_to_interceptor(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """When prompt is provided, it should be forwarded to the interceptor."""
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': '/project', 'prompt': 'Update the description'},
+    )
+    task_interceptor.update_task.assert_called_once()
+    _, kwargs = task_interceptor.update_task.call_args
+    assert kwargs['prompt'] == 'Update the description'
+    assert kwargs['append'] is False  # default value when not provided
+
+
+# ------------------------------------------------------------------
+# update_task append parameter forwarding
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_task_append_true_forwarded_to_interceptor(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """When append=True, the value should be forwarded to the interceptor."""
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': '/project', 'prompt': 'Extra info', 'append': True},
+    )
+    task_interceptor.update_task.assert_called_once()
+    _, kwargs = task_interceptor.update_task.call_args
+    assert kwargs['append'] is True
+
+
+# ------------------------------------------------------------------
+# update_task error handling
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_task_interceptor_error_returns_error_dict(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """When the interceptor raises an Exception, the tool returns {'error': str(e)}."""
+    task_interceptor.update_task.side_effect = RuntimeError('backend unavailable')
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': '/project'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert 'backend unavailable' in result['error']
+
+
+# ------------------------------------------------------------------
 # Defensive tool registration (always registered, even without Taskmaster)
 # ------------------------------------------------------------------
 
