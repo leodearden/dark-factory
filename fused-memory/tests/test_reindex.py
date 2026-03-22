@@ -385,6 +385,69 @@ class TestDropIndex:
 
 
 # ---------------------------------------------------------------------------
+# step-1 (task-52): GraphitiBackend.drop_vector_indices()
+# ---------------------------------------------------------------------------
+
+class TestDropVectorIndices:
+    """GraphitiBackend.drop_vector_indices() drops only VECTOR-type indices."""
+
+    @pytest.mark.asyncio
+    async def test_drops_only_vector_type_indices(self, mock_config):
+        """Calls drop_index for VECTOR indices only, not FULLTEXT/RANGE."""
+        backend = _make_backend(mock_config)
+
+        indices = [
+            {'label': 'Entity', 'field': 'name_embedding', 'type': 'VECTOR', 'entity_type': 'NODE'},
+            {'label': 'Entity', 'field': 'name', 'type': 'FULLTEXT', 'entity_type': 'NODE'},
+            {'label': 'RELATES_TO', 'field': 'fact_embedding', 'type': 'VECTOR', 'entity_type': 'RELATIONSHIP'},
+        ]
+        backend.list_indices = AsyncMock(return_value=indices)
+        backend.drop_index = AsyncMock()
+
+        await backend.drop_vector_indices()
+
+        assert backend.drop_index.call_count == 2
+        calls = backend.drop_index.call_args_list
+        called_pairs = [(c[0][0], c[0][1]) for c in calls]
+        assert ('Entity', 'name_embedding') in called_pairs
+        assert ('RELATES_TO', 'fact_embedding') in called_pairs
+
+    @pytest.mark.asyncio
+    async def test_returns_list_of_dropped_indices(self, mock_config):
+        """Returns list of dicts with 'label' and 'field' for each dropped index."""
+        backend = _make_backend(mock_config)
+
+        indices = [
+            {'label': 'Entity', 'field': 'name_embedding', 'type': 'VECTOR', 'entity_type': 'NODE'},
+            {'label': 'Entity', 'field': 'name', 'type': 'FULLTEXT', 'entity_type': 'NODE'},
+        ]
+        backend.list_indices = AsyncMock(return_value=indices)
+        backend.drop_index = AsyncMock()
+
+        result = await backend.drop_vector_indices()
+
+        assert len(result) == 1
+        assert result[0] == {'label': 'Entity', 'field': 'name_embedding'}
+
+    @pytest.mark.asyncio
+    async def test_no_op_when_no_vector_indices(self, mock_config):
+        """When no VECTOR indices exist, drop_index not called and returns []."""
+        backend = _make_backend(mock_config)
+
+        indices = [
+            {'label': 'Entity', 'field': 'name', 'type': 'FULLTEXT', 'entity_type': 'NODE'},
+            {'label': 'Entity', 'field': 'created_at', 'type': 'RANGE', 'entity_type': 'NODE'},
+        ]
+        backend.list_indices = AsyncMock(return_value=indices)
+        backend.drop_index = AsyncMock()
+
+        result = await backend.drop_vector_indices()
+
+        backend.drop_index.assert_not_called()
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
 # step-9: ReindexManager
 # ---------------------------------------------------------------------------
 
