@@ -11,7 +11,7 @@
     "fused-memory/src/fused_memory/maintenance",
     "fused-memory/tests"
   ],
-  "analysis": "Task requires deleting 6 stale Graphiti edges from FalkorDB that were created by reconciliation runs a3715f42/73e7410b between 2026-03-22 17:50-18:15 UTC. Semantic search fails because these edges embed poorly. The existing GraphitiBackend already has a well-established pattern for direct Cypher queries (using `cast(Any, client.driver)._get_graph(None)` + `await graph.query(cypher, params)`), as seen in `query_stale_node_embeddings`, `query_stale_edge_embeddings`, `get_node_text`, `get_edge_text`, etc. The approach is: (1) Add two new methods to GraphitiBackend \u2014 `query_edges_by_time_range` for temporal-range queries and `bulk_remove_edges` for batch deletion by UUID list. (2) Create a maintenance script `cleanup_stale_edges.py` following the pattern of `reindex.py` (standalone CLI-callable async script with CleanupManager class). (3) Write tests following the exact mock pattern from `test_reindex.py` (`_make_backend`, `_make_graph_mock`, patching `cast`). The edge relationship type in FalkorDB is `RELATES_TO` (confirmed from all existing Cypher queries in graphiti_client.py). The conftest.py `mock_config` fixture provides a FusedMemoryConfig without real API keys.",
+  "analysis": "Task requires deleting 6 stale Graphiti edges from FalkorDB that were created by reconciliation runs a3715f42/73e7410b between 2026-03-22 17:50-18:15 UTC. Semantic search fails because these edges embed poorly. The existing GraphitiBackend already has a well-established pattern for direct Cypher queries (using `cast(Any, client.driver)._get_graph(None)` + `await graph.query(cypher, params)`), as seen in `query_stale_node_embeddings`, `query_stale_edge_embeddings`, `get_node_text`, `get_edge_text`, etc. The approach is: (1) Add two new methods to GraphitiBackend \u2014 `query_edges_by_time_range` for temporal-range queries and `bulk_remove_edges` for batch deletion by UUID list. (2) Create a maintenance script `cleanup_stale_edges.py` following the pattern of `reindex.py` (standalone CLI-callable async script with CleanupManager class). (3) Write tests following the exact mock pattern from `test_reindex.py` (`_make_backend`, `_make_graph_mock`, patching `cast`). The edge relationship type in FalkorDB is `RELATES_TO` (confirmed from all existing Cypher queries in graphiti_client.py). The conftest.py `mock_config` fixture provides a FusedMemoryConfig without real API keys.\n\n**REVIEW FIX (steps 9-10):** bulk_remove_edges() was returning len(uuids) unconditionally instead of the actual number of edges deleted by FalkorDB. The DELETE Cypher had no RETURN clause and no verification. Fix uses a pre-count MATCH query to count how many of the requested UUIDs actually exist as edges before deleting, then returns that verified count. This ensures the CleanupResult.edges_deleted accurately reflects reality, which is critical since this is an irreversible operation and the dry-run workflow depends on trustworthy counts.",
   "prerequisites": [],
   "steps": [
     {
@@ -69,6 +69,20 @@
       "description": "Implement run_cleanup(start, end, config_path=None, dry_run=False) async function and __main__ CLI block. Follows reindex.py pattern: load config, create MemoryService, initialize, create CleanupManager, run cleanup, close in finally. argparse with --start, --end, --dry-run, --config flags. Default start/end to the known stale window (2026-03-22T17:50:00 / 2026-03-22T18:15:00).",
       "status": "done",
       "commit": "908a263"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "REVIEW FIX: Write new failing test test_returns_actual_deletion_count_not_input_length in TestBulkRemoveEdges. This test exposes the bug where bulk_remove_edges returns len(uuids) instead of actual FalkorDB deletion count. Pass 3 UUIDs but mock graph.query to return a pre-count result of [[2]] (simulating only 2 of 3 UUIDs matching existing edges). Use side_effect on graph.query to return different results for the pre-count MATCH call (result with [[2]]) and the DELETE call (empty result). Assert the return value is 2, not 3. This test MUST fail on the current implementation.",
+      "status": "done",
+      "commit": "461abf9"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "REVIEW FIX: Fix bulk_remove_edges to return actual deletion count via pre-count verification. Change implementation to: (1) Run a pre-count Cypher query: 'MATCH ()-[e:RELATES_TO]->() WHERE e.uuid IN $uuids RETURN count(e) AS found' and parse result.result_set[0][0] to get the actual number of matching edges; (2) Run the existing DELETE query unchanged; (3) Return the pre-count integer instead of len(uuids). Also update existing tests in TestBulkRemoveEdges that assumed a single graph.query call: test_deletes_matching_edges needs graph.query mocked with side_effect returning [[3]] for pre-count then empty for DELETE, and assert_awaited_once changed to assert called twice; test_passes_uuid_list_to_query needs to verify the DELETE call's params (second call), not the pre-count call.",
+      "status": "done",
+      "commit": "c886cce"
     }
   ],
   "design_decisions": [
@@ -99,6 +113,10 @@
     {
       "decision": "bulk_remove_edges returns early for empty UUID list without querying FalkorDB",
       "rationale": "Defensive programming \u2014 avoids a no-op DELETE query and makes the behavior explicit. Empty list = 0 deleted, guaranteed."
+    },
+    {
+      "decision": "Use pre-count MATCH query to verify actual deletion count instead of returning len(uuids)",
+      "rationale": "REVIEW FIX: The original implementation returned len(uuids) which is the count of requested deletions, not actual deletions. If any UUID doesn't match an existing edge (already gone, wrong ID, type mismatch), the count is inflated. A pre-count query ('MATCH ... WHERE e.uuid IN $uuids RETURN count(e)') before the DELETE gives the true count of edges that will be affected. Chosen over RETURN-after-DELETE (uncertain FalkorDB support) and post-verify (extra round-trip for the same information). For a maintenance script with no concurrent writers, pre-count is deterministic and simple."
     }
   ],
   "reuse": [
@@ -131,8 +149,13 @@
       "what": "ReindexManager / ReindexResult class pattern",
       "where": "fused-memory/src/fused_memory/maintenance/reindex.py (lines 17-125)",
       "how": "CleanupManager / CleanupResult mirror this structure: dataclass for results, class wrapping backend operations, async methods for find and cleanup."
+    },
+    {
+      "what": "AsyncMock side_effect for multi-call mocking",
+      "where": "fused-memory/tests/test_cleanup_stale_edges.py (existing tests)",
+      "how": "Use side_effect=[result1, result2] on graph.query AsyncMock to return different results for the pre-count MATCH call and the DELETE call in bulk_remove_edges."
     }
   ],
   "_session_id": "53-aa54a933",
-  "_created_at": "2026-03-22T23:01:43.780665+00:00"
+  "_created_at": "2026-03-22T23:14:48.413497+00:00"
 }
