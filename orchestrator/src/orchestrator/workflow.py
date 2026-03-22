@@ -152,6 +152,9 @@ class TaskWorkflow:
         # Unique session identifier for plan ownership (format: {task_id}-{uuid_hex[:8]})
         self.session_id = f'{self.task_id}-{uuid.uuid4().hex[:8]}'
 
+        # Captured during merge so post-merge verify can reset on failure
+        self._merge_pre_sha: str | None = None
+
     @property
     def _task_files(self) -> list[str] | None:
         """Return the file list from the current plan, or None if unavailable/empty."""
@@ -240,18 +243,27 @@ class TaskWorkflow:
             # MERGE (skip for eval mode — no merge into main)
             if not self._worktree_external:
                 self.state = WorkflowState.MERGE
-                merge_outcome = await self._merge(branch_name)
-                if merge_outcome != WorkflowOutcome.DONE:
-                    return merge_outcome
+                async with self.git_ops._merge_lock:
+                    merge_outcome = await self._merge(branch_name)
+                    if merge_outcome != WorkflowOutcome.DONE:
+                        return merge_outcome
 
-                # POST-MERGE VERIFY
-                post_merge = await run_scoped_verification(self.config.project_root, self.config, self._module_configs, task_files=self._task_files)
-                if not post_merge.passed:
-                    logger.error(f'Task {self.task_id}: post-merge verification failed')
-                    await self.git_ops.revert_last_merge(self.config.project_root)
-                    return await self._mark_blocked(
-                        f'Post-merge verification failed: {post_merge.summary}'
-                    )
+                    # POST-MERGE VERIFY — still under lock so no other
+                    # worker can branch off a broken main.
+                    post_merge = await run_scoped_verification(self.config.project_root, self.config, self._module_configs, task_files=self._task_files)
+                    if not post_merge.passed:
+                        logger.error(f'Task {self.task_id}: post-merge verification failed')
+                        assert self._merge_pre_sha is not None
+                        await self.git_ops.reset_to(
+                            self._merge_pre_sha, self.config.project_root,
+                        )
+                        self._write_merge_failure_review(
+                            'post_merge_verify',
+                            f'Post-merge verification failed: {post_merge.summary}',
+                        )
+                        return await self._mark_blocked(
+                            f'Post-merge verification failed: {post_merge.summary}'
+                        )
 
             # SUCCESS — write completion knowledge before status change (ordering guarantee)
             await self._write_completion_to_memory()
@@ -698,15 +710,21 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         self.plan = self.artifacts.read_plan()
 
     async def _merge(self, branch_name: str) -> WorkflowOutcome:
-        """Merge task branch into main."""
+        """Merge task branch into main.  Caller must hold ``git_ops._merge_lock``."""
         assert self.worktree is not None
         merge_result = await self.git_ops.merge_to_main(self.worktree, branch_name)
+        self._merge_pre_sha = merge_result.pre_merge_sha
 
         if merge_result.success:
             return WorkflowOutcome.DONE
 
         if not merge_result.conflicts:
-            return await self._mark_blocked(f'Merge failed: {merge_result.details}')
+            reason = f'Merge failed: {merge_result.details}'
+            # Reset main — the failed merge may have left dirty state
+            if merge_result.pre_merge_sha:
+                await self.git_ops.reset_to(merge_result.pre_merge_sha, self.config.project_root)
+            self._write_merge_failure_review('merge_error', reason)
+            return await self._mark_blocked(reason)
 
         # Try to resolve conflicts with merger agent
         logger.info(f'Task {self.task_id}: merge conflicts detected, invoking merger')
@@ -722,15 +740,39 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if verify.passed:
                 return WorkflowOutcome.DONE
             else:
-                await self.git_ops.abort_merge(self.config.project_root)
-                return await self._mark_blocked(
-                    f'Merge conflict resolution failed verification: {verify.summary}'
-                )
+                assert merge_result.pre_merge_sha is not None
+                await self.git_ops.reset_to(merge_result.pre_merge_sha, self.config.project_root)
+                reason = f'Merge conflict resolution failed verification: {verify.summary}'
+                self._write_merge_failure_review('merger_verify', reason)
+                return await self._mark_blocked(reason)
 
         await self.git_ops.abort_merge(self.config.project_root)
-        return await self._mark_blocked(
-            f'Merger could not resolve conflicts: {merger_result.output[:200]}'
-        )
+        reason = f'Merger could not resolve conflicts: {merger_result.output[:200]}'
+        self._write_merge_failure_review('merger_blocked', reason)
+        return await self._mark_blocked(reason)
+
+    def _write_merge_failure_review(self, category: str, detail: str) -> None:
+        """Write a review-format JSON describing a merge failure to .task/reviews/.
+
+        Uses the same schema as reviewer agents so humans and retry agents
+        can consume it uniformly.
+        """
+        if not self.artifacts:
+            return
+        review = {
+            'reviewer': 'merge',
+            'verdict': 'ISSUES_FOUND',
+            'issues': [
+                {
+                    'severity': 'blocking',
+                    'location': 'main',
+                    'category': category,
+                    'description': detail,
+                },
+            ],
+            'summary': detail[:200],
+        }
+        self.artifacts.write_review('merge', review)
 
     def _select_model_for_role(self, role: AgentRole, base_model: str) -> str:
         """Override model for implementer/debugger based on task complexity."""

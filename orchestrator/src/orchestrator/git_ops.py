@@ -16,6 +16,7 @@ class MergeResult:
     conflicts: bool = False
     details: str = ''
     merge_commit: str | None = None
+    pre_merge_sha: str | None = None
 
 
 async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
@@ -37,6 +38,7 @@ class GitOps:
         self.config = config
         self.project_root = project_root
         self.worktree_base = (project_root / config.worktree_dir).resolve()
+        self._merge_lock = asyncio.Lock()
 
     async def create_worktree(self, branch_name: str) -> tuple[Path, str]:
         """Create a git worktree for a task branch, based off main.
@@ -132,6 +134,8 @@ class GitOps:
         """Merge a task branch into main using --no-ff.
 
         Operates on the main repo (not the worktree) to avoid worktree merge complications.
+        Caller must hold ``_merge_lock`` — use :pymethod:`merge_context` instead
+        of calling this directly.
         """
         full_branch = f'{self.config.branch_prefix}{branch}'
 
@@ -155,6 +159,11 @@ class GitOps:
             cwd=self.project_root,
         )
 
+        # Capture pre-merge HEAD so callers can reset on failure
+        _, pre_merge_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=self.project_root,
+        )
+
         # Remove .task/ artifacts from working dir — task branches may carry
         # .task/ as tracked files from their base commit, conflicting with
         # untracked/gitignored .task/ files on disk.
@@ -172,12 +181,14 @@ class GitOps:
         if rc != 0:
             if 'CONFLICT' in out or 'CONFLICT' in err:
                 conflict_details = await self.get_conflict_details(self.project_root)
-                return MergeResult(success=False, conflicts=True, details=conflict_details)
-            return MergeResult(success=False, details=f'{out}\n{err}')
+                return MergeResult(success=False, conflicts=True, details=conflict_details,
+                                   pre_merge_sha=pre_merge_sha)
+            return MergeResult(success=False, details=f'{out}\n{err}',
+                               pre_merge_sha=pre_merge_sha)
 
         # Get merge commit
         _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=self.project_root)
-        return MergeResult(success=True, merge_commit=sha)
+        return MergeResult(success=True, merge_commit=sha, pre_merge_sha=pre_merge_sha)
 
     async def get_conflict_details(self, cwd: Path) -> str:
         """Parse conflict markers and return structured description."""
@@ -199,19 +210,13 @@ class GitOps:
         await _run(['git', 'merge', '--abort'], cwd=cwd)
         logger.info('Merge aborted')
 
-    async def revert_last_merge(self, cwd: Path) -> None:
-        """Revert the last merge commit on main."""
-        rc, _, err = await _run(
-            ['git', 'revert', '--no-commit', '-m', '1', 'HEAD'],
-            cwd=cwd,
-        )
+    async def reset_to(self, sha: str, cwd: Path | None = None) -> None:
+        """Hard-reset to a specific commit.  Used to undo a failed merge."""
+        target = cwd or self.project_root
+        rc, _, err = await _run(['git', 'reset', '--hard', sha], cwd=target)
         if rc != 0:
-            raise RuntimeError(f'Failed to revert merge: {err}')
-        await _run(
-            ['git', 'commit', '-m', 'Revert failed merge — post-merge verification failed'],
-            cwd=cwd,
-        )
-        logger.warning('Reverted last merge commit due to post-merge verification failure')
+            raise RuntimeError(f'git reset --hard {sha[:8]} failed: {err}')
+        logger.warning('Reset %s to %s', target, sha[:8])
 
     async def cleanup_worktree(self, worktree: Path, branch: str) -> None:
         """Remove worktree and delete branch."""

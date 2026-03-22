@@ -712,9 +712,9 @@ class TestReviewLoop:
 
 @pytest.mark.asyncio
 class TestPostMergeFailure:
-    """Merge succeeds textually but post-merge tests fail → revert → BLOCKED."""
+    """Merge succeeds textually but post-merge tests fail → reset → BLOCKED."""
 
-    async def test_post_merge_verify_fails_reverts(
+    async def test_post_merge_verify_fails_resets(
         self, config, git_ops, task_assignment, monkeypatch
     ):
         stub = AgentStub()
@@ -742,14 +742,34 @@ class TestPostMergeFailure:
 
         monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify_fn)
 
+        # Capture pre-merge HEAD to verify reset
+        _, pre_merge_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=config.project_root,
+        )
+
         outcome = await workflow.run()
 
         assert outcome == WorkflowOutcome.BLOCKED
         assert scheduler.statuses['42'][-1] == 'blocked'
 
-        # Main should be reverted — farewell should NOT be on main
+        # Main should be reset to pre-merge HEAD — no merge commit, no revert
+        _, post_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=config.project_root,
+        )
+        assert post_sha == pre_merge_sha
+
+        # Content should match pre-merge state
         lib_content = (config.project_root / 'lib.py').read_text()
         assert 'farewell' not in lib_content
+
+        # Merge failure review should exist in .task/reviews/
+        assert workflow.artifacts is not None
+        review_path = workflow.artifacts.root / 'reviews' / 'merge.json'
+        assert review_path.exists()
+        import json
+        review = json.loads(review_path.read_text())
+        assert review['verdict'] == 'ISSUES_FOUND'
+        assert review['issues'][0]['category'] == 'post_merge_verify'
 
 
 # ---------------------------------------------------------------------------
