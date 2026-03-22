@@ -11,7 +11,7 @@
     "fused-memory/src/fused_memory/reconciliation",
     "fused-memory/tests"
   ],
-  "analysis": "Five critical bugs across judge.py and harness.py. Bug 1: _build_review_prompt crashes when iterating stage_reports containing plain dict _error entries (injected by harness on failures and stale-run recovery). Fix: isinstance guard on StageReport. Bug 2: JudgeVerdict.action_taken is persisted as 'none' before severity-based mutation to 'rollback'/'halt'; the updated value never reaches the DB. Fix: move journal.add_verdict() to after action_taken determination. Bug 3: judge.is_halted() exists but is never called in run_loop; halted projects keep running cycles. Fix: add halt check before run_full_cycle in run_loop(). Bug 4: BacklogIterator.run() drains a chunk via drain_oldest_chunk(), then run_full_cycle() re-drains via drain(), getting different events; the chunk events are silently lost. Fix: add optional 'events' param to run_full_cycle to accept pre-drained events. Bug 5: asyncio.wait_for timeout cancels run_full_cycle but CancelledError isn't caught by 'except Exception', so complete_run(run_id, 'failed') is never called, leaving the run stuck in 'running'. Fix: add except asyncio.CancelledError handler in run_full_cycle that marks run failed, restores events, and re-raises.",
+  "analysis": "Five critical bugs across judge.py and harness.py. Bug 1: _build_review_prompt crashes when iterating stage_reports containing plain dict _error entries (injected by harness on failures and stale-run recovery). Fix: isinstance guard on StageReport. Bug 2: JudgeVerdict.action_taken is persisted as 'none' before severity-based mutation to 'rollback'/'halt'; the updated value never reaches the DB. Fix: move journal.add_verdict() to after action_taken determination. Bug 3: judge.is_halted() exists but is never called in run_loop; halted projects keep running cycles. Fix: add halt check before run_full_cycle in run_loop(). Bug 4: BacklogIterator.run() drains a chunk via drain_oldest_chunk(), then run_full_cycle() re-drains via drain(), getting different events; the chunk events are silently lost. Fix: add optional 'events' param to run_full_cycle to accept pre-drained events. Bug 5: asyncio.wait_for timeout cancels run_full_cycle but CancelledError isn't caught by 'except Exception', so complete_run(run_id, 'failed') is never called, leaving the run stuck in 'running'. Fix: add except asyncio.CancelledError handler in run_full_cycle that marks run failed, restores events, and re-raises. Review feedback identified two robustness issues in the Bug 5 handler: (a) cleanup awaits can be interrupted by a second cancellation during shutdown, and (b) if cleanup raises, the exception replaces CancelledError, breaking the caller's timeout handler.",
   "prerequisites": [],
   "steps": [
     {
@@ -83,6 +83,34 @@
       "description": "Fix Bug 5 in harness.py run_full_cycle(): Add 'except asyncio.CancelledError' handler between the existing 'except Exception' and 'finally' blocks. In the handler: set run.status='failed', add _error entry to stage_reports with error_type='CancelledError'/Timeout, call complete_run(run_id, 'failed'), call restore_drained(project_id), log the error, then re-raise. This ensures the journal run is properly closed when asyncio.wait_for cancels the coroutine on timeout.",
       "status": "done",
       "commit": "5a117bf"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write failing test for review issue [exception_swallowing]: test_cancellation_cleanup_failure_preserves_cancelled_error. Mock journal.complete_run to raise RuntimeError('DB connection lost') when called during CancelledError cleanup. Run a harness with a slow stage, cancel via asyncio.wait_for timeout. Assert that the caller still receives CancelledError/TimeoutError (not RuntimeError). Currently the cleanup exception replaces CancelledError before the re-raise, so the caller gets RuntimeError instead of TimeoutError, bypassing the timeout handler in run_loop.",
+      "status": "done",
+      "commit": "c2332bd"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Fix review issue [exception_swallowing] in harness.py: Wrap the cleanup awaits inside 'except asyncio.CancelledError' in a nested try/except. Structure: try: await shield(complete_run(...)); await shield(restore_drained(...)); except Exception as cleanup_err: logger.error(f'Cleanup failed after cancellation: {cleanup_err}'). The outer raise statement stays outside the nested try/except so CancelledError is always re-raised regardless of cleanup failures.",
+      "status": "done",
+      "commit": "f43d685"
+    },
+    {
+      "id": "step-13",
+      "type": "test",
+      "description": "Write failing test for review issue [async_cancellation_safety]: test_cancellation_cleanup_shielded_from_second_cancel. Simulate a second cancellation arriving during cleanup by patching journal.complete_run to: (1) cancel the current task, (2) then return normally. Without asyncio.shield(), the second cancellation interrupts the await, leaving the journal run stuck in 'running'. With shield, complete_run finishes despite the outer task being cancelled. Assert journal run status is 'failed' after the double cancellation.",
+      "status": "done",
+      "commit": "a9c25ac"
+    },
+    {
+      "id": "step-14",
+      "type": "impl",
+      "description": "Fix review issue [async_cancellation_safety] in harness.py: Wrap journal.complete_run() and buffer.restore_drained() calls inside 'except asyncio.CancelledError' with asyncio.shield(). Final structure: try: await asyncio.shield(self.journal.complete_run(run_id, 'failed')); await asyncio.shield(self.buffer.restore_drained(project_id)); except Exception as cleanup_err: logger.error(f'Cleanup failed after cancellation: {cleanup_err}'). This protects the critical journal write from concurrent outer cancellation during server shutdown.",
+      "status": "done",
+      "commit": "9c0eeb1"
     }
   ],
   "design_decisions": [
@@ -105,13 +133,17 @@
     {
       "decision": "Catch asyncio.CancelledError inside run_full_cycle rather than creating run_id in outer scope for Bug 5",
       "rationale": "Keeps run lifecycle management self-contained within run_full_cycle. The outer scope (run_loop) already handles TimeoutError for logging/buffer-restore; the CancelledError handler ensures the journal run is properly closed. Both handlers calling restore_drained is idempotent and safe. Re-raising CancelledError preserves asyncio cancellation semantics."
+    },
+    {
+      "decision": "Apply both asyncio.shield() and nested try/except to CancelledError cleanup as a single hardened pattern",
+      "rationale": "asyncio.shield() prevents a second cancellation from aborting the cleanup coroutine mid-flight (the primary invariant: complete_run must finish). The nested try/except prevents any cleanup exception from replacing the original CancelledError, ensuring the caller's TimeoutError handler in run_loop always fires. Both defenses are complementary: shield addresses the cascading-cancellation vector, try/except addresses the exception-replacement vector. Implementing exception_swallowing fix first (step-12) then shield (step-14) as the shield test is harder to write without the try/except already in place."
     }
   ],
   "reuse": [
     {
       "what": "_make_harness_with_mocked_stages helper",
       "where": "fused-memory/tests/test_harness.py line 268",
-      "how": "Reuse for building test harnesses in Bug 3, 4, 5 tests with mocked stages"
+      "how": "Reuse for building test harnesses in Bug 3, 4, 5 tests and new cancellation safety tests with mocked stages"
     },
     {
       "what": "_mock_stage_run helper",
@@ -121,7 +153,7 @@
     {
       "what": "_make_event helper",
       "where": "fused-memory/tests/test_harness.py line 49",
-      "how": "Reuse for creating test ReconciliationEvent objects in Bug 4, 5 tests"
+      "how": "Reuse for creating test ReconciliationEvent objects in Bug 4, 5 tests and new cancellation safety tests"
     },
     {
       "what": "_make_judge_config helper and mock_journal fixture",
@@ -137,8 +169,13 @@
       "what": "Journal get_run deserialization handles dict stage_reports entries",
       "where": "fused-memory/src/fused_memory/reconciliation/journal.py lines 262-266",
       "how": "Journal already preserves _error entries as dicts when loading runs, confirming this is an intended data shape"
+    },
+    {
+      "what": "Existing test_timeout_marks_run_failed test pattern",
+      "where": "fused-memory/tests/test_harness.py line 501",
+      "how": "Reuse the slow-stage + asyncio.wait_for pattern for the new cancellation safety tests. Step-11 extends this by also mocking journal.complete_run to fail. Step-13 extends by simulating a second cancellation inside complete_run."
     }
   ],
   "_session_id": "100-c5989415",
-  "_created_at": "2026-03-22T22:09:02.081887+00:00"
+  "_created_at": "2026-03-22T22:25:27.054952+00:00"
 }
