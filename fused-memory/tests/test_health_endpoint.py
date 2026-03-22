@@ -17,6 +17,16 @@ def mcp_server():
 
 
 @pytest.fixture
+def mcp_server_with_service():
+    """Create an MCP server exposing both the server and service mock."""
+    mock_service = AsyncMock()
+    mock_service.search = AsyncMock(return_value=[])
+    mock_service.get_episodes = AsyncMock(return_value=[])
+    server = create_mcp_server(mock_service)
+    return server, mock_service
+
+
+@pytest.fixture
 def task_interceptor():
     ti = AsyncMock()
     ti.update_task = AsyncMock(return_value={'success': True})
@@ -439,3 +449,48 @@ async def test_add_memory_valid_category_passes_through(mcp_server):
             assert 'ValidationError' != result.get('error_type'), (
                 f'Unexpected validation error for category={valid_cat!r}: {result}'
             )
+
+
+# ------------------------------------------------------------------
+# search limit validation
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_zero_limit(mcp_server):
+    """search with limit=0 returns an error dict."""
+    result = await mcp_server._tool_manager.call_tool(
+        'search',
+        {'query': 'test', 'project_id': 'proj', 'limit': 0},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert 'limit' in result['error'].lower() or '0' in result['error']
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_negative_limit(mcp_server):
+    """search with limit=-1 returns an error dict."""
+    result = await mcp_server._tool_manager.call_tool(
+        'search',
+        {'query': 'test', 'project_id': 'proj', 'limit': -1},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+
+
+@pytest.mark.asyncio
+async def test_search_caps_limit_at_1000(mcp_server_with_service):
+    """search with limit=5000 silently caps to 1000 and calls service with limit=1000."""
+    server, mock_service = mcp_server_with_service
+    result = await server._tool_manager.call_tool(
+        'search',
+        {'query': 'test', 'project_id': 'proj', 'limit': 5000},
+    )
+    # Should not be a validation error - result has 'results' key
+    assert isinstance(result, dict)
+    assert 'results' in result
+    # Verify the service was called with capped limit=1000
+    mock_service.search.assert_called_once()
+    _, kwargs = mock_service.search.call_args
+    assert kwargs['limit'] == 1000
