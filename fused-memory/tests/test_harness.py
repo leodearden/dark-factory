@@ -1,5 +1,6 @@
 """Tests for reconciliation harness (pipeline orchestration)."""
 
+import contextlib
 import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
@@ -643,12 +644,9 @@ async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_ser
     # Also make _recover_stale_runs a no-op
     harness._recover_stale_runs = AsyncMock(return_value=None)
 
-    with patch.object(harness, 'run_full_cycle', side_effect=spy_rfc):
-        try:
-            # Run loop for one sleep cycle (loop sleeps 5s; we wait 0.2s — enough for 1 iteration)
-            await asyncio.wait_for(harness.run_loop(), timeout=0.2)
-        except (TimeoutError, asyncio.TimeoutError):
-            pass  # Expected — loop is infinite
+    with patch.object(harness, 'run_full_cycle', side_effect=spy_rfc), contextlib.suppress(TimeoutError):
+        # Run loop for one sleep cycle (loop sleeps 5s; we wait 0.2s — enough for 1 iteration)
+        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
 
     # For a halted project, run_full_cycle must NOT have been called
     assert len(run_full_cycle_called) == 0, (
