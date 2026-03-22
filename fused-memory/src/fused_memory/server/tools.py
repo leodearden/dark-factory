@@ -182,6 +182,9 @@ def create_mcp_server(
     # ------------------------------------------------------------------
 
     _VALID_TEMPORAL_CONTEXTS = frozenset({'retrospective', 'planning', 'current'})
+    _VALID_TASK_STATUSES = frozenset({
+        'pending', 'done', 'in-progress', 'review', 'deferred', 'cancelled',
+    })
 
     @mcp.tool()
     async def add_episode(
@@ -706,6 +709,14 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
+        if status not in _VALID_TASK_STATUSES:
+            return {
+                'error': (
+                    f'Invalid status {status!r}. '
+                    f'Must be one of {sorted(_VALID_TASK_STATUSES)}.'
+                ),
+                'error_type': 'ValidationError',
+            }
         try:
             return await task_interceptor.set_task_status(
                 task_id=id, status=status, project_root=project_root, tag=tag
