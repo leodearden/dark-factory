@@ -538,3 +538,22 @@ async def test_get_episodes_caps_last_n_at_1000(mcp_server_with_service):
     mock_service.get_episodes.assert_called_once()
     _, kwargs = mock_service.get_episodes.call_args
     assert kwargs['last_n'] == 1000
+
+
+# ------------------------------------------------------------------
+# trigger_reconciliation without taskmaster
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_trigger_reconciliation_without_taskmaster_returns_not_configured():
+    """trigger_reconciliation without a task_interceptor returns a clear 'not configured' error."""
+    mock_service = AsyncMock()
+    server = create_mcp_server(mock_service)  # No task_interceptor
+    result = await server._tool_manager.call_tool(
+        'trigger_reconciliation',
+        {'project_id': 'proj'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert 'not configured' in result['error'].lower()
