@@ -737,3 +737,95 @@ async def test_cancellation_cleanup_failure_preserves_cancelled_error(
             harness.run_full_cycle('test-project', 'buffer_size:1'),
             timeout=0.1,
         )
+
+
+@pytest.mark.asyncio
+async def test_cancellation_cleanup_shielded_from_second_cancel(
+    journal, event_buffer, mock_memory_service,
+):
+    """asyncio.shield() must protect cleanup from a second cancellation during shutdown.
+
+    Review issue [async_cancellation_safety]: Without asyncio.shield(), a second
+    cancellation (e.g., during server shutdown) arriving while complete_run is
+    awaiting the DB write will interrupt complete_run — leaving the journal stuck
+    in 'running'.  With asyncio.shield(), complete_run runs in its own Task and
+    finishes even if the outer task is cancelled again.
+
+    This test injects the second cancel FROM WITHIN complete_run by calling
+    outer_task.cancel() before awaiting asyncio.sleep(0).  Without shield,
+    complete_run runs inside the outer task so asyncio.sleep(0) raises
+    CancelledError (second cancel fires), aborting the write.  With shield,
+    complete_run runs in a separate inner Task unaffected by the outer cancel,
+    so sleep(0) returns normally and the write completes.
+    """
+    import asyncio
+
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+    # Make first stage sleep forever (cancelled by the first outer_task.cancel())
+    async def slow_stage_run(
+        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0],
+    ):
+        await asyncio.sleep(999)
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    harness.stages[0].run = slow_stage_run
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    # Capture the outer task reference so the mock can cancel it from within
+    outer_task_ref: list = [None]
+    original_complete_run = journal.complete_run
+
+    async def self_cancelling_complete_run(run_id, status):
+        if status == 'failed':
+            # Simulate a second external cancellation (e.g., server shutdown)
+            # arriving while cleanup is in progress.
+            outer_task_ref[0].cancel()
+            # Without asyncio.shield: this await runs in the outer task context,
+            # so the pending cancel fires here — CancelledError aborts the write.
+            # With asyncio.shield: this runs in its own inner Task, so the cancel
+            # on the outer task does not propagate here and sleep(0) completes.
+            await asyncio.sleep(0)
+        await original_complete_run(run_id, status)
+
+    journal.complete_run = self_cancelling_complete_run
+
+    outer_task = asyncio.create_task(
+        harness.run_full_cycle('test-project', 'buffer_size:1'),
+    )
+    outer_task_ref[0] = outer_task
+
+    # Let the task start and reach the slow stage
+    await asyncio.sleep(0.05)
+
+    # First cancellation: triggers CancelledError in slow_stage_run → cleanup starts
+    outer_task.cancel()
+
+    # Wait for the outer task to finish (it will raise CancelledError)
+    with contextlib.suppress(asyncio.CancelledError):
+        await outer_task
+
+    # Give any shield-wrapped inner Task time to complete the DB write.
+    # Without shield: no inner task exists; with shield: inner task runs here.
+    await asyncio.sleep(0.1)
+
+    # The journal run must be 'failed', not stuck in 'running'
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    assert len(recent_runs) >= 1
+    run = recent_runs[0]
+    assert run.status == 'failed', (
+        f"Expected status='failed' after double cancellation, got '{run.status}'. "
+        "Review issue [async_cancellation_safety]: cleanup must be wrapped with "
+        "asyncio.shield() so a second cancel cannot abort the DB write."
+    )
