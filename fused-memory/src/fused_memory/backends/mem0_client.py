@@ -194,7 +194,7 @@ class Mem0Backend:
             with contextlib.suppress(Exception):
                 client = getattr(getattr(instance, 'vector_store', None), 'client', None)
                 if client is not None and hasattr(client, 'close'):
-                    client.close()
+                    await client.close()
         self._instances.clear()
 
     def list_projects(self) -> list[tuple[str, str]]:
