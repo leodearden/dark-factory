@@ -3,7 +3,7 @@
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -68,7 +68,7 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
 class ServerConfig(BaseModel):
     """Server configuration."""
 
-    transport: str = Field(default='http', description='Transport: http, stdio, or sse')
+    transport: Literal['http', 'stdio', 'sse'] = Field(default='http', description='Transport: http, stdio, or sse')
     host: str = Field(default='0.0.0.0', description='Server host')
     port: int = Field(default=8000, description='Server port')
     stateless_http: bool = Field(default=False, description='Stateless HTTP mode (no sessions)')
@@ -96,7 +96,7 @@ class LLMProvidersConfig(BaseModel):
 class LLMConfig(BaseModel):
     """LLM configuration — shared by both backends."""
 
-    provider: str = Field(default='openai')
+    provider: Literal['openai', 'anthropic'] = Field(default='openai')
     model: str = Field(default='gpt-4o-mini')
     temperature: float | None = Field(default=None)
     max_tokens: int = Field(default=4096)
@@ -112,7 +112,7 @@ class EmbedderProvidersConfig(BaseModel):
 class EmbedderConfig(BaseModel):
     """Embedder configuration — shared by both backends."""
 
-    provider: str = Field(default='openai')
+    provider: Literal['openai'] = Field(default='openai')
     model: str = Field(default='text-embedding-3-small')
     dimensions: int = Field(default=1536)
     providers: EmbedderProvidersConfig = Field(default_factory=EmbedderProvidersConfig)
@@ -129,7 +129,7 @@ class FalkorDBProviderConfig(BaseModel):
 class GraphitiBackendConfig(BaseModel):
     """Graphiti / FalkorDB backend configuration."""
 
-    provider: str = Field(default='falkordb')
+    provider: Literal['falkordb'] = Field(default='falkordb')
     falkordb: FalkorDBProviderConfig = Field(default_factory=FalkorDBProviderConfig)
 
 
