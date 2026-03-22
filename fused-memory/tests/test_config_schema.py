@@ -7,11 +7,11 @@ from pydantic import ValidationError
 
 from fused_memory.config.schema import (
     EmbedderConfig,
+    FusedMemoryConfig,
     GraphitiBackendConfig,
     LLMConfig,
     ServerConfig,
     YamlSettingsSource,
-    FusedMemoryConfig,
 )
 
 
@@ -36,11 +36,11 @@ class TestServerConfigTransport:
 
     def test_invalid_transport_raises_validation_error(self):
         with pytest.raises(ValidationError):
-            ServerConfig(transport='websocket')
+            ServerConfig(transport='websocket')  # type: ignore[arg-type]
 
     def test_invalid_transport_grpc_raises_validation_error(self):
         with pytest.raises(ValidationError):
-            ServerConfig(transport='grpc')
+            ServerConfig(transport='grpc')  # type: ignore[arg-type]
 
 
 class TestLLMConfigProvider:
@@ -60,11 +60,11 @@ class TestLLMConfigProvider:
 
     def test_invalid_provider_raises_validation_error(self):
         with pytest.raises(ValidationError):
-            LLMConfig(provider='gemini')
+            LLMConfig(provider='gemini')  # type: ignore[arg-type]
 
     def test_invalid_provider_cohere_raises_validation_error(self):
         with pytest.raises(ValidationError):
-            LLMConfig(provider='cohere')
+            LLMConfig(provider='cohere')  # type: ignore[arg-type]
 
 
 class TestEmbedderConfigProvider:
@@ -80,11 +80,11 @@ class TestEmbedderConfigProvider:
 
     def test_invalid_provider_raises_validation_error(self):
         with pytest.raises(ValidationError):
-            EmbedderConfig(provider='cohere')
+            EmbedderConfig(provider='cohere')  # type: ignore[arg-type]
 
     def test_invalid_provider_huggingface_raises_validation_error(self):
         with pytest.raises(ValidationError):
-            EmbedderConfig(provider='huggingface')
+            EmbedderConfig(provider='huggingface')  # type: ignore[arg-type]
 
 
 class TestGraphitiBackendConfigProvider:
@@ -100,11 +100,11 @@ class TestGraphitiBackendConfigProvider:
 
     def test_invalid_provider_raises_validation_error(self):
         with pytest.raises(ValidationError):
-            GraphitiBackendConfig(provider='neo4j')
+            GraphitiBackendConfig(provider='neo4j')  # type: ignore[arg-type]
 
     def test_invalid_provider_redis_raises_validation_error(self):
         with pytest.raises(ValidationError):
-            GraphitiBackendConfig(provider='redis')
+            GraphitiBackendConfig(provider='redis')  # type: ignore[arg-type]
 
 
 class TestFusedMemoryConfigDefaults:
