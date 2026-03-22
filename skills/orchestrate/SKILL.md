@@ -287,7 +287,6 @@ The watcher uses inotify to wait (zero CPU) for new escalation files. When one a
 
 **Watcher options:**
 - `--task-id <id>` — filter to a specific task
-- `--loop` — keep watching instead of exiting after first match (useful with `--ntfy-url` for passive monitoring, but for interactive sessions the one-shot pattern is better since the task completion is the notification)
 - `--ntfy-url <url>` — send push notifications via ntfy.sh (for AFK monitoring)
 
 ### Reading an escalation
