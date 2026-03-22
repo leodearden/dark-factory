@@ -1,0 +1,7 @@
+{
+  "task_id": "104",
+  "title": "Fix routing JSON regex for nested braces",
+  "description": "Fix JSON extraction regex in both classifier and router that fails on nested braces.\n\nFiles to modify:\n- `fused-memory/src/fused_memory/routing/classifier.py` (line 144)\n- `fused-memory/src/fused_memory/routing/router.py` (line 163)\n- `fused-memory/tests/test_classifier.py`\n- `fused-memory/tests/test_router.py`\n\nThe regex `r'\\{[^}]+\\}'` matches the first `{` to the first `}`. If the LLM returns JSON with nested structures (e.g., `{\"primary\": \"...\", \"reasoning\": \"chose X because {...}\"}`), the regex captures an incomplete fragment and `json.loads()` fails, silently falling back to defaults.\n\nFix: Replace with a more robust extraction approach. Options:\n1. Use a balanced-brace regex: `r'\\{[^{}]*(?:\\{[^{}]*\\}[^{}]*)*\\}'`\n2. Or implement a simple brace-counting JSON extractor function that finds the first `{` and scans forward counting braces until balanced.\n\nApply the same fix in both `classifier.py` (line 144) and `router.py` (line 163). Extract to a shared utility if desired to avoid duplication.\n\nAdd tests: LLM response with nested braces in reasoning field; response wrapped in markdown code fences; response with multiple JSON objects (should extract first complete one).",
+  "created_at": "2026-03-22T22:05:26.228392+00:00",
+  "base_commit": "7bc1c641d0337b25ed54b79c8c83b40b98f67f63"
+}

@@ -1,161 +1,99 @@
 {
-  "task_id": "53",
-  "title": "Cleanup: Delete 6 stale Graphiti edges via FalkorDB temporal-range query",
+  "task_id": "104",
+  "title": "Fix routing JSON regex for nested braces",
   "files": [
-    "fused-memory/src/fused_memory/backends/graphiti_client.py",
-    "fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py",
-    "fused-memory/tests/test_cleanup_stale_edges.py"
+    "fused-memory/src/fused_memory/routing/json_extract.py",
+    "fused-memory/src/fused_memory/routing/classifier.py",
+    "fused-memory/src/fused_memory/routing/router.py",
+    "fused-memory/tests/test_json_extract.py",
+    "fused-memory/tests/test_classifier.py",
+    "fused-memory/tests/test_router.py"
   ],
   "modules": [
-    "fused-memory/src/fused_memory/backends",
-    "fused-memory/src/fused_memory/maintenance",
+    "fused-memory/src/fused_memory/routing",
     "fused-memory/tests"
   ],
-  "analysis": "Task requires deleting 6 stale Graphiti edges from FalkorDB that were created by reconciliation runs a3715f42/73e7410b between 2026-03-22 17:50-18:15 UTC. Semantic search fails because these edges embed poorly. The existing GraphitiBackend already has a well-established pattern for direct Cypher queries (using `cast(Any, client.driver)._get_graph(None)` + `await graph.query(cypher, params)`), as seen in `query_stale_node_embeddings`, `query_stale_edge_embeddings`, `get_node_text`, `get_edge_text`, etc. The approach is: (1) Add two new methods to GraphitiBackend \u2014 `query_edges_by_time_range` for temporal-range queries and `bulk_remove_edges` for batch deletion by UUID list. (2) Create a maintenance script `cleanup_stale_edges.py` following the pattern of `reindex.py` (standalone CLI-callable async script with CleanupManager class). (3) Write tests following the exact mock pattern from `test_reindex.py` (`_make_backend`, `_make_graph_mock`, patching `cast`). The edge relationship type in FalkorDB is `RELATES_TO` (confirmed from all existing Cypher queries in graphiti_client.py). The conftest.py `mock_config` fixture provides a FusedMemoryConfig without real API keys.\n\n**REVIEW FIX (steps 9-10):** bulk_remove_edges() was returning len(uuids) unconditionally instead of the actual number of edges deleted by FalkorDB. The DELETE Cypher had no RETURN clause and no verification. Fix uses a pre-count MATCH query to count how many of the requested UUIDs actually exist as edges before deleting, then returns that verified count. This ensures the CleanupResult.edges_deleted accurately reflects reality, which is critical since this is an irreversible operation and the dry-run workflow depends on trustworthy counts.",
+  "analysis": "Both classifier.py (line 144) and router.py (line 163) use `re.search(r'\\{[^}]+\\}', raw, re.DOTALL)` to extract JSON from LLM responses. This regex matches from the first `{` to the first `}`, so any nested braces in the JSON (e.g., in a reasoning field like `\"chose X because {...}\"`) cause it to capture an incomplete fragment. `json.loads()` then fails and the code silently falls back to defaults.\n\nThe fix: create a shared `extract_json()` utility using brace-counting (finds first `{`, scans forward incrementing/decrementing a counter, returns the balanced substring). This handles arbitrary nesting depth, unlike a nested-regex approach which only handles fixed depth. The utility also strips markdown code fences before scanning, since LLMs commonly wrap JSON in ```json...``` blocks.\n\nBoth classifier.py and router.py will import and use this shared utility, replacing the broken regex. Tests cover: nested braces, markdown fences, multiple JSON objects, no JSON present, and integration through the LLM paths of both classifier and router.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing tests for GraphitiBackend.query_edges_by_time_range(start, end). Add TestQueryEdgesByTimeRange class in test_cleanup_stale_edges.py with tests: (1) test_returns_matching_edges \u2014 mock graph returns rows with [uuid, fact, name, valid_at, invalid_at], verify returned list of dicts; (2) test_returns_empty_when_no_matches \u2014 mock returns empty result_set; (3) test_raises_when_not_initialized \u2014 client is None, expect RuntimeError; (4) test_passes_time_params_to_query \u2014 verify start/end passed as Cypher params. Use _make_backend/_make_graph_mock pattern from test_reindex.py.",
+      "description": "Create test_json_extract.py with failing tests for extract_json(): (1) simple flat JSON, (2) JSON with nested braces in a value, (3) JSON wrapped in markdown code fences, (4) text with multiple JSON objects (should extract first complete one), (5) no JSON returns None, (6) text before/after JSON is ignored. Import from fused_memory.routing.json_extract.",
       "status": "done",
-      "commit": "3a7844d"
+      "commit": "ed73c3f"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Implement GraphitiBackend.query_edges_by_time_range(start: str, end: str) -> list[dict]. Uses the existing _get_graph pattern: MATCH ()-[e:RELATES_TO]->() WHERE e.valid_at >= $start AND e.valid_at <= $end RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at. Returns list of dicts with keys uuid, fact, name, valid_at, invalid_at for human review.",
+      "description": "Create json_extract.py in routing/ with `extract_json(text: str) -> str | None`. Implementation: strip markdown code fences (```json...``` or ```...```), then scan for first `{`, count braces (incrementing on `{`, decrementing on `}`; skip characters inside string literals to handle escaped braces), return substring when count reaches 0. Return None if no balanced JSON found. All step-1 tests pass.",
       "status": "done",
-      "commit": "db8c72b"
+      "commit": "3838e1b"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write failing tests for GraphitiBackend.bulk_remove_edges(uuids). Add TestBulkRemoveEdges class with tests: (1) test_deletes_matching_edges \u2014 mock graph.query, verify correct Cypher with UUID list, returns count; (2) test_handles_empty_uuid_list \u2014 empty list returns 0 without calling query; (3) test_raises_when_not_initialized \u2014 client is None, expect RuntimeError; (4) test_passes_uuid_list_to_query \u2014 verify UUIDs passed as $uuids param.",
+      "description": "Add tests to test_classifier.py: a new TestLLMClassification class that mocks the OpenAI client. Test (1) `_llm_classify` with a response containing nested braces in reasoning field produces correct ClassificationResult, (2) response wrapped in markdown code fences parses correctly, (3) response with no JSON falls back to default.",
       "status": "done",
-      "commit": "6261003"
+      "commit": "18183e4"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Implement GraphitiBackend.bulk_remove_edges(uuids: list[str]) -> int. Uses Cypher: MATCH ()-[e:RELATES_TO]->() WHERE e.uuid IN $uuids DELETE e. Returns 0 for empty list without querying. Logs UUIDs being deleted at INFO level.",
+      "description": "Update classifier.py line 144: replace `re.search(r'\\{[^}]+\\}', raw, re.DOTALL)` with `extract_json(raw)`. Import extract_json from fused_memory.routing.json_extract. Adjust the json_match usage: `json_str = extract_json(raw)` then `if not json_str:` guard, then `data = json.loads(json_str)`. Remove unused `re` import if no longer needed (it's still used for _CATEGORY_PATTERNS). All step-3 tests pass.",
       "status": "done",
-      "commit": "db8c72b"
+      "commit": "d41dec4"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write failing tests for CleanupManager class and CleanupResult dataclass. Add TestCleanupManager class with tests: (1) test_find_stale_edges_delegates_to_backend \u2014 calls backend.query_edges_by_time_range with start/end; (2) test_cleanup_queries_and_deletes \u2014 calls find then bulk_remove, returns CleanupResult with edges_found and edges_deleted; (3) test_dry_run_queries_but_does_not_delete \u2014 dry_run=True calls find but skips bulk_remove, edges_deleted=0; (4) test_cleanup_empty_result \u2014 no edges found, no deletion attempted.",
+      "description": "Add tests to test_router.py: a new TestLLMRouting class that mocks the OpenAI client. Test (1) `_llm_route` with a response containing nested braces produces correct ReadRouteResult, (2) response wrapped in markdown code fences parses correctly, (3) response with no JSON falls back to broad default.",
       "status": "done",
-      "commit": "5a2dcb6"
+      "commit": "d1cb9d6"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Implement CleanupManager and CleanupResult in maintenance/cleanup_stale_edges.py. CleanupResult dataclass with edges_found, edges_deleted, edge_details fields. CleanupManager takes a GraphitiBackend, has find_stale_edges(start, end) and cleanup(start, end, dry_run=False) methods. Following reindex.py pattern.",
+      "description": "Update router.py line 163: replace `re.search(r'\\{[^}]+\\}', raw, re.DOTALL)` with `extract_json(raw)`. Import extract_json from fused_memory.routing.json_extract. Adjust usage same pattern as classifier. All step-5 tests pass.",
       "status": "done",
-      "commit": "908a263"
-    },
-    {
-      "id": "step-7",
-      "type": "test",
-      "description": "Write failing tests for run_cleanup async entrypoint. Add TestRunCleanup class with tests: (1) test_loads_config_and_runs_cleanup \u2014 mocks FusedMemoryConfig/MemoryService/CleanupManager, verifies cleanup called with correct start/end/dry_run; (2) test_closes_service_on_success \u2014 verify service.close() called; (3) test_closes_service_on_error \u2014 verify service.close() called even when cleanup raises; (4) test_passes_dry_run_flag \u2014 verify dry_run=True propagated.",
-      "status": "done",
-      "commit": "7f37d44"
-    },
-    {
-      "id": "step-8",
-      "type": "impl",
-      "description": "Implement run_cleanup(start, end, config_path=None, dry_run=False) async function and __main__ CLI block. Follows reindex.py pattern: load config, create MemoryService, initialize, create CleanupManager, run cleanup, close in finally. argparse with --start, --end, --dry-run, --config flags. Default start/end to the known stale window (2026-03-22T17:50:00 / 2026-03-22T18:15:00).",
-      "status": "done",
-      "commit": "908a263"
-    },
-    {
-      "id": "step-9",
-      "type": "test",
-      "description": "REVIEW FIX: Write new failing test test_returns_actual_deletion_count_not_input_length in TestBulkRemoveEdges. This test exposes the bug where bulk_remove_edges returns len(uuids) instead of actual FalkorDB deletion count. Pass 3 UUIDs but mock graph.query to return a pre-count result of [[2]] (simulating only 2 of 3 UUIDs matching existing edges). Use side_effect on graph.query to return different results for the pre-count MATCH call (result with [[2]]) and the DELETE call (empty result). Assert the return value is 2, not 3. This test MUST fail on the current implementation.",
-      "status": "done",
-      "commit": "461abf9"
-    },
-    {
-      "id": "step-10",
-      "type": "impl",
-      "description": "REVIEW FIX: Fix bulk_remove_edges to return actual deletion count via pre-count verification. Change implementation to: (1) Run a pre-count Cypher query: 'MATCH ()-[e:RELATES_TO]->() WHERE e.uuid IN $uuids RETURN count(e) AS found' and parse result.result_set[0][0] to get the actual number of matching edges; (2) Run the existing DELETE query unchanged; (3) Return the pre-count integer instead of len(uuids). Also update existing tests in TestBulkRemoveEdges that assumed a single graph.query call: test_deletes_matching_edges needs graph.query mocked with side_effect returning [[3]] for pre-count then empty for DELETE, and assert_awaited_once changed to assert called twice; test_passes_uuid_list_to_query needs to verify the DELETE call's params (second call), not the pre-count call.",
-      "status": "done",
-      "commit": "c886cce"
+      "commit": "764ce44"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Add query_edges_by_time_range and bulk_remove_edges to GraphitiBackend rather than putting raw Cypher in the maintenance script",
-      "rationale": "Follows the existing pattern where all FalkorDB access is encapsulated in GraphitiBackend (see query_stale_node_embeddings, get_edge_text, etc). Keeps Cypher queries testable via the established mock pattern and reusable for future maintenance tasks."
+      "decision": "Extract to a shared json_extract.py module rather than duplicating the fix inline",
+      "rationale": "The identical regex appears in both classifier.py and router.py. A shared utility eliminates duplication and provides a single place to test the extraction logic thoroughly. Placed in the routing/ package since it's specific to LLM response parsing in that layer."
     },
     {
-      "decision": "Use string-based time range parameters (ISO 8601 strings) rather than datetime objects",
-      "rationale": "FalkorDB/Graphiti stores valid_at as string properties on edges. String comparison in Cypher is simpler and avoids serialization edge cases. The task description already specifies the time window as ISO-like strings."
+      "decision": "Use brace-counting with string-literal awareness instead of a nested regex",
+      "rationale": "A regex like r'\\{[^{}]*(?:\\{[^{}]*\\}[^{}]*)*\\}' only handles one level of nesting. Brace-counting handles arbitrary depth. String-literal tracking (skipping braces inside quotes) handles edge cases like escaped braces in JSON string values. This is more robust for real LLM output."
     },
     {
-      "decision": "Include a dry_run mode in the cleanup script",
-      "rationale": "The task requires human review of found edges before deletion. Dry run allows querying without deleting, then a second run without --dry-run performs the actual deletion. This is safer for an IRREVERSIBLE operation."
+      "decision": "Strip markdown code fences in the extract_json utility",
+      "rationale": "LLMs frequently wrap JSON in ```json...``` blocks. Handling this in the shared utility means both classifier and router get this resilience for free, and it's tested in one place."
     },
     {
-      "decision": "Create a dedicated CleanupManager class rather than inline functions",
-      "rationale": "Mirrors the ReindexManager pattern from reindex.py. Separates orchestration logic from backend access, making each independently testable."
-    },
-    {
-      "decision": "Use RELATES_TO as the edge type in Cypher queries",
-      "rationale": "All existing edge queries in graphiti_client.py use RELATES_TO \u2014 this is the Graphiti-standard relationship type for entity edges (facts)."
-    },
-    {
-      "decision": "Default start/end to the known stale window in CLI args",
-      "rationale": "This task targets a specific incident (2026-03-22 17:50-18:15 UTC). Defaulting CLI args to this window makes the immediate fix a zero-argument invocation while keeping the script reusable for future cleanups."
-    },
-    {
-      "decision": "bulk_remove_edges returns early for empty UUID list without querying FalkorDB",
-      "rationale": "Defensive programming \u2014 avoids a no-op DELETE query and makes the behavior explicit. Empty list = 0 deleted, guaranteed."
-    },
-    {
-      "decision": "Use pre-count MATCH query to verify actual deletion count instead of returning len(uuids)",
-      "rationale": "REVIEW FIX: The original implementation returned len(uuids) which is the count of requested deletions, not actual deletions. If any UUID doesn't match an existing edge (already gone, wrong ID, type mismatch), the count is inflated. A pre-count query ('MATCH ... WHERE e.uuid IN $uuids RETURN count(e)') before the DELETE gives the true count of edges that will be affected. Chosen over RETURN-after-DELETE (uncertain FalkorDB support) and post-verify (extra round-trip for the same information). For a maintenance script with no concurrent writers, pre-count is deterministic and simple."
+      "decision": "Return str | None from extract_json rather than re.Match",
+      "rationale": "The callers only need the JSON string to pass to json.loads(). Returning the string directly is a simpler API than returning a Match object, and decouples the implementation from regex."
     }
   ],
   "reuse": [
     {
-      "what": "GraphitiBackend._get_graph pattern for direct Cypher queries",
-      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py (lines 243-260, 300-318, etc.)",
-      "how": "Use `cast(Any, client.driver)._get_graph(None)` then `await graph.query(cypher, params)` \u2014 identical to query_stale_node_embeddings, get_edge_text, etc."
+      "what": "mock_config fixture from conftest.py",
+      "where": "fused-memory/tests/conftest.py",
+      "how": "Both test_classifier.py and test_router.py already use this fixture. New LLM-path tests will use it too, enabling the classifier/router with llm_fallback=False by default, and overriding to True for specific LLM tests."
     },
     {
-      "what": "Test mock pattern (_make_backend, _make_graph_mock, patch cast)",
-      "where": "fused-memory/tests/test_reindex.py (lines 18-33)",
-      "how": "Replicate _make_backend (injects mock client), _make_graph_mock (creates result_set mock), and `patch('fused_memory.backends.graphiti_client.cast')` for all backend method tests."
+      "what": "unittest.mock.AsyncMock pattern for OpenAI client",
+      "where": "fused-memory/tests/test_journaling_integration.py (and others)",
+      "how": "The project uses AsyncMock extensively. New LLM-path tests will mock the OpenAI completions.create call using the same pattern: create an AsyncMock that returns a mock response object with choices[0].message.content set to the test LLM output string."
     },
     {
-      "what": "CLI entrypoint pattern (run_reindex / argparse / __main__)",
-      "where": "fused-memory/src/fused_memory/maintenance/reindex.py (lines 128-222)",
-      "how": "Follow same structure: async entrypoint loads config, creates MemoryService, initializes, runs operation, closes in finally block. argparse for CLI args."
-    },
-    {
-      "what": "conftest.py mock_config fixture",
-      "where": "fused-memory/tests/conftest.py (lines 46-77)",
-      "how": "Use the existing mock_config fixture for all tests \u2014 provides FusedMemoryConfig without real API keys."
-    },
-    {
-      "what": "GraphitiBackend._require_client() guard",
-      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py (lines 114-117)",
-      "how": "Call self._require_client() at the start of new methods to ensure initialization, matching the pattern of all existing public methods."
-    },
-    {
-      "what": "ReindexManager / ReindexResult class pattern",
-      "where": "fused-memory/src/fused_memory/maintenance/reindex.py (lines 17-125)",
-      "how": "CleanupManager / CleanupResult mirror this structure: dataclass for results, class wrapping backend operations, async methods for find and cleanup."
-    },
-    {
-      "what": "AsyncMock side_effect for multi-call mocking",
-      "where": "fused-memory/tests/test_cleanup_stale_edges.py (existing tests)",
-      "how": "Use side_effect=[result1, result2] on graph.query AsyncMock to return different results for the pre-count MATCH call and the DELETE call in bulk_remove_edges."
+      "what": "Existing ClassificationResult and ReadRouteResult models",
+      "where": "fused-memory/src/fused_memory/models/memory.py",
+      "how": "The fix doesn't change the model layer \u2014 the same result types are returned. Tests assert against these existing model types."
     }
   ],
-  "_session_id": "53-aa54a933",
-  "_created_at": "2026-03-22T23:14:48.413497+00:00"
+  "_session_id": "104-67a0f591",
+  "_created_at": "2026-03-22T22:07:10.903559+00:00"
 }
