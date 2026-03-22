@@ -33,15 +33,15 @@ class QueryType(StrEnum):
 
 
 # Categories whose primary store is Graphiti
-GRAPHITI_PRIMARY: set[MemoryCategory] = {
+GRAPHITI_PRIMARY: frozenset[MemoryCategory] = frozenset({
     MemoryCategory.entities_and_relations,
     MemoryCategory.temporal_facts,
     MemoryCategory.decisions_and_rationale,
-}
+})
 
 # Categories whose primary store is Mem0
-MEM0_PRIMARY: set[MemoryCategory] = {
+MEM0_PRIMARY: frozenset[MemoryCategory] = frozenset({
     MemoryCategory.preferences_and_norms,
     MemoryCategory.procedural_knowledge,
     MemoryCategory.observations_and_summaries,
-}
+})
