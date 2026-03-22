@@ -433,6 +433,12 @@ class ReconciliationHarness:
             # Exception in Python 3.8+.  Without this handler the journal run is left
             # stuck in 'running'.  Mark it failed, restore events, then re-raise so
             # asyncio cancellation semantics are preserved.
+            #
+            # Two defences against cleanup being interrupted:
+            # 1. asyncio.shield() — runs the cleanup coroutine in its own Task so a
+            #    second cancellation (e.g. server shutdown) cannot abort the DB write.
+            # 2. Nested try/except Exception — if cleanup raises, the exception is
+            #    logged but CancelledError is still re-raised to the caller.
             run.status = 'failed'
             run.stage_reports['_error'] = {
                 'error_type': 'CancelledError',
@@ -440,8 +446,8 @@ class ReconciliationHarness:
                 'failed_stage': current_stage_name,
             }
             try:
-                await self.journal.complete_run(run_id, 'failed')
-                await self.buffer.restore_drained(project_id)
+                await asyncio.shield(self.journal.complete_run(run_id, 'failed'))
+                await asyncio.shield(self.buffer.restore_drained(project_id))
             except Exception as cleanup_err:
                 logger.error(f'Cleanup failed after cancellation: {cleanup_err}')
             logger.error(
