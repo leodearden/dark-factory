@@ -125,7 +125,10 @@ class ReindexManager:
         }
 
 
-async def run_reindex(config_path: str | None = None) -> dict:
+async def run_reindex(
+    config_path: str | None = None,
+    drop_indices: bool = False,
+) -> dict:
     """Load config, initialize service, run reindex+replay, close resources.
 
     This is the CLI-callable entrypoint.  It:
@@ -139,9 +142,13 @@ async def run_reindex(config_path: str | None = None) -> dict:
     Args:
         config_path: Optional path to the YAML config file.  When given it is
                      set as CONFIG_PATH before constructing FusedMemoryConfig.
+        drop_indices: When True, drop all VECTOR indices before re-embedding.
+                      Use this to fix a dimension mismatch (e.g. after changing
+                      the embedding model).  Defaults to False.
 
     Returns:
-        Dict with 'reindex_result' (ReindexResult) and 'replay_count' (int).
+        Dict with 'reindex_result' (ReindexResult), 'replay_count' (int), and
+        'indices_dropped' (list of {label, field} dicts).
     """
     import os
 
@@ -172,12 +179,16 @@ async def run_reindex(config_path: str | None = None) -> dict:
 
     try:
         await service.initialize()
-        result = await manager.reindex_and_replay(service.durable_queue)
+        result = await manager.reindex_and_replay(
+            service.durable_queue,
+            drop_indices=drop_indices,
+        )
         ri = result['reindex_result']
         logger.info(
             f'run_reindex complete: nodes={ri.nodes_updated}, '
             f'edges={ri.edges_updated}, errors={ri.errors}, '
-            f'replayed={result["replay_count"]}'
+            f'replayed={result["replay_count"]}, '
+            f'indices_dropped={len(result.get("indices_dropped", []))}'
         )
         return result
     finally:
@@ -185,5 +196,26 @@ async def run_reindex(config_path: str | None = None) -> dict:
 
 
 if __name__ == '__main__':
+    import argparse
+
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(run_reindex())
+
+    parser = argparse.ArgumentParser(
+        description='Re-embed stale FalkorDB vectors and replay dead-letter queue'
+    )
+    parser.add_argument(
+        '--drop-indices',
+        action='store_true',
+        default=False,
+        help=(
+            'Drop all VECTOR indices before re-embedding. '
+            'Use this when the embedding model dimension has changed.'
+        ),
+    )
+    parser.add_argument(
+        '--config',
+        default=None,
+        help='Path to the YAML config file (overrides CONFIG_PATH env var).',
+    )
+    args = parser.parse_args()
+    asyncio.run(run_reindex(config_path=args.config, drop_indices=args.drop_indices))

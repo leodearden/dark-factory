@@ -818,7 +818,9 @@ class TestRunReindex:
             result = await run_reindex()
 
         mock_service.initialize.assert_awaited_once()
-        mock_mgr.reindex_and_replay.assert_awaited_once_with(mock_service.durable_queue)
+        mock_mgr.reindex_and_replay.assert_awaited_once_with(
+            mock_service.durable_queue, drop_indices=False
+        )
         assert result == mock_result
 
     @pytest.mark.asyncio
