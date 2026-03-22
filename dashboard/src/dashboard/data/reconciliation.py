@@ -206,31 +206,31 @@ async def get_buffer_stats(db_path: Path) -> dict:
 
     Returns dict with buffered_count (int) and oldest_event_age_seconds (float|None).
     """
-    try:
-        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM event_buffer WHERE status = 'buffered'",
-            ) as cursor:
-                row = await cursor.fetchone()
-                count = row[0] if row else 0
+    async def _query(db: aiosqlite.Connection) -> dict:
+        async with db.execute(
+            "SELECT COUNT(*) FROM event_buffer WHERE status = 'buffered'",
+        ) as cursor:
+            row = await cursor.fetchone()
+            count = row[0] if row else 0
 
-            async with db.execute(
-                "SELECT MIN(timestamp) FROM event_buffer WHERE status = 'buffered'",
-            ) as cursor:
-                row = await cursor.fetchone()
-                oldest_ts = row[0] if row else None
-    except (FileNotFoundError, sqlite3.OperationalError):
-        logger.debug('get_buffer_stats: DB unavailable at %s', db_path, exc_info=True)
-        return dict(_BUFFER_STATS_DEFAULT)
+        async with db.execute(
+            "SELECT MIN(timestamp) FROM event_buffer WHERE status = 'buffered'",
+        ) as cursor:
+            row = await cursor.fetchone()
+            oldest_ts = row[0] if row else None
 
-    age = None
-    if oldest_ts is not None:
-        oldest_dt = datetime.fromisoformat(oldest_ts)
-        if oldest_dt.tzinfo is None:
-            oldest_dt = oldest_dt.replace(tzinfo=UTC)
-        age = (datetime.now(UTC) - oldest_dt).total_seconds()
+        age = None
+        if oldest_ts is not None:
+            oldest_dt = datetime.fromisoformat(oldest_ts)
+            if oldest_dt.tzinfo is None:
+                oldest_dt = oldest_dt.replace(tzinfo=UTC)
+            age = (datetime.now(UTC) - oldest_dt).total_seconds()
 
-    return {'buffered_count': count, 'oldest_event_age_seconds': age}
+        return {'buffered_count': count, 'oldest_event_age_seconds': age}
+
+    return await _with_readonly_db(
+        db_path, _query, dict(_BUFFER_STATS_DEFAULT), caller='get_buffer_stats'
+    )
 
 
 async def get_burst_state(
@@ -245,45 +245,43 @@ async def get_burst_state(
 
     Each dict contains: agent_id, state, last_write_at, burst_started_at.
     """
-    try:
-        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                'SELECT agent_id, state, last_write_at, burst_started_at'
-                ' FROM burst_state'
-                ' ORDER BY last_write_at DESC',
-            ) as cursor:
-                rows = await cursor.fetchall()
-    except (FileNotFoundError, sqlite3.OperationalError):
-        logger.debug('get_burst_state: DB unavailable at %s', db_path, exc_info=True)
-        return []
+    async def _query(db: aiosqlite.Connection) -> list[dict]:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            'SELECT agent_id, state, last_write_at, burst_started_at'
+            ' FROM burst_state'
+            ' ORDER BY last_write_at DESC',
+        ) as cursor:
+            rows = await cursor.fetchall()
 
-    now = datetime.now(UTC)
-    results = []
-    for row in rows:
-        state = row['state']
-        burst_started = row['burst_started_at']
+        now = datetime.now(UTC)
+        results = []
+        for row in rows:
+            state = row['state']
+            burst_started = row['burst_started_at']
 
-        # Apply cooldown: if last write is older than cooldown, agent is idle
-        if state == 'bursting':
-            try:
-                last_write = datetime.fromisoformat(row['last_write_at'])
-                if last_write.tzinfo is None:
-                    last_write = last_write.replace(tzinfo=UTC)
-                if (now - last_write).total_seconds() > burst_cooldown_seconds:
+            # Apply cooldown: if last write is older than cooldown, agent is idle
+            if state == 'bursting':
+                try:
+                    last_write = datetime.fromisoformat(row['last_write_at'])
+                    if last_write.tzinfo is None:
+                        last_write = last_write.replace(tzinfo=UTC)
+                    if (now - last_write).total_seconds() > burst_cooldown_seconds:
+                        state = 'idle'
+                        burst_started = None
+                except (ValueError, TypeError):
                     state = 'idle'
                     burst_started = None
-            except (ValueError, TypeError):
-                state = 'idle'
-                burst_started = None
 
-        results.append({
-            'agent_id': row['agent_id'],
-            'state': state,
-            'last_write_at': row['last_write_at'],
-            'burst_started_at': burst_started,
-        })
-    return results
+            results.append({
+                'agent_id': row['agent_id'],
+                'state': state,
+                'last_write_at': row['last_write_at'],
+                'burst_started_at': burst_started,
+            })
+        return results
+
+    return await _with_readonly_db(db_path, _query, [], caller='get_burst_state')
 
 
 async def get_latest_verdict(db_path: Path) -> dict | None:
