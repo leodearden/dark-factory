@@ -428,6 +428,24 @@ class ReconciliationHarness:
             )
             return run
 
+        except asyncio.CancelledError:
+            # asyncio.wait_for cancels via CancelledError, which is NOT a subclass of
+            # Exception in Python 3.8+.  Without this handler the journal run is left
+            # stuck in 'running'.  Mark it failed, restore events, then re-raise so
+            # asyncio cancellation semantics are preserved.
+            run.status = 'failed'
+            run.stage_reports['_error'] = {
+                'error_type': 'CancelledError',
+                'error_message': 'Run cancelled (timeout or external cancellation)',
+                'failed_stage': current_stage_name,
+            }
+            await self.journal.complete_run(run_id, 'failed')
+            await self.buffer.restore_drained(project_id)
+            logger.error(
+                f'Reconciliation run {run_id} cancelled for {project_id} '
+                f'(stage: {current_stage_name})'
+            )
+            raise
         except Exception as e:
             run.status = RunStatus.failed
             run.stage_reports['_error'] = {
