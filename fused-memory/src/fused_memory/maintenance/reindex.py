@@ -93,22 +93,35 @@ class ReindexManager:
         self,
         durable_queue,
         group_id: str | None = None,
+        drop_indices: bool = False,
     ) -> dict:
         """Run reindex() then replay dead-lettered queue items.
 
         Args:
             durable_queue: A DurableWriteQueue instance.
             group_id: Optional group to scope the replay (None = all groups).
+            drop_indices: When True, drop all VECTOR indices before re-embedding.
+                This is required when the embedding model has changed and the old
+                fixed-dimension indices must be rebuilt.  Defaults to False for
+                backward compatibility.
 
         Returns:
-            Dict with reindex_result (ReindexResult) and replay_count (int).
+            Dict with reindex_result (ReindexResult), replay_count (int), and
+            indices_dropped (list of {label, field} dicts).
         """
+        indices_dropped: list[dict] = []
+        if drop_indices:
+            logger.info('Dropping stale VECTOR indices before reindex')
+            indices_dropped = await self.backend.drop_vector_indices()
+            logger.info(f'Dropped {len(indices_dropped)} VECTOR index(es)')
+
         reindex_result = await self.reindex()
         replay_count = await durable_queue.replay_dead(group_id=group_id)
         logger.info(f'Replayed {replay_count} dead-letter items after reindex')
         return {
             'reindex_result': reindex_result,
             'replay_count': replay_count,
+            'indices_dropped': indices_dropped,
         }
 
 
