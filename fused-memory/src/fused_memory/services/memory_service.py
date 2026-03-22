@@ -444,7 +444,7 @@ class MemoryService:
                     'memory_ids': memory_ids,
                     'stores': [s.value for s in stores_written],
                 },
-                success=not (_graphiti_error and _mem0_error),
+                success=not (_graphiti_error or _mem0_error),
                 error=_graphiti_error or _mem0_error,
             )
 
