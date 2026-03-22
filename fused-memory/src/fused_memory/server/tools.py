@@ -441,6 +441,13 @@ def create_mcp_server(
             session_id: Session context (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if last_n <= 0:
+            return {
+                'error': f'Invalid last_n {last_n!r}. Must be a positive integer.',
+                'error_type': 'ValidationError',
+            }
+        if last_n > 1000:
+            last_n = 1000
         try:
             episodes = await memory_service.get_episodes(
                 project_id=project_id, last_n=last_n
