@@ -1,7 +1,5 @@
 """Tests for the extract_json() utility in json_extract.py."""
 
-import pytest
-
 from fused_memory.routing.json_extract import extract_json
 
 
