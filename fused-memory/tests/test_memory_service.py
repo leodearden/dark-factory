@@ -511,6 +511,34 @@ class TestGraphitiBackendRemoveEdge:
             mock_edge.delete.assert_called_once_with(mock_client.driver)
 
 
+class TestMem0BackendClose:
+    @pytest.mark.asyncio
+    async def test_close_awaits_client_close(self, mock_config):
+        """Mem0Backend.close() must await client.close() for each cached instance."""
+        from fused_memory.backends.mem0_client import Mem0Backend
+
+        backend = Mem0Backend(mock_config)
+
+        # Build a mock instance with a vector_store.client.close AsyncMock
+        mock_client = MagicMock()
+        mock_client.close = AsyncMock()
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.client = mock_client
+
+        mock_instance = MagicMock()
+        mock_instance.vector_store = mock_vector_store
+
+        backend._instances = {'test_project': mock_instance}
+
+        await backend.close()
+
+        # The close coroutine must have been awaited, not just created
+        mock_client.close.assert_awaited_once()
+        # All instances must be cleared
+        assert backend._instances == {}
+
+
 class TestGetEpisodes:
     @pytest.mark.asyncio
     async def test_returns_list(self, service):
