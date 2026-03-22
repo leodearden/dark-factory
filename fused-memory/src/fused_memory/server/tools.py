@@ -270,6 +270,14 @@ def create_mcp_server(
             dual_write: Force write to both stores (default: false)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if category is not None and category not in _VALID_CATEGORIES:
+            return {
+                'error': (
+                    f'Invalid category {category!r}. '
+                    f'Must be one of {sorted(_VALID_CATEGORIES)} or None.'
+                ),
+                'error_type': 'ValidationError',
+            }
         try:
             causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
             result = await memory_service.add_memory(
