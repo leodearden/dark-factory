@@ -9,12 +9,36 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypeVar
 
 import aiosqlite
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar('_T')
+
+
+async def _with_readonly_db(
+    db_path: Path,
+    fn: Callable[[aiosqlite.Connection], Awaitable[_T]],
+    default: _T,
+    *,
+    caller: str,
+) -> _T:
+    """Open db_path read-only, run fn(db), and return the result.
+
+    On FileNotFoundError or sqlite3.OperationalError, logs at DEBUG and
+    returns *default* instead.
+    """
+    try:
+        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
+            return await fn(db)
+    except (FileNotFoundError, sqlite3.OperationalError):
+        logger.debug('%s: DB unavailable at %s', caller, db_path, exc_info=True)
+        return default
 
 # Default burst cooldown matches EventBuffer.burst_cooldown_seconds
 _DEFAULT_BURST_COOLDOWN = 150
