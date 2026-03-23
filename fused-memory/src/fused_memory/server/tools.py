@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid as uuid_mod
 from typing import TYPE_CHECKING, Any
 
@@ -189,6 +190,15 @@ def create_mcp_server(
     })
     _VALID_STORES = frozenset(v.value for v in SourceStore)
     _VALID_CATEGORIES = frozenset(v.value for v in MemoryCategory)
+
+    def _validate_project_root(project_root: str) -> dict[str, str] | None:
+        """Return an error dict if project_root is not an absolute path, else None."""
+        if not project_root or not os.path.isabs(project_root):
+            return {
+                'error': f'project_root must be a non-empty absolute path, got: {project_root!r}',
+                'error_type': 'ValidationError',
+            }
+        return None
 
     @mcp.tool()
     async def add_episode(
@@ -703,6 +713,8 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
+        if err := _validate_project_root(project_root):
+            return err
         try:
             return await task_interceptor.get_tasks(project_root=project_root, tag=tag)
         except Exception as e:
@@ -722,6 +734,8 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
+        if err := _validate_project_root(project_root):
+            return err
         try:
             return await task_interceptor.get_task(
                 task_id=id, project_root=project_root, tag=tag
@@ -749,6 +763,8 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
+        if err := _validate_project_root(project_root):
+            return err
         if status not in _VALID_TASK_STATUSES:
             return {
                 'error': (
@@ -792,6 +808,8 @@ def create_mcp_server(
             priority: high, medium, or low
             tag: Tag context (optional)
         """
+        if err := _validate_project_root(project_root):
+            return err
         try:
             return await task_interceptor.add_task(
                 project_root=project_root,
@@ -826,6 +844,8 @@ def create_mcp_server(
             append: Append instead of full update
             tag: Tag context (optional)
         """
+        if err := _validate_project_root(project_root):
+            return err
         try:
             if isinstance(metadata, dict):
                 metadata = json.dumps(metadata)
@@ -860,6 +880,8 @@ def create_mcp_server(
             details: Subtask details
             tag: Tag context (optional)
         """
+        if err := _validate_project_root(project_root):
+            return err
         try:
             return await task_interceptor.add_subtask(
                 parent_id=id,
@@ -886,6 +908,8 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
+        if err := _validate_project_root(project_root):
+            return err
         try:
             return await task_interceptor.remove_task(
                 task_id=id, project_root=project_root, tag=tag
@@ -909,6 +933,8 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
+        if err := _validate_project_root(project_root):
+            return err
         try:
             return await task_interceptor.add_dependency(
                 task_id=id,
@@ -935,6 +961,8 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
+        if err := _validate_project_root(project_root):
+            return err
         try:
             return await task_interceptor.remove_dependency(
                 task_id=id,
@@ -965,6 +993,8 @@ def create_mcp_server(
             force: Force expansion even if subtasks exist
             tag: Tag context (optional)
         """
+        if err := _validate_project_root(project_root):
+            return err
         try:
             return await task_interceptor.expand_task(
                 task_id=id,
@@ -993,6 +1023,8 @@ def create_mcp_server(
             num_tasks: Approximate number of tasks to generate
             tag: Tag context (optional)
         """
+        if err := _validate_project_root(project_root):
+            return err
         try:
             return await task_interceptor.parse_prd(
                 input_path=input,

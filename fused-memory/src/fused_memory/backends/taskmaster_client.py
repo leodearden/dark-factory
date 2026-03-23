@@ -147,8 +147,17 @@ class TaskmasterBackend:
     # ── Convenience methods ────────────────────────────────────────────
 
     def _base_args(self, project_root: str | None = None, tag: str | None = None) -> dict:
-        args: dict[str, Any] = {}
-        args['projectRoot'] = project_root or self.config.project_root
+        resolved = project_root or self.config.project_root
+        if not resolved or resolved == '.':
+            raise ValueError(
+                'project_root is required and must be an absolute path; '
+                f'got project_root={project_root!r}, config fallback={self.config.project_root!r}'
+            )
+        logger.debug(
+            'taskmaster projectRoot=%s (caller=%s, config=%s)',
+            resolved, project_root, self.config.project_root,
+        )
+        args: dict[str, Any] = {'projectRoot': resolved}
         if tag:
             args['tag'] = tag
         return args

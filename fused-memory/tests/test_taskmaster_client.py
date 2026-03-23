@@ -135,6 +135,28 @@ async def test_base_args_default_project_root(client):
     assert args['projectRoot'] == '/project'  # From config
 
 
+def test_base_args_rejects_dot_project_root():
+    """_base_args must reject '.' to prevent silent fallback to server CWD."""
+    cfg = TaskmasterConfig(
+        transport='stdio', command='node', args=['server.js'], project_root='.',
+    )
+    c = TaskmasterBackend(cfg)
+    with pytest.raises(ValueError, match='project_root is required'):
+        c._base_args(project_root=None)
+    with pytest.raises(ValueError, match='project_root is required'):
+        c._base_args(project_root='')
+
+
+def test_base_args_rejects_empty_config_fallback():
+    """_base_args must reject when both caller and config are empty."""
+    cfg = TaskmasterConfig(
+        transport='stdio', command='node', args=['server.js'], project_root='',
+    )
+    c = TaskmasterBackend(cfg)
+    with pytest.raises(ValueError, match='project_root is required'):
+        c._base_args(project_root=None)
+
+
 @pytest.mark.asyncio
 async def test_require_session_raises_without_init(config):
     c = TaskmasterBackend(config)
