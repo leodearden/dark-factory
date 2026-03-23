@@ -278,6 +278,75 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
+    async def query_edges_by_time_range(
+        self, start: str, end: str
+    ) -> list[dict]:
+        """Return edges whose valid_at falls within [start, end] (ISO 8601 strings).
+
+        Args:
+            start: ISO 8601 string for the lower bound (inclusive).
+            end: ISO 8601 string for the upper bound (inclusive).
+
+        Returns:
+            List of dicts with keys: uuid, fact, name, valid_at, invalid_at.
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH ()-[e:RELATES_TO]->() '
+            'WHERE e.valid_at >= $start AND e.valid_at <= $end '
+            'RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at'
+        )
+        result = await graph.query(cypher, {'start': start, 'end': end})
+        return [
+            {
+                'uuid': row[0],
+                'fact': row[1],
+                'name': row[2],
+                'valid_at': row[3],
+                'invalid_at': row[4],
+            }
+            for row in (result.result_set or [])
+        ]
+
+    async def bulk_remove_edges(self, uuids: list[str]) -> int:
+        """Delete RELATES_TO edges by UUID list. Returns count of actually matched edges.
+
+        Uses a pre-count MATCH query before deletion to return the true number of
+        edges that exist (and will be deleted), rather than the input list length.
+        This is critical for irreversible operations where accuracy matters.
+
+        Args:
+            uuids: List of edge UUIDs to delete.
+
+        Returns:
+            Number of edges that matched (and were deleted). 0 for empty list.
+        """
+        if not uuids:
+            return 0
+        client = self._require_client()
+        logger.info('Deleting %d edge(s)', len(uuids))
+        logger.debug('Edge UUIDs to delete: %s', uuids)
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        # Pre-count: how many of the requested UUIDs actually exist as edges
+        count_cypher = (
+            'MATCH ()-[e:RELATES_TO]->() '
+            'WHERE e.uuid IN $uuids '
+            'RETURN count(e) AS found'
+        )
+        count_result = await graph.query(count_cypher, {'uuids': uuids})
+        found = int(count_result.result_set[0][0]) if count_result.result_set else 0
+        # Delete the edges
+        delete_cypher = (
+            'MATCH ()-[e:RELATES_TO]->() '
+            'WHERE e.uuid IN $uuids '
+            'DELETE e'
+        )
+        await graph.query(delete_cypher, {'uuids': uuids})
+        return found
+
     async def get_node_text(self, uuid: str) -> tuple[str, str]:
         """Return (name, summary) for the Entity node with the given UUID.
 

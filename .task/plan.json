@@ -1,121 +1,161 @@
 {
-  "task_id": "52",
-  "title": "Fix: Rebuild FalkorDB vector index and replay DLQ dead letters",
+  "task_id": "53",
+  "title": "Cleanup: Delete 6 stale Graphiti edges via FalkorDB temporal-range query",
   "files": [
     "fused-memory/src/fused_memory/backends/graphiti_client.py",
-    "fused-memory/src/fused_memory/maintenance/reindex.py",
-    "fused-memory/tests/test_reindex.py"
+    "fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py",
+    "fused-memory/tests/test_cleanup_stale_edges.py"
   ],
   "modules": [
     "fused-memory/src/fused_memory/backends",
     "fused-memory/src/fused_memory/maintenance",
     "fused-memory/tests"
   ],
-  "analysis": "The DurableWriteQueue has 81 dead letters caused by a FalkorDB vector index dimension mismatch. When FalkorDB creates a VECTOR index, its dimension is fixed at creation time. If the embedder model changes (e.g. from 1024-dim to 1536-dim), all subsequent writes fail because the new vectors don't match the index dimension. The existing `ReindexManager` has `reindex()` (re-embeds stale vectors) and `reindex_and_replay()` (reindex + replay dead letters), but it's missing the critical first step: dropping the old wrong-dimension vector indices. Without dropping them first, even re-embedded correct-dimension vectors would be rejected by the stale index.\n\nThe fix requires three code changes:\n1. A new `drop_vector_indices()` method on `GraphitiBackend` that uses existing `list_indices()` to find VECTOR-type indices and existing `drop_index()` to remove them.\n2. Enhancement of `ReindexManager.reindex_and_replay()` with a `drop_indices=True` parameter that calls `drop_vector_indices()` before re-embedding.\n3. Enhancement of `run_reindex()` CLI entrypoint to support index dropping via a `drop_indices` parameter.\n\nThe existing `list_indices()`, `drop_index()`, `query_stale_*_embeddings()`, `update_*_embedding()`, and `replay_dead()` methods are all already implemented and tested. This task composes them into the correct operational sequence: drop stale indices \u2192 re-embed all vectors \u2192 replay dead letters.",
+  "analysis": "Task requires deleting 6 stale Graphiti edges from FalkorDB that were created by reconciliation runs a3715f42/73e7410b between 2026-03-22 17:50-18:15 UTC. Semantic search fails because these edges embed poorly. The existing GraphitiBackend already has a well-established pattern for direct Cypher queries (using `cast(Any, client.driver)._get_graph(None)` + `await graph.query(cypher, params)`), as seen in `query_stale_node_embeddings`, `query_stale_edge_embeddings`, `get_node_text`, `get_edge_text`, etc. The approach is: (1) Add two new methods to GraphitiBackend \u2014 `query_edges_by_time_range` for temporal-range queries and `bulk_remove_edges` for batch deletion by UUID list. (2) Create a maintenance script `cleanup_stale_edges.py` following the pattern of `reindex.py` (standalone CLI-callable async script with CleanupManager class). (3) Write tests following the exact mock pattern from `test_reindex.py` (`_make_backend`, `_make_graph_mock`, patching `cast`). The edge relationship type in FalkorDB is `RELATES_TO` (confirmed from all existing Cypher queries in graphiti_client.py). The conftest.py `mock_config` fixture provides a FusedMemoryConfig without real API keys.\n\n**REVIEW FIX (steps 9-10):** bulk_remove_edges() was returning len(uuids) unconditionally instead of the actual number of edges deleted by FalkorDB. The DELETE Cypher had no RETURN clause and no verification. Fix uses a pre-count MATCH query to count how many of the requested UUIDs actually exist as edges before deleting, then returns that verified count. This ensures the CleanupResult.edges_deleted accurately reflects reality, which is critical since this is an irreversible operation and the dry-run workflow depends on trustworthy counts.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing tests for `GraphitiBackend.drop_vector_indices()`. Add TestDropVectorIndices class in test_reindex.py with three tests: (1) test_drops_only_vector_type_indices \u2014 list_indices returns [VECTOR on Entity/name_embedding, FULLTEXT on Entity/name, VECTOR on RELATES_TO/fact_embedding], assert drop_index called exactly twice with the VECTOR entries only; (2) test_returns_list_of_dropped_indices \u2014 verify return value is a list of {'label': ..., 'field': ...} dicts for dropped indices; (3) test_no_op_when_no_vector_indices \u2014 list_indices returns only FULLTEXT/RANGE entries, assert drop_index never called and return is empty list. Follow existing test pattern: _make_backend(config), patch cast, use AsyncMock for list_indices and drop_index.",
+      "description": "Write failing tests for GraphitiBackend.query_edges_by_time_range(start, end). Add TestQueryEdgesByTimeRange class in test_cleanup_stale_edges.py with tests: (1) test_returns_matching_edges \u2014 mock graph returns rows with [uuid, fact, name, valid_at, invalid_at], verify returned list of dicts; (2) test_returns_empty_when_no_matches \u2014 mock returns empty result_set; (3) test_raises_when_not_initialized \u2014 client is None, expect RuntimeError; (4) test_passes_time_params_to_query \u2014 verify start/end passed as Cypher params. Use _make_backend/_make_graph_mock pattern from test_reindex.py.",
       "status": "done",
-      "commit": "4941c4e"
+      "commit": "3a7844d"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Add `drop_vector_indices()` method to GraphitiBackend in graphiti_client.py. The method calls `self.list_indices()`, filters for entries where `type == 'VECTOR'`, calls `self.drop_index(label, field)` for each, and returns a list of dicts with 'label' and 'field' keys for each dropped index. Logs the count of dropped indices at INFO level.",
+      "description": "Implement GraphitiBackend.query_edges_by_time_range(start: str, end: str) -> list[dict]. Uses the existing _get_graph pattern: MATCH ()-[e:RELATES_TO]->() WHERE e.valid_at >= $start AND e.valid_at <= $end RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at. Returns list of dicts with keys uuid, fact, name, valid_at, invalid_at for human review.",
       "status": "done",
-      "commit": "993f156"
+      "commit": "db8c72b"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write failing tests for `ReindexManager.reindex_and_replay()` with `drop_indices` parameter. Add to TestReindexAndReplay class: (1) test_drops_indices_before_reindex_when_requested \u2014 call reindex_and_replay(queue, drop_indices=True), verify backend.drop_vector_indices() called before reindex() using call_order tracking; (2) test_skips_drop_when_drop_indices_false \u2014 call reindex_and_replay(queue, drop_indices=False), verify backend.drop_vector_indices() NOT called; (3) test_default_drop_indices_is_false \u2014 call reindex_and_replay(queue) without drop_indices, verify backend.drop_vector_indices() NOT called (backward compatible). (4) test_result_includes_indices_dropped \u2014 verify return dict includes 'indices_dropped' key with the list from drop_vector_indices.",
+      "description": "Write failing tests for GraphitiBackend.bulk_remove_edges(uuids). Add TestBulkRemoveEdges class with tests: (1) test_deletes_matching_edges \u2014 mock graph.query, verify correct Cypher with UUID list, returns count; (2) test_handles_empty_uuid_list \u2014 empty list returns 0 without calling query; (3) test_raises_when_not_initialized \u2014 client is None, expect RuntimeError; (4) test_passes_uuid_list_to_query \u2014 verify UUIDs passed as $uuids param.",
       "status": "done",
-      "commit": "82bd5a7"
+      "commit": "6261003"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Enhance `ReindexManager.reindex_and_replay()` in reindex.py. Add `drop_indices: bool = False` parameter. When True, call `self.backend.drop_vector_indices()` before `self.reindex()` and include the result in the return dict as 'indices_dropped'. When False (default), skip the drop step and set 'indices_dropped' to [] in the return dict. Log the drop operation at INFO level.",
+      "description": "Implement GraphitiBackend.bulk_remove_edges(uuids: list[str]) -> int. Uses Cypher: MATCH ()-[e:RELATES_TO]->() WHERE e.uuid IN $uuids DELETE e. Returns 0 for empty list without querying. Logs UUIDs being deleted at INFO level.",
       "status": "done",
-      "commit": "4e7220f"
+      "commit": "db8c72b"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write failing tests for `run_reindex()` with `drop_indices` parameter. Add to TestRunReindex: (1) test_run_reindex_passes_drop_indices_true \u2014 call run_reindex(drop_indices=True), mock ReindexManager.reindex_and_replay, verify it receives drop_indices=True; (2) test_run_reindex_default_drop_indices_false \u2014 call run_reindex() with no drop_indices argument, verify reindex_and_replay called with drop_indices=False.",
+      "description": "Write failing tests for CleanupManager class and CleanupResult dataclass. Add TestCleanupManager class with tests: (1) test_find_stale_edges_delegates_to_backend \u2014 calls backend.query_edges_by_time_range with start/end; (2) test_cleanup_queries_and_deletes \u2014 calls find then bulk_remove, returns CleanupResult with edges_found and edges_deleted; (3) test_dry_run_queries_but_does_not_delete \u2014 dry_run=True calls find but skips bulk_remove, edges_deleted=0; (4) test_cleanup_empty_result \u2014 no edges found, no deletion attempted.",
       "status": "done",
-      "commit": "64c4023"
+      "commit": "5a2dcb6"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Update `run_reindex()` in reindex.py to accept `drop_indices: bool = False` parameter. Pass it through to `manager.reindex_and_replay(service.durable_queue, drop_indices=drop_indices)`. Update the __main__ block to accept --drop-indices CLI flag via argparse and pass it to run_reindex(). Log the full result including indices_dropped count.",
+      "description": "Implement CleanupManager and CleanupResult in maintenance/cleanup_stale_edges.py. CleanupResult dataclass with edges_found, edges_deleted, edge_details fields. CleanupManager takes a GraphitiBackend, has find_stale_edges(start, end) and cleanup(start, end, dry_run=False) methods. Following reindex.py pattern.",
       "status": "done",
-      "commit": "97197f0"
+      "commit": "908a263"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing tests for run_cleanup async entrypoint. Add TestRunCleanup class with tests: (1) test_loads_config_and_runs_cleanup \u2014 mocks FusedMemoryConfig/MemoryService/CleanupManager, verifies cleanup called with correct start/end/dry_run; (2) test_closes_service_on_success \u2014 verify service.close() called; (3) test_closes_service_on_error \u2014 verify service.close() called even when cleanup raises; (4) test_passes_dry_run_flag \u2014 verify dry_run=True propagated.",
+      "status": "done",
+      "commit": "7f37d44"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Implement run_cleanup(start, end, config_path=None, dry_run=False) async function and __main__ CLI block. Follows reindex.py pattern: load config, create MemoryService, initialize, create CleanupManager, run cleanup, close in finally. argparse with --start, --end, --dry-run, --config flags. Default start/end to the known stale window (2026-03-22T17:50:00 / 2026-03-22T18:15:00).",
+      "status": "done",
+      "commit": "908a263"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "REVIEW FIX: Write new failing test test_returns_actual_deletion_count_not_input_length in TestBulkRemoveEdges. This test exposes the bug where bulk_remove_edges returns len(uuids) instead of actual FalkorDB deletion count. Pass 3 UUIDs but mock graph.query to return a pre-count result of [[2]] (simulating only 2 of 3 UUIDs matching existing edges). Use side_effect on graph.query to return different results for the pre-count MATCH call (result with [[2]]) and the DELETE call (empty result). Assert the return value is 2, not 3. This test MUST fail on the current implementation.",
+      "status": "done",
+      "commit": "461abf9"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "REVIEW FIX: Fix bulk_remove_edges to return actual deletion count via pre-count verification. Change implementation to: (1) Run a pre-count Cypher query: 'MATCH ()-[e:RELATES_TO]->() WHERE e.uuid IN $uuids RETURN count(e) AS found' and parse result.result_set[0][0] to get the actual number of matching edges; (2) Run the existing DELETE query unchanged; (3) Return the pre-count integer instead of len(uuids). Also update existing tests in TestBulkRemoveEdges that assumed a single graph.query call: test_deletes_matching_edges needs graph.query mocked with side_effect returning [[3]] for pre-count then empty for DELETE, and assert_awaited_once changed to assert called twice; test_passes_uuid_list_to_query needs to verify the DELETE call's params (second call), not the pre-count call.",
+      "status": "done",
+      "commit": "c886cce"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Add drop_vector_indices() to GraphitiBackend rather than to ReindexManager",
-      "rationale": "GraphitiBackend already owns list_indices() and drop_index() \u2014 the new method is a natural composition of existing backend primitives. Keeping it on GraphitiBackend lets other consumers (future MCP tools, maintenance scripts) use it independently of ReindexManager."
+      "decision": "Add query_edges_by_time_range and bulk_remove_edges to GraphitiBackend rather than putting raw Cypher in the maintenance script",
+      "rationale": "Follows the existing pattern where all FalkorDB access is encapsulated in GraphitiBackend (see query_stale_node_embeddings, get_edge_text, etc). Keeps Cypher queries testable via the established mock pattern and reusable for future maintenance tasks."
     },
     {
-      "decision": "Use drop_indices=False as default for backward compatibility",
-      "rationale": "The existing reindex_and_replay() is used by reconciliation and other flows that don't need index dropping. Defaulting to False ensures no behavioral change for existing callers. Only the explicit fix scenario passes True."
+      "decision": "Use string-based time range parameters (ISO 8601 strings) rather than datetime objects",
+      "rationale": "FalkorDB/Graphiti stores valid_at as string properties on edges. String comparison in Cypher is simpler and avoids serialization edge cases. The task description already specifies the time window as ISO-like strings."
     },
     {
-      "decision": "Filter by type == 'VECTOR' from list_indices() rather than hardcoding index names",
-      "rationale": "FalkorDB vector index names and structures could change between graphiti_core versions. Filtering by the VECTOR type from db.indexes() is robust against schema evolution \u2014 it drops all vector indices regardless of naming conventions."
+      "decision": "Include a dry_run mode in the cleanup script",
+      "rationale": "The task requires human review of found edges before deletion. Dry run allows querying without deleting, then a second run without --dry-run performs the actual deletion. This is safer for an IRREVERSIBLE operation."
     },
     {
-      "decision": "Include indices_dropped in the return dict rather than just a count",
-      "rationale": "Returning the full list of dropped (label, field) pairs gives operational visibility. The operator can verify exactly which indices were rebuilt, which is critical for a dimension mismatch fix where specificity matters."
+      "decision": "Create a dedicated CleanupManager class rather than inline functions",
+      "rationale": "Mirrors the ReindexManager pattern from reindex.py. Separates orchestration logic from backend access, making each independently testable."
     },
     {
-      "decision": "Keep the fix as a code enhancement rather than a one-off script",
-      "rationale": "Dimension mismatches can recur when embedding models change. Having the drop-and-rebuild sequence as a supported code path (with tests) means future occurrences can be fixed by running `python -m fused_memory.maintenance.reindex --drop-indices` rather than writing ad-hoc scripts."
+      "decision": "Use RELATES_TO as the edge type in Cypher queries",
+      "rationale": "All existing edge queries in graphiti_client.py use RELATES_TO \u2014 this is the Graphiti-standard relationship type for entity edges (facts)."
+    },
+    {
+      "decision": "Default start/end to the known stale window in CLI args",
+      "rationale": "This task targets a specific incident (2026-03-22 17:50-18:15 UTC). Defaulting CLI args to this window makes the immediate fix a zero-argument invocation while keeping the script reusable for future cleanups."
+    },
+    {
+      "decision": "bulk_remove_edges returns early for empty UUID list without querying FalkorDB",
+      "rationale": "Defensive programming \u2014 avoids a no-op DELETE query and makes the behavior explicit. Empty list = 0 deleted, guaranteed."
+    },
+    {
+      "decision": "Use pre-count MATCH query to verify actual deletion count instead of returning len(uuids)",
+      "rationale": "REVIEW FIX: The original implementation returned len(uuids) which is the count of requested deletions, not actual deletions. If any UUID doesn't match an existing edge (already gone, wrong ID, type mismatch), the count is inflated. A pre-count query ('MATCH ... WHERE e.uuid IN $uuids RETURN count(e)') before the DELETE gives the true count of edges that will be affected. Chosen over RETURN-after-DELETE (uncertain FalkorDB support) and post-verify (extra round-trip for the same information). For a maintenance script with no concurrent writers, pre-count is deterministic and simple."
     }
   ],
   "reuse": [
     {
-      "what": "GraphitiBackend.list_indices() \u2014 already returns parsed index records with label, field, type, entity_type",
-      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py lines 341-358",
-      "how": "drop_vector_indices() calls list_indices() and filters result for type=='VECTOR'. No new queries needed."
+      "what": "GraphitiBackend._get_graph pattern for direct Cypher queries",
+      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py (lines 243-260, 300-318, etc.)",
+      "how": "Use `cast(Any, client.driver)._get_graph(None)` then `await graph.query(cypher, params)` \u2014 identical to query_stale_node_embeddings, get_edge_text, etc."
     },
     {
-      "what": "GraphitiBackend.drop_index(label, field) \u2014 generates DROP INDEX cypher",
-      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py lines 360-366",
-      "how": "drop_vector_indices() calls drop_index() for each VECTOR index found. The existing method handles the FalkorDB-specific syntax."
+      "what": "Test mock pattern (_make_backend, _make_graph_mock, patch cast)",
+      "where": "fused-memory/tests/test_reindex.py (lines 18-33)",
+      "how": "Replicate _make_backend (injects mock client), _make_graph_mock (creates result_set mock), and `patch('fused_memory.backends.graphiti_client.cast')` for all backend method tests."
     },
     {
-      "what": "Test helpers _make_backend() and _make_graph_mock()",
-      "where": "fused-memory/tests/test_reindex.py lines 18-33",
-      "how": "New TestDropVectorIndices tests use the same pattern of building a GraphitiBackend with mock client and patching cast to inject graph mocks."
+      "what": "CLI entrypoint pattern (run_reindex / argparse / __main__)",
+      "where": "fused-memory/src/fused_memory/maintenance/reindex.py (lines 128-222)",
+      "how": "Follow same structure: async entrypoint loads config, creates MemoryService, initializes, runs operation, closes in finally block. argparse for CLI args."
     },
     {
-      "what": "Existing TestListIndices and TestDropIndex test patterns",
-      "where": "fused-memory/tests/test_reindex.py lines 315-384",
-      "how": "The new tests follow the same structure: build backend, create graph mock, patch cast, call method, verify. The new tests compose these existing operations."
+      "what": "conftest.py mock_config fixture",
+      "where": "fused-memory/tests/conftest.py (lines 46-77)",
+      "how": "Use the existing mock_config fixture for all tests \u2014 provides FusedMemoryConfig without real API keys."
     },
     {
-      "what": "Existing TestReindexAndReplay test patterns with call_order tracking",
-      "where": "fused-memory/tests/test_reindex.py lines 520-606",
-      "how": "New tests use the same pattern: MagicMock backend/embedder, AsyncMock for reindex/replay_dead, call_order list to verify sequencing."
+      "what": "GraphitiBackend._require_client() guard",
+      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py (lines 114-117)",
+      "how": "Call self._require_client() at the start of new methods to ensure initialization, matching the pattern of all existing public methods."
     },
     {
-      "what": "mock_config fixture from conftest.py",
-      "where": "fused-memory/tests/conftest.py lines 46-77",
-      "how": "Used by TestDropVectorIndices via the existing mock_config parameter. Provides a FusedMemoryConfig that doesn't require real services."
+      "what": "ReindexManager / ReindexResult class pattern",
+      "where": "fused-memory/src/fused_memory/maintenance/reindex.py (lines 17-125)",
+      "how": "CleanupManager / CleanupResult mirror this structure: dataclass for results, class wrapping backend operations, async methods for find and cleanup."
     },
     {
-      "what": "Existing TestRunReindex mock patterns",
-      "where": "fused-memory/tests/test_reindex.py lines 613-738",
-      "how": "New run_reindex tests follow the exact same pattern of patching FusedMemoryConfig, MemoryService, OpenAIEmbedder, and ReindexManager to test the orchestration without real backends."
+      "what": "AsyncMock side_effect for multi-call mocking",
+      "where": "fused-memory/tests/test_cleanup_stale_edges.py (existing tests)",
+      "how": "Use side_effect=[result1, result2] on graph.query AsyncMock to return different results for the pre-count MATCH call and the DELETE call in bulk_remove_edges."
     }
   ],
-  "_session_id": "52-3a097fe4",
-  "_created_at": "2026-03-22T22:49:38.430543+00:00"
+  "_session_id": "53-aa54a933",
+  "_created_at": "2026-03-22T23:14:48.413497+00:00"
 }
