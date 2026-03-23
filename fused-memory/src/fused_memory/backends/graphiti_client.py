@@ -12,6 +12,7 @@ from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.edges import EntityEdge
 from graphiti_core.embedder import OpenAIEmbedder
 from graphiti_core.embedder.openai import OpenAIEmbedderConfig
+from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
@@ -23,10 +24,6 @@ logger = logging.getLogger(__name__)
 
 class NodeNotFoundError(Exception):
     """Raised when a node UUID is not found in FalkorDB."""
-
-
-class EdgeNotFoundError(Exception):
-    """Raised when an edge UUID is not found in FalkorDB."""
 
 
 class GraphitiBackend:
@@ -224,9 +221,13 @@ class GraphitiBackend:
         )
 
     async def remove_edge(self, edge_uuid: str) -> None:
-        """Delete an entity edge (fact) by UUID."""
+        """Delete an entity edge (fact) by UUID. Idempotent — missing edges are ignored."""
         client = self._require_client()
-        edge = await EntityEdge.get_by_uuid(client.driver, edge_uuid)
+        try:
+            edge = await EntityEdge.get_by_uuid(client.driver, edge_uuid)
+        except EdgeNotFoundError:
+            logger.info(f'Edge {edge_uuid} not found (already deleted or episode-cascaded)')
+            return
         await asyncio.wait_for(
             edge.delete(client.driver),
             timeout=self._write_timeout,
@@ -243,40 +244,56 @@ class GraphitiBackend:
     async def query_stale_node_embeddings(
         self, expected_dim: int
     ) -> list[tuple[str, str, int]]:
-        """Return (uuid, name, dim) for Entity nodes whose embedding dim != expected_dim."""
+        """Return (uuid, name, dim) for Entity nodes whose embedding dim != expected_dim.
+
+        FalkorDB's ``size()`` does not work on Vectorf32 properties, so we
+        return all nodes with embeddings and filter client-side by parsing the
+        raw vector text representation (``<v1, v2, ...>``).
+        """
         client = self._require_client()
         driver = cast(Any, client.driver)
         graph = driver._get_graph(None)
         cypher = (
             'MATCH (n:Entity) '
             'WHERE n.name_embedding IS NOT NULL '
-            'AND size(n.name_embedding) <> $dim '
-            'RETURN n.uuid, n.name, size(n.name_embedding) AS dim'
+            'RETURN n.uuid, n.name, n.name_embedding'
         )
-        result = await graph.query(cypher, {'dim': expected_dim})
-        return [
-            (row[0], row[1], row[2])
-            for row in (result.result_set or [])
-        ]
+        result = await graph.ro_query(cypher)
+        stale: list[tuple[str, str, int]] = []
+        for row in result.result_set or []:
+            raw = row[2]
+            if isinstance(raw, bytes):
+                raw = raw.decode('utf-8', errors='replace')
+            dim = len(str(raw).strip('<>').split(', '))
+            if dim != expected_dim:
+                stale.append((row[0], row[1], dim))
+        return stale
 
     async def query_stale_edge_embeddings(
         self, expected_dim: int
     ) -> list[tuple[str, str, int]]:
-        """Return (uuid, name, dim) for RELATES_TO edges whose embedding dim != expected_dim."""
+        """Return (uuid, name, dim) for RELATES_TO edges whose embedding dim != expected_dim.
+
+        See ``query_stale_node_embeddings`` for why client-side filtering is needed.
+        """
         client = self._require_client()
         driver = cast(Any, client.driver)
         graph = driver._get_graph(None)
         cypher = (
             'MATCH (n)-[e:RELATES_TO]->(m) '
             'WHERE e.fact_embedding IS NOT NULL '
-            'AND size(e.fact_embedding) <> $dim '
-            'RETURN e.uuid, e.name, size(e.fact_embedding) AS dim'
+            'RETURN e.uuid, e.name, e.fact_embedding'
         )
-        result = await graph.query(cypher, {'dim': expected_dim})
-        return [
-            (row[0], row[1], row[2])
-            for row in (result.result_set or [])
-        ]
+        result = await graph.ro_query(cypher)
+        stale: list[tuple[str, str, int]] = []
+        for row in result.result_set or []:
+            raw = row[2]
+            if isinstance(raw, bytes):
+                raw = raw.decode('utf-8', errors='replace')
+            dim = len(str(raw).strip('<>').split(', '))
+            if dim != expected_dim:
+                stale.append((row[0], row[1], dim))
+        return stale
 
     async def query_edges_by_time_range(
         self, start: str, end: str

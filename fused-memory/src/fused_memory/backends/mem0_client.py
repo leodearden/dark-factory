@@ -112,8 +112,8 @@ class Mem0Backend:
                 instance.search(
                     query=query,
                     user_id=scope.mem0_user_id,
-                    agent_id=scope.agent_id,
-                    run_id=scope.session_id,
+                    agent_id=None,
+                    run_id=None,
                     limit=limit,
                 ),
                 timeout=self._read_timeout,
