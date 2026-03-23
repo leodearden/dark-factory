@@ -9,7 +9,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from orchestrator.agents.invoke import AgentResult, invoke_with_cap_retry
 from orchestrator.agents.roles import (
@@ -22,7 +22,7 @@ from orchestrator.agents.roles import (
 )
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps
+from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment, files_to_modules
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import run_scoped_verification
@@ -120,6 +120,7 @@ class TaskWorkflow:
         escalation_event: asyncio.Event | None = None,
         usage_gate: UsageGate | None = None,
         initial_plan: dict | None = None,
+        steward_factory=None,
     ):
         self.assignment = assignment
         self.config = config
@@ -152,8 +153,8 @@ class TaskWorkflow:
         # Unique session identifier for plan ownership (format: {task_id}-{uuid_hex[:8]})
         self.session_id = f'{self.task_id}-{uuid.uuid4().hex[:8]}'
 
-        # Captured during merge so post-merge verify can reset on failure
-        self._merge_pre_sha: str | None = None
+        self._steward_factory = steward_factory
+        self._steward: Any | None = None
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -185,6 +186,12 @@ class TaskWorkflow:
             # Sync per-worktree venvs so imports resolve from worktree source
             if not self._worktree_external:
                 await self._sync_worktree_venvs()
+
+            # Start steward if factory was provided
+            if self._steward_factory and self.worktree:
+                steward = self._steward_factory(self.worktree)
+                self._steward = steward
+                await steward.start()
 
             self.artifacts = TaskArtifacts(self.worktree)
             self.artifacts.init(
@@ -248,23 +255,6 @@ class TaskWorkflow:
                     if merge_outcome != WorkflowOutcome.DONE:
                         return merge_outcome
 
-                    # POST-MERGE VERIFY — still under lock so no other
-                    # worker can branch off a broken main.
-                    post_merge = await run_scoped_verification(self.config.project_root, self.config, self._module_configs, task_files=self._task_files)
-                    if not post_merge.passed:
-                        logger.error(f'Task {self.task_id}: post-merge verification failed')
-                        assert self._merge_pre_sha is not None
-                        await self.git_ops.reset_to(
-                            self._merge_pre_sha, self.config.project_root,
-                        )
-                        self._write_merge_failure_review(
-                            'post_merge_verify',
-                            f'Post-merge verification failed: {post_merge.summary}',
-                        )
-                        return await self._mark_blocked(
-                            f'Post-merge verification failed: {post_merge.summary}'
-                        )
-
             # SUCCESS — write completion knowledge before status change (ordering guarantee)
             await self._write_completion_to_memory()
             self.state = WorkflowState.DONE
@@ -285,6 +275,9 @@ class TaskWorkflow:
             return await self._mark_blocked(f'Workflow error: {e}')
 
         finally:
+            # Stop steward if running
+            if self._steward:
+                await self._steward.stop()
             # Cleanup worktree (only if done — keep for debugging if blocked)
             # Skip cleanup for externally-managed worktrees (eval mode)
             if self.state == WorkflowState.DONE and self.worktree and not self._worktree_external:
@@ -710,43 +703,81 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         self.plan = self.artifacts.read_plan()
 
     async def _merge(self, branch_name: str) -> WorkflowOutcome:
-        """Merge task branch into main.  Caller must hold ``git_ops._merge_lock``."""
+        """Merge task branch into main via a temporary worktree.
+
+        The merge and all verification run in an isolated worktree so
+        ``project_root``'s working tree is never touched.  Main is
+        advanced via ``update-ref`` only after verification passes.
+        Caller must hold ``git_ops._merge_lock``.
+        """
         assert self.worktree is not None
         merge_result = await self.git_ops.merge_to_main(self.worktree, branch_name)
-        self._merge_pre_sha = merge_result.pre_merge_sha
+        merge_wt = merge_result.merge_worktree
 
         if merge_result.success:
+            assert merge_wt is not None
+            # Verify in the merge worktree — main hasn't been touched yet
+            verify = await run_scoped_verification(
+                merge_wt, self.config, self._module_configs,
+                task_files=self._task_files,
+            )
+            if not verify.passed:
+                await self.git_ops.cleanup_merge_worktree(merge_wt)
+                reason = f'Post-merge verification failed: {verify.summary}'
+                self._write_merge_failure_review('post_merge_verify', reason)
+                return await self._mark_blocked(reason)
+
+            # Advance main ref atomically
+            assert merge_result.merge_commit is not None
+            if not await self.git_ops.advance_main(merge_result.merge_commit):
+                await self.git_ops.cleanup_merge_worktree(merge_wt)
+                reason = 'Main branch advanced during merge; retry needed'
+                self._write_merge_failure_review('merge_ff_failed', reason)
+                return await self._mark_blocked(reason)
+
+            await self.git_ops.cleanup_merge_worktree(merge_wt)
             return WorkflowOutcome.DONE
 
         if not merge_result.conflicts:
+            # Non-conflict failure — merge worktree already cleaned up
             reason = f'Merge failed: {merge_result.details}'
-            # Reset main — the failed merge may have left dirty state
-            if merge_result.pre_merge_sha:
-                await self.git_ops.reset_to(merge_result.pre_merge_sha, self.config.project_root)
             self._write_merge_failure_review('merge_error', reason)
             return await self._mark_blocked(reason)
 
-        # Try to resolve conflicts with merger agent
+        # --- Conflict resolution ---
+        assert merge_wt is not None
         logger.info(f'Task {self.task_id}: merge conflicts detected, invoking merger')
         task_intent = f"Task: {self.task.get('title', '')}\n{self.task.get('description', '')}"
         prompt = await self.briefing.build_merger_prompt(
-            merge_result.details, task_intent
+            merge_result.details, task_intent,
         )
-        merger_result = await self._invoke(MERGER, prompt, self.config.project_root)
+        merger_result = await self._invoke(MERGER, prompt, merge_wt)
 
         if merger_result.success and 'BLOCKED' not in merger_result.output.upper():
-            # Verify the merge resolution
-            verify = await run_scoped_verification(self.config.project_root, self.config, self._module_configs, task_files=self._task_files)
+            verify = await run_scoped_verification(
+                merge_wt, self.config, self._module_configs,
+                task_files=self._task_files,
+            )
             if verify.passed:
-                return WorkflowOutcome.DONE
-            else:
-                assert merge_result.pre_merge_sha is not None
-                await self.git_ops.reset_to(merge_result.pre_merge_sha, self.config.project_root)
-                reason = f'Merge conflict resolution failed verification: {verify.summary}'
-                self._write_merge_failure_review('merger_verify', reason)
-                return await self._mark_blocked(reason)
+                _, merge_sha, _ = await _run(
+                    ['git', 'rev-parse', 'HEAD'], cwd=merge_wt,
+                )
+                if not await self.git_ops.advance_main(merge_sha):
+                    await self.git_ops.cleanup_merge_worktree(merge_wt)
+                    reason = 'Main advanced during conflict resolution'
+                    self._write_merge_failure_review('merge_ff_failed', reason)
+                    return await self._mark_blocked(reason)
 
-        await self.git_ops.abort_merge(self.config.project_root)
+                await self.git_ops.cleanup_merge_worktree(merge_wt)
+                return WorkflowOutcome.DONE
+
+            await self.git_ops.cleanup_merge_worktree(merge_wt)
+            reason = f'Merge conflict resolution failed verification: {verify.summary}'
+            self._write_merge_failure_review('merger_verify', reason)
+            return await self._mark_blocked(reason)
+
+        # Merger could not resolve
+        await self.git_ops.cleanup_merge_worktree(merge_wt)
         reason = f'Merger could not resolve conflicts: {merger_result.output[:200]}'
         self._write_merge_failure_review('merger_blocked', reason)
         return await self._mark_blocked(reason)

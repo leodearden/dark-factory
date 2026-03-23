@@ -17,6 +17,7 @@ class MergeResult:
     details: str = ''
     merge_commit: str | None = None
     pre_merge_sha: str | None = None
+    merge_worktree: Path | None = None
 
 
 async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
@@ -87,7 +88,7 @@ class GitOps:
     async def commit(self, worktree: Path, message: str) -> str | None:
         """Stage all changes and commit. Returns sha or None if nothing to commit."""
         # Stage all
-        await _run(['git', 'add', '-A', '--', '.', ':!.task', ':!.claude'], cwd=worktree)
+        await _run(['git', 'add', '-A', '--', '.', ':!.task', ':!.claude', ':!.taskmaster/tasks'], cwd=worktree)
 
         # Check for changes
         rc, _, _ = await _run(['git', 'diff', '--cached', '--quiet'], cwd=worktree)
@@ -131,64 +132,134 @@ class GitOps:
         return branch
 
     async def merge_to_main(self, worktree: Path, branch: str) -> MergeResult:
-        """Merge a task branch into main using --no-ff.
+        """Merge a task branch into main using a temporary merge worktree.
 
-        Operates on the main repo (not the worktree) to avoid worktree merge complications.
-        Caller must hold ``_merge_lock`` — use :pymethod:`merge_context` instead
-        of calling this directly.
+        Creates a disposable worktree, performs the merge there, and returns
+        the result.  The caller is responsible for calling :meth:`advance_main`
+        after verification and :meth:`cleanup_merge_worktree` when done.
+
+        Never touches ``project_root``'s working tree or index.
+        Caller must hold ``_merge_lock``.
         """
         full_branch = f'{self.config.branch_prefix}{branch}'
+        merge_wt: Path | None = None
 
-        # Fetch latest main
+        try:
+            merge_wt, pre_merge_sha = await self._create_merge_worktree()
+
+            # Remove .task/ artifacts — task branches may carry .task/ as
+            # tracked files from their base commit.
+            task_dir = merge_wt / '.task'
+            if task_dir.exists():
+                import shutil
+                shutil.rmtree(task_dir)
+
+            # Merge with no-ff
+            rc, out, err = await _run(
+                ['git', 'merge', '--no-ff', full_branch,
+                 '-m', f'Merge {full_branch} into {self.config.main_branch}'],
+                cwd=merge_wt,
+            )
+
+            if rc != 0:
+                if 'CONFLICT' in out or 'CONFLICT' in err:
+                    conflict_details = await self.get_conflict_details(merge_wt)
+                    return MergeResult(
+                        success=False, conflicts=True,
+                        details=conflict_details,
+                        pre_merge_sha=pre_merge_sha,
+                        merge_worktree=merge_wt,
+                    )
+                # Non-conflict failure — clean up immediately
+                await self.cleanup_merge_worktree(merge_wt)
+                return MergeResult(
+                    success=False, details=f'{out}\n{err}',
+                    pre_merge_sha=pre_merge_sha,
+                )
+
+            _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
+            return MergeResult(
+                success=True, merge_commit=sha,
+                pre_merge_sha=pre_merge_sha,
+                merge_worktree=merge_wt,
+            )
+
+        except Exception:
+            if merge_wt:
+                await self.cleanup_merge_worktree(merge_wt)
+            raise
+
+    async def _create_merge_worktree(self) -> tuple[Path, str]:
+        """Create a temporary detached worktree at main HEAD for merging."""
+        import uuid
+        merge_id = uuid.uuid4().hex[:8]
+        merge_wt = self.worktree_base / f'_merge-{merge_id}'
+        merge_wt.parent.mkdir(parents=True, exist_ok=True)
+
+        # Fetch latest (best-effort — no remote in tests)
         await _run(
             ['git', 'fetch', self.config.remote, self.config.main_branch],
             cwd=self.project_root,
         )
 
-        # Checkout main in the main repo
-        rc, _, err = await _run(
-            ['git', 'checkout', self.config.main_branch],
-            cwd=self.project_root,
-        )
-        if rc != 0:
-            return MergeResult(success=False, details=f'Failed to checkout main: {err}')
-
-        # Pull latest
-        await _run(
-            ['git', 'pull', '--ff-only', self.config.remote, self.config.main_branch],
-            cwd=self.project_root,
-        )
-
-        # Capture pre-merge HEAD so callers can reset on failure
+        # Capture current main SHA
         _, pre_merge_sha, _ = await _run(
-            ['git', 'rev-parse', 'HEAD'], cwd=self.project_root,
-        )
-
-        # Remove .task/ artifacts from working dir — task branches may carry
-        # .task/ as tracked files from their base commit, conflicting with
-        # untracked/gitignored .task/ files on disk.
-        task_dir = self.project_root / '.task'
-        if task_dir.exists():
-            import shutil
-            shutil.rmtree(task_dir)
-
-        # Merge with no-ff
-        rc, out, err = await _run(
-            ['git', 'merge', '--no-ff', full_branch, '-m', f'Merge {full_branch} into {self.config.main_branch}'],
+            ['git', 'rev-parse', self.config.main_branch],
             cwd=self.project_root,
         )
 
+        # Detached worktree avoids "branch already checked out" error
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '--detach', str(merge_wt), self.config.main_branch],
+            cwd=self.project_root,
+        )
         if rc != 0:
-            if 'CONFLICT' in out or 'CONFLICT' in err:
-                conflict_details = await self.get_conflict_details(self.project_root)
-                return MergeResult(success=False, conflicts=True, details=conflict_details,
-                                   pre_merge_sha=pre_merge_sha)
-            return MergeResult(success=False, details=f'{out}\n{err}',
-                               pre_merge_sha=pre_merge_sha)
+            raise RuntimeError(f'Failed to create merge worktree: {err}')
 
-        # Get merge commit
-        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=self.project_root)
-        return MergeResult(success=True, merge_commit=sha, pre_merge_sha=pre_merge_sha)
+        logger.info(f'Created merge worktree at {merge_wt} (HEAD={pre_merge_sha[:8]})')
+        return merge_wt, pre_merge_sha
+
+    async def cleanup_merge_worktree(self, merge_wt: Path) -> None:
+        """Remove a temporary merge worktree."""
+        rc, _, err = await _run(
+            ['git', 'worktree', 'remove', str(merge_wt), '--force'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            logger.warning(f'Failed to remove merge worktree {merge_wt}: {err}')
+        else:
+            logger.info(f'Cleaned up merge worktree {merge_wt}')
+
+    async def advance_main(self, merge_sha: str) -> bool:
+        """Advance main branch ref to *merge_sha* atomically.
+
+        Uses ``update-ref`` so the project_root working tree is never touched.
+        Returns False if main has moved past the merge base (caller should
+        mark the task as blocked).
+        """
+        rc, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor',
+             self.config.main_branch, merge_sha],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            logger.warning(
+                f'Cannot fast-forward: {merge_sha[:8]} is not a descendant '
+                f'of {self.config.main_branch}'
+            )
+            return False
+
+        rc, _, err = await _run(
+            ['git', 'update-ref',
+             f'refs/heads/{self.config.main_branch}', merge_sha],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            logger.error(f'update-ref failed: {err}')
+            return False
+
+        logger.info(f'Advanced {self.config.main_branch} to {merge_sha[:8]}')
+        return True
 
     async def get_conflict_details(self, cwd: Path) -> str:
         """Parse conflict markers and return structured description."""
@@ -209,14 +280,6 @@ class GitOps:
         """Abort an in-progress merge."""
         await _run(['git', 'merge', '--abort'], cwd=cwd)
         logger.info('Merge aborted')
-
-    async def reset_to(self, sha: str, cwd: Path | None = None) -> None:
-        """Hard-reset to a specific commit.  Used to undo a failed merge."""
-        target = cwd or self.project_root
-        rc, _, err = await _run(['git', 'reset', '--hard', sha], cwd=target)
-        if rc != 0:
-            raise RuntimeError(f'git reset --hard {sha[:8]} failed: {err}')
-        logger.warning('Reset %s to %s', target, sha[:8])
 
     async def cleanup_worktree(self, worktree: Path, branch: str) -> None:
         """Remove worktree and delete branch."""

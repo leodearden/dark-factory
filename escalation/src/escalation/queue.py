@@ -78,14 +78,21 @@ class EscalationQueue:
             logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
             return None
 
-    def get_by_task(self, task_id: str, status: str | None = None) -> list[Escalation]:
+    def get_by_task(
+        self, task_id: str, status: str | None = None, level: int | None = None,
+    ) -> list[Escalation]:
         """Scan dir for escalations matching a task ID."""
         results = []
         for path in self.queue_dir.glob('esc-*.json'):
             try:
                 esc = Escalation.from_json(path.read_text())
-                if esc.task_id == task_id and (status is None or esc.status == status):
-                    results.append(esc)
+                if esc.task_id != task_id:
+                    continue
+                if status is not None and esc.status != status:
+                    continue
+                if level is not None and esc.level != level:
+                    continue
+                results.append(esc)
             except (json.JSONDecodeError, KeyError):
                 continue
         return results

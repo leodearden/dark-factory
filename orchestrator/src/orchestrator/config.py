@@ -76,6 +76,7 @@ class ModelsConfig(BaseModel):
     debugger: str = Field(default='opus')
     reviewer: str = Field(default='sonnet')
     merger: str = Field(default='opus')
+    steward: str = Field(default='sonnet')
     module_tagger: str = Field(default='sonnet')
 
 
@@ -87,6 +88,7 @@ class BudgetsConfig(BaseModel):
     debugger: float = Field(default=5.0)
     reviewer: float = Field(default=2.0)
     merger: float = Field(default=5.0)
+    steward: float = Field(default=3.0)
     module_tagger: float = Field(default=2.0)
 
 
@@ -98,6 +100,7 @@ class TurnsConfig(BaseModel):
     debugger: int = Field(default=50)
     reviewer: int = Field(default=30)
     merger: int = Field(default=50)
+    steward: int = Field(default=30)
     module_tagger: int = Field(default=30)
 
 
@@ -109,6 +112,7 @@ class EffortConfig(BaseModel):
     debugger: str = Field(default='high')
     reviewer: str = Field(default='medium')
     merger: str = Field(default='high')
+    steward: str = Field(default='medium')
     module_tagger: str = Field(default='medium')
 
 
@@ -120,6 +124,7 @@ class BackendsConfig(BaseModel):
     debugger: str = Field(default='claude')
     reviewer: str = Field(default='claude')
     merger: str = Field(default='claude')
+    steward: str = Field(default='claude')
     module_tagger: str = Field(default='claude')
 
 

@@ -342,6 +342,34 @@ You will be given:
 )
 
 
+STEWARD = AgentRole(
+    name='steward',
+    system_prompt="""\
+You are a task steward — an autonomous first-line escalation handler.
+
+## Context
+
+You will be given an escalation from a task agent that hit a blocker it
+could not resolve on its own. Your job is to resolve the issue so the
+agent can continue, or to re-escalate to a human if you cannot.
+
+## Rules
+
+1. **Stay in scope.** Only fix what the escalation describes. Do not
+   refactor surrounding code or add features.
+2. **Be conservative.** If the fix is not obvious, re-escalate with
+   level=1 (steward→human) rather than guessing.
+3. **Verify your fix.** Run the relevant tests after making changes.
+4. **Resolve the escalation** by calling resolve_issue with a summary.
+""" + _ESCALATION_INSTRUCTIONS,
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS,
+                   'mcp__escalation__resolve_issue'],
+    default_model='sonnet',
+    default_budget=3.0,
+    default_max_turns=30,
+)
+
+
 ALL_REVIEWERS = [
     REVIEWER_TEST_ANALYST,
     REVIEWER_REUSE_AUDITOR,
@@ -355,6 +383,7 @@ ROLES = {
     'implementer': IMPLEMENTER,
     'debugger': DEBUGGER,
     'merger': MERGER,
+    'steward': STEWARD,
     'reviewer_test_analyst': REVIEWER_TEST_ANALYST,
     'reviewer_reuse_auditor': REVIEWER_REUSE_AUDITOR,
     'reviewer_architect_reviewer': REVIEWER_ARCHITECT,
