@@ -23,6 +23,7 @@ from fused_memory.models.enums import (
 from fused_memory.models.memory import (
     AddEpisodeResponse,
     AddMemoryResponse,
+    EpisodeStatus,
     MemoryResult,
     ReadRouteResult,
 )
@@ -282,7 +283,7 @@ class MemoryService:
 
         return AddEpisodeResponse(
             episode_id=episode_id,
-            status='queued',
+            status=EpisodeStatus.queued,
             message=f'Episode queued for processing in project {project_id}',
         )
 

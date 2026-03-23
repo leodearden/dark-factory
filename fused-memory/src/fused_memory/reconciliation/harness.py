@@ -19,6 +19,8 @@ from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.reconciliation import (
     ReconciliationRun,
+    RunStatus,
+    RunType,
     StageId,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -329,11 +331,11 @@ class ReconciliationHarness:
         run = ReconciliationRun(
             id=run_id,
             project_id=project_id,
-            run_type='full',
+            run_type=RunType.full,
             trigger_reason=trigger_reason,
             started_at=datetime.now(UTC),
             events_processed=len(events),
-            status='running',
+            status=RunStatus.running,
         )
         await self.journal.start_run(run)
 
@@ -389,7 +391,7 @@ class ReconciliationHarness:
             await self.journal.update_watermark(watermark)
 
             run.completed_at = datetime.now(UTC)
-            run.status = 'completed'
+            run.status = RunStatus.completed
             await self.journal.complete_run(run_id, 'completed')
 
             # Async judge review
@@ -410,7 +412,7 @@ class ReconciliationHarness:
             return run
 
         except Exception as e:
-            run.status = 'failed'
+            run.status = RunStatus.failed
             run.stage_reports['_error'] = {
                 'error_type': type(e).__name__,
                 'error_message': str(e),
@@ -520,11 +522,11 @@ class ReconciliationHarness:
         run = ReconciliationRun(
             id=run_id,
             project_id=project_id,
-            run_type='remediation',
+            run_type=RunType.remediation,
             trigger_reason=f'integrity_findings:{len(findings)}',
             started_at=datetime.now(UTC),
             events_processed=0,
-            status='running',
+            status=RunStatus.running,
             triggered_by=parent_run_id,
         )
         await self.journal.start_run(run)
@@ -565,7 +567,7 @@ class ReconciliationHarness:
             # Do NOT update watermark — remediation processed no new episodes/events
 
             run.completed_at = datetime.now(UTC)
-            run.status = 'completed'
+            run.status = RunStatus.completed
             await self.journal.complete_run(run_id, 'completed')
 
             # Judge review for remediation run
@@ -593,7 +595,7 @@ class ReconciliationHarness:
             )
 
         except Exception as e:
-            run.status = 'failed'
+            run.status = RunStatus.failed
             run.stage_reports['_error'] = {
                 'error_type': type(e).__name__,
                 'error_message': str(e),
