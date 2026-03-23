@@ -155,7 +155,7 @@ def load_task_tree(tasks_json_path: Path) -> list[dict]:
     for task in raw_tasks:
         try:
             result.append({
-                'id': str(task.get('id', '')),
+                'id': int(task.get('id', 0)),
                 'title': task.get('title'),
                 'status': task.get('status'),
                 'priority': task.get('priority'),

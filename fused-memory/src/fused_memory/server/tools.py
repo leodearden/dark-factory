@@ -191,6 +191,15 @@ def create_mcp_server(
     _VALID_STORES = frozenset(v.value for v in SourceStore)
     _VALID_CATEGORIES = frozenset(v.value for v in MemoryCategory)
 
+    def _validate_project_id(project_id: str) -> dict[str, str] | None:
+        """Return an error dict if project_id is empty, else None."""
+        if not project_id:
+            return {
+                'error': 'project_id is required and must be non-empty',
+                'error_type': 'ValidationError',
+            }
+        return None
+
     def _validate_project_root(project_root: str) -> dict[str, str] | None:
         """Return an error dict if project_root is not an absolute path, else None."""
         if not project_root or not os.path.isabs(project_root):
@@ -230,6 +239,8 @@ def create_mcp_server(
                 infer the time-frame of the episode without parsing content.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := _validate_project_id(project_id):
+            return err
         if temporal_context is not None and temporal_context not in _VALID_TEMPORAL_CONTEXTS:
             return {
                 'error': (
@@ -282,6 +293,8 @@ def create_mcp_server(
             dual_write: Force write to both stores (default: false)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := _validate_project_id(project_id):
+            return err
         if category is not None and category not in _VALID_CATEGORIES:
             return {
                 'error': (
@@ -345,6 +358,8 @@ def create_mcp_server(
             session_id: Filter by session (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := _validate_project_id(project_id):
+            return err
         if limit <= 0:
             return {
                 'error': f'Invalid limit {limit!r}. Must be a positive integer.',
@@ -406,6 +421,8 @@ def create_mcp_server(
             session_id: Session context (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := _validate_project_id(project_id):
+            return err
         try:
             result = await memory_service.get_entity(name=name, project_id=project_id)
             await _log_read(
@@ -453,6 +470,8 @@ def create_mcp_server(
             session_id: Session context (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := _validate_project_id(project_id):
+            return err
         if last_n <= 0:
             return {
                 'error': f'Invalid last_n {last_n!r}. Must be a positive integer.',
@@ -519,6 +538,8 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := _validate_project_id(project_id):
+            return err
         if store not in _VALID_STORES:
             return {
                 'error': (
@@ -563,6 +584,8 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := _validate_project_id(project_id):
+            return err
         try:
             causation_id, source, _ = _extract_causation(metadata, agent_id)
             return await memory_service.delete_episode(
@@ -614,6 +637,8 @@ def create_mcp_server(
             source_store: Source store to replay from (currently only "mem0")
             limit: Max memories to replay (None = all)
         """
+        if err := _validate_project_id(project_id):
+            return err
         try:
             count = await memory_service.replay_from_store(
                 source_project_id=project_id,
@@ -673,6 +698,8 @@ def create_mcp_server(
         Args:
             project_id: Project to trigger reconciliation for
         """
+        if err := _validate_project_id(project_id):
+            return err
         if not _taskmaster_configured:
             return {
                 'error': 'Taskmaster is not configured. Cannot trigger reconciliation.',
