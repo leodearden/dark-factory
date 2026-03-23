@@ -18,6 +18,7 @@ from shared.usage_gate import UsageGate
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.reconciliation import (
+    ReconciliationEvent,
     ReconciliationRun,
     RunStatus,
     RunType,
@@ -329,7 +330,7 @@ class ReconciliationHarness:
         project_id: str,
         trigger_reason: str,
         tier: TierConfig | None = None,
-        events: list | None = None,
+        events: list[ReconciliationEvent] | None = None,
     ) -> ReconciliationRun:
         """Execute the three-stage pipeline for a project.
 
@@ -437,19 +438,24 @@ class ReconciliationHarness:
             # Two defences against cleanup being interrupted:
             # 1. asyncio.shield() — runs the cleanup coroutine in its own Task so a
             #    second cancellation (e.g. server shutdown) cannot abort the DB write.
-            # 2. Nested try/except Exception — if cleanup raises, the exception is
-            #    logged but CancelledError is still re-raised to the caller.
+            # 2. Independent try/except BaseException per cleanup step — each step
+            #    runs regardless of the other's outcome, and CancelledError is still
+            #    re-raised to the caller.
             run.status = 'failed'
             run.stage_reports['_error'] = {
                 'error_type': 'CancelledError',
                 'error_message': 'Run cancelled (timeout or external cancellation)',
                 'failed_stage': current_stage_name,
+                'traceback': '',
             }
             try:
                 await asyncio.shield(self.journal.complete_run(run_id, 'failed'))
+            except BaseException as cleanup_err:
+                logger.error(f'complete_run failed after cancellation: {cleanup_err}')
+            try:
                 await asyncio.shield(self.buffer.restore_drained(project_id))
-            except Exception as cleanup_err:
-                logger.error(f'Cleanup failed after cancellation: {cleanup_err}')
+            except BaseException as cleanup_err:
+                logger.error(f'restore_drained failed after cancellation: {cleanup_err}')
             logger.error(
                 f'Reconciliation run {run_id} cancelled for {project_id} '
                 f'(stage: {current_stage_name})'
