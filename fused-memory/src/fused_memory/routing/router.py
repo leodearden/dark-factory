@@ -69,7 +69,7 @@ _QUERY_TYPE_ROUTING: dict[QueryType, ReadRouteResult] = {
     ),
 }
 
-ROUTING_PROMPT = """\
+ROUTING_SYSTEM_PROMPT = """\
 Given a search query from an agent, determine which memory store(s) to search.
 
 Query types:
@@ -80,14 +80,12 @@ Query types:
 - procedural: "how do I", "steps to", "process for"
 - broad: general topic query, recap, summary
 
-Query: "{query}"
-
 Respond as JSON:
-{{
+{
   "query_type": "<type>",
   "stores": ["graphiti", "mem0"],
   "primary_store": "graphiti"
-}}"""
+}"""
 
 
 class ReadRouter:
@@ -149,12 +147,13 @@ class ReadRouter:
     async def _llm_route(self, query: str) -> ReadRouteResult:
         """Use LLM to classify the query type."""
         client = self._get_openai_client()
-        prompt = ROUTING_PROMPT.format(query=query[:1000])
-
         try:
             response = await client.chat.completions.create(
                 model=self.config.llm.model,
-                messages=[{'role': 'user', 'content': prompt}],
+                messages=[
+                    {'role': 'system', 'content': ROUTING_SYSTEM_PROMPT},
+                    {'role': 'user', 'content': query[:1000]},
+                ],
                 temperature=0.0,
                 max_tokens=256,
             )

@@ -34,7 +34,7 @@ _CATEGORY_PATTERNS: dict[MemoryCategory, list[re.Pattern]] = {
     ],
 }
 
-CLASSIFICATION_PROMPT = """\
+CLASSIFICATION_SYSTEM_PROMPT = """\
 Given a memory extracted from an agent interaction, classify it into exactly one
 primary category. If the memory has a strong secondary nature, also identify that.
 
@@ -46,15 +46,13 @@ Categories:
 5. procedural_knowledge — how to do things, workflows, steps
 6. observations_and_summaries — high-level takeaways, session recaps
 
-Memory: "{content}"
-
 Respond as JSON:
-{{
+{
   "primary": "<category>",
   "secondary": "<category or null>",
   "confidence": <0.0-1.0>,
   "reasoning": "<brief>"
-}}"""
+}"""
 
 
 class WriteClassifier:
@@ -129,12 +127,13 @@ class WriteClassifier:
     async def _llm_classify(self, content: str) -> ClassificationResult:
         """Use LLM for classification."""
         client = self._get_openai_client()
-        prompt = CLASSIFICATION_PROMPT.format(content=content[:2000])
-
         try:
             response = await client.chat.completions.create(
                 model=self.config.llm.model,
-                messages=[{'role': 'user', 'content': prompt}],
+                messages=[
+                    {'role': 'system', 'content': CLASSIFICATION_SYSTEM_PROMPT},
+                    {'role': 'user', 'content': content[:2000]},
+                ],
                 temperature=0.0,
                 max_tokens=256,
             )
