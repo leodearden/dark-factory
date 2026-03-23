@@ -441,7 +441,7 @@ class ReconciliationHarness:
             # 2. Independent try/except BaseException per cleanup step — each step
             #    runs regardless of the other's outcome, and CancelledError is still
             #    re-raised to the caller.
-            run.status = 'failed'
+            run.status = RunStatus.failed
             run.stage_reports['_error'] = {
                 'error_type': 'CancelledError',
                 'error_message': 'Run cancelled (timeout or external cancellation)',

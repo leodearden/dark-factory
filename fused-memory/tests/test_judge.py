@@ -220,6 +220,8 @@ async def test_build_review_prompt_handles_error_dict_entries(mock_journal):
 
     from fused_memory.models.reconciliation import (
         ReconciliationRun,
+        RunStatus,
+        RunType,
         StageId,
         StageReport,
     )
@@ -242,11 +244,11 @@ async def test_build_review_prompt_handles_error_dict_entries(mock_journal):
     run = ReconciliationRun(
         id='run-bug1-test',
         project_id='test-project',
-        run_type='full',
+        run_type=RunType.full,
         trigger_reason='buffer_size:3',
         started_at=now,
         events_processed=3,
-        status='failed',
+        status=RunStatus.failed,
         stage_reports={
             'memory_consolidator': good_report,
             '_error': {
@@ -281,6 +283,8 @@ async def test_verdict_action_taken_persisted_after_mutation_moderate(mock_journ
 
     from fused_memory.models.reconciliation import (
         ReconciliationRun,
+        RunStatus,
+        RunType,
         StageId,
         StageReport,
     )
@@ -293,11 +297,11 @@ async def test_verdict_action_taken_persisted_after_mutation_moderate(mock_journ
     run = ReconciliationRun(
         id='run-bug2-moderate',
         project_id='test-project',
-        run_type='full',
+        run_type=RunType.full,
         trigger_reason='buffer_size:3',
         started_at=now,
         events_processed=3,
-        status='completed',
+        status=RunStatus.completed,
         stage_reports={
             'memory_consolidator': StageReport(
                 stage=StageId.memory_consolidator,
@@ -342,7 +346,7 @@ async def test_verdict_action_taken_persisted_after_mutation_serious(mock_journa
     from datetime import UTC, datetime
     from unittest.mock import patch
 
-    from fused_memory.models.reconciliation import ReconciliationRun
+    from fused_memory.models.reconciliation import ReconciliationRun, RunStatus, RunType
 
     config = _make_judge_config(halt_on_judge_serious=True)
     judge = Judge(config=config, journal=mock_journal)
@@ -351,11 +355,11 @@ async def test_verdict_action_taken_persisted_after_mutation_serious(mock_journa
     run = ReconciliationRun(
         id='run-bug2-serious',
         project_id='test-project',
-        run_type='full',
+        run_type=RunType.full,
         trigger_reason='buffer_size:3',
         started_at=now,
         events_processed=3,
-        status='completed',
+        status=RunStatus.completed,
         stage_reports={},
     )
     mock_journal.get_run = AsyncMock(return_value=run)
