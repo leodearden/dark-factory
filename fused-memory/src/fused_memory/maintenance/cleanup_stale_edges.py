@@ -11,8 +11,8 @@ from fused_memory.services.memory_service import MemoryService
 logger = logging.getLogger(__name__)
 
 # Default stale window (2026-03-22 reconciliation incident)
-_DEFAULT_START = '2026-03-22T17:50:00'
-_DEFAULT_END = '2026-03-22T18:15:00'
+_DEFAULT_START = '2026-03-22T17:50:00+00:00'
+_DEFAULT_END = '2026-03-22T18:15:00+00:00'
 
 
 @dataclass
@@ -114,6 +114,7 @@ async def run_cleanup(
     """
     import os
 
+    old_config_path = os.environ.get('CONFIG_PATH')
     if config_path is not None:
         os.environ['CONFIG_PATH'] = config_path
 
@@ -131,6 +132,11 @@ async def run_cleanup(
         return result
     finally:
         await service.close()
+        if config_path is not None:
+            if old_config_path is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = old_config_path
 
 
 if __name__ == '__main__':

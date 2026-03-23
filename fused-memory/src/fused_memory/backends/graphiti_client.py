@@ -326,7 +326,8 @@ class GraphitiBackend:
         if not uuids:
             return 0
         client = self._require_client()
-        logger.info(f'Deleting {len(uuids)} edge(s): {uuids}')
+        logger.info('Deleting %d edge(s)', len(uuids))
+        logger.debug('Edge UUIDs to delete: %s', uuids)
         driver = cast(Any, client.driver)
         graph = driver._get_graph(None)
         # Pre-count: how many of the requested UUIDs actually exist as edges
@@ -336,7 +337,7 @@ class GraphitiBackend:
             'RETURN count(e) AS found'
         )
         count_result = await graph.query(count_cypher, {'uuids': uuids})
-        found = int(count_result.result_set[0][0])
+        found = int(count_result.result_set[0][0]) if count_result.result_set else 0
         # Delete the edges
         delete_cypher = (
             'MATCH ()-[e:RELATES_TO]->() '
