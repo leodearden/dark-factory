@@ -9,6 +9,7 @@ from openai import AsyncOpenAI
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import QueryType, SourceStore
 from fused_memory.models.memory import ReadRouteResult
+from fused_memory.routing.json_extract import extract_json
 
 logger = logging.getLogger(__name__)
 
@@ -159,12 +160,12 @@ class ReadRouter:
             )
             raw = response.choices[0].message.content or ''
 
-            json_match = re.search(r'\{[^}]+\}', raw, re.DOTALL)
-            if not json_match:
+            json_str = extract_json(raw)
+            if not json_str:
                 logger.warning(f'LLM routing returned no JSON: {raw[:200]}')
                 return _QUERY_TYPE_ROUTING[QueryType.broad]
 
-            data = json.loads(json_match.group())
+            data = json.loads(json_str)
             query_type = QueryType(data['query_type'])
             stores = [SourceStore(s) for s in data.get('stores', ['graphiti', 'mem0'])]
             primary_store = SourceStore(data.get('primary_store', 'graphiti'))
