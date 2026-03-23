@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.services.memory_service import MemoryService
 
 if TYPE_CHECKING:
@@ -135,6 +136,7 @@ def create_mcp_server(
     """Create and configure the FastMCP server with all tools."""
 
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
+    _taskmaster_configured = task_interceptor is not None
 
     async def _log_read(
         operation: str,
@@ -182,6 +184,11 @@ def create_mcp_server(
     # ------------------------------------------------------------------
 
     _VALID_TEMPORAL_CONTEXTS = frozenset({'retrospective', 'planning', 'current'})
+    _VALID_TASK_STATUSES = frozenset({
+        'pending', 'done', 'in-progress', 'review', 'deferred', 'cancelled', 'blocked',
+    })
+    _VALID_STORES = frozenset(v.value for v in SourceStore)
+    _VALID_CATEGORIES = frozenset(v.value for v in MemoryCategory)
 
     @mcp.tool()
     async def add_episode(
@@ -218,7 +225,8 @@ def create_mcp_server(
                 'error': (
                     f'Invalid temporal_context {temporal_context!r}. '
                     f'Must be one of {sorted(_VALID_TEMPORAL_CONTEXTS)} or None.'
-                )
+                ),
+                'error_type': 'ValidationError',
             }
         try:
             causation_id, op_source, _ = _extract_causation(metadata, agent_id)
@@ -236,7 +244,7 @@ def create_mcp_server(
             return result.model_dump()
         except Exception as e:
             logger.error(f'add_episode error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def add_memory(
@@ -264,6 +272,14 @@ def create_mcp_server(
             dual_write: Force write to both stores (default: false)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if category is not None and category not in _VALID_CATEGORIES:
+            return {
+                'error': (
+                    f'Invalid category {category!r}. '
+                    f'Must be one of {sorted(_VALID_CATEGORIES)} or None.'
+                ),
+                'error_type': 'ValidationError',
+            }
         try:
             causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
             result = await memory_service.add_memory(
@@ -280,7 +296,7 @@ def create_mcp_server(
             return result.model_dump()
         except Exception as e:
             logger.error(f'add_memory error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
     # Read tools
@@ -319,6 +335,13 @@ def create_mcp_server(
             session_id: Filter by session (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if limit <= 0:
+            return {
+                'error': f'Invalid limit {limit!r}. Must be a positive integer.',
+                'error_type': 'ValidationError',
+            }
+        if limit > 1000:
+            limit = 1000
         try:
             results = await memory_service.search(
                 query=query,
@@ -350,7 +373,7 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def get_entity(
@@ -398,7 +421,7 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def get_episodes(
@@ -420,6 +443,13 @@ def create_mcp_server(
             session_id: Session context (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if last_n <= 0:
+            return {
+                'error': f'Invalid last_n {last_n!r}. Must be a positive integer.',
+                'error_type': 'ValidationError',
+            }
+        if last_n > 1000:
+            last_n = 1000
         try:
             episodes = await memory_service.get_episodes(
                 project_id=project_id, last_n=last_n
@@ -444,7 +474,7 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
     # Delete tools
@@ -479,6 +509,14 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if store not in _VALID_STORES:
+            return {
+                'error': (
+                    f'Invalid store {store!r}. '
+                    f'Must be one of {sorted(_VALID_STORES)}.'
+                ),
+                'error_type': 'ValidationError',
+            }
         try:
             causation_id, source, _ = _extract_causation(metadata, agent_id)
             return await memory_service.delete_memory(
@@ -488,7 +526,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'delete_memory error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def delete_episode(
@@ -524,7 +562,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'delete_episode error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
     # Management tools
@@ -543,7 +581,7 @@ def create_mcp_server(
             return await memory_service.get_status(project_id=project_id)
         except Exception as e:
             logger.error(f'get_status error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
     # Queue management tools
@@ -574,7 +612,7 @@ def create_mcp_server(
             return {'status': 'queued', 'items_queued': count, 'project_id': project_id}
         except Exception as e:
             logger.error(f'replay_to_graphiti error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def get_queue_stats() -> dict[str, Any]:
@@ -583,11 +621,11 @@ def create_mcp_server(
         """
         try:
             if memory_service.durable_queue is None:
-                return {'error': 'Queue not initialized'}
+                return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
             return await memory_service.durable_queue.get_stats()
         except Exception as e:
             logger.error(f'get_queue_stats error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def replay_dead_letters(
@@ -604,12 +642,12 @@ def create_mcp_server(
         """
         try:
             if memory_service.durable_queue is None:
-                return {'error': 'Queue not initialized'}
+                return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
             count = await memory_service.durable_queue.replay_dead(group_id=project_id)
             return {'status': 'replayed', 'items_reset': count}
         except Exception as e:
             logger.error(f'replay_dead_letters error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
     # Reconciliation tools
@@ -625,6 +663,11 @@ def create_mcp_server(
         Args:
             project_id: Project to trigger reconciliation for
         """
+        if not _taskmaster_configured:
+            return {
+                'error': 'Taskmaster is not configured. Cannot trigger reconciliation.',
+                'error_type': 'ConfigurationError',
+            }
         try:
             await task_interceptor.buffer.request_trigger(project_id)  # type: ignore[union-attr]
             return {
@@ -634,7 +677,7 @@ def create_mcp_server(
             }
         except Exception as e:
             logger.error(f'trigger_reconciliation error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
     # Task proxy tools (always registered; errors if Taskmaster unavailable)
@@ -664,7 +707,7 @@ def create_mcp_server(
             return await task_interceptor.get_tasks(project_root=project_root, tag=tag)
         except Exception as e:
             logger.error(f'get_tasks error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def get_task(
@@ -685,7 +728,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'get_task error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def set_task_status(
@@ -702,17 +745,25 @@ def create_mcp_server(
 
         Args:
             id: Task ID (comma-separated for multiple)
-            status: pending, done, in-progress, review, deferred, or cancelled
+            status: pending, done, in-progress, blocked, review, deferred, or cancelled
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
+        if status not in _VALID_TASK_STATUSES:
+            return {
+                'error': (
+                    f'Invalid status {status!r}. '
+                    f'Must be one of {sorted(_VALID_TASK_STATUSES)}.'
+                ),
+                'error_type': 'ValidationError',
+            }
         try:
             return await task_interceptor.set_task_status(
                 task_id=id, status=status, project_root=project_root, tag=tag
             )
         except Exception as e:
             logger.error(f'set_task_status error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def add_task(
@@ -754,7 +805,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'add_task error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def update_task(
@@ -788,7 +839,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'update_task error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def add_subtask(
@@ -820,7 +871,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'add_subtask error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def remove_task(
@@ -841,7 +892,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'remove_task error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def add_dependency(
@@ -867,7 +918,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'add_dependency error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def remove_dependency(
@@ -893,7 +944,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'remove_dependency error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def expand_task(
@@ -925,7 +976,7 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'expand_task error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def parse_prd(
@@ -951,6 +1002,6 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'parse_prd error: {e}')
-            return {'error': str(e)}
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     return mcp

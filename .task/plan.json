@@ -1,181 +1,192 @@
 {
-  "task_id": "100",
-  "title": "Fix critical judge + harness reconciliation bugs",
+  "task_id": "105",
+  "title": "Add server tools input validation",
   "files": [
-    "fused-memory/src/fused_memory/reconciliation/judge.py",
-    "fused-memory/src/fused_memory/reconciliation/harness.py",
-    "fused-memory/tests/test_judge.py",
-    "fused-memory/tests/test_harness.py"
+    "fused-memory/src/fused_memory/server/tools.py",
+    "fused-memory/tests/test_health_endpoint.py"
   ],
   "modules": [
-    "fused-memory/src/fused_memory/reconciliation",
+    "fused-memory/src/fused_memory/server",
     "fused-memory/tests"
   ],
-  "analysis": "Five critical bugs across judge.py and harness.py. Bug 1: _build_review_prompt crashes when iterating stage_reports containing plain dict _error entries (injected by harness on failures and stale-run recovery). Fix: isinstance guard on StageReport. Bug 2: JudgeVerdict.action_taken is persisted as 'none' before severity-based mutation to 'rollback'/'halt'; the updated value never reaches the DB. Fix: move journal.add_verdict() to after action_taken determination. Bug 3: judge.is_halted() exists but is never called in run_loop; halted projects keep running cycles. Fix: add halt check before run_full_cycle in run_loop(). Bug 4: BacklogIterator.run() drains a chunk via drain_oldest_chunk(), then run_full_cycle() re-drains via drain(), getting different events; the chunk events are silently lost. Fix: add optional 'events' param to run_full_cycle to accept pre-drained events. Bug 5: asyncio.wait_for timeout cancels run_full_cycle but CancelledError isn't caught by 'except Exception', so complete_run(run_id, 'failed') is never called, leaving the run stuck in 'running'. Fix: add except asyncio.CancelledError handler in run_full_cycle that marks run failed, restores events, and re-raises. Review feedback identified two robustness issues in the Bug 5 handler: (a) cleanup awaits can be interrupted by a second cancellation during shutdown, and (b) if cleanup raises, the exception replaces CancelledError, breaking the caller's timeout handler.",
+  "analysis": "tools.py defines all MCP tool functions as closures inside create_mcp_server(). Currently, parameters like status, store, category, and limit are passed through to service/interceptor without validation, producing opaque errors deep in the stack. The existing codebase has one validation pattern to follow: temporal_context in add_episode (lines 216-222) validates against a frozenset and returns {'error': '...'} before calling the service. Error handlers consistently return {'error': str(e)} without error_type. The fallback EventBuffer (line 649) is created with db_path=None but never initialized \u2014 trigger_reconciliation (line 629) accesses the buffer directly and would hit a cryptic RuntimeError. The test file test_health_endpoint.py already tests tool-level behavior using mcp_server._tool_manager.call_tool() and has the right fixtures (mcp_server, mcp_server_with_tasks). There are ~24 exception handler return sites that need error_type added.\n\n[REVIEW FIX] All three reviewers flagged that 'blocked' is absent from _VALID_TASK_STATUSES (line 187). TaskInterceptor.STATUS_TRIGGERS (task_interceptor.py:27) explicitly includes 'blocked', targeted.py:66 has an _on_task_blocked handler, and the set_task_status docstring documents 'done/blocked/cancelled/deferred' transitions. Any set_task_status(status='blocked') call would receive a ValidationError \u2014 a functional regression. Steps 15-16 fix this with a regression test and the one-line fix.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing test for Bug 1: test_build_review_prompt_handles_error_dict_entries. Create a mock run with stage_reports containing both a StageReport and a plain dict _error entry (as injected by harness line 414 and _recover_stale_runs line 119). Call _build_review_prompt() and assert it does NOT raise AttributeError. Verify the prompt string contains info from both the StageReport and the _error dict.",
+      "description": "Write failing test: set_task_status rejects invalid status values. Test that calling set_task_status with status='bogus' returns an error dict containing 'invalid' and listing valid statuses (pending, done, in-progress, review, deferred, cancelled). Also test that a valid status like 'done' passes through to the interceptor.",
       "status": "done",
-      "commit": "7154590"
+      "commit": "eca167a"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Fix Bug 1 in judge.py _build_review_prompt (lines 104-111): Add isinstance(report, StageReport) guard. For StageReport instances, extract items_flagged/stats/llm_calls/tokens_used as before. For dict entries (like _error), include the dict directly in the stage_reports output. This handles both the explicit _error entries injected by harness and any future non-StageReport entries.",
+      "description": "Add _VALID_TASK_STATUSES frozenset and validation guard at the top of set_task_status tool (before the try block). Return {'error': f'Invalid status {status!r}. Must be one of {sorted(_VALID_TASK_STATUSES)}.', 'error_type': 'ValidationError'} for invalid values.",
       "status": "done",
-      "commit": "0b99a62"
+      "commit": "339fbb5"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write failing test for Bug 2: test_verdict_action_taken_persisted_after_mutation. Mock journal and _call_llm to return a 'moderate' severity verdict. Call review_run() and assert that journal.add_verdict() was called with a verdict whose action_taken is 'rollback', not 'none'. Also test 'serious' severity persists 'halt'. The test should fail because currently add_verdict is called BEFORE action_taken mutation.",
+      "description": "Write failing test: delete_memory rejects invalid store values. Test that store='redis' returns an error dict mentioning valid stores (graphiti, mem0). Also test valid store passes through.",
       "status": "done",
-      "commit": "3449b68"
+      "commit": "23eef12"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Fix Bug 2 in judge.py review_run(): Move the journal.add_verdict(verdict) call (currently at line 48) to AFTER the action_taken determination block (after line 70). This ensures the verdict written to the DB has the correct action_taken value ('rollback', 'halt', or 'none'). The log statement at lines 50-58 should also move after the action_taken block since it logs action_taken.",
+      "description": "Add validation guard at the top of delete_memory tool using SourceStore enum values from models/enums.py. Build _VALID_STORES frozenset from SourceStore. Return clear error with error_type='ValidationError'.",
       "status": "done",
-      "commit": "892cb17"
+      "commit": "c6c677c"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write failing test for Bug 3: test_halted_project_skips_cycle. Create a harness with a judge, halt a project via judge._halted_projects.add(). Push events and trigger a cycle. Assert that run_full_cycle is NOT called for the halted project. This tests that the halt check is wired into run_loop or the cycle entry point. Since run_loop is an infinite loop, test via a helper or by patching run_full_cycle and calling the relevant section directly.",
+      "description": "Write failing test: add_memory rejects invalid category values. Test that category='invalid_cat' returns error listing all 6 MemoryCategory values. Also test that None category (auto-classify) passes through, and valid category passes through.",
       "status": "done",
-      "commit": "344276c"
+      "commit": "a454dab"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Fix Bug 3 in harness.py run_loop(): After acquiring the run lock (line 238) and before the BacklogIterator/run_full_cycle branching, add: if self.judge and self.judge.is_halted(project_id): logger.warning(...); await self.buffer.mark_run_complete(project_id); continue. This skips the cycle for halted projects while properly releasing the lock.",
+      "description": "Add validation guard in add_memory: when category is not None, validate against _VALID_CATEGORIES frozenset built from MemoryCategory enum. Import MemoryCategory from models/enums.py. Return clear error with error_type='ValidationError'.",
       "status": "done",
-      "commit": "4242b15"
+      "commit": "935ee2b"
     },
     {
       "id": "step-7",
       "type": "test",
-      "description": "Write failing test for Bug 4: test_run_full_cycle_accepts_pre_drained_events. Create a harness with mocked stages. Do NOT push any events to the buffer (empty buffer). Create 2 ReconciliationEvent objects manually. Call run_full_cycle(project_id, reason, events=[evt1, evt2]). Assert run.events_processed == 2 (proves it used the passed events instead of drain() which would return 0). Also verify the stage mock received those 2 events.",
+      "description": "Write failing tests: search rejects non-positive limit (0, -1) and caps limit at 1000. Test limit=0 returns error, limit=-1 returns error, limit=5000 is silently capped to 1000 (verify service called with limit=1000).",
       "status": "done",
-      "commit": "b68ed65"
+      "commit": "c8918d3"
     },
     {
       "id": "step-8",
       "type": "impl",
-      "description": "Fix Bug 4: Add optional 'events' parameter to run_full_cycle(). When events is provided, skip the self.buffer.drain() call and use the provided events. Update BacklogIterator.run() to pass chunk events: self.harness.run_full_cycle(project_id, ..., events=chunk). The final consolidation pass keeps events=None to drain remaining buffer normally.",
+      "description": "Add limit validation at top of search tool: if limit <= 0, return error with error_type='ValidationError'. If limit > 1000, set limit = min(limit, 1000) before forwarding to service.",
       "status": "done",
-      "commit": "2907ab3"
+      "commit": "8e61930"
     },
     {
       "id": "step-9",
       "type": "test",
-      "description": "Write failing test for Bug 5: test_timeout_marks_run_failed. Create a harness where stage.run is an async function that sleeps for a long time (asyncio.sleep(999)). Push events, then call asyncio.wait_for(harness.run_full_cycle(...), timeout=0.1). Catch TimeoutError. Then query the journal for recent runs and assert the run's status is 'failed', not 'running'. Also verify events were restored to the buffer.",
+      "description": "Write failing tests: get_episodes rejects non-positive last_n (0, -1) and caps at 1000. Same pattern as search limit tests \u2014 verify service called with capped value.",
       "status": "done",
-      "commit": "2cd5dbe"
+      "commit": "8d1f629"
     },
     {
       "id": "step-10",
       "type": "impl",
-      "description": "Fix Bug 5 in harness.py run_full_cycle(): Add 'except asyncio.CancelledError' handler between the existing 'except Exception' and 'finally' blocks. In the handler: set run.status='failed', add _error entry to stage_reports with error_type='CancelledError'/Timeout, call complete_run(run_id, 'failed'), call restore_drained(project_id), log the error, then re-raise. This ensures the journal run is properly closed when asyncio.wait_for cancels the coroutine on timeout.",
+      "description": "Add last_n validation at top of get_episodes tool: if last_n <= 0, return error. If last_n > 1000, cap to 1000.",
       "status": "done",
-      "commit": "5a117bf"
+      "commit": "3771e85"
     },
     {
       "id": "step-11",
       "type": "test",
-      "description": "Write failing test for review issue [exception_swallowing]: test_cancellation_cleanup_failure_preserves_cancelled_error. Mock journal.complete_run to raise RuntimeError('DB connection lost') when called during CancelledError cleanup. Run a harness with a slow stage, cancel via asyncio.wait_for timeout. Assert that the caller still receives CancelledError/TimeoutError (not RuntimeError). Currently the cleanup exception replaces CancelledError before the re-raise, so the caller gets RuntimeError instead of TimeoutError, bypassing the timeout handler in run_loop.",
+      "description": "Write failing test: trigger_reconciliation without taskmaster returns clear 'not configured' error instead of cryptic 'EventBuffer not initialized' RuntimeError. Create server without task_interceptor, call trigger_reconciliation, verify 'not configured' in error.",
       "status": "done",
-      "commit": "c2332bd"
+      "commit": "72b74c4"
     },
     {
       "id": "step-12",
       "type": "impl",
-      "description": "Fix review issue [exception_swallowing] in harness.py: Wrap the cleanup awaits inside 'except asyncio.CancelledError' in a nested try/except. Structure: try: await shield(complete_run(...)); await shield(restore_drained(...)); except Exception as cleanup_err: logger.error(f'Cleanup failed after cancellation: {cleanup_err}'). The outer raise statement stays outside the nested try/except so CancelledError is always re-raised regardless of cleanup failures.",
+      "description": "Guard trigger_reconciliation tool: add an early check \u2014 if the original task_interceptor argument was None (track via a _taskmaster_configured bool), return {'error': 'Taskmaster is not configured. Cannot trigger reconciliation.', 'error_type': 'ConfigurationError'} before accessing the buffer.",
       "status": "done",
-      "commit": "f43d685"
+      "commit": "2edea2b"
     },
     {
       "id": "step-13",
       "type": "test",
-      "description": "Write failing test for review issue [async_cancellation_safety]: test_cancellation_cleanup_shielded_from_second_cancel. Simulate a second cancellation arriving during cleanup by patching journal.complete_run to: (1) cancel the current task, (2) then return normally. Without asyncio.shield(), the second cancellation interrupts the await, leaving the journal run stuck in 'running'. With shield, complete_run finishes despite the outer task being cancelled. Assert journal run status is 'failed' after the double cancellation.",
+      "description": "Write failing test: error responses from exception handlers include error_type field. Use existing mcp_server_with_tasks fixture, make interceptor.set_task_status raise RuntimeError, verify result has 'error_type': 'RuntimeError'. Also test with update_task raising ValueError to verify error_type='ValueError'.",
       "status": "done",
-      "commit": "a9c25ac"
+      "commit": "af95709"
     },
     {
       "id": "step-14",
       "type": "impl",
-      "description": "Fix review issue [async_cancellation_safety] in harness.py: Wrap journal.complete_run() and buffer.restore_drained() calls inside 'except asyncio.CancelledError' with asyncio.shield(). Final structure: try: await asyncio.shield(self.journal.complete_run(run_id, 'failed')); await asyncio.shield(self.buffer.restore_drained(project_id)); except Exception as cleanup_err: logger.error(f'Cleanup failed after cancellation: {cleanup_err}'). This protects the critical journal write from concurrent outer cancellation during server shutdown.",
+      "description": "Update all ~24 exception handler return statements in tools.py: change every {'error': str(e)} to {'error': str(e), 'error_type': type(e).__name__}. Covers add_episode, add_memory, search, get_entity, get_episodes, delete_memory, delete_episode, get_status, replay_to_graphiti, get_queue_stats, replay_dead_letters, trigger_reconciliation, and all 11 task proxy tools.",
       "status": "done",
-      "commit": "9c0eeb1"
+      "commit": "fc34125"
+    },
+    {
+      "id": "step-15",
+      "type": "test",
+      "description": "[REVIEW FIX] Write regression test: set_task_status accepts 'blocked' as a valid status. Test that calling set_task_status with status='blocked' passes through to the interceptor (no validation error returned). This test will fail against the current code because 'blocked' is absent from _VALID_TASK_STATUSES. Use the same pattern as test_set_task_status_valid_status_passes_through but with status='blocked'. Also parametrize or add a second assertion confirming all TaskInterceptor.STATUS_TRIGGERS values ('done', 'blocked', 'cancelled', 'deferred') are accepted.",
+      "status": "done",
+      "commit": "7ab4c94"
+    },
+    {
+      "id": "step-16",
+      "type": "impl",
+      "description": "[REVIEW FIX] Add 'blocked' to _VALID_TASK_STATUSES: change frozenset({'pending', 'done', 'in-progress', 'review', 'deferred', 'cancelled'}) to frozenset({'pending', 'done', 'in-progress', 'review', 'deferred', 'cancelled', 'blocked'}). This is a one-line fix that restores 'blocked' as a valid pass-through status, matching TaskInterceptor.STATUS_TRIGGERS and the set_task_status docstring.",
+      "status": "done",
+      "commit": "9e0efab"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Use isinstance(report, StageReport) guard rather than try/except for Bug 1",
-      "rationale": "The type annotation on stage_reports is already dict[str, StageReport | dict], so an isinstance check is idiomatic and explicit. try/except would mask other AttributeErrors."
+      "decision": "Follow the existing temporal_context validation pattern (early return with error dict before try block)",
+      "rationale": "Consistency with the codebase. This pattern is already used in add_episode (lines 216-222) and is well-tested."
     },
     {
-      "decision": "Move journal.add_verdict() after action_taken determination rather than adding a second persist call for Bug 2",
-      "rationale": "Single write is simpler, cheaper, and avoids a race window where the DB has a stale action_taken value. The log statement moves too since it logs action_taken."
+      "decision": "Use MemoryCategory and SourceStore enums from models/enums.py for validation sets instead of hardcoded strings",
+      "rationale": "DRY \u2014 the enums are the canonical source of truth. If new categories/stores are added, validation stays in sync."
     },
     {
-      "decision": "Add halt check after lock acquisition in run_loop for Bug 3",
-      "rationale": "Checking after lock acquisition ensures we don't hold the lock while skipping the cycle. We release it immediately via mark_run_complete. Checking before lock acquisition would waste a lock attempt on non-halted projects."
+      "decision": "Silently cap limit/last_n at 1000 instead of rejecting values over 1000",
+      "rationale": "Rejecting would be a breaking change if any client sends large limits. Capping is defensive without being disruptive. Non-positive values (<=0) are still rejected since they're clearly erroneous."
     },
     {
-      "decision": "Add optional 'events' parameter to run_full_cycle rather than restructuring BacklogIterator for Bug 4",
-      "rationale": "Minimal API surface change, backward compatible (events=None uses drain()), and clearly separates the concern of event sourcing from pipeline execution. The alternative of restructuring BacklogIterator to not use run_full_cycle would duplicate pipeline logic."
+      "decision": "Guard trigger_reconciliation by tracking _taskmaster_configured flag rather than inspecting EventBuffer internals",
+      "rationale": "The real issue is that taskmaster isn't configured, not that the buffer isn't initialized. A flag set at server creation time is clean and doesn't depend on internal state of EventBuffer or TaskInterceptor."
     },
     {
-      "decision": "Catch asyncio.CancelledError inside run_full_cycle rather than creating run_id in outer scope for Bug 5",
-      "rationale": "Keeps run lifecycle management self-contained within run_full_cycle. The outer scope (run_loop) already handles TimeoutError for logging/buffer-restore; the CancelledError handler ensures the journal run is properly closed. Both handlers calling restore_drained is idempotent and safe. Re-raising CancelledError preserves asyncio cancellation semantics."
+      "decision": "Add error_type to validation errors too, using 'ValidationError' as the type name",
+      "rationale": "Validation errors aren't Python exceptions but should still have a distinguishable error_type for MCP clients. 'ValidationError' matches the common Python naming convention and provides clear categorization."
     },
     {
-      "decision": "Apply both asyncio.shield() and nested try/except to CancelledError cleanup as a single hardened pattern",
-      "rationale": "asyncio.shield() prevents a second cancellation from aborting the cleanup coroutine mid-flight (the primary invariant: complete_run must finish). The nested try/except prevents any cleanup exception from replacing the original CancelledError, ensuring the caller's TimeoutError handler in run_loop always fires. Both defenses are complementary: shield addresses the cascading-cancellation vector, try/except addresses the exception-replacement vector. Implementing exception_swallowing fix first (step-12) then shield (step-14) as the shield test is harder to write without the try/except already in place."
+      "decision": "Add all validation tests to test_health_endpoint.py rather than a new file",
+      "rationale": "The file header says 'Tests for the /health endpoint, MCP tool-level behavior, and server settings' \u2014 input validation is MCP tool-level behavior. The file already has the right fixtures (mcp_server, mcp_server_with_tasks) and the _tool_manager.call_tool() pattern."
+    },
+    {
+      "decision": "[REVIEW FIX] Add 'blocked' to _VALID_TASK_STATUSES as a hardcoded string rather than deriving from TaskInterceptor.STATUS_TRIGGERS",
+      "rationale": "The validation set includes non-trigger statuses too (pending, in-progress, review) so it can't be derived solely from STATUS_TRIGGERS. A TaskStatus StrEnum (as suggested by the reviewer) would be ideal long-term, but is out of scope for this task \u2014 it would require changes to models/enums.py and potentially the interceptor. The immediate fix is minimal and correct: add the missing 'blocked' string to the existing frozenset."
     }
   ],
   "reuse": [
     {
-      "what": "_make_harness_with_mocked_stages helper",
-      "where": "fused-memory/tests/test_harness.py line 268",
-      "how": "Reuse for building test harnesses in Bug 3, 4, 5 tests and new cancellation safety tests with mocked stages"
+      "what": "MemoryCategory StrEnum",
+      "where": "fused-memory/src/fused_memory/models/enums.py",
+      "how": "Import and use frozenset(v.value for v in MemoryCategory) to build validation set"
     },
     {
-      "what": "_mock_stage_run helper",
-      "where": "fused-memory/tests/test_harness.py line 291",
-      "how": "Reuse for creating mock stage.run methods in Bug 3, 4, 5 tests"
+      "what": "SourceStore StrEnum",
+      "where": "fused-memory/src/fused_memory/models/enums.py",
+      "how": "Import and use frozenset(v.value for v in SourceStore) to build validation set"
     },
     {
-      "what": "_make_event helper",
-      "where": "fused-memory/tests/test_harness.py line 49",
-      "how": "Reuse for creating test ReconciliationEvent objects in Bug 4, 5 tests and new cancellation safety tests"
+      "what": "Existing temporal_context validation pattern",
+      "where": "fused-memory/src/fused_memory/server/tools.py lines 216-222",
+      "how": "Follow same pattern: frozenset of valid values, early-return dict with 'error' key before try block"
     },
     {
-      "what": "_make_judge_config helper and mock_journal fixture",
-      "where": "fused-memory/tests/test_judge.py line 13 and 78",
-      "how": "Reuse for creating test Judge instances in Bug 1, 2 tests"
+      "what": "Existing test fixtures and call_tool pattern",
+      "where": "fused-memory/tests/test_health_endpoint.py",
+      "how": "Use mcp_server and mcp_server_with_tasks fixtures, call via server._tool_manager.call_tool(name, params)"
     },
     {
-      "what": "Existing ReconciliationRun model with stage_reports: dict[str, StageReport | dict]",
-      "where": "fused-memory/src/fused_memory/models/reconciliation.py line 87",
-      "how": "The type annotation already supports dict entries in stage_reports, no model change needed for Bug 1"
+      "what": "task_interceptor fixture (AsyncMock)",
+      "where": "fused-memory/tests/test_health_endpoint.py line 20",
+      "how": "Reuse for testing validation bypass (valid values) and error_type propagation (side_effect=Exception)"
     },
     {
-      "what": "Journal get_run deserialization handles dict stage_reports entries",
-      "where": "fused-memory/src/fused_memory/reconciliation/journal.py lines 262-266",
-      "how": "Journal already preserves _error entries as dicts when loading runs, confirming this is an intended data shape"
-    },
-    {
-      "what": "Existing test_timeout_marks_run_failed test pattern",
-      "where": "fused-memory/tests/test_harness.py line 501",
-      "how": "Reuse the slow-stage + asyncio.wait_for pattern for the new cancellation safety tests. Step-11 extends this by also mocking journal.complete_run to fail. Step-13 extends by simulating a second cancellation inside complete_run."
+      "what": "Existing test_set_task_status_valid_status_passes_through test pattern",
+      "where": "fused-memory/tests/test_health_endpoint.py (step-1 test)",
+      "how": "Clone pattern for step-15 regression test \u2014 same fixture usage, same assertion style, but with status='blocked'"
     }
   ],
-  "_session_id": "100-c5989415",
-  "_created_at": "2026-03-22T22:25:27.054952+00:00"
+  "_session_id": "105-caba0179",
+  "_created_at": "2026-03-22T22:34:38.722197+00:00"
 }
