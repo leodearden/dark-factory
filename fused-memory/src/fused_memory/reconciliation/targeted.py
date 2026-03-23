@@ -13,6 +13,7 @@ from fused_memory.models.reconciliation import (
     RunStatus,
     RunType,
 )
+from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
@@ -29,12 +30,48 @@ class TargetedReconciler:
         taskmaster: TaskmasterBackend,
         journal: ReconciliationJournal,
         config: FusedMemoryConfig,
+        event_buffer: EventBuffer | None = None,
     ):
         self.memory = memory_service
         self.taskmaster = taskmaster
         self.journal = journal
         self.config = config.reconciliation
         self.verifier = CodebaseVerifier(config.reconciliation)
+        self.buffer = event_buffer
+
+    async def _fenced_add_memory(
+        self,
+        content: str,
+        category: str,
+        project_id: str,
+        metadata: dict,
+        causation_id: str,
+    ) -> bool:
+        """Write memory if no full cycle is active; defer otherwise.
+
+        Returns True if written immediately, False if deferred.
+        """
+        if self.buffer is not None and await self.buffer.is_full_recon_active(project_id):
+            metadata = {**metadata, '_deferred': True, '_causation_id': causation_id}
+            await self.buffer.defer_write(
+                project_id=project_id,
+                content=content,
+                category=category,
+                metadata=metadata,
+                agent_id='targeted-reconciliation',
+            )
+            logger.info(f'Deferred write during active full cycle for task in {project_id}')
+            return False
+
+        await self.memory.add_memory(
+            content=content,
+            category=category,
+            project_id=project_id,
+            metadata=metadata,
+            causation_id=causation_id,
+            _source='targeted_recon',
+        )
+        return True
 
     async def reconcile_task(
         self,
@@ -112,7 +149,7 @@ class TargetedReconciler:
             if details:
                 content += f"\nDetails: {details[:500]}"
 
-            await self.memory.add_memory(
+            written = await self._fenced_add_memory(
                 content=content,
                 category='observations_and_summaries',
                 project_id=project_id,
@@ -122,12 +159,12 @@ class TargetedReconciler:
                     'transition': 'done',
                 },
                 causation_id=run_id,
-                _source='targeted_recon',
             )
-            result['actions'].append({'type': 'knowledge_captured_fast'})
+            action_type = 'knowledge_captured_fast' if written else 'knowledge_deferred_fast'
+            result['actions'].append({'type': action_type})
             await self.journal.add_run_action(
                 run_id, 'write', 'memory', 'add_memory',
-                {'task_id': task_id, 'type': 'completion_fast'},
+                {'task_id': task_id, 'type': 'completion_fast', 'deferred': not written},
                 causation_id=run_id,
             )
         except Exception as e:
@@ -155,7 +192,7 @@ class TargetedReconciler:
                     scope_hints=_extract_scope_hints(task),
                 )
                 if verification.verdict in ('confirmed', 'contradicted'):
-                    await self.memory.add_memory(
+                    written = await self._fenced_add_memory(
                         content=f"Completed task '{title}': {verification.summary}",
                         category='observations_and_summaries',
                         project_id=project_id,
@@ -165,15 +202,16 @@ class TargetedReconciler:
                             'verification_verdict': verification.verdict,
                         },
                         causation_id=run_id,
-                        _source='targeted_recon',
                     )
+                    action_type = 'knowledge_captured' if written else 'knowledge_deferred'
                     result['actions'].append({
-                        'type': 'knowledge_captured',
+                        'type': action_type,
                         'verification': verification.verdict,
                     })
                     await self.journal.add_run_action(
                         run_id, 'write', 'memory', 'add_memory',
-                        {'task_id': task_id, 'type': 'verification', 'verdict': verification.verdict},
+                        {'task_id': task_id, 'type': 'verification', 'verdict': verification.verdict,
+                         'deferred': not written},
                         causation_id=run_id,
                     )
             except Exception as e:

@@ -50,8 +50,18 @@ def config():
 
 
 @pytest.fixture
-def reconciler(mock_memory_service, mock_taskmaster, journal, config):
-    r = TargetedReconciler(mock_memory_service, mock_taskmaster, journal, config)
+def mock_event_buffer():
+    buf = AsyncMock()
+    buf.is_full_recon_active = AsyncMock(return_value=False)
+    buf.defer_write = AsyncMock(return_value='deferred-id')
+    return buf
+
+
+@pytest.fixture
+def reconciler(mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer):
+    r = TargetedReconciler(
+        mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+    )
     # Mock the verifier to avoid actual LLM calls
     r.verifier = AsyncMock()
     r.verifier.verify = AsyncMock(return_value=VerificationResult(
@@ -322,3 +332,106 @@ async def test_bulk_reconcile_separates_ids(reconciler, mock_memory_service, moc
     if mock_taskmaster.update_task.called:
         call_kwargs = mock_taskmaster.update_task.call_args.kwargs
         assert call_kwargs['project_root'] == '/home/leo/src/dark-factory'
+
+
+# ── Cycle fence (write deferral) tests ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_done_defers_write_during_active_cycle(
+    mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+):
+    """When a full cycle is active, memory writes are deferred to the buffer."""
+    mock_event_buffer.is_full_recon_active = AsyncMock(return_value=True)
+    r = TargetedReconciler(
+        mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+    )
+    r.verifier = AsyncMock()
+
+    task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
+    result = await r.reconcile_task(
+        task_id='1', transition='done', project_id='test-project', task_before=task_before,
+    )
+
+    # Memory service should NOT have been called for writes
+    mock_memory_service.add_memory.assert_not_called()
+    # Buffer should have received the deferred write
+    mock_event_buffer.defer_write.assert_called()
+    # Action should indicate deferral
+    assert any(a['type'] == 'knowledge_deferred_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
+async def test_done_writes_normally_when_no_cycle(reconciler, mock_memory_service, mock_event_buffer):
+    """When no full cycle is active, writes proceed normally."""
+    task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
+    result = await reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project', task_before=task_before,
+    )
+
+    # Memory service should have been called
+    assert mock_memory_service.add_memory.call_count >= 1
+    # Buffer defer should NOT have been called
+    mock_event_buffer.defer_write.assert_not_called()
+    # Action should indicate normal write
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
+async def test_reads_proceed_during_active_cycle(
+    mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+):
+    """Reads (search) still execute even when a full cycle is active."""
+    mock_event_buffer.is_full_recon_active = AsyncMock(return_value=True)
+    r = TargetedReconciler(
+        mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+    )
+    r.verifier = AsyncMock()
+
+    task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
+    await r.reconcile_task(
+        task_id='1', transition='done', project_id='test-project', task_before=task_before,
+    )
+
+    # Search should still proceed
+    mock_memory_service.search.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_blocked_proceeds_during_active_cycle(
+    mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+):
+    """Blocked handler only does reads + taskmaster writes, so it's unaffected by the fence."""
+    mock_event_buffer.is_full_recon_active = AsyncMock(return_value=True)
+    mock_memory_service.search = AsyncMock(return_value=[
+        MemoryResult(id='1', content='info', source_store=SourceStore.mem0, entities=['X']),
+    ])
+    r = TargetedReconciler(
+        mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+    )
+    r.verifier = AsyncMock()
+
+    task_before = {'id': '1', 'title': 'Blocked', 'status': 'in-progress'}
+    result = await r.reconcile_task(
+        task_id='1', transition='blocked', project_id='test-project', task_before=task_before,
+    )
+
+    # Search and taskmaster update should still work
+    mock_memory_service.search.assert_called()
+    hints_actions = [a for a in result.get('actions', []) if a['type'] == 'hints_attached']
+    assert len(hints_actions) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_buffer_writes_normally(mock_memory_service, mock_taskmaster, journal, config):
+    """When event_buffer is None, writes proceed without fence check."""
+    r = TargetedReconciler(mock_memory_service, mock_taskmaster, journal, config)
+    r.verifier = AsyncMock()
+
+    task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
+    result = await r.reconcile_task(
+        task_id='1', transition='done', project_id='test-project', task_before=task_before,
+    )
+
+    assert mock_memory_service.add_memory.call_count >= 1
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))

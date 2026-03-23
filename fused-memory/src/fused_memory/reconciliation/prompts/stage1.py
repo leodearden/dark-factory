@@ -45,6 +45,11 @@ invalidates task assumptions, completed work not reflected in tasks).
 - Use search broadly to find related memories before making changes.
 - When you have completed your work, produce your final structured report as your response.
 
+## Cycle Fence
+When a cycle fence timestamp is provided in the payload, do NOT delete, merge, or modify \
+any memory with metadata source=targeted_reconciliation created after that timestamp. \
+These are recent targeted reconciliation writes that should be preserved for the next cycle.
+
 ## Remediation Mode
 When the payload title is "Remediation Run", you are operating in focused remediation mode:
 - ONLY address the specific findings listed in the payload. Do NOT perform general consolidation.

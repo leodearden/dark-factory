@@ -144,7 +144,9 @@ async def run_server():
         # Targeted reconciler (needs memory_service + taskmaster + journal)
         targeted = None
         if taskmaster and taskmaster.connected:
-            targeted = TargetedReconciler(memory_service, taskmaster, journal, config)
+            targeted = TargetedReconciler(
+                memory_service, taskmaster, journal, config, event_buffer,
+            )
 
         task_interceptor = TaskInterceptor(taskmaster, targeted, event_buffer)
 

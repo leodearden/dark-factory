@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fused_memory.models.reconciliation import (
@@ -28,6 +29,9 @@ class MemoryConsolidator(BaseStage):
     # Remediation support — set by harness for second pass
     remediation_findings: list[dict] | None = None
     prior_s3_findings: list[dict] | None = None
+
+    # Cycle fence — set by harness to protect targeted-recon writes
+    cycle_fence_time: datetime | None = None
 
     def get_system_prompt(self) -> str:
         return STAGE1_SYSTEM_PROMPT
@@ -96,7 +100,18 @@ class MemoryConsolidator(BaseStage):
                 f'{_format_findings(self.prior_s3_findings)}\n'
             )
 
-        # 6. Format
+        # 6. Cycle fence section
+        cycle_fence_section = ''
+        if self.cycle_fence_time:
+            cycle_fence_section = (
+                f'\n### Cycle Fence\n'
+                f'This cycle started at {self.cycle_fence_time.isoformat()}.\n'
+                f'Do NOT delete, merge, or modify any memory whose metadata includes '
+                f'`source=targeted_reconciliation` and was created after this timestamp. '
+                f'These are recent targeted reconciliation writes that must be preserved.\n'
+            )
+
+        # 7. Format
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}
 
@@ -114,7 +129,7 @@ class MemoryConsolidator(BaseStage):
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}
+{prior_s3_section}{cycle_fence_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.

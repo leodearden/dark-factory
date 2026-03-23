@@ -627,3 +627,89 @@ async def test_cleanup_drained(tmp_path):
         assert row['cnt'] == 1
     finally:
         await buf.close()
+
+
+# ── Deferred writes (cycle fence) ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_defer_write_and_pop(buf):
+    """Deferred write should be retrievable via pop."""
+    write_id = await buf.defer_write(
+        project_id='test-project',
+        content='Task X completed',
+        category='observations_and_summaries',
+        metadata={'source': 'targeted_reconciliation', 'task_id': '1'},
+        agent_id='targeted-reconciliation',
+    )
+    assert write_id  # non-empty string
+
+    writes = await buf.pop_deferred_writes('test-project')
+    assert len(writes) == 1
+    assert writes[0]['content'] == 'Task X completed'
+    assert writes[0]['category'] == 'observations_and_summaries'
+    assert writes[0]['metadata']['source'] == 'targeted_reconciliation'
+    assert writes[0]['agent_id'] == 'targeted-reconciliation'
+
+
+@pytest.mark.asyncio
+async def test_pop_deferred_writes_empty(buf):
+    """Pop on empty table returns empty list."""
+    writes = await buf.pop_deferred_writes('test-project')
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_pop_deferred_writes_clears(buf):
+    """Second pop returns empty after first pop consumed all writes."""
+    await buf.defer_write('test-project', 'content1', 'cat1', {})
+    await buf.defer_write('test-project', 'content2', 'cat2', {})
+
+    first_pop = await buf.pop_deferred_writes('test-project')
+    assert len(first_pop) == 2
+
+    second_pop = await buf.pop_deferred_writes('test-project')
+    assert second_pop == []
+
+
+@pytest.mark.asyncio
+async def test_pop_deferred_writes_project_isolation(buf):
+    """Deferred writes are scoped to project_id."""
+    await buf.defer_write('project-a', 'content-a', 'cat', {})
+    await buf.defer_write('project-b', 'content-b', 'cat', {})
+
+    writes_a = await buf.pop_deferred_writes('project-a')
+    assert len(writes_a) == 1
+    assert writes_a[0]['content'] == 'content-a'
+
+    writes_b = await buf.pop_deferred_writes('project-b')
+    assert len(writes_b) == 1
+    assert writes_b[0]['content'] == 'content-b'
+
+
+@pytest.mark.asyncio
+async def test_is_full_recon_active_no_lock(buf):
+    """Returns False when no lock is held."""
+    assert await buf.is_full_recon_active('test-project') is False
+
+
+@pytest.mark.asyncio
+async def test_is_full_recon_active_with_lock(buf):
+    """Returns True when another instance holds the lock."""
+    acquired = await buf.mark_run_active('test-project')
+    assert acquired is True
+    assert await buf.is_full_recon_active('test-project') is True
+
+    await buf.mark_run_complete('test-project')
+    assert await buf.is_full_recon_active('test-project') is False
+
+
+@pytest.mark.asyncio
+async def test_deferred_writes_ordering(buf):
+    """Pop returns deferred writes in creation order."""
+    await buf.defer_write('test-project', 'first', 'cat', {})
+    await buf.defer_write('test-project', 'second', 'cat', {})
+    await buf.defer_write('test-project', 'third', 'cat', {})
+
+    writes = await buf.pop_deferred_writes('test-project')
+    assert [w['content'] for w in writes] == ['first', 'second', 'third']

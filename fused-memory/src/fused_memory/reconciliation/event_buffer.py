@@ -47,6 +47,17 @@ CREATE TABLE IF NOT EXISTS burst_state (
     last_write_at TEXT NOT NULL,
     burst_started_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS deferred_writes (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    category TEXT NOT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    agent_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dw_project ON deferred_writes(project_id);
 """
 
 
@@ -434,6 +445,77 @@ class EventBuffer:
             (now, project_id, self.instance_id),
         )
         await db.commit()
+
+    # ── Deferred writes (cycle fence) ─────────────────────────────────
+
+    async def is_full_recon_active(self, project_id: str) -> bool:
+        """Check if a full reconciliation cycle holds the lock for this project."""
+        return await self._is_run_locked(project_id)
+
+    async def defer_write(
+        self,
+        project_id: str,
+        content: str,
+        category: str,
+        metadata: dict,
+        agent_id: str | None = None,
+    ) -> str:
+        """Queue a memory write for replay after the current full cycle completes."""
+        db = self._require_db()
+        write_id = str(uuid4())
+        await db.execute(
+            """INSERT INTO deferred_writes
+               (id, project_id, content, category, metadata, agent_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                write_id,
+                project_id,
+                content,
+                category,
+                json.dumps(metadata),
+                agent_id,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        await db.commit()
+        logger.info(
+            'reconciliation.write_deferred',
+            extra={'project_id': project_id, 'category': category, 'write_id': write_id},
+        )
+        return write_id
+
+    async def pop_deferred_writes(self, project_id: str) -> list[dict]:
+        """Atomically pop all deferred writes for a project.
+
+        Returns list of ``{content, category, metadata, agent_id}`` dicts.
+        """
+        db = self._require_db()
+        async with db.execute(
+            'SELECT * FROM deferred_writes WHERE project_id = ? ORDER BY created_at',
+            (project_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        if not rows:
+            return []
+
+        ids = [row['id'] for row in rows]
+        placeholders = ','.join('?' for _ in ids)
+        await db.execute(
+            f'DELETE FROM deferred_writes WHERE id IN ({placeholders})',
+            ids,
+        )
+        await db.commit()
+
+        return [
+            {
+                'content': row['content'],
+                'category': row['category'],
+                'metadata': json.loads(row['metadata']),
+                'agent_id': row['agent_id'],
+            }
+            for row in rows
+        ]
 
     # ── Queries ────────────────────────────────────────────────────────
 

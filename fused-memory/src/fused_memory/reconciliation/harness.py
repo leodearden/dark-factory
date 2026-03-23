@@ -130,7 +130,28 @@ class ReconciliationHarness:
             if restored:
                 logger.info(f'Restored {restored} drained events for stale run {run.id}')
             await self.buffer.mark_run_complete(run.project_id)
+            await self._replay_deferred_writes(run.project_id)
             self._escalate('recon_stale_run', run.id, f'Run stuck for >{cutoff}s, recovered')
+
+    # ── Deferred write replay ─────────────────────────────────────────
+
+    async def _replay_deferred_writes(self, project_id: str) -> None:
+        """Replay targeted-recon writes that were deferred during a full cycle."""
+        deferred = await self.buffer.pop_deferred_writes(project_id)
+        if not deferred:
+            return
+        logger.info(f'Replaying {len(deferred)} deferred writes for {project_id}')
+        for write in deferred:
+            try:
+                await self.memory.add_memory(
+                    content=write['content'],
+                    category=write['category'],
+                    project_id=project_id,
+                    metadata=write['metadata'],
+                    _source='targeted_recon',
+                )
+            except Exception as e:
+                logger.warning(f'Failed to replay deferred write: {e}')
 
     # ── Escalation support ─────────────────────────────────────────────
 
@@ -245,6 +266,7 @@ class ReconciliationHarness:
                                         f'Skipping cycle for halted project {project_id}'
                                     )
                                     await self.buffer.mark_run_complete(project_id)
+                                    await self._replay_deferred_writes(project_id)
                                     continue
 
                                 # Select tier before draining
@@ -265,6 +287,7 @@ class ReconciliationHarness:
                                         with suppress(asyncio.CancelledError):
                                             await heartbeat_task
                                         await self.buffer.mark_run_complete(project_id)
+                                        await self._replay_deferred_writes(project_id)
                                 else:
                                     heartbeat_task = asyncio.create_task(
                                         self._heartbeat_loop(project_id)
@@ -287,6 +310,7 @@ class ReconciliationHarness:
                                         with suppress(asyncio.CancelledError):
                                             await heartbeat_task
                                         await self.buffer.mark_run_complete(project_id)
+                                        await self._replay_deferred_writes(project_id)
 
                     # Periodic cleanup of drained events (~every 50s / 10 iterations)
                     loop_count += 1
@@ -381,6 +405,7 @@ class ReconciliationHarness:
         prior_s3_findings = await self._get_prior_s3_findings(project_id)
 
         current_stage_name: str | None = None
+        cycle_start_time = datetime.now(UTC)
         try:
             reports = []
             for stage in self.stages:
@@ -388,11 +413,12 @@ class ReconciliationHarness:
                 stage.project_id = project_id
                 stage.project_root = project_root
 
-                # Apply tier limits and prior S3 findings to Stage 1
+                # Apply tier limits, prior S3 findings, and cycle fence to Stage 1
                 if isinstance(stage, MemoryConsolidator):
                     stage.episode_limit = tier.episode_limit
                     stage.memory_limit = tier.memory_limit
                     stage.prior_s3_findings = prior_s3_findings
+                    stage.cycle_fence_time = cycle_start_time
 
                 report = await stage.run(
                     events, watermark, reports, run_id, model=tier.model,
@@ -479,10 +505,11 @@ class ReconciliationHarness:
             raise
         finally:
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
-            # Reset prior_s3_findings to prevent leaking into next cycle
+            # Reset stage state to prevent leaking into next cycle
             for stage in self.stages:
                 if isinstance(stage, MemoryConsolidator):
                     stage.prior_s3_findings = None
+                    stage.cycle_fence_time = None
 
     # ── Remediation support ───────────────────────────────────────────
 
