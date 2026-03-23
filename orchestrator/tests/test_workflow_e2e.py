@@ -474,8 +474,11 @@ class TestHappyPath:
         outcome = await workflow.run()
         assert outcome == WorkflowOutcome.DONE
 
-        # Verify the farewell function is on main
-        lib_content = (config.project_root / 'lib.py').read_text()
+        # Verify the farewell function is in main's git tree
+        # (update-ref doesn't update the working tree, so check via git show)
+        _, lib_content, _ = await _run(
+            ['git', 'show', 'main:lib.py'], cwd=config.project_root,
+        )
         assert 'def farewell' in lib_content
         assert 'Goodbye' in lib_content
 
@@ -712,7 +715,7 @@ class TestReviewLoop:
 
 @pytest.mark.asyncio
 class TestPostMergeFailure:
-    """Merge succeeds textually but post-merge tests fail → reset → BLOCKED."""
+    """Merge succeeds textually but post-merge tests fail → BLOCKED (main never advanced)."""
 
     async def test_post_merge_verify_fails_resets(
         self, config, git_ops, task_assignment, monkeypatch
@@ -727,24 +730,24 @@ class TestPostMergeFailure:
         async def verify_fn(cwd, cfg, module_configs=None, **kwargs):
             nonlocal verify_call
             verify_call += 1
-            if cwd == config.project_root:
-                # Post-merge verify on main — fail
+            # First verify: in-worktree (pass).
+            # Second verify: post-merge in merge worktree (fail).
+            if verify_call <= 1:
                 return VerifyResult(
-                    passed=False, test_output='FAILED on main',
-                    lint_output='', type_output='',
-                    summary='Post-merge failure',
+                    passed=True, test_output='OK', lint_output='',
+                    type_output='', summary='All checks passed',
                 )
-            # In-worktree verify — pass
             return VerifyResult(
-                passed=True, test_output='OK', lint_output='',
-                type_output='', summary='All checks passed',
+                passed=False, test_output='FAILED post-merge',
+                lint_output='', type_output='',
+                summary='Post-merge failure',
             )
 
         monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify_fn)
 
-        # Capture pre-merge HEAD to verify reset
+        # Capture pre-merge main ref
         _, pre_merge_sha, _ = await _run(
-            ['git', 'rev-parse', 'HEAD'], cwd=config.project_root,
+            ['git', 'rev-parse', 'main'], cwd=config.project_root,
         )
 
         outcome = await workflow.run()
@@ -752,15 +755,11 @@ class TestPostMergeFailure:
         assert outcome == WorkflowOutcome.BLOCKED
         assert scheduler.statuses['42'][-1] == 'blocked'
 
-        # Main should be reset to pre-merge HEAD — no merge commit, no revert
+        # Main should NOT have advanced — update-ref was never called
         _, post_sha, _ = await _run(
-            ['git', 'rev-parse', 'HEAD'], cwd=config.project_root,
+            ['git', 'rev-parse', 'main'], cwd=config.project_root,
         )
         assert post_sha == pre_merge_sha
-
-        # Content should match pre-merge state
-        lib_content = (config.project_root / 'lib.py').read_text()
-        assert 'farewell' not in lib_content
 
         # Merge failure review should exist in .task/reviews/
         assert workflow.artifacts is not None

@@ -78,6 +78,25 @@ class TestWorktreeLifecycle:
         assert 'base_change.py' in diff
         assert 'y = 2' in diff
 
+    async def test_commit_excludes_taskmaster_tasks(self, git_ops: GitOps):
+        """Files in .taskmaster/tasks/ must not be staged by commit()."""
+        worktree, _ = await git_ops.create_worktree('feature-exclude')
+
+        tasks_dir = worktree / '.taskmaster' / 'tasks'
+        tasks_dir.mkdir(parents=True, exist_ok=True)
+        (tasks_dir / 'tasks.json').write_text('{"tasks": []}')
+        (worktree / 'real_change.py').write_text('x = 1\n')
+
+        sha = await git_ops.commit(worktree, 'Test exclusion')
+        assert sha is not None
+
+        rc, files, _ = await _run(
+            ['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', sha],
+            cwd=worktree,
+        )
+        assert 'real_change.py' in files
+        assert '.taskmaster/tasks/tasks.json' not in files
+
     async def test_cleanup_worktree(self, git_ops: GitOps):
         worktree, _ = await git_ops.create_worktree('feature-5')
         assert worktree.exists()
@@ -92,7 +111,48 @@ class TestWorktreeLifecycle:
         result = await git_ops.merge_to_main(worktree, 'feature-6')
         assert result.success
         assert result.merge_commit is not None
-        assert (git_ops.project_root / 'merged.py').exists()
+        assert result.merge_worktree is not None
+        assert result.merge_worktree != git_ops.project_root
+
+        # Merge worktree has the file
+        assert (result.merge_worktree / 'merged.py').exists()
+
+        # Main ref not advanced yet — project_root working tree untouched
+        assert not (git_ops.project_root / 'merged.py').exists()
+
+        # Advance main and verify
+        assert await git_ops.advance_main(result.merge_commit)
+        _, content, _ = await _run(
+            ['git', 'show', 'main:merged.py'], cwd=git_ops.project_root,
+        )
+        assert 'merged = True' in content
+
+        await git_ops.cleanup_merge_worktree(result.merge_worktree)
+        assert not result.merge_worktree.exists()
+
+    async def test_advance_main_rejects_non_ancestor(self, git_ops: GitOps):
+        """advance_main rejects a SHA that isn't a descendant of main."""
+        # Use a commit from a branch that hasn't been merged
+        worktree, _ = await git_ops.create_worktree('orphan')
+        (worktree / 'orphan.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Orphan commit')
+
+        # Advance main to a different commit first
+        worktree2, _ = await git_ops.create_worktree('advance-first')
+        (worktree2 / 'first.py').write_text('y = 1\n')
+        await git_ops.commit(worktree2, 'First commit')
+        result = await git_ops.merge_to_main(worktree2, 'advance-first')
+        assert result.success
+        assert result.merge_commit is not None
+        assert result.merge_worktree is not None
+        await git_ops.advance_main(result.merge_commit)
+        await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # Now the orphan branch's commit is NOT a descendant of new main
+        _, orphan_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
+        )
+        assert not await git_ops.advance_main(orphan_sha)
 
     async def test_get_current_branch(self, git_ops: GitOps):
         worktree, _ = await git_ops.create_worktree('feature-7')
@@ -117,11 +177,16 @@ class TestMergeConflicts:
         # Merge A first — should succeed
         result_a = await git_ops.merge_to_main(wt_a, 'branch-a')
         assert result_a.success
+        assert result_a.merge_commit is not None
+        assert result_a.merge_worktree is not None
+        await git_ops.advance_main(result_a.merge_commit)
+        await git_ops.cleanup_merge_worktree(result_a.merge_worktree)
 
         # Merge B — should conflict (main now has "A", branch has "B")
         result_b = await git_ops.merge_to_main(wt_b, 'branch-b')
         assert not result_b.success
         assert result_b.conflicts
+        assert result_b.merge_worktree is not None
 
-        # Abort to clean up
-        await git_ops.abort_merge(git_ops.project_root)
+        # Clean up the conflict worktree
+        await git_ops.cleanup_merge_worktree(result_b.merge_worktree)

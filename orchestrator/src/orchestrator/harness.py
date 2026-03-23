@@ -26,6 +26,12 @@ try:
 except ImportError:
     HAS_ESCALATION = False
 
+try:
+    from orchestrator.steward import TaskSteward
+    HAS_STEWARD = True
+except ImportError:
+    HAS_STEWARD = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +43,8 @@ class TaskReport:
     cost_usd: float = 0.0
     duration_ms: int = 0
     agent_invocations: int = 0
+    steward_cost_usd: float = 0.0
+    steward_invocations: int = 0
 
 
 @dataclass
@@ -483,6 +491,25 @@ Output JSON matching the schema. Every task must appear in the output.
 
             recovered_plan = self._recovered_plans.pop(assignment.task_id, None)
 
+            # Build steward factory — steward starts when the workflow
+            # creates its worktree (it needs the path).
+            steward_factory = None
+            if HAS_STEWARD and self._escalation_queue:
+                esc_q = self._escalation_queue  # capture for closure (narrows type)
+
+                def _make_steward(worktree: Path, *, _assign=assignment) -> TaskSteward:  # type: ignore[name-defined]
+                    return TaskSteward(
+                        task_id=_assign.task_id,
+                        task=_assign.task,
+                        worktree=worktree,
+                        config=self.config,
+                        mcp=self.mcp,
+                        escalation_queue=esc_q,
+                        briefing=self.briefing,
+                        usage_gate=self.usage_gate,
+                    )
+                steward_factory = _make_steward
+
             workflow = TaskWorkflow(
                 assignment=assignment,
                 config=self.config,
@@ -494,8 +521,16 @@ Output JSON matching the schema. Every task must appear in the output.
                 escalation_event=esc_event,
                 usage_gate=self.usage_gate,
                 initial_plan=recovered_plan,
+                steward_factory=steward_factory,
             )
             outcome = await workflow.run()
+
+            steward_cost = 0.0
+            steward_invocations = 0
+            steward = workflow._steward
+            if steward and hasattr(steward, 'metrics'):
+                steward_cost = steward.metrics.total_cost_usd
+                steward_invocations = steward.metrics.invocations
 
             return TaskReport(
                 task_id=assignment.task_id,
@@ -504,6 +539,8 @@ Output JSON matching the schema. Every task must appear in the output.
                 cost_usd=workflow.metrics.total_cost_usd,
                 duration_ms=workflow.metrics.total_duration_ms,
                 agent_invocations=workflow.metrics.agent_invocations,
+                steward_cost_usd=steward_cost,
+                steward_invocations=steward_invocations,
             )
         except Exception as e:
             logger.exception(f'Workflow slot error for task {assignment.task_id}: {e}')
