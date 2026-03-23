@@ -67,8 +67,8 @@ class TestIntegrationFlow:
         assert stats['counts'].get('completed', 0) == 1
 
     @pytest.mark.asyncio
-    async def test_add_memory_mem0_only_no_queue(self, integrated_service):
-        """add_memory with mem0 category -> direct write, no queue items."""
+    async def test_add_memory_mem0_processed_via_queue(self, integrated_service):
+        """add_memory with mem0 category -> enqueued -> worker processes -> mem0 called."""
         svc = integrated_service
 
         result = await svc.add_memory(
@@ -77,11 +77,13 @@ class TestIntegrationFlow:
             project_id='test',
         )
         assert SourceStore.mem0 in result.stores_written
-        svc.mem0.add.assert_called_once()
 
+        # Wait for worker to process
+        await asyncio.sleep(1.0)
+
+        svc.mem0.add.assert_called_once()
         stats = await svc.durable_queue.get_stats()
-        total = sum(stats['counts'].values())
-        assert total == 0
+        assert stats['counts'].get('completed', 0) == 1
 
     @pytest.mark.asyncio
     async def test_add_episode_uuid_survives_full_flow(self, integrated_service):
@@ -104,33 +106,36 @@ class TestIntegrationFlow:
 
     @pytest.mark.asyncio
     async def test_add_episode_processed_with_callback(self, integrated_service):
-        """add_episode -> enqueued with dual_write_episode callback -> graphiti called -> mem0 called for edges."""
+        """add_episode -> enqueued with dual_write_episode callback -> graphiti called -> facts enqueued for mem0."""
         svc = integrated_service
 
         # graphiti.add_episode returns result with entity_edges for dual-write
         mock_result = MagicMock()
         edge = MagicMock()
-        edge.fact = 'Redis uses port 6379'
+        edge.fact = 'Always format code with black'  # preferences -> mem0 primary
         mock_result.entity_edges = [edge]
         svc.graphiti.add_episode.return_value = mock_result
 
         result = await svc.add_episode(
-            content='User discussed auth changes',
+            content='User discussed formatting preferences',
             project_id='test',
         )
         assert result.status == 'queued'
 
-        # Wait for worker + callback
-        await asyncio.sleep(1.5)
+        # Wait for worker + callback + mem0 classify_and_add processing
+        await asyncio.sleep(2.5)
 
         svc.graphiti.add_episode.assert_called_once()
-        # Dual-write callback should have classified the edge and written to mem0
-        # (the fact matches 'uses' pattern -> entities_and_relations -> graphiti primary)
-        # Only if classified as mem0 primary or secondary would mem0.add be called
+        # The callback enqueues mem0_classify_and_add items which the queue processes.
+        # The fact "Always format code with black" should classify as preferences_and_norms
+        # (mem0 primary) and trigger a mem0.add call.
+        stats = await svc.durable_queue.get_stats()
+        # At minimum the episode item completed; mem0 items may also be completed
+        assert stats['counts'].get('completed', 0) >= 1
 
     @pytest.mark.asyncio
     async def test_dual_write_both_paths(self, integrated_service):
-        """add_memory with dual_write=True -> graphiti enqueued + mem0 written directly."""
+        """add_memory with dual_write=True -> both graphiti and mem0 enqueued and processed."""
         svc = integrated_service
 
         result = await svc.add_memory(
@@ -142,12 +147,10 @@ class TestIntegrationFlow:
         assert SourceStore.graphiti in result.stores_written
         assert SourceStore.mem0 in result.stores_written
 
-        # Mem0 written synchronously
-        svc.mem0.add.assert_called_once()
-
-        # Wait for queue to process graphiti write
-        await asyncio.sleep(1.0)
+        # Wait for queue to process both writes
+        await asyncio.sleep(1.5)
         svc.graphiti.add_episode.assert_called_once()
+        svc.mem0.add.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_replay_from_store_enqueues_batch(self, integrated_service):

@@ -76,9 +76,11 @@ class TestAddMemory:
         )
         assert SourceStore.mem0 in result.stores_written
         assert result.category == MemoryCategory.preferences_and_norms
-        # Mem0 written directly, no queue
-        service.mem0.add.assert_called_once()
-        service.durable_queue.enqueue.assert_not_called()
+        # Mem0 now routed through durable queue
+        service.durable_queue.enqueue.assert_called_once()
+        call_kwargs = service.durable_queue.enqueue.call_args[1]
+        assert call_kwargs['operation'] == 'mem0_add'
+        assert call_kwargs['group_id'].startswith('mem0_')
 
     @pytest.mark.asyncio
     async def test_dual_write(self, service):
@@ -90,8 +92,11 @@ class TestAddMemory:
         )
         assert SourceStore.graphiti in result.stores_written
         assert SourceStore.mem0 in result.stores_written
-        service.durable_queue.enqueue.assert_called_once()
-        service.mem0.add.assert_called_once()
+        # Both stores go through the queue now
+        assert service.durable_queue.enqueue.call_count == 2
+        ops = [c[1]['operation'] for c in service.durable_queue.enqueue.call_args_list]
+        assert 'add_memory_graphiti' in ops
+        assert 'mem0_add' in ops
 
     @pytest.mark.asyncio
     async def test_auto_classification(self, service):
@@ -104,12 +109,11 @@ class TestAddMemory:
 
 
     @pytest.mark.asyncio
-    async def test_mem0_error_surfaced_in_response(self, service):
-        """Bug 2: mem0 errors must appear in the response message.
-
-        Currently only _graphiti_error is appended; a Mem0 failure is silent.
-        """
-        service.mem0.add = AsyncMock(side_effect=ValueError('qdrant connection refused'))
+    async def test_mem0_enqueue_error_surfaced_in_response(self, service):
+        """Mem0 enqueue errors must appear in the response message."""
+        service.durable_queue.enqueue = AsyncMock(
+            side_effect=ValueError('sqlite disk full')
+        )
 
         result = await service.add_memory(
             content='Always use type hints',
@@ -123,14 +127,14 @@ class TestAddMemory:
 
     @pytest.mark.asyncio
     async def test_success_false_when_only_targeted_store_fails(self, service):
-        """Bug 1: success must be False when ANY targeted store errors.
+        """success must be False when the only targeted store's enqueue fails.
 
-        For a Mem0-only write (preferences_and_norms), if mem0.add raises,
+        For a Mem0-only write (preferences_and_norms), if enqueue raises,
         _graphiti_error is None and _mem0_error is set.
-        With `and`, `not (None and error)` = `not None` = True (wrong).
-        With `or`,  `not (None or error)`  = `not error` = False (correct).
         """
-        service.mem0.add = AsyncMock(side_effect=ValueError('qdrant connection refused'))
+        service.durable_queue.enqueue = AsyncMock(
+            side_effect=ValueError('sqlite disk full')
+        )
         mock_journal = MagicMock()
         mock_journal.log_write_op = AsyncMock()
         service._write_journal = mock_journal
@@ -144,7 +148,7 @@ class TestAddMemory:
         mock_journal.log_write_op.assert_called_once()
         call_kwargs = mock_journal.log_write_op.call_args[1]
         assert call_kwargs['success'] is False, (
-            'Expected success=False when the only targeted store (Mem0) fails, '
+            'Expected success=False when the only targeted store (Mem0) enqueue fails, '
             f'but got success={call_kwargs["success"]}'
         )
 
@@ -208,6 +212,80 @@ class TestExecuteGraphitiWrite:
         service.graphiti.add_episode.assert_called_once()
         call_kwargs = service.graphiti.add_episode.call_args[1]
         assert call_kwargs.get('uuid') is None
+
+
+class TestDurableWriteDispatcher:
+    @pytest.mark.asyncio
+    async def test_routes_graphiti_operations(self, service):
+        """add_episode and add_memory_graphiti route to _execute_graphiti_write."""
+        payload = {
+            'name': 'test', 'content': 'test', 'source': 'text',
+            'group_id': 'test', 'source_description': '',
+        }
+        await service._execute_durable_write('add_episode', dict(payload))
+        service.graphiti.add_episode.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_routes_mem0_add(self, service):
+        """mem0_add operation routes to _execute_mem0_write."""
+        payload = {
+            'content': 'Always use type hints',
+            'metadata': {'category': 'preferences_and_norms'},
+            'project_id': 'test',
+        }
+        await service._execute_durable_write('mem0_add', payload)
+        service.mem0.add.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_routes_mem0_classify_and_add(self, service):
+        """mem0_classify_and_add routes to _execute_mem0_classify_and_add."""
+        payload = {
+            'fact_text': 'Always format with black',
+            'project_id': 'test',
+        }
+        # classifier will route this — may or may not call mem0.add depending on
+        # heuristic classification. Just verify no error.
+        await service._execute_durable_write('mem0_classify_and_add', payload)
+
+
+class TestDualWriteCallback:
+    @pytest.mark.asyncio
+    async def test_callback_enqueues_facts_as_batch(self, service):
+        """_dual_write_callback should batch-enqueue extracted facts."""
+        from tests.conftest import MockAddEpisodeResult, MockEdge
+
+        result = MockAddEpisodeResult(entity_edges=[
+            MockEdge(fact='Redis uses port 6379'),
+            MockEdge(fact='Auth service depends on Redis'),
+        ])
+        payload = {
+            'project_id': 'test',
+            'agent_id': 'test-agent',
+            '_causation_id': 'caus-1',
+        }
+        await service._dual_write_callback('dual_write_episode', result, payload)
+
+        service.durable_queue.enqueue_batch.assert_called_once()
+        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        assert len(batch) == 2
+        assert all(item['operation'] == 'mem0_classify_and_add' for item in batch)
+        assert all(item['group_id'] == 'mem0_test' for item in batch)
+        assert batch[0]['payload']['fact_text'] == 'Redis uses port 6379'
+
+    @pytest.mark.asyncio
+    async def test_callback_no_edges_is_noop(self, service):
+        """No entity_edges → no enqueue."""
+        from tests.conftest import MockAddEpisodeResult
+
+        result = MockAddEpisodeResult(entity_edges=[])
+        await service._dual_write_callback('dual_write_episode', result, {'project_id': 'test'})
+        service.durable_queue.enqueue_batch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_callback_none_result_is_noop(self, service):
+        """None result → no enqueue."""
+        await service._dual_write_callback('dual_write_episode', None, {'project_id': 'test'})
+        service.durable_queue.enqueue_batch.assert_not_called()
 
 
 class TestReplayFromStore:

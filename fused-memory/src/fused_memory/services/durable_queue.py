@@ -267,25 +267,23 @@ class DurableWriteQueue:
             return item
 
     async def _process_item(self, item: QueueItem) -> None:
-        """Execute the write, handle success/failure."""
+        """Execute the write, handle success/failure.
+
+        Callbacks run *before* marking completed so that a callback
+        failure triggers retry instead of being silently lost.
+        """
         async with self._semaphore:
             try:
                 result = await asyncio.wait_for(
                     self._execute_write(item.operation, item.parsed_payload()),
                     timeout=self._write_timeout_seconds,
                 )
-                await self._mark_completed(item)
-                # Fire callback
+                # Fire callback before marking completed — failure retries item
                 if item.callback_type and item.callback_type in self._callbacks:
-                    try:
-                        await self._callbacks[item.callback_type](
-                            item.callback_type, result, item.parsed_payload()
-                        )
-                    except Exception as cb_err:
-                        logger.error(
-                            'Callback %s failed for item %d: %s',
-                            item.callback_type, item.id, cb_err,
-                        )
+                    await self._callbacks[item.callback_type](
+                        item.callback_type, result, item.parsed_payload()
+                    )
+                await self._mark_completed(item)
             except Exception as exc:
                 await self._handle_failure(item, exc)
 

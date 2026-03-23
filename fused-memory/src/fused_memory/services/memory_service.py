@@ -77,7 +77,7 @@ class MemoryService:
         qcfg = self.config.queue
         self.durable_queue = DurableWriteQueue(
             data_dir=qcfg.data_dir,
-            execute_write=self._execute_graphiti_write,
+            execute_write=self._execute_durable_write,
             workers_per_group=qcfg.workers_per_group,
             semaphore_limit=qcfg.semaphore_limit,
             max_attempts=qcfg.max_attempts,
@@ -152,6 +152,16 @@ class MemoryService:
     # Durable queue: execute write dispatcher
     # ------------------------------------------------------------------
 
+    async def _execute_durable_write(
+        self, operation: str, payload: dict[str, Any]
+    ) -> Any:
+        """Route a queued write to the appropriate backend handler."""
+        if operation == 'mem0_add':
+            return await self._execute_mem0_write(payload)
+        if operation == 'mem0_classify_and_add':
+            return await self._execute_mem0_classify_and_add(payload)
+        return await self._execute_graphiti_write(operation, payload)
+
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
     ) -> Any:
@@ -185,17 +195,140 @@ class MemoryService:
         )
         return result
 
-    async def _dual_write_callback(
-        self, callback_type: str, result: Any, payload: dict[str, Any]
-    ) -> None:
-        """Post-process callback: classify extracted edges and dual-write to Mem0."""
+    async def _execute_mem0_write(self, payload: dict[str, Any]) -> Any:
+        """Execute a queued Mem0 add operation."""
+        causation_id = payload.pop('_causation_id', None)
+        write_op_id = payload.pop('_write_op_id', None)
+        scope = Scope(
+            project_id=payload['project_id'],
+            agent_id=payload.get('agent_id'),
+            session_id=payload.get('session_id'),
+        )
+        metadata = payload.get('metadata', {})
+
+        result = await self._journaled_backend_call(
+            write_op_id=write_op_id,
+            causation_id=causation_id,
+            backend='mem0',
+            operation='add',
+            payload={'content': payload['content'][:200]},
+            coro=self.mem0.add(
+                content=payload['content'], scope=scope, metadata=metadata
+            ),
+        )
+
+        # Log Layer 1 for the queued write
+        if self._write_journal:
+            await self._write_journal.log_write_op(
+                write_op_id=write_op_id or str(uuid_mod.uuid4()),
+                causation_id=causation_id,
+                source='durable_queue',
+                operation='add_memory',
+                project_id=payload['project_id'],
+                agent_id=payload.get('agent_id'),
+                session_id=payload.get('session_id'),
+                params={
+                    'content': payload['content'][:200],
+                    'category': metadata.get('category', ''),
+                },
+                result_summary=str(result)[:500] if result else None,
+                success=True,
+            )
+
+        return result
+
+    async def _execute_mem0_classify_and_add(
+        self, payload: dict[str, Any]
+    ) -> Any:
+        """Classify a fact extracted from an episode and write to Mem0 if appropriate."""
+        fact_text = payload['fact_text']
+        causation_id = payload.get('_causation_id')
+        write_op_id = str(uuid_mod.uuid4())
         scope = Scope(
             project_id=payload.get('project_id', 'main'),
             agent_id=payload.get('agent_id'),
             session_id=payload.get('session_id'),
         )
-        causation_id = payload.get('_causation_id')
-        await self._dual_write_from_episode(result, scope, causation_id=causation_id)
+
+        classification = await self.classifier.classify(fact_text)
+        if classification.primary not in MEM0_PRIMARY and classification.secondary is None:
+            return None  # Not Mem0-bound
+
+        metadata = {
+            'category': classification.primary.value,
+            'source': 'episode_extraction',
+            'confidence': classification.confidence,
+        }
+        if classification.secondary:
+            metadata['secondary_category'] = classification.secondary.value
+
+        result = await self._journaled_backend_call(
+            write_op_id=write_op_id,
+            causation_id=causation_id,
+            backend='mem0',
+            operation='add',
+            payload={'content': fact_text[:200]},
+            coro=self.mem0.add(content=fact_text, scope=scope, metadata=metadata),
+        )
+
+        # Log Layer 1 for the derived write
+        if self._write_journal:
+            await self._write_journal.log_write_op(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                source='dual_write',
+                provenance='derived',
+                operation='add_memory',
+                project_id=scope.project_id,
+                agent_id=scope.agent_id,
+                session_id=scope.session_id,
+                params={
+                    'content': fact_text[:200],
+                    'category': classification.primary.value,
+                },
+                result_summary=str(result)[:500] if result else None,
+                success=True,
+            )
+
+        logger.debug(f'Durable dual-wrote fact to Mem0: {fact_text[:80]}')
+        return result
+
+    async def _dual_write_callback(
+        self, callback_type: str, result: Any, payload: dict[str, Any]
+    ) -> None:
+        """Post-process callback: extract facts and enqueue each for durable Mem0 write.
+
+        Instead of writing directly to Mem0 (fire-and-forget), we batch-enqueue
+        each extracted fact as a ``mem0_classify_and_add`` queue item so it gets
+        independent retry / dead-letter handling.
+        """
+        if result is None:
+            return
+
+        edges = getattr(result, 'entity_edges', None) or []
+        if not edges:
+            return
+
+        project_id = payload.get('project_id', 'main')
+        group_id = f'mem0_{project_id}'
+
+        batch = [
+            {
+                'group_id': group_id,
+                'operation': 'mem0_classify_and_add',
+                'payload': {
+                    'fact_text': getattr(edge, 'fact', None) or str(edge),
+                    'project_id': project_id,
+                    'agent_id': payload.get('agent_id'),
+                    'session_id': payload.get('session_id'),
+                    '_causation_id': payload.get('_causation_id'),
+                },
+            }
+            for edge in edges
+        ]
+
+        assert self.durable_queue is not None
+        await self.durable_queue.enqueue_batch(batch)
 
     # ------------------------------------------------------------------
     # Write: add_episode
@@ -287,72 +420,6 @@ class MemoryService:
             message=f'Episode queued for processing in project {project_id}',
         )
 
-    async def _dual_write_from_episode(
-        self, result: Any, scope: Scope, *, causation_id: str | None = None
-    ) -> None:
-        """Classify extracted facts and write Mem0-bound memories."""
-        if result is None:
-            return
-
-        # Graphiti's add_episode returns AddEpisodeResults with .entity_edges
-        edges = getattr(result, 'entity_edges', None) or []
-        for edge in edges:
-            fact_text = getattr(edge, 'fact', None) or str(edge)
-            write_op_id = str(uuid_mod.uuid4())
-            try:
-                classification = await self.classifier.classify(fact_text)
-                if classification.primary in MEM0_PRIMARY or classification.secondary is not None:
-                    metadata = {
-                        'category': classification.primary.value,
-                        'source': 'episode_extraction',
-                        'confidence': classification.confidence,
-                    }
-                    if classification.secondary:
-                        metadata['secondary_category'] = classification.secondary.value
-
-                    mem0_result = await self._journaled_backend_call(
-                        write_op_id=write_op_id,
-                        causation_id=causation_id,
-                        backend='mem0',
-                        operation='add',
-                        payload={'content': fact_text[:200]},
-                        coro=self.mem0.add(content=fact_text, scope=scope, metadata=metadata),
-                    )
-
-                    # Log Layer 1 for the derived write
-                    if self._write_journal:
-                        await self._write_journal.log_write_op(
-                            write_op_id=write_op_id,
-                            causation_id=causation_id,
-                            source='dual_write',
-                            provenance='derived',
-                            operation='add_memory',
-                            project_id=scope.project_id,
-                            agent_id=scope.agent_id,
-                            session_id=scope.session_id,
-                            params={'content': fact_text[:200], 'category': classification.primary.value},
-                            result_summary=str(mem0_result)[:500] if mem0_result else None,
-                            success=True,
-                        )
-
-                    logger.debug(f'Dual-wrote fact to Mem0: {fact_text[:80]}')
-            except Exception as e:
-                if self._write_journal:
-                    await self._write_journal.log_write_op(
-                        write_op_id=write_op_id,
-                        causation_id=causation_id,
-                        source='dual_write',
-                        provenance='derived',
-                        operation='add_memory',
-                        project_id=scope.project_id,
-                        agent_id=scope.agent_id,
-                        session_id=scope.session_id,
-                        params={'content': fact_text[:200]},
-                        success=False,
-                        error=str(e),
-                    )
-                logger.error(f'Dual-write failed for fact: {e}')
-
     # ------------------------------------------------------------------
     # Write: add_memory
     # ------------------------------------------------------------------
@@ -420,24 +487,27 @@ class MemoryService:
                 logger.error(f'Graphiti enqueue failed: {e}')
                 _graphiti_error = f'{type(e).__name__}: {e}'
 
-        # Mem0: direct write (fast, no queue needed)
+        # Mem0: enqueue via durable queue (retry + dead-letter on failure)
         if write_mem0:
             try:
-                result = await self._journaled_backend_call(
-                    write_op_id=write_op_id,
-                    causation_id=causation_id,
-                    backend='mem0',
-                    operation='add',
-                    payload={'content': content[:200], 'category': resolved_category.value},
-                    coro=self.mem0.add(content=content, scope=scope, metadata=meta),
+                assert self.durable_queue is not None
+                await self.durable_queue.enqueue(
+                    group_id=f'mem0_{scope.project_id}',
+                    operation='mem0_add',
+                    payload={
+                        'content': content,
+                        'metadata': meta,
+                        'project_id': project_id,
+                        'agent_id': agent_id,
+                        'session_id': session_id,
+                        '_causation_id': causation_id,
+                        '_write_op_id': write_op_id,
+                    },
                 )
-                results = result.get('results', [])
-                for r in results:
-                    if 'id' in r:
-                        memory_ids.append(r['id'])
+                # Durably persisted to SQLite — report as queued
                 stores_written.append(SourceStore.mem0)
             except Exception as e:
-                logger.error(f'Mem0 write failed: {e}')
+                logger.error(f'Mem0 enqueue failed: {e}')
                 _mem0_error = str(e)
 
         # Layer 1 journal entry
@@ -473,7 +543,7 @@ class MemoryService:
             agent_id=agent_id,
         ))
 
-        msg = f'Memory stored in {[s.value for s in stores_written]}'
+        msg = f'Memory queued for {[s.value for s in stores_written]}'
         if _graphiti_error:
             msg += f' [graphiti_error: {_graphiti_error}]'
         if _mem0_error:

@@ -36,6 +36,7 @@ def service(mock_config, write_journal):
 
     svc.durable_queue = MagicMock()
     svc.durable_queue.enqueue = AsyncMock(return_value=1)
+    svc.durable_queue.enqueue_batch = AsyncMock(return_value=[1])
     svc.durable_queue.close = AsyncMock()
 
     svc.set_write_journal(write_journal)
@@ -44,7 +45,11 @@ def service(mock_config, write_journal):
 
 @pytest.mark.asyncio
 async def test_add_memory_logs_write_op_with_causation(service, write_journal):
-    """MCP path: add_memory logs Layer 1 with causation_id."""
+    """MCP path: add_memory logs Layer 1 with causation_id.
+
+    Layer 2 backend_op is logged later when the queue worker processes the
+    item, so we only check Layer 1 here (Mem0 writes are now durable/deferred).
+    """
     cid = str(uuid.uuid4())
     await service.add_memory(
         content='Test fact',
@@ -58,10 +63,9 @@ async def test_add_memory_logs_write_op_with_causation(service, write_journal):
     assert write_ops[0]['operation'] == 'add_memory'
     assert write_ops[0]['success'] == 1
 
-    # Layer 2: Mem0 backend op
-    backend_ops = [o for o in ops if o['layer'] == 'backend_op']
-    assert len(backend_ops) == 1
-    assert backend_ops[0]['backend'] == 'mem0'
+    # Verify causation_id was passed through to queue payload for deferred logging
+    payload = service.durable_queue.enqueue.call_args[1]['payload']
+    assert payload['_causation_id'] == cid
 
 
 @pytest.mark.asyncio
@@ -115,8 +119,8 @@ async def test_graphiti_write_logs_backend_op(service, write_journal):
 
 
 @pytest.mark.asyncio
-async def test_dual_write_logs_derived_ops(service, write_journal):
-    """Dual-write callback logs derived Layer 1 + Layer 2 entries."""
+async def test_dual_write_callback_enqueues_with_causation(service, write_journal):
+    """Dual-write callback batch-enqueues facts with causation_id in payload."""
     from tests.conftest import MockAddEpisodeResult, MockEdge
 
     cid = str(uuid.uuid4())
@@ -124,19 +128,19 @@ async def test_dual_write_logs_derived_ops(service, write_journal):
         MockEdge(fact='Always use type hints in Python'),
     ])
 
-    from fused_memory.models.scope import Scope
-    scope = Scope(project_id='test')
-    await service._dual_write_from_episode(result, scope, causation_id=cid)
+    payload = {
+        'project_id': 'test',
+        'agent_id': 'test-agent',
+        '_causation_id': cid,
+    }
+    await service._dual_write_callback('dual_write_episode', result, payload)
 
-    ops = await write_journal.get_ops_by_causation(cid)
-    write_ops = [o for o in ops if o['layer'] == 'write_op']
-    assert len(write_ops) >= 1
-    assert write_ops[0]['source'] == 'dual_write'
-    assert write_ops[0]['provenance'] == 'derived'
-
-    backend_ops = [o for o in ops if o['layer'] == 'backend_op']
-    assert len(backend_ops) >= 1
-    assert backend_ops[0]['backend'] == 'mem0'
+    service.durable_queue.enqueue_batch.assert_called_once()
+    batch = service.durable_queue.enqueue_batch.call_args[0][0]
+    assert len(batch) == 1
+    assert batch[0]['operation'] == 'mem0_classify_and_add'
+    assert batch[0]['payload']['_causation_id'] == cid
+    assert batch[0]['payload']['fact_text'] == 'Always use type hints in Python'
 
 
 @pytest.mark.asyncio

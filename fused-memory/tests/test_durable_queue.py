@@ -399,7 +399,8 @@ class TestEnqueueBatchRollback:
 
 class TestCallbackFailure:
     @pytest.mark.asyncio
-    async def test_callback_error_doesnt_affect_completion(self, queue, mock_execute):
+    async def test_callback_error_triggers_retry(self, queue, mock_execute):
+        """Callback failure should retry the item, not silently complete it."""
         failing_callback = AsyncMock(side_effect=ValueError('callback boom'))
         queue.register_callback('bad_cb', failing_callback)
 
@@ -408,11 +409,31 @@ class TestCallbackFailure:
             payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
             callback_type='bad_cb',
         )
+
+        # Wait for all retries to exhaust (max_attempts=3 in fixture)
+        await asyncio.sleep(2.0)
+
+        stats = await queue.get_stats()
+        # Item should be dead-lettered, not completed — callback kept failing
+        assert stats['counts'].get('dead', 0) == 1
+        assert stats['counts'].get('completed', 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_callback_success_completes_item(self, queue, mock_execute):
+        """Callback success should mark the item completed."""
+        ok_callback = AsyncMock()
+        queue.register_callback('ok_cb', ok_callback)
+
+        await queue.enqueue(
+            group_id='proj1', operation='add_episode',
+            payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
+            callback_type='ok_cb',
+        )
         await asyncio.sleep(0.3)
 
-        # Item should still be completed despite callback failure
         stats = await queue.get_stats()
         assert stats['counts'].get('completed', 0) == 1
+        ok_callback.assert_called_once()
 
 
 class TestShutdown:
