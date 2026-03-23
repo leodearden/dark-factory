@@ -225,7 +225,8 @@ def create_mcp_server(
                 'error': (
                     f'Invalid temporal_context {temporal_context!r}. '
                     f'Must be one of {sorted(_VALID_TEMPORAL_CONTEXTS)} or None.'
-                )
+                ),
+                'error_type': 'ValidationError',
             }
         try:
             causation_id, op_source, _ = _extract_causation(metadata, agent_id)
@@ -620,7 +621,7 @@ def create_mcp_server(
         """
         try:
             if memory_service.durable_queue is None:
-                return {'error': 'Queue not initialized'}
+                return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
             return await memory_service.durable_queue.get_stats()
         except Exception as e:
             logger.error(f'get_queue_stats error: {e}')
@@ -641,7 +642,7 @@ def create_mcp_server(
         """
         try:
             if memory_service.durable_queue is None:
-                return {'error': 'Queue not initialized'}
+                return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
             count = await memory_service.durable_queue.replay_dead(group_id=project_id)
             return {'status': 'replayed', 'items_reset': count}
         except Exception as e:
@@ -744,7 +745,7 @@ def create_mcp_server(
 
         Args:
             id: Task ID (comma-separated for multiple)
-            status: pending, done, in-progress, review, deferred, or cancelled
+            status: pending, done, in-progress, blocked, review, deferred, or cancelled
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
