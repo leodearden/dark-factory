@@ -496,3 +496,96 @@ class TestGetJournalEntries:
 
         entries = await get_journal_entries(missing_db_path, 'run-001')
         assert entries == []
+
+
+class TestWithReadonlyDb:
+    """Unit tests for the _with_readonly_db helper function."""
+
+    async def test_returns_callback_result_on_success(self, reconciliation_db):
+        """Helper returns the value returned by the callback on success."""
+        from dashboard.data.reconciliation import _with_readonly_db
+
+        async def _fn(db):
+            async with db.execute('SELECT 1') as cur:
+                row = await cur.fetchone()
+            return row[0]
+
+        result = await _with_readonly_db(reconciliation_db, _fn, default=99, caller='test')
+        assert result == 1
+
+    async def test_returns_default_on_file_not_found(self, missing_db_path):
+        """Helper returns the default value when the DB file does not exist."""
+        from dashboard.data.reconciliation import _with_readonly_db
+
+        async def _fn(db):
+            return 'should not reach here'
+
+        result = await _with_readonly_db(missing_db_path, _fn, default=[], caller='test')
+        assert result == []
+
+    async def test_returns_default_on_operational_error(self, tmp_path):
+        """Helper returns the default value on sqlite3.OperationalError (no-table DB)."""
+        import sqlite3 as _sqlite3
+
+        from dashboard.data.reconciliation import _with_readonly_db
+
+        # Valid SQLite file but with no tables — querying any table raises OperationalError
+        db_path = tmp_path / 'notables.db'
+        _sqlite3.connect(str(db_path)).close()
+
+        async def _fn(db):
+            async with db.execute('SELECT * FROM nonexistent_table') as cur:
+                return await cur.fetchall()
+
+        result = await _with_readonly_db(db_path, _fn, default={}, caller='test')
+        assert result == {}
+
+    async def test_emits_debug_log_with_caller_on_file_not_found(
+        self, missing_db_path, caplog
+    ):
+        """Helper emits a DEBUG log containing the caller name on FileNotFoundError."""
+        from dashboard.data.reconciliation import _with_readonly_db
+
+        async def _fn(db):
+            return 'noop'
+
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
+            await _with_readonly_db(
+                missing_db_path, _fn, default=None, caller='my_caller_fn'
+            )
+
+        debug_records = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG and 'dashboard.data.reconciliation' in r.name
+        ]
+        assert debug_records, f'Expected DEBUG log, got: {caplog.records}'
+        assert any('my_caller_fn' in r.message for r in debug_records), (
+            f'Expected caller name in message, got: {[r.message for r in debug_records]}'
+        )
+
+    async def test_emits_debug_log_with_caller_on_operational_error(
+        self, tmp_path, caplog
+    ):
+        """Helper emits a DEBUG log containing the caller name on OperationalError."""
+        import sqlite3 as _sqlite3
+
+        from dashboard.data.reconciliation import _with_readonly_db
+
+        db_path = tmp_path / 'notables2.db'
+        _sqlite3.connect(str(db_path)).close()
+
+        async def _fn(db):
+            async with db.execute('SELECT * FROM missing_table') as cur:
+                return await cur.fetchall()
+
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
+            await _with_readonly_db(db_path, _fn, default=None, caller='another_fn')
+
+        debug_records = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG and 'dashboard.data.reconciliation' in r.name
+        ]
+        assert debug_records, f'Expected DEBUG log, got: {caplog.records}'
+        assert any('another_fn' in r.message for r in debug_records), (
+            f'Expected caller name in message, got: {[r.message for r in debug_records]}'
+        )
