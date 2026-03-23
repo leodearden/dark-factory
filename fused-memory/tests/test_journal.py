@@ -10,8 +10,12 @@ from fused_memory.models.reconciliation import (
     JournalEntry,
     JudgeVerdict,
     ReconciliationRun,
+    RunStatus,
+    RunType,
     StageId,
     StageReport,
+    VerdictAction,
+    VerdictSeverity,
     Watermark,
 )
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -55,11 +59,11 @@ async def test_run_lifecycle(journal):
     run = ReconciliationRun(
         id=run_id,
         project_id='test-project',
-        run_type='full',
+        run_type=RunType.full,
         trigger_reason='buffer_size:10',
         started_at=datetime.now(UTC),
         events_processed=10,
-        status='running',
+        status=RunStatus.running,
     )
     await journal.start_run(run)
 
@@ -110,19 +114,19 @@ async def test_judge_verdict(journal):
     run = ReconciliationRun(
         id=run_id,
         project_id='test-project',
-        run_type='full',
+        run_type=RunType.full,
         trigger_reason='test',
         started_at=datetime.now(UTC),
-        status='completed',
+        status=RunStatus.completed,
     )
     await journal.start_run(run)
 
     verdict = JudgeVerdict(
         run_id=run_id,
         reviewed_at=datetime.now(UTC),
-        severity='ok',
+        severity=VerdictSeverity.ok,
         findings=[],
-        action_taken='none',
+        action_taken=VerdictAction.none,
     )
     await journal.add_verdict(verdict)
 
@@ -137,10 +141,10 @@ async def test_recent_runs(journal):
         run = ReconciliationRun(
             id=str(uuid.uuid4()),
             project_id='test-project',
-            run_type='full',
+            run_type=RunType.full,
             trigger_reason=f'test_{i}',
             started_at=datetime.now(UTC),
-            status='running',
+            status=RunStatus.running,
         )
         await journal.start_run(run)
 
@@ -155,10 +159,10 @@ async def test_stats(journal):
     run = ReconciliationRun(
         id=run_id,
         project_id='test-project',
-        run_type='full',
+        run_type=RunType.full,
         trigger_reason='test',
         started_at=now,
-        status='running',
+        status=RunStatus.running,
     )
     await journal.start_run(run)
     await journal.complete_run(run_id, 'completed')
@@ -182,10 +186,10 @@ async def test_stage_reports_roundtrip(journal):
     run = ReconciliationRun(
         id=run_id,
         project_id='test-project',
-        run_type='full',
+        run_type=RunType.full,
         trigger_reason='test',
         started_at=now,
-        status='running',
+        status=RunStatus.running,
     )
     await journal.start_run(run)
 

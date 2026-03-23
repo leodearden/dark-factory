@@ -74,18 +74,36 @@ class StageReport(BaseModel):
     tokens_used: int = 0
 
 
+class RunType(StrEnum):
+    """Type of reconciliation run."""
+
+    full = 'full'
+    targeted = 'targeted'
+    remediation = 'remediation'
+
+
+class RunStatus(StrEnum):
+    """Status of a reconciliation run."""
+
+    running = 'running'
+    completed = 'completed'
+    failed = 'failed'
+    rolled_back = 'rolled_back'
+    circuit_breaker = 'circuit_breaker'
+
+
 class ReconciliationRun(BaseModel):
     """Metadata for a reconciliation run."""
 
     id: str
     project_id: str
-    run_type: str  # 'full' | 'targeted'
+    run_type: RunType
     trigger_reason: str
     started_at: datetime
     completed_at: datetime | None = None
     events_processed: int = 0
     stage_reports: dict[str, StageReport | dict] = Field(default_factory=dict)
-    status: str = 'running'  # 'running', 'completed', 'failed', 'rolled_back', 'circuit_breaker'
+    status: RunStatus = RunStatus.running
     triggered_by: str | None = None  # parent run_id for remediation runs
 
 
@@ -96,10 +114,18 @@ class MemoryHints(BaseModel):
     queries: list[str] = Field(default_factory=list)
 
 
+class VerificationVerdict(StrEnum):
+    """Verdict from the codebase verification agent."""
+
+    confirmed = 'confirmed'
+    contradicted = 'contradicted'
+    inconclusive = 'inconclusive'
+
+
 class VerificationResult(BaseModel):
     """Result from the explore agent's codebase verification."""
 
-    verdict: str  # 'confirmed' | 'contradicted' | 'inconclusive'
+    verdict: VerificationVerdict
     confidence: float = Field(ge=0.0, le=1.0)
     evidence: list[dict] = Field(default_factory=list)
     summary: str = ''
@@ -117,11 +143,29 @@ class Watermark(BaseModel):
     last_task_change_timestamp: datetime | None = None
 
 
+class VerdictSeverity(StrEnum):
+    """Severity level of a judge verdict."""
+
+    ok = 'ok'
+    minor = 'minor'
+    moderate = 'moderate'
+    serious = 'serious'
+
+
+class VerdictAction(StrEnum):
+    """Action taken based on a judge verdict."""
+
+    none = 'none'
+    auto_fix = 'auto_fix'
+    rollback = 'rollback'
+    halt = 'halt'
+
+
 class JudgeVerdict(BaseModel):
     """LLM-as-judge verdict for a reconciliation run."""
 
     run_id: str
     reviewed_at: datetime
-    severity: str  # 'ok' | 'minor' | 'moderate' | 'serious'
+    severity: VerdictSeverity
     findings: list[dict] = Field(default_factory=list)
-    action_taken: str = 'none'  # 'none' | 'auto_fix' | 'rollback' | 'halt'
+    action_taken: VerdictAction = VerdictAction.none

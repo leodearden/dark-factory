@@ -12,6 +12,8 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
     ReconciliationRun,
+    RunStatus,
+    RunType,
     StageReport,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -100,11 +102,11 @@ async def test_journal_run_lifecycle(journal):
     run = ReconciliationRun(
         id=str(uuid.uuid4()),
         project_id='test-project',
-        run_type='full',
+        run_type=RunType.full,
         trigger_reason='buffer_size:3',
         started_at=datetime.now(UTC),
         events_processed=3,
-        status='running',
+        status=RunStatus.running,
     )
     await journal.start_run(run)
     assert await journal.is_run_active('test-project')
@@ -464,22 +466,22 @@ async def test_journal_triggered_by_roundtrip(journal):
     parent_run = ReconciliationRun(
         id=parent_id,
         project_id='test-project',
-        run_type='full',
+        run_type=RunType.full,
         trigger_reason='buffer_size:5',
         started_at=datetime.now(UTC),
         events_processed=5,
-        status='completed',
+        status=RunStatus.completed,
     )
     await journal.start_run(parent_run)
 
     child_run = ReconciliationRun(
         id=child_id,
         project_id='test-project',
-        run_type='remediation',
+        run_type=RunType.remediation,
         trigger_reason='integrity_findings:2',
         started_at=datetime.now(UTC),
         events_processed=0,
-        status='running',
+        status=RunStatus.running,
         triggered_by=parent_id,
     )
     await journal.start_run(child_run)

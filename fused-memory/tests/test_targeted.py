@@ -8,7 +8,7 @@ import pytest_asyncio
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
-from fused_memory.models.reconciliation import VerificationResult
+from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.targeted import TargetedReconciler
 
@@ -55,7 +55,7 @@ def reconciler(mock_memory_service, mock_taskmaster, journal, config):
     # Mock the verifier to avoid actual LLM calls
     r.verifier = AsyncMock()
     r.verifier.verify = AsyncMock(return_value=VerificationResult(
-        verdict='confirmed',
+        verdict=VerificationVerdict.confirmed,
         confidence=0.9,
         evidence=[{'file_path': 'test.py', 'snippet': 'def test()'}],
         summary='Confirmed via test.py',

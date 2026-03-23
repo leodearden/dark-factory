@@ -1,8 +1,18 @@
 """Response and result models for the fused memory system."""
 
+from enum import StrEnum
+
 from pydantic import BaseModel, Field
 
 from fused_memory.models.enums import MemoryCategory, QueryType, SourceStore
+
+
+class EpisodeStatus(StrEnum):
+    """Processing status of an add_episode request."""
+
+    queued = 'queued'
+    processed = 'processed'
+    error = 'error'
 
 
 class ClassificationResult(BaseModel):
@@ -32,7 +42,7 @@ class AddEpisodeResponse(BaseModel):
     """Response from add_episode."""
 
     episode_id: str | None = None
-    status: str  # 'queued' | 'processed' | 'error'
+    status: EpisodeStatus
     message: str = ''
 
 

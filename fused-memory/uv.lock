@@ -348,6 +348,13 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.7" },
 ]
 
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest-asyncio", specifier = ">=0.23" },
+    { name = "ruff", specifier = ">=0.4" },
+]
+
 [[package]]
 name = "distro"
 version = "1.9.0"

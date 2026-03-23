@@ -11,6 +11,7 @@ from fused_memory.models.memory import (
     AddEpisodeResponse,
     AddMemoryResponse,
     ClassificationResult,
+    EpisodeStatus,
     MemoryResult,
     ReadRouteResult,
 )
@@ -22,6 +23,7 @@ __all__ = [
     'AddEpisodeResponse',
     'AddMemoryResponse',
     'ClassificationResult',
+    'EpisodeStatus',
     'MemoryCategory',
     'MemoryResult',
     'QueryType',

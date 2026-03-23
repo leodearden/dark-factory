@@ -6,7 +6,7 @@ import os
 from datetime import UTC, datetime
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import JudgeVerdict
+from fused_memory.models.reconciliation import JudgeVerdict, VerdictAction, VerdictSeverity
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
@@ -59,12 +59,12 @@ class Judge:
 
             # Act on verdict
             if verdict.severity == 'moderate':
-                verdict.action_taken = 'rollback'
+                verdict.action_taken = VerdictAction.rollback
                 logger.warning(f'Judge: moderate issues in run {run_id}, recommending rollback')
             elif verdict.severity == 'serious':
                 if self.config.halt_on_judge_serious:
                     self._halted_projects.add(run.project_id)
-                    verdict.action_taken = 'halt'
+                    verdict.action_taken = VerdictAction.halt
                     logger.error(
                         f'Judge: SERIOUS issues in run {run_id}, halting project {run.project_id}'
                     )
@@ -258,22 +258,22 @@ Review this run and provide your verdict as JSON.
             return JudgeVerdict(
                 run_id=run_id,
                 reviewed_at=datetime.now(UTC),
-                severity=data.get('severity', 'ok'),
+                severity=data.get('severity', VerdictSeverity.ok),
                 findings=data.get('findings', []),
-                action_taken='none',
+                action_taken=VerdictAction.none,
             )
         except (json.JSONDecodeError, IndexError, KeyError) as e:
             logger.warning(f'Failed to parse judge response: {e}')
             return JudgeVerdict(
                 run_id=run_id,
                 reviewed_at=datetime.now(UTC),
-                severity='minor',
+                severity=VerdictSeverity.minor,
                 findings=[{
                     'issue': 'Judge response could not be parsed',
                     'severity': 'minor',
                     'recommendation': 'Manual review recommended',
                 }],
-                action_taken='none',
+                action_taken=VerdictAction.none,
             )
 
     async def _check_error_trends(self, project_id: str, verdicts: list[JudgeVerdict]) -> None:

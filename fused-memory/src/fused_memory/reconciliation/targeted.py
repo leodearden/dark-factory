@@ -10,6 +10,8 @@ from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.reconciliation import (
     MemoryHints,
     ReconciliationRun,
+    RunStatus,
+    RunType,
 )
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.verify import CodebaseVerifier
@@ -52,11 +54,11 @@ class TargetedReconciler:
         run = ReconciliationRun(
             id=run_id,
             project_id=project_id,
-            run_type='targeted',
+            run_type=RunType.targeted,
             trigger_reason=f'task_{transition}:{task_id}',
             started_at=start,
             events_processed=1,
-            status='running',
+            status=RunStatus.running,
         )
         await self.journal.start_run(run)
 
