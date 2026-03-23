@@ -6,7 +6,12 @@ import os
 from datetime import UTC, datetime
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import JudgeVerdict, VerdictAction, VerdictSeverity
+from fused_memory.models.reconciliation import (
+    JudgeVerdict,
+    StageReport,
+    VerdictAction,
+    VerdictSeverity,
+)
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
@@ -45,6 +50,19 @@ class Judge:
             response_text = await self._call_llm(prompt)
             verdict = self._parse_verdict(response_text, run_id)
 
+            # Act on verdict — must happen BEFORE persisting so the DB receives the
+            # final action_taken value ('rollback', 'halt', or 'none')
+            if verdict.severity == 'moderate':
+                verdict.action_taken = VerdictAction.rollback
+                logger.warning(f'Judge: moderate issues in run {run_id}, recommending rollback')
+            elif verdict.severity == 'serious':
+                if self.config.halt_on_judge_serious:
+                    self._halted_projects.add(run.project_id)
+                    verdict.action_taken = VerdictAction.halt
+                    logger.error(
+                        f'Judge: SERIOUS issues in run {run_id}, halting project {run.project_id}'
+                    )
+
             await self.journal.add_verdict(verdict)
 
             logger.info(
@@ -56,18 +74,6 @@ class Judge:
                     'action_taken': verdict.action_taken,
                 },
             )
-
-            # Act on verdict
-            if verdict.severity == 'moderate':
-                verdict.action_taken = VerdictAction.rollback
-                logger.warning(f'Judge: moderate issues in run {run_id}, recommending rollback')
-            elif verdict.severity == 'serious':
-                if self.config.halt_on_judge_serious:
-                    self._halted_projects.add(run.project_id)
-                    verdict.action_taken = VerdictAction.halt
-                    logger.error(
-                        f'Judge: SERIOUS issues in run {run_id}, halting project {run.project_id}'
-                    )
 
             # Check error trends
             all_verdicts = recent_verdicts + [verdict]
@@ -103,12 +109,16 @@ class Judge:
 
         stage_reports = {}
         for stage_id, report in run.stage_reports.items():
-            stage_reports[stage_id] = {
-                'items_flagged': len(report.items_flagged),
-                'stats': report.stats,
-                'llm_calls': report.llm_calls,
-                'tokens_used': report.tokens_used,
-            }
+            if isinstance(report, StageReport):
+                stage_reports[stage_id] = {
+                    'items_flagged': len(report.items_flagged),
+                    'stats': report.stats,
+                    'llm_calls': report.llm_calls,
+                    'tokens_used': report.tokens_used,
+                }
+            else:
+                # Plain dict entries (e.g. _error injected by harness on failure)
+                stage_reports[stage_id] = report
 
         # Summarize MCP actions
         actions = combined_actions or []

@@ -18,6 +18,7 @@ from shared.usage_gate import UsageGate
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.reconciliation import (
+    ReconciliationEvent,
     ReconciliationRun,
     RunStatus,
     RunType,
@@ -238,6 +239,14 @@ class ReconciliationHarness:
                         if should:
                             acquired = await self.buffer.mark_run_active(project_id)
                             if acquired:
+                                # Skip cycle for halted projects
+                                if self.judge and self.judge.is_halted(project_id):
+                                    logger.warning(
+                                        f'Skipping cycle for halted project {project_id}'
+                                    )
+                                    await self.buffer.mark_run_complete(project_id)
+                                    continue
+
                                 # Select tier before draining
                                 tier = await self._select_tier(project_id)
 
@@ -321,12 +330,21 @@ class ReconciliationHarness:
         project_id: str,
         trigger_reason: str,
         tier: TierConfig | None = None,
+        events: list[ReconciliationEvent] | None = None,
     ) -> ReconciliationRun:
-        """Execute the three-stage pipeline for a project."""
+        """Execute the three-stage pipeline for a project.
+
+        Args:
+            events: Optional pre-drained event list.  When provided, buffer.drain()
+                    is skipped and these events are used directly.  This allows
+                    BacklogIterator to pass already-drained chunk events without
+                    a double-drain.
+        """
         tier = tier or TierConfig()
         run_id = str(uuid4())
         watermark = await self.journal.get_watermark(project_id)
-        events = await self.buffer.drain(project_id)
+        if events is None:
+            events = await self.buffer.drain(project_id)
 
         run = ReconciliationRun(
             id=run_id,
@@ -411,6 +429,38 @@ class ReconciliationHarness:
             )
             return run
 
+        except asyncio.CancelledError:
+            # asyncio.wait_for cancels via CancelledError, which is NOT a subclass of
+            # Exception in Python 3.8+.  Without this handler the journal run is left
+            # stuck in 'running'.  Mark it failed, restore events, then re-raise so
+            # asyncio cancellation semantics are preserved.
+            #
+            # Two defences against cleanup being interrupted:
+            # 1. asyncio.shield() — runs the cleanup coroutine in its own Task so a
+            #    second cancellation (e.g. server shutdown) cannot abort the DB write.
+            # 2. Independent try/except BaseException per cleanup step — each step
+            #    runs regardless of the other's outcome, and CancelledError is still
+            #    re-raised to the caller.
+            run.status = RunStatus.failed
+            run.stage_reports['_error'] = {
+                'error_type': 'CancelledError',
+                'error_message': 'Run cancelled (timeout or external cancellation)',
+                'failed_stage': current_stage_name,
+                'traceback': '',
+            }
+            try:
+                await asyncio.shield(self.journal.complete_run(run_id, 'failed'))
+            except BaseException as cleanup_err:
+                logger.error(f'complete_run failed after cancellation: {cleanup_err}')
+            try:
+                await asyncio.shield(self.buffer.restore_drained(project_id))
+            except BaseException as cleanup_err:
+                logger.error(f'restore_drained failed after cancellation: {cleanup_err}')
+            logger.error(
+                f'Reconciliation run {run_id} cancelled for {project_id} '
+                f'(stage: {current_stage_name})'
+            )
+            raise
         except Exception as e:
             run.status = RunStatus.failed
             run.stage_reports['_error'] = {
@@ -678,6 +728,7 @@ class BacklogIterator:
                     self.harness.run_full_cycle(
                         project_id, f'backlog_chunk:{chunk_num}:{len(chunk)}',
                         tier=opus_tier,
+                        events=chunk,
                     ),
                     timeout=self.config.cycle_timeout_seconds,
                 )

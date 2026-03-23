@@ -1,99 +1,181 @@
 {
-  "task_id": "104",
-  "title": "Fix routing JSON regex for nested braces",
+  "task_id": "100",
+  "title": "Fix critical judge + harness reconciliation bugs",
   "files": [
-    "fused-memory/src/fused_memory/routing/json_extract.py",
-    "fused-memory/src/fused_memory/routing/classifier.py",
-    "fused-memory/src/fused_memory/routing/router.py",
-    "fused-memory/tests/test_json_extract.py",
-    "fused-memory/tests/test_classifier.py",
-    "fused-memory/tests/test_router.py"
+    "fused-memory/src/fused_memory/reconciliation/judge.py",
+    "fused-memory/src/fused_memory/reconciliation/harness.py",
+    "fused-memory/tests/test_judge.py",
+    "fused-memory/tests/test_harness.py"
   ],
   "modules": [
-    "fused-memory/src/fused_memory/routing",
+    "fused-memory/src/fused_memory/reconciliation",
     "fused-memory/tests"
   ],
-  "analysis": "Both classifier.py (line 144) and router.py (line 163) use `re.search(r'\\{[^}]+\\}', raw, re.DOTALL)` to extract JSON from LLM responses. This regex matches from the first `{` to the first `}`, so any nested braces in the JSON (e.g., in a reasoning field like `\"chose X because {...}\"`) cause it to capture an incomplete fragment. `json.loads()` then fails and the code silently falls back to defaults.\n\nThe fix: create a shared `extract_json()` utility using brace-counting (finds first `{`, scans forward incrementing/decrementing a counter, returns the balanced substring). This handles arbitrary nesting depth, unlike a nested-regex approach which only handles fixed depth. The utility also strips markdown code fences before scanning, since LLMs commonly wrap JSON in ```json...``` blocks.\n\nBoth classifier.py and router.py will import and use this shared utility, replacing the broken regex. Tests cover: nested braces, markdown fences, multiple JSON objects, no JSON present, and integration through the LLM paths of both classifier and router.",
+  "analysis": "Five critical bugs across judge.py and harness.py. Bug 1: _build_review_prompt crashes when iterating stage_reports containing plain dict _error entries (injected by harness on failures and stale-run recovery). Fix: isinstance guard on StageReport. Bug 2: JudgeVerdict.action_taken is persisted as 'none' before severity-based mutation to 'rollback'/'halt'; the updated value never reaches the DB. Fix: move journal.add_verdict() to after action_taken determination. Bug 3: judge.is_halted() exists but is never called in run_loop; halted projects keep running cycles. Fix: add halt check before run_full_cycle in run_loop(). Bug 4: BacklogIterator.run() drains a chunk via drain_oldest_chunk(), then run_full_cycle() re-drains via drain(), getting different events; the chunk events are silently lost. Fix: add optional 'events' param to run_full_cycle to accept pre-drained events. Bug 5: asyncio.wait_for timeout cancels run_full_cycle but CancelledError isn't caught by 'except Exception', so complete_run(run_id, 'failed') is never called, leaving the run stuck in 'running'. Fix: add except asyncio.CancelledError handler in run_full_cycle that marks run failed, restores events, and re-raises. Review feedback identified two robustness issues in the Bug 5 handler: (a) cleanup awaits can be interrupted by a second cancellation during shutdown, and (b) if cleanup raises, the exception replaces CancelledError, breaking the caller's timeout handler.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Create test_json_extract.py with failing tests for extract_json(): (1) simple flat JSON, (2) JSON with nested braces in a value, (3) JSON wrapped in markdown code fences, (4) text with multiple JSON objects (should extract first complete one), (5) no JSON returns None, (6) text before/after JSON is ignored. Import from fused_memory.routing.json_extract.",
+      "description": "Write failing test for Bug 1: test_build_review_prompt_handles_error_dict_entries. Create a mock run with stage_reports containing both a StageReport and a plain dict _error entry (as injected by harness line 414 and _recover_stale_runs line 119). Call _build_review_prompt() and assert it does NOT raise AttributeError. Verify the prompt string contains info from both the StageReport and the _error dict.",
       "status": "done",
-      "commit": "ed73c3f"
+      "commit": "7154590"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Create json_extract.py in routing/ with `extract_json(text: str) -> str | None`. Implementation: strip markdown code fences (```json...``` or ```...```), then scan for first `{`, count braces (incrementing on `{`, decrementing on `}`; skip characters inside string literals to handle escaped braces), return substring when count reaches 0. Return None if no balanced JSON found. All step-1 tests pass.",
+      "description": "Fix Bug 1 in judge.py _build_review_prompt (lines 104-111): Add isinstance(report, StageReport) guard. For StageReport instances, extract items_flagged/stats/llm_calls/tokens_used as before. For dict entries (like _error), include the dict directly in the stage_reports output. This handles both the explicit _error entries injected by harness and any future non-StageReport entries.",
       "status": "done",
-      "commit": "3838e1b"
+      "commit": "0b99a62"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Add tests to test_classifier.py: a new TestLLMClassification class that mocks the OpenAI client. Test (1) `_llm_classify` with a response containing nested braces in reasoning field produces correct ClassificationResult, (2) response wrapped in markdown code fences parses correctly, (3) response with no JSON falls back to default.",
+      "description": "Write failing test for Bug 2: test_verdict_action_taken_persisted_after_mutation. Mock journal and _call_llm to return a 'moderate' severity verdict. Call review_run() and assert that journal.add_verdict() was called with a verdict whose action_taken is 'rollback', not 'none'. Also test 'serious' severity persists 'halt'. The test should fail because currently add_verdict is called BEFORE action_taken mutation.",
       "status": "done",
-      "commit": "18183e4"
+      "commit": "3449b68"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Update classifier.py line 144: replace `re.search(r'\\{[^}]+\\}', raw, re.DOTALL)` with `extract_json(raw)`. Import extract_json from fused_memory.routing.json_extract. Adjust the json_match usage: `json_str = extract_json(raw)` then `if not json_str:` guard, then `data = json.loads(json_str)`. Remove unused `re` import if no longer needed (it's still used for _CATEGORY_PATTERNS). All step-3 tests pass.",
+      "description": "Fix Bug 2 in judge.py review_run(): Move the journal.add_verdict(verdict) call (currently at line 48) to AFTER the action_taken determination block (after line 70). This ensures the verdict written to the DB has the correct action_taken value ('rollback', 'halt', or 'none'). The log statement at lines 50-58 should also move after the action_taken block since it logs action_taken.",
       "status": "done",
-      "commit": "d41dec4"
+      "commit": "892cb17"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Add tests to test_router.py: a new TestLLMRouting class that mocks the OpenAI client. Test (1) `_llm_route` with a response containing nested braces produces correct ReadRouteResult, (2) response wrapped in markdown code fences parses correctly, (3) response with no JSON falls back to broad default.",
+      "description": "Write failing test for Bug 3: test_halted_project_skips_cycle. Create a harness with a judge, halt a project via judge._halted_projects.add(). Push events and trigger a cycle. Assert that run_full_cycle is NOT called for the halted project. This tests that the halt check is wired into run_loop or the cycle entry point. Since run_loop is an infinite loop, test via a helper or by patching run_full_cycle and calling the relevant section directly.",
       "status": "done",
-      "commit": "d1cb9d6"
+      "commit": "344276c"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Update router.py line 163: replace `re.search(r'\\{[^}]+\\}', raw, re.DOTALL)` with `extract_json(raw)`. Import extract_json from fused_memory.routing.json_extract. Adjust usage same pattern as classifier. All step-5 tests pass.",
+      "description": "Fix Bug 3 in harness.py run_loop(): After acquiring the run lock (line 238) and before the BacklogIterator/run_full_cycle branching, add: if self.judge and self.judge.is_halted(project_id): logger.warning(...); await self.buffer.mark_run_complete(project_id); continue. This skips the cycle for halted projects while properly releasing the lock.",
       "status": "done",
-      "commit": "764ce44"
+      "commit": "4242b15"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing test for Bug 4: test_run_full_cycle_accepts_pre_drained_events. Create a harness with mocked stages. Do NOT push any events to the buffer (empty buffer). Create 2 ReconciliationEvent objects manually. Call run_full_cycle(project_id, reason, events=[evt1, evt2]). Assert run.events_processed == 2 (proves it used the passed events instead of drain() which would return 0). Also verify the stage mock received those 2 events.",
+      "status": "done",
+      "commit": "b68ed65"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Fix Bug 4: Add optional 'events' parameter to run_full_cycle(). When events is provided, skip the self.buffer.drain() call and use the provided events. Update BacklogIterator.run() to pass chunk events: self.harness.run_full_cycle(project_id, ..., events=chunk). The final consolidation pass keeps events=None to drain remaining buffer normally.",
+      "status": "done",
+      "commit": "2907ab3"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write failing test for Bug 5: test_timeout_marks_run_failed. Create a harness where stage.run is an async function that sleeps for a long time (asyncio.sleep(999)). Push events, then call asyncio.wait_for(harness.run_full_cycle(...), timeout=0.1). Catch TimeoutError. Then query the journal for recent runs and assert the run's status is 'failed', not 'running'. Also verify events were restored to the buffer.",
+      "status": "done",
+      "commit": "2cd5dbe"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Fix Bug 5 in harness.py run_full_cycle(): Add 'except asyncio.CancelledError' handler between the existing 'except Exception' and 'finally' blocks. In the handler: set run.status='failed', add _error entry to stage_reports with error_type='CancelledError'/Timeout, call complete_run(run_id, 'failed'), call restore_drained(project_id), log the error, then re-raise. This ensures the journal run is properly closed when asyncio.wait_for cancels the coroutine on timeout.",
+      "status": "done",
+      "commit": "5a117bf"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write failing test for review issue [exception_swallowing]: test_cancellation_cleanup_failure_preserves_cancelled_error. Mock journal.complete_run to raise RuntimeError('DB connection lost') when called during CancelledError cleanup. Run a harness with a slow stage, cancel via asyncio.wait_for timeout. Assert that the caller still receives CancelledError/TimeoutError (not RuntimeError). Currently the cleanup exception replaces CancelledError before the re-raise, so the caller gets RuntimeError instead of TimeoutError, bypassing the timeout handler in run_loop.",
+      "status": "done",
+      "commit": "c2332bd"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Fix review issue [exception_swallowing] in harness.py: Wrap the cleanup awaits inside 'except asyncio.CancelledError' in a nested try/except. Structure: try: await shield(complete_run(...)); await shield(restore_drained(...)); except Exception as cleanup_err: logger.error(f'Cleanup failed after cancellation: {cleanup_err}'). The outer raise statement stays outside the nested try/except so CancelledError is always re-raised regardless of cleanup failures.",
+      "status": "done",
+      "commit": "f43d685"
+    },
+    {
+      "id": "step-13",
+      "type": "test",
+      "description": "Write failing test for review issue [async_cancellation_safety]: test_cancellation_cleanup_shielded_from_second_cancel. Simulate a second cancellation arriving during cleanup by patching journal.complete_run to: (1) cancel the current task, (2) then return normally. Without asyncio.shield(), the second cancellation interrupts the await, leaving the journal run stuck in 'running'. With shield, complete_run finishes despite the outer task being cancelled. Assert journal run status is 'failed' after the double cancellation.",
+      "status": "done",
+      "commit": "a9c25ac"
+    },
+    {
+      "id": "step-14",
+      "type": "impl",
+      "description": "Fix review issue [async_cancellation_safety] in harness.py: Wrap journal.complete_run() and buffer.restore_drained() calls inside 'except asyncio.CancelledError' with asyncio.shield(). Final structure: try: await asyncio.shield(self.journal.complete_run(run_id, 'failed')); await asyncio.shield(self.buffer.restore_drained(project_id)); except Exception as cleanup_err: logger.error(f'Cleanup failed after cancellation: {cleanup_err}'). This protects the critical journal write from concurrent outer cancellation during server shutdown.",
+      "status": "done",
+      "commit": "9c0eeb1"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Extract to a shared json_extract.py module rather than duplicating the fix inline",
-      "rationale": "The identical regex appears in both classifier.py and router.py. A shared utility eliminates duplication and provides a single place to test the extraction logic thoroughly. Placed in the routing/ package since it's specific to LLM response parsing in that layer."
+      "decision": "Use isinstance(report, StageReport) guard rather than try/except for Bug 1",
+      "rationale": "The type annotation on stage_reports is already dict[str, StageReport | dict], so an isinstance check is idiomatic and explicit. try/except would mask other AttributeErrors."
     },
     {
-      "decision": "Use brace-counting with string-literal awareness instead of a nested regex",
-      "rationale": "A regex like r'\\{[^{}]*(?:\\{[^{}]*\\}[^{}]*)*\\}' only handles one level of nesting. Brace-counting handles arbitrary depth. String-literal tracking (skipping braces inside quotes) handles edge cases like escaped braces in JSON string values. This is more robust for real LLM output."
+      "decision": "Move journal.add_verdict() after action_taken determination rather than adding a second persist call for Bug 2",
+      "rationale": "Single write is simpler, cheaper, and avoids a race window where the DB has a stale action_taken value. The log statement moves too since it logs action_taken."
     },
     {
-      "decision": "Strip markdown code fences in the extract_json utility",
-      "rationale": "LLMs frequently wrap JSON in ```json...``` blocks. Handling this in the shared utility means both classifier and router get this resilience for free, and it's tested in one place."
+      "decision": "Add halt check after lock acquisition in run_loop for Bug 3",
+      "rationale": "Checking after lock acquisition ensures we don't hold the lock while skipping the cycle. We release it immediately via mark_run_complete. Checking before lock acquisition would waste a lock attempt on non-halted projects."
     },
     {
-      "decision": "Return str | None from extract_json rather than re.Match",
-      "rationale": "The callers only need the JSON string to pass to json.loads(). Returning the string directly is a simpler API than returning a Match object, and decouples the implementation from regex."
+      "decision": "Add optional 'events' parameter to run_full_cycle rather than restructuring BacklogIterator for Bug 4",
+      "rationale": "Minimal API surface change, backward compatible (events=None uses drain()), and clearly separates the concern of event sourcing from pipeline execution. The alternative of restructuring BacklogIterator to not use run_full_cycle would duplicate pipeline logic."
+    },
+    {
+      "decision": "Catch asyncio.CancelledError inside run_full_cycle rather than creating run_id in outer scope for Bug 5",
+      "rationale": "Keeps run lifecycle management self-contained within run_full_cycle. The outer scope (run_loop) already handles TimeoutError for logging/buffer-restore; the CancelledError handler ensures the journal run is properly closed. Both handlers calling restore_drained is idempotent and safe. Re-raising CancelledError preserves asyncio cancellation semantics."
+    },
+    {
+      "decision": "Apply both asyncio.shield() and nested try/except to CancelledError cleanup as a single hardened pattern",
+      "rationale": "asyncio.shield() prevents a second cancellation from aborting the cleanup coroutine mid-flight (the primary invariant: complete_run must finish). The nested try/except prevents any cleanup exception from replacing the original CancelledError, ensuring the caller's TimeoutError handler in run_loop always fires. Both defenses are complementary: shield addresses the cascading-cancellation vector, try/except addresses the exception-replacement vector. Implementing exception_swallowing fix first (step-12) then shield (step-14) as the shield test is harder to write without the try/except already in place."
     }
   ],
   "reuse": [
     {
-      "what": "mock_config fixture from conftest.py",
-      "where": "fused-memory/tests/conftest.py",
-      "how": "Both test_classifier.py and test_router.py already use this fixture. New LLM-path tests will use it too, enabling the classifier/router with llm_fallback=False by default, and overriding to True for specific LLM tests."
+      "what": "_make_harness_with_mocked_stages helper",
+      "where": "fused-memory/tests/test_harness.py line 268",
+      "how": "Reuse for building test harnesses in Bug 3, 4, 5 tests and new cancellation safety tests with mocked stages"
     },
     {
-      "what": "unittest.mock.AsyncMock pattern for OpenAI client",
-      "where": "fused-memory/tests/test_journaling_integration.py (and others)",
-      "how": "The project uses AsyncMock extensively. New LLM-path tests will mock the OpenAI completions.create call using the same pattern: create an AsyncMock that returns a mock response object with choices[0].message.content set to the test LLM output string."
+      "what": "_mock_stage_run helper",
+      "where": "fused-memory/tests/test_harness.py line 291",
+      "how": "Reuse for creating mock stage.run methods in Bug 3, 4, 5 tests"
     },
     {
-      "what": "Existing ClassificationResult and ReadRouteResult models",
-      "where": "fused-memory/src/fused_memory/models/memory.py",
-      "how": "The fix doesn't change the model layer \u2014 the same result types are returned. Tests assert against these existing model types."
+      "what": "_make_event helper",
+      "where": "fused-memory/tests/test_harness.py line 49",
+      "how": "Reuse for creating test ReconciliationEvent objects in Bug 4, 5 tests and new cancellation safety tests"
+    },
+    {
+      "what": "_make_judge_config helper and mock_journal fixture",
+      "where": "fused-memory/tests/test_judge.py line 13 and 78",
+      "how": "Reuse for creating test Judge instances in Bug 1, 2 tests"
+    },
+    {
+      "what": "Existing ReconciliationRun model with stage_reports: dict[str, StageReport | dict]",
+      "where": "fused-memory/src/fused_memory/models/reconciliation.py line 87",
+      "how": "The type annotation already supports dict entries in stage_reports, no model change needed for Bug 1"
+    },
+    {
+      "what": "Journal get_run deserialization handles dict stage_reports entries",
+      "where": "fused-memory/src/fused_memory/reconciliation/journal.py lines 262-266",
+      "how": "Journal already preserves _error entries as dicts when loading runs, confirming this is an intended data shape"
+    },
+    {
+      "what": "Existing test_timeout_marks_run_failed test pattern",
+      "where": "fused-memory/tests/test_harness.py line 501",
+      "how": "Reuse the slow-stage + asyncio.wait_for pattern for the new cancellation safety tests. Step-11 extends this by also mocking journal.complete_run to fail. Step-13 extends by simulating a second cancellation inside complete_run."
     }
   ],
-  "_session_id": "104-67a0f591",
-  "_created_at": "2026-03-22T22:07:10.903559+00:00"
+  "_session_id": "100-c5989415",
+  "_created_at": "2026-03-22T22:25:27.054952+00:00"
 }

@@ -1,5 +1,6 @@
 """Tests for reconciliation harness (pipeline orchestration)."""
 
+import contextlib
 import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
@@ -499,6 +500,162 @@ async def test_journal_triggered_by_roundtrip(journal):
 
 
 @pytest.mark.asyncio
+async def test_timeout_marks_run_failed(journal, event_buffer, mock_memory_service):
+    """When asyncio.wait_for cancels run_full_cycle on timeout, the run must be marked 'failed'.
+
+    Bug 5: asyncio.wait_for timeout cancels run_full_cycle via asyncio.CancelledError.
+    CancelledError is NOT caught by 'except Exception', so complete_run(run_id, 'failed')
+    is never called, leaving the run stuck in 'running'.
+
+    This test confirms that after a timeout:
+    - The journal run has status 'failed' (not 'running')
+    - The buffer events were restored (buffer size == original event count)
+    """
+    import asyncio
+
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+    # Make first stage sleep forever (simulating a long-running stage)
+    async def slow_stage_run(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0]):
+        await asyncio.sleep(999)  # Will be cancelled by wait_for
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    harness.stages[0].run = slow_stage_run
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    # Push events so drain returns something
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+
+    # Run with a tight timeout to force cancellation
+    with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+        await asyncio.wait_for(
+            harness.run_full_cycle('test-project', 'buffer_size:2'),
+            timeout=0.1,
+        )
+
+    # Give the event loop a moment to process any cleanup
+    await asyncio.sleep(0.05)
+
+    # The run must be marked 'failed', not stuck in 'running'
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    assert len(recent_runs) >= 1
+    run = recent_runs[0]
+    assert run.status == 'failed', (
+        f"Expected run.status='failed' after timeout, got '{run.status}'. "
+        "Bug 5: CancelledError is not caught in run_full_cycle, so complete_run is never called."
+    )
+
+    # Events must have been restored to the buffer
+    stats = await event_buffer.get_buffer_stats('test-project')
+    assert stats['size'] == 2, (
+        f"Expected buffer size=2 after timeout, got {stats['size']}. "
+        "Bug 5: restore_drained is not called on CancelledError."
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_accepts_pre_drained_events(journal, event_buffer, mock_memory_service):
+    """run_full_cycle() must accept an optional 'events' param to skip drain().
+
+    Bug 4: BacklogIterator.run() drains a chunk via drain_oldest_chunk(), then calls
+    run_full_cycle() which re-drains via drain(), getting different events — the chunk
+    events are silently lost.  Fix: add optional events param to run_full_cycle so
+    BacklogIterator can pass the already-drained chunk.
+
+    This test confirms that passing events=[...] to run_full_cycle uses those events
+    without calling buffer.drain(), and that events_processed reflects the passed count.
+    """
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+    # Mock all stages to succeed
+    for stage in harness.stages:
+        _mock_stage_run(stage)
+
+    # Do NOT push any events to the buffer (drain() would return 0 events)
+    # Manually create 2 events
+    evt1 = _make_event()
+    evt2 = _make_event()
+
+    # Call run_full_cycle with pre-drained events
+    # This should fail currently because run_full_cycle doesn't accept an 'events' param
+    run = await harness.run_full_cycle('test-project', 'backlog_chunk:1:2', events=[evt1, evt2])
+
+    assert run.events_processed == 2, (
+        f"Expected events_processed=2 from pre-drained events, got {run.events_processed}. "
+        "Bug 4: run_full_cycle does not accept an 'events' parameter."
+    )
+    assert run.status == 'completed'
+
+
+@pytest.mark.asyncio
+async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_service):
+    """run_loop() must skip run_full_cycle for projects that are halted by the judge.
+
+    Bug 3: judge.is_halted() is never called in run_loop, so halted projects keep
+    processing new cycles.  This test drives one run_loop iteration via a short
+    asyncio.wait_for and confirms run_full_cycle is never called for a halted project.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+    # Wire a real judge with the project pre-halted
+    from fused_memory.config.schema import ReconciliationConfig
+    from fused_memory.reconciliation.judge import Judge
+
+    judge_config = ReconciliationConfig(
+        enabled=True,
+        explore_codebase_root='/tmp/test',
+        agent_llm_provider='anthropic',
+        agent_llm_model='claude-sonnet-4-20250514',
+    )
+    mock_j = AsyncMock()
+    mock_j.get_run = AsyncMock(return_value=None)
+    harness.judge = Judge(config=judge_config, journal=mock_j)
+    harness.judge._halted_projects.add('test-project')  # Pre-halt the project
+
+    # Push enough events to trigger a cycle
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    # Confirm trigger would fire
+    should, _ = await event_buffer.should_trigger('test-project')
+    assert should
+
+    # Track whether run_full_cycle is called
+    run_full_cycle_called = []
+    original_rfc = harness.run_full_cycle
+
+    async def spy_rfc(*args, **kwargs):
+        run_full_cycle_called.append(args)
+        return await original_rfc(*args, **kwargs)
+
+    # Also make _recover_stale_runs a no-op
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+
+    with patch.object(harness, 'run_full_cycle', side_effect=spy_rfc), contextlib.suppress(TimeoutError):
+        # Run loop for one sleep cycle (loop sleeps 5s; we wait 0.2s — enough for 1 iteration)
+        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+
+    # For a halted project, run_full_cycle must NOT have been called
+    assert len(run_full_cycle_called) == 0, (
+        f"run_full_cycle was called {len(run_full_cycle_called)} time(s) "
+        "for a halted project — Bug 3: halt check not wired into run_loop."
+    )
+
+
+@pytest.mark.asyncio
 async def test_stage_state_reset_after_remediation(journal, event_buffer, mock_memory_service):
     """Stage state (remediation_findings, remediation_mode) is reset after remediation."""
     from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
@@ -522,3 +679,153 @@ async def test_stage_state_reset_after_remediation(journal, event_buffer, mock_m
     assert stage1.remediation_findings is None
     assert stage1.prior_s3_findings is None
     assert stage2.remediation_mode is False
+
+
+@pytest.mark.asyncio
+async def test_cancellation_cleanup_failure_preserves_cancelled_error(
+    journal, event_buffer, mock_memory_service,
+):
+    """Cleanup exception during CancelledError handler must not replace CancelledError.
+
+    Review issue [exception_swallowing]: If journal.complete_run raises RuntimeError
+    during the CancelledError cleanup, the exception currently replaces CancelledError
+    before the re-raise — so the caller receives RuntimeError instead of TimeoutError,
+    bypassing run_loop's timeout handler.
+
+    Fix: wrap cleanup awaits in a nested try/except Exception so CancelledError is
+    always re-raised regardless of cleanup failures.
+    """
+    import asyncio
+
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+    # Make first stage sleep forever (will be cancelled by wait_for timeout)
+    async def slow_stage_run(
+        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0],
+    ):
+        await asyncio.sleep(999)
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    harness.stages[0].run = slow_stage_run
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    # Mock complete_run to raise RuntimeError when called during cleanup (status='failed')
+    original_complete_run = journal.complete_run
+
+    async def failing_complete_run(run_id, status):
+        if status == 'failed':
+            raise RuntimeError('DB connection lost')
+        return await original_complete_run(run_id, status)
+
+    journal.complete_run = failing_complete_run
+
+    # The caller must receive TimeoutError, NOT RuntimeError from the cleanup failure.
+    # Before the fix, RuntimeError replaces CancelledError and propagates to the caller.
+    with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+        await asyncio.wait_for(
+            harness.run_full_cycle('test-project', 'buffer_size:1'),
+            timeout=0.1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancellation_cleanup_shielded_from_second_cancel(
+    journal, event_buffer, mock_memory_service,
+):
+    """asyncio.shield() must protect cleanup from a second cancellation during shutdown.
+
+    Review issue [async_cancellation_safety]: Without asyncio.shield(), a second
+    cancellation (e.g., during server shutdown) arriving while complete_run is
+    awaiting the DB write will interrupt complete_run — leaving the journal stuck
+    in 'running'.  With asyncio.shield(), complete_run runs in its own Task and
+    finishes even if the outer task is cancelled again.
+
+    This test injects the second cancel FROM WITHIN complete_run by calling
+    outer_task.cancel() before awaiting asyncio.sleep(0).  Without shield,
+    complete_run runs inside the outer task so asyncio.sleep(0) raises
+    CancelledError (second cancel fires), aborting the write.  With shield,
+    complete_run runs in a separate inner Task unaffected by the outer cancel,
+    so sleep(0) returns normally and the write completes.
+    """
+    import asyncio
+
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+    # Make first stage sleep forever (cancelled by the first outer_task.cancel())
+    async def slow_stage_run(
+        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0],
+    ):
+        await asyncio.sleep(999)
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    harness.stages[0].run = slow_stage_run
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    # Capture the outer task reference so the mock can cancel it from within
+    outer_task_ref: list = [None]
+    original_complete_run = journal.complete_run
+
+    async def self_cancelling_complete_run(run_id, status):
+        if status == 'failed':
+            # Simulate a second external cancellation (e.g., server shutdown)
+            # arriving while cleanup is in progress.
+            outer_task_ref[0].cancel()
+            # Without asyncio.shield: this await runs in the outer task context,
+            # so the pending cancel fires here — CancelledError aborts the write.
+            # With asyncio.shield: this runs in its own inner Task, so the cancel
+            # on the outer task does not propagate here and sleep(0) completes.
+            await asyncio.sleep(0)
+        await original_complete_run(run_id, status)
+
+    journal.complete_run = self_cancelling_complete_run
+
+    outer_task = asyncio.create_task(
+        harness.run_full_cycle('test-project', 'buffer_size:1'),
+    )
+    outer_task_ref[0] = outer_task
+
+    # Let the task start and reach the slow stage
+    await asyncio.sleep(0.05)
+
+    # First cancellation: triggers CancelledError in slow_stage_run → cleanup starts
+    outer_task.cancel()
+
+    # Wait for the outer task to finish (it will raise CancelledError)
+    with contextlib.suppress(asyncio.CancelledError):
+        await outer_task
+
+    # Give any shield-wrapped inner Task time to complete the DB write.
+    # Without shield: no inner task exists; with shield: inner task runs here.
+    await asyncio.sleep(0.1)
+
+    # The journal run must be 'failed', not stuck in 'running'
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    assert len(recent_runs) >= 1
+    run = recent_runs[0]
+    assert run.status == 'failed', (
+        f"Expected status='failed' after double cancellation, got '{run.status}'. "
+        "Review issue [async_cancellation_safety]: cleanup must be wrapped with "
+        "asyncio.shield() so a second cancel cannot abort the DB write."
+    )
