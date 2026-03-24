@@ -2,11 +2,15 @@
 ZombieEdgeVerifier, and run_verify_zombie_edges entrypoint."""
 from __future__ import annotations
 
+import contextlib
+import logging
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.maintenance.verify_zombie_edges import VerifyResult, run_verify_zombie_edges
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrored from test_cleanup_stale_edges.py)
@@ -539,10 +543,6 @@ class TestRunVerifyZombieEdgesEnvVarRestore:
     @pytest.mark.asyncio
     async def test_restores_config_path_when_close_raises(self):
         """CONFIG_PATH is restored even when service.close() raises in the finally block."""
-        import os
-
-        from fused_memory.maintenance.verify_zombie_edges import VerifyResult, run_verify_zombie_edges
-
         original = os.environ.get('CONFIG_PATH')
         try:
             mock_service = AsyncMock()
@@ -563,10 +563,8 @@ class TestRunVerifyZombieEdgesEnvVarRestore:
                 mock_verifier.cleanup = AsyncMock(return_value=mock_result)
                 mock_verifier_cls.return_value = mock_verifier
 
-                try:
+                with contextlib.suppress(RuntimeError):
                     await run_verify_zombie_edges(uuids=['test-uuid'], config_path='test.yaml')
-                except RuntimeError:
-                    pass  # close() error propagates with current (unfixed) code
 
             # CONFIG_PATH must be restored regardless of close() raising
             assert os.environ.get('CONFIG_PATH') == original
@@ -589,10 +587,6 @@ class TestRunVerifyZombieEdgesCloseWarning:
     @pytest.mark.asyncio
     async def test_logs_warning_when_close_raises(self, caplog):
         """A WARNING containing the function name is logged when service.close() raises."""
-        import logging
-
-        from fused_memory.maintenance.verify_zombie_edges import VerifyResult, run_verify_zombie_edges
-
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
         mock_service.close = AsyncMock(side_effect=RuntimeError('close error'))
@@ -611,14 +605,14 @@ class TestRunVerifyZombieEdgesCloseWarning:
             mock_verifier.cleanup = AsyncMock(return_value=mock_result)
             mock_verifier_cls.return_value = mock_verifier
 
-            with caplog.at_level(
-                logging.WARNING,
-                logger='fused_memory.maintenance.verify_zombie_edges',
+            with (
+                caplog.at_level(
+                    logging.WARNING,
+                    logger='fused_memory.maintenance.verify_zombie_edges',
+                ),
+                contextlib.suppress(RuntimeError),
             ):
-                try:
-                    await run_verify_zombie_edges(uuids=['test-uuid'])
-                except RuntimeError:
-                    pass  # close() error propagates with current (unfixed) code
+                await run_verify_zombie_edges(uuids=['test-uuid'])
 
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any(
