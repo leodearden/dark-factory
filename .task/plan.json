@@ -23,43 +23,43 @@
       "id": "step-2",
       "type": "impl",
       "description": "Implement _build_edge_dict(self, e) -> dict as a private method on MemoryService, placed between _search_graphiti and get_entity. Extracts uuid via getattr(e, 'uuid', None), fact via getattr(e, 'fact', str(e)), name via getattr(e, 'name', None), builds temporal dict from valid_at/invalid_at (None when both absent), extracts entity names from source_node/target_node, and builds provenance from episodes. Returns dict with keys: uuid, fact, name, temporal, entities, provenance. Run new TestBuildEdgeDict tests to verify they pass.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "e922dd5"
     },
     {
       "id": "step-3",
       "type": "test",
       "description": "Run existing TestSearch and TestSearchDeleteRoundtrip test classes to confirm green baseline before refactoring _search_graphiti. These tests exercise the full edge-to-MemoryResult conversion path including temporal, entities, and provenance fields.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "e922dd5"
     },
     {
       "id": "step-4",
       "type": "impl",
       "description": "Refactor _search_graphiti() to use _build_edge_dict: replace the ~20 lines of inline temporal/entities/provenance extraction (lines ~727-748) with `d = self._build_edge_dict(edge)`. Map the returned dict fields into the MemoryResult constructor: id=d['uuid'] or str(i), content=d['fact'], temporal=d['temporal'], entities=d['entities'], provenance=d['provenance']. Keep the rank-based score computation inline. Run TestSearch and TestSearchDeleteRoundtrip tests to confirm no regression.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "4a4c464"
     },
     {
       "id": "step-5",
       "type": "test",
       "description": "Run existing TestGetEntityTemporalMetadata, TestGetEntityNameEntitiesProvenance, and TestGetEntityValidOnly test classes to confirm green baseline before refactoring get_entity.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "4a4c464"
     },
     {
       "id": "step-6",
       "type": "impl",
       "description": "Refactor get_entity() to use _build_edge_dict: replace the ~20 lines of inline edge extraction (lines ~834-855 and the edge_data.append dict construction) with `edge_data.append(self._build_edge_dict(e))`. The helper returns a dict with the exact same keys (uuid, fact, name, temporal, entities, provenance). Run all TestGetEntity* tests to confirm no regression.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "cbc53ed"
     },
     {
       "id": "step-7",
       "type": "test",
       "description": "Run the full test_memory_service.py test suite to confirm all existing tests still pass after both refactorings. This is the final regression check covering search, get_entity, delete, episode, close, and all other scenarios.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "cbc53ed"
     }
   ],
   "design_decisions": [
