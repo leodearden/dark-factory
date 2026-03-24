@@ -875,6 +875,26 @@ class TestBuildEdgeDict:
         d = service._build_edge_dict(edge)
         assert d['fact'] == 'EdgeWithoutFact-str-representation'
 
+    def test_non_string_episode_objects_converted_to_str_in_provenance(self, service):
+        """Non-string episode objects in an edge's episodes list are str()-converted."""
+
+        class CustomEpisode:
+            def __str__(self):
+                return 'custom-ep-repr'
+
+        class EdgeWithCustomEpisodes:
+            uuid = 'u-ep'
+            fact = 'episode fact'
+            name = None
+            source_node = None
+            target_node = None
+            episodes = [CustomEpisode(), CustomEpisode()]
+            valid_at = None
+            invalid_at = None
+
+        d = service._build_edge_dict(EdgeWithCustomEpisodes())
+        assert d['provenance'] == ['custom-ep-repr', 'custom-ep-repr']
+
 
 class TestGetEntityValidOnly:
     """Tests that get_entity() valid_only parameter filters invalidated edges."""
