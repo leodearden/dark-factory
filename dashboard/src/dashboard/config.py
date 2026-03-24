@@ -42,6 +42,14 @@ class DashboardConfig:
     def worktrees_dir(self) -> Path:
         return self.project_root / '.worktrees'
 
+    @property
+    def runs_db(self) -> Path:
+        return self.project_root / 'data' / 'orchestrator' / 'runs.db'
+
+    @property
+    def escalations_dir(self) -> Path:
+        return self.project_root / 'data' / 'escalations'
+
     @classmethod
     def from_env(cls) -> DashboardConfig:
         """Create config with DASHBOARD_-prefixed env var overrides."""

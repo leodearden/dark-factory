@@ -24,6 +24,9 @@ class Escalation:
     worktree: str | None = None  # path to worktree
     workflow_state: str | None = None  # what state the agent was in
     level: int = 0  # 0 = agent→steward, 1 = steward→human
+    resolved_at: str | None = None
+    resolved_by: str | None = None  # "steward" | "interactive" | "auto-dismissed"
+    resolution_turns: int | None = None  # conversation turns to resolve
 
     def to_dict(self) -> dict:
         return asdict(self)
