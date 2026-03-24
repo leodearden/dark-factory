@@ -941,6 +941,9 @@ class TestBuildEdgeDict:
         assert d['temporal']['valid_at'] == '', (
             f"valid_at '' should be preserved, got {d['temporal']['valid_at']!r}"
         )
+        assert d['temporal']['invalid_at'] is None, (
+            f"invalid_at should be None when not set, got {d['temporal']['invalid_at']!r}"
+        )
 
     def test_empty_string_invalid_at_builds_temporal_dict(self, service):
         """An edge with invalid_at='' (empty string, not None) must still produce a temporal dict.
@@ -959,6 +962,9 @@ class TestBuildEdgeDict:
         )
         assert d['temporal']['invalid_at'] == '', (
             f"invalid_at '' should be preserved, got {d['temporal']['invalid_at']!r}"
+        )
+        assert d['temporal']['valid_at'] is None, (
+            f"valid_at should be None when not set, got {d['temporal']['valid_at']!r}"
         )
 
 
