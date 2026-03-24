@@ -484,14 +484,7 @@ class TestSearch:
         test_edge_with_no_uuid_attr_returns_none which only tests the helper in isolation.
         """
 
-        class EdgeWithoutUuid:
-            fact = 'some fact'
-            name = None
-            source_node = None
-            target_node = None
-            episodes = []
-            valid_at = None
-            invalid_at = None
+        from tests.conftest import EdgeWithoutUuid
 
         service.graphiti.search = AsyncMock(return_value=[EdgeWithoutUuid()])
         service.mem0.search = AsyncMock(return_value={'results': []})
@@ -871,15 +864,7 @@ class TestBuildEdgeDict:
 
     def test_edge_with_no_uuid_attr_returns_none(self, service):
         """Edge object without a uuid attribute returns uuid=None."""
-
-        class EdgeWithoutUuid:
-            fact = 'some fact'
-            name = None
-            source_node = None
-            target_node = None
-            episodes = []
-            valid_at = None
-            invalid_at = None
+        from tests.conftest import EdgeWithoutUuid
 
         d = service._build_edge_dict(EdgeWithoutUuid())
         assert d['uuid'] is None
