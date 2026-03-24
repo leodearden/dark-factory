@@ -1,138 +1,57 @@
 {
-  "task_id": "129",
-  "title": "Fix: get_entity should include temporal metadata (valid_at/invalid_at) on returned edges",
+  "task_id": "130",
+  "title": "Move get_entity tool tests from test_health_endpoint.py to dedicated test_tools.py",
   "files": [
-    "fused-memory/src/fused_memory/services/memory_service.py",
-    "fused-memory/src/fused_memory/server/tools.py",
-    "fused-memory/tests/test_memory_service.py",
-    "fused-memory/tests/conftest.py"
+    "fused-memory/tests/test_tools.py",
+    "fused-memory/tests/test_health_endpoint.py"
   ],
   "modules": [
-    "fused-memory/src/fused_memory/services",
-    "fused-memory/src/fused_memory/server",
     "fused-memory/tests"
   ],
-  "analysis": "The get_entity() method in memory_service.py (lines 796-829) returns edges with only {uuid, fact} \u2014 missing temporal metadata, edge name, entity names, and provenance. Meanwhile, the _search_graphiti() method (lines 716-763) in the same file already extracts all of these fields from the exact same Graphiti edge objects. The fix is to reuse the proven extraction pattern from _search_graphiti() in get_entity(), enriching edge dicts to include temporal (valid_at/invalid_at), name, entities, and provenance. Additionally, a valid_only parameter should be added at both the service level (memory_service.py) and MCP tool level (tools.py) to let callers filter out historically-invalidated edges. The GraphitiBackend in graphiti_client.py does NOT need changes \u2014 it already returns full Graphiti edge objects with all metadata; the problem is purely in the dict-construction step within memory_service.py. MockEdge in conftest.py already has valid_at and invalid_at fields, but needs a 'name' field added for complete test coverage of edge relationship names.",
-  "prerequisites": [
-    {
-      "id": "pre-1",
-      "description": "Add 'name' field to MockEdge in conftest.py (default: None) so tests can set edge relationship names. MockEdge already has valid_at, invalid_at, source_node, target_node, episodes \u2014 only 'name' is missing.",
-      "status": "done",
-      "commit": "b37f5ba",
-      "tests": []
-    }
-  ],
+  "analysis": "Task 129 appended two get_entity MCP tool tests to fused-memory/tests/test_health_endpoint.py (lines 644-687): test_get_entity_tool_passes_valid_only_true_to_service and test_get_entity_tool_valid_only_defaults_to_false. These test the get_entity tool handler's valid_only parameter forwarding, not any health endpoint. They are fully self-contained \u2014 each creates its own AsyncMock service and MCP server inline, with no dependency on the file's fixtures (mcp_server, mcp_server_with_service, etc.). The move is clean: create test_tools.py with the two tests and their imports, then remove the section (lines 644-687) from test_health_endpoint.py. No fixture sharing needed. The new file name test_tools.py parallels test_memory_service.py (service-layer tests vs tool-layer tests) and provides a natural home for future tool-level tests that are currently co-located in test_health_endpoint.py.",
+  "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing test: test_get_entity_edges_include_temporal_metadata \u2014 create MockEdges with valid_at/invalid_at set, call service.get_entity(), assert each returned edge dict has a 'temporal' key containing {valid_at: str, invalid_at: str|None}. Also test edge with neither field returns temporal: None.",
+      "description": "Create fused-memory/tests/test_tools.py with the two get_entity tool tests (test_get_entity_tool_passes_valid_only_true_to_service, test_get_entity_tool_valid_only_defaults_to_false) copied from test_health_endpoint.py. Include the necessary imports (AsyncMock, pytest, create_mcp_server) and module docstring. Run pytest on the new file to confirm both tests pass.",
       "status": "done",
-      "commit": "cd235ba"
+      "commit": "fd0af75"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "In memory_service.py get_entity(), extract valid_at and invalid_at from each edge using the same getattr+temporal-dict pattern as _search_graphiti() (lines 728-735). Add 'temporal' key to each edge dict.",
+      "description": "Remove the get_entity section (section comment block at lines 644-646 and the two async test functions at lines 649-687) from test_health_endpoint.py. Run pytest on both test_health_endpoint.py and test_tools.py to confirm: (a) the old file's remaining tests still pass, (b) the new file's 2 tests still pass, and (c) no duplicate test names exist.",
       "status": "done",
-      "commit": "eff1e6c"
-    },
-    {
-      "id": "step-3",
-      "type": "test",
-      "description": "Write failing test: test_get_entity_edges_include_name_entities_provenance \u2014 create MockEdges with name, source_node/target_node (MockNode), and episodes list. Assert each returned edge dict has 'name' (str), 'entities' (list of node names), and 'provenance' (list of episode ID strings).",
-      "status": "done",
-      "commit": "a05282d"
-    },
-    {
-      "id": "step-4",
-      "type": "impl",
-      "description": "In memory_service.py get_entity(), extract name (getattr with default None), entities (from source_node.name/target_node.name), and provenance (from episodes list) using the same pattern as _search_graphiti() (lines 737-748). Add all three keys to each edge dict.",
-      "status": "done",
-      "commit": "165c63c"
-    },
-    {
-      "id": "step-5",
-      "type": "test",
-      "description": "Write failing test: test_get_entity_valid_only_filters_invalidated_edges \u2014 create 3 MockEdges: one with invalid_at=None (valid), one with invalid_at set (invalidated), one with neither. Call get_entity(valid_only=True), assert only edges without non-null invalid_at are returned. Also test default (valid_only=False) returns all edges.",
-      "status": "done",
-      "commit": "4557e6e"
-    },
-    {
-      "id": "step-6",
-      "type": "impl",
-      "description": "Add valid_only: bool = False parameter to memory_service.get_entity(). When True, skip edges where getattr(edge, 'invalid_at', None) is not None. Apply filter before building edge_data list.",
-      "status": "done",
-      "commit": "b34c865"
-    },
-    {
-      "id": "step-7",
-      "type": "test",
-      "description": "Write failing test: test_get_entity_tool_accepts_valid_only \u2014 verify the MCP tool handler in tools.py passes valid_only to memory_service.get_entity(). Mock memory_service.get_entity, call the tool function with valid_only=True, assert the mock was called with valid_only=True.",
-      "status": "done",
-      "commit": "7da5b73"
-    },
-    {
-      "id": "step-8",
-      "type": "impl",
-      "description": "Add valid_only: bool = False parameter to the get_entity MCP tool in tools.py. Update docstring to document the parameter. Pass it through to memory_service.get_entity(valid_only=valid_only).",
-      "status": "done",
-      "commit": "2c7bfbe"
+      "commit": "7772fb2"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Enrich edge dicts in memory_service.py rather than changing GraphitiBackend",
-      "rationale": "GraphitiBackend.search() already returns full Graphiti edge objects with all temporal metadata. The data loss happens in memory_service.py's dict-construction loop (lines 822-827) which only extracts uuid and fact. Fixing at this layer is minimal, targeted, and consistent with _search_graphiti() which solves the same problem for the search() path."
+      "decision": "Name the new file test_tools.py rather than test_get_entity_tool.py",
+      "rationale": "test_tools.py parallels test_memory_service.py (service-layer vs tool-layer) and provides a natural landing zone for future tool-level tests that are currently misplaced in test_health_endpoint.py. Avoids file proliferation \u2014 one file per tool would create 15+ test files."
     },
     {
-      "decision": "Use the same temporal dict structure as _search_graphiti() \u2014 {valid_at: str|None, invalid_at: str|None} nested under a 'temporal' key",
-      "rationale": "Consistency with search() results. Agents already parse this structure from search results (see MemoryResult.temporal field). Using the same format means consuming code doesn't need different parsing paths for search vs get_entity."
+      "decision": "Keep tests self-contained (no shared fixtures) in test_tools.py for now",
+      "rationale": "The two get_entity tests already create their own mocks inline. Extracting fixtures is premature since the file starts with only 2 tests. Fixtures can be introduced when more tests are moved here in the future."
     },
     {
-      "decision": "Add name, entities, and provenance to edges alongside temporal metadata",
-      "rationale": "While the task specifically calls out temporal metadata, _search_graphiti() also extracts name, entities, and provenance \u2014 and get_entity lacks all of them. Including these makes get_entity results complete and avoids a follow-up task. The extraction code is already proven in _search_graphiti()."
-    },
-    {
-      "decision": "valid_only defaults to False (not True)",
-      "rationale": "Backward compatibility \u2014 existing callers expect all edges returned. Agents that need only valid edges opt in explicitly. This also lets reconciliation agents see the full history when needed."
-    },
-    {
-      "decision": "Filter valid_only in memory_service (application layer) not GraphitiBackend (query layer)",
-      "rationale": "The Graphiti search() API doesn't support filtering by invalid_at natively. Adding a Cypher query variant in GraphitiBackend would be a larger change. Since get_entity returns at most ~10 edges (num_results=10), post-fetch filtering is negligible cost and keeps the fix contained."
-    },
-    {
-      "decision": "No changes to graphiti_client.py (GraphitiBackend)",
-      "rationale": "The task description mentions graphiti_client.py but inspection shows there is no get_entity wrapper there. The backend's search() and search_nodes() return full objects. All changes are in memory_service.py and tools.py."
+      "decision": "Do not move other tool tests from test_health_endpoint.py in this task",
+      "rationale": "The task scope is specifically the two get_entity tests. Moving others (update_task, set_task_status, delete_memory, add_memory, search, get_episodes, etc.) would be a scope violation \u2014 that's a separate cleanup task."
     }
   ],
   "reuse": [
     {
-      "what": "Temporal metadata extraction pattern",
-      "where": "memory_service.py _search_graphiti() lines 728-735",
-      "how": "Copy the getattr-based extraction of valid_at/invalid_at and temporal dict construction directly into get_entity()'s edge loop"
+      "what": "Existing test pattern from test_health_endpoint.py: AsyncMock service + create_mcp_server + _tool_manager.call_tool",
+      "where": "fused-memory/tests/test_health_endpoint.py lines 649-687",
+      "how": "Copy the exact test code verbatim \u2014 the tests are self-contained and use the same mock pattern already established in the file."
     },
     {
-      "what": "Entity name extraction pattern",
-      "where": "memory_service.py _search_graphiti() lines 737-744",
-      "how": "Copy the source_node/target_node name extraction into get_entity()'s edge loop"
-    },
-    {
-      "what": "Episode provenance extraction pattern",
-      "where": "memory_service.py _search_graphiti() lines 746-748",
-      "how": "Copy the episodes-to-provenance-list conversion into get_entity()'s edge loop"
-    },
-    {
-      "what": "MockEdge and MockNode test fixtures",
-      "where": "tests/conftest.py lines 19-36",
-      "how": "Use existing MockEdge (already has valid_at, invalid_at, source_node, target_node, episodes) and MockNode (has name) in new get_entity tests \u2014 only need to add 'name' field to MockEdge"
-    },
-    {
-      "what": "Service test fixture with mocked backends",
-      "where": "tests/test_memory_service.py lines 12-39 (service fixture)",
-      "how": "Reuse the existing 'service' fixture which provides MemoryService with mocked graphiti.search, graphiti.search_nodes, etc. Set return values with MockEdge/MockNode instances."
+      "what": "create_mcp_server factory function",
+      "where": "fused_memory.server.tools",
+      "how": "Import and use to create MCP server instances with mocked MemoryService for tool-level testing."
     }
   ],
-  "_session_id": "129-089f2d32",
-  "_created_at": "2026-03-24T22:21:56.655762+00:00"
+  "_session_id": "130-f63c2473",
+  "_created_at": "2026-03-24T22:38:24.393380+00:00"
 }
