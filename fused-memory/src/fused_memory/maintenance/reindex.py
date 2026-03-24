@@ -195,7 +195,10 @@ async def run_reindex(
         return result
     finally:
         if service is not None:
-            await service.close()
+            try:
+                await service.close()
+            except Exception:
+                logger.warning('Error closing service during run_reindex cleanup', exc_info=True)
         if config_path is not None:
             if old_config_path is None:
                 os.environ.pop('CONFIG_PATH', None)
