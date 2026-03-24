@@ -1187,3 +1187,77 @@ async def test_claude_cli_not_installed():
     with patch('asyncio.create_subprocess_exec', side_effect=FileNotFoundError), \
          pytest.raises(RuntimeError, match='Claude CLI not found'):
         await agent.run('test')
+
+
+# ---------------------------------------------------------------------------
+# Cap-Hit Backoff
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_sleeps_on_cap_hit():
+    """_call_claude_cli sleeps before retrying on cap hit."""
+    from unittest.mock import AsyncMock
+
+    from fused_memory.reconciliation.agent_loop import _CAP_HIT_COOLDOWN_SECS
+
+    config = _make_config(agent_llm_provider='claude-cli', agent_llm_model='opus')
+
+    tools = {
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete',
+            parameters={'type': 'object', 'properties': {}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='Test',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+
+    # Wire up a mock usage gate
+    gate = MagicMock()
+    gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
+    cap_call_count = 0
+
+    def detect_side_effect(*args, **kwargs):
+        nonlocal cap_call_count
+        cap_call_count += 1
+        return cap_call_count == 1  # cap hit first time only
+
+    gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
+    agent._usage_gate = gate
+
+    # Build a JSON result the CLI would produce
+    cli_result = json.dumps({
+        'result': '',
+        'session_id': 'sess-1',
+        'num_input_tokens': 100,
+        'num_output_tokens': 50,
+        'structured_output': json.dumps({
+            'thinking': 'done',
+            'tool_calls': [{'name': 'stage_complete', 'arguments': {}}],
+        }),
+    })
+
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = AsyncMock(return_value=(
+        cli_result.encode(), b'',
+    ))
+
+    messages = [{'role': 'user', 'content': 'test prompt'}]
+    tool_schemas: list = []
+
+    with (
+        patch('asyncio.create_subprocess_exec', new_callable=AsyncMock, return_value=mock_proc),
+        patch('asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+    ):
+        await agent._call_claude_cli(messages, tool_schemas)
+
+        mock_sleep.assert_called_once_with(_CAP_HIT_COOLDOWN_SECS)
+        assert gate.before_invoke.call_count == 2

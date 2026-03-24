@@ -21,6 +21,8 @@ from fused_memory.models.reconciliation import JournalEntry
 
 logger = logging.getLogger(__name__)
 
+_CAP_HIT_COOLDOWN_SECS = 5.0
+
 CLAUDE_CLI_RESPONSE_SCHEMA = {
     'type': 'object',
     'properties': {
@@ -388,10 +390,14 @@ class AgentLoop:
             if self._usage_gate and self._usage_gate.detect_cap_hit(
                 stderr_text, stdout_text, 'claude', oauth_token=oauth_token,
             ):
-                logger.warning('Usage cap hit during CLI call, resetting session and retrying')
+                logger.warning(
+                    f'Usage cap hit during CLI call, sleeping '
+                    f'{_CAP_HIT_COOLDOWN_SECS}s before retrying',
+                )
                 # Reset session so next call starts fresh (can't --resume a capped session)
                 if is_first_call:
                     self._cli_session_id = None
+                await asyncio.sleep(_CAP_HIT_COOLDOWN_SECS)
                 continue
 
             # 4. Non-zero exit: include both stdout and stderr in error

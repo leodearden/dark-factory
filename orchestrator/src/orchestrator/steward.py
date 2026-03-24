@@ -37,6 +37,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_CAP_HIT_COOLDOWN_SECS = 5.0
+
 
 @dataclass
 class StewardMetrics:
@@ -325,13 +327,15 @@ class TaskSteward:
 
             result: AgentResult = await invoke_agent(**kwargs)
 
-            # Cap-hit: reset session (can't resume across account switch)
+            # Cap-hit: sleep, then reset session (can't resume across account switch)
             if self.usage_gate and self.usage_gate.detect_cap_hit(
                 result.stderr, result.output, 'claude', oauth_token=oauth_token,
             ):
                 logger.warning(
-                    f'Steward for task {self.task_id}: cap hit, resetting session'
+                    f'Steward for task {self.task_id}: cap hit, sleeping '
+                    f'{_CAP_HIT_COOLDOWN_SECS}s before retry',
                 )
+                await asyncio.sleep(_CAP_HIT_COOLDOWN_SECS)
                 self._session_id = None
                 # Rebuild full initial prompt (context lost)
                 pending_dicts = [

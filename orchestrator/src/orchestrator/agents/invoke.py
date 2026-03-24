@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_CAP_HIT_COOLDOWN_SECS = 5.0
+
 # Approximate cost per million tokens by model (for backends without native cost reporting)
 _MODEL_COSTS: dict[str, dict[str, float]] = {
     # OpenAI models: {input_per_1m, output_per_1m}
@@ -67,9 +69,16 @@ async def invoke_with_cap_retry(
         ):
             acct_name = usage_gate.active_account_name
             if acct_name:
-                logger.warning(f'{label}: cap hit, switching to account {acct_name}')
+                logger.warning(
+                    f'{label}: cap hit, sleeping {_CAP_HIT_COOLDOWN_SECS}s '
+                    f'then switching to account {acct_name}',
+                )
             else:
-                logger.warning(f'{label}: cap hit on all accounts, waiting for reset')
+                logger.warning(
+                    f'{label}: cap hit on all accounts, sleeping '
+                    f'{_CAP_HIT_COOLDOWN_SECS}s then waiting for reset',
+                )
+            await asyncio.sleep(_CAP_HIT_COOLDOWN_SECS)
             continue
 
         if usage_gate:

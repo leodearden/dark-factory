@@ -162,6 +162,71 @@ class TestStewardSessionPersistence:
 
 
 # ---------------------------------------------------------------------------
+# Cap-Hit Backoff
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardCapHitBackoff:
+
+    async def test_sleeps_before_prompt_rebuild_on_cap_hit(self, steward, mock_briefing):
+        """Steward sleeps _CAP_HIT_COOLDOWN_SECS before retrying on cap hit."""
+        from orchestrator.steward import _CAP_HIT_COOLDOWN_SECS
+
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+
+        call_count = 0
+
+        def detect_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return call_count == 1  # cap hit on first call only
+
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='token-a')
+        gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
+        gate.on_agent_complete = MagicMock()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
+            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+        ):
+            mock_invoke.return_value = _make_result(session_id='sess-new')
+            await steward._handle_escalation(esc)
+
+            mock_sleep.assert_called_once_with(_CAP_HIT_COOLDOWN_SECS)
+            assert mock_invoke.call_count == 2
+            # Session was reset and recaptured
+            assert steward._session_id == 'sess-new'
+
+    async def test_no_sleep_when_no_cap_hit(self, steward):
+        """No sleep when invocation succeeds without cap hit."""
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='token-a')
+        gate.detect_cap_hit = MagicMock(return_value=False)
+        gate.on_agent_complete = MagicMock()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
+            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+        ):
+            mock_invoke.return_value = _make_result()
+            await steward._handle_escalation(esc)
+
+            mock_sleep.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Retry Logic
 # ---------------------------------------------------------------------------
 
