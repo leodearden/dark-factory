@@ -779,10 +779,10 @@ class MemoryService:
         valid_at = getattr(e, 'valid_at', None)
         invalid_at = getattr(e, 'invalid_at', None)
         temporal = None
-        if valid_at or invalid_at:
+        if valid_at is not None or invalid_at is not None:
             temporal = {
-                'valid_at': str(valid_at) if valid_at else None,
-                'invalid_at': str(invalid_at) if invalid_at else None,
+                'valid_at': str(valid_at) if valid_at is not None else None,
+                'invalid_at': str(invalid_at) if invalid_at is not None else None,
             }
 
         # Extract entity names from source/target nodes
