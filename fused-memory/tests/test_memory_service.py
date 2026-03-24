@@ -741,6 +741,106 @@ class TestGetEntityNameEntitiesProvenance:
         assert e['provenance'] == []
 
 
+class TestBuildEdgeDict:
+    """Tests for the _build_edge_dict helper method."""
+
+    def test_full_edge_returns_all_six_keys(self, service):
+        """A fully populated edge returns all six expected keys with correct values."""
+        from tests.conftest import MockEdge, MockNode
+
+        edge = MockEdge(
+            fact='Auth service depends on Redis',
+            uuid='edge-uuid-1',
+            name='DEPENDS_ON',
+            source_node=MockNode(name='Auth Service'),
+            target_node=MockNode(name='Redis'),
+            episodes=['ep-1', 'ep-2'],
+            valid_at='2026-01-01T00:00:00+00:00',
+            invalid_at='2026-06-01T00:00:00+00:00',
+        )
+        d = service._build_edge_dict(edge)
+
+        assert set(d.keys()) == {'uuid', 'fact', 'name', 'temporal', 'entities', 'provenance'}
+        assert d['uuid'] == 'edge-uuid-1'
+        assert d['fact'] == 'Auth service depends on Redis'
+        assert d['name'] == 'DEPENDS_ON'
+        assert d['temporal'] == {
+            'valid_at': '2026-01-01T00:00:00+00:00',
+            'invalid_at': '2026-06-01T00:00:00+00:00',
+        }
+        assert d['entities'] == ['Auth Service', 'Redis']
+        assert d['provenance'] == ['ep-1', 'ep-2']
+
+    def test_minimal_edge_returns_safe_defaults(self, service):
+        """An edge with no temporal/nodes/episodes returns temporal=None, entities=[], provenance=[]."""
+        from tests.conftest import MockEdge
+
+        edge = MockEdge(fact='bare fact', uuid='bare-uuid')
+        d = service._build_edge_dict(edge)
+
+        assert d['temporal'] is None
+        assert d['entities'] == []
+        assert d['provenance'] == []
+
+    def test_edge_with_only_valid_at_returns_temporal_dict(self, service):
+        """Edge with only valid_at set returns temporal dict with valid_at set and invalid_at=None."""
+        from tests.conftest import MockEdge
+
+        edge = MockEdge(fact='fact', uuid='u1', valid_at='2026-01-01T00:00:00+00:00')
+        d = service._build_edge_dict(edge)
+
+        assert d['temporal'] is not None
+        assert d['temporal']['valid_at'] == '2026-01-01T00:00:00+00:00'
+        assert d['temporal']['invalid_at'] is None
+
+    def test_edge_with_only_source_node_returns_single_entity(self, service):
+        """Edge with only source_node and no target_node returns single-element entities list."""
+        from tests.conftest import MockEdge, MockNode
+
+        edge = MockEdge(
+            fact='fact',
+            uuid='u2',
+            source_node=MockNode(name='SourceEntity'),
+        )
+        d = service._build_edge_dict(edge)
+
+        assert d['entities'] == ['SourceEntity']
+
+    def test_edge_with_no_uuid_attr_returns_none(self, service):
+        """Edge object without a uuid attribute returns uuid=None."""
+
+        class EdgeWithoutUuid:
+            fact = 'some fact'
+            name = None
+            source_node = None
+            target_node = None
+            episodes = []
+            valid_at = None
+            invalid_at = None
+
+        d = service._build_edge_dict(EdgeWithoutUuid())
+        assert d['uuid'] is None
+
+    def test_edge_without_fact_attr_falls_back_to_str(self, service):
+        """Edge object without fact attr uses str(edge) as the fact value."""
+
+        class EdgeWithoutFact:
+            uuid = 'u3'
+            name = None
+            source_node = None
+            target_node = None
+            episodes = []
+            valid_at = None
+            invalid_at = None
+
+            def __str__(self):
+                return 'EdgeWithoutFact-str-representation'
+
+        edge = EdgeWithoutFact()
+        d = service._build_edge_dict(edge)
+        assert d['fact'] == 'EdgeWithoutFact-str-representation'
+
+
 class TestGetEntityValidOnly:
     """Tests that get_entity() valid_only parameter filters invalidated edges."""
 
