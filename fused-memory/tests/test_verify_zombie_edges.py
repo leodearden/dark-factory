@@ -2,11 +2,15 @@
 ZombieEdgeVerifier, and run_verify_zombie_edges entrypoint."""
 from __future__ import annotations
 
+import contextlib
+import logging
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.maintenance.verify_zombie_edges import VerifyResult, run_verify_zombie_edges
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrored from test_cleanup_stale_edges.py)
@@ -535,3 +539,83 @@ class TestRunVerifyZombieEdgesEnvVarRestore:
                 os.environ.pop('CONFIG_PATH', None)
             else:
                 os.environ['CONFIG_PATH'] = original
+
+    @pytest.mark.asyncio
+    async def test_restores_config_path_when_close_raises(self):
+        """CONFIG_PATH is restored even when service.close() raises in the finally block."""
+        original = os.environ.get('CONFIG_PATH')
+        try:
+            mock_service = AsyncMock()
+            mock_service.graphiti = MagicMock()
+            mock_service.close = AsyncMock(side_effect=RuntimeError('close error'))
+
+            mock_result = VerifyResult()
+
+            with (
+                patch('fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig'),
+                patch(
+                    'fused_memory.maintenance.verify_zombie_edges.MemoryService',
+                    return_value=mock_service,
+                ),
+                patch('fused_memory.maintenance.verify_zombie_edges.ZombieEdgeVerifier') as mock_verifier_cls,
+            ):
+                mock_verifier = MagicMock()
+                mock_verifier.cleanup = AsyncMock(return_value=mock_result)
+                mock_verifier_cls.return_value = mock_verifier
+
+                with contextlib.suppress(RuntimeError):
+                    await run_verify_zombie_edges(uuids=['test-uuid'], config_path='test.yaml')
+
+            # CONFIG_PATH must be restored regardless of close() raising
+            assert os.environ.get('CONFIG_PATH') == original
+        finally:
+            # Safety net: ensure env var is cleaned up even if the test itself errors
+            if original is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = original
+
+
+# ---------------------------------------------------------------------------
+# step-5 (task-146): run_verify_zombie_edges logs WARNING when close() raises
+# ---------------------------------------------------------------------------
+
+
+class TestRunVerifyZombieEdgesCloseWarning:
+    """run_verify_zombie_edges() logs a WARNING when service.close() raises in the finally block."""
+
+    @pytest.mark.asyncio
+    async def test_logs_warning_when_close_raises(self, caplog):
+        """A WARNING containing the function name is logged when service.close() raises."""
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+        mock_service.close = AsyncMock(side_effect=RuntimeError('close error'))
+
+        mock_result = VerifyResult()
+
+        with (
+            patch('fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig'),
+            patch(
+                'fused_memory.maintenance.verify_zombie_edges.MemoryService',
+                return_value=mock_service,
+            ),
+            patch('fused_memory.maintenance.verify_zombie_edges.ZombieEdgeVerifier') as mock_verifier_cls,
+        ):
+            mock_verifier = MagicMock()
+            mock_verifier.cleanup = AsyncMock(return_value=mock_result)
+            mock_verifier_cls.return_value = mock_verifier
+
+            with (
+                caplog.at_level(
+                    logging.WARNING,
+                    logger='fused_memory.maintenance.verify_zombie_edges',
+                ),
+                contextlib.suppress(RuntimeError),
+            ):
+                await run_verify_zombie_edges(uuids=['test-uuid'])
+
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            'Error closing service during run_verify_zombie_edges cleanup' in m
+            for m in warning_messages
+        ), f'Expected warning about close() failure, got: {warning_messages}'

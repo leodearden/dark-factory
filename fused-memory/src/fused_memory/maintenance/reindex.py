@@ -195,6 +195,7 @@ async def run_reindex(
         return result
     finally:
         if service is not None:
+            # Catch close() errors so CONFIG_PATH restoration below always runs.
             try:
                 await service.close()
             except Exception:
