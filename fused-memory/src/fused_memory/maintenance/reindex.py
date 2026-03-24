@@ -152,32 +152,34 @@ async def run_reindex(
     """
     import os
 
-    if config_path is not None:
-        os.environ['CONFIG_PATH'] = config_path
-
-    config = FusedMemoryConfig()
-    service = MemoryService(config)
-
-    # Build a dedicated embedder for re-embedding stale content.
-    emb_cfg = config.embedder
-    openai_provider = emb_cfg.providers.openai
-    openai_api_key: str | None = None
-    if openai_provider is not None:
-        openai_api_key = openai_provider.api_key
-    embedder_config = OpenAIEmbedderConfig(
-        api_key=openai_api_key,
-        embedding_model=emb_cfg.model,
-        embedding_dim=emb_cfg.dimensions,
-    )
-    embedder = OpenAIEmbedder(config=embedder_config)
-
-    manager = ReindexManager(
-        backend=service.graphiti,
-        embedder=embedder,
-        expected_dim=config.embedder.dimensions,
-    )
-
+    old_config_path = os.environ.get('CONFIG_PATH')
+    service = None
     try:
+        if config_path is not None:
+            os.environ['CONFIG_PATH'] = config_path
+
+        config = FusedMemoryConfig()
+        service = MemoryService(config)
+
+        # Build a dedicated embedder for re-embedding stale content.
+        emb_cfg = config.embedder
+        openai_provider = emb_cfg.providers.openai
+        openai_api_key: str | None = None
+        if openai_provider is not None:
+            openai_api_key = openai_provider.api_key
+        embedder_config = OpenAIEmbedderConfig(
+            api_key=openai_api_key,
+            embedding_model=emb_cfg.model,
+            embedding_dim=emb_cfg.dimensions,
+        )
+        embedder = OpenAIEmbedder(config=embedder_config)
+
+        manager = ReindexManager(
+            backend=service.graphiti,
+            embedder=embedder,
+            expected_dim=config.embedder.dimensions,
+        )
+
         await service.initialize()
         result = await manager.reindex_and_replay(
             service.durable_queue,
@@ -192,7 +194,16 @@ async def run_reindex(
         )
         return result
     finally:
-        await service.close()
+        if service is not None:
+            try:
+                await service.close()
+            except Exception:
+                logger.warning('Error closing service during run_reindex cleanup', exc_info=True)
+        if config_path is not None:
+            if old_config_path is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = old_config_path
 
 
 if __name__ == '__main__':
