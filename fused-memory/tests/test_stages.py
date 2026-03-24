@@ -344,7 +344,7 @@ class TestProjectIdValidation:
         from fused_memory.models.reconciliation import StageId, Watermark
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         # project_id defaults to '' — should raise before executing
-        watermark = Watermark(project_id='')
+        watermark = Watermark()
         with pytest.raises(ValueError, match='project_id'):
             await stage.run(
                 events=[],
@@ -415,14 +415,14 @@ class TestProjectIdValidation:
             )
 
     @pytest.mark.asyncio
-    async def test_run_allows_empty_watermark_project_id(self, mock_deps):
+    async def test_run_allows_none_watermark_project_id(self, mock_deps):
         from unittest.mock import patch
 
         from fused_memory.models.reconciliation import StageId, Watermark
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
-        # Empty watermark project_id skips the mismatch check
-        watermark = Watermark(project_id='')
+        # None watermark project_id skips the mismatch check
+        watermark = Watermark()
 
         async def fake_assemble_payload(events, wm, prior_reports):
             return '## Base Payload\nsome context'
@@ -438,7 +438,7 @@ class TestProjectIdValidation:
                 new=fake_run_stage_via_cli,
             ),
         ):
-            # Should not raise — empty watermark project_id bypasses mismatch check
+            # Should not raise — None watermark project_id bypasses mismatch check
             await stage.run(
                 events=[],
                 watermark=watermark,
