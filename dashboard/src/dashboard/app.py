@@ -15,6 +15,12 @@ from fastapi.templating import Jinja2Templates
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data.orchestrator import discover_orchestrators
+from dashboard.data.performance import (
+    get_completion_paths,
+    get_escalation_rates,
+    get_loop_histograms,
+    get_time_centiles,
+)
 from dashboard.data.reconciliation import (
     get_buffer_stats,
     get_burst_state,
@@ -88,6 +94,23 @@ def format_trigger(value: str | None) -> str:
 
 
 templates.env.filters['format_trigger'] = format_trigger
+
+
+def format_duration_ms(value: int | float | None) -> str:
+    """Format a duration in milliseconds to a human-friendly string."""
+    if value is None or value <= 0:
+        return '-'
+    seconds = value / 1000
+    if seconds < 60:
+        return f'{seconds:.0f}s'
+    minutes = seconds / 60
+    if minutes < 60:
+        return f'{minutes:.0f}m'
+    hours = minutes / 60
+    return f'{hours:.1f}h'
+
+
+templates.env.filters['format_duration_ms'] = format_duration_ms
 
 
 @asynccontextmanager
@@ -208,4 +231,28 @@ async def partials_orchestrators(request: Request):
     orchestrators = await asyncio.to_thread(discover_orchestrators, config)
     return templates.TemplateResponse(
         request, 'partials/orchestrators.html', context={'orchestrators': orchestrators}
+    )
+
+
+@app.get('/partials/performance')
+async def partials_performance(request: Request):
+    """Render the performance panel partial (htmx fragment)."""
+    config = request.app.state.config
+    db = config.runs_db
+    esc_dir = config.escalations_dir
+
+    paths, escalations, histograms, ttc = await asyncio.gather(
+        get_completion_paths(db, esc_dir),
+        get_escalation_rates(db, esc_dir),
+        get_loop_histograms(db),
+        get_time_centiles(db),
+    )
+    return templates.TemplateResponse(
+        request, 'partials/performance.html',
+        context={
+            'paths': paths,
+            'escalations': escalations,
+            'histograms': histograms,
+            'ttc': ttc,
+        },
     )

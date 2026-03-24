@@ -8,6 +8,7 @@ import logging
 import os
 import tempfile
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 from escalation.models import Escalation
@@ -110,7 +111,8 @@ class EscalationQueue:
         return results
 
     def resolve(
-        self, escalation_id: str, resolution: str, dismiss: bool = False
+        self, escalation_id: str, resolution: str, dismiss: bool = False,
+        *, resolved_by: str | None = None, resolution_turns: int | None = None,
     ) -> Escalation | None:
         """Update an escalation's status to resolved or dismissed."""
         esc = self.get(escalation_id)
@@ -119,6 +121,11 @@ class EscalationQueue:
 
         esc.status = 'dismissed' if dismiss else 'resolved'
         esc.resolution = resolution
+        esc.resolved_at = datetime.now(UTC).isoformat()
+        if resolved_by is not None:
+            esc.resolved_by = resolved_by
+        if resolution_turns is not None:
+            esc.resolution_turns = resolution_turns
 
         path = self.queue_dir / f'{escalation_id}.json'
         fd, tmp_path = tempfile.mkstemp(
@@ -143,6 +150,21 @@ class EscalationQueue:
 
         return esc
 
+    def _rewrite(self, escalation_id: str, escalation: Escalation) -> None:
+        """Atomically rewrite an escalation's JSON file."""
+        path = self.queue_dir / f'{escalation_id}.json'
+        fd, tmp_path = tempfile.mkstemp(
+            suffix='.tmp', prefix=escalation_id, dir=str(self.queue_dir)
+        )
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(escalation.to_json())
+            os.rename(tmp_path, str(path))
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
+
     def dismiss_all_pending(self, resolution: str) -> int:
         """Dismiss all pending escalations with the given resolution message.
 
@@ -153,7 +175,7 @@ class EscalationQueue:
         count = 0
         for esc in pending:
             try:
-                if self.resolve(esc.id, resolution, dismiss=True) is not None:
+                if self.resolve(esc.id, resolution, dismiss=True, resolved_by='auto-dismissed') is not None:
                     count += 1
             except Exception as e:
                 logger.warning(f'Failed to dismiss escalation {esc.id}: {e}')

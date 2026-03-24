@@ -57,7 +57,7 @@ def _fake_reviews(suggestions=None):
 def _make_escalation(**overrides):
     from escalation.models import Escalation
 
-    defaults = dict(
+    defaults: dict = dict(
         id='esc-42-0',
         task_id='42',
         agent_role='orchestrator',
@@ -67,7 +67,7 @@ def _make_escalation(**overrides):
         detail='[]',
     )
     defaults.update(overrides)
-    return Escalation(**defaults)
+    return Escalation(**defaults)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

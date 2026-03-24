@@ -43,8 +43,12 @@ class TaskReport:
     cost_usd: float = 0.0
     duration_ms: int = 0
     agent_invocations: int = 0
+    execute_iterations: int = 0
+    verify_attempts: int = 0
+    review_cycles: int = 0
     steward_cost_usd: float = 0.0
     steward_invocations: int = 0
+    completed_at: str = ''
 
 
 @dataclass
@@ -223,6 +227,21 @@ class Harness:
         finally:
             # 4. Shutdown
             self.report.completed_at = datetime.now(UTC).isoformat()
+
+            # Persist run metrics to SQLite
+            try:
+                from orchestrator.run_store import RunStore
+
+                db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
+                store = RunStore(db_path)
+                store.save_run(
+                    self.report,
+                    self.config.fused_memory.project_id,
+                    str(prd_path),
+                )
+            except Exception as e:
+                logger.warning(f'Failed to persist run metrics: {e}')
+
             if self.usage_gate:
                 if self.usage_gate.total_pause_secs > 0:
                     self.report.paused_for_cap = True
@@ -553,8 +572,12 @@ Output JSON matching the schema. Every task must appear in the output.
                 cost_usd=workflow.metrics.total_cost_usd,
                 duration_ms=workflow.metrics.total_duration_ms,
                 agent_invocations=workflow.metrics.agent_invocations,
+                execute_iterations=workflow.metrics.execute_iterations,
+                verify_attempts=workflow.metrics.verify_attempts,
+                review_cycles=workflow.metrics.review_cycles,
                 steward_cost_usd=steward_cost,
                 steward_invocations=steward_invocations,
+                completed_at=datetime.now(UTC).isoformat(),
             )
         except Exception as e:
             logger.exception(f'Workflow slot error for task {assignment.task_id}: {e}')
