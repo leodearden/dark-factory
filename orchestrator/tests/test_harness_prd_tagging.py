@@ -37,6 +37,48 @@ def _task(tid: str, *, prd: str | None = None) -> dict:
 
 
 @pytest.mark.asyncio
+async def test_populate_tasks_tolerates_already_populated(harness, monkeypatch):
+    """parse_prd returning 'already contains' is a no-op, not a crash."""
+    async def mock_mcp_call(url, method, payload, **kwargs):
+        return {
+            'result': {
+                'content': [{
+                    'type': 'text',
+                    'text': "Error: Tag 'master' already contains 99 tasks.",
+                    'isError': True,
+                }],
+            },
+        }
+
+    monkeypatch.setattr('orchestrator.harness.mcp_call', mock_mcp_call)
+    harness.mcp = type('FakeMcp', (), {'url': 'http://localhost:9999'})()
+
+    # Should not raise
+    await harness._populate_tasks(Path('/fake/prd.md'))
+
+
+@pytest.mark.asyncio
+async def test_populate_tasks_raises_on_unexpected_error(harness, monkeypatch):
+    """parse_prd errors other than 'already contains' propagate."""
+    async def mock_mcp_call(url, method, payload, **kwargs):
+        return {
+            'result': {
+                'content': [{
+                    'type': 'text',
+                    'text': 'Error: Model rate limited',
+                    'isError': True,
+                }],
+            },
+        }
+
+    monkeypatch.setattr('orchestrator.harness.mcp_call', mock_mcp_call)
+    harness.mcp = type('FakeMcp', (), {'url': 'http://localhost:9999'})()
+
+    with pytest.raises(RuntimeError, match='parse_prd error'):
+        await harness._populate_tasks(Path('/fake/prd.md'))
+
+
+@pytest.mark.asyncio
 async def test_tags_new_tasks_with_prd(harness, tmp_path):
     """New tasks get PRD metadata; already-tagged tasks are skipped."""
     prd = tmp_path / 'feature.md'

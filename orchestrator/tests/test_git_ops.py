@@ -161,6 +161,77 @@ class TestWorktreeLifecycle:
 
 
 @pytest.mark.asyncio
+class TestCommitTaskStatuses:
+    async def test_commits_changed_tasks_json(self, git_ops: GitOps):
+        """commit_task_statuses commits only .taskmaster/tasks/tasks.json."""
+        tasks_dir = git_ops.project_root / '.taskmaster' / 'tasks'
+        tasks_dir.mkdir(parents=True)
+        tasks_file = tasks_dir / 'tasks.json'
+        tasks_file.write_text('{"tasks": []}')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Add tasks.json'], cwd=git_ops.project_root)
+
+        # Modify tasks.json in working tree (simulates set_task_status)
+        tasks_file.write_text('{"tasks": [{"id": 1, "status": "done"}]}')
+
+        sha = await git_ops.commit_task_statuses()
+        assert sha is not None
+
+        # Verify the commit contains only tasks.json
+        rc, files, _ = await _run(
+            ['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', sha],
+            cwd=git_ops.project_root,
+        )
+        assert '.taskmaster/tasks/tasks.json' in files
+        assert files.strip() == '.taskmaster/tasks/tasks.json'
+
+    async def test_noop_when_unchanged(self, git_ops: GitOps):
+        """Returns None when tasks.json has no changes."""
+        tasks_dir = git_ops.project_root / '.taskmaster' / 'tasks'
+        tasks_dir.mkdir(parents=True)
+        (tasks_dir / 'tasks.json').write_text('{"tasks": []}')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Add tasks.json'], cwd=git_ops.project_root)
+
+        sha = await git_ops.commit_task_statuses()
+        assert sha is None
+
+    async def test_noop_when_no_tasks_file(self, git_ops: GitOps):
+        """Returns None when tasks.json doesn't exist."""
+        sha = await git_ops.commit_task_statuses()
+        assert sha is None
+
+    async def test_does_not_stage_other_files(self, git_ops: GitOps):
+        """Other dirty files in the working tree are not committed."""
+        tasks_dir = git_ops.project_root / '.taskmaster' / 'tasks'
+        tasks_dir.mkdir(parents=True)
+        (tasks_dir / 'tasks.json').write_text('{"tasks": []}')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Add tasks.json'], cwd=git_ops.project_root)
+
+        # Dirty both tasks.json and another file
+        (tasks_dir / 'tasks.json').write_text('{"tasks": [{"id": 1}]}')
+        (git_ops.project_root / 'unrelated.py').write_text('x = 1\n')
+
+        sha = await git_ops.commit_task_statuses()
+        assert sha is not None
+
+        # Only tasks.json in the commit
+        _, files, _ = await _run(
+            ['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', sha],
+            cwd=git_ops.project_root,
+        )
+        assert 'unrelated.py' not in files
+
+        # unrelated.py is still untracked
+        _, status, _ = await _run(
+            ['git', 'status', '--porcelain', '--', 'unrelated.py'],
+            cwd=git_ops.project_root,
+        )
+        assert 'unrelated.py' in status
+
+
+@pytest.mark.asyncio
 class TestMergeConflicts:
     async def test_conflict_detection(self, git_ops: GitOps):
         # Create BOTH branches before merging either (both fork from same main)

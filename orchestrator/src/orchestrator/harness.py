@@ -213,6 +213,13 @@ class Harness:
             )
             self.report.total_cost_usd = sum(r.cost_usd for r in task_reports)
 
+            # Commit accumulated task status changes so they survive
+            # working-tree resets and are visible to future merge worktrees.
+            if self.report.completed > 0:
+                sha = await self.git_ops.commit_task_statuses()
+                if sha:
+                    logger.info(f'Committed task statuses: {sha[:8]}')
+
         finally:
             # 4. Shutdown
             self.report.completed_at = datetime.now(UTC).isoformat()
@@ -244,7 +251,14 @@ class Harness:
             )
             content = result.get('result', {}).get('content', [{}])
             text = content[0].get('text', '') if content else ''
+            if content and content[0].get('isError'):
+                raise RuntimeError(f'parse_prd error: {text}')
             logger.info(f'PRD parsed: {text[:200]}')
+        except RuntimeError as e:
+            if 'already contains' in str(e):
+                logger.info('Task tree already populated — skipping parse_prd')
+            else:
+                raise
         except Exception as e:
             raise RuntimeError(f'Failed to parse PRD: {e}') from e
 

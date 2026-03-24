@@ -230,6 +230,38 @@ class GitOps:
         else:
             logger.info(f'Cleaned up merge worktree {merge_wt}')
 
+    async def commit_task_statuses(self) -> str | None:
+        """Commit task status changes in the project root. Returns sha or None.
+
+        Only stages ``.taskmaster/tasks/tasks.json`` — no other files are
+        touched.  Safe to call when nothing has changed (returns None).
+        """
+        tasks_file = '.taskmaster/tasks/tasks.json'
+        rc, _, _ = await _run(
+            ['git', 'diff', '--quiet', '--', tasks_file],
+            cwd=self.project_root,
+        )
+        if rc == 0:
+            return None  # no changes
+
+        await _run(
+            ['git', 'add', '--', tasks_file],
+            cwd=self.project_root,
+        )
+        rc, _, err = await _run(
+            ['git', 'commit', '-m',
+             'chore: sync task statuses with orchestrator run'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            logger.warning(f'Failed to commit task statuses: {err}')
+            return None
+
+        _, sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=self.project_root,
+        )
+        return sha
+
     async def advance_main(self, merge_sha: str) -> bool:
         """Advance main branch ref to *merge_sha* atomically.
 
