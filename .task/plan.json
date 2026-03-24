@@ -1,117 +1,115 @@
 {
-  "task_id": "146",
-  "title": "Align defensive service.close() try/except across all maintenance entrypoints",
+  "task_id": "149",
+  "title": "Polish task 145: consolidate EdgeWithNoneEpisodes, add provenance assertions and docstring",
   "files": [
-    "fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py",
-    "fused-memory/src/fused_memory/maintenance/verify_zombie_edges.py",
-    "fused-memory/src/fused_memory/maintenance/reindex.py",
-    "fused-memory/tests/test_cleanup_stale_edges.py",
-    "fused-memory/tests/test_verify_zombie_edges.py",
-    "fused-memory/tests/test_reindex.py"
+    "fused-memory/tests/conftest.py",
+    "fused-memory/tests/test_memory_service.py",
+    "fused-memory/src/fused_memory/services/memory_service.py"
   ],
   "modules": [
-    "fused-memory/src/fused_memory/maintenance",
-    "fused-memory/tests"
+    "fused-memory/tests",
+    "fused-memory/src/fused_memory/services"
   ],
-  "analysis": "The three maintenance entrypoints (run_reindex, run_cleanup, run_verify_zombie_edges) share an identical finally-block pattern: close the MemoryService, then restore CONFIG_PATH. However, only reindex.py (lines 198-201) wraps service.close() in try/except to prevent a close() failure from blocking CONFIG_PATH restoration. cleanup_stale_edges.py (line 134) and verify_zombie_edges.py (line 174) have bare `await service.close()` calls \u2014 if close() raises, the CONFIG_PATH restoration code below it is skipped, violating the env-var invariant.\n\nThe fix is straightforward: wrap the bare service.close() calls in the same try/except pattern used in reindex.py, and add a comment explaining the purpose across all three files. Existing tests verify that service.close() is called (test_closes_service_on_success, test_closes_service_on_error), but no tests verify that CONFIG_PATH is still restored when close() itself raises. New tests must cover this critical behavior for cleanup_stale_edges.py and verify_zombie_edges.py, and also verify the new log warning message is emitted.\n\nThe existing test for test_closes_service_on_success in TestRunCleanup (line 341) asserts `mock_service.close.assert_awaited_once()`. After our change, close() is still called but now wrapped in try/except. The assertion remains valid because AsyncMock.close will be awaited inside the try block. The test_closes_service_on_error tests also remain valid \u2014 they test that close() runs even when the main operation raises, which is orthogonal to what happens when close() itself raises.",
+  "analysis": "Four small, independent polish items from the task 145 review. All surgical, low-risk changes.\n\n1. **EdgeWithNoneEpisodes → conftest.py** (test_memory_service.py:962-968): The inline class at line 962 contradicts the fixture-consolidation pattern established by task 145 (which moved EdgeWithoutUuid to conftest.py). The conftest pattern uses @dataclass with typed fields and defaults. Tests import locally via `from tests.conftest import ...`. The new dataclass needs `episodes: list[str] | None = None` to model the 'attribute present but None' case.\n\n2. **Docstring gap for provenance** (memory_service.py:769-827): _build_edge_dict documents uuid (lines 780-786) and temporal (lines 788-795) key semantics but omits provenance, despite the comment at line 816 saying 'see docstring'. The docstring's Key semantics section should be extended with a provenance entry, and the inline comment should be made self-contained.\n\n3. **Missing provenance assertion in unit test** (test_memory_service.py:865-870): test_edge_with_no_uuid_attr_returns_none uses EdgeWithoutUuid which has `episodes: list[str] = field(default_factory=list)`, producing `provenance == []`. Test only asserts `d['uuid'] is None`. Adding `assert d['provenance'] == []` catches regressions in the episodes→provenance mapping.\n\n4. **Missing provenance assertion in search integration test** (test_memory_service.py:478-496): test_none_uuid_edge_falls_back_to_index_in_search also uses EdgeWithoutUuid. MemoryResult has a `provenance: list[str]` field (models/memory.py:35). Test asserts `results[0].id == '0'` but should also verify `results[0].provenance == []`.\n\nAll items are additive (new assertions, docstring additions, fixture consolidation). TDD approach: write new assertions first (they pass immediately since behavior already exists), then do the refactoring (move class, update docstring).",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing test in test_cleanup_stale_edges.py: add test_restores_config_path_when_close_raises to TestRunCleanupEnvVarRestore. Save original CONFIG_PATH, create mock_service with close=AsyncMock(side_effect=RuntimeError('close error')), patch FusedMemoryConfig, MemoryService (returns mock_service), and CleanupManager (returns mock with successful cleanup). Call run_cleanup(config_path='test.yaml'). Assert os.environ.get('CONFIG_PATH') == original after the call completes (the close error should not propagate since run_cleanup returns a result from the try block). Wrap in try/finally for test safety. This WILL FAIL because bare `await service.close()` at line 134 raises and skips CONFIG_PATH restoration.",
+      "description": "Add provenance assertion to test_edge_with_no_uuid_attr_returns_none (test_memory_service.py:870). After the existing `assert d['uuid'] is None`, add: `assert d['provenance'] == [], f\"provenance should be [] when edge has empty episodes, got {d['provenance']!r}\"`. This should pass immediately — EdgeWithoutUuid has episodes=[] which _build_edge_dict maps to provenance=[].",
       "status": "done",
-      "commit": "7980b7e"
+      "commit": "83fefba"
     },
     {
       "id": "step-2",
       "type": "test",
-      "description": "Write failing test in test_cleanup_stale_edges.py: add new class TestRunCleanupCloseWarning with test_logs_warning_when_close_raises. Create mock_service with close=AsyncMock(side_effect=RuntimeError('close error')), patch all constructors to succeed, use caplog at WARNING level for 'fused_memory.maintenance.cleanup_stale_edges' logger, call run_cleanup(). Assert a WARNING record containing 'Error closing service during run_cleanup cleanup' was logged. This WILL FAIL because the bare await has no try/except and no warning logging.",
+      "description": "Add provenance assertion to test_none_uuid_edge_falls_back_to_index_in_search (test_memory_service.py:~496). After the existing `assert results[0].id == '0'` block, add: `assert results[0].provenance == [], f\"provenance should be [] when edge has empty episodes, got {results[0].provenance!r}\"`. This should pass immediately — the MemoryResult constructed from EdgeWithoutUuid carries provenance=[].",
       "status": "done",
-      "commit": "332ae1c"
+      "commit": "83fefba"
     },
     {
       "id": "step-3",
       "type": "impl",
-      "description": "In cleanup_stale_edges.py run_cleanup() finally block (lines 132-139), replace bare `await service.close()` at line 134 with: `# Catch close() errors so CONFIG_PATH restoration below always runs.\\ntry:\\n    await service.close()\\nexcept Exception:\\n    logger.warning('Error closing service during run_cleanup cleanup', exc_info=True)`. Keep the CONFIG_PATH restoration logic unchanged below. This makes step-1 and step-2 tests pass while preserving all existing test assertions.",
+      "description": "Run both modified tests (test_edge_with_no_uuid_attr_returns_none and test_none_uuid_edge_falls_back_to_index_in_search) to verify the new assertions pass against existing code. No code changes — this validates the assertions are correct.",
       "status": "done",
-      "commit": "21e24e1"
+      "commit": "83fefba"
     },
     {
       "id": "step-4",
-      "type": "test",
-      "description": "Write failing test in test_verify_zombie_edges.py: add test_restores_config_path_when_close_raises to TestRunVerifyZombieEdgesEnvVarRestore. Save original CONFIG_PATH, create mock_service with close=AsyncMock(side_effect=RuntimeError('close error')), patch FusedMemoryConfig, MemoryService (returns mock_service), and ZombieEdgeVerifier (returns mock with successful cleanup). Call run_verify_zombie_edges(uuids=['test-uuid'], config_path='test.yaml'). Assert CONFIG_PATH is restored. This WILL FAIL because bare `await service.close()` at line 174 raises and skips restoration.",
+      "type": "impl",
+      "description": "Add EdgeWithNoneEpisodes dataclass to conftest.py. Place it after EdgeWithoutUuid (after line 54). Fields: uuid: str = 'u-ep-none', fact: str = 'fact with none episodes', name: str | None = None, source_node: MockNode | None = None, target_node: MockNode | None = None, episodes: list[str] | None = None, valid_at: str | None = None, invalid_at: str | None = None. Docstring: 'Simulates a Graphiti edge where the episodes attribute is present but None. Tests the is-not-None semantic: None episodes must produce empty provenance, same as a missing episodes attribute.'",
       "status": "done",
-      "commit": "4b12131"
+      "commit": "016806e"
     },
     {
       "id": "step-5",
-      "type": "test",
-      "description": "Write failing test in test_verify_zombie_edges.py: add new class TestRunVerifyZombieEdgesCloseWarning with test_logs_warning_when_close_raises. Create mock_service with close=AsyncMock(side_effect=RuntimeError('close error')), patch all constructors, use caplog at WARNING level, call run_verify_zombie_edges(uuids=['test-uuid']). Assert WARNING containing 'Error closing service during run_verify_zombie_edges cleanup' was logged. This WILL FAIL because the bare await has no try/except.",
+      "type": "impl",
+      "description": "Replace inline EdgeWithNoneEpisodes class in test_none_episodes_attr_produces_empty_provenance (test_memory_service.py:962-968) with an import: `from tests.conftest import EdgeWithNoneEpisodes`. Remove the 7-line inline class definition. Update `service._build_edge_dict(EdgeWithNoneEpisodes())` call — no change needed since dataclass defaults match the inline class exactly.",
       "status": "done",
-      "commit": "7c83651"
+      "commit": "016806e"
     },
     {
       "id": "step-6",
-      "type": "impl",
-      "description": "In verify_zombie_edges.py run_verify_zombie_edges() finally block (lines 172-179), replace bare `await service.close()` at line 174 with: `# Catch close() errors so CONFIG_PATH restoration below always runs.\\ntry:\\n    await service.close()\\nexcept Exception:\\n    logger.warning('Error closing service during run_verify_zombie_edges cleanup', exc_info=True)`. Keep CONFIG_PATH restoration unchanged. This makes step-4 and step-5 tests pass.",
+      "type": "test",
+      "description": "Run test_none_episodes_attr_produces_empty_provenance to confirm the refactored import from conftest works identically to the inline class.",
       "status": "done",
-      "commit": "05b1393"
+      "commit": "016806e"
     },
     {
       "id": "step-7",
       "type": "impl",
-      "description": "In reindex.py run_reindex() finally block (line 197), add the inline comment `# Catch close() errors so CONFIG_PATH restoration below always runs.` above the existing try block at line 198. The try/except already exists here from the Task 143 fix \u2014 this step only adds the documenting comment to complete the three-way alignment.",
+      "description": "Update _build_edge_dict docstring (memory_service.py:769) to add provenance to the Key semantics section. After the ``temporal`` entry (line 795), add:\n\n``provenance``:\n    Empty list ``[]`` when the edge object lacks an ``episodes`` attribute\n    (``getattr(e, 'episodes', None)`` returns its default ``None``) or when\n    ``episodes is None`` (attribute present but explicitly ``None``).\n    When ``episodes`` is a non-``None`` iterable, each element is stringified\n    via ``str()``.  The ``is not None`` policy matches ``uuid`` and ``temporal``\n    — truthiness is deliberately avoided so that an empty list ``[]`` remains\n    a valid (if degenerate) input.\n\nAlso update the inline comment at line 816 to be self-contained: replace 'matches uuid/temporal pattern (see docstring)' with 'getattr default is None; None treated as absent → empty list (same is-not-None policy as uuid/temporal)'.",
       "status": "done",
-      "commit": "8cb35ae"
+      "commit": "6e00777"
     },
     {
       "id": "step-8",
       "type": "test",
-      "description": "Run full test suite for all three modules: pytest fused-memory/tests/test_reindex.py fused-memory/tests/test_cleanup_stale_edges.py fused-memory/tests/test_verify_zombie_edges.py. Verify all existing tests pass (no regressions) and all new tests pass. Confirm the three finally blocks are now structurally identical: `if service is not None: # comment \\n try: await service.close() \\n except Exception: logger.warning(...)` followed by CONFIG_PATH restoration.",
+      "description": "Run the full TestBuildEdgeDict and TestSearch test classes to confirm all existing and new tests pass with all changes applied. This is the final validation that all four polish items are correct.",
       "status": "done",
-      "commit": "8cb35ae"
+      "commit": "6e00777"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Match the exact try/except pattern from reindex.py rather than extracting a shared helper",
-      "rationale": "The task description explicitly says to apply the same pattern. Extracting a helper (e.g. _safe_close()) would be a scope expansion beyond what's requested and would touch more code than necessary. The inline pattern is only 4 lines and is already established in reindex.py."
+      "decision": "Write new assertions (steps 1-2) before refactoring (steps 4-5)",
+      "rationale": "TDD discipline: establish the new assertions as a safety net first, verify they pass against existing code, then do the structural refactoring. If the fixture move breaks the provenance mapping, the new assertions catch it."
     },
     {
-      "decision": "Use function-specific warning messages (e.g. 'during run_cleanup cleanup' vs 'during run_verify_zombie_edges cleanup')",
-      "rationale": "Matches the existing reindex.py pattern which uses 'during run_reindex cleanup'. Function-specific messages make it easier to identify which entrypoint had the close() failure in production logs."
+      "decision": "EdgeWithNoneEpisodes uses typed field `episodes: list[str] | None = None` rather than bare `episodes = None`",
+      "rationale": "Matches the typed dataclass pattern in conftest.py (EdgeWithoutUuid, MockEdge). The union type explicitly documents that None is a valid value distinct from an empty list, which is the whole point of this fixture."
     },
     {
-      "decision": "Test CONFIG_PATH restoration when close() raises, not just that close() is called",
-      "rationale": "The whole point of this try/except is to protect the CONFIG_PATH restoration that follows. Existing tests only verify service.close() is called. Testing the actual invariant (env var restored even when close fails) is the high-value behavioral test that proves the fix works."
+      "decision": "Both extend the docstring AND make the inline comment self-contained",
+      "rationale": "The task offers option (a) or (b). Doing both is superior: the docstring should be complete (all three is-not-None fields documented uniformly), and the inline comment should be independently understandable without cross-referencing. The task description itself suggests this by listing both options."
     },
     {
-      "decision": "Add inline comment to all three files including existing reindex.py",
-      "rationale": "Per the task description, the comment documents that the try/except is load-bearing for the CONFIG_PATH invariant, not merely defensive. Adding it to reindex.py (which already has the try/except but not the comment) completes the documentation alignment across all three entrypoints."
-    },
-    {
-      "decision": "Test the warning log message in addition to CONFIG_PATH restoration",
-      "rationale": "The warning log is the only observable indicator that close() failed silently. Without it, close() failures would be invisible in production. Testing its presence ensures the pattern is complete, not just structurally present but functionally logging."
+      "decision": "Keep EdgeWithNoneEpisodes default field values identical to the inline class",
+      "rationale": "uuid='u-ep-none', fact='fact with none episodes', etc. Preserving exact values means the test body needs zero changes beyond the import swap, minimizing risk."
     }
   ],
   "reuse": [
     {
-      "what": "try/except pattern from reindex.py lines 197-201",
-      "where": "fused-memory/src/fused_memory/maintenance/reindex.py",
-      "how": "Copy the exact try/except Exception block with logger.warning('Error closing service during run_<name> cleanup', exc_info=True) into the finally blocks of cleanup_stale_edges.py and verify_zombie_edges.py, substituting the function name in the message."
+      "what": "EdgeWithoutUuid dataclass pattern in conftest.py",
+      "where": "fused-memory/tests/conftest.py:40-54",
+      "how": "EdgeWithNoneEpisodes follows the exact same structure: @dataclass, same field types as MockEdge with specific defaults to test a particular edge case. Place immediately after EdgeWithoutUuid."
     },
     {
-      "what": "ENV var restoration test pattern from TestRunCleanupEnvVarRestore",
-      "where": "fused-memory/tests/test_cleanup_stale_edges.py lines 398-455",
-      "how": "New close-error tests follow the same structure: save original CONFIG_PATH, set up mocks with patches, call entrypoint with config_path='test.yaml', assert CONFIG_PATH == original, wrap in try/finally safety net. The key addition is patching mock_service.close with side_effect=RuntimeError."
+      "what": "Local import pattern for conftest fixtures",
+      "where": "test_memory_service.py:867, 487, 464, 984",
+      "how": "Tests import conftest fixtures locally with `from tests.conftest import X`. EdgeWithNoneEpisodes uses the same pattern."
     },
     {
-      "what": "Mock service setup from TestRunCleanup and TestRunVerifyZombieEdges",
-      "where": "fused-memory/tests/test_cleanup_stale_edges.py lines 283-391 and test_verify_zombie_edges.py lines 253-364",
-      "how": "Reuse the same AsyncMock() pattern for mock_service, the same patch context managers for FusedMemoryConfig/MemoryService/Manager classes, and the same CleanupResult/VerifyResult mock returns."
+      "what": "Assertion message pattern with f-string and repr",
+      "where": "test_memory_service.py:870, 494-495, 951-953, 973-974",
+      "how": "All assertions use descriptive f-string messages with {value!r}. New provenance assertions follow this convention exactly."
+    },
+    {
+      "what": "Docstring Key semantics format in _build_edge_dict",
+      "where": "memory_service.py:778-795",
+      "how": "uuid and temporal entries use backtick-quoted key names, double-backtick code references, indented paragraphs explaining None vs empty-string semantics. The provenance entry mirrors this exact format."
     }
   ],
-  "_session_id": "146-961b4949",
-  "_created_at": "2026-03-24T23:28:48.394892+00:00"
+  "_session_id": "149-c55c6f30",
+  "_created_at": "2026-03-24T23:37:18.030374+00:00"
 }

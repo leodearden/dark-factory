@@ -793,6 +793,16 @@ class MemoryService:
             Truthiness checks are deliberately avoided here for the same reason
             as for ``uuid`` — an empty-string timestamp is a valid (if unusual)
             value and must not be silently dropped.
+
+        ``provenance``:
+            Empty list ``[]`` when the edge object lacks an ``episodes``
+            attribute (``getattr(e, 'episodes', None)`` returns its default
+            ``None``) or when ``episodes is None`` (attribute present but
+            explicitly ``None``).  When ``episodes`` is a non-``None``
+            iterable, each element is stringified via ``str()``.  The
+            ``is not None`` policy matches ``uuid`` and ``temporal`` —
+            truthiness is deliberately avoided so that an empty list ``[]``
+            remains a valid (if degenerate) input.
         """
         fact = getattr(e, 'fact', str(e))
         valid_at = getattr(e, 'valid_at', None)
@@ -813,7 +823,8 @@ class MemoryService:
         if target_node and hasattr(target_node, 'name'):
             entities.append(target_node.name)
 
-        # Episode provenance — is-not-None, not truthiness, matches uuid/temporal pattern (see docstring)
+        # Episode provenance — getattr default is None; None treated as absent → empty list
+        # (same is-not-None policy as uuid/temporal: an empty list [] is a valid input)
         episodes = getattr(e, 'episodes', None)
         provenance = [str(ep) for ep in (episodes if episodes is not None else [])]
 

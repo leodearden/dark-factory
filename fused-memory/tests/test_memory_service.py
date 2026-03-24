@@ -494,6 +494,9 @@ class TestSearch:
         assert results[0].id == '0', (
             f"Expected str(0) fallback id when uuid is None, got {results[0].id!r}"
         )
+        assert results[0].provenance == [], (
+            f"provenance should be [] when edge has empty episodes, got {results[0].provenance!r}"
+        )
 
 
 class TestDeleteMemory:
@@ -868,6 +871,9 @@ class TestBuildEdgeDict:
 
         d = service._build_edge_dict(EdgeWithoutUuid())
         assert d['uuid'] is None
+        assert d['provenance'] == [], (
+            f"provenance should be [] when edge has empty episodes, got {d['provenance']!r}"
+        )
 
     def test_edge_without_fact_attr_falls_back_to_str(self, service):
         """Edge object without fact attr uses str(edge) as the fact value."""
@@ -958,16 +964,7 @@ class TestBuildEdgeDict:
         Documents the is-not-None semantic: None episodes must not raise and must
         produce an empty list, same as a missing episodes attribute.
         """
-
-        class EdgeWithNoneEpisodes:
-            uuid = 'u-ep-none'
-            fact = 'fact with none episodes'
-            name = None
-            source_node = None
-            target_node = None
-            episodes = None  # attribute present, value is None
-            valid_at = None
-            invalid_at = None
+        from tests.conftest import EdgeWithNoneEpisodes
 
         d = service._build_edge_dict(EdgeWithNoneEpisodes())
         assert d['provenance'] == [], (
