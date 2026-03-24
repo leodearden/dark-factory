@@ -967,6 +967,28 @@ class TestBuildEdgeDict:
             f"valid_at should be None when not set, got {d['temporal']['valid_at']!r}"
         )
 
+    def test_none_episodes_attr_produces_empty_provenance(self, service):
+        """Edge with episodes=None (attribute present but None) returns provenance=[].
+
+        Documents the is-not-None semantic: None episodes must not raise and must
+        produce an empty list, same as a missing episodes attribute.
+        """
+
+        class EdgeWithNoneEpisodes:
+            uuid = 'u-ep-none'
+            fact = 'fact with none episodes'
+            name = None
+            source_node = None
+            target_node = None
+            episodes = None  # attribute present, value is None
+            valid_at = None
+            invalid_at = None
+
+        d = service._build_edge_dict(EdgeWithNoneEpisodes())
+        assert d['provenance'] == [], (
+            f"provenance should be [] when episodes is None, got {d['provenance']!r}"
+        )
+
 
 class TestGetEntityValidOnly:
     """Tests that get_entity() valid_only parameter filters invalidated edges."""
