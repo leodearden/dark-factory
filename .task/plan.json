@@ -62,15 +62,15 @@
       "id": "step-6",
       "type": "impl",
       "description": "Add valid_only: bool = False parameter to memory_service.get_entity(). When True, skip edges where getattr(edge, 'invalid_at', None) is not None. Apply filter before building edge_data list.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "b34c865"
     },
     {
       "id": "step-7",
       "type": "test",
       "description": "Write failing test: test_get_entity_tool_accepts_valid_only \u2014 verify the MCP tool handler in tools.py passes valid_only to memory_service.get_entity(). Mock memory_service.get_entity, call the tool function with valid_only=True, assert the mock was called with valid_only=True.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "7da5b73"
     },
     {
       "id": "step-8",
