@@ -389,3 +389,39 @@ class TestRunCleanup:
         assert call_kwargs is not None
         _, kwargs = call_kwargs
         assert kwargs.get('dry_run') is True
+
+
+# ---------------------------------------------------------------------------
+# step-1/2: run_cleanup env-var restoration on constructor failure
+# ---------------------------------------------------------------------------
+
+class TestRunCleanupEnvVarRestore:
+    """run_cleanup() restores CONFIG_PATH even when constructors raise."""
+
+    @pytest.mark.asyncio
+    async def test_restores_env_var_when_config_constructor_fails(self):
+        """CONFIG_PATH is restored when FusedMemoryConfig() raises."""
+        import os
+
+        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
+
+        original = os.environ.get('CONFIG_PATH')
+        try:
+            with (
+                patch(
+                    'fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig',
+                    side_effect=RuntimeError('config error'),
+                ),
+                pytest.raises(RuntimeError, match='config error'),
+            ):
+                await run_cleanup(
+                    config_path='test.yaml',
+                )
+            # CONFIG_PATH must be restored to its original value
+            assert os.environ.get('CONFIG_PATH') == original
+        finally:
+            # Safety: ensure test cleanup regardless
+            if original is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = original
