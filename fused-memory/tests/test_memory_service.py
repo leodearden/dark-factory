@@ -453,6 +453,27 @@ class TestSearch:
         # Should have the inferred category, not None
         assert results[0].category == MemoryCategory.entities_and_relations
 
+    @pytest.mark.asyncio
+    async def test_empty_string_uuid_preserved_in_search_graphiti(self, service):
+        """An edge with an empty-string uuid must not be replaced by its index.
+
+        MockEdge defaults uuid to '' (empty string).  The buggy code uses
+        `d['uuid'] or str(i)` which coerces '' to '0'.  The correct code uses
+        `d['uuid'] if d['uuid'] is not None else str(i)` which preserves ''.
+        """
+        from tests.conftest import MockEdge
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='some fact'),  # uuid defaults to ''
+        ])
+        service.mem0.search = AsyncMock(return_value={'results': []})
+
+        results = await service.search(query='test', project_id='test')
+        assert len(results) == 1
+        assert results[0].id == '', (
+            f"Expected empty-string uuid to be preserved, got {results[0].id!r}"
+        )
+
 
 class TestDeleteMemory:
     @pytest.mark.asyncio
