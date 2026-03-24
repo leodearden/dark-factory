@@ -92,7 +92,7 @@ class BaseStage:
             raise ValueError(
                 'project_id must be set before running a reconciliation stage'
             )
-        if watermark.project_id and watermark.project_id != self.project_id:
+        if watermark.project_id is not None and watermark.project_id != self.project_id:
             raise ValueError(
                 f'watermark project_id {watermark.project_id!r} != stage project_id {self.project_id!r}'
             )
