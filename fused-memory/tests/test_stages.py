@@ -354,6 +354,21 @@ class TestProjectIdValidation:
             )
 
     @pytest.mark.asyncio
+    async def test_run_raises_on_whitespace_project_id(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId, Watermark
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        # Whitespace-only project_id is truthy but semantically empty
+        stage.project_id = '   '
+        watermark = Watermark(project_id='dark_factory')
+        with pytest.raises(ValueError, match='project_id'):
+            await stage.run(
+                events=[],
+                watermark=watermark,
+                prior_reports=[],
+                run_id='test-run-001',
+            )
+
+    @pytest.mark.asyncio
     async def test_recon_context_includes_project_id(self, mock_deps):
         from unittest.mock import patch
 
