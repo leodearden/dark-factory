@@ -821,9 +821,18 @@ class MemoryService:
 
         edge_data = []
         for e in edges:
+            valid_at = getattr(e, 'valid_at', None)
+            invalid_at = getattr(e, 'invalid_at', None)
+            temporal = None
+            if valid_at or invalid_at:
+                temporal = {
+                    'valid_at': str(valid_at) if valid_at else None,
+                    'invalid_at': str(invalid_at) if invalid_at else None,
+                }
             edge_data.append({
                 'uuid': getattr(e, 'uuid', None),
                 'fact': getattr(e, 'fact', str(e)),
+                'temporal': temporal,
             })
 
         return {'nodes': node_data, 'edges': edge_data}
