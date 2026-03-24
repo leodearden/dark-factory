@@ -414,3 +414,57 @@ class TestRunVerifyZombieEdgesEmptyGuard:
         ):
             with pytest.raises(ValueError, match='--uuids'):
                 await run_verify_zombie_edges(uuids=[])
+
+
+# ---------------------------------------------------------------------------
+# step-11: REVIEW FIX 2 — semantic mismatch (RELATES_TO alignment + warning log)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckEdgesByUuidUsesRelatesToType:
+    """check_edges_by_uuid must use RELATES_TO to align with bulk_remove_edges."""
+
+    @pytest.mark.asyncio
+    async def test_uses_relates_to_edge_type(self, mock_config):
+        """Cypher query must use ':RELATES_TO' to match bulk_remove_edges delete path."""
+        backend = _make_backend(mock_config)
+        uuids = ['aaa11111']
+        rows = [['aaa11111']]
+        graph = _make_graph_mock(rows)
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.check_edges_by_uuid(uuids)
+        call_args = graph.query.call_args
+        assert call_args is not None
+        cypher_string = call_args[0][0]
+        assert ':RELATES_TO' in cypher_string, (
+            f'Expected :RELATES_TO in Cypher query, got: {cypher_string!r}'
+        )
+
+
+class TestZombieEdgeVerifierCleanupWarning:
+    """cleanup() emits a WARNING when deleted < len(found)."""
+
+    @pytest.mark.asyncio
+    async def test_warns_when_deleted_less_than_found(self, mock_config, caplog):
+        """WARNING is logged when bulk_remove_edges deletes fewer edges than found."""
+        import logging
+
+        from fused_memory.maintenance.verify_zombie_edges import ZombieEdgeVerifier
+
+        backend = _make_backend(mock_config)
+        # 3 UUIDs found but only 2 actually deleted
+        backend.check_edges_by_uuid = AsyncMock(return_value=['f1', 'f2', 'f3'])
+        backend.bulk_remove_edges = AsyncMock(return_value=2)
+        verifier = ZombieEdgeVerifier(backend=backend)
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.maintenance.verify_zombie_edges'):
+            result = await verifier.cleanup(['f1', 'f2', 'f3'], dry_run=False)
+
+        assert result.deleted == 2
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('could not be deleted' in m or 'mismatch' in m.lower() or '1' in m
+                   for m in warning_messages), (
+            f'Expected a warning about undeletable edges, got: {warning_messages}'
+        )

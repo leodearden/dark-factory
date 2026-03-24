@@ -365,16 +365,18 @@ class GraphitiBackend:
         return found
 
     async def check_edges_by_uuid(self, uuids: list[str]) -> list[str]:
-        """Return which UUIDs in the input list exist as edges in FalkorDB (read-only).
+        """Return which UUIDs in the input list exist as RELATES_TO edges in FalkorDB (read-only).
 
-        Uses unlabeled edge matching (MATCH ()-[e]->()) to catch any edge type,
-        not just RELATES_TO. This is intentional for a safety-first cleanup check.
+        Uses RELATES_TO edge matching to be consistent with bulk_remove_edges, which only
+        deletes RELATES_TO edges. All Graphiti-created edges are of this type. Aligning the
+        filter here prevents false-confidence: an edge that verify reports as 'found' will
+        always be deletable by bulk_remove_edges.
 
         Args:
             uuids: List of edge UUIDs to look up.
 
         Returns:
-            List of UUIDs that were found as edges. Order not guaranteed.
+            List of UUIDs that were found as RELATES_TO edges. Order not guaranteed.
             Returns empty list immediately for empty input (no FalkorDB query).
         """
         if not uuids:
@@ -383,7 +385,7 @@ class GraphitiBackend:
         driver = cast(Any, client.driver)
         graph = driver._get_graph(None)
         cypher = (
-            'MATCH ()-[e]->() '
+            'MATCH ()-[e:RELATES_TO]->() '
             'WHERE e.uuid IN $uuids '
             'RETURN e.uuid'
         )

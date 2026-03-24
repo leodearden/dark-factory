@@ -107,6 +107,12 @@ class ZombieEdgeVerifier:
         deleted = await self.backend.bulk_remove_edges(result.found)
         result.deleted = deleted
         logger.info('Deleted %d zombie edge(s)', deleted)
+        if deleted < len(result.found):
+            logger.warning(
+                '%d edge(s) were found by verify but could not be deleted by bulk_remove_edges '
+                '— possible edge type mismatch or concurrent removal',
+                len(result.found) - deleted,
+            )
         return result
 
 
