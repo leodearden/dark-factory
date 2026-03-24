@@ -728,7 +728,7 @@ class MemoryService:
             # Score: rank-based (no explicit score from Graphiti search)
             score = max(0.0, 1.0 - (i * 0.05))
             results.append(MemoryResult(
-                id=d['uuid'] or str(i),
+                id=d['uuid'] if d['uuid'] is not None else str(i),
                 content=d['fact'],
                 category=None,
                 source_store=SourceStore.graphiti,
