@@ -46,29 +46,29 @@
       "id": "step-5",
       "type": "test",
       "description": "Write failing tests for ZombieEdgeVerifier.cleanup(uuids, dry_run). Tests: dry_run=True verifies only (no deletion), dry_run=False verifies then deletes found edges via backend.bulk_remove_edges, handles case where no edges exist (skip delete), returns accurate VerifyResult with deleted count.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "c4e70d697c2cfb8453d6da0e31ebd1bf610d2dcc"
     },
     {
       "id": "step-6",
       "type": "impl",
       "description": "Implement ZombieEdgeVerifier.cleanup(uuids, dry_run=False) \u2192 VerifyResult. Calls verify() first, then if not dry_run and found edges exist, calls backend.bulk_remove_edges(found_uuids). Sets result.deleted to the return value.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "82cff762bc5de07e55bb9a1e4bcfbfe2fefb9e85"
     },
     {
       "id": "step-7",
       "type": "test",
       "description": "Write failing tests for run_verify_zombie_edges() async entrypoint. Tests: loads config and initializes MemoryService, calls cleanup with correct args, closes service on success, closes service on error (finally block), passes dry_run flag through. Follow exact pattern from TestRunCleanup in test_cleanup_stale_edges.py.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "c4e70d697c2cfb8453d6da0e31ebd1bf610d2dcc"
     },
     {
       "id": "step-8",
       "type": "impl",
       "description": "Implement run_verify_zombie_edges(uuids, config_path, dry_run) async entrypoint and __main__ CLI block in verify_zombie_edges.py. Pattern: load FusedMemoryConfig, create MemoryService, create ZombieEdgeVerifier(backend=service.graphiti), run cleanup, close in finally. CLI: argparse with --dry-run, --config, optional --uuids override (defaults to TASK_111_ZOMBIE_UUIDS).",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "82cff762bc5de07e55bb9a1e4bcfbfe2fefb9e85"
     }
   ],
   "design_decisions": [
