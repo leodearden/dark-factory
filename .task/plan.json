@@ -1,101 +1,115 @@
 {
-  "task_id": "145",
-  "title": "Harden _build_edge_dict tests and fix episodes truthiness inconsistency",
+  "task_id": "149",
+  "title": "Polish task 145: consolidate EdgeWithNoneEpisodes, add provenance assertions and docstring",
   "files": [
-    "fused-memory/src/fused_memory/services/memory_service.py",
+    "fused-memory/tests/conftest.py",
     "fused-memory/tests/test_memory_service.py",
-    "fused-memory/tests/conftest.py"
+    "fused-memory/src/fused_memory/services/memory_service.py"
   ],
   "modules": [
-    "fused-memory/src/fused_memory/services",
-    "fused-memory/tests"
+    "fused-memory/tests",
+    "fused-memory/src/fused_memory/services"
   ],
-  "analysis": "Three targeted improvements from task 140 review, all scoped to _build_edge_dict and its tests.\n\n(1) **Episodes truthiness (memory_service.py:817)**: Line 817 uses `getattr(e, 'episodes', []) or []` — a truthiness-based fallback — while the docstring at lines 793-795 explicitly states truthiness checks are 'deliberately avoided' for _build_edge_dict. The behavior is identical for all realistic inputs (None -> [], [] -> [], ['a'] -> ['a']), so this is a consistency/style fix, not a behavioral bug. We fix the code to use `is not None` to match the docstring's universal 'no truthiness' principle, and add an inline comment explaining the pattern.\n\n(2) **EdgeWithoutUuid duplication (test_memory_service.py:487,875)**: Identical 8-line plain class defined inline at lines 487-494 (TestSearch) and 875-882 (TestBuildEdgeDict). conftest.py already has MockEdge, MockNode, MockAddEpisodeResult as dataclasses. We add EdgeWithoutUuid alongside them as a dataclass with field(default_factory=list) for episodes, matching MockEdge's pattern but deliberately omitting the uuid field so getattr(e, 'uuid', None) returns None.\n\n(3) **Cross-field temporal assertions (test_memory_service.py:926-962)**: The two empty-string temporal tests each only assert the field they set, but don't assert the OTHER temporal field is None. The existing tests at lines 837-857 follow a pattern where both temporal fields are asserted. Adding the missing assertions hardens these tests to catch regressions where the wrong field gets populated.",
+  "analysis": "Four small, independent polish items from the task 145 review. All surgical, low-risk changes.\n\n1. **EdgeWithNoneEpisodes → conftest.py** (test_memory_service.py:962-968): The inline class at line 962 contradicts the fixture-consolidation pattern established by task 145 (which moved EdgeWithoutUuid to conftest.py). The conftest pattern uses @dataclass with typed fields and defaults. Tests import locally via `from tests.conftest import ...`. The new dataclass needs `episodes: list[str] | None = None` to model the 'attribute present but None' case.\n\n2. **Docstring gap for provenance** (memory_service.py:769-827): _build_edge_dict documents uuid (lines 780-786) and temporal (lines 788-795) key semantics but omits provenance, despite the comment at line 816 saying 'see docstring'. The docstring's Key semantics section should be extended with a provenance entry, and the inline comment should be made self-contained.\n\n3. **Missing provenance assertion in unit test** (test_memory_service.py:865-870): test_edge_with_no_uuid_attr_returns_none uses EdgeWithoutUuid which has `episodes: list[str] = field(default_factory=list)`, producing `provenance == []`. Test only asserts `d['uuid'] is None`. Adding `assert d['provenance'] == []` catches regressions in the episodes→provenance mapping.\n\n4. **Missing provenance assertion in search integration test** (test_memory_service.py:478-496): test_none_uuid_edge_falls_back_to_index_in_search also uses EdgeWithoutUuid. MemoryResult has a `provenance: list[str]` field (models/memory.py:35). Test asserts `results[0].id == '0'` but should also verify `results[0].provenance == []`.\n\nAll items are additive (new assertions, docstring additions, fixture consolidation). TDD approach: write new assertions first (they pass immediately since behavior already exists), then do the refactoring (move class, update docstring).",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Add cross-field assertion `assert d['temporal']['invalid_at'] is None` to test_empty_string_valid_at_builds_temporal_dict (after line 943). This matches the pattern at line 846 where the only-valid_at test asserts invalid_at is None. Should pass immediately — test hardening, not a new behavior.",
+      "description": "Add provenance assertion to test_edge_with_no_uuid_attr_returns_none (test_memory_service.py:870). After the existing `assert d['uuid'] is None`, add: `assert d['provenance'] == [], f\"provenance should be [] when edge has empty episodes, got {d['provenance']!r}\"`. This should pass immediately — EdgeWithoutUuid has episodes=[] which _build_edge_dict maps to provenance=[].",
       "status": "done",
-      "commit": "58171e9"
+      "commit": "83fefba"
     },
     {
       "id": "step-2",
       "type": "test",
-      "description": "Add cross-field assertion `assert d['temporal']['valid_at'] is None` to test_empty_string_invalid_at_builds_temporal_dict (after line 962). This matches the pattern at line 856 where the only-invalid_at test asserts valid_at is None. Should pass immediately — test hardening, not a new behavior.",
+      "description": "Add provenance assertion to test_none_uuid_edge_falls_back_to_index_in_search (test_memory_service.py:~496). After the existing `assert results[0].id == '0'` block, add: `assert results[0].provenance == [], f\"provenance should be [] when edge has empty episodes, got {results[0].provenance!r}\"`. This should pass immediately — the MemoryResult constructed from EdgeWithoutUuid carries provenance=[].",
       "status": "done",
-      "commit": "58171e9"
+      "commit": "83fefba"
     },
     {
       "id": "step-3",
-      "type": "test",
-      "description": "Write test `test_none_episodes_attr_produces_empty_provenance` in TestBuildEdgeDict. Create an inline edge class with `episodes = None` (attribute present but None). Assert `d['provenance'] == []`. This documents the is-not-None semantic for episodes. Will pass with both old (or-based) and new (is not None) code, but serves as the specification that the impl step fulfills.",
+      "type": "impl",
+      "description": "Run both modified tests (test_edge_with_no_uuid_attr_returns_none and test_none_uuid_edge_falls_back_to_index_in_search) to verify the new assertions pass against existing code. No code changes — this validates the assertions are correct.",
       "status": "done",
-      "commit": "a91221d"
+      "commit": "83fefba"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Fix episodes truthiness on memory_service.py line 817. Replace `getattr(e, 'episodes', []) or []` and `provenance = [str(ep) for ep in episodes]` with: `episodes = getattr(e, 'episodes', None)` then `provenance = [str(ep) for ep in (episodes if episodes is not None else [])]`. Add inline comment: `# is-not-None, not truthiness — matches uuid/temporal pattern (see docstring)`. Verify step-3 test still passes.",
+      "description": "Add EdgeWithNoneEpisodes dataclass to conftest.py. Place it after EdgeWithoutUuid (after line 54). Fields: uuid: str = 'u-ep-none', fact: str = 'fact with none episodes', name: str | None = None, source_node: MockNode | None = None, target_node: MockNode | None = None, episodes: list[str] | None = None, valid_at: str | None = None, invalid_at: str | None = None. Docstring: 'Simulates a Graphiti edge where the episodes attribute is present but None. Tests the is-not-None semantic: None episodes must produce empty provenance, same as a missing episodes attribute.'",
       "status": "done",
-      "commit": "498ab60"
+      "commit": "016806e"
     },
     {
       "id": "step-5",
       "type": "impl",
-      "description": "Add EdgeWithoutUuid dataclass to conftest.py after MockEdge (around line 38). Fields: fact: str = 'some fact', name: str | None = None, source_node: MockNode | None = None, target_node: MockNode | None = None, episodes: list[str] = field(default_factory=list), valid_at: str | None = None, invalid_at: str | None = None. Docstring: 'Simulates a Graphiti edge that lacks a uuid attribute.' No uuid field — getattr(e, 'uuid', None) returns None.",
+      "description": "Replace inline EdgeWithNoneEpisodes class in test_none_episodes_attr_produces_empty_provenance (test_memory_service.py:962-968) with an import: `from tests.conftest import EdgeWithNoneEpisodes`. Remove the 7-line inline class definition. Update `service._build_edge_dict(EdgeWithNoneEpisodes())` call — no change needed since dataclass defaults match the inline class exactly.",
       "status": "done",
-      "commit": "75813d5"
+      "commit": "016806e"
     },
     {
       "id": "step-6",
-      "type": "impl",
-      "description": "Replace both inline EdgeWithoutUuid class definitions in test_memory_service.py with imports from conftest. At line 487 (TestSearch.test_none_uuid_edge_falls_back_to_index_in_search): remove 8-line class, add `from tests.conftest import EdgeWithoutUuid`. At line 875 (TestBuildEdgeDict.test_edge_with_no_uuid_attr_returns_none): same replacement. Follows the existing import pattern used at lines 839, 850, 933, 952 for MockEdge. Run full test suite to confirm no regressions.",
+      "type": "test",
+      "description": "Run test_none_episodes_attr_produces_empty_provenance to confirm the refactored import from conftest works identically to the inline class.",
       "status": "done",
-      "commit": "1ceb34d"
+      "commit": "016806e"
+    },
+    {
+      "id": "step-7",
+      "type": "impl",
+      "description": "Update _build_edge_dict docstring (memory_service.py:769) to add provenance to the Key semantics section. After the ``temporal`` entry (line 795), add:\n\n``provenance``:\n    Empty list ``[]`` when the edge object lacks an ``episodes`` attribute\n    (``getattr(e, 'episodes', None)`` returns its default ``None``) or when\n    ``episodes is None`` (attribute present but explicitly ``None``).\n    When ``episodes`` is a non-``None`` iterable, each element is stringified\n    via ``str()``.  The ``is not None`` policy matches ``uuid`` and ``temporal``\n    — truthiness is deliberately avoided so that an empty list ``[]`` remains\n    a valid (if degenerate) input.\n\nAlso update the inline comment at line 816 to be self-contained: replace 'matches uuid/temporal pattern (see docstring)' with 'getattr default is None; None treated as absent → empty list (same is-not-None policy as uuid/temporal)'.",
+      "status": "done",
+      "commit": "6e00777"
+    },
+    {
+      "id": "step-8",
+      "type": "test",
+      "description": "Run the full TestBuildEdgeDict and TestSearch test classes to confirm all existing and new tests pass with all changes applied. This is the final validation that all four polish items are correct.",
+      "status": "done",
+      "commit": "6e00777"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Fix code to use `is not None` (option 1) rather than narrowing docstring scope (option 2)",
-      "rationale": "The docstring establishes a universal 'no truthiness' principle for _build_edge_dict. Narrowing it to uuid/temporal-only would weaken the principle and leave a truthiness footgun for future fields. The code change is minimal (2 lines) and makes the pattern uniform across all three field groups: uuid, temporal, and episodes."
+      "decision": "Write new assertions (steps 1-2) before refactoring (steps 4-5)",
+      "rationale": "TDD discipline: establish the new assertions as a safety net first, verify they pass against existing code, then do the structural refactoring. If the fixture move breaks the provenance mapping, the new assertions catch it."
     },
     {
-      "decision": "EdgeWithoutUuid deliberately omits the uuid field rather than setting uuid=None",
-      "rationale": "The whole point of this fixture is testing getattr(e, 'uuid', None) returning None because the attribute doesn't exist. A dataclass field with default=None would create an attribute that exists with value None. Omitting the field accurately models the real-world scenario of a Graphiti edge object lacking the uuid property."
+      "decision": "EdgeWithNoneEpisodes uses typed field `episodes: list[str] | None = None` rather than bare `episodes = None`",
+      "rationale": "Matches the typed dataclass pattern in conftest.py (EdgeWithoutUuid, MockEdge). The union type explicitly documents that None is a valid value distinct from an empty list, which is the whole point of this fixture."
     },
     {
-      "decision": "Cross-field assertions added to existing tests rather than creating new test functions",
-      "rationale": "The task explicitly requests that the existing tests 'should also assert' the other temporal field. This matches the pattern established at lines 837-857 where single-field temporal tests assert both fields. Adding to existing tests keeps the test count stable and the test names accurate."
+      "decision": "Both extend the docstring AND make the inline comment self-contained",
+      "rationale": "The task offers option (a) or (b). Doing both is superior: the docstring should be complete (all three is-not-None fields documented uniformly), and the inline comment should be independently understandable without cross-referencing. The task description itself suggests this by listing both options."
     },
     {
-      "decision": "episodes=None test (step-3) written before impl (step-4) even though it passes with both old and new code",
-      "rationale": "TDD principle: write the specification test first. The test documents the intended semantic (is-not-None, not truthiness). While behavior is identical for None input, the test serves as a regression guard and specification. It also validates that the None case works correctly after the refactor."
+      "decision": "Keep EdgeWithNoneEpisodes default field values identical to the inline class",
+      "rationale": "uuid='u-ep-none', fact='fact with none episodes', etc. Preserving exact values means the test body needs zero changes beyond the import swap, minimizing risk."
     }
   ],
   "reuse": [
     {
-      "what": "MockEdge dataclass pattern (field types, default_factory, docstring style)",
-      "where": "fused-memory/tests/conftest.py lines 26-37",
-      "how": "EdgeWithoutUuid mirrors MockEdge's structure — same fields, same types, same default patterns — but omits uuid. Uses field(default_factory=list) for episodes."
+      "what": "EdgeWithoutUuid dataclass pattern in conftest.py",
+      "where": "fused-memory/tests/conftest.py:40-54",
+      "how": "EdgeWithNoneEpisodes follows the exact same structure: @dataclass, same field types as MockEdge with specific defaults to test a particular edge case. Place immediately after EdgeWithoutUuid."
     },
     {
-      "what": "Existing `from tests.conftest import` pattern for shared fixtures",
-      "where": "test_memory_service.py lines 839, 850, 933, 952",
-      "how": "Tests already use `from tests.conftest import MockEdge` — EdgeWithoutUuid will follow the same import pattern."
+      "what": "Local import pattern for conftest fixtures",
+      "where": "test_memory_service.py:867, 487, 464, 984",
+      "how": "Tests import conftest fixtures locally with `from tests.conftest import X`. EdgeWithNoneEpisodes uses the same pattern."
     },
     {
-      "what": "Temporal cross-field assertion pattern",
-      "where": "test_memory_service.py lines 844-846 and 855-857",
-      "how": "The pattern of asserting both temporal fields (the set one and the None one) is copied exactly from the existing only-valid_at and only-invalid_at tests."
+      "what": "Assertion message pattern with f-string and repr",
+      "where": "test_memory_service.py:870, 494-495, 951-953, 973-974",
+      "how": "All assertions use descriptive f-string messages with {value!r}. New provenance assertions follow this convention exactly."
     },
     {
-      "what": "is-not-None pattern for getattr results in _build_edge_dict",
-      "where": "memory_service.py lines 798-805 (valid_at/invalid_at handling)",
-      "how": "The episodes fix replicates the exact same getattr -> is not None -> fallback pattern already used for valid_at and invalid_at."
+      "what": "Docstring Key semantics format in _build_edge_dict",
+      "where": "memory_service.py:778-795",
+      "how": "uuid and temporal entries use backtick-quoted key names, double-backtick code references, indented paragraphs explaining None vs empty-string semantics. The provenance entry mirrors this exact format."
     }
   ],
-  "_session_id": "145-a97e313f",
-  "_created_at": "2026-03-24T23:23:38.029306+00:00"
+  "_session_id": "149-c55c6f30",
+  "_created_at": "2026-03-24T23:37:18.030374+00:00"
 }
