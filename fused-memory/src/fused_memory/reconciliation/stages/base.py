@@ -102,6 +102,7 @@ class BaseStage:
             f'agent_id: recon-stage-{self.stage_id.value}\n\n'
             f'**IMPORTANT**: For every fused-memory write call, include:\n'
             f'- `agent_id`: "recon-stage-{self.stage_id.value}"\n'
+            f'- `project_id`: "{self.project_id}"\n'
             f'- In `metadata`: include `"_causation_id": "{run_id}"`\n'
         )
         payload = payload + recon_context
