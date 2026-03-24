@@ -411,9 +411,9 @@ class TestRunVerifyZombieEdgesEmptyGuard:
         with (
             patch('fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig'),
             patch('fused_memory.maintenance.verify_zombie_edges.MemoryService'),
+            pytest.raises(ValueError, match='--uuids'),
         ):
-            with pytest.raises(ValueError, match='--uuids'):
-                await run_verify_zombie_edges(uuids=[])
+            await run_verify_zombie_edges(uuids=[])
 
 
 # ---------------------------------------------------------------------------
@@ -487,15 +487,17 @@ class TestRunVerifyZombieEdgesEnvVarRestore:
 
         original = os.environ.get('CONFIG_PATH')
         try:
-            with patch(
-                'fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig',
-                side_effect=RuntimeError('config error'),
+            with (
+                patch(
+                    'fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig',
+                    side_effect=RuntimeError('config error'),
+                ),
+                pytest.raises(RuntimeError, match='config error'),
             ):
-                with pytest.raises(RuntimeError, match='config error'):
-                    await run_verify_zombie_edges(
-                        uuids=['test-uuid'],
-                        config_path='test.yaml',
-                    )
+                await run_verify_zombie_edges(
+                    uuids=['test-uuid'],
+                    config_path='test.yaml',
+                )
             # CONFIG_PATH must be restored to its original value
             assert os.environ.get('CONFIG_PATH') == original
         finally:
@@ -520,12 +522,12 @@ class TestRunVerifyZombieEdgesEnvVarRestore:
                     'fused_memory.maintenance.verify_zombie_edges.MemoryService',
                     side_effect=RuntimeError('service error'),
                 ),
+                pytest.raises(RuntimeError, match='service error'),
             ):
-                with pytest.raises(RuntimeError, match='service error'):
-                    await run_verify_zombie_edges(
-                        uuids=['test-uuid'],
-                        config_path='test.yaml',
-                    )
+                await run_verify_zombie_edges(
+                    uuids=['test-uuid'],
+                    config_path='test.yaml',
+                )
             # CONFIG_PATH must be restored to its original value
             assert os.environ.get('CONFIG_PATH') == original
         finally:
