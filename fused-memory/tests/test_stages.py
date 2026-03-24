@@ -727,9 +727,10 @@ class TestWatermarkProjectIdNormalization:
 
     def test_watermark_rejects_non_string_project_id(self):
         from pydantic import ValidationError
+
         from fused_memory.models.reconciliation import Watermark
         with pytest.raises(ValidationError):
-            Watermark(project_id=123)
+            Watermark(project_id=123)  # type: ignore[arg-type]
 
 
 class TestTierConfig:
