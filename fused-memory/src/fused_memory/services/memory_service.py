@@ -724,41 +724,18 @@ class MemoryService:
         )
         results = []
         for i, edge in enumerate(edges):
-            fact = getattr(edge, 'fact', str(edge))
-            valid_at = getattr(edge, 'valid_at', None)
-            invalid_at = getattr(edge, 'invalid_at', None)
-            temporal = None
-            if valid_at or invalid_at:
-                temporal = {
-                    'valid_at': str(valid_at) if valid_at else None,
-                    'invalid_at': str(invalid_at) if invalid_at else None,
-                }
-
-            # Extract entity names from source/target nodes
-            entities = []
-            source_node = getattr(edge, 'source_node', None)
-            target_node = getattr(edge, 'target_node', None)
-            if source_node and hasattr(source_node, 'name'):
-                entities.append(source_node.name)
-            if target_node and hasattr(target_node, 'name'):
-                entities.append(target_node.name)
-
-            # Episode provenance
-            episodes = getattr(edge, 'episodes', []) or []
-            provenance = [str(ep) for ep in episodes]
-
+            d = self._build_edge_dict(edge)
             # Score: rank-based (no explicit score from Graphiti search)
             score = max(0.0, 1.0 - (i * 0.05))
-
             results.append(MemoryResult(
-                id=getattr(edge, 'uuid', str(i)),
-                content=fact,
+                id=d['uuid'] or str(i),
+                content=d['fact'],
                 category=None,
                 source_store=SourceStore.graphiti,
                 relevance_score=score,
-                provenance=provenance,
-                temporal=temporal,
-                entities=entities,
+                provenance=d['provenance'],
+                temporal=d['temporal'],
+                entities=d['entities'],
             ))
         return results
 
