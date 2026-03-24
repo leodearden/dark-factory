@@ -11,7 +11,7 @@
     "fused-memory/src/fused_memory/maintenance",
     "fused-memory/tests"
   ],
-  "analysis": "Task 128 is an operational verification task: Task 111 ('Delete 19 confirmed FalkorDB zombie Graphiti edges') was marked done but no confirmation memory exists that the Cypher DELETE was actually executed. The knowledge graph still records the edges as pending deletion.\n\nExisting infrastructure analysis:\n- `GraphitiBackend.bulk_remove_edges(uuids)` already handles pre-count + DELETE for RELATES_TO edges, but it always deletes \u2014 no check-only mode exists.\n- `cleanup_stale_edges.py` does time-range based cleanup, not UUID-targeted verification.\n- FalkorDB runs as a native host process on port 6379 (Redis protocol), config in `fused-memory/config/config.yaml`.\n\nApproach: Create a UUID-targeted verification and deletion maintenance script that fills the gap between 'check if edges exist' and 'delete them'. Add a `check_edges_by_uuid` read-only method to GraphitiBackend for the verify-first workflow. The script stores the 19 zombie UUIDs as a constant for reproducibility and provides both dry-run (verify-only) and live-delete modes.\n\nThe task's Cypher uses `MATCH ()-[e]->()` (any edge type) but Graphiti only creates RELATES_TO edges between Entity nodes, so matching `()-[e:RELATES_TO]->()` is equivalent and consistent with existing code patterns. However, for safety, the check method will use unlabeled edge matching to catch any edge type.\n\nNote: The 19 UUIDs in the task description are 8-character hex strings (Graphiti's short UUID format), not full UUID4. The existing `bulk_remove_edges` passes UUIDs as-is to Cypher, so this is compatible.",
+  "analysis": "Task 128 is an operational verification task: Task 111 ('Delete 19 confirmed FalkorDB zombie Graphiti edges') was marked done but no confirmation memory exists that the Cypher DELETE was actually executed. The knowledge graph still records the edges as pending deletion.\n\nExisting infrastructure analysis:\n- `GraphitiBackend.bulk_remove_edges(uuids)` already handles pre-count + DELETE for RELATES_TO edges, but it always deletes \u2014 no check-only mode exists.\n- `cleanup_stale_edges.py` does time-range based cleanup, not UUID-targeted verification.\n- FalkorDB runs as a native host process on port 6379 (Redis protocol), config in `fused-memory/config/config.yaml`.\n\nApproach: Create a UUID-targeted verification and deletion maintenance script that fills the gap between 'check if edges exist' and 'delete them'. Add a `check_edges_by_uuid` read-only method to GraphitiBackend for the verify-first workflow. The script stores the 19 zombie UUIDs as a constant for reproducibility and provides both dry-run (verify-only) and live-delete modes.\n\nThe task's Cypher uses `MATCH ()-[e]->()` (any edge type) but Graphiti only creates RELATES_TO edges between Entity nodes, so matching `()-[e:RELATES_TO]->()` is equivalent and consistent with existing code patterns. However, for safety, the check method will use unlabeled edge matching to catch any edge type.\n\nNote: The 19 UUIDs in the task description are 8-character hex strings (Graphiti's short UUID format), not full UUID4. The existing `bulk_remove_edges` passes UUIDs as-is to Cypher, so this is compatible.\n\n--- POST-REVIEW AMENDMENTS ---\n\nReview identified three blocking issues requiring fixes:\n\n1. PLACEHOLDER UUIDS: TASK_111_ZOMBIE_UUIDS contains synthetic values (12345678, a1b2c3d4, etc.) that are obviously fake. The real UUIDs are unknown (consistent with the task's 'unconfirmed deletion' premise). Fix: empty the constant with a comment directing operators to supply real UUIDs via --uuids, and guard against running with an empty UUID list.\n\n2. SEMANTIC MISMATCH: check_edges_by_uuid uses unlabeled MATCH ()-[e]->() but bulk_remove_edges uses MATCH ()-[e:RELATES_TO]->(). This means verify can report edges as 'found' that bulk_remove_edges silently skips. Fix: align check_edges_by_uuid to use RELATES_TO (all Graphiti edges are this type), and add a warning log in cleanup() when deleted < len(found) as a safety net.\n\n3. ENV VAR LEAK: CONFIG_PATH env var mutation at line 152-154 occurs before the try block at line 160. If FusedMemoryConfig(), MemoryService(), or ZombieEdgeVerifier() constructors raise, the env var is never restored. Fix: move all construction inside the try block, handle potentially-uninitialized service in finally.",
   "prerequisites": [],
   "steps": [
     {
@@ -69,6 +69,48 @@
       "description": "Implement run_verify_zombie_edges(uuids, config_path, dry_run) async entrypoint and __main__ CLI block in verify_zombie_edges.py. Pattern: load FusedMemoryConfig, create MemoryService, create ZombieEdgeVerifier(backend=service.graphiti), run cleanup, close in finally. CLI: argparse with --dry-run, --config, optional --uuids override (defaults to TASK_111_ZOMBIE_UUIDS).",
       "status": "done",
       "commit": "82cff762bc5de07e55bb9a1e4bcfbfe2fefb9e85"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "REVIEW FIX 1 (placeholder UUIDs) \u2014 Write failing tests: (a) assert TASK_111_ZOMBIE_UUIDS is an empty list, (b) test run_verify_zombie_edges raises ValueError when resolved uuids is empty (i.e., no --uuids provided and constant is empty). The ValueError test patches FusedMemoryConfig and MemoryService to verify the error fires before any service construction.",
+      "status": "done",
+      "commit": "171c3a1"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "REVIEW FIX 1 (placeholder UUIDs) \u2014 Replace TASK_111_ZOMBIE_UUIDS contents with an empty list and a comment block explaining: real UUIDs were never confirmed, operators must supply UUIDs via --uuids flag, or populate the constant after extracting real UUIDs from FalkorDB. Add a ValueError guard at the top of run_verify_zombie_edges: if the resolved uuids list is empty, raise ValueError with a message directing the operator to use --uuids.",
+      "status": "done",
+      "commit": "171c3a1"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "REVIEW FIX 2 (semantic mismatch) \u2014 Write failing tests: (a) in TestCheckEdgesByUuid, add test_uses_relates_to_edge_type that asserts the Cypher query string passed to graph.query contains ':RELATES_TO' (inspects call_args[0][0]). (b) In TestZombieEdgeVerifierCleanup, add test_warns_when_deleted_less_than_found that asserts a WARNING-level log is emitted when result.deleted < len(result.found) \u2014 mock check_edges_by_uuid returning 3 found, bulk_remove_edges returning 2 deleted, assert 'could not be deleted' or similar substring in caplog.",
+      "status": "done",
+      "commit": "4e29639"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "REVIEW FIX 2 (semantic mismatch) \u2014 (a) Change check_edges_by_uuid Cypher from 'MATCH ()-[e]->()' to 'MATCH ()-[e:RELATES_TO]->()' to align with bulk_remove_edges. Update docstring to remove the 'unlabeled matching' rationale and note it matches RELATES_TO for consistency with the delete path. (b) In ZombieEdgeVerifier.cleanup(), after the bulk_remove_edges call, add: if result.deleted < len(result.found): logger.warning('%d edge(s) were found by verify but could not be deleted by bulk_remove_edges \u2014 possible edge type mismatch or concurrent removal', len(result.found) - result.deleted).",
+      "status": "done",
+      "commit": "4e29639"
+    },
+    {
+      "id": "step-13",
+      "type": "test",
+      "description": "REVIEW FIX 3 (env var leak) \u2014 Write failing tests: (a) test_restores_env_var_when_config_constructor_fails: set config_path='test.yaml', patch FusedMemoryConfig to raise RuntimeError, assert CONFIG_PATH is restored to its original value (or absent) after the exception. (b) test_restores_env_var_when_service_constructor_fails: patch MemoryService to raise RuntimeError, assert CONFIG_PATH is restored. Both tests should snapshot os.environ.get('CONFIG_PATH') before the call and assert it matches after.",
+      "status": "done",
+      "commit": "e3740f2"
+    },
+    {
+      "id": "step-14",
+      "type": "impl",
+      "description": "REVIEW FIX 3 (env var leak) \u2014 Restructure run_verify_zombie_edges to wrap env var mutation AND all object construction inside the try block. In the finally block, conditionally close service only if it was successfully created (use a sentinel: service = None before try, 'if service is not None: await service.close()' in finally). Env var restoration stays in finally. The structure becomes: service=None, old=os.environ.get('CONFIG_PATH'), try: [set env, construct config/service/verifier, initialize, run cleanup, return], finally: [close service if not None, restore env var].",
+      "status": "done",
+      "commit": "e3740f2"
     }
   ],
   "design_decisions": [
@@ -77,12 +119,16 @@
       "rationale": "The verify-first workflow needs a non-destructive query. bulk_remove_edges always deletes after counting. Separation of read and write operations is safer for irreversible graph mutations and enables dry-run mode without conditional deletion logic in the backend."
     },
     {
-      "decision": "Use unlabeled edge matching (MATCH ()-[e]->()) in check_edges_by_uuid instead of RELATES_TO-specific matching",
-      "rationale": "The task's original Cypher uses unlabeled matching. While Graphiti primarily creates RELATES_TO edges, zombie edges could theoretically be any type. Unlabeled matching is safer for a cleanup tool. bulk_remove_edges still uses RELATES_TO matching for consistency with existing code."
+      "decision": "Use RELATES_TO edge matching in check_edges_by_uuid to align with bulk_remove_edges (REVISED from review)",
+      "rationale": "Original plan used unlabeled MATCH ()-[e]->() for safety, but review correctly identified that this creates a semantic mismatch: verify can report edges as 'found' that bulk_remove_edges silently skips (it only deletes RELATES_TO). Since all Graphiti edges are RELATES_TO type, aligning the filter eliminates the entire class of false-confidence bugs. A secondary warning log in cleanup() catches any remaining edge cases (concurrent removal, etc.)."
     },
     {
       "decision": "Store the 19 zombie UUIDs as a named constant TASK_111_ZOMBIE_UUIDS in the script",
       "rationale": "Provides traceability back to Task 111, makes the script self-documenting, and allows the CLI to default to these UUIDs while still accepting overrides via --uuids flag for reuse in future zombie-edge scenarios."
+    },
+    {
+      "decision": "Empty TASK_111_ZOMBIE_UUIDS constant with operator guidance instead of shipping placeholder values (REVISED from review)",
+      "rationale": "Review correctly identified that the 19 UUIDs (12345678, a1b2c3d4, etc.) are obviously synthetic. The task's premise is 'unconfirmed deletion' \u2014 the real UUIDs are unknown. Shipping fakes would cause the script to always report all 19 as 'missing' and delete nothing, which is precisely the false confidence the script was built to prevent. An empty constant with a clear comment directs operators to supply real UUIDs via --uuids or populate the constant after extracting them from FalkorDB."
     },
     {
       "decision": "Create a new maintenance script rather than extending cleanup_stale_edges.py",
@@ -91,6 +137,10 @@
     {
       "decision": "Follow the existing test pattern exactly (mock graph with AsyncMock, patch cast, _make_backend helper)",
       "rationale": "Consistency with test_cleanup_stale_edges.py and test_reindex.py. Same mock infrastructure, same assertion patterns. Reduces cognitive load and ensures the test harness works the same way across all maintenance utilities."
+    },
+    {
+      "decision": "Move all object construction inside try block to prevent env var leak (ADDED from review)",
+      "rationale": "Review identified that CONFIG_PATH env var mutation (line 152-154) occurs before the try block (line 160). If FusedMemoryConfig(), MemoryService(), or ZombieEdgeVerifier() constructors raise, the finally block is never reached and the env var is permanently mutated. This poisons subsequent FusedMemoryConfig() calls in the same process. Fix: env var set + all construction + work inside try, conditional service.close() + env var restore in finally."
     }
   ],
   "reuse": [
@@ -126,5 +176,5 @@
     }
   ],
   "_session_id": "128-daf3427e",
-  "_created_at": "2026-03-24T22:22:26.654278+00:00"
+  "_created_at": "2026-03-24T22:37:43.399689+00:00"
 }
