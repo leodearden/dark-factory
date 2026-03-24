@@ -126,7 +126,7 @@ class TestZombieEdgeVerifierVerify:
     @pytest.mark.asyncio
     async def test_handles_all_found(self, mock_config):
         """verify() handles case where all UUIDs exist as edges."""
-        from fused_memory.maintenance.verify_zombie_edges import VerifyResult, ZombieEdgeVerifier
+        from fused_memory.maintenance.verify_zombie_edges import ZombieEdgeVerifier
 
         backend = _make_backend(mock_config)
         backend.check_edges_by_uuid = AsyncMock(return_value=['x1', 'x2', 'x3'])
@@ -140,7 +140,7 @@ class TestZombieEdgeVerifierVerify:
     @pytest.mark.asyncio
     async def test_handles_all_missing(self, mock_config):
         """verify() handles case where no UUIDs exist as edges."""
-        from fused_memory.maintenance.verify_zombie_edges import VerifyResult, ZombieEdgeVerifier
+        from fused_memory.maintenance.verify_zombie_edges import ZombieEdgeVerifier
 
         backend = _make_backend(mock_config)
         backend.check_edges_by_uuid = AsyncMock(return_value=[])
@@ -215,7 +215,7 @@ class TestZombieEdgeVerifierCleanup:
     @pytest.mark.asyncio
     async def test_skips_delete_when_no_edges_exist(self, mock_config):
         """cleanup() skips bulk_remove_edges when verify finds no existing edges."""
-        from fused_memory.maintenance.verify_zombie_edges import VerifyResult, ZombieEdgeVerifier
+        from fused_memory.maintenance.verify_zombie_edges import ZombieEdgeVerifier
 
         backend = _make_backend(mock_config)
         backend.check_edges_by_uuid = AsyncMock(return_value=[])
@@ -232,7 +232,7 @@ class TestZombieEdgeVerifierCleanup:
     @pytest.mark.asyncio
     async def test_returns_accurate_deleted_count(self, mock_config):
         """deleted field reflects actual return value from bulk_remove_edges."""
-        from fused_memory.maintenance.verify_zombie_edges import VerifyResult, ZombieEdgeVerifier
+        from fused_memory.maintenance.verify_zombie_edges import ZombieEdgeVerifier
 
         backend = _make_backend(mock_config)
         # 3 UUIDs exist, but bulk_remove_edges returns 2 (one may have been concurrently removed)
@@ -256,7 +256,10 @@ class TestRunVerifyZombieEdges:
     @pytest.mark.asyncio
     async def test_loads_config_and_runs_cleanup(self):
         """run_verify_zombie_edges() initializes MemoryService and calls cleanup."""
-        from fused_memory.maintenance.verify_zombie_edges import VerifyResult, run_verify_zombie_edges
+        from fused_memory.maintenance.verify_zombie_edges import (
+            VerifyResult,
+            run_verify_zombie_edges,
+        )
 
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
@@ -285,7 +288,10 @@ class TestRunVerifyZombieEdges:
     @pytest.mark.asyncio
     async def test_closes_service_on_success(self):
         """run_verify_zombie_edges() calls service.close() in finally block after success."""
-        from fused_memory.maintenance.verify_zombie_edges import VerifyResult, run_verify_zombie_edges
+        from fused_memory.maintenance.verify_zombie_edges import (
+            VerifyResult,
+            run_verify_zombie_edges,
+        )
 
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
@@ -331,7 +337,10 @@ class TestRunVerifyZombieEdges:
     @pytest.mark.asyncio
     async def test_passes_dry_run_flag(self):
         """run_verify_zombie_edges(dry_run=True) passes dry_run=True to cleanup."""
-        from fused_memory.maintenance.verify_zombie_edges import VerifyResult, run_verify_zombie_edges
+        from fused_memory.maintenance.verify_zombie_edges import (
+            VerifyResult,
+            run_verify_zombie_edges,
+        )
 
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
