@@ -774,6 +774,25 @@ class MemoryService:
 
         Returns:
             dict with keys: uuid, fact, name, temporal, entities, provenance
+
+        Key semantics (load-bearing — callers depend on these):
+
+        ``uuid``:
+            ``None`` when the edge object lacks a ``uuid`` attribute entirely
+            (``getattr(e, 'uuid', None)`` returns its default ``None``).
+            ``''`` (empty string) when the attribute exists but is blank.
+            Callers use ``is not None`` — not truthiness — to decide whether to
+            fall back to a synthetic id (``str(i)``), so these two cases are
+            intentionally distinct.
+
+        ``temporal``:
+            ``None`` when both ``valid_at`` and ``invalid_at`` are ``None``.
+            A dict ``{'valid_at': ..., 'invalid_at': ...}`` when either value
+            ``is not None`` (including empty string ``''``).  Values inside the
+            dict are ``str(x)`` when ``x is not None``, else ``None``.
+            Truthiness checks are deliberately avoided here for the same reason
+            as for ``uuid`` — an empty-string timestamp is a valid (if unusual)
+            value and must not be silently dropped.
         """
         fact = getattr(e, 'fact', str(e))
         valid_at = getattr(e, 'valid_at', None)
