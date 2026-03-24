@@ -1,111 +1,88 @@
 {
-  "task_id": "131",
-  "title": "Extract _build_edge_dict helper to DRY edge extraction in MemoryService",
+  "task_id": "139",
+  "title": "Backport env-var-leak fix from verify_zombie_edges to cleanup_stale_edges",
   "files": [
-    "fused-memory/src/fused_memory/services/memory_service.py",
-    "fused-memory/tests/test_memory_service.py"
+    "fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py",
+    "fused-memory/tests/test_cleanup_stale_edges.py"
   ],
   "modules": [
-    "fused-memory/src/fused_memory/services",
+    "fused-memory/src/fused_memory/maintenance",
     "fused-memory/tests"
   ],
-  "analysis": "The code block that builds temporal/entities/provenance from a Graphiti edge object is duplicated verbatim in two locations:\n\n1. `_search_graphiti()` (lines ~727-748): Extracts fact, valid_at, invalid_at into temporal dict; extracts source_node/target_node names into entities list; extracts episodes into provenance list of strings. Then builds a MemoryResult using these plus a rank-based score.\n\n2. `get_entity()` (lines ~834-855): Identical temporal, entities, and provenance extraction logic. Then appends a plain dict with uuid, fact, name, temporal, entities, provenance.\n\nThe refactoring extracts a private helper `_build_edge_dict(self, e) -> dict` that returns `{uuid, fact, name, temporal, entities, provenance}`. Both call-sites reuse this dict:\n- `_search_graphiti` maps the dict fields into MemoryResult constructor args (with uuid fallback to str(i) for missing uuid)\n- `get_entity` appends the dict directly into edge_data\n\nExisting tests for both `_search_graphiti` (via TestSearch, TestSearchDeleteRoundtrip) and `get_entity` (via TestGetEntityTemporalMetadata, TestGetEntityNameEntitiesProvenance, TestGetEntityValidOnly) provide comprehensive regression coverage. New tests target the helper directly for edge-case coverage.\n\nThe conftest already provides MockEdge and MockNode dataclasses with all needed attributes (fact, uuid, name, source_node, target_node, episodes, valid_at, invalid_at).",
+  "analysis": "cleanup_stale_edges.py:run_cleanup() has a correctness bug at lines 117-123: os.environ['CONFIG_PATH'] is mutated at line 119, then FusedMemoryConfig(), MemoryService(), and CleanupManager() are all constructed at lines 121-123 BEFORE the try block. If any constructor raises, execution never enters the try/finally, so (1) CONFIG_PATH is never restored (env var leak) and (2) if MemoryService succeeded but CleanupManager failed, service.close() is never called (resource leak). verify_zombie_edges.py:run_verify_zombie_edges() (lines 152-179) already has the correct pattern: service=None sentinel before try, all env var mutation and construction inside try, guarded 'if service is not None: await service.close()' in finally. The fix is a straightforward structural backport. Existing tests in test_cleanup_stale_edges.py (TestRunCleanup class, lines 283-391) mock at the module level and test the happy path and cleanup-raises-error path, but do NOT test constructor failures \u2014 so the env var leak was never caught. test_verify_zombie_edges.py has TestRunVerifyZombieEdgesEnvVarRestore (lines 478-537) with the exact test pattern to mirror.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write tests for _build_edge_dict helper in a new TestBuildEdgeDict class: (1) full edge with all fields populated (uuid, fact, name, valid_at, invalid_at, source_node, target_node, episodes) returns correct dict with all six keys; (2) minimal edge with no temporal/nodes/episodes returns temporal=None, entities=[], provenance=[]; (3) edge with only valid_at set returns temporal dict with valid_at set and invalid_at=None; (4) edge with only source_node (no target_node) returns single-element entities list; (5) edge with no uuid attr returns uuid=None; (6) edge object without fact attr falls back to str(edge) for the fact value.",
+      "description": "Write failing test class TestRunCleanupEnvVarRestore with test_restores_env_var_when_config_constructor_fails: save original CONFIG_PATH, patch FusedMemoryConfig to raise RuntimeError('config error'), call run_cleanup(uuids=['test-uuid'], config_path='test.yaml') expecting RuntimeError, assert os.environ.get('CONFIG_PATH') == original. Wrap assertion in try/finally safety net to restore CONFIG_PATH if test itself fails. Mirror exact pattern from TestRunVerifyZombieEdgesEnvVarRestore.test_restores_env_var_when_config_constructor_fails (test_verify_zombie_edges.py lines 482-508). This WILL FAIL because env var mutation at line 119 is outside the try block.",
       "status": "done",
-      "commit": "6882120"
+      "commit": "645c8f7"
     },
     {
       "id": "step-2",
-      "type": "impl",
-      "description": "Implement _build_edge_dict(self, e) -> dict as a private method on MemoryService, placed between _search_graphiti and get_entity. Extracts uuid via getattr(e, 'uuid', None), fact via getattr(e, 'fact', str(e)), name via getattr(e, 'name', None), builds temporal dict from valid_at/invalid_at (None when both absent), extracts entity names from source_node/target_node, and builds provenance from episodes. Returns dict with keys: uuid, fact, name, temporal, entities, provenance. Run new TestBuildEdgeDict tests to verify they pass.",
+      "type": "test",
+      "description": "Add test_restores_env_var_when_service_constructor_fails to TestRunCleanupEnvVarRestore: patch FusedMemoryConfig (success) and MemoryService (raises RuntimeError('service error')), call run_cleanup(config_path='test.yaml') expecting RuntimeError, assert CONFIG_PATH restored. Mirror pattern from test_verify_zombie_edges.py lines 510-537. This WILL FAIL for the same structural reason as step-1.",
       "status": "done",
-      "commit": "e922dd5"
+      "commit": "0618e44"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Run existing TestSearch and TestSearchDeleteRoundtrip test classes to confirm green baseline before refactoring _search_graphiti. These tests exercise the full edge-to-MemoryResult conversion path including temporal, entities, and provenance fields.",
+      "description": "Write failing test class TestRunCleanupServiceLifecycle with test_closes_service_when_cleanup_manager_constructor_fails: patch FusedMemoryConfig (success), MemoryService (success, returns mock_service with AsyncMock close), CleanupManager (raises RuntimeError). Call run_cleanup() expecting RuntimeError. Assert mock_service.close.assert_awaited_once(). This WILL FAIL because in current code CleanupManager() at line 123 raises before the try block, so service.close() in finally never executes.",
       "status": "done",
-      "commit": "e922dd5"
+      "commit": "1b9c9b4"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Refactor _search_graphiti() to use _build_edge_dict: replace the ~20 lines of inline temporal/entities/provenance extraction (lines ~727-748) with `d = self._build_edge_dict(edge)`. Map the returned dict fields into the MemoryResult constructor: id=d['uuid'] or str(i), content=d['fact'], temporal=d['temporal'], entities=d['entities'], provenance=d['provenance']. Keep the rank-based score computation inline. Run TestSearch and TestSearchDeleteRoundtrip tests to confirm no regression.",
+      "description": "Restructure run_cleanup() in cleanup_stale_edges.py to match the verify_zombie_edges pattern: (1) Add 'service = None' before the try block, (2) Move 'if config_path is not None: os.environ[\"CONFIG_PATH\"] = config_path' inside the try block, (3) Move FusedMemoryConfig(), MemoryService(), CleanupManager() inside the try block, (4) Change finally to: 'if service is not None: await service.close()'. All three failing tests from steps 1-3 should now pass, and all existing TestRunCleanup tests remain green since they mock constructors at module level.",
       "status": "done",
-      "commit": "4a4c464"
+      "commit": "84c2917"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Run existing TestGetEntityTemporalMetadata, TestGetEntityNameEntitiesProvenance, and TestGetEntityValidOnly test classes to confirm green baseline before refactoring get_entity.",
+      "description": "Run the full test_cleanup_stale_edges.py test suite to verify no regressions: all existing TestRunCleanup tests (test_loads_config_and_runs_cleanup, test_closes_service_on_success, test_closes_service_on_error, test_passes_dry_run_flag), all TestCleanupManager tests, all TestQueryEdgesByTimeRange and TestBulkRemoveEdges tests, plus all new TestRunCleanupEnvVarRestore and TestRunCleanupServiceLifecycle tests pass.",
       "status": "done",
-      "commit": "4a4c464"
-    },
-    {
-      "id": "step-6",
-      "type": "impl",
-      "description": "Refactor get_entity() to use _build_edge_dict: replace the ~20 lines of inline edge extraction (lines ~834-855 and the edge_data.append dict construction) with `edge_data.append(self._build_edge_dict(e))`. The helper returns a dict with the exact same keys (uuid, fact, name, temporal, entities, provenance). Run all TestGetEntity* tests to confirm no regression.",
-      "status": "done",
-      "commit": "cbc53ed"
-    },
-    {
-      "id": "step-7",
-      "type": "test",
-      "description": "Run the full test_memory_service.py test suite to confirm all existing tests still pass after both refactorings. This is the final regression check covering search, get_entity, delete, episode, close, and all other scenarios.",
-      "status": "done",
-      "commit": "cbc53ed"
+      "commit": "84c2917"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Helper returns a plain dict, not a dataclass or NamedTuple",
-      "rationale": "get_entity() already returns edge data as plain dicts in its response. Using the same format means the helper's return value can be appended directly to edge_data without conversion. A typed class would add overhead with no consumer benefit."
+      "decision": "Exact structural mirror of verify_zombie_edges pattern rather than an alternative fix",
+      "rationale": "The task explicitly asks to 'backport the same fix'. Using the identical pattern (service=None sentinel, all construction inside try, guarded close in finally) ensures consistency across maintenance entrypoints and makes the codebase easier to audit."
     },
     {
-      "decision": "Helper is a regular instance method (_build_edge_dict(self, e)), not a @staticmethod",
-      "rationale": "Matches the task description signature. While the current implementation doesn't need self, keeping it as an instance method follows the convention in MemoryService where all private methods are instance methods (e.g., _search_graphiti, _search_mem0) and leaves room for future use of self (e.g., logging)."
+      "decision": "Do NOT wrap service.close() in try/except for this task",
+      "rationale": "verify_zombie_edges.py doesn't wrap close() in try/except either. Adding it only in cleanup_stale_edges would create an inconsistency between the two entrypoints. If this defensive pattern is adopted, it should be done in both files together as a separate task. The task description says 'optionally' for this."
     },
     {
-      "decision": "uuid default is None in the helper, not a fallback index",
-      "rationale": "The index-based uuid fallback (str(i)) is specific to _search_graphiti's rank-ordered iteration context. The helper should return the raw edge uuid or None. The _search_graphiti call-site handles the fallback: `id=d['uuid'] or str(i)`. This keeps the helper generic and reusable."
+      "decision": "Write env-var tests with try/finally safety cleanup in the test itself",
+      "rationale": "The verify_zombie_edges tests wrap their CONFIG_PATH assertions in try/finally to ensure the env var is restored even if the test assertion fails. This prevents test pollution across the test session. We mirror the same defensive pattern."
     },
     {
-      "decision": "fact default uses str(e) in the helper, matching both existing call-sites",
-      "rationale": "Both _search_graphiti and get_entity use getattr(edge, 'fact', str(edge)) as the fallback. The helper preserves this exact behavior for backward compatibility."
-    },
-    {
-      "decision": "Helper placed as a method on MemoryService class, not extracted to a utility module",
-      "rationale": "The helper is only used by two methods within MemoryService. Extracting to a utility module would be over-engineering for two call-sites. If a third consumer appears later, it can be promoted."
+      "decision": "Separate test class for service lifecycle (TestRunCleanupServiceLifecycle) vs env var (TestRunCleanupEnvVarRestore)",
+      "rationale": "The env var tests and service lifecycle test exercise different aspects of the same structural fix. Separate classes make the test intent clear and mirror the naming convention in test_verify_zombie_edges.py where env var tests get their own class."
     }
   ],
   "reuse": [
     {
-      "what": "MockEdge and MockNode dataclasses from conftest",
-      "where": "fused-memory/tests/conftest.py (lines 19-38)",
-      "how": "Used to construct test edge objects with all relevant attributes (fact, uuid, name, source_node, target_node, episodes, valid_at, invalid_at). Already used by existing get_entity and search tests \u2014 reuse directly in new TestBuildEdgeDict tests."
+      "what": "TestRunVerifyZombieEdgesEnvVarRestore test pattern",
+      "where": "fused-memory/tests/test_verify_zombie_edges.py lines 478-537",
+      "how": "Mirror the two test methods (test_restores_env_var_when_config_constructor_fails, test_restores_env_var_when_service_constructor_fails) adapting import paths and function names from verify_zombie_edges to cleanup_stale_edges. Patch paths change from 'fused_memory.maintenance.verify_zombie_edges.*' to 'fused_memory.maintenance.cleanup_stale_edges.*'."
     },
     {
-      "what": "service fixture with mocked backends",
-      "where": "fused-memory/tests/test_memory_service.py (lines 12-39)",
-      "how": "Provides a MemoryService instance with mocked graphiti/mem0/queue backends. New _build_edge_dict tests call service._build_edge_dict() through this fixture for consistency with existing test patterns."
+      "what": "run_verify_zombie_edges entrypoint structure (the correct pattern)",
+      "where": "fused-memory/src/fused_memory/maintenance/verify_zombie_edges.py lines 152-179",
+      "how": "Backport the service=None sentinel, try-wrapped construction, and guarded 'if service is not None: await service.close()' pattern directly into run_cleanup(). The env-var save/restore logic in the finally block is already identical between the two files."
     },
     {
-      "what": "Existing regression tests for _search_graphiti and get_entity",
-      "where": "fused-memory/tests/test_memory_service.py (TestSearch*, TestGetEntity* classes)",
-      "how": "Serve as regression guards during refactoring steps 3-6. No need to duplicate these tests \u2014 verify they remain green after each refactoring step."
-    },
-    {
-      "what": "Edge extraction pattern from _search_graphiti lines 727-748",
-      "where": "fused-memory/src/fused_memory/services/memory_service.py",
-      "how": "The exact logic (temporal dict construction, entity name extraction, episode provenance) is extracted verbatim into the new _build_edge_dict helper. No logic changes, pure extraction."
+      "what": "Existing TestRunCleanup mock and patch patterns",
+      "where": "fused-memory/tests/test_cleanup_stale_edges.py lines 283-391",
+      "how": "Follow the same patch target paths (fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig, .MemoryService, .CleanupManager) and AsyncMock setup patterns used by existing entrypoint tests."
     }
   ],
-  "_session_id": "131-0b40c33e",
-  "_created_at": "2026-03-24T22:38:52.988528+00:00"
+  "_session_id": "139-7689e980",
+  "_created_at": "2026-03-24T22:56:48.683400+00:00"
 }
