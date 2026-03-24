@@ -307,7 +307,7 @@ class TestRunVerifyZombieEdges:
             mock_verifier.cleanup = AsyncMock(return_value=mock_result)
             mock_verifier_cls.return_value = mock_verifier
 
-            await run_verify_zombie_edges()
+            await run_verify_zombie_edges(uuids=['uuid-x'])
 
         mock_service.close.assert_awaited_once()
 
@@ -330,7 +330,7 @@ class TestRunVerifyZombieEdges:
             mock_verifier_cls.return_value = mock_verifier
 
             with pytest.raises(RuntimeError, match='falkordb unavailable'):
-                await run_verify_zombie_edges()
+                await run_verify_zombie_edges(uuids=['uuid-x'])
 
         mock_service.close.assert_awaited_once()
 
@@ -356,9 +356,61 @@ class TestRunVerifyZombieEdges:
             mock_verifier.cleanup = AsyncMock(return_value=mock_result)
             mock_verifier_cls.return_value = mock_verifier
 
-            await run_verify_zombie_edges(dry_run=True)
+            await run_verify_zombie_edges(uuids=['e1'], dry_run=True)
 
         call_kwargs = mock_verifier.cleanup.call_args
         assert call_kwargs is not None
         _, kwargs = call_kwargs
         assert kwargs.get('dry_run') is True
+
+
+# ---------------------------------------------------------------------------
+# step-9: REVIEW FIX 1 — placeholder UUIDs
+# ---------------------------------------------------------------------------
+
+
+class TestTaskUuidsConstant:
+    """TASK_111_ZOMBIE_UUIDS must be an empty list (real UUIDs are unconfirmed)."""
+
+    def test_constant_is_empty_list(self):
+        """TASK_111_ZOMBIE_UUIDS must be an empty list, not synthetic placeholders."""
+        from fused_memory.maintenance.verify_zombie_edges import TASK_111_ZOMBIE_UUIDS
+
+        assert TASK_111_ZOMBIE_UUIDS == [], (
+            'TASK_111_ZOMBIE_UUIDS must be empty: real UUIDs are unconfirmed. '
+            'Populate via --uuids CLI flag or update the constant after extracting from FalkorDB.'
+        )
+
+
+class TestRunVerifyZombieEdgesEmptyGuard:
+    """run_verify_zombie_edges raises ValueError when the resolved UUID list is empty."""
+
+    @pytest.mark.asyncio
+    async def test_raises_value_error_when_uuids_empty_and_constant_empty(self):
+        """ValueError fires before service construction when resolved uuids is empty."""
+        from fused_memory.maintenance.verify_zombie_edges import run_verify_zombie_edges
+
+        # Patch FusedMemoryConfig and MemoryService to ensure error fires before them
+        with (
+            patch('fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig') as mock_cfg_cls,
+            patch('fused_memory.maintenance.verify_zombie_edges.MemoryService') as mock_svc_cls,
+        ):
+            with pytest.raises(ValueError, match='--uuids'):
+                # No uuids arg, constant is empty → ValueError
+                await run_verify_zombie_edges()
+
+            # Service should NOT have been constructed
+            mock_svc_cls.assert_not_called()
+            mock_cfg_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raises_value_error_when_explicit_empty_list_passed(self):
+        """ValueError fires when caller explicitly passes an empty list."""
+        from fused_memory.maintenance.verify_zombie_edges import run_verify_zombie_edges
+
+        with (
+            patch('fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig'),
+            patch('fused_memory.maintenance.verify_zombie_edges.MemoryService'),
+        ):
+            with pytest.raises(ValueError, match='--uuids'):
+                await run_verify_zombie_edges(uuids=[])

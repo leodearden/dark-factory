@@ -22,25 +22,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 TASK_111_ZOMBIE_UUIDS: list[str] = [
-    '3f0bf796',
-    '85603be3',
-    'a1b2c3d4',
-    'e5f6a7b8',
-    'c9d0e1f2',
-    '12345678',
-    '9abcdef0',
-    '11223344',
-    '55667788',
-    '99aabbcc',
-    'ddeeff00',
-    '11223355',
-    '66778899',
-    'aabbccdd',
-    'eeff0011',
-    '22334455',
-    '66778800',
-    '99aabbdd',
-    'cceeff11',
+    # The real UUIDs from Task 111 were never confirmed.
+    # This constant is intentionally empty to prevent accidental use of placeholder values.
+    #
+    # To use this script:
+    #   1. Extract the real zombie edge UUIDs from FalkorDB first, OR
+    #   2. Pass them via the --uuids CLI flag:
+    #      python -m fused_memory.maintenance.verify_zombie_edges --dry-run --uuids <uuid1> <uuid2> ...
 ]
 
 
@@ -148,6 +136,12 @@ async def run_verify_zombie_edges(
 
     if uuids is None:
         uuids = TASK_111_ZOMBIE_UUIDS
+
+    if not uuids:
+        raise ValueError(
+            'No UUIDs to process. TASK_111_ZOMBIE_UUIDS is empty because the real UUIDs '
+            'were never confirmed. Provide them via --uuids <uuid1> <uuid2> ...'
+        )
 
     old_config_path = os.environ.get('CONFIG_PATH')
     if config_path is not None:
