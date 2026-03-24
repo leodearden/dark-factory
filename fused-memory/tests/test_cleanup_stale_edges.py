@@ -425,3 +425,31 @@ class TestRunCleanupEnvVarRestore:
                 os.environ.pop('CONFIG_PATH', None)
             else:
                 os.environ['CONFIG_PATH'] = original
+
+    @pytest.mark.asyncio
+    async def test_restores_env_var_when_service_constructor_fails(self):
+        """CONFIG_PATH is restored when MemoryService() raises."""
+        import os
+
+        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
+
+        original = os.environ.get('CONFIG_PATH')
+        try:
+            with (
+                patch('fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig'),
+                patch(
+                    'fused_memory.maintenance.cleanup_stale_edges.MemoryService',
+                    side_effect=RuntimeError('service error'),
+                ),
+                pytest.raises(RuntimeError, match='service error'),
+            ):
+                await run_cleanup(
+                    config_path='test.yaml',
+                )
+            # CONFIG_PATH must be restored to its original value
+            assert os.environ.get('CONFIG_PATH') == original
+        finally:
+            if original is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = original
