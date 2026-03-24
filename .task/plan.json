@@ -1,88 +1,125 @@
 {
-  "task_id": "139",
-  "title": "Backport env-var-leak fix from verify_zombie_edges to cleanup_stale_edges",
+  "task_id": "143",
+  "title": "Backport env-var-leak fix from cleanup_stale_edges to run_reindex",
   "files": [
-    "fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py",
-    "fused-memory/tests/test_cleanup_stale_edges.py"
+    "fused-memory/src/fused_memory/maintenance/reindex.py",
+    "fused-memory/tests/test_reindex.py"
   ],
   "modules": [
     "fused-memory/src/fused_memory/maintenance",
     "fused-memory/tests"
   ],
-  "analysis": "cleanup_stale_edges.py:run_cleanup() has a correctness bug at lines 117-123: os.environ['CONFIG_PATH'] is mutated at line 119, then FusedMemoryConfig(), MemoryService(), and CleanupManager() are all constructed at lines 121-123 BEFORE the try block. If any constructor raises, execution never enters the try/finally, so (1) CONFIG_PATH is never restored (env var leak) and (2) if MemoryService succeeded but CleanupManager failed, service.close() is never called (resource leak). verify_zombie_edges.py:run_verify_zombie_edges() (lines 152-179) already has the correct pattern: service=None sentinel before try, all env var mutation and construction inside try, guarded 'if service is not None: await service.close()' in finally. The fix is a straightforward structural backport. Existing tests in test_cleanup_stale_edges.py (TestRunCleanup class, lines 283-391) mock at the module level and test the happy path and cleanup-raises-error path, but do NOT test constructor failures \u2014 so the env var leak was never caught. test_verify_zombie_edges.py has TestRunVerifyZombieEdgesEnvVarRestore (lines 478-537) with the exact test pattern to mirror.",
+  "analysis": "run_reindex() in reindex.py has the same structural bug that Task 139 fixed in cleanup_stale_edges.py. Two concrete issues: (1) os.environ['CONFIG_PATH'] is mutated at line 156 outside any try block with no save/restore \u2014 if any subsequent constructor (FusedMemoryConfig at line 158, MemoryService at line 159, OpenAIEmbedder at line 172, ReindexManager at line 174) raises, CONFIG_PATH is permanently corrupted. (2) All four constructors run at lines 158-178 BEFORE the try block at line 180 \u2014 if MemoryService succeeds at line 159 but OpenAIEmbedder (line 172) or ReindexManager (line 174) raises, execution never enters the try block so the finally block never runs, meaning service.close() is never called and the MemoryService is leaked. The fix mirrors the established pattern in cleanup_stale_edges.run_cleanup(): save old_config_path before try, set service=None sentinel, move all constructor calls and os.environ mutation inside the try block, and conditionally close service + restore CONFIG_PATH in finally. run_reindex() has more constructors than run_cleanup() (adding OpenAIEmbedderConfig, OpenAIEmbedder, and ReindexManager vs just CleanupManager), so the test coverage is expanded to cover each additional constructor failure point. The existing test_reindex.py TestRunReindex class (lines 791-915) tests happy path and runtime errors but has NO tests for constructor-failure env-var restoration or service lifecycle \u2014 this is the gap we fill.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing test class TestRunCleanupEnvVarRestore with test_restores_env_var_when_config_constructor_fails: save original CONFIG_PATH, patch FusedMemoryConfig to raise RuntimeError('config error'), call run_cleanup(uuids=['test-uuid'], config_path='test.yaml') expecting RuntimeError, assert os.environ.get('CONFIG_PATH') == original. Wrap assertion in try/finally safety net to restore CONFIG_PATH if test itself fails. Mirror exact pattern from TestRunVerifyZombieEdgesEnvVarRestore.test_restores_env_var_when_config_constructor_fails (test_verify_zombie_edges.py lines 482-508). This WILL FAIL because env var mutation at line 119 is outside the try block.",
+      "description": "Write failing test class TestRunReindexEnvVarRestore with test_restores_env_var_when_config_constructor_fails: save original CONFIG_PATH, patch fused_memory.maintenance.reindex.FusedMemoryConfig to raise RuntimeError('config error'), call run_reindex(config_path='test.yaml') expecting RuntimeError, assert os.environ.get('CONFIG_PATH') == original. Wrap assertion in try/finally safety net to restore CONFIG_PATH if test itself fails. Mirror exact pattern from TestRunCleanupEnvVarRestore.test_restores_env_var_when_config_constructor_fails (test_cleanup_stale_edges.py lines 402-427). This WILL FAIL because env var mutation at line 156 is outside the try block with no restore logic.",
       "status": "done",
-      "commit": "645c8f7"
+      "commit": "ce9c271"
     },
     {
       "id": "step-2",
       "type": "test",
-      "description": "Add test_restores_env_var_when_service_constructor_fails to TestRunCleanupEnvVarRestore: patch FusedMemoryConfig (success) and MemoryService (raises RuntimeError('service error')), call run_cleanup(config_path='test.yaml') expecting RuntimeError, assert CONFIG_PATH restored. Mirror pattern from test_verify_zombie_edges.py lines 510-537. This WILL FAIL for the same structural reason as step-1.",
+      "description": "Write failing test class TestRunReindexServiceLifecycle with test_closes_service_when_manager_constructor_fails: patch FusedMemoryConfig (success with embedder config attrs), MemoryService (success, returns mock_service with AsyncMock close), OpenAIEmbedder (success), ReindexManager (raises RuntimeError('manager error')). Call run_reindex() expecting RuntimeError. Assert mock_service.close.assert_awaited_once(). This WILL FAIL because ReindexManager() at line 174 raises before the try block at line 180, so the finally at line 194 never executes and service.close() is never called.",
       "status": "done",
-      "commit": "0618e44"
+      "commit": "ce9c271"
     },
     {
       "id": "step-3",
-      "type": "test",
-      "description": "Write failing test class TestRunCleanupServiceLifecycle with test_closes_service_when_cleanup_manager_constructor_fails: patch FusedMemoryConfig (success), MemoryService (success, returns mock_service with AsyncMock close), CleanupManager (raises RuntimeError). Call run_cleanup() expecting RuntimeError. Assert mock_service.close.assert_awaited_once(). This WILL FAIL because in current code CleanupManager() at line 123 raises before the try block, so service.close() in finally never executes.",
+      "type": "impl",
+      "description": "Restructure run_reindex() in reindex.py to match the cleanup_stale_edges pattern: (1) Add 'old_config_path = os.environ.get(\"CONFIG_PATH\")' before try, (2) Add 'service = None' sentinel before try, (3) Move 'if config_path is not None: os.environ[\"CONFIG_PATH\"] = config_path' inside try, (4) Move all constructor calls (FusedMemoryConfig, MemoryService, embedder config setup, OpenAIEmbedder, ReindexManager) inside try, (5) Change finally to: 'if service is not None: await service.close()' plus CONFIG_PATH restore logic (if config_path is not None: pop if old was None, else restore old value). Steps 1-2 failing tests now pass, and all existing TestRunReindex tests remain green.",
       "status": "done",
-      "commit": "1b9c9b4"
+      "commit": "3d7c4f4"
     },
     {
       "id": "step-4",
-      "type": "impl",
-      "description": "Restructure run_cleanup() in cleanup_stale_edges.py to match the verify_zombie_edges pattern: (1) Add 'service = None' before the try block, (2) Move 'if config_path is not None: os.environ[\"CONFIG_PATH\"] = config_path' inside the try block, (3) Move FusedMemoryConfig(), MemoryService(), CleanupManager() inside the try block, (4) Change finally to: 'if service is not None: await service.close()'. All three failing tests from steps 1-3 should now pass, and all existing TestRunCleanup tests remain green since they mock constructors at module level.",
+      "type": "test",
+      "description": "Add test_restores_env_var_when_service_constructor_fails to TestRunReindexEnvVarRestore: patch FusedMemoryConfig (success), MemoryService (raises RuntimeError('service error')), call run_reindex(config_path='test.yaml') expecting RuntimeError, assert CONFIG_PATH restored. Mirror pattern from TestRunCleanupEnvVarRestore.test_restores_env_var_when_service_constructor_fails. Should pass immediately with step-3's implementation.",
       "status": "done",
-      "commit": "84c2917"
+      "commit": "480d171"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Run the full test_cleanup_stale_edges.py test suite to verify no regressions: all existing TestRunCleanup tests (test_loads_config_and_runs_cleanup, test_closes_service_on_success, test_closes_service_on_error, test_passes_dry_run_flag), all TestCleanupManager tests, all TestQueryEdgesByTimeRange and TestBulkRemoveEdges tests, plus all new TestRunCleanupEnvVarRestore and TestRunCleanupServiceLifecycle tests pass.",
+      "description": "Add test_restores_env_var_when_embedder_constructor_fails to TestRunReindexEnvVarRestore: patch FusedMemoryConfig (success with embedder config attrs), MemoryService (success), OpenAIEmbedder (raises RuntimeError('embedder error')), call run_reindex(config_path='test.yaml') expecting RuntimeError, assert CONFIG_PATH restored. This is reindex-specific \u2014 cleanup_stale_edges has no embedder constructor. Should pass immediately.",
       "status": "done",
-      "commit": "84c2917"
+      "commit": "480d171"
+    },
+    {
+      "id": "step-6",
+      "type": "test",
+      "description": "Add test_restores_env_var_when_manager_constructor_fails to TestRunReindexEnvVarRestore: patch FusedMemoryConfig (success), MemoryService (success), OpenAIEmbedder (success), ReindexManager (raises RuntimeError('manager error')), call run_reindex(config_path='test.yaml') expecting RuntimeError, assert CONFIG_PATH restored. Should pass immediately.",
+      "status": "done",
+      "commit": "480d171"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Add test_closes_service_when_embedder_constructor_fails to TestRunReindexServiceLifecycle: patch FusedMemoryConfig (success with embedder config attrs), MemoryService (success, returns mock_service), OpenAIEmbedder (raises RuntimeError('embedder error')). Call run_reindex() expecting RuntimeError. Assert mock_service.close.assert_awaited_once(). Should pass immediately with step-3's implementation.",
+      "status": "done",
+      "commit": "480d171"
+    },
+    {
+      "id": "step-8",
+      "type": "test",
+      "description": "Add test_skips_close_when_service_never_created to TestRunReindexServiceLifecycle: patch FusedMemoryConfig to raise RuntimeError('config error') \u2014 service is never constructed. Call run_reindex() expecting RuntimeError. Assert no AttributeError occurs and the exception propagates cleanly. Verifies the service=None sentinel guard works correctly when MemoryService was never instantiated.",
+      "status": "done",
+      "commit": "480d171"
+    },
+    {
+      "id": "step-9",
+      "type": "impl",
+      "description": "Optionally wrap service.close() in try/except per convention (memory id 458388ca): change 'if service is not None: await service.close()' to 'if service is not None: try: await service.close() except Exception: logger.warning(\"Error closing service\", exc_info=True)'. This is a defensive pattern that prevents close() errors from masking the original exception. Run full test suite to verify no regressions.",
+      "status": "done",
+      "commit": "eb25121"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Exact structural mirror of verify_zombie_edges pattern rather than an alternative fix",
-      "rationale": "The task explicitly asks to 'backport the same fix'. Using the identical pattern (service=None sentinel, all construction inside try, guarded close in finally) ensures consistency across maintenance entrypoints and makes the codebase easier to audit."
+      "decision": "Mirror the exact cleanup_stale_edges.run_cleanup() pattern for CONFIG_PATH save/restore and service lifecycle",
+      "rationale": "Task 139 established this as the canonical fix pattern. Using the identical structure (old_config_path save, service=None sentinel, all construction inside try, guarded close + restore in finally) ensures consistency across maintenance entrypoints and makes the codebase easier to audit."
     },
     {
-      "decision": "Do NOT wrap service.close() in try/except for this task",
-      "rationale": "verify_zombie_edges.py doesn't wrap close() in try/except either. Adding it only in cleanup_stale_edges would create an inconsistency between the two entrypoints. If this defensive pattern is adopted, it should be done in both files together as a separate task. The task description says 'optionally' for this."
+      "decision": "Move ALL four constructors (FusedMemoryConfig, MemoryService, OpenAIEmbedder, ReindexManager) inside the try block, not just some",
+      "rationale": "Any constructor that runs after the os.environ mutation must be inside the try block to ensure CONFIG_PATH is restored on failure. Moving all of them keeps the pattern simple and uniform \u2014 there's no cost to wrapping FusedMemoryConfig too, and it exactly matches the cleanup_stale_edges pattern."
     },
     {
-      "decision": "Write env-var tests with try/finally safety cleanup in the test itself",
-      "rationale": "The verify_zombie_edges tests wrap their CONFIG_PATH assertions in try/finally to ensure the env var is restored even if the test assertion fails. This prevents test pollution across the test session. We mirror the same defensive pattern."
+      "decision": "Add reindex-specific tests for embedder constructor failure (not present in cleanup_stale_edges tests)",
+      "rationale": "run_reindex() has two additional constructors (OpenAIEmbedderConfig + OpenAIEmbedder) that run_cleanup() lacks. OpenAIEmbedder failure is the most likely failure point in practice (e.g., missing OPENAI_API_KEY), so it deserves explicit test coverage for both env-var restore and service lifecycle."
     },
     {
-      "decision": "Separate test class for service lifecycle (TestRunCleanupServiceLifecycle) vs env var (TestRunCleanupEnvVarRestore)",
-      "rationale": "The env var tests and service lifecycle test exercise different aspects of the same structural fix. Separate classes make the test intent clear and mirror the naming convention in test_verify_zombie_edges.py where env var tests get their own class."
+      "decision": "Keep service.close() try/except wrapping as a separate optional step (step-9)",
+      "rationale": "The cleanup_stale_edges reference implementation does NOT wrap close() in try/except. The task description marks this as optional per a convention (memory id 458388ca). Implementing it as a separate step keeps the core fix reviewable on its own and avoids creating an inconsistency between the two entrypoints."
+    },
+    {
+      "decision": "Use the same test class naming convention as cleanup_stale_edges: TestRunReindexEnvVarRestore and TestRunReindexServiceLifecycle",
+      "rationale": "Consistent naming with TestRunCleanupEnvVarRestore and TestRunCleanupServiceLifecycle makes it obvious these are the backported equivalents and helps with test discovery."
     }
   ],
   "reuse": [
     {
-      "what": "TestRunVerifyZombieEdgesEnvVarRestore test pattern",
-      "where": "fused-memory/tests/test_verify_zombie_edges.py lines 478-537",
-      "how": "Mirror the two test methods (test_restores_env_var_when_config_constructor_fails, test_restores_env_var_when_service_constructor_fails) adapting import paths and function names from verify_zombie_edges to cleanup_stale_edges. Patch paths change from 'fused_memory.maintenance.verify_zombie_edges.*' to 'fused_memory.maintenance.cleanup_stale_edges.*'."
+      "what": "CONFIG_PATH save/restore + service=None sentinel pattern from run_cleanup()",
+      "where": "fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py lines 117-139",
+      "how": "Copy the exact structural pattern: old_config_path = os.environ.get('CONFIG_PATH') before try, service = None before try, all constructors inside try, conditional close + CONFIG_PATH restore in finally. Adapt for reindex's additional constructors (embedder config, OpenAIEmbedder)."
     },
     {
-      "what": "run_verify_zombie_edges entrypoint structure (the correct pattern)",
-      "where": "fused-memory/src/fused_memory/maintenance/verify_zombie_edges.py lines 152-179",
-      "how": "Backport the service=None sentinel, try-wrapped construction, and guarded 'if service is not None: await service.close()' pattern directly into run_cleanup(). The env-var save/restore logic in the finally block is already identical between the two files."
+      "what": "TestRunCleanupEnvVarRestore test pattern",
+      "where": "fused-memory/tests/test_cleanup_stale_edges.py lines 398-455",
+      "how": "Mirror test structure: save original CONFIG_PATH, patch constructor to raise, call run_reindex(config_path='test.yaml'), assert CONFIG_PATH equals original after exception. Wrap in try/finally for test safety. Adapt patch paths from 'fused_memory.maintenance.cleanup_stale_edges.*' to 'fused_memory.maintenance.reindex.*' and add extra patches for OpenAIEmbedder."
     },
     {
-      "what": "Existing TestRunCleanup mock and patch patterns",
-      "where": "fused-memory/tests/test_cleanup_stale_edges.py lines 283-391",
-      "how": "Follow the same patch target paths (fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig, .MemoryService, .CleanupManager) and AsyncMock setup patterns used by existing entrypoint tests."
+      "what": "TestRunCleanupServiceLifecycle test pattern",
+      "where": "fused-memory/tests/test_cleanup_stale_edges.py lines 462-487",
+      "how": "Mirror test structure: patch constructors to succeed up to the failing one, patch the target constructor to raise, assert mock_service.close was awaited. Adapt for reindex's additional constructors and patch paths."
+    },
+    {
+      "what": "Existing TestRunReindex mock setup pattern (mock_config attributes)",
+      "where": "fused-memory/tests/test_reindex.py lines 791-915",
+      "how": "Reuse the same mock_config attribute setup: mock_config.embedder.dimensions = 1536, .providers.openai.api_key = 'test-key', .model = 'text-embedding-3-small'. Use the same patch targets ('fused_memory.maintenance.reindex.FusedMemoryConfig', '.MemoryService', '.OpenAIEmbedder', '.ReindexManager')."
     }
   ],
-  "_session_id": "139-7689e980",
-  "_created_at": "2026-03-24T22:56:48.683400+00:00"
+  "_session_id": "143-31d9e658",
+  "_created_at": "2026-03-24T23:13:18.716646+00:00"
 }
