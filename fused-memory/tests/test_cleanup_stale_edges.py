@@ -497,6 +497,55 @@ class TestRunCleanupEnvVarRestore:
 
 
 # ---------------------------------------------------------------------------
+# step-2 (task-146): run_cleanup logs WARNING when service.close() raises
+# ---------------------------------------------------------------------------
+
+
+class TestRunCleanupCloseWarning:
+    """run_cleanup() logs a WARNING when service.close() raises in the finally block."""
+
+    @pytest.mark.asyncio
+    async def test_logs_warning_when_close_raises(self, caplog):
+        """A WARNING containing the function name is logged when service.close() raises."""
+        import logging
+
+        from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
+
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+        mock_service.close = AsyncMock(side_effect=RuntimeError('close error'))
+
+        mock_result = CleanupResult()
+
+        with (
+            patch('fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig'),
+            patch(
+                'fused_memory.maintenance.cleanup_stale_edges.MemoryService',
+                return_value=mock_service,
+            ),
+            patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.cleanup = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
+
+            with caplog.at_level(
+                logging.WARNING,
+                logger='fused_memory.maintenance.cleanup_stale_edges',
+            ):
+                try:
+                    await run_cleanup()
+                except RuntimeError:
+                    pass  # close() error propagates with current (unfixed) code
+
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            'Error closing service during run_cleanup cleanup' in m
+            for m in warning_messages
+        ), f'Expected warning about close() failure, got: {warning_messages}'
+
+
+# ---------------------------------------------------------------------------
 # step-3: run_cleanup service lifecycle — close() when CleanupManager raises
 # ---------------------------------------------------------------------------
 
