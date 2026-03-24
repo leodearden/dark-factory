@@ -150,14 +150,15 @@ async def run_verify_zombie_edges(
         )
 
     old_config_path = os.environ.get('CONFIG_PATH')
-    if config_path is not None:
-        os.environ['CONFIG_PATH'] = config_path
-
-    config = FusedMemoryConfig()
-    service = MemoryService(config)
-    verifier = ZombieEdgeVerifier(backend=service.graphiti)
-
+    service = None
     try:
+        if config_path is not None:
+            os.environ['CONFIG_PATH'] = config_path
+
+        config = FusedMemoryConfig()
+        service = MemoryService(config)
+        verifier = ZombieEdgeVerifier(backend=service.graphiti)
+
         await service.initialize()
         result = await verifier.cleanup(uuids=uuids, dry_run=dry_run)
         logger.info(
@@ -169,7 +170,8 @@ async def run_verify_zombie_edges(
         )
         return result
     finally:
-        await service.close()
+        if service is not None:
+            await service.close()
         if config_path is not None:
             if old_config_path is None:
                 os.environ.pop('CONFIG_PATH', None)

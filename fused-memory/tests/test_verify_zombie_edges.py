@@ -468,3 +468,68 @@ class TestZombieEdgeVerifierCleanupWarning:
                    for m in warning_messages), (
             f'Expected a warning about undeletable edges, got: {warning_messages}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-13: REVIEW FIX 3 — env var leak
+# ---------------------------------------------------------------------------
+
+
+class TestRunVerifyZombieEdgesEnvVarRestore:
+    """run_verify_zombie_edges() restores CONFIG_PATH even when constructors raise."""
+
+    @pytest.mark.asyncio
+    async def test_restores_env_var_when_config_constructor_fails(self):
+        """CONFIG_PATH is restored when FusedMemoryConfig() raises."""
+        import os
+
+        from fused_memory.maintenance.verify_zombie_edges import run_verify_zombie_edges
+
+        original = os.environ.get('CONFIG_PATH')
+        try:
+            with patch(
+                'fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig',
+                side_effect=RuntimeError('config error'),
+            ):
+                with pytest.raises(RuntimeError, match='config error'):
+                    await run_verify_zombie_edges(
+                        uuids=['test-uuid'],
+                        config_path='test.yaml',
+                    )
+            # CONFIG_PATH must be restored to its original value
+            assert os.environ.get('CONFIG_PATH') == original
+        finally:
+            # Safety: ensure test cleanup regardless
+            if original is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = original
+
+    @pytest.mark.asyncio
+    async def test_restores_env_var_when_service_constructor_fails(self):
+        """CONFIG_PATH is restored when MemoryService() raises."""
+        import os
+
+        from fused_memory.maintenance.verify_zombie_edges import run_verify_zombie_edges
+
+        original = os.environ.get('CONFIG_PATH')
+        try:
+            with (
+                patch('fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig'),
+                patch(
+                    'fused_memory.maintenance.verify_zombie_edges.MemoryService',
+                    side_effect=RuntimeError('service error'),
+                ),
+            ):
+                with pytest.raises(RuntimeError, match='service error'):
+                    await run_verify_zombie_edges(
+                        uuids=['test-uuid'],
+                        config_path='test.yaml',
+                    )
+            # CONFIG_PATH must be restored to its original value
+            assert os.environ.get('CONFIG_PATH') == original
+        finally:
+            if original is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = original
