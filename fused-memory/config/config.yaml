@@ -5,6 +5,8 @@ server:
   transport: "http"
   host: "0.0.0.0"
   port: 8002
+  stateless_http: true
+  json_response: true
 
 llm:
   provider: "openai"

@@ -181,10 +181,21 @@ async def run_server():
     elif transport == 'sse':
         await mcp.run_sse_async()
     elif transport == 'http':
+        import uvicorn
+
         display_host = 'localhost' if config.server.host == '0.0.0.0' else config.server.host
         logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')
         configure_uvicorn_logging()
-        await mcp.run_streamable_http_async()
+        starlette_app = mcp.streamable_http_app()
+        uv_config = uvicorn.Config(
+            starlette_app,
+            host=config.server.host,
+            port=config.server.port,
+            log_level='info',
+            timeout_keep_alive=config.server.keepalive_timeout,
+        )
+        server = uvicorn.Server(uv_config)
+        await server.serve()
     else:
         raise ValueError(f'Unsupported transport: {transport}')
 

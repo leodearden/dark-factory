@@ -178,7 +178,27 @@ def create_mcp_server(
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health_check(request: Request) -> JSONResponse:
-        return JSONResponse({"status": "ok"})
+        import asyncio
+
+        graphiti_ok = False
+        mem0_ok = False
+        try:
+            async with asyncio.timeout(5):
+                await memory_service.graphiti.list_graphs()
+                graphiti_ok = True
+        except Exception:
+            pass
+        try:
+            async with asyncio.timeout(5):
+                memory_service.mem0.list_projects()
+                mem0_ok = True
+        except Exception:
+            pass
+
+        ok = graphiti_ok and mem0_ok
+        body = {"status": "ok" if ok else "degraded",
+                "graphiti": graphiti_ok, "mem0": mem0_ok}
+        return JSONResponse(body, status_code=200 if ok else 503)
 
     # ------------------------------------------------------------------
     # Write tools

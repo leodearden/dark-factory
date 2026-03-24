@@ -73,6 +73,7 @@ class ServerConfig(BaseModel):
     port: int = Field(default=8000, description='Server port')
     stateless_http: bool = Field(default=False, description='Stateless HTTP mode (no sessions)')
     json_response: bool = Field(default=False, description='JSON responses instead of SSE')
+    keepalive_timeout: int = Field(default=30, description='HTTP keep-alive timeout in seconds')
 
 
 # --- LLM ---
