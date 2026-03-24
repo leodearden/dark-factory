@@ -131,7 +131,11 @@ async def run_cleanup(
         return result
     finally:
         if service is not None:
-            await service.close()
+            # Catch close() errors so CONFIG_PATH restoration below always runs.
+            try:
+                await service.close()
+            except Exception:
+                logger.warning('Error closing service during run_cleanup cleanup', exc_info=True)
         if config_path is not None:
             if old_config_path is None:
                 os.environ.pop('CONFIG_PATH', None)
