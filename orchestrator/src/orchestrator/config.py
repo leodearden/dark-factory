@@ -98,8 +98,7 @@ class ModelsConfig(BaseModel):
     debugger: str = Field(default='opus')
     reviewer: str = Field(default='sonnet')
     merger: str = Field(default='opus')
-    steward: str = Field(default='sonnet')
-    steward_triage: str = Field(default='opus')
+    steward: str = Field(default='opus')
     module_tagger: str = Field(default='sonnet')
 
 
@@ -111,8 +110,7 @@ class BudgetsConfig(BaseModel):
     debugger: float = Field(default=5.0)
     reviewer: float = Field(default=2.0)
     merger: float = Field(default=5.0)
-    steward: float = Field(default=3.0)
-    steward_triage: float = Field(default=10.0)
+    steward: float = Field(default=5.0)
     module_tagger: float = Field(default=2.0)
 
 
@@ -124,8 +122,7 @@ class TurnsConfig(BaseModel):
     debugger: int = Field(default=50)
     reviewer: int = Field(default=30)
     merger: int = Field(default=50)
-    steward: int = Field(default=30)
-    steward_triage: int = Field(default=50)
+    steward: int = Field(default=100)
     module_tagger: int = Field(default=30)
 
 
@@ -137,8 +134,7 @@ class EffortConfig(BaseModel):
     debugger: str = Field(default='high')
     reviewer: str = Field(default='medium')
     merger: str = Field(default='high')
-    steward: str = Field(default='medium')
-    steward_triage: str = Field(default='high')
+    steward: str = Field(default='high')
     module_tagger: str = Field(default='medium')
 
 
@@ -151,7 +147,6 @@ class BackendsConfig(BaseModel):
     reviewer: str = Field(default='claude')
     merger: str = Field(default='claude')
     steward: str = Field(default='claude')
-    steward_triage: str = Field(default='claude')
     module_tagger: str = Field(default='claude')
 
 
@@ -251,6 +246,11 @@ class OrchestratorConfig(BaseSettings):
     max_execute_iterations: int = Field(default=10)
     max_verify_attempts: int = Field(default=5)
     max_review_cycles: int = Field(default=2)
+
+    # Steward lifecycle
+    steward_lifetime_budget: float = Field(default=12.0)
+    steward_max_retries: int = Field(default=3)
+    steward_completion_timeout: float = Field(default=300.0)
 
     # Models, budgets, turns per role
     models: ModelsConfig = Field(default_factory=ModelsConfig)

@@ -1,4 +1,4 @@
-"""Tests for the TaskSteward process steward."""
+"""Tests for the persistent TaskSteward."""
 
 from __future__ import annotations
 
@@ -7,8 +7,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from escalation.models import Escalation
 
 from orchestrator.steward import StewardMetrics, TaskSteward
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -17,13 +22,8 @@ def worktree(tmp_path: Path) -> Path:
     wt.mkdir()
     task_dir = wt / '.task'
     task_dir.mkdir()
-    (task_dir / 'metadata.json').write_text(json.dumps({
-        'task_id': '42', 'title': 'Test', 'description': 'desc',
-    }))
-    (task_dir / 'plan.json').write_text(json.dumps({
-        'task_id': '42', 'title': 'Test',
-        'steps': [{'id': 'step-1', 'status': 'pending'}],
-    }))
+    (task_dir / 'metadata.json').write_text(json.dumps({'task_id': '42'}))
+    (task_dir / 'plan.json').write_text(json.dumps({'steps': []}))
     return wt
 
 
@@ -32,19 +32,17 @@ def mock_config():
     config = MagicMock()
     config.project_root = Path('/tmp/fake-project')
     config.models.steward = 'opus'
-    config.budgets.steward = 15.0
+    config.budgets.steward = 5.0
     config.max_turns.steward = 100
-    config.effort.steward = 'max'
+    config.effort.steward = 'high'
     config.backends.steward = 'claude'
-    config.models.steward_triage = 'opus'
-    config.budgets.steward_triage = 10.0
-    config.max_turns.steward_triage = 50
-    config.effort.steward_triage = 'high'
-    config.backends.steward_triage = 'claude'
     config.escalation.host = 'localhost'
     config.escalation.port = 8102
     config.fused_memory.url = 'http://localhost:8002'
     config.fused_memory.project_id = 'dark_factory'
+    config.steward_lifetime_budget = 12.0
+    config.steward_max_retries = 3
+    config.steward_completion_timeout = 300.0
     return config
 
 
@@ -54,6 +52,8 @@ def mock_queue(tmp_path: Path):
     queue.queue_dir = tmp_path / 'escalations'
     queue.queue_dir.mkdir()
     queue.get_by_task.return_value = []
+    queue.get.return_value = None
+    queue.make_id.return_value = 'esc-42-99'
     return queue
 
 
@@ -68,8 +68,8 @@ def mock_mcp():
 @pytest.fixture
 def mock_briefing():
     briefing = AsyncMock()
-    briefing.build_steward_prompt.return_value = 'Handle this escalation.'
-    briefing.build_steward_triage_prompt.return_value = 'Triage these suggestions.'
+    briefing.build_steward_initial_prompt.return_value = 'Full steward briefing.'
+    briefing.build_steward_continuation_prompt.return_value = 'New escalation details.'
     return briefing
 
 
@@ -86,236 +86,320 @@ def steward(worktree, mock_config, mock_queue, mock_mcp, mock_briefing):
     )
 
 
-class TestNextEscalation:
-    @pytest.mark.asyncio
-    async def test_returns_existing_pending(self, steward, mock_queue):
-        """Should pick up an already-pending escalation without running the watcher."""
-        from escalation.models import Escalation
-
-        esc = Escalation(
-            id='esc-42-1', task_id='42', agent_role='orchestrator',
-            severity='blocking', category='limit_exhausted',
-            summary='execute limit exhausted',
-        )
-        mock_queue.get_by_task.return_value = [esc]
-
-        result = await steward._next_escalation()
-        assert result is not None
-        assert result.id == 'esc-42-1'
-
-    @pytest.mark.asyncio
-    async def test_returns_none_when_watcher_fails(self, steward, mock_queue):
-        """When no pending and watcher exits with error, return None."""
-        mock_queue.get_by_task.return_value = []
-
-        with patch('orchestrator.steward.asyncio.create_subprocess_exec') as mock_exec:
-            proc = AsyncMock()
-            proc.returncode = 1
-            proc.communicate.return_value = (b'', b'error')
-            mock_exec.return_value = proc
-
-            result = await steward._next_escalation()
-            assert result is None
+def _make_result(cost=1.0, turns=5, session_id='sess-abc', success=True):
+    from shared.cli_invoke import AgentResult
+    return AgentResult(
+        success=success,
+        output='done',
+        cost_usd=cost,
+        duration_ms=5000,
+        turns=turns,
+        session_id=session_id,
+    )
 
 
-class TestHandleEscalation:
-    @pytest.mark.asyncio
-    async def test_invokes_agent_and_tracks_metrics(self, steward, mock_queue):
-        from escalation.models import Escalation
+def _make_escalation(**overrides):  # type: ignore[no-untyped-def]
+    defaults: dict = dict(
+        id='esc-42-1',
+        task_id='42',
+        agent_role='orchestrator',
+        severity='blocking',
+        category='limit_exhausted',
+        summary='execute limit exhausted',
+    )
+    defaults.update(overrides)
+    return Escalation(**defaults)  # type: ignore[arg-type]
 
-        esc = Escalation(
-            id='esc-42-1', task_id='42', agent_role='orchestrator',
-            severity='blocking', category='limit_exhausted',
-            summary='execute limit exhausted',
+
+# ---------------------------------------------------------------------------
+# Session Persistence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardSessionPersistence:
+
+    async def test_first_invocation_uses_initial_prompt(self, steward, mock_briefing):
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
         )
 
-        mock_result = MagicMock()
-        mock_result.success = True
-        mock_result.cost_usd = 2.50
-        mock_result.duration_ms = 30000
-        mock_result.turns = 15
-
-        with patch('orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = mock_result
-            mock_queue.get_by_task.return_value = []  # resolved after invocation
-
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(session_id='sess-first')
             await steward._handle_escalation(esc)
 
-            assert steward.metrics.invocations == 1
-            assert steward.metrics.total_cost_usd == 2.50
-            assert steward.metrics.escalations_handled == 1
-            mock_invoke.assert_called_once()
+            mock_briefing.build_steward_initial_prompt.assert_called_once()
+            mock_briefing.build_steward_continuation_prompt.assert_not_called()
+            assert 'resume_session_id' not in mock_invoke.call_args.kwargs
 
-    @pytest.mark.asyncio
-    async def test_passes_correct_role_config(self, steward, mock_config):
-        from escalation.models import Escalation
-
-        esc = Escalation(
-            id='esc-42-1', task_id='42', agent_role='orchestrator',
-            severity='blocking', category='limit_exhausted',
-            summary='test',
+    async def test_second_invocation_uses_resume(self, steward, mock_briefing):
+        steward._session_id = 'sess-first'
+        esc = _make_escalation(id='esc-42-2')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-2', status='resolved', resolution='fixed',
         )
 
-        mock_result = MagicMock()
-        mock_result.success = True
-        mock_result.cost_usd = 0
-        mock_result.duration_ms = 0
-        mock_result.turns = 0
-
-        with patch('orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = mock_result
-            steward.escalation_queue.get_by_task.return_value = []
-
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(session_id='sess-second')
             await steward._handle_escalation(esc)
 
-            call_kwargs = mock_invoke.call_args.kwargs
-            assert call_kwargs['model'] == 'opus'
-            assert call_kwargs['max_turns'] == 100
-            assert call_kwargs['max_budget_usd'] == 15.0
-            assert call_kwargs['effort'] == 'max'
+            mock_briefing.build_steward_continuation_prompt.assert_called_once()
+            mock_briefing.build_steward_initial_prompt.assert_not_called()
+            assert mock_invoke.call_args.kwargs['resume_session_id'] == 'sess-first'
+
+    async def test_session_id_captured_from_result(self, steward):
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(session_id='sess-captured')
+            await steward._handle_escalation(esc)
+
+        assert steward._session_id == 'sess-captured'
 
 
-class TestRunLoop:
-    @pytest.mark.asyncio
+# ---------------------------------------------------------------------------
+# Retry Logic
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardRetryLogic:
+
+    async def test_retry_count_increments_on_unresolved(self, steward):
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = _make_escalation(status='pending')
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result()
+            await steward._handle_escalation(esc)
+
+        assert steward._retry_counts.get('esc-42-1') == 1
+
+    async def test_auto_escalates_after_max_retries(self, steward, mock_config):
+        mock_config.steward_max_retries = 2
+        esc = _make_escalation()
+        steward._retry_counts['esc-42-1'] = 2
+
+        await steward._handle_escalation(esc)
+
+        steward.escalation_queue.submit.assert_called_once()
+        submitted = steward.escalation_queue.submit.call_args[0][0]
+        assert submitted.level == 1
+        assert 'Failed after 2 attempts' in submitted.summary
+
+        steward.escalation_queue.resolve.assert_called_once()
+        assert steward.escalation_queue.resolve.call_args[1].get('dismiss') is True
+
+    async def test_different_escalations_have_independent_counts(self, steward):
+        for esc_id in ('esc-42-1', 'esc-42-2'):
+            esc = _make_escalation(id=esc_id)
+            steward.escalation_queue.get.return_value = _make_escalation(
+                id=esc_id, status='pending',
+            )
+            with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+                mock_invoke.return_value = _make_result()
+                await steward._handle_escalation(esc)
+
+        assert steward._retry_counts == {'esc-42-1': 1, 'esc-42-2': 1}
+
+
+# ---------------------------------------------------------------------------
+# Lifetime Budget
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardLifetimeBudget:
+
+    async def test_tracks_cumulative_cost(self, steward):
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(cost=2.5)
+            await steward._handle_escalation(esc)
+
+        assert steward.metrics.total_cost_usd == pytest.approx(2.5)
+
+    async def test_auto_escalates_on_budget_exhaustion(self, steward, mock_config):
+        mock_config.steward_lifetime_budget = 5.0
+        steward.metrics.total_cost_usd = 6.0
+
+        esc = _make_escalation()
+        await steward._handle_escalation(esc)
+
+        steward.escalation_queue.submit.assert_called_once()
+        submitted = steward.escalation_queue.submit.call_args[0][0]
+        assert submitted.level == 1
+        assert 'budget exhausted' in submitted.summary.lower()
+
+    async def test_per_invocation_budget_capped_by_remaining(self, steward, mock_config):
+        mock_config.steward_lifetime_budget = 12.0
+        mock_config.budgets.steward = 5.0
+        steward.metrics.total_cost_usd = 10.0
+
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(cost=1.5)
+            await steward._handle_escalation(esc)
+            assert mock_invoke.call_args.kwargs['max_budget_usd'] == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
+# Unified Role
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardUnifiedRole:
+
+    async def test_blocking_escalation_uses_worktree_cwd(self, steward, worktree):
+        esc = _make_escalation(category='limit_exhausted')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result()
+            await steward._handle_escalation(esc)
+            assert mock_invoke.call_args.kwargs['cwd'] == worktree
+
+    async def test_suggestions_use_project_root_cwd(self, steward, mock_config):
+        esc = _make_escalation(category='review_suggestions', severity='info', detail='[]')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            category='review_suggestions', status='resolved', resolution='triaged',
+        )
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result()
+            await steward._handle_escalation(esc)
+            assert mock_invoke.call_args.kwargs['cwd'] == mock_config.project_root
+
+    async def test_same_role_for_all_escalation_types(self, steward):
+        from orchestrator.agents.roles import STEWARD
+        for category in ('limit_exhausted', 'review_suggestions', 'review_issues'):
+            esc = _make_escalation(category=category, severity='info')
+            steward.escalation_queue.get.return_value = _make_escalation(
+                category=category, status='resolved', resolution='done',
+            )
+            steward._session_id = None
+            with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+                mock_invoke.return_value = _make_result()
+                await steward._handle_escalation(esc)
+                assert mock_invoke.call_args.kwargs['system_prompt'] == STEWARD.system_prompt
+
+
+# ---------------------------------------------------------------------------
+# Auto-Escalation
+# ---------------------------------------------------------------------------
+
+
+class TestStewardAutoEscalation:
+
+    def test_creates_level1_with_diagnostic(self, steward):
+        esc = _make_escalation()
+        steward._auto_escalate_to_human(esc, 'test reason')
+
+        submitted = steward.escalation_queue.submit.call_args[0][0]
+        assert submitted.level == 1
+        assert submitted.task_id == '42'
+        assert 'test reason' in submitted.summary
+
+    def test_dismisses_original(self, steward):
+        esc = _make_escalation()
+        steward._auto_escalate_to_human(esc, 'test reason')
+
+        call_args = steward.escalation_queue.resolve.call_args
+        assert call_args[0][0] == 'esc-42-1'
+        assert call_args[1].get('dismiss') is True
+
+    def test_tracks_reescalation_metric(self, steward):
+        esc = _make_escalation()
+        steward._auto_escalate_to_human(esc, 'test reason')
+        assert steward.metrics.escalations_reescalated == 1
+
+
+# ---------------------------------------------------------------------------
+# Run Loop
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardRunLoop:
+
     async def test_stops_when_stopped_flag_set(self, steward):
-        """Loop should exit when _stopped is set."""
         steward._stopped = True
         await steward._run_loop()
-        # Should exit immediately without error
 
-    @pytest.mark.asyncio
     async def test_stops_when_no_escalation(self, steward):
-        """Loop should exit when _next_escalation returns None."""
         with patch.object(steward, '_next_escalation', new_callable=AsyncMock) as mock_next:
             mock_next.return_value = None
             await steward._run_loop()
-            mock_next.assert_called_once()
+
+    async def test_handles_multiple_sequential_escalations(self, steward):
+        esc1 = _make_escalation(id='esc-42-1')
+        esc2 = _make_escalation(id='esc-42-2')
+        call_count = 0
+
+        async def _next_esc():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return esc1
+            elif call_count == 2:
+                return esc2
+            return None
+
+        handle_mock = AsyncMock()
+        with (
+            patch.object(steward, '_next_escalation', side_effect=_next_esc),
+            patch.object(steward, '_handle_escalation', handle_mock),
+        ):
+            await steward._run_loop()
+            assert handle_mock.call_count == 2
 
 
-class TestTriageRouting:
-    @pytest.mark.asyncio
-    async def test_review_suggestions_uses_triage_role(self, steward, mock_config):
-        """review_suggestions category should use STEWARD_TRIAGE role and config."""
-        from escalation.models import Escalation
-
-        suggestions = [
-            {'reviewer': 'reuse_auditor', 'severity': 'suggestion',
-             'location': 'src/foo.py:10', 'category': 'duplication',
-             'description': 'Duplicate logic', 'suggested_fix': 'Extract helper'},
-        ]
-        esc = Escalation(
-            id='esc-42-1', task_id='42', agent_role='orchestrator',
-            severity='info', category='review_suggestions',
-            summary='1 review suggestion(s) for triage',
-            detail=json.dumps(suggestions),
-        )
-
-        mock_result = MagicMock()
-        mock_result.success = True
-        mock_result.cost_usd = 5.0
-        mock_result.duration_ms = 60000
-        mock_result.turns = 20
-
-        with patch('orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = mock_result
-            steward.escalation_queue.get_by_task.return_value = []
-
-            await steward._handle_escalation(esc)
-
-            call_kwargs = mock_invoke.call_args.kwargs
-            assert call_kwargs['model'] == 'opus'
-            assert call_kwargs['max_budget_usd'] == 10.0
-            assert call_kwargs['max_turns'] == 50
-            assert call_kwargs['effort'] == 'high'
-            assert 'triager' in call_kwargs['system_prompt'].lower()
-
-    @pytest.mark.asyncio
-    async def test_regular_escalation_uses_steward_role(self, steward, mock_config):
-        """Non-suggestion escalation should use standard STEWARD role."""
-        from escalation.models import Escalation
-
-        esc = Escalation(
-            id='esc-42-1', task_id='42', agent_role='orchestrator',
-            severity='blocking', category='limit_exhausted',
-            summary='test',
-        )
-
-        mock_result = MagicMock()
-        mock_result.success = True
-        mock_result.cost_usd = 0
-        mock_result.duration_ms = 0
-        mock_result.turns = 0
-
-        with patch('orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = mock_result
-            steward.escalation_queue.get_by_task.return_value = []
-
-            await steward._handle_escalation(esc)
-
-            call_kwargs = mock_invoke.call_args.kwargs
-            assert 'escalation handler' in call_kwargs['system_prompt'].lower()
-
-    @pytest.mark.asyncio
-    async def test_triage_runs_in_project_root(self, steward, mock_config, worktree):
-        """Triage should run in project_root (post-merge), not worktree."""
-        from escalation.models import Escalation
-
-        esc = Escalation(
-            id='esc-42-1', task_id='42', agent_role='orchestrator',
-            severity='info', category='review_suggestions',
-            summary='1 suggestion', detail='[]',
-        )
-
-        mock_result = MagicMock()
-        mock_result.success = True
-        mock_result.cost_usd = 0
-        mock_result.duration_ms = 0
-        mock_result.turns = 0
-
-        with patch('orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = mock_result
-            steward.escalation_queue.get_by_task.return_value = []
-
-            await steward._handle_escalation(esc)
-
-            call_kwargs = mock_invoke.call_args.kwargs
-            assert call_kwargs['cwd'] == mock_config.project_root
-
-    @pytest.mark.asyncio
-    async def test_triage_passes_parsed_suggestions(self, steward, mock_briefing):
-        """Triage should pass parsed JSON suggestions to the briefing builder."""
-        from escalation.models import Escalation
-
-        suggestions = [
-            {'reviewer': 'test_analyst', 'description': 'Missing edge case test'},
-        ]
-        esc = Escalation(
-            id='esc-42-1', task_id='42', agent_role='orchestrator',
-            severity='info', category='review_suggestions',
-            summary='1 suggestion', detail=json.dumps(suggestions),
-        )
-
-        mock_result = MagicMock()
-        mock_result.success = True
-        mock_result.cost_usd = 0
-        mock_result.duration_ms = 0
-        mock_result.turns = 0
-
-        with patch('orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = mock_result
-            steward.escalation_queue.get_by_task.return_value = []
-
-            await steward._handle_escalation(esc)
-
-            mock_briefing.build_steward_triage_prompt.assert_called_once()
-            call_kwargs = mock_briefing.build_steward_triage_prompt.call_args.kwargs
-            assert call_kwargs['suggestions'] == suggestions
-            assert call_kwargs['escalation_id'] == 'esc-42-1'
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
 
 
 class TestStewardMetrics:
+
     def test_initial_values(self):
         m = StewardMetrics()
         assert m.invocations == 0
         assert m.total_cost_usd == 0.0
-        assert m.escalations_handled == 0
+        assert m.escalations_reescalated == 0
+
+
+# ---------------------------------------------------------------------------
+# Next Escalation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestNextEscalation:
+
+    async def test_returns_existing_pending(self, steward):
+        esc = _make_escalation()
+        steward.escalation_queue.get_by_task.return_value = [esc]
+        result = await steward._next_escalation()
+        assert result is esc
+
+    async def test_returns_none_when_watcher_fails(self, steward):
+        steward.escalation_queue.get_by_task.return_value = []
+        with patch('asyncio.create_subprocess_exec', new_callable=AsyncMock) as mock_exec:
+            proc = AsyncMock()
+            proc.returncode = 1
+            proc.communicate.return_value = (b'', b'error')
+            mock_exec.return_value = proc
+            result = await steward._next_escalation()
+            assert result is None

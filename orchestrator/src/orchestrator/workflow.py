@@ -27,6 +27,13 @@ from orchestrator.scheduler import TaskAssignment, files_to_modules
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import run_scoped_verification
 
+
+class _StewardReescalated(Exception):
+    """Raised when the steward re-escalates to level-1 (human intervention)."""
+
+    def __init__(self, escalations):
+        self.escalations = escalations
+
 if TYPE_CHECKING:
     from orchestrator.usage_gate import UsageGate
 
@@ -187,12 +194,6 @@ class TaskWorkflow:
             if not self._worktree_external:
                 await self._sync_worktree_venvs()
 
-            # Start steward if factory was provided
-            if self._steward_factory and self.worktree:
-                steward = self._steward_factory(self.worktree)
-                self._steward = steward
-                await steward.start()
-
             self.artifacts = TaskArtifacts(self.worktree)
             self.artifacts.init(
                 self.task_id,
@@ -224,16 +225,15 @@ class TaskWorkflow:
                 outcome = await self._execute_verify_review_loop()
                 if outcome == WorkflowOutcome.ESCALATED:
                     self.state = WorkflowState.ESCALATED
+                    await self._ensure_steward_started()
                     logger.info(f'Task {self.task_id}: waiting for escalation resolution')
-                    resolution = await self._wait_for_resolution()
-                    # Check if any escalation was dismissed (terminate)
-                    assert self.escalation_queue is not None
-                    dismissed = [
-                        e for e in self.escalation_queue.get_by_task(self.task_id)
-                        if e.status == 'dismissed'
-                    ]
-                    if dismissed:
-                        return await self._mark_blocked('Task terminated via escalation')
+                    try:
+                        resolution = await self._wait_for_resolution()
+                    except _StewardReescalated:
+                        return await self._mark_blocked(
+                            'Steward re-escalated to human',
+                            skip_escalation=True,
+                        )
                     # Resume with resolution context
                     logger.info(f'Task {self.task_id}: resuming after escalation resolution')
                     resume_prompt = await self.briefing.build_resume_prompt(
@@ -257,8 +257,9 @@ class TaskWorkflow:
 
             # SUCCESS — write completion knowledge before status change (ordering guarantee)
             await self._write_completion_to_memory()
-            # Wait for steward to finish triaging review suggestions (if any)
-            await self._await_suggestion_triage(timeout=300.0)
+            # Wait for steward to finish any pending work (suggestion triage, etc.)
+            await self._ensure_steward_started()
+            await self._await_steward_completion()
             self.state = WorkflowState.DONE
             await self.scheduler.set_task_status(self.task_id, 'done')
             logger.info(
@@ -454,10 +455,8 @@ class TaskWorkflow:
 
             review_cycle += 1
             if review_cycle >= self.config.max_review_cycles:
-                return await self._mark_blocked(
-                    f'Review cycles exhausted ({review_cycle}). '
-                    f'Blocking issues: {len(reviews.blocking_issues)}'
-                )
+                self._escalate_review_issues(reviews)
+                return WorkflowOutcome.ESCALATED
 
             # Re-plan based on review feedback
             logger.info(
@@ -915,20 +914,34 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         return self.escalation_queue.get_by_task(self.task_id, status='pending')
 
     async def _wait_for_resolution(self) -> str:
-        """Wait for all pending escalations to be resolved."""
+        """Wait for all level-0 pending escalations to be resolved.
+
+        Raises ``_StewardReescalated`` if the steward re-escalated to
+        level-1 (human), indicating the task should be blocked.
+        """
         if self._escalation_event is None:
             self._escalation_event = asyncio.Event()
 
-        # Poll until all pending escalations for this task are resolved
+        assert self.escalation_queue is not None
+
+        # Wait for level-0 pending escalations to clear
         while True:
-            pending = self._check_escalations()
-            if not pending:
+            pending_l0 = self.escalation_queue.get_by_task(
+                self.task_id, status='pending', level=0,
+            )
+            if not pending_l0:
                 break
             self._escalation_event.clear()
             await self._escalation_event.wait()
 
+        # Check for level-1 re-escalation (steward gave up)
+        pending_l1 = self.escalation_queue.get_by_task(
+            self.task_id, status='pending', level=1,
+        )
+        if pending_l1:
+            raise _StewardReescalated(pending_l1)
+
         # Collect resolutions
-        assert self.escalation_queue is not None
         resolved = [
             e for e in self.escalation_queue.get_by_task(self.task_id)
             if e.status == 'resolved' and e.resolution
@@ -1001,8 +1014,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
         self.escalation_queue.submit(esc)
 
-    async def _mark_blocked(self, reason: str) -> WorkflowOutcome:
-        """Mark task as blocked and create an escalation entry."""
+    async def _mark_blocked(
+        self, reason: str, *, skip_escalation: bool = False,
+    ) -> WorkflowOutcome:
+        """Mark task as blocked and optionally create an escalation entry.
+
+        *skip_escalation* suppresses escalation creation when a level-1
+        escalation already exists (e.g. steward re-escalated to human).
+        """
         if self.state == WorkflowState.DONE:
             logger.warning(
                 'Task %s: already DONE, ignoring late blocked transition: %s',
@@ -1013,22 +1032,27 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         await self.scheduler.set_task_status(self.task_id, 'blocked')
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
 
-        if self.escalation_queue:
-            from escalation.models import Escalation
-
-            esc = Escalation(
-                id=self.escalation_queue.make_id(self.task_id),
-                task_id=self.task_id,
-                agent_role='orchestrator',
-                severity='blocking',
-                category='task_failure',
-                summary=reason[:200],
-                detail=reason,
-                suggested_action='investigate_and_retry',
-                worktree=str(self.worktree) if self.worktree else None,
-                workflow_state=self.state.value,
+        if self.escalation_queue and not skip_escalation:
+            # Don't create a duplicate if level-1 already pending
+            existing_l1 = self.escalation_queue.get_by_task(
+                self.task_id, status='pending', level=1,
             )
-            self.escalation_queue.submit(esc)
+            if not existing_l1:
+                from escalation.models import Escalation
+
+                esc = Escalation(
+                    id=self.escalation_queue.make_id(self.task_id),
+                    task_id=self.task_id,
+                    agent_role='orchestrator',
+                    severity='blocking',
+                    category='task_failure',
+                    summary=reason[:200],
+                    detail=reason,
+                    suggested_action='investigate_and_retry',
+                    worktree=str(self.worktree) if self.worktree else None,
+                    workflow_state=self.state.value,
+                )
+                self.escalation_queue.submit(esc)
 
         return WorkflowOutcome.BLOCKED
 
@@ -1169,31 +1193,79 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             f'for steward triage ({esc.id})'
         )
 
-    async def _await_suggestion_triage(self, timeout: float = 300.0) -> None:
-        """Wait for steward to complete suggestion triage, with timeout.
-
-        On timeout, auto-re-escalate to level 1 (steward->human) and dismiss
-        the original level-0 escalation.
-        """
+    def _escalate_review_issues(self, reviews) -> None:
+        """Submit remaining review issues as a blocking escalation for the steward."""
         if not self.escalation_queue:
             return
 
+        from escalation.models import Escalation
+
+        detail = reviews.format_for_replan()
+        n_blocking = len(reviews.blocking_issues)
+        n_suggestions = len(reviews.suggestions)
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role='orchestrator',
+            severity='blocking',
+            category='review_issues',
+            summary=(
+                f'Review cycles exhausted with {n_blocking} blocking issue(s) '
+                f'and {n_suggestions} suggestion(s)'
+            ),
+            detail=detail,
+            suggested_action='fix_review_issues',
+            worktree=str(self.worktree) if self.worktree else None,
+            workflow_state=self.state.value,
+        )
+        self.escalation_queue.submit(esc)
+        logger.info(
+            f'Task {self.task_id}: escalated {n_blocking} review issues '
+            f'to steward ({esc.id})'
+        )
+
+    async def _ensure_steward_started(self) -> None:
+        """Start the steward lazily on first call, if factory was provided."""
+        if self._steward is not None:
+            return
+        if not self._steward_factory or not self.worktree:
+            return
+        # Check if there are pending level-0 escalations worth starting for
+        if self.escalation_queue:
+            pending = self.escalation_queue.get_by_task(
+                self.task_id, status='pending', level=0,
+            )
+            if not pending:
+                return
+        steward = self._steward_factory(self.worktree)
+        self._steward = steward
+        await steward.start()
+
+    async def _await_steward_completion(self) -> None:
+        """Wait for the steward to finish pending work, with grace period.
+
+        On timeout, auto-re-escalate remaining level-0 escalations to
+        level 1 (steward→human) and dismiss the originals.
+
+        Only waits if the steward is actually running — otherwise there's
+        nothing to wait for.
+        """
+        if not self.escalation_queue or not self._steward:
+            return
+
+        timeout = self.config.steward_completion_timeout
         queue = self.escalation_queue
 
-        def _pending_suggestions():
-            return [
-                e for e in queue.get_by_task(
-                    self.task_id, status='pending',
-                )
-                if e.category == 'review_suggestions'
-            ]
+        def _pending_l0():
+            return queue.get_by_task(self.task_id, status='pending', level=0)
 
-        pending = _pending_suggestions()
+        pending = _pending_l0()
         if not pending:
             return
 
         logger.info(
-            f'Task {self.task_id}: waiting up to {timeout:.0f}s for suggestion triage'
+            f'Task {self.task_id}: waiting up to {timeout:.0f}s for steward completion'
         )
 
         if self._escalation_event is None:
@@ -1201,9 +1273,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         deadline = asyncio.get_event_loop().time() + timeout
         while True:
-            pending = _pending_suggestions()
+            pending = _pending_l0()
             if not pending:
-                logger.info(f'Task {self.task_id}: suggestion triage complete')
+                logger.info(f'Task {self.task_id}: steward completed all pending work')
                 return
 
             remaining = deadline - asyncio.get_event_loop().time()
@@ -1218,28 +1290,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             except TimeoutError:
                 break
 
-        # Timeout — re-escalate to level 1 (steward -> human)
+        # Timeout — re-escalate remaining to level 1
         from escalation.models import Escalation
 
         logger.warning(
-            f'Task {self.task_id}: suggestion triage timed out after {timeout:.0f}s, '
+            f'Task {self.task_id}: steward completion timed out after {timeout:.0f}s, '
             f're-escalating {len(pending)} item(s) to level 1'
         )
         for esc in pending:
             reesc = Escalation(
-                id=self.escalation_queue.make_id(self.task_id),
+                id=queue.make_id(self.task_id),
                 task_id=self.task_id,
                 agent_role='steward',
-                severity='info',
-                category='review_suggestions',
-                summary=f'Triage timeout: {esc.summary}',
+                severity=esc.severity,
+                category=esc.category,
+                summary=f'Steward timeout: {esc.summary}',
                 detail=esc.detail,
-                suggested_action='manual_triage',
+                suggested_action='manual_intervention',
                 level=1,
             )
-            self.escalation_queue.submit(reesc)
-            self.escalation_queue.resolve(
+            queue.submit(reesc)
+            queue.resolve(
                 esc.id,
-                'Auto-dismissed: triage timeout, re-escalated to level 1',
+                'Auto-dismissed: steward completion timeout, re-escalated to level 1',
                 dismiss=True,
             )

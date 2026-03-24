@@ -95,12 +95,14 @@ async def invoke_agent(
     effort: str | None = None,
     backend: str = 'claude',
     oauth_token: str | None = None,
+    resume_session_id: str | None = None,
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
 
     Dispatches to the appropriate backend (claude, codex, gemini).
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
+    *resume_session_id*, when set, resumes an existing Claude session.
     """
     if backend == 'claude':
         return await _invoke_claude_with_sandbox(
@@ -110,6 +112,7 @@ async def invoke_agent(
             mcp_config=mcp_config, output_schema=output_schema,
             permission_mode=permission_mode, sandbox_modules=sandbox_modules,
             effort=effort, oauth_token=oauth_token,
+            resume_session_id=resume_session_id,
         )
     elif backend == 'codex':
         return await _invoke_codex(
@@ -146,6 +149,7 @@ async def _invoke_claude_with_sandbox(
     sandbox_modules: list[str] | None,
     effort: str | None,
     oauth_token: str | None = None,
+    resume_session_id: str | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI with optional bwrap sandboxing.
 
@@ -161,7 +165,12 @@ async def _invoke_claude_with_sandbox(
             cmd = ['claude', '--print', '--output-format', 'json']
             cmd.extend(['--model', model])
             cmd.extend(['--max-budget-usd', str(max_budget_usd)])
-            cmd.extend(['--system-prompt', system_prompt])
+
+            if resume_session_id:
+                cmd.extend(['--resume', resume_session_id])
+            else:
+                cmd.extend(['--system-prompt', system_prompt])
+
             cmd.extend(['--permission-mode', permission_mode])
             cmd.extend(['--max-turns', str(max_turns)])
             if effort:
@@ -203,7 +212,7 @@ async def _invoke_claude_with_sandbox(
         allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
         mcp_config=mcp_config, output_schema=output_schema,
         permission_mode=permission_mode, effort=effort,
-        oauth_token=oauth_token,
+        oauth_token=oauth_token, resume_session_id=resume_session_id,
     )
 
 

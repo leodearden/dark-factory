@@ -648,11 +648,10 @@ Output JSON matching the schema. Every task must appear in the output.
             logger.info('Escalation server stopped')
 
     def _on_escalation(self, escalation) -> None:
-        """Callback when a blocking escalation is submitted — wake the waiting workflow."""
-        if escalation.severity == 'blocking':
-            event = self._escalation_events.get(escalation.task_id)
-            if event:
-                event.set()
+        """Callback when any escalation is submitted — wake the waiting workflow/steward."""
+        event = self._escalation_events.get(escalation.task_id)
+        if event:
+            event.set()
 
     def _on_escalation_resolved(self, escalation) -> None:
         """Callback when an escalation is resolved — wake the waiting workflow."""

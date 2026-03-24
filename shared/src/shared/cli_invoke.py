@@ -60,11 +60,16 @@ async def invoke_claude_agent(
     effort: str | None = None,
     oauth_token: str | None = None,
     timeout_seconds: float | None = None,
+    resume_session_id: str | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
+
+    *resume_session_id*, when set, resumes an existing session via
+    ``--resume <id>`` instead of starting a new one.  The system prompt is
+    skipped on resume (it was already set in the initial session).
     """
     return await _invoke_claude(
         prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
@@ -73,6 +78,7 @@ async def invoke_claude_agent(
         mcp_config=mcp_config, output_schema=output_schema,
         permission_mode=permission_mode, effort=effort,
         oauth_token=oauth_token, timeout_seconds=timeout_seconds,
+        resume_session_id=resume_session_id,
     )
 
 
@@ -127,13 +133,20 @@ async def _invoke_claude(
     effort: str | None,
     oauth_token: str | None = None,
     timeout_seconds: float | None = None,
+    resume_session_id: str | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     cmd = ['claude', '--print', '--output-format', 'json']
 
     cmd.extend(['--model', model])
     cmd.extend(['--max-budget-usd', str(max_budget_usd)])
-    cmd.extend(['--system-prompt', system_prompt])
+
+    if resume_session_id:
+        # Resume an existing session — skip --system-prompt (incompatible)
+        cmd.extend(['--resume', resume_session_id])
+    else:
+        cmd.extend(['--system-prompt', system_prompt])
+
     cmd.extend(['--permission-mode', permission_mode])
     cmd.extend(['--max-turns', str(max_turns)])
 

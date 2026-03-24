@@ -1,11 +1,16 @@
-"""Per-task process steward — autonomous first-line escalation handler.
+"""Per-task persistent steward — autonomous escalation handler.
 
-The steward watches for escalations on a specific task and handles them
-by invoking a Claude Code session with the STEWARD role. It runs as an
-asyncio.Task alongside the workflow, started by the harness on first
-blocking escalation.
+The steward maintains a single Claude session across all escalations for a task,
+accumulating context via ``--resume``.  It handles both blocking escalations
+(code fixes) and review suggestion triage (create tasks / write conventions /
+dismiss).
 
-Event loop: check pending → run watcher → handle → repeat until done/stopped.
+Lifecycle:
+- Started lazily on first escalation (not at workflow start).
+- Each escalation either resumes the existing session or creates a fresh one.
+- Budget-capped at $12 lifetime; auto-re-escalates to level-1 on exhaustion.
+- Retries each escalation up to 3 times before re-escalating to level-1.
+- Stopped by the workflow after task completion + grace period.
 """
 
 from __future__ import annotations
@@ -18,13 +23,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from orchestrator.agents.invoke import invoke_with_cap_retry
-from orchestrator.agents.roles import STEWARD, STEWARD_TRIAGE
+from orchestrator.agents.invoke import invoke_agent
+from orchestrator.agents.roles import STEWARD
 
 if TYPE_CHECKING:
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
+    from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.config import OrchestratorConfig
     from orchestrator.mcp_lifecycle import McpLifecycle
     from orchestrator.usage_gate import UsageGate
@@ -38,10 +44,11 @@ class StewardMetrics:
     total_cost_usd: float = 0.0
     total_duration_ms: int = 0
     escalations_handled: int = 0
+    escalations_reescalated: int = 0
 
 
 class TaskSteward:
-    """Per-task process steward — handles escalations autonomously."""
+    """Per-task persistent steward — handles escalations via a resumable session."""
 
     def __init__(
         self,
@@ -51,7 +58,7 @@ class TaskSteward:
         config: OrchestratorConfig,
         mcp: McpLifecycle,
         escalation_queue: EscalationQueue,
-        briefing,
+        briefing: BriefingAssembler,
         usage_gate: UsageGate | None = None,
     ):
         self.task_id = task_id
@@ -63,9 +70,15 @@ class TaskSteward:
         self.briefing = briefing
         self.usage_gate = usage_gate
 
-        self._task: asyncio.Task | None = None
+        self._session_id: str | None = None
         self._stopped = False
+        self._task: asyncio.Task | None = None
+        self._retry_counts: dict[str, int] = {}
         self.metrics = StewardMetrics()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def start(self) -> None:
         """Start the steward event loop as a background asyncio.Task."""
@@ -88,59 +101,49 @@ class TaskSteward:
             f'cost=${self.metrics.total_cost_usd:.2f})'
         )
 
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
     async def _run_loop(self) -> None:
-        """Watch for escalations, handle them, repeat until done or stopped."""
+        """Watch for escalations, handle them, repeat until stopped."""
         while not self._stopped:
             try:
                 escalation = await self._next_escalation()
                 if escalation is None or self._stopped:
                     break
-
                 await self._handle_escalation(escalation)
-
-                if await self._is_task_complete():
-                    logger.info(
-                        f'Steward for task {self.task_id}: task complete, exiting'
-                    )
-                    break
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception(
                     f'Steward for task {self.task_id}: unhandled error in loop'
                 )
-                # Don't crash the loop — wait a moment and retry
                 await asyncio.sleep(2)
 
+    # ------------------------------------------------------------------
+    # Escalation retrieval
+    # ------------------------------------------------------------------
+
     async def _next_escalation(self) -> Escalation | None:
-        """Get the next level-0 pending escalation (agent→steward scope).
+        """Get the next level-0 pending escalation.
 
         Checks for already-pending escalations before starting the watcher
         to avoid a race between escalation submission and watcher startup.
-        Level-1 escalations (steward→human) are ignored — those are for
-        the interactive session / /unblock skill.
         """
-        # Check for existing pending level-0 escalations first
         pending = self.escalation_queue.get_by_task(
             self.task_id, status='pending', level=0,
         )
         if pending:
             return pending[0]
 
-        # No pending level-0 — block on watcher subprocess
-        # The watcher doesn't filter by level, so we re-check after it fires
         esc = await self._watch_for_escalation()
         if esc is not None and esc.level != 0:
-            # Watcher picked up a level-1 (steward→human) escalation — ignore it
             return None
         return esc
 
     async def _watch_for_escalation(self) -> Escalation | None:
-        """Run the escalation watcher as a blocking subprocess.
-
-        The watcher uses inotify to detect new escalation files and exits
-        after the first matching event, printing the escalation JSON to stdout.
-        """
+        """Block on the inotify watcher subprocess until an escalation arrives."""
         from escalation.models import Escalation as EscModel
 
         queue_dir = self.escalation_queue.queue_dir
@@ -166,8 +169,9 @@ class TaskSteward:
 
         if proc.returncode != 0 or not stdout.strip():
             if stderr:
-                logger.debug(
-                    f'Steward watcher stderr: {stderr.decode()[:200]}'
+                logger.warning(
+                    f'Steward watcher stderr for task {self.task_id}: '
+                    f'{stderr.decode()[:200]}'
                 )
             return None
 
@@ -178,74 +182,84 @@ class TaskSteward:
             logger.warning(f'Steward watcher parse error: {e}')
             return None
 
+    # ------------------------------------------------------------------
+    # Escalation handling
+    # ------------------------------------------------------------------
+
     async def _handle_escalation(self, escalation: Escalation) -> None:
-        """Invoke the steward agent to handle a single escalation."""
+        """Handle a single escalation via the persistent session."""
         logger.info(
             f'Steward for task {self.task_id}: handling escalation '
             f'{escalation.id} [{escalation.category}] — {escalation.summary}'
         )
 
-        # Collect all pending escalations for context
-        pending = self.escalation_queue.get_by_task(
-            self.task_id, status='pending',
-        )
-        pending_dicts = [e.to_dict() for e in pending]
-
-        # Build MCP config — fused-memory + escalation
-        esc_cfg = self.config.escalation
-        escalation_url = f'http://{esc_cfg.host}:{esc_cfg.port}/mcp'
-        mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
-
-        # Route: triage suggestions use a different role, prompt, and config
-        if escalation.category == 'review_suggestions':
-            role = STEWARD_TRIAGE
-            suggestions = json.loads(escalation.detail) if escalation.detail else []
-            prompt = await self.briefing.build_steward_triage_prompt(
-                task=self.task,
-                suggestions=suggestions,
-                escalation_id=escalation.id,
-                worktree=self.worktree,
+        # Guard: lifetime budget exhausted
+        if self.metrics.total_cost_usd >= self.config.steward_lifetime_budget:
+            self._auto_escalate_to_human(
+                escalation, 'Steward lifetime budget exhausted '
+                f'(${self.metrics.total_cost_usd:.2f} / '
+                f'${self.config.steward_lifetime_budget:.2f})',
             )
-            model = self.config.models.steward_triage
-            max_turns = self.config.max_turns.steward_triage
-            budget = self.config.budgets.steward_triage
-            effort = self.config.effort.steward_triage
-            backend = self.config.backends.steward_triage
-            cwd = self.config.project_root  # post-merge — read from main
+            return
+
+        # Guard: per-escalation retry limit
+        retry_count = self._retry_counts.get(escalation.id, 0)
+        if retry_count >= self.config.steward_max_retries:
+            self._auto_escalate_to_human(
+                escalation,
+                f'Failed after {retry_count} attempts: {escalation.summary}',
+            )
+            return
+
+        # CWD: suggestions read from main (post-merge), others from worktree
+        if escalation.category == 'review_suggestions':
+            cwd = self.config.project_root
         else:
-            role = STEWARD
-            prompt = await self.briefing.build_steward_prompt(
+            cwd = self.worktree
+
+        # Prompt: initial (full briefing) vs continuation (just the escalation)
+        is_initial = self._session_id is None
+        if is_initial:
+            pending_dicts = [
+                e.to_dict()
+                for e in self.escalation_queue.get_by_task(
+                    self.task_id, status='pending',
+                )
+            ]
+            prompt = await self.briefing.build_steward_initial_prompt(
                 task=self.task,
                 escalation=escalation.to_dict(),
                 pending_escalations=pending_dicts,
                 worktree=self.worktree,
             )
-            model = self.config.models.steward
-            max_turns = self.config.max_turns.steward
-            budget = self.config.budgets.steward
-            effort = self.config.effort.steward
-            backend = self.config.backends.steward
-            cwd = self.worktree
+        else:
+            prompt = await self.briefing.build_steward_continuation_prompt(
+                task=self.task,
+                escalation=escalation.to_dict(),
+            )
 
-        result = await invoke_with_cap_retry(
-            usage_gate=self.usage_gate,
-            label=f'Steward for task {self.task_id}',
+        # MCP config
+        esc_cfg = self.config.escalation
+        escalation_url = f'http://{esc_cfg.host}:{esc_cfg.port}/mcp'
+        mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
+
+        # Per-invocation budget: capped by lifetime remaining
+        remaining = self.config.steward_lifetime_budget - self.metrics.total_cost_usd
+        per_invocation = min(self.config.budgets.steward, remaining)
+
+        # Invoke with session persistence and cap-hit recovery
+        result = await self._invoke_with_session(
             prompt=prompt,
-            system_prompt=role.system_prompt,
             cwd=cwd,
-            model=model,
-            max_turns=max_turns,
-            max_budget_usd=budget,
-            allowed_tools=role.allowed_tools or None,
             mcp_config=mcp_config,
-            effort=effort,
-            backend=backend,
+            per_invocation_budget=per_invocation,
+            escalation=escalation,
         )
 
+        # Track metrics
         self.metrics.invocations += 1
         self.metrics.total_cost_usd += result.cost_usd
         self.metrics.total_duration_ms += result.duration_ms
-        self.metrics.escalations_handled += 1
 
         logger.info(
             f'Steward for task {self.task_id}: invocation complete '
@@ -253,54 +267,154 @@ class TaskSteward:
             f'turns={result.turns})'
         )
 
-        # Patch resolution metadata — steward agent can't pass these via MCP
-        # reliably, so we post-fill after the invocation completes.
+        # Patch resolution metadata
+        self._patch_resolution_metadata(escalation.id, result)
+
+        # Check if escalation was actually resolved
         updated = self.escalation_queue.get(escalation.id)
-        if updated and updated.status in ('resolved', 'dismissed') and not updated.resolved_by:
+        if updated and updated.status == 'pending':
+            self._retry_counts[escalation.id] = retry_count + 1
+            logger.warning(
+                f'Steward for task {self.task_id}: escalation {escalation.id} '
+                f'still pending (attempt {retry_count + 1}/'
+                f'{self.config.steward_max_retries})'
+            )
+        else:
+            self.metrics.escalations_handled += 1
+
+    # ------------------------------------------------------------------
+    # Session-aware invocation with cap-hit recovery
+    # ------------------------------------------------------------------
+
+    async def _invoke_with_session(
+        self,
+        prompt: str,
+        cwd: Path,
+        mcp_config: dict,
+        per_invocation_budget: float,
+        escalation: Escalation,
+    ):
+        """Invoke the steward agent, resuming the session if one exists.
+
+        On usage-cap hit: resets the session and rebuilds the full initial
+        prompt (context is lost across account switches).
+        """
+        from shared.cli_invoke import AgentResult
+
+        while True:
+            oauth_token = None
+            if self.usage_gate:
+                oauth_token = await self.usage_gate.before_invoke()
+
+            kwargs: dict = dict(
+                prompt=prompt,
+                system_prompt=STEWARD.system_prompt,
+                cwd=cwd,
+                model=self.config.models.steward,
+                max_turns=self.config.max_turns.steward,
+                max_budget_usd=per_invocation_budget,
+                allowed_tools=STEWARD.allowed_tools or None,
+                mcp_config=mcp_config,
+                effort=self.config.effort.steward,
+                backend=self.config.backends.steward,
+                oauth_token=oauth_token,
+            )
+
+            if self._session_id is not None:
+                kwargs['resume_session_id'] = self._session_id
+
+            result: AgentResult = await invoke_agent(**kwargs)
+
+            # Cap-hit: reset session (can't resume across account switch)
+            if self.usage_gate and self.usage_gate.detect_cap_hit(
+                result.stderr, result.output, 'claude', oauth_token=oauth_token,
+            ):
+                logger.warning(
+                    f'Steward for task {self.task_id}: cap hit, resetting session'
+                )
+                self._session_id = None
+                # Rebuild full initial prompt (context lost)
+                pending_dicts = [
+                    e.to_dict()
+                    for e in self.escalation_queue.get_by_task(
+                        self.task_id, status='pending',
+                    )
+                ]
+                prompt = await self.briefing.build_steward_initial_prompt(
+                    task=self.task,
+                    escalation=escalation.to_dict(),
+                    pending_escalations=pending_dicts,
+                    worktree=self.worktree,
+                )
+                continue
+
+            if self.usage_gate:
+                self.usage_gate.on_agent_complete(result.cost_usd)
+
+            # Capture session ID for subsequent --resume calls
+            if result.session_id:
+                self._session_id = result.session_id
+
+            return result
+
+    # ------------------------------------------------------------------
+    # Auto-escalation to level-1 (human)
+    # ------------------------------------------------------------------
+
+    def _auto_escalate_to_human(
+        self, escalation: Escalation, reason: str,
+    ) -> None:
+        """Re-escalate to level-1 and dismiss the original level-0."""
+        from escalation.models import Escalation as EscModel
+
+        reesc = EscModel(
+            id=self.escalation_queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role='steward',
+            severity=escalation.severity,
+            category=escalation.category,
+            summary=f'Steward re-escalation: {reason}',
+            detail=(
+                f'Original escalation: {escalation.summary}\n\n'
+                f'{escalation.detail}\n\n'
+                f'Steward reason for re-escalation: {reason}'
+            ),
+            suggested_action='manual_intervention',
+            worktree=str(self.worktree),
+            level=1,
+        )
+        self.escalation_queue.submit(reesc)
+
+        self.escalation_queue.resolve(
+            escalation.id,
+            f'Auto-dismissed: re-escalated to level 1 — {reason}',
+            dismiss=True,
+            resolved_by='steward',
+        )
+
+        self.metrics.escalations_reescalated += 1
+        logger.warning(
+            f'Steward for task {self.task_id}: re-escalated {escalation.id} '
+            f'to level 1: {reason}'
+        )
+
+    # ------------------------------------------------------------------
+    # Metadata patching
+    # ------------------------------------------------------------------
+
+    def _patch_resolution_metadata(self, escalation_id: str, result) -> None:
+        """Post-fill resolved_by and resolution_turns if the agent resolved it."""
+        updated = self.escalation_queue.get(escalation_id)
+        if (
+            updated
+            and updated.status in ('resolved', 'dismissed')
+            and not updated.resolved_by
+        ):
             updated.resolved_by = 'steward'
             updated.resolution_turns = result.turns
             try:
-                self.escalation_queue._rewrite(escalation.id, updated)
+                self.escalation_queue._rewrite(escalation_id, updated)  # noqa: SLF001
             except Exception as e:
-                logger.warning(f'Failed to patch steward metadata on {escalation.id}: {e}')
-
-        # Check if the escalation was resolved
-        still_pending = self.escalation_queue.get_by_task(
-            self.task_id, status='pending',
-        )
-        if still_pending:
-            pending_ids = [e.id for e in still_pending]
-            logger.warning(
-                f'Steward for task {self.task_id}: escalation(s) still pending '
-                f'after invocation: {pending_ids}'
-            )
-
-    async def _is_task_complete(self) -> bool:
-        """Check if the task has reached a terminal state."""
-        try:
-            from orchestrator.mcp_lifecycle import mcp_call
-
-            result = await mcp_call(
-                f'{self.mcp.url}/mcp',
-                'tools/call',
-                {
-                    'name': 'get_task',
-                    'arguments': {
-                        'id': self.task_id,
-                        'project_root': str(self.config.project_root),
-                    },
-                },
-                timeout=10,
-            )
-            content = result.get('result', {}).get('content', [{}])
-            text = content[0].get('text', '') if content else ''
-            try:
-                task_data = json.loads(text)
-            except (json.JSONDecodeError, TypeError):
-                return False
-
-            status = task_data.get('status', '')
-            return status in ('done', 'cancelled')
-        except Exception as e:
-            logger.debug(f'Steward task status check failed: {e}')
-            return False
+                logger.warning(
+                    f'Failed to patch steward metadata on {escalation_id}: {e}'
+                )

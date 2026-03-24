@@ -229,28 +229,22 @@ is preserved in the worktree. Read .task/plan.json and .task/iterations.jsonl
 to understand current progress, then continue from where the previous agent left off.
 """
 
-    async def build_steward_prompt(
+    async def build_steward_initial_prompt(
         self,
         task: dict,
         escalation: dict,
         pending_escalations: list[dict],
         worktree: Path,
     ) -> str:
-        """Build prompt for the steward agent handling a blocking escalation."""
+        """Build full briefing prompt for the steward's first invocation.
+
+        Includes memory context, task details, escalation info, and action
+        instructions.  Used for the initial session and after cap-hit resets.
+        """
         context = await self._get_memory_context(task.get('id'))
         identity = self._agent_identity(task.get('id'), 'steward')
         task_block = self._format_task(task)
-
-        esc_lines = [
-            f'- **ID:** `{escalation.get("id", "?")}`',
-            f'- **Category:** {escalation.get("category", "unknown")}',
-            f'- **Severity:** {escalation.get("severity", "unknown")}',
-            f'- **Summary:** {escalation.get("summary", "N/A")}',
-        ]
-        if escalation.get('detail'):
-            esc_lines.append(f'- **Detail:** {escalation["detail"]}')
-        if escalation.get('suggested_action'):
-            esc_lines.append(f'- **Suggested action:** {escalation["suggested_action"]}')
+        esc_block = self._format_escalation(escalation)
 
         pending_block = ''
         other_pending = [e for e in pending_escalations if e.get('id') != escalation.get('id')]
@@ -272,75 +266,57 @@ to understand current progress, then continue from where the previous agent left
 
 # Escalation
 
-{chr(10).join(esc_lines)}
+{esc_block}
 {pending_block}
-# Action
-
-1. Understand the escalation and the task context.
-2. Read the relevant code in the worktree at `{worktree}`.
-3. Fix the issue described in the escalation.
-4. Run tests to verify your fix.
-5. Call `resolve_issue` with a summary of what you did.
-"""
-
-    async def build_steward_triage_prompt(
-        self,
-        task: dict,
-        suggestions: list[dict],
-        escalation_id: str,
-        worktree: Path,
-    ) -> str:
-        """Build prompt for the steward triaging review suggestions."""
-        context = await self._get_memory_context(task.get('id'))
-        identity = self._agent_identity(task.get('id'), 'steward-triage')
-        task_block = self._format_task(task)
-
-        suggestion_lines = []
-        for i, s in enumerate(suggestions, 1):
-            parts = [f'### Suggestion {i}']
-            if s.get('reviewer'):
-                parts.append(f'- **Reviewer:** {s["reviewer"]}')
-            if s.get('location'):
-                parts.append(f'- **Location:** `{s["location"]}`')
-            if s.get('category'):
-                parts.append(f'- **Category:** {s["category"]}')
-            if s.get('description'):
-                parts.append(f'- **Description:** {s["description"]}')
-            if s.get('suggested_fix'):
-                parts.append(f'- **Suggested fix:** {s["suggested_fix"]}')
-            suggestion_lines.append('\n'.join(parts))
-
-        suggestions_block = '\n\n'.join(suggestion_lines)
-
-        return f"""\
-{context}
-
-{identity}
-
-# Originating Task
-
-{task_block}
-
-# Review Suggestions to Triage
-
-{suggestions_block}
-
 # Parameters
 
 - **project_id:** `{self.project_id}`
 - **project_root:** `{self.config.project_root}`
-- **escalation_id:** `{escalation_id}`
+- **worktree:** `{worktree}`
 
 # Action
 
-Triage each suggestion above. For each one:
-1. Read the code at the indicated location.
-2. Search memory and tasks for existing coverage.
-3. Classify as `create_task`, `convention`, or `dismiss`.
-4. Execute the classification (call `add_task` or `add_memory` as appropriate).
-
-When finished, call `resolve_issue(escalation_id="{escalation_id}", resolution="<your triage summary>")`.
+1. Understand the escalation and the task context.
+2. Read the relevant code.
+3. Handle the escalation — fix the issue, or triage suggestions.
+4. Run tests to verify any code changes.
+5. Call `resolve_issue` with a summary of what you did.
 """
+
+    async def build_steward_continuation_prompt(
+        self,
+        task: dict,
+        escalation: dict,
+    ) -> str:
+        """Build a minimal prompt for resuming the steward session.
+
+        The session already has full context from the initial briefing,
+        so this just provides the new escalation details.
+        """
+        esc_block = self._format_escalation(escalation)
+
+        return f"""\
+# New Escalation for Task {task.get('id', '?')} — {task.get('title', '')}
+
+{esc_block}
+
+Handle this escalation, then call `resolve_issue` with a summary.
+"""
+
+    @staticmethod
+    def _format_escalation(escalation: dict) -> str:
+        """Format an escalation dict (blocking or suggestion) into markdown."""
+        lines = [
+            f'- **ID:** `{escalation.get("id", "?")}`',
+            f'- **Category:** {escalation.get("category", "unknown")}',
+            f'- **Severity:** {escalation.get("severity", "unknown")}',
+            f'- **Summary:** {escalation.get("summary", "N/A")}',
+        ]
+        if escalation.get('detail'):
+            lines.append(f'- **Detail:** {escalation["detail"]}')
+        if escalation.get('suggested_action'):
+            lines.append(f'- **Suggested action:** {escalation["suggested_action"]}')
+        return chr(10).join(lines)
 
     async def _get_memory_context(self, task_id: str | None = None) -> str:
         """Call fused-memory search for project context."""
