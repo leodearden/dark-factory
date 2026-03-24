@@ -8,6 +8,7 @@ import yaml
 from orchestrator.config import (
     ModuleConfig,
     OrchestratorConfig,
+    _deep_merge,
     _discover_module_configs,
     load_config,
 )
@@ -17,10 +18,12 @@ class TestDefaults:
     """Tests for OrchestratorConfig defaults — isolated from real config files."""
 
     def test_default_values(self, monkeypatch, tmp_path):
+        """Package defaults.yaml is loaded via settings_customise_sources."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         config = OrchestratorConfig()
-        assert config.max_concurrent_tasks == 3
+        # Values from package defaults.yaml (not Pydantic field defaults)
+        assert config.max_concurrent_tasks == 12
         assert config.max_per_module == 1
         assert config.max_execute_iterations == 10
         assert config.max_verify_attempts == 5
@@ -66,12 +69,12 @@ class TestDefaults:
 
 
 class TestYamlLoading:
-    def test_load_config_warns_when_no_config_file(self, tmp_path: Path, caplog):
+    def test_load_config_logs_when_no_config_file(self, tmp_path: Path, caplog):
         nonexistent = tmp_path / 'nonexistent.yaml'
-        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.config'):
             load_config(nonexistent)
         assert any(
-            'No config file' in r.message or 'using defaults' in r.message.lower()
+            'No project config file found' in r.message or 'package defaults' in r.message.lower()
             for r in caplog.records
         )
 
@@ -86,13 +89,13 @@ class TestYamlLoading:
         config = load_config(None)
         assert config.max_concurrent_tasks == 7
 
-    def test_load_config_warns_when_no_config_found(self, tmp_path: Path, monkeypatch, caplog):
+    def test_load_config_logs_when_no_project_config_found(self, tmp_path: Path, monkeypatch, caplog):
         # Empty dir with no config files and no ORCH_CONFIG_PATH
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
-        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.config'):
             load_config(None)
-        assert any('No config file found' in r.message for r in caplog.records)
+        assert any('No project config file found' in r.message for r in caplog.records)
 
     def test_load_from_yaml(self, tmp_path: Path):
         config_data = {
@@ -107,8 +110,8 @@ class TestYamlLoading:
         assert config.max_concurrent_tasks == 5
         assert config.models.architect == 'sonnet'
         assert config.budgets.architect == 3.0
-        # Unset values should use defaults
-        assert config.models.implementer == 'opus'
+        # Unset values should use package defaults
+        assert config.models.implementer == 'sonnet'
 
 
 class TestModuleConfigDiscovery:
@@ -183,6 +186,65 @@ class TestModuleConfigDiscovery:
         assert 'backend' in config._module_configs
         assert config._module_configs['backend'].test_command == 'cargo test'
         assert config._module_configs['backend'].max_per_module == 2
+
+
+class TestLayeredConfig:
+    """Tests for deep merge of package defaults + project config."""
+
+    def test_deep_merge_basic(self):
+        base = {'a': 1, 'b': {'x': 10, 'y': 20}}
+        override = {'b': {'y': 99}, 'c': 3}
+        result = _deep_merge(base, override)
+        assert result == {'a': 1, 'b': {'x': 10, 'y': 99}, 'c': 3}
+
+    def test_deep_merge_override_replaces_non_dict(self):
+        base = {'a': {'nested': 1}}
+        override = {'a': 'flat'}
+        result = _deep_merge(base, override)
+        assert result == {'a': 'flat'}
+
+    def test_deep_merge_does_not_mutate_base(self):
+        base = {'a': {'x': 1}}
+        override = {'a': {'y': 2}}
+        _deep_merge(base, override)
+        assert base == {'a': {'x': 1}}
+
+    def test_defaults_applied_when_no_project_config(self, tmp_path, monkeypatch):
+        """With no project config file, package defaults should apply."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = load_config(None)
+        # Package defaults define effort.architect = 'max' (pydantic default is 'high')
+        assert config.effort.architect == 'max'
+        assert config.backends.architect == 'claude'
+        assert config.max_concurrent_tasks == 12
+
+    def test_project_config_overrides_defaults(self, tmp_path, monkeypatch):
+        """Project config values should override package defaults."""
+        project_cfg = tmp_path / 'config.yaml'
+        project_cfg.write_text(yaml.dump({
+            'models': {'implementer': 'opus'},
+            'max_concurrent_tasks': 8,
+        }))
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = load_config(project_cfg)
+        # Overridden
+        assert config.models.implementer == 'opus'
+        assert config.max_concurrent_tasks == 8
+        # Preserved from package defaults
+        assert config.models.architect == 'opus'
+        assert config.effort.architect == 'max'
+
+    def test_deep_merge_preserves_sibling_keys(self, tmp_path, monkeypatch):
+        """Overriding one key in a nested dict should not clobber siblings."""
+        project_cfg = tmp_path / 'config.yaml'
+        project_cfg.write_text(yaml.dump({
+            'budgets': {'architect': 99.0},
+        }))
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = load_config(project_cfg)
+        assert config.budgets.architect == 99.0
+        assert config.budgets.implementer == 10.0  # preserved from defaults
 
 
 class TestPathResolution:

@@ -1,5 +1,6 @@
 """Configuration schema for the orchestrator."""
 
+import importlib.resources
 import logging
 import os
 import re
@@ -16,6 +17,24 @@ from pydantic_settings import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Deep-merge *override* into *base*.  Override values win at leaf level."""
+    merged = base.copy()
+    for key, value in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_defaults() -> dict[str, Any]:
+    """Load the package-bundled defaults.yaml."""
+    defaults_path = importlib.resources.files('orchestrator').joinpath('defaults.yaml')
+    with importlib.resources.as_file(defaults_path) as p, open(p) as f:
+        return yaml.safe_load(f) or {}
 
 
 class YamlSettingsSource(PydanticBaseSettingsSource):
@@ -58,11 +77,14 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
         return None, field_name, False
 
     def __call__(self) -> dict[str, Any]:
-        if not self.config_path.exists():
-            return {}
-        with open(self.config_path) as f:
-            raw_config = yaml.safe_load(f) or {}
-        return self._expand_env_vars(raw_config)
+        # Layer 1: package-bundled defaults
+        base = _load_defaults()
+        # Layer 2: project config file (overrides defaults via deep merge)
+        if self.config_path.exists():
+            with open(self.config_path) as f:
+                project_config = yaml.safe_load(f) or {}
+            base = _deep_merge(base, self._expand_env_vars(project_config))
+        return base
 
 
 # --- Sub-models ---
@@ -326,9 +348,9 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
         del os.environ['ORCH_CONFIG_PATH']
     config = OrchestratorConfig()
     if found is None:
-        logger.warning(
-            'No config file found (checked config.yaml, orchestrator/config.yaml). '
-            'Using defaults. Pass --config or set ORCH_CONFIG_PATH to specify.',
+        logger.info(
+            'No project config file found (checked config.yaml, orchestrator/config.yaml). '
+            'Using package defaults. Pass --config or set ORCH_CONFIG_PATH to specify.',
         )
     config._module_configs = _discover_module_configs(config.project_root)
     return config

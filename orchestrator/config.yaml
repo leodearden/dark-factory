@@ -1,60 +1,7 @@
-# Orchestrator configuration
-# Supports ${VAR_NAME} and ${VAR_NAME:default_value} environment variable expansion
+# Dark Factory — project-specific orchestrator overrides.
+# Core defaults are in the orchestrator package (defaults.yaml).
 
-# Concurrency
-max_concurrent_tasks: 12
-max_per_module: 1
-lock_depth: 4
-module_overrides: {}
-
-# Iteration limits
-max_execute_iterations: 10
-max_verify_attempts: 5
-max_review_cycles: 2
-
-# Models per role
-models:
-  architect: "opus"
-  implementer: "sonnet"
-  debugger: "sonnet"
-  reviewer: "sonnet"
-  merger: "opus"
-
-# Budget per invocation (USD)
-budgets:
-  architect: 5.0
-  implementer: 10.0
-  debugger: 5.0
-  reviewer: 2.0
-  merger: 5.0
-
-# Turn limits per invocation
-max_turns:
-  architect: 50
-  implementer: 80
-  debugger: 50
-  reviewer: 30
-  merger: 50
-
-# Reasoning effort per role
-effort:
-  architect: "max"
-  implementer: "max"
-  debugger: "max"
-  reviewer: "medium"
-  merger: "max"
-  module_tagger: "medium"
-
-# Backend CLI per role (claude, codex, gemini)
-backends:
-  architect: "claude"
-  implementer: "claude"
-  debugger: "claude"
-  reviewer: "claude"
-  merger: "claude"
-  module_tagger: "claude"
-
-# Verification commands
+# Verification commands (dark-factory multi-subproject layout)
 test_command: "pytest"
 lint_command: "ruff check shared escalation fused-memory orchestrator dashboard"
 type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright"
@@ -76,38 +23,20 @@ fused_memory:
     - "--transport"
     - "http"
 
-# Sandbox
-sandbox:
-  enabled: false
-
 # Escalation — port 8102 (matches .mcp.json so interactive sessions share the server)
 escalation:
   queue_dir: "data/escalations"
   port: 8102
 
-# Git
-git:
-  main_branch: "main"
-  branch_prefix: "task/"
-  remote: "origin"
-  worktree_dir: ".worktrees"
-
-# Usage cap handling
+# Usage cap — multi-account failover
 usage_cap:
-  enabled: true
-  # session_budget_usd: 50.0    # uncomment to limit per-run spend
-  pause_threshold: 0.96          # pause if startup check shows >96% utilization
-  wait_for_reset: true           # wait and auto-resume vs exit
-  probe_interval_secs: 300       # 5 min initial probe interval
-  max_probe_interval_secs: 1800  # 30 min max backoff
-  # Multi-account failover
   accounts:
     - name: max-c
       oauth_token_env: CLAUDE_OAUTH_TOKEN_C
     - name: max-b
       oauth_token_env: CLAUDE_OAUTH_TOKEN_B
-    - name: max-a
-      oauth_token_env: CLAUDE_OAUTH_TOKEN_A
+#    - name: max-a
+#      oauth_token_env: CLAUDE_OAUTH_TOKEN_A
 
 # Project root (absolute path)
 project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"

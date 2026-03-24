@@ -1,0 +1,88 @@
+# Core orchestrator defaults — shipped as package data.
+# Per-project config files override individual keys via deep merge.
+
+# Concurrency
+max_concurrent_tasks: 12
+max_per_module: 1
+lock_depth: 4
+module_overrides: {}
+
+# Iteration limits
+max_execute_iterations: 10
+max_verify_attempts: 5
+max_review_cycles: 2
+
+# Models per role
+models:
+  architect: "opus"
+  implementer: "sonnet"
+  debugger: "sonnet"
+  reviewer: "sonnet"
+  merger: "opus"
+  steward: "sonnet"
+  module_tagger: "sonnet"
+
+# Budget per invocation (USD)
+budgets:
+  architect: 5.0
+  implementer: 10.0
+  debugger: 5.0
+  reviewer: 2.0
+  merger: 5.0
+  steward: 3.0
+  module_tagger: 2.0
+
+# Turn limits per invocation
+max_turns:
+  architect: 50
+  implementer: 80
+  debugger: 50
+  reviewer: 30
+  merger: 50
+  steward: 30
+  module_tagger: 30
+
+# Reasoning effort per role
+effort:
+  architect: "max"
+  implementer: "max"
+  debugger: "max"
+  reviewer: "medium"
+  merger: "max"
+  steward: "medium"
+  module_tagger: "medium"
+
+# Backend CLI per role (claude, codex, gemini)
+backends:
+  architect: "claude"
+  implementer: "claude"
+  debugger: "claude"
+  reviewer: "claude"
+  merger: "claude"
+  steward: "claude"
+  module_tagger: "claude"
+
+# Sandbox
+sandbox:
+  enabled: false
+
+# Escalation
+escalation:
+  queue_dir: "data/escalations"
+  port: 8100
+  host: "127.0.0.1"
+
+# Git
+git:
+  main_branch: "main"
+  branch_prefix: "task/"
+  remote: "origin"
+  worktree_dir: ".worktrees"
+
+# Usage cap handling
+usage_cap:
+  enabled: true
+  pause_threshold: 0.96
+  wait_for_reset: true
+  probe_interval_secs: 300
+  max_probe_interval_secs: 1800

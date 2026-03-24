@@ -818,7 +818,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # Check step count if plan is available (always true for implementer/debugger)
         if self.plan:
             step_count = len(self.plan.get('steps', []))
-            if step_count >= 15:
+            if step_count >= 12:
                 logger.info(
                     'Task %s: upgrading %s to opus (%d Rust modules, %d steps)',
                     self.task_id, role.name, len(rust_modules), step_count,
