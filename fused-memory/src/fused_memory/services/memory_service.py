@@ -813,9 +813,9 @@ class MemoryService:
         if target_node and hasattr(target_node, 'name'):
             entities.append(target_node.name)
 
-        # Episode provenance
-        episodes = getattr(e, 'episodes', []) or []
-        provenance = [str(ep) for ep in episodes]
+        # Episode provenance — is-not-None, not truthiness, matches uuid/temporal pattern (see docstring)
+        episodes = getattr(e, 'episodes', None)
+        provenance = [str(ep) for ep in (episodes if episodes is not None else [])]
 
         return {
             'uuid': getattr(e, 'uuid', None),
