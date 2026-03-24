@@ -55,6 +55,24 @@ class EdgeWithoutUuid:
 
 
 @dataclass
+class EdgeWithNoneEpisodes:
+    """Simulates a Graphiti edge where the episodes attribute is present but None.
+
+    Tests the is-not-None semantic: None episodes must produce empty provenance,
+    same as a missing episodes attribute.
+    """
+
+    uuid: str = 'u-ep-none'
+    fact: str = 'fact with none episodes'
+    name: str | None = None
+    source_node: MockNode | None = None
+    target_node: MockNode | None = None
+    episodes: list[str] | None = None
+    valid_at: str | None = None
+    invalid_at: str | None = None
+
+
+@dataclass
 class MockAddEpisodeResult:
     """Simulates the AddEpisodeResults returned by Graphiti's add_episode."""
 

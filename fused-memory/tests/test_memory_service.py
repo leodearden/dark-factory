@@ -964,16 +964,7 @@ class TestBuildEdgeDict:
         Documents the is-not-None semantic: None episodes must not raise and must
         produce an empty list, same as a missing episodes attribute.
         """
-
-        class EdgeWithNoneEpisodes:
-            uuid = 'u-ep-none'
-            fact = 'fact with none episodes'
-            name = None
-            source_node = None
-            target_node = None
-            episodes = None  # attribute present, value is None
-            valid_at = None
-            invalid_at = None
+        from tests.conftest import EdgeWithNoneEpisodes
 
         d = service._build_edge_dict(EdgeWithNoneEpisodes())
         assert d['provenance'] == [], (
