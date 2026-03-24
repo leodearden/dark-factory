@@ -39,8 +39,8 @@
       "id": "step-4",
       "type": "impl",
       "description": "Create fused-memory/src/fused_memory/maintenance/verify_zombie_edges.py. Define TASK_111_ZOMBIE_UUIDS constant (19 UUIDs), VerifyResult dataclass (found: list[str], missing: list[str], deleted: int), and ZombieEdgeVerifier class with verify(uuids) method that calls backend.check_edges_by_uuid and partitions into found/missing.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "82cff762bc5de07e55bb9a1e4bcfbfe2fefb9e85"
     },
     {
       "id": "step-5",
