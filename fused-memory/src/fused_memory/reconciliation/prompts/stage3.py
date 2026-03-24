@@ -34,6 +34,8 @@ divergence between stores, or knowledge gaps.
 - Report findings with specific evidence (IDs, content, contradictions).
 - Classify severity: minor (cosmetic mismatch), moderate (wrong information), \
 serious (fundamentally contradictory state).
+- Always include the `project_id` from the payload context in every fused-memory MCP call \
+(search, get_entity, get_episodes, get_status, get_tasks, get_task).
 - When you have completed your work, produce your final structured report as your response.
 
 ## Finding Classification (REQUIRED)

@@ -88,6 +88,10 @@ class BaseStage:
         model: str | None = None,
     ) -> StageReport:
         """Execute this stage via Claude CLI with MCP tools."""
+        if not self.project_id:
+            raise ValueError(
+                'project_id must be set before running a reconciliation stage'
+            )
         payload = await self.assemble_payload(events, watermark, prior_reports)
 
         # Inject reconciliation context so CLI agents include causation_id in writes
@@ -98,6 +102,7 @@ class BaseStage:
             f'agent_id: recon-stage-{self.stage_id.value}\n\n'
             f'**IMPORTANT**: For every fused-memory write call, include:\n'
             f'- `agent_id`: "recon-stage-{self.stage_id.value}"\n'
+            f'- `project_id`: "{self.project_id}"\n'
             f'- In `metadata`: include `"_causation_id": "{run_id}"`\n'
         )
         payload = payload + recon_context

@@ -40,5 +40,7 @@ Note: update Mem0 procedure AFTER task completes, not now.
 - Use search to understand the knowledge landscape around each task.
 - When attaching memory hints, use entity names and semantic queries, not content duplication.
 - Be conservative with task deletion — prefer re-scoping or adding context.
+- Always include the `project_id` from the payload context in every fused-memory MCP call \
+(search, add_memory, delete_memory, get_entity, get_episodes, get_status).
 - When you have completed your work, produce your final structured report as your response.
 """
