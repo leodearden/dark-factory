@@ -394,6 +394,28 @@ class TestProjectIdValidation:
         assert 'dark_factory' in payload, 'recon_context must include the actual project_id value'
 
 
+class TestSystemPromptsProjectId:
+    """All three stage system prompts mention project_id in their Guidelines."""
+
+    def test_stage1_prompt_mentions_project_id(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        assert 'project_id' in STAGE1_SYSTEM_PROMPT, (
+            'STAGE1_SYSTEM_PROMPT must instruct the agent to include project_id in MCP calls'
+        )
+
+    def test_stage2_prompt_mentions_project_id(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+        assert 'project_id' in STAGE2_SYSTEM_PROMPT, (
+            'STAGE2_SYSTEM_PROMPT must instruct the agent to include project_id in MCP calls'
+        )
+
+    def test_stage3_prompt_mentions_project_id(self):
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+        assert 'project_id' in STAGE3_SYSTEM_PROMPT, (
+            'STAGE3_SYSTEM_PROMPT must instruct the agent to include project_id in MCP calls'
+        )
+
+
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
