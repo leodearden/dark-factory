@@ -914,6 +914,25 @@ class TestBuildEdgeDict:
             f"valid_at '' should be preserved, got {d['temporal']['valid_at']!r}"
         )
 
+    def test_empty_string_invalid_at_builds_temporal_dict(self, service):
+        """An edge with invalid_at='' (empty string, not None) must still produce a temporal dict.
+
+        The buggy code uses `if valid_at or invalid_at:` which treats '' as falsy,
+        causing the temporal dict to be skipped entirely.  The correct code uses
+        `is not None` checks so that empty-string values are preserved.
+        """
+        from tests.conftest import MockEdge
+
+        edge = MockEdge(fact='fact', uuid='u-ia', invalid_at='')
+        d = service._build_edge_dict(edge)
+
+        assert d['temporal'] is not None, (
+            "temporal dict should be built even when invalid_at is '' (not None)"
+        )
+        assert d['temporal']['invalid_at'] == '', (
+            f"invalid_at '' should be preserved, got {d['temporal']['invalid_at']!r}"
+        )
+
 
 class TestGetEntityValidOnly:
     """Tests that get_entity() valid_only parameter filters invalidated edges."""
