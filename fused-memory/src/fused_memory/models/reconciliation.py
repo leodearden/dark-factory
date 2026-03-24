@@ -140,14 +140,14 @@ class Watermark(BaseModel):
 
     @field_validator('project_id', mode='before')
     @classmethod
-    def normalize_project_id(cls, v: object) -> str | None:
+    def normalize_project_id(cls, v: str | None) -> str | None:
         """Strip whitespace; convert empty/whitespace-only strings to None."""
         if v is None:
             return None
         if isinstance(v, str):
             stripped = v.strip()
             return stripped if stripped else None
-        return v  # type: ignore[return-value]
+        raise ValueError(f'project_id must be str or None, got {type(v).__name__}')
 
     last_full_run_completed: datetime | None = None
     last_episode_timestamp: datetime | None = None
