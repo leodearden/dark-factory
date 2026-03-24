@@ -1,0 +1,130 @@
+{
+  "task_id": "128",
+  "title": "Verify/execute FalkorDB Cypher DELETE for 19 zombie edges (Task 111 unconfirmed)",
+  "files": [
+    "fused-memory/src/fused_memory/backends/graphiti_client.py",
+    "fused-memory/src/fused_memory/maintenance/verify_zombie_edges.py",
+    "fused-memory/tests/test_verify_zombie_edges.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/backends",
+    "fused-memory/src/fused_memory/maintenance",
+    "fused-memory/tests"
+  ],
+  "analysis": "Task 128 is an operational verification task: Task 111 ('Delete 19 confirmed FalkorDB zombie Graphiti edges') was marked done but no confirmation memory exists that the Cypher DELETE was actually executed. The knowledge graph still records the edges as pending deletion.\n\nExisting infrastructure analysis:\n- `GraphitiBackend.bulk_remove_edges(uuids)` already handles pre-count + DELETE for RELATES_TO edges, but it always deletes \u2014 no check-only mode exists.\n- `cleanup_stale_edges.py` does time-range based cleanup, not UUID-targeted verification.\n- FalkorDB runs as a native host process on port 6379 (Redis protocol), config in `fused-memory/config/config.yaml`.\n\nApproach: Create a UUID-targeted verification and deletion maintenance script that fills the gap between 'check if edges exist' and 'delete them'. Add a `check_edges_by_uuid` read-only method to GraphitiBackend for the verify-first workflow. The script stores the 19 zombie UUIDs as a constant for reproducibility and provides both dry-run (verify-only) and live-delete modes.\n\nThe task's Cypher uses `MATCH ()-[e]->()` (any edge type) but Graphiti only creates RELATES_TO edges between Entity nodes, so matching `()-[e:RELATES_TO]->()` is equivalent and consistent with existing code patterns. However, for safety, the check method will use unlabeled edge matching to catch any edge type.\n\nNote: The 19 UUIDs in the task description are 8-character hex strings (Graphiti's short UUID format), not full UUID4. The existing `bulk_remove_edges` passes UUIDs as-is to Cypher, so this is compatible.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing tests for GraphitiBackend.check_edges_by_uuid(uuids) \u2014 a read-only method that returns which UUIDs exist as edges in FalkorDB. Tests: returns found UUIDs, returns empty for no matches, returns empty for empty input, raises RuntimeError when not initialized. Follow exact pattern from TestBulkRemoveEdges in test_cleanup_stale_edges.py (mock graph with AsyncMock, patch cast).",
+      "status": "done",
+      "commit": "c4e70d697c2cfb8453d6da0e31ebd1bf610d2dcc"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Add check_edges_by_uuid(uuids: list[str]) -> list[str] to GraphitiBackend in graphiti_client.py. Cypher: MATCH ()-[e]->() WHERE e.uuid IN $uuids RETURN e.uuid. Returns list of found UUID strings. Uses _require_client() guard, same driver._get_graph(None) pattern as bulk_remove_edges. Place after bulk_remove_edges (line ~365).",
+      "status": "done",
+      "commit": "e7a7c926825cb4ce6f7a327751297fcea26a2b89"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing tests for ZombieEdgeVerifier.verify(uuids) in test_verify_zombie_edges.py. Tests: returns VerifyResult with found/missing UUID lists, handles all-found case, handles all-missing case, handles empty input. Mock GraphitiBackend.check_edges_by_uuid as AsyncMock.",
+      "status": "done",
+      "commit": "c4e70d697c2cfb8453d6da0e31ebd1bf610d2dcc"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Create fused-memory/src/fused_memory/maintenance/verify_zombie_edges.py. Define TASK_111_ZOMBIE_UUIDS constant (19 UUIDs), VerifyResult dataclass (found: list[str], missing: list[str], deleted: int), and ZombieEdgeVerifier class with verify(uuids) method that calls backend.check_edges_by_uuid and partitions into found/missing.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing tests for ZombieEdgeVerifier.cleanup(uuids, dry_run). Tests: dry_run=True verifies only (no deletion), dry_run=False verifies then deletes found edges via backend.bulk_remove_edges, handles case where no edges exist (skip delete), returns accurate VerifyResult with deleted count.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Implement ZombieEdgeVerifier.cleanup(uuids, dry_run=False) \u2192 VerifyResult. Calls verify() first, then if not dry_run and found edges exist, calls backend.bulk_remove_edges(found_uuids). Sets result.deleted to the return value.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing tests for run_verify_zombie_edges() async entrypoint. Tests: loads config and initializes MemoryService, calls cleanup with correct args, closes service on success, closes service on error (finally block), passes dry_run flag through. Follow exact pattern from TestRunCleanup in test_cleanup_stale_edges.py.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Implement run_verify_zombie_edges(uuids, config_path, dry_run) async entrypoint and __main__ CLI block in verify_zombie_edges.py. Pattern: load FusedMemoryConfig, create MemoryService, create ZombieEdgeVerifier(backend=service.graphiti), run cleanup, close in finally. CLI: argparse with --dry-run, --config, optional --uuids override (defaults to TASK_111_ZOMBIE_UUIDS).",
+      "status": "pending",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Add check_edges_by_uuid as a separate read-only method on GraphitiBackend rather than reusing bulk_remove_edges",
+      "rationale": "The verify-first workflow needs a non-destructive query. bulk_remove_edges always deletes after counting. Separation of read and write operations is safer for irreversible graph mutations and enables dry-run mode without conditional deletion logic in the backend."
+    },
+    {
+      "decision": "Use unlabeled edge matching (MATCH ()-[e]->()) in check_edges_by_uuid instead of RELATES_TO-specific matching",
+      "rationale": "The task's original Cypher uses unlabeled matching. While Graphiti primarily creates RELATES_TO edges, zombie edges could theoretically be any type. Unlabeled matching is safer for a cleanup tool. bulk_remove_edges still uses RELATES_TO matching for consistency with existing code."
+    },
+    {
+      "decision": "Store the 19 zombie UUIDs as a named constant TASK_111_ZOMBIE_UUIDS in the script",
+      "rationale": "Provides traceability back to Task 111, makes the script self-documenting, and allows the CLI to default to these UUIDs while still accepting overrides via --uuids flag for reuse in future zombie-edge scenarios."
+    },
+    {
+      "decision": "Create a new maintenance script rather than extending cleanup_stale_edges.py",
+      "rationale": "cleanup_stale_edges.py is purpose-built for time-range queries. UUID-targeted verification is a different use case (specific known edges, not a temporal window). Separate scripts keep each module focused and independently testable."
+    },
+    {
+      "decision": "Follow the existing test pattern exactly (mock graph with AsyncMock, patch cast, _make_backend helper)",
+      "rationale": "Consistency with test_cleanup_stale_edges.py and test_reindex.py. Same mock infrastructure, same assertion patterns. Reduces cognitive load and ensures the test harness works the same way across all maintenance utilities."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "GraphitiBackend._require_client() guard pattern",
+      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py",
+      "how": "check_edges_by_uuid uses the same _require_client() \u2192 cast(Any, client.driver) \u2192 driver._get_graph(None) pattern as bulk_remove_edges, get_node_text, get_edge_text, etc."
+    },
+    {
+      "what": "GraphitiBackend.bulk_remove_edges(uuids) for deletion",
+      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py:330-365",
+      "how": "ZombieEdgeVerifier.cleanup() delegates deletion to the existing bulk_remove_edges method rather than duplicating the pre-count + DELETE Cypher pattern."
+    },
+    {
+      "what": "run_cleanup() entrypoint pattern (config load \u2192 service init \u2192 run \u2192 finally close)",
+      "where": "fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py:91-139",
+      "how": "run_verify_zombie_edges() follows the identical lifecycle pattern: load FusedMemoryConfig, create MemoryService, run operation, close service in finally block, restore env vars."
+    },
+    {
+      "what": "_make_backend() and _make_graph_mock() test helpers",
+      "where": "fused-memory/tests/test_cleanup_stale_edges.py:14-28",
+      "how": "Duplicated into test_verify_zombie_edges.py following the same pattern as test_reindex.py (comment says 'mirrored from test_reindex.py'). These helpers create a GraphitiBackend with mock client and a mock graph that returns configurable result sets."
+    },
+    {
+      "what": "conftest.py mock_config fixture",
+      "where": "fused-memory/tests/conftest.py:46-77",
+      "how": "All tests use the shared mock_config fixture which provides a FusedMemoryConfig with test defaults (no real API keys needed)."
+    },
+    {
+      "what": "CleanupManager + CleanupResult architectural pattern",
+      "where": "fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py:18-88",
+      "how": "ZombieEdgeVerifier + VerifyResult follows the same Manager+Result pattern: dataclass result with operation counts, manager class wrapping backend, verify (find) then cleanup (delete) separation."
+    }
+  ],
+  "_session_id": "128-daf3427e",
+  "_created_at": "2026-03-24T22:22:26.654278+00:00"
+}
