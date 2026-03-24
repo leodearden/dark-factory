@@ -353,6 +353,46 @@ class TestProjectIdValidation:
                 run_id='test-run-001',
             )
 
+    @pytest.mark.asyncio
+    async def test_recon_context_includes_project_id(self, mock_deps):
+        from unittest.mock import AsyncMock, patch
+
+        from fused_memory.models.reconciliation import StageId, Watermark
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+        watermark = Watermark(project_id='dark_factory')
+
+        captured_payload = {}
+
+        async def fake_assemble_payload(events, wm, prior_reports):
+            return '## Base Payload\nsome context'
+
+        async def fake_run_stage_via_cli(**kwargs):
+            captured_payload['payload'] = kwargs.get('payload', '')
+            from fused_memory.reconciliation.cli_stage_runner import StageResult
+            return StageResult(
+                success=True,
+                report={'summary': 'ok'},
+            )
+
+        with (
+            patch.object(stage, 'assemble_payload', new=fake_assemble_payload),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=fake_run_stage_via_cli,
+            ),
+        ):
+            await stage.run(
+                events=[],
+                watermark=watermark,
+                prior_reports=[],
+                run_id='test-run-001',
+            )
+
+        payload = captured_payload.get('payload', '')
+        assert 'project_id' in payload, 'recon_context must mention project_id'
+        assert 'dark_factory' in payload, 'recon_context must include the actual project_id value'
+
 
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
