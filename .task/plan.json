@@ -1,93 +1,101 @@
 {
-  "task_id": "140",
-  "title": "Harden _build_edge_dict: docstring contract, temporal is-not-None, missing uuid-None integration test",
+  "task_id": "145",
+  "title": "Harden _build_edge_dict tests and fix episodes truthiness inconsistency",
   "files": [
     "fused-memory/src/fused_memory/services/memory_service.py",
-    "fused-memory/tests/test_memory_service.py"
+    "fused-memory/tests/test_memory_service.py",
+    "fused-memory/tests/conftest.py"
   ],
   "modules": [
     "fused-memory/src/fused_memory/services",
     "fused-memory/tests"
   ],
-  "analysis": "Three small hardening improvements from the task 138 review, all scoped to _build_edge_dict and _search_graphiti in memory_service.py:\n\n1. **Temporal falsy-value bug (lines 782-785)**: The checks `if valid_at or invalid_at:` and `str(valid_at) if valid_at else None` use Python truthiness, meaning an empty-string value like `valid_at=''` would be treated as absent (temporal dict skipped entirely, or value coerced to None). This is the same bug class fixed for uuid in task 138. Fix: replace all three truthiness checks with explicit `is not None` comparisons.\n\n2. **Integration test gap**: `test_edge_with_no_uuid_attr_returns_none` (line 844) confirms the helper returns `uuid=None`, and `test_empty_string_uuid_preserved_in_search_graphiti` (line 457) confirms empty-string preservation. But no test exercises the actual fallback path where `uuid is None` causes `_search_graphiti` to use `str(i)` as the result id. Need a test that mocks an EdgeWithoutUuid through `service.search()` and asserts `results[0].id == '0'`.\n\n3. **Docstring gap**: The `_build_edge_dict` docstring (lines 770-777) describes the six keys but doesn't document the load-bearing semantics of the `uuid` field: `None` when the attribute is missing vs `''` when present-but-blank. Callers (_search_graphiti line 731) rely on this distinction.\n\nExisting test infrastructure is mature: MockEdge/MockNode in conftest.py, service fixture with mocked backends, TestBuildEdgeDict class with 8 tests, TestSearch class with category and uuid-preservation tests. All new tests follow established patterns.",
+  "analysis": "Three targeted improvements from task 140 review, all scoped to _build_edge_dict and its tests.\n\n(1) **Episodes truthiness (memory_service.py:817)**: Line 817 uses `getattr(e, 'episodes', []) or []` — a truthiness-based fallback — while the docstring at lines 793-795 explicitly states truthiness checks are 'deliberately avoided' for _build_edge_dict. The behavior is identical for all realistic inputs (None -> [], [] -> [], ['a'] -> ['a']), so this is a consistency/style fix, not a behavioral bug. We fix the code to use `is not None` to match the docstring's universal 'no truthiness' principle, and add an inline comment explaining the pattern.\n\n(2) **EdgeWithoutUuid duplication (test_memory_service.py:487,875)**: Identical 8-line plain class defined inline at lines 487-494 (TestSearch) and 875-882 (TestBuildEdgeDict). conftest.py already has MockEdge, MockNode, MockAddEpisodeResult as dataclasses. We add EdgeWithoutUuid alongside them as a dataclass with field(default_factory=list) for episodes, matching MockEdge's pattern but deliberately omitting the uuid field so getattr(e, 'uuid', None) returns None.\n\n(3) **Cross-field temporal assertions (test_memory_service.py:926-962)**: The two empty-string temporal tests each only assert the field they set, but don't assert the OTHER temporal field is None. The existing tests at lines 837-846 and 848-857 follow a pattern where both temporal fields are asserted. Adding the missing assertions hardens these tests to catch regressions where the wrong field gets populated.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing test in TestBuildEdgeDict: `test_empty_string_valid_at_builds_temporal_dict` — create a MockEdge with `valid_at=''` (empty string, not None), call `_build_edge_dict`, assert `d['temporal']` is not None and `d['temporal']['valid_at'] == ''`. This will FAIL because the current truthiness check `if valid_at or invalid_at:` treats '' as falsy, skipping temporal dict construction entirely.",
+      "description": "Add cross-field assertion `assert d['temporal']['invalid_at'] is None` to test_empty_string_valid_at_builds_temporal_dict (after line 943). This matches the pattern at line 846 where the only-valid_at test asserts invalid_at is None. Should pass immediately — test hardening, not a new behavior.",
       "status": "done",
-      "commit": "9a43114"
+      "commit": "58171e9"
     },
     {
       "id": "step-2",
       "type": "test",
-      "description": "Write failing test in TestBuildEdgeDict: `test_empty_string_invalid_at_builds_temporal_dict` — create a MockEdge with `invalid_at=''`, assert `d['temporal']` is not None and `d['temporal']['invalid_at'] == ''`. Also FAILS due to same truthiness bug on the `invalid_at` path.",
+      "description": "Add cross-field assertion `assert d['temporal']['valid_at'] is None` to test_empty_string_invalid_at_builds_temporal_dict (after line 962). This matches the pattern at line 856 where the only-invalid_at test asserts valid_at is None. Should pass immediately — test hardening, not a new behavior.",
       "status": "done",
-      "commit": "5b0e68c"
+      "commit": "58171e9"
     },
     {
       "id": "step-3",
-      "type": "impl",
-      "description": "Fix temporal truthiness checks in `_build_edge_dict` (lines 782-785): change `if valid_at or invalid_at:` to `if valid_at is not None or invalid_at is not None:`, change `str(valid_at) if valid_at else None` to `str(valid_at) if valid_at is not None else None`, change `str(invalid_at) if invalid_at else None` to `str(invalid_at) if invalid_at is not None else None`. Both new tests from steps 1-2 should now pass. Verify all existing temporal tests (test_edge_with_only_valid_at, test_edge_with_only_invalid_at, test_full_edge_returns_all_six_keys) still pass.",
+      "type": "test",
+      "description": "Write test `test_none_episodes_attr_produces_empty_provenance` in TestBuildEdgeDict. Create an inline edge class with `episodes = None` (attribute present but None). Assert `d['provenance'] == []`. This documents the is-not-None semantic for episodes. Will pass with both old (or-based) and new (is not None) code, but serves as the specification that the impl step fulfills.",
       "status": "done",
-      "commit": "fb8f0d6"
+      "commit": "a91221d"
     },
     {
       "id": "step-4",
-      "type": "test",
-      "description": "Write integration test in TestSearch: `test_none_uuid_edge_falls_back_to_index_in_search` — define an inline `EdgeWithoutUuid` class (no uuid attribute, matching the pattern at test_memory_service.py line 847-854), mock `service.graphiti.search` to return `[EdgeWithoutUuid()]`, mock `service.mem0.search` to return empty results, call `await service.search(query='test', project_id='test')`, assert `results[0].id == '0'` (the str(i) fallback). This test should pass immediately since the `is not None` check on line 731 already handles this; it fills a coverage gap.",
+      "type": "impl",
+      "description": "Fix episodes truthiness on memory_service.py line 817. Replace `episodes = getattr(e, 'episodes', []) or []` and `provenance = [str(ep) for ep in episodes]` with: `episodes = getattr(e, 'episodes', None)` then `provenance = [str(ep) for ep in (episodes if episodes is not None else [])]`. Add inline comment: `# is-not-None, not truthiness — matches uuid/temporal pattern (see docstring)`. Verify step-3 test still passes.",
       "status": "done",
-      "commit": "564c9d2"
+      "commit": "498ab60"
     },
     {
       "id": "step-5",
       "type": "impl",
-      "description": "Update `_build_edge_dict` docstring (lines 770-777) to document the uuid contract: `uuid` is `None` when the edge object lacks a uuid attribute entirely (via `getattr(e, 'uuid', None)` default), and may be `''` (empty string) when the attribute exists but is blank. Note this distinction is load-bearing: callers use `is not None` (not truthiness) to decide whether to fall back to a synthetic id. Also note the temporal values follow the same `is not None` convention.",
+      "description": "Add EdgeWithoutUuid dataclass to conftest.py after MockEdge (around line 38). Fields: fact: str = 'some fact', name: str | None = None, source_node: MockNode | None = None, target_node: MockNode | None = None, episodes: list[str] = field(default_factory=list), valid_at: str | None = None, invalid_at: str | None = None. Docstring: 'Simulates a Graphiti edge that lacks a uuid attribute.' No uuid field — getattr(e, 'uuid', None) returns None.",
       "status": "done",
-      "commit": "6d300af"
+      "commit": "75813d5"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Replace both inline EdgeWithoutUuid class definitions in test_memory_service.py with imports from conftest. At line 487 (TestSearch.test_none_uuid_edge_falls_back_to_index_in_search): remove 8-line class, add `from tests.conftest import EdgeWithoutUuid`. At line 875 (TestBuildEdgeDict.test_edge_with_no_uuid_attr_returns_none): same replacement. Follows the existing import pattern used at lines 839, 850, 933, 952 for MockEdge. Run full test suite to confirm no regressions.",
+      "status": "done",
+      "commit": "1ceb34d"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Write two separate tests for valid_at='' and invalid_at='' rather than one combined test",
-      "rationale": "Each conditional branch (valid_at, invalid_at) has its own truthiness check on line 782 and its own value conversion on lines 784-785. Separate tests make the failure mode explicit — if either branch regresses, the test name identifies exactly which one."
+      "decision": "Fix code to use `is not None` (option 1) rather than narrowing docstring scope (option 2)",
+      "rationale": "The docstring establishes a universal 'no truthiness' principle for _build_edge_dict. Narrowing it to uuid/temporal-only would weaken the principle and leave a truthiness footgun for future fields. The code change is minimal (2 lines) and makes the pattern uniform across all three field groups: uuid, temporal, and episodes."
     },
     {
-      "decision": "Integration test for uuid-None fallback uses an inline class instead of MockEdge",
-      "rationale": "MockEdge has `uuid: str = ''` as a default. To test the 'no uuid attribute at all' path (which returns None from getattr), we need a class that lacks the uuid attribute entirely, matching the pattern already used in test_edge_with_no_uuid_attr_returns_none (line 844-857)."
+      "decision": "EdgeWithoutUuid deliberately omits the uuid field rather than setting uuid=None",
+      "rationale": "The whole point of this fixture is testing getattr(e, 'uuid', None) returning None because the attribute doesn't exist. A dataclass field with default=None would create an attribute that exists with value None. Omitting the field accurately models the real-world scenario of a Graphiti edge object lacking the uuid property."
     },
     {
-      "decision": "Step 4 test is expected to pass immediately (no red phase)",
-      "rationale": "The uuid fallback code was already fixed in task 138. This test fills a coverage gap — it exercises the end-to-end path through _search_graphiti where uuid=None triggers the str(i) fallback, not just the helper. Coverage-gap tests that pass on first run are acceptable when the implementation already exists."
+      "decision": "Cross-field assertions added to existing tests rather than creating new test functions",
+      "rationale": "The task explicitly requests that the existing tests 'should also assert' the other temporal field. This matches the pattern established at lines 837-857 where single-field temporal tests assert both fields. Adding to existing tests keeps the test count stable and the test names accurate."
     },
     {
-      "decision": "Docstring update is a separate step at the end, not a prerequisite",
-      "rationale": "The docstring documents the semantics that the tests validate. Writing it after all tests pass ensures the documented contract matches the verified behavior."
+      "decision": "episodes=None test (step-3) written before impl (step-4) even though it passes with both old and new code",
+      "rationale": "TDD principle: write the specification test first. The test documents the intended semantic (is-not-None, not truthiness). While behavior is identical for None input, the test serves as a regression guard and specification. It also validates that the None case works correctly after the refactor."
     }
   ],
   "reuse": [
     {
-      "what": "MockEdge / MockNode dataclasses",
-      "where": "fused-memory/tests/conftest.py lines 19-37",
-      "how": "Import for temporal tests in steps 1-2. MockEdge already supports valid_at/invalid_at fields with None defaults, just pass '' to test the falsy-value path."
+      "what": "MockEdge dataclass pattern (field types, default_factory, docstring style)",
+      "where": "fused-memory/tests/conftest.py lines 26-37",
+      "how": "EdgeWithoutUuid mirrors MockEdge's structure — same fields, same types, same default patterns — but omits uuid. Uses field(default_factory=list) for episodes."
     },
     {
-      "what": "EdgeWithoutUuid inline class pattern",
-      "where": "fused-memory/tests/test_memory_service.py lines 847-854",
-      "how": "Reuse the same inline class pattern from test_edge_with_no_uuid_attr_returns_none for the integration test in step 4. Copy the class definition into the new test method."
+      "what": "Existing `from tests.conftest import` pattern for shared fixtures",
+      "where": "test_memory_service.py lines 839, 850, 933, 952",
+      "how": "Tests already use `from tests.conftest import MockEdge` — EdgeWithoutUuid will follow the same import pattern."
     },
     {
-      "what": "service fixture with mocked backends",
-      "where": "fused-memory/tests/test_memory_service.py lines 13-33",
-      "how": "All new tests use the existing `service` fixture which provides MemoryService with mocked graphiti/mem0 backends."
+      "what": "Temporal cross-field assertion pattern",
+      "where": "test_memory_service.py lines 844-846 and 855-857",
+      "how": "The pattern of asserting both temporal fields (the set one and the None one) is copied exactly from the existing only-valid_at and only-invalid_at tests."
     },
     {
-      "what": "test_empty_string_uuid_preserved_in_search_graphiti pattern",
-      "where": "fused-memory/tests/test_memory_service.py lines 457-475",
-      "how": "Step 4's integration test follows the same mock-search-assert structure: mock graphiti.search return, mock mem0.search empty, call service.search, assert result id."
+      "what": "is-not-None pattern for getattr results in _build_edge_dict",
+      "where": "memory_service.py lines 798-805 (valid_at/invalid_at handling)",
+      "how": "The episodes fix replicates the exact same getattr -> is not None -> fallback pattern already used for valid_at and invalid_at."
     }
   ],
-  "_session_id": "140-36b29b06",
-  "_created_at": "2026-03-24T23:08:21.287297+00:00"
+  "_session_id": "145-a97e313f",
+  "_created_at": "2026-03-24T23:23:38.029306+00:00"
 }
