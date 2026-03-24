@@ -28,15 +28,5 @@ escalation:
   queue_dir: "data/escalations"
   port: 8102
 
-# Usage cap — multi-account failover
-usage_cap:
-  accounts:
-    - name: max-c
-      oauth_token_env: CLAUDE_OAUTH_TOKEN_C
-    - name: max-b
-      oauth_token_env: CLAUDE_OAUTH_TOKEN_B
-#    - name: max-a
-#      oauth_token_env: CLAUDE_OAUTH_TOKEN_A
-
 # Project root (absolute path)
 project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"
