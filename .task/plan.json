@@ -76,8 +76,8 @@
       "id": "step-8",
       "type": "impl",
       "description": "Add valid_only: bool = False parameter to the get_entity MCP tool in tools.py. Update docstring to document the parameter. Pass it through to memory_service.get_entity(valid_only=valid_only).",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "2c7bfbe"
     }
   ],
   "design_decisions": [
