@@ -474,6 +474,34 @@ class TestSearch:
             f"Expected empty-string uuid to be preserved, got {results[0].id!r}"
         )
 
+    @pytest.mark.asyncio
+    async def test_none_uuid_edge_falls_back_to_index_in_search(self, service):
+        """An edge with no uuid attribute at all uses its index position as the result id.
+
+        When _build_edge_dict returns uuid=None (via getattr default), _search_graphiti
+        should use str(i) as the result id.  For the first (index 0) edge this is '0'.
+        This covers the end-to-end uuid=None fallback path, complementing the unit test
+        test_edge_with_no_uuid_attr_returns_none which only tests the helper in isolation.
+        """
+
+        class EdgeWithoutUuid:
+            fact = 'some fact'
+            name = None
+            source_node = None
+            target_node = None
+            episodes = []
+            valid_at = None
+            invalid_at = None
+
+        service.graphiti.search = AsyncMock(return_value=[EdgeWithoutUuid()])
+        service.mem0.search = AsyncMock(return_value={'results': []})
+
+        results = await service.search(query='test', project_id='test')
+        assert len(results) == 1
+        assert results[0].id == '0', (
+            f"Expected str(0) fallback id when uuid is None, got {results[0].id!r}"
+        )
+
 
 class TestDeleteMemory:
     @pytest.mark.asyncio
@@ -894,6 +922,44 @@ class TestBuildEdgeDict:
 
         d = service._build_edge_dict(EdgeWithCustomEpisodes())
         assert d['provenance'] == ['custom-ep-repr', 'custom-ep-repr']
+
+    def test_empty_string_valid_at_builds_temporal_dict(self, service):
+        """An edge with valid_at='' (empty string, not None) must still produce a temporal dict.
+
+        The buggy code uses `if valid_at or invalid_at:` which treats '' as falsy,
+        causing the temporal dict to be skipped entirely.  The correct code uses
+        `is not None` checks so that empty-string values are preserved.
+        """
+        from tests.conftest import MockEdge
+
+        edge = MockEdge(fact='fact', uuid='u-va', valid_at='')
+        d = service._build_edge_dict(edge)
+
+        assert d['temporal'] is not None, (
+            "temporal dict should be built even when valid_at is '' (not None)"
+        )
+        assert d['temporal']['valid_at'] == '', (
+            f"valid_at '' should be preserved, got {d['temporal']['valid_at']!r}"
+        )
+
+    def test_empty_string_invalid_at_builds_temporal_dict(self, service):
+        """An edge with invalid_at='' (empty string, not None) must still produce a temporal dict.
+
+        The buggy code uses `if valid_at or invalid_at:` which treats '' as falsy,
+        causing the temporal dict to be skipped entirely.  The correct code uses
+        `is not None` checks so that empty-string values are preserved.
+        """
+        from tests.conftest import MockEdge
+
+        edge = MockEdge(fact='fact', uuid='u-ia', invalid_at='')
+        d = service._build_edge_dict(edge)
+
+        assert d['temporal'] is not None, (
+            "temporal dict should be built even when invalid_at is '' (not None)"
+        )
+        assert d['temporal']['invalid_at'] == '', (
+            f"invalid_at '' should be preserved, got {d['temporal']['invalid_at']!r}"
+        )
 
 
 class TestGetEntityValidOnly:
