@@ -88,9 +88,13 @@ class BaseStage:
         model: str | None = None,
     ) -> StageReport:
         """Execute this stage via Claude CLI with MCP tools."""
-        if not self.project_id:
+        if not self.project_id or not self.project_id.strip():
             raise ValueError(
                 'project_id must be set before running a reconciliation stage'
+            )
+        if watermark.project_id and watermark.project_id != self.project_id:
+            raise ValueError(
+                f'watermark project_id {watermark.project_id!r} != stage project_id {self.project_id!r}'
             )
         payload = await self.assemble_payload(events, watermark, prior_reports)
 

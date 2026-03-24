@@ -1,57 +1,110 @@
 {
-  "task_id": "130",
-  "title": "Move get_entity tool tests from test_health_endpoint.py to dedicated test_tools.py",
+  "task_id": "135",
+  "title": "Harden project_id validation in BaseStage.run()",
   "files": [
-    "fused-memory/tests/test_tools.py",
-    "fused-memory/tests/test_health_endpoint.py"
+    "fused-memory/src/fused_memory/reconciliation/stages/base.py",
+    "fused-memory/tests/test_stages.py"
   ],
   "modules": [
+    "fused-memory/src/fused_memory/reconciliation/stages",
     "fused-memory/tests"
   ],
-  "analysis": "Task 129 appended two get_entity MCP tool tests to fused-memory/tests/test_health_endpoint.py (lines 644-687): test_get_entity_tool_passes_valid_only_true_to_service and test_get_entity_tool_valid_only_defaults_to_false. These test the get_entity tool handler's valid_only parameter forwarding, not any health endpoint. They are fully self-contained \u2014 each creates its own AsyncMock service and MCP server inline, with no dependency on the file's fixtures (mcp_server, mcp_server_with_service, etc.). The move is clean: create test_tools.py with the two tests and their imports, then remove the section (lines 644-687) from test_health_endpoint.py. No fixture sharing needed. The new file name test_tools.py parallels test_memory_service.py (service-layer tests vs tool-layer tests) and provides a natural home for future tool-level tests that are currently co-located in test_health_endpoint.py.",
-  "prerequisites": [],
+  "analysis": "Three targeted robustness improvements to project_id handling in BaseStage.run().\n\n1. **Whitespace bypass** (base.py:91): The guard `if not self.project_id` is truthy for whitespace-only strings like '   ' because non-empty strings are truthy in Python. Fix: add `.strip()` check.\n\n2. **Watermark mismatch** (base.py:91-108): After validation, the code injects `self.project_id` into the recon_context payload (line 105), but never checks that `watermark.project_id` matches. The Watermark model (reconciliation.py:135-143) has a required `project_id: str` field. If a caller sets stage.project_id='A' but passes Watermark(project_id='B'), the agent sees contradictory scoping — the payload says 'A' while the watermark carries 'B'. Fix: add an explicit consistency check.\n\n3. **Missing assertion** (test_stages.py:458-465): test_stage1_remediation_payload_contains_project_id only asserts `'dark_factory' in payload` but NOT `'project_id' in payload`. Every other test in TestPayloadProjectId (stage1 normal, stage2, stage3) asserts both. This is a test coverage gap — fix by adding the missing assertion.\n\nAll three changes are small and surgical. The existing test infrastructure (mock_deps fixture, MemoryConsolidator with AsyncMock deps, Watermark construction) can be reused directly.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Add missing assertion to test_stage1_remediation_payload_contains_project_id (test_stages.py:465): add `assert 'project_id' in payload` to match the pattern used by every other test in TestPayloadProjectId.",
+      "status": "done",
+      "commit": "a075147",
+      "tests": [
+        "fused-memory/tests/test_stages.py::TestPayloadProjectId::test_stage1_remediation_payload_contains_project_id"
+      ]
+    }
+  ],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Create fused-memory/tests/test_tools.py with the two get_entity tool tests (test_get_entity_tool_passes_valid_only_true_to_service, test_get_entity_tool_valid_only_defaults_to_false) copied from test_health_endpoint.py. Include the necessary imports (AsyncMock, pytest, create_mcp_server) and module docstring. Run pytest on the new file to confirm both tests pass.",
+      "description": "Write failing test: test_run_raises_on_whitespace_project_id — set stage.project_id='   ' (whitespace-only), call stage.run() with a valid watermark, assert ValueError is raised with 'project_id' in the message. Place in TestProjectIdValidation class alongside the existing test_run_raises_on_empty_project_id.",
       "status": "done",
-      "commit": "fd0af75"
+      "commit": "82d2413"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Remove the get_entity section (section comment block at lines 644-646 and the two async test functions at lines 649-687) from test_health_endpoint.py. Run pytest on both test_health_endpoint.py and test_tools.py to confirm: (a) the old file's remaining tests still pass, (b) the new file's 2 tests still pass, and (c) no duplicate test names exist.",
+      "description": "In base.py line 91, change `if not self.project_id:` to `if not self.project_id or not self.project_id.strip():` to reject whitespace-only project_id strings.",
       "status": "done",
-      "commit": "7772fb2"
+      "commit": "ea3ac7b"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing test: test_run_raises_on_watermark_project_id_mismatch — set stage.project_id='project_a', pass Watermark(project_id='project_b'), call stage.run(), assert ValueError is raised with a message mentioning both 'project_a' and 'project_b' (or 'mismatch'). Place in TestProjectIdValidation class.",
+      "status": "done",
+      "commit": "a1b9aa8"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "In base.py, after the existing project_id-empty guard (line 91-94), add: `if watermark.project_id and watermark.project_id != self.project_id: raise ValueError(f'watermark project_id {watermark.project_id!r} != stage project_id {self.project_id!r}')`. This catches contradictory scoping before the CLI subprocess runs.",
+      "status": "done",
+      "commit": "e9d460f"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write passing test: test_run_allows_matching_watermark_project_id — set stage.project_id='dark_factory', pass Watermark(project_id='dark_factory'). Patch assemble_payload and run_stage_via_cli, assert no exception is raised and run completes. This is a positive regression test for the happy path with the new mismatch check.",
+      "status": "done",
+      "commit": "e9d460f"
+    },
+    {
+      "id": "step-6",
+      "type": "test",
+      "description": "Write passing test: test_run_allows_empty_watermark_project_id — set stage.project_id='dark_factory', pass Watermark(project_id=''). Patch assemble_payload and run_stage_via_cli, assert no exception is raised. This ensures the mismatch check only triggers when watermark.project_id is non-empty (the `if watermark.project_id and ...` guard).",
+      "status": "done",
+      "commit": "e9d460f"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Name the new file test_tools.py rather than test_get_entity_tool.py",
-      "rationale": "test_tools.py parallels test_memory_service.py (service-layer vs tool-layer) and provides a natural landing zone for future tool-level tests that are currently misplaced in test_health_endpoint.py. Avoids file proliferation \u2014 one file per tool would create 15+ test files."
+      "decision": "Use `if not self.project_id or not self.project_id.strip()` rather than stripping and reassigning",
+      "rationale": "Minimal change — keeps self.project_id untouched (doesn't silently strip whitespace). Fails fast with a clear error, letting the caller fix the root cause rather than masking it."
     },
     {
-      "decision": "Keep tests self-contained (no shared fixtures) in test_tools.py for now",
-      "rationale": "The two get_entity tests already create their own mocks inline. Extracting fixtures is premature since the file starts with only 2 tests. Fixtures can be introduced when more tests are moved here in the future."
+      "decision": "Only check watermark mismatch when watermark.project_id is non-empty",
+      "rationale": "The Watermark model requires project_id: str, but existing code constructs Watermark(project_id='') as default. The `if watermark.project_id and ...` guard avoids breaking callers that pass an empty watermark project_id while having a valid stage.project_id."
     },
     {
-      "decision": "Do not move other tool tests from test_health_endpoint.py in this task",
-      "rationale": "The task scope is specifically the two get_entity tests. Moving others (update_task, set_task_status, delete_memory, add_memory, search, get_episodes, etc.) would be a scope violation \u2014 that's a separate cleanup task."
+      "decision": "Place new tests in existing TestProjectIdValidation class rather than a new class",
+      "rationale": "The existing class already covers project_id validation in BaseStage.run(). Adding whitespace and mismatch tests here maintains cohesion and makes it easy to run all related tests together."
+    },
+    {
+      "decision": "Steps 5-6 are positive regression tests added in the same commit as step-4 impl",
+      "rationale": "These verify the happy path isn't broken by the mismatch check. They don't follow strict red-green TDD (they pass immediately) but serve as regression guards. Pairing them with the impl step is the natural place."
     }
   ],
   "reuse": [
     {
-      "what": "Existing test pattern from test_health_endpoint.py: AsyncMock service + create_mcp_server + _tool_manager.call_tool",
-      "where": "fused-memory/tests/test_health_endpoint.py lines 649-687",
-      "how": "Copy the exact test code verbatim \u2014 the tests are self-contained and use the same mock pattern already established in the file."
+      "what": "TestProjectIdValidation.mock_deps fixture",
+      "where": "test_stages.py lines 329-340",
+      "how": "Reuse directly for all new tests — provides ReconciliationConfig, AsyncMock memory_service/taskmaster/journal"
     },
     {
-      "what": "create_mcp_server factory function",
-      "where": "fused_memory.server.tools",
-      "how": "Import and use to create MCP server instances with mocked MemoryService for tool-level testing."
+      "what": "test_run_raises_on_empty_project_id test pattern",
+      "where": "test_stages.py lines 342-354",
+      "how": "Mirror the structure for the whitespace test: create stage with MemoryConsolidator, set project_id, construct Watermark, call stage.run() in pytest.raises(ValueError)"
+    },
+    {
+      "what": "test_recon_context_includes_project_id patching pattern",
+      "where": "test_stages.py lines 357-394",
+      "how": "Reuse the fake_assemble_payload + fake_run_stage_via_cli + patch approach for positive regression tests (steps 5-6)"
+    },
+    {
+      "what": "Watermark model constructor",
+      "where": "fused_memory/models/reconciliation.py:135-143",
+      "how": "Construct with different project_id values to test mismatch scenarios"
     }
   ],
-  "_session_id": "130-f63c2473",
-  "_created_at": "2026-03-24T22:38:24.393380+00:00"
+  "_session_id": "135-5cba9c59",
+  "_created_at": "2026-03-24T22:40:15.127790+00:00"
 }
