@@ -739,3 +739,62 @@ class TestGetEntityNameEntitiesProvenance:
         assert e['name'] is None
         assert e['entities'] == []
         assert e['provenance'] == []
+
+
+class TestGetEntityValidOnly:
+    """Tests that get_entity() valid_only parameter filters invalidated edges."""
+
+    @pytest.mark.asyncio
+    async def test_valid_only_filters_invalidated_edges(self, service):
+        """valid_only=True should exclude edges where invalid_at is not None."""
+        from tests.conftest import MockEdge
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='current fact', uuid='e1', invalid_at=None),           # valid
+            MockEdge(fact='old fact', uuid='e2', invalid_at='2026-01-01T00:00:00+00:00'),  # invalidated
+            MockEdge(fact='no dates fact', uuid='e3'),                            # no dates → valid
+        ])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+
+        result = await service.get_entity(name='Thing', project_id='test', valid_only=True)
+        edges = result['edges']
+
+        uuids = [e['uuid'] for e in edges]
+        assert 'e1' in uuids, "valid edge (invalid_at=None) must be included"
+        assert 'e3' in uuids, "edge with no dates must be included"
+        assert 'e2' not in uuids, "invalidated edge must be excluded"
+
+    @pytest.mark.asyncio
+    async def test_valid_only_false_returns_all_edges(self, service):
+        """valid_only=False (default) must return all edges including invalidated ones."""
+        from tests.conftest import MockEdge
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='current fact', uuid='e1', invalid_at=None),
+            MockEdge(fact='old fact', uuid='e2', invalid_at='2026-01-01T00:00:00+00:00'),
+        ])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+
+        result = await service.get_entity(name='Thing', project_id='test', valid_only=False)
+        edges = result['edges']
+        uuids = [e['uuid'] for e in edges]
+        assert 'e1' in uuids
+        assert 'e2' in uuids
+
+    @pytest.mark.asyncio
+    async def test_valid_only_defaults_to_false(self, service):
+        """Calling get_entity() without valid_only should return all edges."""
+        from tests.conftest import MockEdge
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='current fact', uuid='e1'),
+            MockEdge(fact='old fact', uuid='e2', invalid_at='2026-01-01T00:00:00+00:00'),
+        ])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+
+        result = await service.get_entity(name='Thing', project_id='test')
+        edges = result['edges']
+        uuids = [e['uuid'] for e in edges]
+        # Default (valid_only=False) returns all
+        assert 'e1' in uuids
+        assert 'e2' in uuids
