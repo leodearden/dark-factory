@@ -1,111 +1,130 @@
 {
-  "task_id": "131",
-  "title": "Extract _build_edge_dict helper to DRY edge extraction in MemoryService",
+  "task_id": "136",
+  "title": "Normalize Watermark.project_id type and symmetric whitespace handling",
   "files": [
-    "fused-memory/src/fused_memory/services/memory_service.py",
-    "fused-memory/tests/test_memory_service.py"
+    "fused-memory/src/fused_memory/models/reconciliation.py",
+    "fused-memory/src/fused_memory/reconciliation/stages/base.py",
+    "fused-memory/src/fused_memory/reconciliation/journal.py",
+    "fused-memory/tests/test_stages.py",
+    "fused-memory/tests/test_journal.py"
   ],
   "modules": [
-    "fused-memory/src/fused_memory/services",
+    "fused-memory/src/fused_memory/models",
+    "fused-memory/src/fused_memory/reconciliation/stages",
+    "fused-memory/src/fused_memory/reconciliation",
     "fused-memory/tests"
   ],
-  "analysis": "The code block that builds temporal/entities/provenance from a Graphiti edge object is duplicated verbatim in two locations:\n\n1. `_search_graphiti()` (lines ~727-748): Extracts fact, valid_at, invalid_at into temporal dict; extracts source_node/target_node names into entities list; extracts episodes into provenance list of strings. Then builds a MemoryResult using these plus a rank-based score.\n\n2. `get_entity()` (lines ~834-855): Identical temporal, entities, and provenance extraction logic. Then appends a plain dict with uuid, fact, name, temporal, entities, provenance.\n\nThe refactoring extracts a private helper `_build_edge_dict(self, e) -> dict` that returns `{uuid, fact, name, temporal, entities, provenance}`. Both call-sites reuse this dict:\n- `_search_graphiti` maps the dict fields into MemoryResult constructor args (with uuid fallback to str(i) for missing uuid)\n- `get_entity` appends the dict directly into edge_data\n\nExisting tests for both `_search_graphiti` (via TestSearch, TestSearchDeleteRoundtrip) and `get_entity` (via TestGetEntityTemporalMetadata, TestGetEntityNameEntitiesProvenance, TestGetEntityValidOnly) provide comprehensive regression coverage. New tests target the helper directly for edge-case coverage.\n\nThe conftest already provides MockEdge and MockNode dataclasses with all needed attributes (fact, uuid, name, source_node, target_node, episodes, valid_at, invalid_at).",
+  "analysis": "Watermark.project_id is currently `str` (required) with empty string '' used as a sentinel for 'not set'. This leaks the bypass convention into callers and creates asymmetric validation: BaseStage.run() strip()-checks stage.project_id but only truthiness-checks watermark.project_id. A whitespace-only watermark project_id like '   ' is truthy, bypasses the empty check, but mismatches with a real project_id \u2014 producing a confusing error. The fix involves three coordinated changes: (1) make Watermark.project_id Optional with None as the explicit 'not set' sentinel, (2) add a Pydantic field_validator that strip-normalizes and converts empty/whitespace to None, (3) update BaseStage.run() to strip-normalize stage.project_id and use `is not None` for the watermark check. Two existing tests construct Watermark(project_id='') and need updating to Watermark() for semantic clarity. The journal.update_watermark() also needs a safety guard since None project_id would be invalid as a DB primary key. Key callers: journal.get_watermark constructs Watermark(project_id=project_id) \u2014 always a real string. harness.py gets watermarks from journal, sets stage.project_id from harness args. test_stages.py has two Watermark(project_id='') constructions. test_harness.py uses Watermark(project_id='test-project') \u2014 no change needed. No existing Pydantic validators in models/ \u2014 this will be the first.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write tests for _build_edge_dict helper in a new TestBuildEdgeDict class: (1) full edge with all fields populated (uuid, fact, name, valid_at, invalid_at, source_node, target_node, episodes) returns correct dict with all six keys; (2) minimal edge with no temporal/nodes/episodes returns temporal=None, entities=[], provenance=[]; (3) edge with only valid_at set returns temporal dict with valid_at set and invalid_at=None; (4) edge with only source_node (no target_node) returns single-element entities list; (5) edge with no uuid attr returns uuid=None; (6) edge object without fact attr falls back to str(edge) for the fact value.",
+      "description": "Write failing tests for Watermark.project_id normalization as TestWatermarkProjectIdNormalization in test_stages.py: (1) Watermark() without project_id defaults to None, (2) Watermark(project_id='') normalizes to None, (3) Watermark(project_id='   ') normalizes to None, (4) Watermark(project_id='dark_factory') is unchanged, (5) Watermark(project_id=' dark_factory ') strips to 'dark_factory'. These test the model-level validator.",
       "status": "done",
-      "commit": "6882120"
+      "commit": "d3e271e"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Implement _build_edge_dict(self, e) -> dict as a private method on MemoryService, placed between _search_graphiti and get_entity. Extracts uuid via getattr(e, 'uuid', None), fact via getattr(e, 'fact', str(e)), name via getattr(e, 'name', None), builds temporal dict from valid_at/invalid_at (None when both absent), extracts entity names from source_node/target_node, and builds provenance from episodes. Returns dict with keys: uuid, fact, name, temporal, entities, provenance. Run new TestBuildEdgeDict tests to verify they pass.",
+      "description": "In reconciliation.py: Change Watermark.project_id from `project_id: str` to `project_id: str | None = None`. Add `from pydantic import field_validator` import. Add field_validator('project_id', mode='before') classmethod that strips whitespace and converts empty/whitespace-only strings to None. Verify step-1 tests pass.",
       "status": "done",
-      "commit": "e922dd5"
+      "commit": "22d4e80"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Run existing TestSearch and TestSearchDeleteRoundtrip test classes to confirm green baseline before refactoring _search_graphiti. These tests exercise the full edge-to-MemoryResult conversion path including temporal, entities, and provenance fields.",
+      "description": "Write failing test: whitespace-only watermark project_id ('   ') should be treated as None and bypass the mismatch check (not cause confusing mismatch error). Add test_run_allows_whitespace_only_watermark_project_id to TestProjectIdValidation in test_stages.py \u2014 sets stage.project_id='dark_factory', watermark=Watermark(project_id='   '), mocks assemble_payload and run_stage_via_cli, expects no ValueError.",
       "status": "done",
-      "commit": "e922dd5"
+      "commit": "36d19fc"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "Refactor _search_graphiti() to use _build_edge_dict: replace the ~20 lines of inline temporal/entities/provenance extraction (lines ~727-748) with `d = self._build_edge_dict(edge)`. Map the returned dict fields into the MemoryResult constructor: id=d['uuid'] or str(i), content=d['fact'], temporal=d['temporal'], entities=d['entities'], provenance=d['provenance']. Keep the rank-based score computation inline. Run TestSearch and TestSearchDeleteRoundtrip tests to confirm no regression.",
+      "description": "In base.py: Update watermark mismatch guard from `if watermark.project_id and watermark.project_id != self.project_id` to `if watermark.project_id is not None and watermark.project_id != self.project_id`. The Watermark validator already normalizes whitespace to None, so this check is now correct. Verify step-3 test passes.",
       "status": "done",
-      "commit": "4a4c464"
+      "commit": "398dd56"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Run existing TestGetEntityTemporalMetadata, TestGetEntityNameEntitiesProvenance, and TestGetEntityValidOnly test classes to confirm green baseline before refactoring get_entity.",
+      "description": "Write failing tests for padded stage project_id handling: (1) test_run_strips_padded_stage_project_id \u2014 sets stage.project_id='dark_factory  ', watermark=Watermark(project_id='dark_factory'), mocks assemble_payload/run_stage_via_cli, expects no ValueError. (2) test_run_uses_stripped_project_id_in_payload \u2014 same setup, captures payload from run_stage_via_cli, asserts payload contains 'dark_factory' without trailing spaces.",
       "status": "done",
-      "commit": "4a4c464"
+      "commit": "3667bf2"
     },
     {
       "id": "step-6",
       "type": "impl",
-      "description": "Refactor get_entity() to use _build_edge_dict: replace the ~20 lines of inline edge extraction (lines ~834-855 and the edge_data.append dict construction) with `edge_data.append(self._build_edge_dict(e))`. The helper returns a dict with the exact same keys (uuid, fact, name, temporal, entities, provenance). Run all TestGetEntity* tests to confirm no regression.",
+      "description": "In base.py run(): Add strip-normalization at the top: `self.project_id = self.project_id.strip() if self.project_id else ''` before the empty check. This ensures the stripped value is used in both validation and the payload template (recon_context f-string). Verify step-5 tests pass.",
       "status": "done",
-      "commit": "cbc53ed"
+      "commit": "12a27c5"
     },
     {
       "id": "step-7",
       "type": "test",
-      "description": "Run the full test_memory_service.py test suite to confirm all existing tests still pass after both refactorings. This is the final regression check covering search, get_entity, delete, episode, close, and all other scenarios.",
+      "description": "Write failing test in test_journal.py: test_update_watermark_rejects_none_project_id \u2014 constructs Watermark() (project_id=None), calls journal.update_watermark(wm), expects ValueError('Cannot persist watermark without project_id').",
       "status": "done",
-      "commit": "cbc53ed"
+      "commit": "38adaa5"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "In journal.py update_watermark(): Add guard at top of method: `if watermark.project_id is None: raise ValueError('Cannot persist watermark without project_id')`. Verify step-7 test passes.",
+      "status": "done",
+      "commit": "f9740a3"
+    },
+    {
+      "id": "step-9",
+      "type": "impl",
+      "description": "Update existing tests in test_stages.py for semantic clarity: (1) In test_run_raises_on_empty_project_id (line 347), change Watermark(project_id='') to Watermark(). (2) In test_run_allows_empty_watermark_project_id (line 425), change Watermark(project_id='') to Watermark(), rename method to test_run_allows_none_watermark_project_id, update comment from 'Empty watermark project_id' to 'None watermark project_id'. Run full test suite to confirm all tests pass.",
+      "status": "done",
+      "commit": "fd26eff"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Helper returns a plain dict, not a dataclass or NamedTuple",
-      "rationale": "get_entity() already returns edge data as plain dicts in its response. Using the same format means the helper's return value can be appended directly to edge_data without conversion. A typed class would add overhead with no consumer benefit."
+      "decision": "Use Pydantic field_validator on Watermark.project_id to strip-normalize and convert empty/whitespace to None",
+      "rationale": "Centralizes normalization at the model boundary rather than scattering strip() calls across every consumer. All Watermark instances get consistent project_id values regardless of how they're constructed. This is the first validator in models/ but follows Pydantic v2 best practices."
     },
     {
-      "decision": "Helper is a regular instance method (_build_edge_dict(self, e)), not a @staticmethod",
-      "rationale": "Matches the task description signature. While the current implementation doesn't need self, keeping it as an instance method follows the convention in MemoryService where all private methods are instance methods (e.g., _search_graphiti, _search_mem0) and leaves room for future use of self (e.g., logging)."
+      "decision": "Strip-normalize stage.project_id in-place at the top of run() rather than adding a property setter",
+      "rationale": "BaseStage.project_id is a plain str attribute set by harness.py \u2014 adding a property setter would be over-engineering for a single assignment site. Normalizing in run() is the single point where all validation happens, and ensures the stripped value flows into the payload template too."
     },
     {
-      "decision": "uuid default is None in the helper, not a fallback index",
-      "rationale": "The index-based uuid fallback (str(i)) is specific to _search_graphiti's rank-ordered iteration context. The helper should return the raw edge uuid or None. The _search_graphiti call-site handles the fallback: `id=d['uuid'] or str(i)`. This keeps the helper generic and reusable."
+      "decision": "Add ValueError guard in journal.update_watermark() for None project_id",
+      "rationale": "The watermarks table has project_id as TEXT PRIMARY KEY \u2014 writing NULL would violate the schema silently or cause a confusing DB error. While get_watermark always provides a real project_id, this guard prevents silent DB corruption if a None-project_id Watermark is ever accidentally persisted."
     },
     {
-      "decision": "fact default uses str(e) in the helper, matching both existing call-sites",
-      "rationale": "Both _search_graphiti and get_entity use getattr(edge, 'fact', str(edge)) as the fallback. The helper preserves this exact behavior for backward compatibility."
+      "decision": "Keep Watermark(project_id=None) as the default rather than removing the field entirely",
+      "rationale": "Some callers legitimately construct Watermarks without knowing project_id upfront (test fixtures, temporary objects). Using Optional[str] with None makes 'not set' explicit in the type system without breaking construction patterns."
     },
     {
-      "decision": "Helper placed as a method on MemoryService class, not extracted to a utility module",
-      "rationale": "The helper is only used by two methods within MemoryService. Extracting to a utility module would be over-engineering for two call-sites. If a third consumer appears later, it can be promoted."
+      "decision": "Rename test_run_allows_empty_watermark_project_id to test_run_allows_none_watermark_project_id",
+      "rationale": "The semantic meaning changes from 'empty string bypasses check' to 'None bypasses check'. The test name should reflect the new contract so future readers understand the intended behavior."
     }
   ],
   "reuse": [
     {
-      "what": "MockEdge and MockNode dataclasses from conftest",
-      "where": "fused-memory/tests/conftest.py (lines 19-38)",
-      "how": "Used to construct test edge objects with all relevant attributes (fact, uuid, name, source_node, target_node, episodes, valid_at, invalid_at). Already used by existing get_entity and search tests \u2014 reuse directly in new TestBuildEdgeDict tests."
+      "what": "Existing TestProjectIdValidation test class and mock_deps fixture in test_stages.py",
+      "where": "fused-memory/tests/test_stages.py lines 326-488",
+      "how": "Add new whitespace and padding tests to this existing class; reuse the mock_deps fixture and the fake_assemble_payload/fake_run_stage_via_cli patterns from existing tests (lines 395-407)."
     },
     {
-      "what": "service fixture with mocked backends",
-      "where": "fused-memory/tests/test_memory_service.py (lines 12-39)",
-      "how": "Provides a MemoryService instance with mocked graphiti/mem0/queue backends. New _build_edge_dict tests call service._build_edge_dict() through this fixture for consistency with existing test patterns."
+      "what": "Existing journal fixture in test_journal.py",
+      "where": "fused-memory/tests/test_journal.py lines 24-29",
+      "how": "Reuse for the new update_watermark None-rejection test \u2014 provides an initialized SQLite journal in a tmp directory."
     },
     {
-      "what": "Existing regression tests for _search_graphiti and get_entity",
-      "where": "fused-memory/tests/test_memory_service.py (TestSearch*, TestGetEntity* classes)",
-      "how": "Serve as regression guards during refactoring steps 3-6. No need to duplicate these tests \u2014 verify they remain green after each refactoring step."
+      "what": "Pydantic field_validator",
+      "where": "pydantic library (already a project dependency, used by all models in reconciliation.py)",
+      "how": "Import field_validator from pydantic and apply as a classmethod decorator on Watermark.project_id."
     },
     {
-      "what": "Edge extraction pattern from _search_graphiti lines 727-748",
-      "where": "fused-memory/src/fused_memory/services/memory_service.py",
-      "how": "The exact logic (temporal dict construction, entity name extraction, episode provenance) is extracted verbatim into the new _build_edge_dict helper. No logic changes, pure extraction."
+      "what": "Existing fake_assemble_payload and fake_run_stage_via_cli pattern",
+      "where": "fused-memory/tests/test_stages.py lines 395-407",
+      "how": "Reuse this exact mocking pattern for new tests that need to get past the validation checks and into the CLI execution path (padding tests, whitespace tests)."
     }
   ],
-  "_session_id": "131-0b40c33e",
-  "_created_at": "2026-03-24T22:38:52.988528+00:00"
+  "_session_id": "136-921b5d73",
+  "_created_at": "2026-03-24T22:54:22.053760+00:00"
 }
