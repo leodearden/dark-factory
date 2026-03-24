@@ -725,6 +725,13 @@ class TestWatermarkProjectIdNormalization:
         wm = Watermark(project_id=' dark_factory ')
         assert wm.project_id == 'dark_factory'
 
+    def test_watermark_rejects_non_string_project_id(self):
+        from pydantic import ValidationError
+
+        from fused_memory.models.reconciliation import Watermark
+        with pytest.raises(ValidationError):
+            Watermark(project_id=123)  # type: ignore[arg-type]
+
 
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
