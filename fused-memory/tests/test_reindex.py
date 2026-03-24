@@ -977,3 +977,80 @@ class TestRunReindex:
         mock_cfg_cls.assert_called_once()
         call_kwargs = mock_cfg_cls.call_args[1]
         assert call_kwargs.get('embedding_dim') == 768
+
+
+# ---------------------------------------------------------------------------
+# step-1/2: run_reindex env-var restoration on constructor failure
+# ---------------------------------------------------------------------------
+
+class TestRunReindexEnvVarRestore:
+    """run_reindex() restores CONFIG_PATH even when constructors raise."""
+
+    @pytest.mark.asyncio
+    async def test_restores_env_var_when_config_constructor_fails(self):
+        """CONFIG_PATH is restored when FusedMemoryConfig() raises."""
+        import os
+
+        from fused_memory.maintenance.reindex import run_reindex
+
+        original = os.environ.get('CONFIG_PATH')
+        try:
+            with (
+                patch(
+                    'fused_memory.maintenance.reindex.FusedMemoryConfig',
+                    side_effect=RuntimeError('config error'),
+                ),
+                pytest.raises(RuntimeError, match='config error'),
+            ):
+                await run_reindex(
+                    config_path='test.yaml',
+                )
+            # CONFIG_PATH must be restored to its original value
+            assert os.environ.get('CONFIG_PATH') == original
+        finally:
+            # Safety: ensure test cleanup regardless
+            if original is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = original
+
+
+# ---------------------------------------------------------------------------
+# step-2: run_reindex service lifecycle — close() when ReindexManager raises
+# ---------------------------------------------------------------------------
+
+class TestRunReindexServiceLifecycle:
+    """run_reindex() properly manages MemoryService lifecycle even when constructors fail."""
+
+    @pytest.mark.asyncio
+    async def test_closes_service_when_manager_constructor_fails(self):
+        """service.close() is called when ReindexManager() raises."""
+        from fused_memory.maintenance.reindex import run_reindex
+
+        mock_config = MagicMock()
+        mock_config.embedder.dimensions = 1536
+        mock_config.embedder.providers.openai.api_key = 'test-key'
+        mock_config.embedder.model = 'text-embedding-3-small'
+
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+
+        with (
+            patch(
+                'fused_memory.maintenance.reindex.FusedMemoryConfig',
+                return_value=mock_config,
+            ),
+            patch(
+                'fused_memory.maintenance.reindex.MemoryService',
+                return_value=mock_service,
+            ),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch(
+                'fused_memory.maintenance.reindex.ReindexManager',
+                side_effect=RuntimeError('manager error'),
+            ),
+            pytest.raises(RuntimeError, match='manager error'),
+        ):
+            await run_reindex()
+
+        mock_service.close.assert_awaited_once()
