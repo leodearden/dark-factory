@@ -1,0 +1,48 @@
+{
+  "skill_name": "review",
+  "evals": [
+    {
+      "id": 0,
+      "name": "full-review",
+      "prompt": "/review",
+      "expected_output": "Three-phase review report covering integration verification, architectural coherence, and triage. Should gracefully degrade (no briefing exists). Should produce review/reports/ files and display a structured summary.",
+      "files": [],
+      "assertions": [
+        {"name": "briefing_degradation_warning", "description": "Warns about missing briefing and suggests /review-briefing"},
+        {"name": "three_phases_present", "description": "Contains distinct sections for Phase 1, Phase 2, and Phase 3"},
+        {"name": "tests_actually_executed", "description": "Reports real test pass/fail counts"},
+        {"name": "lint_or_typecheck_executed", "description": "Reports lint or typecheck results with specifics"},
+        {"name": "stubs_identified", "description": "Identifies at least one stub/TODO with file location"},
+        {"name": "report_files_saved", "description": "Saves structured report files to outputs directory"},
+        {"name": "structured_summary_format", "description": "Final output uses structured per-phase format"}
+      ]
+    },
+    {
+      "id": 1,
+      "name": "scoped-fused-memory",
+      "prompt": "/review --scope fused-memory",
+      "expected_output": "Review scoped to the fused-memory subproject only. Should narrow test/lint/scan scope to fused-memory/. Same three phases but constrained.",
+      "files": [],
+      "assertions": [
+        {"name": "scope_respected", "description": "Findings reference fused-memory, not other subprojects"},
+        {"name": "briefing_degradation", "description": "Notes missing briefing"},
+        {"name": "tests_scoped", "description": "Tests run against fused-memory specifically"},
+        {"name": "stubs_in_fused_memory", "description": "Finds stubs within fused-memory source code"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "phase1-only",
+      "prompt": "/review --phase integration",
+      "expected_output": "Phase 1 only — run tests, lint, typecheck, smoke tests. Save phase1 report to review/reports/. No Phase 2 or Phase 3.",
+      "files": [],
+      "assertions": [
+        {"name": "only_phase1", "description": "No Phase 2 or Phase 3 content in output"},
+        {"name": "tests_executed", "description": "Reports actual test pass/fail numbers"},
+        {"name": "lint_executed", "description": "Reports lint or typecheck results"},
+        {"name": "phase1_report_saved", "description": "Phase 1 report file exists in outputs"},
+        {"name": "smoke_tests_skipped", "description": "Notes smoke tests skipped due to missing briefing"}
+      ]
+    }
+  ]
+}
