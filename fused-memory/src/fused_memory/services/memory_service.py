@@ -848,38 +848,7 @@ class MemoryService:
                 'labels': getattr(n, 'labels', []),
             })
 
-        edge_data = []
-        for e in edges:
-            valid_at = getattr(e, 'valid_at', None)
-            invalid_at = getattr(e, 'invalid_at', None)
-            temporal = None
-            if valid_at or invalid_at:
-                temporal = {
-                    'valid_at': str(valid_at) if valid_at else None,
-                    'invalid_at': str(invalid_at) if invalid_at else None,
-                }
-
-            # Extract entity names from source/target nodes
-            entities = []
-            source_node = getattr(e, 'source_node', None)
-            target_node = getattr(e, 'target_node', None)
-            if source_node and hasattr(source_node, 'name'):
-                entities.append(source_node.name)
-            if target_node and hasattr(target_node, 'name'):
-                entities.append(target_node.name)
-
-            # Episode provenance
-            episodes = getattr(e, 'episodes', []) or []
-            provenance = [str(ep) for ep in episodes]
-
-            edge_data.append({
-                'uuid': getattr(e, 'uuid', None),
-                'fact': getattr(e, 'fact', str(e)),
-                'name': getattr(e, 'name', None),
-                'temporal': temporal,
-                'entities': entities,
-                'provenance': provenance,
-            })
+        edge_data = [self._build_edge_dict(e) for e in edges]
 
         return {'nodes': node_data, 'edges': edge_data}
 
