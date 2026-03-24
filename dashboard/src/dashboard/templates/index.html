@@ -6,7 +6,7 @@
     <section
         hx-get="/partials/orchestrators"
         hx-trigger="load, every 10s"
-        hx-swap="innerHTML"
+        hx-swap="morph:innerHTML"
         hx-request='{"timeout": 8000}'
         aria-live="polite"
     >
@@ -20,7 +20,7 @@
     <section
         hx-get="/partials/performance"
         hx-trigger="load, every 30s"
-        hx-swap="innerHTML"
+        hx-swap="morph:innerHTML"
         hx-request='{"timeout": 12000}'
         aria-live="polite"
     >
@@ -48,7 +48,7 @@
     <section
         hx-get="/partials/memory-graphs"
         hx-trigger="load, every 60s"
-        hx-swap="innerHTML"
+        hx-swap="morph:innerHTML"
         hx-request='{"timeout": 10000}'
     >
         <div class="animate-pulse h-48 bg-gray-800 rounded"></div>

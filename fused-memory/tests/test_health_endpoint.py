@@ -51,7 +51,10 @@ def test_health_returns_200(health_app):
     client = TestClient(health_app)
     resp = client.get('/health')
     assert resp.status_code == 200
-    assert resp.json() == {'status': 'ok'}
+    body = resp.json()
+    assert body['status'] == 'ok'
+    assert 'graphiti' in body
+    assert 'mem0' in body
 
 
 def test_health_post_not_allowed(health_app):

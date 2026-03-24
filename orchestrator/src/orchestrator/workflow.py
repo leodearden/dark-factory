@@ -1178,9 +1178,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if not self.escalation_queue:
             return
 
+        queue = self.escalation_queue
+
         def _pending_suggestions():
             return [
-                e for e in self.escalation_queue.get_by_task(
+                e for e in queue.get_by_task(
                     self.task_id, status='pending',
                 )
                 if e.category == 'review_suggestions'

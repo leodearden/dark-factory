@@ -153,10 +153,10 @@ class TestDismissAllPendingResilience:
         # Patch resolve() so it raises OSError for esc-2-1, succeeds for others
         original_resolve = queue.resolve
 
-        def patched_resolve(esc_id: str, resolution: str, dismiss: bool = False):
+        def patched_resolve(esc_id: str, resolution: str, dismiss: bool = False, **kwargs):
             if esc_id == 'esc-2-1':
                 raise OSError('disk full')
-            return original_resolve(esc_id, resolution, dismiss=dismiss)
+            return original_resolve(esc_id, resolution, dismiss=dismiss, **kwargs)
 
         with patch.object(queue, 'resolve', side_effect=patched_resolve):
             count = queue.dismiss_all_pending('Stale from prior run')
@@ -172,10 +172,10 @@ class TestDismissAllPendingResilience:
 
         original_resolve = queue.resolve
 
-        def patched_resolve(esc_id: str, resolution: str, dismiss: bool = False):
+        def patched_resolve(esc_id: str, resolution: str, dismiss: bool = False, **kwargs):
             if esc_id == 'esc-1-1':
                 raise OSError('permission denied')
-            return original_resolve(esc_id, resolution, dismiss=dismiss)
+            return original_resolve(esc_id, resolution, dismiss=dismiss, **kwargs)
 
         with patch.object(queue, 'resolve', side_effect=patched_resolve):
             count = queue.dismiss_all_pending('Stale from prior run')

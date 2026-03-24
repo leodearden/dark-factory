@@ -30,6 +30,7 @@ def _make_graph_mock(rows: list[list]) -> MagicMock:
     result.result_set = rows
     graph_mock = MagicMock()
     graph_mock.query = AsyncMock(return_value=result)
+    graph_mock.ro_query = AsyncMock(return_value=result)
     return graph_mock
 
 
@@ -43,9 +44,11 @@ class TestQueryStaleNodeEmbeddings:
     @pytest.mark.asyncio
     async def test_returns_stale_nodes(self, mock_config):
         backend = _make_backend(mock_config)
+        vec_3 = '<' + ', '.join(['0.1'] * 3) + '>'
+        vec_5 = '<' + ', '.join(['0.1'] * 5) + '>'
         rows = [
-            ['uuid-1', 'Node A', 1024],
-            ['uuid-2', 'Node B', 512],
+            ['uuid-1', 'Node A', vec_3],
+            ['uuid-2', 'Node B', vec_5],
         ]
         graph = _make_graph_mock(rows)
         cast_target = MagicMock()
@@ -53,8 +56,8 @@ class TestQueryStaleNodeEmbeddings:
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
             result = await backend.query_stale_node_embeddings(expected_dim=1536)
         assert len(result) == 2
-        assert result[0] == ('uuid-1', 'Node A', 1024)
-        assert result[1] == ('uuid-2', 'Node B', 512)
+        assert result[0] == ('uuid-1', 'Node A', 3)
+        assert result[1] == ('uuid-2', 'Node B', 5)
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_all_match(self, mock_config):
@@ -73,19 +76,17 @@ class TestQueryStaleNodeEmbeddings:
             await backend.query_stale_node_embeddings(expected_dim=1536)
 
     @pytest.mark.asyncio
-    async def test_passes_dim_param_to_query(self, mock_config):
+    async def test_calls_ro_query(self, mock_config):
         backend = _make_backend(mock_config)
         graph = _make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
             await backend.query_stale_node_embeddings(expected_dim=768)
-        call_kwargs = graph.query.call_args
-        assert call_kwargs is not None
-        # check dim is passed as a parameter
-        args, kwargs = call_kwargs
-        cypher_args = args[1] if len(args) > 1 else kwargs.get('params', {})
-        assert cypher_args.get('dim') == 768
+        graph.ro_query.assert_called_once()
+        cypher = graph.ro_query.call_args[0][0]
+        assert 'Entity' in cypher
+        assert 'name_embedding' in cypher
 
 
 class TestQueryStaleEdgeEmbeddings:
@@ -94,8 +95,9 @@ class TestQueryStaleEdgeEmbeddings:
     @pytest.mark.asyncio
     async def test_returns_stale_edges(self, mock_config):
         backend = _make_backend(mock_config)
+        vec_4 = '<' + ', '.join(['0.1'] * 4) + '>'
         rows = [
-            ['edge-uuid-1', 'edge name', 1024],
+            ['edge-uuid-1', 'edge name', vec_4],
         ]
         graph = _make_graph_mock(rows)
         cast_target = MagicMock()
@@ -103,7 +105,7 @@ class TestQueryStaleEdgeEmbeddings:
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
             result = await backend.query_stale_edge_embeddings(expected_dim=1536)
         assert len(result) == 1
-        assert result[0] == ('edge-uuid-1', 'edge name', 1024)
+        assert result[0] == ('edge-uuid-1', 'edge name', 4)
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_all_match(self, mock_config):
@@ -122,18 +124,17 @@ class TestQueryStaleEdgeEmbeddings:
             await backend.query_stale_edge_embeddings(expected_dim=1536)
 
     @pytest.mark.asyncio
-    async def test_passes_dim_param_to_query(self, mock_config):
+    async def test_calls_ro_query(self, mock_config):
         backend = _make_backend(mock_config)
         graph = _make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
             await backend.query_stale_edge_embeddings(expected_dim=768)
-        call_kwargs = graph.query.call_args
-        assert call_kwargs is not None
-        args, kwargs = call_kwargs
-        cypher_args = args[1] if len(args) > 1 else kwargs.get('params', {})
-        assert cypher_args.get('dim') == 768
+        graph.ro_query.assert_called_once()
+        cypher = graph.ro_query.call_args[0][0]
+        assert 'RELATES_TO' in cypher
+        assert 'fact_embedding' in cypher
 
 
 # ---------------------------------------------------------------------------

@@ -181,7 +181,7 @@ class TestLoadTaskTree:
         result = load_task_tree(tasks_json)
 
         assert len(result) == 3
-        assert result[0]['id'] == '1'
+        assert result[0]['id'] == 1
         assert result[0]['title'] == 'Setup'
         assert result[0]['status'] == 'done'
         assert result[0]['priority'] == 'high'

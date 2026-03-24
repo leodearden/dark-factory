@@ -195,12 +195,12 @@ async def get_escalation_rates(
 
         result: dict[str, dict] = {}
         for project_id, cutoff in cutoffs.items():
-            rows = await db.execute_fetchall(
+            rows = list(await db.execute_fetchall(
                 'SELECT task_id, steward_invocations '
                 '  FROM task_results '
                 ' WHERE project_id = ? AND completed_at >= ? ',
                 (project_id, cutoff),
-            )
+            ))
 
             total = len(rows)
             steward_count = 0
