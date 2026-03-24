@@ -579,6 +579,35 @@ class TestPayloadProjectId:
         assert 'project_id' in payload, 'Stage 3 payload must mention project_id'
 
 
+class TestWatermarkProjectIdNormalization:
+    """Watermark.project_id field_validator normalizes whitespace and converts empty to None."""
+
+    def test_watermark_default_project_id_is_none(self):
+        from fused_memory.models.reconciliation import Watermark
+        wm = Watermark()
+        assert wm.project_id is None
+
+    def test_watermark_empty_string_normalizes_to_none(self):
+        from fused_memory.models.reconciliation import Watermark
+        wm = Watermark(project_id='')
+        assert wm.project_id is None
+
+    def test_watermark_whitespace_only_normalizes_to_none(self):
+        from fused_memory.models.reconciliation import Watermark
+        wm = Watermark(project_id='   ')
+        assert wm.project_id is None
+
+    def test_watermark_valid_project_id_unchanged(self):
+        from fused_memory.models.reconciliation import Watermark
+        wm = Watermark(project_id='dark_factory')
+        assert wm.project_id == 'dark_factory'
+
+    def test_watermark_padded_project_id_stripped(self):
+        from fused_memory.models.reconciliation import Watermark
+        wm = Watermark(project_id=' dark_factory ')
+        assert wm.project_id == 'dark_factory'
+
+
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
