@@ -474,6 +474,34 @@ class TestSearch:
             f"Expected empty-string uuid to be preserved, got {results[0].id!r}"
         )
 
+    @pytest.mark.asyncio
+    async def test_none_uuid_edge_falls_back_to_index_in_search(self, service):
+        """An edge with no uuid attribute at all uses its index position as the result id.
+
+        When _build_edge_dict returns uuid=None (via getattr default), _search_graphiti
+        should use str(i) as the result id.  For the first (index 0) edge this is '0'.
+        This covers the end-to-end uuid=None fallback path, complementing the unit test
+        test_edge_with_no_uuid_attr_returns_none which only tests the helper in isolation.
+        """
+
+        class EdgeWithoutUuid:
+            fact = 'some fact'
+            name = None
+            source_node = None
+            target_node = None
+            episodes = []
+            valid_at = None
+            invalid_at = None
+
+        service.graphiti.search = AsyncMock(return_value=[EdgeWithoutUuid()])
+        service.mem0.search = AsyncMock(return_value={'results': []})
+
+        results = await service.search(query='test', project_id='test')
+        assert len(results) == 1
+        assert results[0].id == '0', (
+            f"Expected str(0) fallback id when uuid is None, got {results[0].id!r}"
+        )
+
 
 class TestDeleteMemory:
     @pytest.mark.asyncio
