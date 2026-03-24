@@ -622,3 +622,64 @@ class TestGetEpisodes:
     async def test_returns_list(self, service):
         episodes = await service.get_episodes(project_id='test')
         assert isinstance(episodes, list)
+
+
+class TestGetEntityTemporalMetadata:
+    """Tests that get_entity() returns temporal metadata on each edge."""
+
+    @pytest.mark.asyncio
+    async def test_get_entity_edges_include_temporal_metadata(self, service):
+        """Each edge dict must include a 'temporal' key with valid_at/invalid_at."""
+        from tests.conftest import MockEdge
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Auth service uses Redis',
+                uuid='edge-1',
+                valid_at='2026-01-01T00:00:00+00:00',
+                invalid_at=None,
+            ),
+            MockEdge(
+                fact='Auth service was standalone',
+                uuid='edge-2',
+                valid_at='2025-01-01T00:00:00+00:00',
+                invalid_at='2026-01-01T00:00:00+00:00',
+            ),
+        ])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+
+        result = await service.get_entity(name='Auth', project_id='test')
+        edges = result['edges']
+
+        assert len(edges) == 2
+
+        # First edge: valid_at set, invalid_at None
+        e0 = edges[0]
+        assert 'temporal' in e0, "Edge must have 'temporal' key"
+        assert e0['temporal'] is not None
+        assert e0['temporal']['valid_at'] == '2026-01-01T00:00:00+00:00'
+        assert e0['temporal']['invalid_at'] is None
+
+        # Second edge: both set
+        e1 = edges[1]
+        assert 'temporal' in e1, "Edge must have 'temporal' key"
+        assert e1['temporal'] is not None
+        assert e1['temporal']['valid_at'] == '2025-01-01T00:00:00+00:00'
+        assert e1['temporal']['invalid_at'] == '2026-01-01T00:00:00+00:00'
+
+    @pytest.mark.asyncio
+    async def test_get_entity_edge_without_temporal_has_none(self, service):
+        """An edge with neither valid_at nor invalid_at should return temporal=None."""
+        from tests.conftest import MockEdge
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='plain fact', uuid='edge-3'),
+        ])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+
+        result = await service.get_entity(name='Something', project_id='test')
+        edges = result['edges']
+
+        assert len(edges) == 1
+        assert 'temporal' in edges[0]
+        assert edges[0]['temporal'] is None
