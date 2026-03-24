@@ -817,6 +817,17 @@ class TestBuildEdgeDict:
         assert d['temporal']['valid_at'] == '2026-01-01T00:00:00+00:00'
         assert d['temporal']['invalid_at'] is None
 
+    def test_edge_with_only_invalid_at_returns_temporal_dict(self, service):
+        """Edge with only invalid_at set returns temporal dict with invalid_at set and valid_at=None."""
+        from tests.conftest import MockEdge
+
+        edge = MockEdge(fact='fact', uuid='u-inv', invalid_at='2026-06-01T00:00:00+00:00')
+        d = service._build_edge_dict(edge)
+
+        assert d['temporal'] is not None
+        assert d['temporal']['valid_at'] is None
+        assert d['temporal']['invalid_at'] == '2026-06-01T00:00:00+00:00'
+
     def test_edge_with_only_source_node_returns_single_entity(self, service):
         """Edge with only source_node and no target_node returns single-element entities list."""
         from tests.conftest import MockEdge, MockNode
