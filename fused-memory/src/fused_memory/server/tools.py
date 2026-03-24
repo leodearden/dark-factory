@@ -424,6 +424,7 @@ def create_mcp_server(
     async def get_entity(
         name: str,
         project_id: str,
+        valid_only: bool = False,
         agent_id: str | None = None,
         session_id: str | None = None,
         ctx: Context | None = None,
@@ -437,6 +438,9 @@ def create_mcp_server(
         Args:
             name: Entity name (fuzzy matched — partial or approximate names work)
             project_id: Project scope (required)
+            valid_only: When True, exclude edges where invalid_at is set
+                (i.e. edges that have been historically invalidated). Defaults
+                to False so all edges, including historical ones, are returned.
             agent_id: Which agent is reading (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
         """
@@ -444,7 +448,9 @@ def create_mcp_server(
         if err := _validate_project_id(project_id):
             return err
         try:
-            result = await memory_service.get_entity(name=name, project_id=project_id)
+            result = await memory_service.get_entity(
+                name=name, project_id=project_id, valid_only=valid_only
+            )
             await _log_read(
                 operation='get_entity',
                 project_id=project_id,

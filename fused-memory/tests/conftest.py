@@ -29,6 +29,7 @@ class MockEdge:
 
     fact: str
     uuid: str = ''
+    name: str | None = None
     source_node: MockNode | None = None
     target_node: MockNode | None = None
     episodes: list[str] = field(default_factory=list)
