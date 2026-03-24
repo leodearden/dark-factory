@@ -683,3 +683,59 @@ class TestGetEntityTemporalMetadata:
         assert len(edges) == 1
         assert 'temporal' in edges[0]
         assert edges[0]['temporal'] is None
+
+
+class TestGetEntityNameEntitiesProvenance:
+    """Tests that get_entity() returns name, entities, and provenance on each edge."""
+
+    @pytest.mark.asyncio
+    async def test_get_entity_edges_include_name_entities_provenance(self, service):
+        """Each edge dict must include 'name', 'entities', and 'provenance'."""
+        from tests.conftest import MockEdge, MockNode
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Auth service uses Redis',
+                uuid='edge-1',
+                name='USES',
+                source_node=MockNode(name='Auth Service'),
+                target_node=MockNode(name='Redis'),
+                episodes=['ep-uuid-1', 'ep-uuid-2'],
+            ),
+        ])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+
+        result = await service.get_entity(name='Auth', project_id='test')
+        edges = result['edges']
+
+        assert len(edges) == 1
+        e = edges[0]
+
+        assert 'name' in e, "Edge must have 'name' key"
+        assert e['name'] == 'USES'
+
+        assert 'entities' in e, "Edge must have 'entities' key"
+        assert 'Auth Service' in e['entities']
+        assert 'Redis' in e['entities']
+
+        assert 'provenance' in e, "Edge must have 'provenance' key"
+        assert e['provenance'] == ['ep-uuid-1', 'ep-uuid-2']
+
+    @pytest.mark.asyncio
+    async def test_get_entity_edge_without_nodes_has_empty_entities(self, service):
+        """An edge with no source/target nodes returns entities=[]."""
+        from tests.conftest import MockEdge
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='bare fact', uuid='edge-2', name=None),
+        ])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+
+        result = await service.get_entity(name='Bare', project_id='test')
+        edges = result['edges']
+
+        assert len(edges) == 1
+        e = edges[0]
+        assert e['name'] is None
+        assert e['entities'] == []
+        assert e['provenance'] == []
