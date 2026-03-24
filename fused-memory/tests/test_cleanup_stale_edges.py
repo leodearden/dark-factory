@@ -453,3 +453,35 @@ class TestRunCleanupEnvVarRestore:
                 os.environ.pop('CONFIG_PATH', None)
             else:
                 os.environ['CONFIG_PATH'] = original
+
+
+# ---------------------------------------------------------------------------
+# step-3: run_cleanup service lifecycle — close() when CleanupManager raises
+# ---------------------------------------------------------------------------
+
+class TestRunCleanupServiceLifecycle:
+    """run_cleanup() properly manages MemoryService lifecycle even when constructors fail."""
+
+    @pytest.mark.asyncio
+    async def test_closes_service_when_cleanup_manager_constructor_fails(self):
+        """service.close() is called when CleanupManager() raises."""
+        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
+
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+
+        with (
+            patch('fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig'),
+            patch(
+                'fused_memory.maintenance.cleanup_stale_edges.MemoryService',
+                return_value=mock_service,
+            ),
+            patch(
+                'fused_memory.maintenance.cleanup_stale_edges.CleanupManager',
+                side_effect=RuntimeError('manager error'),
+            ),
+            pytest.raises(RuntimeError, match='manager error'),
+        ):
+            await run_cleanup()
+
+        mock_service.close.assert_awaited_once()
