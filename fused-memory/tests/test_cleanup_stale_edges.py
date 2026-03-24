@@ -1,6 +1,7 @@
 """Tests for cleanup_stale_edges maintenance: GraphitiBackend time-range queries and CleanupManager."""
 from __future__ import annotations
 
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -481,10 +482,8 @@ class TestRunCleanupEnvVarRestore:
                 mock_mgr.cleanup = AsyncMock(return_value=mock_result)
                 mock_mgr_cls.return_value = mock_mgr
 
-                try:
+                with contextlib.suppress(RuntimeError):
                     await run_cleanup(config_path='test.yaml')
-                except RuntimeError:
-                    pass  # close() error propagates with current (unfixed) code
 
             # CONFIG_PATH must be restored regardless of close() raising
             assert os.environ.get('CONFIG_PATH') == original
@@ -529,14 +528,14 @@ class TestRunCleanupCloseWarning:
             mock_mgr.cleanup = AsyncMock(return_value=mock_result)
             mock_mgr_cls.return_value = mock_mgr
 
-            with caplog.at_level(
-                logging.WARNING,
-                logger='fused_memory.maintenance.cleanup_stale_edges',
+            with (
+                caplog.at_level(
+                    logging.WARNING,
+                    logger='fused_memory.maintenance.cleanup_stale_edges',
+                ),
+                contextlib.suppress(RuntimeError),
             ):
-                try:
-                    await run_cleanup()
-                except RuntimeError:
-                    pass  # close() error propagates with current (unfixed) code
+                await run_cleanup()
 
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any(
