@@ -416,6 +416,75 @@ class TestSystemPromptsProjectId:
         )
 
 
+class TestPayloadProjectId:
+    """Regression tests: assemble_payload output contains project_id for all stages."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+
+        # memory_service mock with nested mem0
+        memory_service = AsyncMock()
+        memory_service.get_episodes.return_value = []
+        memory_service.get_status.return_value = {}
+        mem0_mock = MagicMock()
+        mem0_mock.get_all = AsyncMock(return_value={'results': []})
+        memory_service.mem0 = mem0_mock
+
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {}
+
+        return {
+            'memory_service': memory_service,
+            'taskmaster': taskmaster,
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_stage1_payload_contains_project_id(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId, Watermark
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+        watermark = Watermark(project_id='dark_factory')
+        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+        assert 'dark_factory' in payload, 'Stage 1 payload must contain project_id value'
+        assert 'project_id' in payload, 'Stage 1 payload must mention project_id'
+
+    @pytest.mark.asyncio
+    async def test_stage1_remediation_payload_contains_project_id(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId, Watermark
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.remediation_findings = []
+        watermark = Watermark(project_id='dark_factory')
+        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+        assert 'dark_factory' in payload, 'Stage 1 remediation payload must contain project_id value'
+
+    @pytest.mark.asyncio
+    async def test_stage2_payload_contains_project_id(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId, Watermark
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        watermark = Watermark(project_id='dark_factory')
+        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+        assert 'dark_factory' in payload, 'Stage 2 payload must contain project_id value'
+        assert 'project_id' in payload, 'Stage 2 payload must mention project_id'
+
+    @pytest.mark.asyncio
+    async def test_stage3_payload_contains_project_id(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId, Watermark
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage.project_id = 'dark_factory'
+        watermark = Watermark(project_id='dark_factory')
+        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+        assert 'dark_factory' in payload, 'Stage 3 payload must contain project_id value'
+        assert 'project_id' in payload, 'Stage 3 payload must mention project_id'
+
+
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
