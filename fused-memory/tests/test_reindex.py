@@ -1014,6 +1014,119 @@ class TestRunReindexEnvVarRestore:
             else:
                 os.environ['CONFIG_PATH'] = original
 
+    @pytest.mark.asyncio
+    async def test_restores_env_var_when_service_constructor_fails(self):
+        """CONFIG_PATH is restored when MemoryService() raises."""
+        import os
+
+        from fused_memory.maintenance.reindex import run_reindex
+
+        original = os.environ.get('CONFIG_PATH')
+        try:
+            with (
+                patch('fused_memory.maintenance.reindex.FusedMemoryConfig'),
+                patch(
+                    'fused_memory.maintenance.reindex.MemoryService',
+                    side_effect=RuntimeError('service error'),
+                ),
+                pytest.raises(RuntimeError, match='service error'),
+            ):
+                await run_reindex(
+                    config_path='test.yaml',
+                )
+            # CONFIG_PATH must be restored to its original value
+            assert os.environ.get('CONFIG_PATH') == original
+        finally:
+            if original is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = original
+
+    @pytest.mark.asyncio
+    async def test_restores_env_var_when_embedder_constructor_fails(self):
+        """CONFIG_PATH is restored when OpenAIEmbedder() raises."""
+        import os
+
+        from fused_memory.maintenance.reindex import run_reindex
+
+        mock_config = MagicMock()
+        mock_config.embedder.dimensions = 1536
+        mock_config.embedder.providers.openai.api_key = 'test-key'
+        mock_config.embedder.model = 'text-embedding-3-small'
+
+        mock_service = AsyncMock()
+
+        original = os.environ.get('CONFIG_PATH')
+        try:
+            with (
+                patch(
+                    'fused_memory.maintenance.reindex.FusedMemoryConfig',
+                    return_value=mock_config,
+                ),
+                patch(
+                    'fused_memory.maintenance.reindex.MemoryService',
+                    return_value=mock_service,
+                ),
+                patch(
+                    'fused_memory.maintenance.reindex.OpenAIEmbedder',
+                    side_effect=RuntimeError('embedder error'),
+                ),
+                pytest.raises(RuntimeError, match='embedder error'),
+            ):
+                await run_reindex(
+                    config_path='test.yaml',
+                )
+            # CONFIG_PATH must be restored to its original value
+            assert os.environ.get('CONFIG_PATH') == original
+        finally:
+            if original is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = original
+
+    @pytest.mark.asyncio
+    async def test_restores_env_var_when_manager_constructor_fails(self):
+        """CONFIG_PATH is restored when ReindexManager() raises."""
+        import os
+
+        from fused_memory.maintenance.reindex import run_reindex
+
+        mock_config = MagicMock()
+        mock_config.embedder.dimensions = 1536
+        mock_config.embedder.providers.openai.api_key = 'test-key'
+        mock_config.embedder.model = 'text-embedding-3-small'
+
+        mock_service = AsyncMock()
+
+        original = os.environ.get('CONFIG_PATH')
+        try:
+            with (
+                patch(
+                    'fused_memory.maintenance.reindex.FusedMemoryConfig',
+                    return_value=mock_config,
+                ),
+                patch(
+                    'fused_memory.maintenance.reindex.MemoryService',
+                    return_value=mock_service,
+                ),
+                patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+                patch(
+                    'fused_memory.maintenance.reindex.ReindexManager',
+                    side_effect=RuntimeError('manager error'),
+                ),
+                pytest.raises(RuntimeError, match='manager error'),
+            ):
+                await run_reindex(
+                    config_path='test.yaml',
+                )
+            # CONFIG_PATH must be restored to its original value
+            assert os.environ.get('CONFIG_PATH') == original
+        finally:
+            if original is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = original
+
 
 # ---------------------------------------------------------------------------
 # step-2: run_reindex service lifecycle — close() when ReindexManager raises
@@ -1054,3 +1167,50 @@ class TestRunReindexServiceLifecycle:
             await run_reindex()
 
         mock_service.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_closes_service_when_embedder_constructor_fails(self):
+        """service.close() is called when OpenAIEmbedder() raises."""
+        from fused_memory.maintenance.reindex import run_reindex
+
+        mock_config = MagicMock()
+        mock_config.embedder.dimensions = 1536
+        mock_config.embedder.providers.openai.api_key = 'test-key'
+        mock_config.embedder.model = 'text-embedding-3-small'
+
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+
+        with (
+            patch(
+                'fused_memory.maintenance.reindex.FusedMemoryConfig',
+                return_value=mock_config,
+            ),
+            patch(
+                'fused_memory.maintenance.reindex.MemoryService',
+                return_value=mock_service,
+            ),
+            patch(
+                'fused_memory.maintenance.reindex.OpenAIEmbedder',
+                side_effect=RuntimeError('embedder error'),
+            ),
+            pytest.raises(RuntimeError, match='embedder error'),
+        ):
+            await run_reindex()
+
+        mock_service.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_skips_close_when_service_never_created(self):
+        """No AttributeError when FusedMemoryConfig() raises before MemoryService is created."""
+        from fused_memory.maintenance.reindex import run_reindex
+
+        with (
+            patch(
+                'fused_memory.maintenance.reindex.FusedMemoryConfig',
+                side_effect=RuntimeError('config error'),
+            ),
+            pytest.raises(RuntimeError, match='config error'),
+        ):
+            await run_reindex()
+        # If we reach here without AttributeError, the service=None sentinel worked correctly
