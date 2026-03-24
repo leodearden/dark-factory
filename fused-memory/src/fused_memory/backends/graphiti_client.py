@@ -364,6 +364,32 @@ class GraphitiBackend:
         await graph.query(delete_cypher, {'uuids': uuids})
         return found
 
+    async def check_edges_by_uuid(self, uuids: list[str]) -> list[str]:
+        """Return which UUIDs in the input list exist as edges in FalkorDB (read-only).
+
+        Uses unlabeled edge matching (MATCH ()-[e]->()) to catch any edge type,
+        not just RELATES_TO. This is intentional for a safety-first cleanup check.
+
+        Args:
+            uuids: List of edge UUIDs to look up.
+
+        Returns:
+            List of UUIDs that were found as edges. Order not guaranteed.
+            Returns empty list immediately for empty input (no FalkorDB query).
+        """
+        if not uuids:
+            return []
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH ()-[e]->() '
+            'WHERE e.uuid IN $uuids '
+            'RETURN e.uuid'
+        )
+        result = await graph.query(cypher, {'uuids': uuids})
+        return [row[0] for row in (result.result_set or [])]
+
     async def get_node_text(self, uuid: str) -> tuple[str, str]:
         """Return (name, summary) for the Entity node with the given UUID.
 
