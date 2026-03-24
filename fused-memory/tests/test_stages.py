@@ -323,6 +323,37 @@ class TestStage3PromptAlignment:
         assert 'Output Format' in STAGE3_SYSTEM_PROMPT
 
 
+class TestProjectIdValidation:
+    """BaseStage.run() validates project_id before executing."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        from unittest.mock import AsyncMock
+
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_run_raises_on_empty_project_id(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId, Watermark
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        # project_id defaults to '' — should raise before executing
+        watermark = Watermark(project_id='')
+        with pytest.raises(ValueError, match='project_id'):
+            await stage.run(
+                events=[],
+                watermark=watermark,
+                prior_reports=[],
+                run_id='test-run-001',
+            )
+
+
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
