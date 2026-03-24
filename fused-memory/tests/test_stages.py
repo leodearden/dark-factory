@@ -355,7 +355,7 @@ class TestProjectIdValidation:
 
     @pytest.mark.asyncio
     async def test_recon_context_includes_project_id(self, mock_deps):
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         from fused_memory.models.reconciliation import StageId, Watermark
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
