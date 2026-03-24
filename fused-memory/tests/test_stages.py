@@ -463,6 +463,7 @@ class TestPayloadProjectId:
         watermark = Watermark(project_id='dark_factory')
         payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
         assert 'dark_factory' in payload, 'Stage 1 remediation payload must contain project_id value'
+        assert 'project_id' in payload, 'Stage 1 remediation payload must mention project_id'
 
     @pytest.mark.asyncio
     async def test_stage2_payload_contains_project_id(self, mock_deps):
