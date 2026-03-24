@@ -6,7 +6,6 @@ import pytest
 
 from fused_memory.server.tools import create_mcp_server
 
-
 # ------------------------------------------------------------------
 # get_entity valid_only parameter forwarding
 # ------------------------------------------------------------------
