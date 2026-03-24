@@ -384,6 +384,69 @@ class TestProjectIdValidation:
             )
 
     @pytest.mark.asyncio
+    async def test_run_allows_matching_watermark_project_id(self, mock_deps):
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, Watermark
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+        watermark = Watermark(project_id='dark_factory')
+
+        async def fake_assemble_payload(events, wm, prior_reports):
+            return '## Base Payload\nsome context'
+
+        async def fake_run_stage_via_cli(**kwargs):
+            from fused_memory.reconciliation.cli_stage_runner import StageResult
+            return StageResult(success=True, report={'summary': 'ok'})
+
+        with (
+            patch.object(stage, 'assemble_payload', new=fake_assemble_payload),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=fake_run_stage_via_cli,
+            ),
+        ):
+            # Should not raise — matching project_ids are accepted
+            await stage.run(
+                events=[],
+                watermark=watermark,
+                prior_reports=[],
+                run_id='test-run-001',
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_allows_empty_watermark_project_id(self, mock_deps):
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, Watermark
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+        # Empty watermark project_id skips the mismatch check
+        watermark = Watermark(project_id='')
+
+        async def fake_assemble_payload(events, wm, prior_reports):
+            return '## Base Payload\nsome context'
+
+        async def fake_run_stage_via_cli(**kwargs):
+            from fused_memory.reconciliation.cli_stage_runner import StageResult
+            return StageResult(success=True, report={'summary': 'ok'})
+
+        with (
+            patch.object(stage, 'assemble_payload', new=fake_assemble_payload),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=fake_run_stage_via_cli,
+            ),
+        ):
+            # Should not raise — empty watermark project_id bypasses mismatch check
+            await stage.run(
+                events=[],
+                watermark=watermark,
+                prior_reports=[],
+                run_id='test-run-001',
+            )
+
+    @pytest.mark.asyncio
     async def test_recon_context_includes_project_id(self, mock_deps):
         from unittest.mock import patch
 
