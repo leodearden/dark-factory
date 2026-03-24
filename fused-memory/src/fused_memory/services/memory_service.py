@@ -797,8 +797,16 @@ class MemoryService:
         self,
         name: str,
         project_id: str = 'main',
+        valid_only: bool = False,
     ) -> dict:
-        """Entity lookup in Graphiti — returns nodes + edges."""
+        """Entity lookup in Graphiti — returns nodes + edges.
+
+        Args:
+            name: Entity name to look up (fuzzy matched).
+            project_id: Project scope.
+            valid_only: When True, exclude edges where invalid_at is set
+                (i.e. edges that have been historically invalidated).
+        """
         nodes = await self.graphiti.search_nodes(
             query=name,
             group_ids=[project_id],
@@ -809,6 +817,9 @@ class MemoryService:
             group_ids=[project_id],
             num_results=10,
         )
+
+        if valid_only:
+            edges = [e for e in edges if getattr(e, 'invalid_at', None) is None]
 
         node_data = []
         for n in nodes:
