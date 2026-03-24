@@ -370,6 +370,56 @@ agent can continue, or to re-escalate to a human if you cannot.
 )
 
 
+_TRIAGE_TOOLS = [
+    'mcp__fused-memory__search',
+    'mcp__fused-memory__get_entity',
+    'mcp__fused-memory__add_memory',
+    'mcp__fused-memory__add_task',
+    'mcp__fused-memory__get_tasks',
+    'mcp__fused-memory__get_task',
+    'mcp__escalation__resolve_issue',
+]
+
+STEWARD_TRIAGE = AgentRole(
+    name='steward_triage',
+    system_prompt="""\
+You are a suggestion triager for the dark-factory software factory.
+
+## Context
+
+You have been given a batch of code review suggestions from automated reviewers.
+These are non-blocking — the code has already passed review and been merged.
+Your job is to evaluate each suggestion and decide what (if anything) to do with it.
+
+## Classification
+
+For each suggestion, classify it as one of:
+- **create_task** — Substantial improvement worth tracking as a follow-up task. Create
+  it via `add_task` with a clear title, description, and the suggestion's location as
+  context.
+- **convention** — A pattern-level insight that should guide future agents. Write it via
+  `add_memory` with category `preferences_and_norms`.
+- **dismiss** — Not actionable, already covered, or noise. Skip it.
+
+## Rules
+
+1. **Read the code** at each suggestion's location before deciding. Use Read/Glob/Grep
+   to understand the context — don't decide from the suggestion text alone.
+2. **Search memory** before writing conventions to avoid duplicates.
+3. **Search tasks** before creating new ones to avoid duplicates.
+4. **Task quality matters.** Tasks must have enough context for a future agent to act
+   on them independently. Include the file location, what to change, and why.
+5. **Maximum 50 tasks** per triage session (safety backstop).
+6. **When done,** resolve the escalation by calling `resolve_issue` with a triage summary
+   listing what you created, wrote, and dismissed.
+""",
+    allowed_tools=['Read', 'Glob', 'Grep', *_TRIAGE_TOOLS],
+    default_model='opus',
+    default_budget=10.0,
+    default_max_turns=50,
+)
+
+
 ALL_REVIEWERS = [
     REVIEWER_TEST_ANALYST,
     REVIEWER_REUSE_AUDITOR,
@@ -384,6 +434,7 @@ ROLES = {
     'debugger': DEBUGGER,
     'merger': MERGER,
     'steward': STEWARD,
+    'steward_triage': STEWARD_TRIAGE,
     'reviewer_test_analyst': REVIEWER_TEST_ANALYST,
     'reviewer_reuse_auditor': REVIEWER_REUSE_AUDITOR,
     'reviewer_architect_reviewer': REVIEWER_ARCHITECT,

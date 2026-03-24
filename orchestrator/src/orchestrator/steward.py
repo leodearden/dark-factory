@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from orchestrator.agents.invoke import invoke_with_cap_retry
-from orchestrator.agents.roles import STEWARD
+from orchestrator.agents.roles import STEWARD, STEWARD_TRIAGE
 
 if TYPE_CHECKING:
     from escalation.models import Escalation
@@ -191,34 +191,55 @@ class TaskSteward:
         )
         pending_dicts = [e.to_dict() for e in pending]
 
-        # Build the prompt
-        prompt = await self.briefing.build_steward_prompt(
-            task=self.task,
-            escalation=escalation.to_dict(),
-            pending_escalations=pending_dicts,
-            worktree=self.worktree,
-        )
-
         # Build MCP config — fused-memory + escalation
         esc_cfg = self.config.escalation
         escalation_url = f'http://{esc_cfg.host}:{esc_cfg.port}/mcp'
         mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
 
-        role = STEWARD
+        # Route: triage suggestions use a different role, prompt, and config
+        if escalation.category == 'review_suggestions':
+            role = STEWARD_TRIAGE
+            suggestions = json.loads(escalation.detail) if escalation.detail else []
+            prompt = await self.briefing.build_steward_triage_prompt(
+                task=self.task,
+                suggestions=suggestions,
+                escalation_id=escalation.id,
+                worktree=self.worktree,
+            )
+            model = self.config.models.steward_triage
+            max_turns = self.config.max_turns.steward_triage
+            budget = self.config.budgets.steward_triage
+            effort = self.config.effort.steward_triage
+            backend = self.config.backends.steward_triage
+            cwd = self.config.project_root  # post-merge — read from main
+        else:
+            role = STEWARD
+            prompt = await self.briefing.build_steward_prompt(
+                task=self.task,
+                escalation=escalation.to_dict(),
+                pending_escalations=pending_dicts,
+                worktree=self.worktree,
+            )
+            model = self.config.models.steward
+            max_turns = self.config.max_turns.steward
+            budget = self.config.budgets.steward
+            effort = self.config.effort.steward
+            backend = self.config.backends.steward
+            cwd = self.worktree
 
         result = await invoke_with_cap_retry(
             usage_gate=self.usage_gate,
             label=f'Steward for task {self.task_id}',
             prompt=prompt,
             system_prompt=role.system_prompt,
-            cwd=self.worktree,
-            model=self.config.models.steward,
-            max_turns=self.config.max_turns.steward,
-            max_budget_usd=self.config.budgets.steward,
+            cwd=cwd,
+            model=model,
+            max_turns=max_turns,
+            max_budget_usd=budget,
             allowed_tools=role.allowed_tools or None,
             mcp_config=mcp_config,
-            effort=self.config.effort.steward,
-            backend=self.config.backends.steward,
+            effort=effort,
+            backend=backend,
         )
 
         self.metrics.invocations += 1
@@ -231,6 +252,17 @@ class TaskSteward:
             f'(success={result.success}, cost=${result.cost_usd:.2f}, '
             f'turns={result.turns})'
         )
+
+        # Patch resolution metadata — steward agent can't pass these via MCP
+        # reliably, so we post-fill after the invocation completes.
+        updated = self.escalation_queue.get(escalation.id)
+        if updated and updated.status in ('resolved', 'dismissed') and not updated.resolved_by:
+            updated.resolved_by = 'steward'
+            updated.resolution_turns = result.turns
+            try:
+                self.escalation_queue._rewrite(escalation.id, updated)
+            except Exception as e:
+                logger.warning(f'Failed to patch steward metadata on {escalation.id}: {e}')
 
         # Check if the escalation was resolved
         still_pending = self.escalation_queue.get_by_task(

@@ -20,6 +20,7 @@ models:
   reviewer: "sonnet"
   merger: "opus"
   steward: "sonnet"
+  steward_triage: "opus"
   module_tagger: "sonnet"
 
 # Budget per invocation (USD)
@@ -30,6 +31,7 @@ budgets:
   reviewer: 2.0
   merger: 5.0
   steward: 3.0
+  steward_triage: 10.0
   module_tagger: 2.0
 
 # Turn limits per invocation
@@ -40,6 +42,7 @@ max_turns:
   reviewer: 30
   merger: 50
   steward: 30
+  steward_triage: 50
   module_tagger: 30
 
 # Reasoning effort per role
@@ -50,6 +53,7 @@ effort:
   reviewer: "medium"
   merger: "max"
   steward: "medium"
+  steward_triage: "max"
   module_tagger: "medium"
 
 # Backend CLI per role (claude, codex, gemini)
@@ -60,6 +64,7 @@ backends:
   reviewer: "claude"
   merger: "claude"
   steward: "claude"
+  steward_triage: "claude"
   module_tagger: "claude"
 
 # Sandbox

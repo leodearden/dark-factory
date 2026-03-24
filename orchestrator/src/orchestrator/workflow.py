@@ -257,6 +257,8 @@ class TaskWorkflow:
 
             # SUCCESS — write completion knowledge before status change (ordering guarantee)
             await self._write_completion_to_memory()
+            # Wait for steward to finish triaging review suggestions (if any)
+            await self._await_suggestion_triage(timeout=300.0)
             self.state = WorkflowState.DONE
             await self.scheduler.set_task_status(self.task_id, 'done')
             logger.info(
@@ -444,8 +446,10 @@ class TaskWorkflow:
             self.state = WorkflowState.REVIEW
             reviews = await self._review()
             if not reviews.has_blocking_issues:
-                # Write suggestions to memory
-                await self._write_suggestions_to_memory(reviews)
+                if self.escalation_queue and reviews.suggestions:
+                    self._escalate_suggestions(reviews)
+                else:
+                    await self._write_suggestions_to_memory(reviews)
                 return WorkflowOutcome.DONE
 
             review_cycle += 1
@@ -1138,3 +1142,102 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     )
         except Exception as e:
             logger.warning(f'Failed to write suggestions to memory: {e}')
+
+    def _escalate_suggestions(self, reviews) -> None:
+        """Submit review suggestions as an info escalation for steward triage."""
+        from escalation.models import Escalation
+
+        suggestions = reviews.suggestions
+        if not suggestions or not self.escalation_queue:
+            return
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role='orchestrator',
+            severity='info',
+            category='review_suggestions',
+            summary=f'{len(suggestions)} review suggestion(s) for triage',
+            detail=json.dumps(suggestions),
+            suggested_action='triage_suggestions',
+            worktree=str(self.worktree) if self.worktree else None,
+            workflow_state=self.state.value,
+        )
+        self.escalation_queue.submit(esc)
+        logger.info(
+            f'Task {self.task_id}: submitted {len(suggestions)} suggestions '
+            f'for steward triage ({esc.id})'
+        )
+
+    async def _await_suggestion_triage(self, timeout: float = 300.0) -> None:
+        """Wait for steward to complete suggestion triage, with timeout.
+
+        On timeout, auto-re-escalate to level 1 (steward->human) and dismiss
+        the original level-0 escalation.
+        """
+        if not self.escalation_queue:
+            return
+
+        def _pending_suggestions():
+            return [
+                e for e in self.escalation_queue.get_by_task(
+                    self.task_id, status='pending',
+                )
+                if e.category == 'review_suggestions'
+            ]
+
+        pending = _pending_suggestions()
+        if not pending:
+            return
+
+        logger.info(
+            f'Task {self.task_id}: waiting up to {timeout:.0f}s for suggestion triage'
+        )
+
+        if self._escalation_event is None:
+            self._escalation_event = asyncio.Event()
+
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            pending = _pending_suggestions()
+            if not pending:
+                logger.info(f'Task {self.task_id}: suggestion triage complete')
+                return
+
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                break
+
+            self._escalation_event.clear()
+            try:
+                await asyncio.wait_for(
+                    self._escalation_event.wait(), timeout=remaining,
+                )
+            except TimeoutError:
+                break
+
+        # Timeout — re-escalate to level 1 (steward -> human)
+        from escalation.models import Escalation
+
+        logger.warning(
+            f'Task {self.task_id}: suggestion triage timed out after {timeout:.0f}s, '
+            f're-escalating {len(pending)} item(s) to level 1'
+        )
+        for esc in pending:
+            reesc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role='steward',
+                severity='info',
+                category='review_suggestions',
+                summary=f'Triage timeout: {esc.summary}',
+                detail=esc.detail,
+                suggested_action='manual_triage',
+                level=1,
+            )
+            self.escalation_queue.submit(reesc)
+            self.escalation_queue.resolve(
+                esc.id,
+                'Auto-dismissed: triage timeout, re-escalated to level 1',
+                dismiss=True,
+            )

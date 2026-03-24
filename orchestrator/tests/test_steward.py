@@ -36,6 +36,11 @@ def mock_config():
     config.max_turns.steward = 100
     config.effort.steward = 'max'
     config.backends.steward = 'claude'
+    config.models.steward_triage = 'opus'
+    config.budgets.steward_triage = 10.0
+    config.max_turns.steward_triage = 50
+    config.effort.steward_triage = 'high'
+    config.backends.steward_triage = 'claude'
     config.escalation.host = 'localhost'
     config.escalation.port = 8102
     config.fused_memory.url = 'http://localhost:8002'
@@ -64,6 +69,7 @@ def mock_mcp():
 def mock_briefing():
     briefing = AsyncMock()
     briefing.build_steward_prompt.return_value = 'Handle this escalation.'
+    briefing.build_steward_triage_prompt.return_value = 'Triage these suggestions.'
     return briefing
 
 
@@ -184,6 +190,127 @@ class TestRunLoop:
             mock_next.return_value = None
             await steward._run_loop()
             mock_next.assert_called_once()
+
+
+class TestTriageRouting:
+    @pytest.mark.asyncio
+    async def test_review_suggestions_uses_triage_role(self, steward, mock_config):
+        """review_suggestions category should use STEWARD_TRIAGE role and config."""
+        from escalation.models import Escalation
+
+        suggestions = [
+            {'reviewer': 'reuse_auditor', 'severity': 'suggestion',
+             'location': 'src/foo.py:10', 'category': 'duplication',
+             'description': 'Duplicate logic', 'suggested_fix': 'Extract helper'},
+        ]
+        esc = Escalation(
+            id='esc-42-1', task_id='42', agent_role='orchestrator',
+            severity='info', category='review_suggestions',
+            summary='1 review suggestion(s) for triage',
+            detail=json.dumps(suggestions),
+        )
+
+        mock_result = MagicMock()
+        mock_result.success = True
+        mock_result.cost_usd = 5.0
+        mock_result.duration_ms = 60000
+        mock_result.turns = 20
+
+        with patch('orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = mock_result
+            steward.escalation_queue.get_by_task.return_value = []
+
+            await steward._handle_escalation(esc)
+
+            call_kwargs = mock_invoke.call_args.kwargs
+            assert call_kwargs['model'] == 'opus'
+            assert call_kwargs['max_budget_usd'] == 10.0
+            assert call_kwargs['max_turns'] == 50
+            assert call_kwargs['effort'] == 'high'
+            assert 'triager' in call_kwargs['system_prompt'].lower()
+
+    @pytest.mark.asyncio
+    async def test_regular_escalation_uses_steward_role(self, steward, mock_config):
+        """Non-suggestion escalation should use standard STEWARD role."""
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id='esc-42-1', task_id='42', agent_role='orchestrator',
+            severity='blocking', category='limit_exhausted',
+            summary='test',
+        )
+
+        mock_result = MagicMock()
+        mock_result.success = True
+        mock_result.cost_usd = 0
+        mock_result.duration_ms = 0
+        mock_result.turns = 0
+
+        with patch('orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = mock_result
+            steward.escalation_queue.get_by_task.return_value = []
+
+            await steward._handle_escalation(esc)
+
+            call_kwargs = mock_invoke.call_args.kwargs
+            assert 'escalation handler' in call_kwargs['system_prompt'].lower()
+
+    @pytest.mark.asyncio
+    async def test_triage_runs_in_project_root(self, steward, mock_config, worktree):
+        """Triage should run in project_root (post-merge), not worktree."""
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id='esc-42-1', task_id='42', agent_role='orchestrator',
+            severity='info', category='review_suggestions',
+            summary='1 suggestion', detail='[]',
+        )
+
+        mock_result = MagicMock()
+        mock_result.success = True
+        mock_result.cost_usd = 0
+        mock_result.duration_ms = 0
+        mock_result.turns = 0
+
+        with patch('orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = mock_result
+            steward.escalation_queue.get_by_task.return_value = []
+
+            await steward._handle_escalation(esc)
+
+            call_kwargs = mock_invoke.call_args.kwargs
+            assert call_kwargs['cwd'] == mock_config.project_root
+
+    @pytest.mark.asyncio
+    async def test_triage_passes_parsed_suggestions(self, steward, mock_briefing):
+        """Triage should pass parsed JSON suggestions to the briefing builder."""
+        from escalation.models import Escalation
+
+        suggestions = [
+            {'reviewer': 'test_analyst', 'description': 'Missing edge case test'},
+        ]
+        esc = Escalation(
+            id='esc-42-1', task_id='42', agent_role='orchestrator',
+            severity='info', category='review_suggestions',
+            summary='1 suggestion', detail=json.dumps(suggestions),
+        )
+
+        mock_result = MagicMock()
+        mock_result.success = True
+        mock_result.cost_usd = 0
+        mock_result.duration_ms = 0
+        mock_result.turns = 0
+
+        with patch('orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = mock_result
+            steward.escalation_queue.get_by_task.return_value = []
+
+            await steward._handle_escalation(esc)
+
+            mock_briefing.build_steward_triage_prompt.assert_called_once()
+            call_kwargs = mock_briefing.build_steward_triage_prompt.call_args.kwargs
+            assert call_kwargs['suggestions'] == suggestions
+            assert call_kwargs['escalation_id'] == 'esc-42-1'
 
 
 class TestStewardMetrics:

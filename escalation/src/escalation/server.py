@@ -22,6 +22,8 @@ CATEGORIES = [
     'recon_backlog_overflow',
     'recon_stale_run',
     'recon_integrity_issue',
+    # Review triage
+    'review_suggestions',
 ]
 
 
@@ -102,13 +104,20 @@ def create_server(queue: EscalationQueue) -> FastMCP:
         escalation_id: str,
         resolution: str,
         terminate: bool = False,
+        resolved_by: str | None = None,
+        resolution_turns: int | None = None,
     ) -> dict[str, Any]:
         """Resolve or dismiss an escalation. The resolution text is injected into the
         agent's briefing when the task resumes.
 
         Set terminate=true to abandon the task rather than resume it.
+        Use resolved_by to attribute the resolver (e.g. "steward", "interactive").
+        Use resolution_turns to record how many conversation turns resolution took.
         """
-        esc = queue.resolve(escalation_id, resolution, dismiss=terminate)
+        esc = queue.resolve(
+            escalation_id, resolution, dismiss=terminate,
+            resolved_by=resolved_by, resolution_turns=resolution_turns,
+        )
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found'}
         return esc.to_dict()

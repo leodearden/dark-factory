@@ -99,6 +99,7 @@ class ModelsConfig(BaseModel):
     reviewer: str = Field(default='sonnet')
     merger: str = Field(default='opus')
     steward: str = Field(default='sonnet')
+    steward_triage: str = Field(default='opus')
     module_tagger: str = Field(default='sonnet')
 
 
@@ -111,6 +112,7 @@ class BudgetsConfig(BaseModel):
     reviewer: float = Field(default=2.0)
     merger: float = Field(default=5.0)
     steward: float = Field(default=3.0)
+    steward_triage: float = Field(default=10.0)
     module_tagger: float = Field(default=2.0)
 
 
@@ -123,6 +125,7 @@ class TurnsConfig(BaseModel):
     reviewer: int = Field(default=30)
     merger: int = Field(default=50)
     steward: int = Field(default=30)
+    steward_triage: int = Field(default=50)
     module_tagger: int = Field(default=30)
 
 
@@ -135,6 +138,7 @@ class EffortConfig(BaseModel):
     reviewer: str = Field(default='medium')
     merger: str = Field(default='high')
     steward: str = Field(default='medium')
+    steward_triage: str = Field(default='high')
     module_tagger: str = Field(default='medium')
 
 
@@ -147,6 +151,7 @@ class BackendsConfig(BaseModel):
     reviewer: str = Field(default='claude')
     merger: str = Field(default='claude')
     steward: str = Field(default='claude')
+    steward_triage: str = Field(default='claude')
     module_tagger: str = Field(default='claude')
 
 
