@@ -1,110 +1,111 @@
 {
-  "task_id": "135",
-  "title": "Harden project_id validation in BaseStage.run()",
+  "task_id": "131",
+  "title": "Extract _build_edge_dict helper to DRY edge extraction in MemoryService",
   "files": [
-    "fused-memory/src/fused_memory/reconciliation/stages/base.py",
-    "fused-memory/tests/test_stages.py"
+    "fused-memory/src/fused_memory/services/memory_service.py",
+    "fused-memory/tests/test_memory_service.py"
   ],
   "modules": [
-    "fused-memory/src/fused_memory/reconciliation/stages",
+    "fused-memory/src/fused_memory/services",
     "fused-memory/tests"
   ],
-  "analysis": "Three targeted robustness improvements to project_id handling in BaseStage.run().\n\n1. **Whitespace bypass** (base.py:91): The guard `if not self.project_id` is truthy for whitespace-only strings like '   ' because non-empty strings are truthy in Python. Fix: add `.strip()` check.\n\n2. **Watermark mismatch** (base.py:91-108): After validation, the code injects `self.project_id` into the recon_context payload (line 105), but never checks that `watermark.project_id` matches. The Watermark model (reconciliation.py:135-143) has a required `project_id: str` field. If a caller sets stage.project_id='A' but passes Watermark(project_id='B'), the agent sees contradictory scoping — the payload says 'A' while the watermark carries 'B'. Fix: add an explicit consistency check.\n\n3. **Missing assertion** (test_stages.py:458-465): test_stage1_remediation_payload_contains_project_id only asserts `'dark_factory' in payload` but NOT `'project_id' in payload`. Every other test in TestPayloadProjectId (stage1 normal, stage2, stage3) asserts both. This is a test coverage gap — fix by adding the missing assertion.\n\nAll three changes are small and surgical. The existing test infrastructure (mock_deps fixture, MemoryConsolidator with AsyncMock deps, Watermark construction) can be reused directly.",
-  "prerequisites": [
-    {
-      "id": "pre-1",
-      "description": "Add missing assertion to test_stage1_remediation_payload_contains_project_id (test_stages.py:465): add `assert 'project_id' in payload` to match the pattern used by every other test in TestPayloadProjectId.",
-      "status": "done",
-      "commit": "a075147",
-      "tests": [
-        "fused-memory/tests/test_stages.py::TestPayloadProjectId::test_stage1_remediation_payload_contains_project_id"
-      ]
-    }
-  ],
+  "analysis": "The code block that builds temporal/entities/provenance from a Graphiti edge object is duplicated verbatim in two locations:\n\n1. `_search_graphiti()` (lines ~727-748): Extracts fact, valid_at, invalid_at into temporal dict; extracts source_node/target_node names into entities list; extracts episodes into provenance list of strings. Then builds a MemoryResult using these plus a rank-based score.\n\n2. `get_entity()` (lines ~834-855): Identical temporal, entities, and provenance extraction logic. Then appends a plain dict with uuid, fact, name, temporal, entities, provenance.\n\nThe refactoring extracts a private helper `_build_edge_dict(self, e) -> dict` that returns `{uuid, fact, name, temporal, entities, provenance}`. Both call-sites reuse this dict:\n- `_search_graphiti` maps the dict fields into MemoryResult constructor args (with uuid fallback to str(i) for missing uuid)\n- `get_entity` appends the dict directly into edge_data\n\nExisting tests for both `_search_graphiti` (via TestSearch, TestSearchDeleteRoundtrip) and `get_entity` (via TestGetEntityTemporalMetadata, TestGetEntityNameEntitiesProvenance, TestGetEntityValidOnly) provide comprehensive regression coverage. New tests target the helper directly for edge-case coverage.\n\nThe conftest already provides MockEdge and MockNode dataclasses with all needed attributes (fact, uuid, name, source_node, target_node, episodes, valid_at, invalid_at).",
+  "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing test: test_run_raises_on_whitespace_project_id — set stage.project_id='   ' (whitespace-only), call stage.run() with a valid watermark, assert ValueError is raised with 'project_id' in the message. Place in TestProjectIdValidation class alongside the existing test_run_raises_on_empty_project_id.",
+      "description": "Write tests for _build_edge_dict helper in a new TestBuildEdgeDict class: (1) full edge with all fields populated (uuid, fact, name, valid_at, invalid_at, source_node, target_node, episodes) returns correct dict with all six keys; (2) minimal edge with no temporal/nodes/episodes returns temporal=None, entities=[], provenance=[]; (3) edge with only valid_at set returns temporal dict with valid_at set and invalid_at=None; (4) edge with only source_node (no target_node) returns single-element entities list; (5) edge with no uuid attr returns uuid=None; (6) edge object without fact attr falls back to str(edge) for the fact value.",
       "status": "done",
-      "commit": "82d2413"
+      "commit": "6882120"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "In base.py line 91, change `if not self.project_id:` to `if not self.project_id or not self.project_id.strip():` to reject whitespace-only project_id strings.",
+      "description": "Implement _build_edge_dict(self, e) -> dict as a private method on MemoryService, placed between _search_graphiti and get_entity. Extracts uuid via getattr(e, 'uuid', None), fact via getattr(e, 'fact', str(e)), name via getattr(e, 'name', None), builds temporal dict from valid_at/invalid_at (None when both absent), extracts entity names from source_node/target_node, and builds provenance from episodes. Returns dict with keys: uuid, fact, name, temporal, entities, provenance. Run new TestBuildEdgeDict tests to verify they pass.",
       "status": "done",
-      "commit": "ea3ac7b"
+      "commit": "e922dd5"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Write failing test: test_run_raises_on_watermark_project_id_mismatch — set stage.project_id='project_a', pass Watermark(project_id='project_b'), call stage.run(), assert ValueError is raised with a message mentioning both 'project_a' and 'project_b' (or 'mismatch'). Place in TestProjectIdValidation class.",
+      "description": "Run existing TestSearch and TestSearchDeleteRoundtrip test classes to confirm green baseline before refactoring _search_graphiti. These tests exercise the full edge-to-MemoryResult conversion path including temporal, entities, and provenance fields.",
       "status": "done",
-      "commit": "a1b9aa8"
+      "commit": "e922dd5"
     },
     {
       "id": "step-4",
       "type": "impl",
-      "description": "In base.py, after the existing project_id-empty guard (line 91-94), add: `if watermark.project_id and watermark.project_id != self.project_id: raise ValueError(f'watermark project_id {watermark.project_id!r} != stage project_id {self.project_id!r}')`. This catches contradictory scoping before the CLI subprocess runs.",
+      "description": "Refactor _search_graphiti() to use _build_edge_dict: replace the ~20 lines of inline temporal/entities/provenance extraction (lines ~727-748) with `d = self._build_edge_dict(edge)`. Map the returned dict fields into the MemoryResult constructor: id=d['uuid'] or str(i), content=d['fact'], temporal=d['temporal'], entities=d['entities'], provenance=d['provenance']. Keep the rank-based score computation inline. Run TestSearch and TestSearchDeleteRoundtrip tests to confirm no regression.",
       "status": "done",
-      "commit": "e9d460f"
+      "commit": "4a4c464"
     },
     {
       "id": "step-5",
       "type": "test",
-      "description": "Write passing test: test_run_allows_matching_watermark_project_id — set stage.project_id='dark_factory', pass Watermark(project_id='dark_factory'). Patch assemble_payload and run_stage_via_cli, assert no exception is raised and run completes. This is a positive regression test for the happy path with the new mismatch check.",
+      "description": "Run existing TestGetEntityTemporalMetadata, TestGetEntityNameEntitiesProvenance, and TestGetEntityValidOnly test classes to confirm green baseline before refactoring get_entity.",
       "status": "done",
-      "commit": "e9d460f"
+      "commit": "4a4c464"
     },
     {
       "id": "step-6",
-      "type": "test",
-      "description": "Write passing test: test_run_allows_empty_watermark_project_id — set stage.project_id='dark_factory', pass Watermark(project_id=''). Patch assemble_payload and run_stage_via_cli, assert no exception is raised. This ensures the mismatch check only triggers when watermark.project_id is non-empty (the `if watermark.project_id and ...` guard).",
+      "type": "impl",
+      "description": "Refactor get_entity() to use _build_edge_dict: replace the ~20 lines of inline edge extraction (lines ~834-855 and the edge_data.append dict construction) with `edge_data.append(self._build_edge_dict(e))`. The helper returns a dict with the exact same keys (uuid, fact, name, temporal, entities, provenance). Run all TestGetEntity* tests to confirm no regression.",
       "status": "done",
-      "commit": "e9d460f"
+      "commit": "cbc53ed"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Run the full test_memory_service.py test suite to confirm all existing tests still pass after both refactorings. This is the final regression check covering search, get_entity, delete, episode, close, and all other scenarios.",
+      "status": "done",
+      "commit": "cbc53ed"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Use `if not self.project_id or not self.project_id.strip()` rather than stripping and reassigning",
-      "rationale": "Minimal change — keeps self.project_id untouched (doesn't silently strip whitespace). Fails fast with a clear error, letting the caller fix the root cause rather than masking it."
+      "decision": "Helper returns a plain dict, not a dataclass or NamedTuple",
+      "rationale": "get_entity() already returns edge data as plain dicts in its response. Using the same format means the helper's return value can be appended directly to edge_data without conversion. A typed class would add overhead with no consumer benefit."
     },
     {
-      "decision": "Only check watermark mismatch when watermark.project_id is non-empty",
-      "rationale": "The Watermark model requires project_id: str, but existing code constructs Watermark(project_id='') as default. The `if watermark.project_id and ...` guard avoids breaking callers that pass an empty watermark project_id while having a valid stage.project_id."
+      "decision": "Helper is a regular instance method (_build_edge_dict(self, e)), not a @staticmethod",
+      "rationale": "Matches the task description signature. While the current implementation doesn't need self, keeping it as an instance method follows the convention in MemoryService where all private methods are instance methods (e.g., _search_graphiti, _search_mem0) and leaves room for future use of self (e.g., logging)."
     },
     {
-      "decision": "Place new tests in existing TestProjectIdValidation class rather than a new class",
-      "rationale": "The existing class already covers project_id validation in BaseStage.run(). Adding whitespace and mismatch tests here maintains cohesion and makes it easy to run all related tests together."
+      "decision": "uuid default is None in the helper, not a fallback index",
+      "rationale": "The index-based uuid fallback (str(i)) is specific to _search_graphiti's rank-ordered iteration context. The helper should return the raw edge uuid or None. The _search_graphiti call-site handles the fallback: `id=d['uuid'] or str(i)`. This keeps the helper generic and reusable."
     },
     {
-      "decision": "Steps 5-6 are positive regression tests added in the same commit as step-4 impl",
-      "rationale": "These verify the happy path isn't broken by the mismatch check. They don't follow strict red-green TDD (they pass immediately) but serve as regression guards. Pairing them with the impl step is the natural place."
+      "decision": "fact default uses str(e) in the helper, matching both existing call-sites",
+      "rationale": "Both _search_graphiti and get_entity use getattr(edge, 'fact', str(edge)) as the fallback. The helper preserves this exact behavior for backward compatibility."
+    },
+    {
+      "decision": "Helper placed as a method on MemoryService class, not extracted to a utility module",
+      "rationale": "The helper is only used by two methods within MemoryService. Extracting to a utility module would be over-engineering for two call-sites. If a third consumer appears later, it can be promoted."
     }
   ],
   "reuse": [
     {
-      "what": "TestProjectIdValidation.mock_deps fixture",
-      "where": "test_stages.py lines 329-340",
-      "how": "Reuse directly for all new tests — provides ReconciliationConfig, AsyncMock memory_service/taskmaster/journal"
+      "what": "MockEdge and MockNode dataclasses from conftest",
+      "where": "fused-memory/tests/conftest.py (lines 19-38)",
+      "how": "Used to construct test edge objects with all relevant attributes (fact, uuid, name, source_node, target_node, episodes, valid_at, invalid_at). Already used by existing get_entity and search tests \u2014 reuse directly in new TestBuildEdgeDict tests."
     },
     {
-      "what": "test_run_raises_on_empty_project_id test pattern",
-      "where": "test_stages.py lines 342-354",
-      "how": "Mirror the structure for the whitespace test: create stage with MemoryConsolidator, set project_id, construct Watermark, call stage.run() in pytest.raises(ValueError)"
+      "what": "service fixture with mocked backends",
+      "where": "fused-memory/tests/test_memory_service.py (lines 12-39)",
+      "how": "Provides a MemoryService instance with mocked graphiti/mem0/queue backends. New _build_edge_dict tests call service._build_edge_dict() through this fixture for consistency with existing test patterns."
     },
     {
-      "what": "test_recon_context_includes_project_id patching pattern",
-      "where": "test_stages.py lines 357-394",
-      "how": "Reuse the fake_assemble_payload + fake_run_stage_via_cli + patch approach for positive regression tests (steps 5-6)"
+      "what": "Existing regression tests for _search_graphiti and get_entity",
+      "where": "fused-memory/tests/test_memory_service.py (TestSearch*, TestGetEntity* classes)",
+      "how": "Serve as regression guards during refactoring steps 3-6. No need to duplicate these tests \u2014 verify they remain green after each refactoring step."
     },
     {
-      "what": "Watermark model constructor",
-      "where": "fused_memory/models/reconciliation.py:135-143",
-      "how": "Construct with different project_id values to test mismatch scenarios"
+      "what": "Edge extraction pattern from _search_graphiti lines 727-748",
+      "where": "fused-memory/src/fused_memory/services/memory_service.py",
+      "how": "The exact logic (temporal dict construction, entity name extraction, episode provenance) is extracted verbatim into the new _build_edge_dict helper. No logic changes, pure extraction."
     }
   ],
-  "_session_id": "135-5cba9c59",
-  "_created_at": "2026-03-24T22:40:15.127790+00:00"
+  "_session_id": "131-0b40c33e",
+  "_created_at": "2026-03-24T22:38:52.988528+00:00"
 }
