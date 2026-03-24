@@ -344,7 +344,7 @@ class TestProjectIdValidation:
         from fused_memory.models.reconciliation import StageId, Watermark
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         # project_id defaults to '' — should raise before executing
-        watermark = Watermark(project_id='')
+        watermark = Watermark()
         with pytest.raises(ValueError, match='project_id'):
             await stage.run(
                 events=[],
@@ -415,14 +415,14 @@ class TestProjectIdValidation:
             )
 
     @pytest.mark.asyncio
-    async def test_run_allows_empty_watermark_project_id(self, mock_deps):
+    async def test_run_allows_none_watermark_project_id(self, mock_deps):
         from unittest.mock import patch
 
         from fused_memory.models.reconciliation import StageId, Watermark
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
-        # Empty watermark project_id skips the mismatch check
-        watermark = Watermark(project_id='')
+        # None watermark project_id skips the mismatch check
+        watermark = Watermark()
 
         async def fake_assemble_payload(events, wm, prior_reports):
             return '## Base Payload\nsome context'
@@ -438,7 +438,39 @@ class TestProjectIdValidation:
                 new=fake_run_stage_via_cli,
             ),
         ):
-            # Should not raise — empty watermark project_id bypasses mismatch check
+            # Should not raise — None watermark project_id bypasses mismatch check
+            await stage.run(
+                events=[],
+                watermark=watermark,
+                prior_reports=[],
+                run_id='test-run-001',
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_allows_whitespace_only_watermark_project_id(self, mock_deps):
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, Watermark
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+        # Whitespace-only watermark project_id normalizes to None and bypasses mismatch check
+        watermark = Watermark(project_id='   ')
+
+        async def fake_assemble_payload(events, wm, prior_reports):
+            return '## Base Payload\nsome context'
+
+        async def fake_run_stage_via_cli(**kwargs):
+            from fused_memory.reconciliation.cli_stage_runner import StageResult
+            return StageResult(success=True, report={'summary': 'ok'})
+
+        with (
+            patch.object(stage, 'assemble_payload', new=fake_assemble_payload),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=fake_run_stage_via_cli,
+            ),
+        ):
+            # Should not raise — whitespace-only watermark project_id normalizes to None
             await stage.run(
                 events=[],
                 watermark=watermark,
@@ -577,6 +609,121 @@ class TestPayloadProjectId:
         payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
         assert 'dark_factory' in payload, 'Stage 3 payload must contain project_id value'
         assert 'project_id' in payload, 'Stage 3 payload must mention project_id'
+
+
+class TestPaddedStageProjectId:
+    """BaseStage.run() strips whitespace from stage.project_id before validation."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        from unittest.mock import AsyncMock
+
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_run_strips_padded_stage_project_id(self, mock_deps):
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, Watermark
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory  '
+        watermark = Watermark(project_id='dark_factory')
+
+        async def fake_assemble_payload(events, wm, prior_reports):
+            return '## Base Payload\nsome context'
+
+        async def fake_run_stage_via_cli(**kwargs):
+            from fused_memory.reconciliation.cli_stage_runner import StageResult
+            return StageResult(success=True, report={'summary': 'ok'})
+
+        with (
+            patch.object(stage, 'assemble_payload', new=fake_assemble_payload),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=fake_run_stage_via_cli,
+            ),
+        ):
+            # Should not raise — padded stage project_id strips to 'dark_factory'
+            await stage.run(
+                events=[],
+                watermark=watermark,
+                prior_reports=[],
+                run_id='test-run-001',
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_uses_stripped_project_id_in_payload(self, mock_deps):
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, Watermark
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = '  dark_factory  '
+        watermark = Watermark(project_id='dark_factory')
+
+        captured = {}
+
+        async def fake_assemble_payload(events, wm, prior_reports):
+            return '## Base Payload\nsome context'
+
+        async def fake_run_stage_via_cli(**kwargs):
+            captured['payload'] = kwargs.get('payload', '')
+            from fused_memory.reconciliation.cli_stage_runner import StageResult
+            return StageResult(success=True, report={'summary': 'ok'})
+
+        with (
+            patch.object(stage, 'assemble_payload', new=fake_assemble_payload),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=fake_run_stage_via_cli,
+            ),
+        ):
+            await stage.run(
+                events=[],
+                watermark=watermark,
+                prior_reports=[],
+                run_id='test-run-001',
+            )
+
+        payload = captured.get('payload', '')
+        # Stripped value must appear in payload; padded value must not
+        assert 'dark_factory' in payload
+        assert '  dark_factory  ' not in payload
+
+
+class TestWatermarkProjectIdNormalization:
+    """Watermark.project_id field_validator normalizes whitespace and converts empty to None."""
+
+    def test_watermark_default_project_id_is_none(self):
+        from fused_memory.models.reconciliation import Watermark
+        wm = Watermark()
+        assert wm.project_id is None
+
+    def test_watermark_empty_string_normalizes_to_none(self):
+        from fused_memory.models.reconciliation import Watermark
+        wm = Watermark(project_id='')
+        assert wm.project_id is None
+
+    def test_watermark_whitespace_only_normalizes_to_none(self):
+        from fused_memory.models.reconciliation import Watermark
+        wm = Watermark(project_id='   ')
+        assert wm.project_id is None
+
+    def test_watermark_valid_project_id_unchanged(self):
+        from fused_memory.models.reconciliation import Watermark
+        wm = Watermark(project_id='dark_factory')
+        assert wm.project_id == 'dark_factory'
+
+    def test_watermark_padded_project_id_stripped(self):
+        from fused_memory.models.reconciliation import Watermark
+        wm = Watermark(project_id=' dark_factory ')
+        assert wm.project_id == 'dark_factory'
 
 
 class TestTierConfig:

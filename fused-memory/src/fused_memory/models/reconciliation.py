@@ -3,7 +3,7 @@
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class EventType(StrEnum):
@@ -135,8 +135,20 @@ class VerificationResult(BaseModel):
 class Watermark(BaseModel):
     """Tracks what's been processed per project."""
 
-    project_id: str
+    project_id: str | None = None
     last_full_run_id: str | None = None
+
+    @field_validator('project_id', mode='before')
+    @classmethod
+    def normalize_project_id(cls, v: object) -> str | None:
+        """Strip whitespace; convert empty/whitespace-only strings to None."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            stripped = v.strip()
+            return stripped if stripped else None
+        return v  # type: ignore[return-value]
+
     last_full_run_completed: datetime | None = None
     last_episode_timestamp: datetime | None = None
     last_memory_timestamp: datetime | None = None

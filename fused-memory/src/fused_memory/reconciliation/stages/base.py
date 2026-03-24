@@ -88,11 +88,12 @@ class BaseStage:
         model: str | None = None,
     ) -> StageReport:
         """Execute this stage via Claude CLI with MCP tools."""
+        self.project_id = self.project_id.strip() if self.project_id else ''
         if not self.project_id or not self.project_id.strip():
             raise ValueError(
                 'project_id must be set before running a reconciliation stage'
             )
-        if watermark.project_id and watermark.project_id != self.project_id:
+        if watermark.project_id is not None and watermark.project_id != self.project_id:
             raise ValueError(
                 f'watermark project_id {watermark.project_id!r} != stage project_id {self.project_id!r}'
             )
