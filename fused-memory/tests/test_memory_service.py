@@ -484,14 +484,7 @@ class TestSearch:
         test_edge_with_no_uuid_attr_returns_none which only tests the helper in isolation.
         """
 
-        class EdgeWithoutUuid:
-            fact = 'some fact'
-            name = None
-            source_node = None
-            target_node = None
-            episodes = []
-            valid_at = None
-            invalid_at = None
+        from tests.conftest import EdgeWithoutUuid
 
         service.graphiti.search = AsyncMock(return_value=[EdgeWithoutUuid()])
         service.mem0.search = AsyncMock(return_value={'results': []})
@@ -871,15 +864,7 @@ class TestBuildEdgeDict:
 
     def test_edge_with_no_uuid_attr_returns_none(self, service):
         """Edge object without a uuid attribute returns uuid=None."""
-
-        class EdgeWithoutUuid:
-            fact = 'some fact'
-            name = None
-            source_node = None
-            target_node = None
-            episodes = []
-            valid_at = None
-            invalid_at = None
+        from tests.conftest import EdgeWithoutUuid
 
         d = service._build_edge_dict(EdgeWithoutUuid())
         assert d['uuid'] is None
@@ -941,6 +926,9 @@ class TestBuildEdgeDict:
         assert d['temporal']['valid_at'] == '', (
             f"valid_at '' should be preserved, got {d['temporal']['valid_at']!r}"
         )
+        assert d['temporal']['invalid_at'] is None, (
+            f"invalid_at should be None when not set, got {d['temporal']['invalid_at']!r}"
+        )
 
     def test_empty_string_invalid_at_builds_temporal_dict(self, service):
         """An edge with invalid_at='' (empty string, not None) must still produce a temporal dict.
@@ -959,6 +947,31 @@ class TestBuildEdgeDict:
         )
         assert d['temporal']['invalid_at'] == '', (
             f"invalid_at '' should be preserved, got {d['temporal']['invalid_at']!r}"
+        )
+        assert d['temporal']['valid_at'] is None, (
+            f"valid_at should be None when not set, got {d['temporal']['valid_at']!r}"
+        )
+
+    def test_none_episodes_attr_produces_empty_provenance(self, service):
+        """Edge with episodes=None (attribute present but None) returns provenance=[].
+
+        Documents the is-not-None semantic: None episodes must not raise and must
+        produce an empty list, same as a missing episodes attribute.
+        """
+
+        class EdgeWithNoneEpisodes:
+            uuid = 'u-ep-none'
+            fact = 'fact with none episodes'
+            name = None
+            source_node = None
+            target_node = None
+            episodes = None  # attribute present, value is None
+            valid_at = None
+            invalid_at = None
+
+        d = service._build_edge_dict(EdgeWithNoneEpisodes())
+        assert d['provenance'] == [], (
+            f"provenance should be [] when episodes is None, got {d['provenance']!r}"
         )
 
 

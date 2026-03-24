@@ -38,6 +38,23 @@ class MockEdge:
 
 
 @dataclass
+class EdgeWithoutUuid:
+    """Simulates a Graphiti edge that lacks a uuid attribute.
+
+    Deliberately omits the uuid field so that getattr(e, 'uuid', None) returns
+    None — modelling real-world edge objects that do not expose a uuid property.
+    """
+
+    fact: str = 'some fact'
+    name: str | None = None
+    source_node: MockNode | None = None
+    target_node: MockNode | None = None
+    episodes: list[str] = field(default_factory=list)
+    valid_at: str | None = None
+    invalid_at: str | None = None
+
+
+@dataclass
 class MockAddEpisodeResult:
     """Simulates the AddEpisodeResults returned by Graphiti's add_episode."""
 

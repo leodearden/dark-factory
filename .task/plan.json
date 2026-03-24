@@ -1,125 +1,101 @@
 {
-  "task_id": "143",
-  "title": "Backport env-var-leak fix from cleanup_stale_edges to run_reindex",
+  "task_id": "145",
+  "title": "Harden _build_edge_dict tests and fix episodes truthiness inconsistency",
   "files": [
-    "fused-memory/src/fused_memory/maintenance/reindex.py",
-    "fused-memory/tests/test_reindex.py"
+    "fused-memory/src/fused_memory/services/memory_service.py",
+    "fused-memory/tests/test_memory_service.py",
+    "fused-memory/tests/conftest.py"
   ],
   "modules": [
-    "fused-memory/src/fused_memory/maintenance",
+    "fused-memory/src/fused_memory/services",
     "fused-memory/tests"
   ],
-  "analysis": "run_reindex() in reindex.py has the same structural bug that Task 139 fixed in cleanup_stale_edges.py. Two concrete issues: (1) os.environ['CONFIG_PATH'] is mutated at line 156 outside any try block with no save/restore \u2014 if any subsequent constructor (FusedMemoryConfig at line 158, MemoryService at line 159, OpenAIEmbedder at line 172, ReindexManager at line 174) raises, CONFIG_PATH is permanently corrupted. (2) All four constructors run at lines 158-178 BEFORE the try block at line 180 \u2014 if MemoryService succeeds at line 159 but OpenAIEmbedder (line 172) or ReindexManager (line 174) raises, execution never enters the try block so the finally block never runs, meaning service.close() is never called and the MemoryService is leaked. The fix mirrors the established pattern in cleanup_stale_edges.run_cleanup(): save old_config_path before try, set service=None sentinel, move all constructor calls and os.environ mutation inside the try block, and conditionally close service + restore CONFIG_PATH in finally. run_reindex() has more constructors than run_cleanup() (adding OpenAIEmbedderConfig, OpenAIEmbedder, and ReindexManager vs just CleanupManager), so the test coverage is expanded to cover each additional constructor failure point. The existing test_reindex.py TestRunReindex class (lines 791-915) tests happy path and runtime errors but has NO tests for constructor-failure env-var restoration or service lifecycle \u2014 this is the gap we fill.",
+  "analysis": "Three targeted improvements from task 140 review, all scoped to _build_edge_dict and its tests.\n\n(1) **Episodes truthiness (memory_service.py:817)**: Line 817 uses `getattr(e, 'episodes', []) or []` — a truthiness-based fallback — while the docstring at lines 793-795 explicitly states truthiness checks are 'deliberately avoided' for _build_edge_dict. The behavior is identical for all realistic inputs (None -> [], [] -> [], ['a'] -> ['a']), so this is a consistency/style fix, not a behavioral bug. We fix the code to use `is not None` to match the docstring's universal 'no truthiness' principle, and add an inline comment explaining the pattern.\n\n(2) **EdgeWithoutUuid duplication (test_memory_service.py:487,875)**: Identical 8-line plain class defined inline at lines 487-494 (TestSearch) and 875-882 (TestBuildEdgeDict). conftest.py already has MockEdge, MockNode, MockAddEpisodeResult as dataclasses. We add EdgeWithoutUuid alongside them as a dataclass with field(default_factory=list) for episodes, matching MockEdge's pattern but deliberately omitting the uuid field so getattr(e, 'uuid', None) returns None.\n\n(3) **Cross-field temporal assertions (test_memory_service.py:926-962)**: The two empty-string temporal tests each only assert the field they set, but don't assert the OTHER temporal field is None. The existing tests at lines 837-857 follow a pattern where both temporal fields are asserted. Adding the missing assertions hardens these tests to catch regressions where the wrong field gets populated.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing test class TestRunReindexEnvVarRestore with test_restores_env_var_when_config_constructor_fails: save original CONFIG_PATH, patch fused_memory.maintenance.reindex.FusedMemoryConfig to raise RuntimeError('config error'), call run_reindex(config_path='test.yaml') expecting RuntimeError, assert os.environ.get('CONFIG_PATH') == original. Wrap assertion in try/finally safety net to restore CONFIG_PATH if test itself fails. Mirror exact pattern from TestRunCleanupEnvVarRestore.test_restores_env_var_when_config_constructor_fails (test_cleanup_stale_edges.py lines 402-427). This WILL FAIL because env var mutation at line 156 is outside the try block with no restore logic.",
+      "description": "Add cross-field assertion `assert d['temporal']['invalid_at'] is None` to test_empty_string_valid_at_builds_temporal_dict (after line 943). This matches the pattern at line 846 where the only-valid_at test asserts invalid_at is None. Should pass immediately — test hardening, not a new behavior.",
       "status": "done",
-      "commit": "ce9c271"
+      "commit": "58171e9"
     },
     {
       "id": "step-2",
       "type": "test",
-      "description": "Write failing test class TestRunReindexServiceLifecycle with test_closes_service_when_manager_constructor_fails: patch FusedMemoryConfig (success with embedder config attrs), MemoryService (success, returns mock_service with AsyncMock close), OpenAIEmbedder (success), ReindexManager (raises RuntimeError('manager error')). Call run_reindex() expecting RuntimeError. Assert mock_service.close.assert_awaited_once(). This WILL FAIL because ReindexManager() at line 174 raises before the try block at line 180, so the finally at line 194 never executes and service.close() is never called.",
+      "description": "Add cross-field assertion `assert d['temporal']['valid_at'] is None` to test_empty_string_invalid_at_builds_temporal_dict (after line 962). This matches the pattern at line 856 where the only-invalid_at test asserts valid_at is None. Should pass immediately — test hardening, not a new behavior.",
       "status": "done",
-      "commit": "ce9c271"
+      "commit": "58171e9"
     },
     {
       "id": "step-3",
-      "type": "impl",
-      "description": "Restructure run_reindex() in reindex.py to match the cleanup_stale_edges pattern: (1) Add 'old_config_path = os.environ.get(\"CONFIG_PATH\")' before try, (2) Add 'service = None' sentinel before try, (3) Move 'if config_path is not None: os.environ[\"CONFIG_PATH\"] = config_path' inside try, (4) Move all constructor calls (FusedMemoryConfig, MemoryService, embedder config setup, OpenAIEmbedder, ReindexManager) inside try, (5) Change finally to: 'if service is not None: await service.close()' plus CONFIG_PATH restore logic (if config_path is not None: pop if old was None, else restore old value). Steps 1-2 failing tests now pass, and all existing TestRunReindex tests remain green.",
+      "type": "test",
+      "description": "Write test `test_none_episodes_attr_produces_empty_provenance` in TestBuildEdgeDict. Create an inline edge class with `episodes = None` (attribute present but None). Assert `d['provenance'] == []`. This documents the is-not-None semantic for episodes. Will pass with both old (or-based) and new (is not None) code, but serves as the specification that the impl step fulfills.",
       "status": "done",
-      "commit": "3d7c4f4"
+      "commit": "a91221d"
     },
     {
       "id": "step-4",
-      "type": "test",
-      "description": "Add test_restores_env_var_when_service_constructor_fails to TestRunReindexEnvVarRestore: patch FusedMemoryConfig (success), MemoryService (raises RuntimeError('service error')), call run_reindex(config_path='test.yaml') expecting RuntimeError, assert CONFIG_PATH restored. Mirror pattern from TestRunCleanupEnvVarRestore.test_restores_env_var_when_service_constructor_fails. Should pass immediately with step-3's implementation.",
+      "type": "impl",
+      "description": "Fix episodes truthiness on memory_service.py line 817. Replace `getattr(e, 'episodes', []) or []` and `provenance = [str(ep) for ep in episodes]` with: `episodes = getattr(e, 'episodes', None)` then `provenance = [str(ep) for ep in (episodes if episodes is not None else [])]`. Add inline comment: `# is-not-None, not truthiness — matches uuid/temporal pattern (see docstring)`. Verify step-3 test still passes.",
       "status": "done",
-      "commit": "480d171"
+      "commit": "498ab60"
     },
     {
       "id": "step-5",
-      "type": "test",
-      "description": "Add test_restores_env_var_when_embedder_constructor_fails to TestRunReindexEnvVarRestore: patch FusedMemoryConfig (success with embedder config attrs), MemoryService (success), OpenAIEmbedder (raises RuntimeError('embedder error')), call run_reindex(config_path='test.yaml') expecting RuntimeError, assert CONFIG_PATH restored. This is reindex-specific \u2014 cleanup_stale_edges has no embedder constructor. Should pass immediately.",
+      "type": "impl",
+      "description": "Add EdgeWithoutUuid dataclass to conftest.py after MockEdge (around line 38). Fields: fact: str = 'some fact', name: str | None = None, source_node: MockNode | None = None, target_node: MockNode | None = None, episodes: list[str] = field(default_factory=list), valid_at: str | None = None, invalid_at: str | None = None. Docstring: 'Simulates a Graphiti edge that lacks a uuid attribute.' No uuid field — getattr(e, 'uuid', None) returns None.",
       "status": "done",
-      "commit": "480d171"
+      "commit": "75813d5"
     },
     {
       "id": "step-6",
-      "type": "test",
-      "description": "Add test_restores_env_var_when_manager_constructor_fails to TestRunReindexEnvVarRestore: patch FusedMemoryConfig (success), MemoryService (success), OpenAIEmbedder (success), ReindexManager (raises RuntimeError('manager error')), call run_reindex(config_path='test.yaml') expecting RuntimeError, assert CONFIG_PATH restored. Should pass immediately.",
-      "status": "done",
-      "commit": "480d171"
-    },
-    {
-      "id": "step-7",
-      "type": "test",
-      "description": "Add test_closes_service_when_embedder_constructor_fails to TestRunReindexServiceLifecycle: patch FusedMemoryConfig (success with embedder config attrs), MemoryService (success, returns mock_service), OpenAIEmbedder (raises RuntimeError('embedder error')). Call run_reindex() expecting RuntimeError. Assert mock_service.close.assert_awaited_once(). Should pass immediately with step-3's implementation.",
-      "status": "done",
-      "commit": "480d171"
-    },
-    {
-      "id": "step-8",
-      "type": "test",
-      "description": "Add test_skips_close_when_service_never_created to TestRunReindexServiceLifecycle: patch FusedMemoryConfig to raise RuntimeError('config error') \u2014 service is never constructed. Call run_reindex() expecting RuntimeError. Assert no AttributeError occurs and the exception propagates cleanly. Verifies the service=None sentinel guard works correctly when MemoryService was never instantiated.",
-      "status": "done",
-      "commit": "480d171"
-    },
-    {
-      "id": "step-9",
       "type": "impl",
-      "description": "Optionally wrap service.close() in try/except per convention (memory id 458388ca): change 'if service is not None: await service.close()' to 'if service is not None: try: await service.close() except Exception: logger.warning(\"Error closing service\", exc_info=True)'. This is a defensive pattern that prevents close() errors from masking the original exception. Run full test suite to verify no regressions.",
+      "description": "Replace both inline EdgeWithoutUuid class definitions in test_memory_service.py with imports from conftest. At line 487 (TestSearch.test_none_uuid_edge_falls_back_to_index_in_search): remove 8-line class, add `from tests.conftest import EdgeWithoutUuid`. At line 875 (TestBuildEdgeDict.test_edge_with_no_uuid_attr_returns_none): same replacement. Follows the existing import pattern used at lines 839, 850, 933, 952 for MockEdge. Run full test suite to confirm no regressions.",
       "status": "done",
-      "commit": "eb25121"
+      "commit": "1ceb34d"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Mirror the exact cleanup_stale_edges.run_cleanup() pattern for CONFIG_PATH save/restore and service lifecycle",
-      "rationale": "Task 139 established this as the canonical fix pattern. Using the identical structure (old_config_path save, service=None sentinel, all construction inside try, guarded close + restore in finally) ensures consistency across maintenance entrypoints and makes the codebase easier to audit."
+      "decision": "Fix code to use `is not None` (option 1) rather than narrowing docstring scope (option 2)",
+      "rationale": "The docstring establishes a universal 'no truthiness' principle for _build_edge_dict. Narrowing it to uuid/temporal-only would weaken the principle and leave a truthiness footgun for future fields. The code change is minimal (2 lines) and makes the pattern uniform across all three field groups: uuid, temporal, and episodes."
     },
     {
-      "decision": "Move ALL four constructors (FusedMemoryConfig, MemoryService, OpenAIEmbedder, ReindexManager) inside the try block, not just some",
-      "rationale": "Any constructor that runs after the os.environ mutation must be inside the try block to ensure CONFIG_PATH is restored on failure. Moving all of them keeps the pattern simple and uniform \u2014 there's no cost to wrapping FusedMemoryConfig too, and it exactly matches the cleanup_stale_edges pattern."
+      "decision": "EdgeWithoutUuid deliberately omits the uuid field rather than setting uuid=None",
+      "rationale": "The whole point of this fixture is testing getattr(e, 'uuid', None) returning None because the attribute doesn't exist. A dataclass field with default=None would create an attribute that exists with value None. Omitting the field accurately models the real-world scenario of a Graphiti edge object lacking the uuid property."
     },
     {
-      "decision": "Add reindex-specific tests for embedder constructor failure (not present in cleanup_stale_edges tests)",
-      "rationale": "run_reindex() has two additional constructors (OpenAIEmbedderConfig + OpenAIEmbedder) that run_cleanup() lacks. OpenAIEmbedder failure is the most likely failure point in practice (e.g., missing OPENAI_API_KEY), so it deserves explicit test coverage for both env-var restore and service lifecycle."
+      "decision": "Cross-field assertions added to existing tests rather than creating new test functions",
+      "rationale": "The task explicitly requests that the existing tests 'should also assert' the other temporal field. This matches the pattern established at lines 837-857 where single-field temporal tests assert both fields. Adding to existing tests keeps the test count stable and the test names accurate."
     },
     {
-      "decision": "Keep service.close() try/except wrapping as a separate optional step (step-9)",
-      "rationale": "The cleanup_stale_edges reference implementation does NOT wrap close() in try/except. The task description marks this as optional per a convention (memory id 458388ca). Implementing it as a separate step keeps the core fix reviewable on its own and avoids creating an inconsistency between the two entrypoints."
-    },
-    {
-      "decision": "Use the same test class naming convention as cleanup_stale_edges: TestRunReindexEnvVarRestore and TestRunReindexServiceLifecycle",
-      "rationale": "Consistent naming with TestRunCleanupEnvVarRestore and TestRunCleanupServiceLifecycle makes it obvious these are the backported equivalents and helps with test discovery."
+      "decision": "episodes=None test (step-3) written before impl (step-4) even though it passes with both old and new code",
+      "rationale": "TDD principle: write the specification test first. The test documents the intended semantic (is-not-None, not truthiness). While behavior is identical for None input, the test serves as a regression guard and specification. It also validates that the None case works correctly after the refactor."
     }
   ],
   "reuse": [
     {
-      "what": "CONFIG_PATH save/restore + service=None sentinel pattern from run_cleanup()",
-      "where": "fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py lines 117-139",
-      "how": "Copy the exact structural pattern: old_config_path = os.environ.get('CONFIG_PATH') before try, service = None before try, all constructors inside try, conditional close + CONFIG_PATH restore in finally. Adapt for reindex's additional constructors (embedder config, OpenAIEmbedder)."
+      "what": "MockEdge dataclass pattern (field types, default_factory, docstring style)",
+      "where": "fused-memory/tests/conftest.py lines 26-37",
+      "how": "EdgeWithoutUuid mirrors MockEdge's structure — same fields, same types, same default patterns — but omits uuid. Uses field(default_factory=list) for episodes."
     },
     {
-      "what": "TestRunCleanupEnvVarRestore test pattern",
-      "where": "fused-memory/tests/test_cleanup_stale_edges.py lines 398-455",
-      "how": "Mirror test structure: save original CONFIG_PATH, patch constructor to raise, call run_reindex(config_path='test.yaml'), assert CONFIG_PATH equals original after exception. Wrap in try/finally for test safety. Adapt patch paths from 'fused_memory.maintenance.cleanup_stale_edges.*' to 'fused_memory.maintenance.reindex.*' and add extra patches for OpenAIEmbedder."
+      "what": "Existing `from tests.conftest import` pattern for shared fixtures",
+      "where": "test_memory_service.py lines 839, 850, 933, 952",
+      "how": "Tests already use `from tests.conftest import MockEdge` — EdgeWithoutUuid will follow the same import pattern."
     },
     {
-      "what": "TestRunCleanupServiceLifecycle test pattern",
-      "where": "fused-memory/tests/test_cleanup_stale_edges.py lines 462-487",
-      "how": "Mirror test structure: patch constructors to succeed up to the failing one, patch the target constructor to raise, assert mock_service.close was awaited. Adapt for reindex's additional constructors and patch paths."
+      "what": "Temporal cross-field assertion pattern",
+      "where": "test_memory_service.py lines 844-846 and 855-857",
+      "how": "The pattern of asserting both temporal fields (the set one and the None one) is copied exactly from the existing only-valid_at and only-invalid_at tests."
     },
     {
-      "what": "Existing TestRunReindex mock setup pattern (mock_config attributes)",
-      "where": "fused-memory/tests/test_reindex.py lines 791-915",
-      "how": "Reuse the same mock_config attribute setup: mock_config.embedder.dimensions = 1536, .providers.openai.api_key = 'test-key', .model = 'text-embedding-3-small'. Use the same patch targets ('fused_memory.maintenance.reindex.FusedMemoryConfig', '.MemoryService', '.OpenAIEmbedder', '.ReindexManager')."
+      "what": "is-not-None pattern for getattr results in _build_edge_dict",
+      "where": "memory_service.py lines 798-805 (valid_at/invalid_at handling)",
+      "how": "The episodes fix replicates the exact same getattr -> is not None -> fallback pattern already used for valid_at and invalid_at."
     }
   ],
-  "_session_id": "143-31d9e658",
-  "_created_at": "2026-03-24T23:13:18.716646+00:00"
+  "_session_id": "145-a97e313f",
+  "_created_at": "2026-03-24T23:23:38.029306+00:00"
 }
