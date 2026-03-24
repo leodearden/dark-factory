@@ -789,6 +789,47 @@ class MemoryService:
             ))
         return results
 
+    def _build_edge_dict(self, e) -> dict:
+        """Build a plain dict from a Graphiti edge object.
+
+        Extracts the six standard fields shared by both _search_graphiti and
+        get_entity, eliminating the duplicated extraction logic.
+
+        Returns:
+            dict with keys: uuid, fact, name, temporal, entities, provenance
+        """
+        fact = getattr(e, 'fact', str(e))
+        valid_at = getattr(e, 'valid_at', None)
+        invalid_at = getattr(e, 'invalid_at', None)
+        temporal = None
+        if valid_at or invalid_at:
+            temporal = {
+                'valid_at': str(valid_at) if valid_at else None,
+                'invalid_at': str(invalid_at) if invalid_at else None,
+            }
+
+        # Extract entity names from source/target nodes
+        entities = []
+        source_node = getattr(e, 'source_node', None)
+        target_node = getattr(e, 'target_node', None)
+        if source_node and hasattr(source_node, 'name'):
+            entities.append(source_node.name)
+        if target_node and hasattr(target_node, 'name'):
+            entities.append(target_node.name)
+
+        # Episode provenance
+        episodes = getattr(e, 'episodes', []) or []
+        provenance = [str(ep) for ep in episodes]
+
+        return {
+            'uuid': getattr(e, 'uuid', None),
+            'fact': fact,
+            'name': getattr(e, 'name', None),
+            'temporal': temporal,
+            'entities': entities,
+            'provenance': provenance,
+        }
+
     # ------------------------------------------------------------------
     # Read: get_entity
     # ------------------------------------------------------------------
