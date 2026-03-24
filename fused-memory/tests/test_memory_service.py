@@ -796,12 +796,15 @@ class TestBuildEdgeDict:
         """An edge with no temporal/nodes/episodes returns temporal=None, entities=[], provenance=[]."""
         from tests.conftest import MockEdge
 
-        edge = MockEdge(fact='bare fact', uuid='bare-uuid')
+        edge = MockEdge(fact='bare fact')  # uuid defaults to ''
         d = service._build_edge_dict(edge)
 
         assert d['temporal'] is None
         assert d['entities'] == []
         assert d['provenance'] == []
+        assert d['uuid'] == ''
+        assert d['fact'] == 'bare fact'
+        assert d['name'] is None
 
     def test_edge_with_only_valid_at_returns_temporal_dict(self, service):
         """Edge with only valid_at set returns temporal dict with valid_at set and invalid_at=None."""
