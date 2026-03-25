@@ -25,13 +25,13 @@
       "type": "test",
       "description": "Hoist import to module level: Remove the `from fused_memory.maintenance.utils import _safe_close` line from inside all 6 test method bodies (lines 16, 27, 38, 55, 72, 100) and add a single module-level import `from fused_memory.maintenance.utils import _safe_close` after the `import pytest` line. Verify all 6 tests still pass unchanged.",
       "status": "done",
-      "commit": null
+      "commit": "2099c71"
     },
     {
       "id": "step-2",
       "type": "test",
       "description": "Strengthen test_does_not_raise_when_close_raises: After the `await _safe_close(service, logger, 'test_context')` call (current line 32), add `service.close.assert_awaited_once()` to verify close was actually attempted, not just that no exception propagated. Verify the test passes.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {

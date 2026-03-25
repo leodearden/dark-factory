@@ -28,6 +28,7 @@ class TestSafeClose:
         logger = logging.getLogger('test_does_not_raise')
         # Must not raise
         await _safe_close(service, logger, 'test_context')
+        service.close.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_logs_warning_with_context_name_on_close_error(self, caplog):
