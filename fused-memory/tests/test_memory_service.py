@@ -498,6 +498,29 @@ class TestSearch:
             f"provenance should be [] when edge has empty episodes, got {results[0].provenance!r}"
         )
 
+    @pytest.mark.asyncio
+    async def test_none_episodes_edge_produces_empty_provenance_in_search(self, service):
+        """An edge with episodes=None (attribute present but None) produces empty provenance in search results.
+
+        Covers the full search() → _search_graphiti → _build_edge_dict pipeline with None episodes,
+        complementing the unit test test_none_episodes_attr_produces_empty_provenance which only
+        tests the helper in isolation.
+        """
+
+        from tests.conftest import EdgeWithNoneEpisodes
+
+        service.graphiti.search = AsyncMock(return_value=[EdgeWithNoneEpisodes()])
+        service.mem0.search = AsyncMock(return_value={'results': []})
+
+        results = await service.search(query='test', project_id='test')
+        assert len(results) == 1
+        assert results[0].id == 'u-ep-none', (
+            f"Expected uuid 'u-ep-none' as result id, got {results[0].id!r}"
+        )
+        assert results[0].provenance == [], (
+            f"provenance should be [] when edge has episodes=None, got {results[0].provenance!r}"
+        )
+
 
 class TestDeleteMemory:
     @pytest.mark.asyncio
