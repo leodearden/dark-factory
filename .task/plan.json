@@ -1,120 +1,126 @@
 {
-  "task_id": "150",
-  "title": "Extract _safe_close() async helper for maintenance entrypoints",
+  "task_id": "151",
+  "title": "Maintenance test quality: remove dead suppress, add missing reindex tests, fix imports",
   "files": [
-    "fused-memory/src/fused_memory/maintenance/utils.py",
-    "fused-memory/tests/test_maintenance_utils.py",
-    "fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py",
-    "fused-memory/src/fused_memory/maintenance/verify_zombie_edges.py",
-    "fused-memory/src/fused_memory/maintenance/reindex.py"
+    "fused-memory/tests/test_cleanup_stale_edges.py",
+    "fused-memory/tests/test_verify_zombie_edges.py",
+    "fused-memory/tests/test_reindex.py"
   ],
   "modules": [
-    "fused-memory/src/fused_memory/maintenance",
     "fused-memory/tests"
   ],
-  "analysis": "Three async maintenance entrypoints (run_reindex, run_cleanup, run_verify_zombie_edges) each contain an identical 4-line try/except block in their finally clause that defensively closes a MemoryService:\n\n```python\nif service is not None:\n    try:\n        await service.close()\n    except Exception:\n        logger.warning('Error closing service during <name> cleanup', exc_info=True)\n```\n\nThis pattern was added by Task 146 to ensure CONFIG_PATH env var restoration always runs even if close() raises. The duplication is across:\n- reindex.py lines 197-202\n- cleanup_stale_edges.py lines 133-138\n- verify_zombie_edges.py lines 173-181\n\nThe extraction is safe because:\n1. Each caller passes its own module-level `logger`, so log output is attributed to the correct module (no change in log source).\n2. The `context_name` parameter produces identical warning messages via `%s` formatting.\n3. Existing tests mock `service.close` at the object level (AsyncMock), not at a module import path, so mock paths don't change.\n4. Tests that check `caplog` for warning messages will see the same logger name and message content.\n5. Tests that check `mock_service.close.assert_awaited_once()` still work since `_safe_close` calls `service.close()` directly.\n\nI verified all 3 test files: test_reindex.py (TestRunReindex, TestRunReindexEnvVarRestore, TestRunReindexServiceLifecycle), test_cleanup_stale_edges.py (TestRunCleanup, TestRunCleanupCloseWarning, TestRunCleanupEnvVarRestore, TestRunCleanupServiceLifecycle), and test_verify_zombie_edges.py (TestRunVerifyZombieEdges, TestRunVerifyZombieEdgesCloseWarning, TestRunVerifyZombieEdgesEnvVarRestore). None require modification.",
+  "analysis": "Three test quality issues across the maintenance test suite need cleanup:\n\n1. **Dead contextlib.suppress**: In test_cleanup_stale_edges.py and test_verify_zombie_edges.py, the `test_restores_config_path_when_close_raises` and `test_logs_warning_when_close_raises` tests wrap run_* calls with `contextlib.suppress(RuntimeError)`. This was needed before Task 146's defensive close alignment, which added try/except around service.close() in the implementation. Now the implementations catch close() errors internally and never propagate RuntimeError, so these suppresses are dead code. Removing them makes the tests document the contract that the entrypoint succeeds even when close() fails \u2014 and if a regression re-exposes the error, the test will correctly fail rather than silently suppressing it.\n\n2. **Missing reindex close-warning tests**: test_cleanup_stale_edges.py has TestRunCleanupCloseWarning and test_verify_zombie_edges.py has TestRunVerifyZombieEdgesCloseWarning, but test_reindex.py has no close-warning test despite run_reindex using the exact same try/except/logger.warning pattern (line 202 of reindex.py). Two tests are needed: (a) TestRunReindexCloseWarning.test_logs_warning_when_close_raises, and (b) TestRunReindexEnvVarRestore.test_restores_config_path_when_close_raises. These complete the three-way test symmetry.\n\n3. **Local imports in test_cleanup_stale_edges.py**: The close-warning and env-var-restore tests import `os`, `logging`, and `CleanupResult`/`run_cleanup` inside test methods (~lines 461, 509, 511) instead of at module level. test_verify_zombie_edges.py already has these at module level. Promoting the imports follows the established pattern and reduces per-test overhead.\n\nAll changes are test-only. No implementation code changes needed.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Create fused-memory/tests/test_maintenance_utils.py with failing tests for _safe_close:\n\n1. test_calls_service_close \u2014 create an AsyncMock service, call _safe_close(service, logger, 'test_context'), assert service.close was awaited once.\n2. test_does_not_raise_when_close_raises \u2014 set service.close = AsyncMock(side_effect=RuntimeError('boom')), call _safe_close, assert no exception propagates.\n3. test_logs_warning_with_context_name_on_close_error \u2014 set service.close to raise, call _safe_close with context_name='run_reindex', assert caplog contains WARNING 'Error closing service during run_reindex cleanup'.\n4. test_logs_warning_with_exc_info \u2014 same as #3 but verify the log record has exc_info set (record.exc_info is not None).\n5. test_uses_provided_logger_not_module_logger \u2014 pass a custom logger (logging.getLogger('custom.test')), set caplog to capture that logger, verify warning appears under 'custom.test' not 'fused_memory.maintenance.utils'.\n6. test_noop_when_close_succeeds_no_warning \u2014 service.close succeeds, verify no WARNING records in caplog.\n\nAll tests import from fused_memory.maintenance.utils which doesn't exist yet, so they fail with ImportError.",
+      "description": "Remove dead contextlib.suppress(RuntimeError) from test_cleanup_stale_edges.py test_restores_config_path_when_close_raises (~line 485). The run_cleanup implementation now catches close() errors internally, so await run_cleanup(...) no longer raises. Remove the `with contextlib.suppress(RuntimeError):` wrapper (lines 485-486) and dedent the `await run_cleanup(config_path='test.yaml')` call to align with the outer `with` block. Run the test to confirm it passes without the suppress.",
       "status": "done",
-      "commit": "ec8d6f7"
+      "commit": "c0d4104"
     },
     {
       "id": "step-2",
-      "type": "impl",
-      "description": "Create fused-memory/src/fused_memory/maintenance/utils.py with:\n\n```python\n\"\"\"Shared helpers for maintenance entrypoints.\"\"\"\nfrom __future__ import annotations\n\nimport logging\nfrom typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from fused_memory.services.memory_service import MemoryService\n\n\nasync def _safe_close(\n    service: MemoryService,\n    logger: logging.Logger,\n    context_name: str,\n) -> None:\n    \"\"\"Close a MemoryService, logging but not raising on failure.\n\n    Ensures CONFIG_PATH restoration (or other finally-block cleanup)\n    always runs even if close() raises.\n    \"\"\"\n    try:\n        await service.close()\n    except Exception:\n        logger.warning(\n            'Error closing service during %s cleanup',\n            context_name,\n            exc_info=True,\n        )\n```\n\nRun the tests from step-1 to verify they all pass.",
+      "type": "test",
+      "description": "Remove dead contextlib.suppress(RuntimeError) from test_cleanup_stale_edges.py test_logs_warning_when_close_raises (~line 536). Remove the `contextlib.suppress(RuntimeError)` from the combined `with` block at lines 531-537, leaving only `caplog.at_level(...)` as the single context manager. The `await run_cleanup()` call stays at the same indentation. Run to confirm it still captures the warning log and passes.",
       "status": "done",
-      "commit": "c0ec152"
+      "commit": "30cf5d7"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Run existing test_cleanup_stale_edges.py to establish green baseline before refactoring cleanup_stale_edges.py. All TestRunCleanup, TestRunCleanupCloseWarning, TestRunCleanupEnvVarRestore, and TestRunCleanupServiceLifecycle tests must pass.",
+      "description": "Remove dead contextlib.suppress(RuntimeError) from test_verify_zombie_edges.py test_restores_config_path_when_close_raises (~line 566). Same pattern as step-1: remove the `with contextlib.suppress(RuntimeError):` wrapper and dedent the `await run_verify_zombie_edges(...)` call. Run the test to confirm it passes.",
       "status": "done",
-      "commit": "a3a59f9"
+      "commit": "49b7aa9"
     },
     {
       "id": "step-4",
-      "type": "impl",
-      "description": "Replace inline try/except in cleanup_stale_edges.py run_cleanup() finally block (lines 133-138) with:\n\n```python\n    finally:\n        if service is not None:\n            # Catch close() errors so CONFIG_PATH restoration below always runs.\n            await _safe_close(service, logger, 'run_cleanup')\n        if config_path is not None:\n```\n\nAdd import at top of file: `from fused_memory.maintenance.utils import _safe_close`\n\nRun test_cleanup_stale_edges.py to verify all existing tests pass without modification.",
+      "type": "test",
+      "description": "Remove dead contextlib.suppress(RuntimeError) from test_verify_zombie_edges.py test_logs_warning_when_close_raises (~line 613). Same pattern as step-2: remove contextlib.suppress from the combined `with` block, keeping only caplog.at_level. Run to confirm it captures warnings and passes.",
       "status": "done",
-      "commit": "3844cab"
+      "commit": "b068ef7"
     },
     {
       "id": "step-5",
-      "type": "test",
-      "description": "Run existing test_verify_zombie_edges.py to establish green baseline before refactoring verify_zombie_edges.py. All TestRunVerifyZombieEdges, TestRunVerifyZombieEdgesCloseWarning, TestRunVerifyZombieEdgesEnvVarRestore tests must pass.",
+      "type": "impl",
+      "description": "Promote local imports to module-level in test_cleanup_stale_edges.py. Add `import logging`, `import os` to the stdlib import block (after `import contextlib`, before `from unittest.mock`), and add `from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup` to the project import block (after the GraphitiBackend import). Remove the local `import os` (~line 461), `import logging` (~line 509), and `from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup` (~line 463, 511) from inside test methods. Run all tests in the file to confirm nothing breaks.",
       "status": "done",
-      "commit": "943b33b"
+      "commit": "7eb8183"
     },
     {
       "id": "step-6",
-      "type": "impl",
-      "description": "Replace inline try/except in verify_zombie_edges.py run_verify_zombie_edges() finally block (lines 173-181) with:\n\n```python\n    finally:\n        if service is not None:\n            # Catch close() errors so CONFIG_PATH restoration below always runs.\n            await _safe_close(service, logger, 'run_verify_zombie_edges')\n        if config_path is not None:\n```\n\nAdd import at top of file: `from fused_memory.maintenance.utils import _safe_close`\n\nRun test_verify_zombie_edges.py to verify all existing tests pass without modification.",
+      "type": "test",
+      "description": "Add test_restores_config_path_when_close_raises to the existing TestRunReindexEnvVarRestore class in test_reindex.py. This mirrors the pattern in test_verify_zombie_edges.py lines 543-576 (post-suppress removal). Create mock_config with embedder.dimensions=1536, embedder.providers.openai.api_key='test-key', embedder.model='text-embedding-3-small'. Create mock_service with close=AsyncMock(side_effect=RuntimeError('close error')). Patch FusedMemoryConfig, MemoryService, OpenAIEmbedder, and ReindexManager (with mock reindex_and_replay returning a dict with reindex_result and replay_count). Call await run_reindex(config_path='test.yaml') directly (no suppress). Assert os.environ.get('CONFIG_PATH') == original. Use try/finally safety net. Run test to confirm it passes.",
       "status": "done",
-      "commit": "b07f695"
+      "commit": "1643f82"
     },
     {
       "id": "step-7",
       "type": "test",
-      "description": "Run existing test_reindex.py to establish green baseline before refactoring reindex.py. All TestRunReindex, TestRunReindexEnvVarRestore, TestRunReindexServiceLifecycle tests must pass.",
+      "description": "Add new TestRunReindexCloseWarning class with test_logs_warning_when_close_raises to test_reindex.py. Place it after TestRunReindexEnvVarRestore, before TestRunReindexServiceLifecycle. This mirrors TestRunCleanupCloseWarning and TestRunVerifyZombieEdgesCloseWarning. Same mock setup as step-6 but no config_path (tests default path). Use caplog.at_level(logging.WARNING, logger='fused_memory.maintenance.reindex') \u2014 no suppress needed. Call await run_reindex(). Assert warning_messages contains 'Error closing service during run_reindex cleanup'. Add `import logging` to module-level imports in test_reindex.py. Run test to confirm it passes.",
       "status": "done",
-      "commit": "86fbe52"
+      "commit": "aa24e6d"
     },
     {
       "id": "step-8",
       "type": "impl",
-      "description": "Replace inline try/except in reindex.py run_reindex() finally block (lines 197-202) with:\n\n```python\n    finally:\n        if service is not None:\n            # Catch close() errors so CONFIG_PATH restoration below always runs.\n            await _safe_close(service, logger, 'run_reindex')\n        if config_path is not None:\n```\n\nAdd import at top of file: `from fused_memory.maintenance.utils import _safe_close`\n\nRun test_reindex.py to verify all existing tests pass without modification. Then run all three test files together as final regression check.",
+      "description": "Final cleanup and full verification. Check if contextlib import is still needed in test_cleanup_stale_edges.py and test_verify_zombie_edges.py after removing all suppress calls \u2014 if no other contextlib usage remains, remove `import contextlib`. Run the full test suite for all three files: pytest fused-memory/tests/test_cleanup_stale_edges.py fused-memory/tests/test_verify_zombie_edges.py fused-memory/tests/test_reindex.py -v. Confirm zero failures.",
       "status": "done",
-      "commit": "3c8fca4"
+      "commit": "e0d209a"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Accept logger as a parameter rather than using a module-level logger in utils.py",
-      "rationale": "Each maintenance entrypoint has its own module-level logger (e.g., fused_memory.maintenance.reindex). If _safe_close used its own logger (fused_memory.maintenance.utils), warning messages would appear under a different logger name, breaking existing caplog-based tests and changing log attribution. Passing the caller's logger preserves exact behavioral equivalence."
+      "decision": "Remove suppress rather than keep it as defensive code",
+      "rationale": "The implementation's try/except around service.close() is the contract. If a regression propagates the error, the test should fail loudly rather than silently suppressing it. This makes the tests document the contract and detect regressions."
     },
     {
-      "decision": "Use %s formatting instead of f-string for the warning message",
-      "rationale": "Python logging best practice: logger.warning('...%s...', arg) defers string formatting to the logging framework, which avoids formatting cost when the log level is disabled. It also matches the style used in verify_zombie_edges.py (lines 178-180) which already uses %s-style for its log messages."
+      "decision": "New reindex tests call run_reindex directly without contextlib.suppress",
+      "rationale": "The whole point of this task is that the implementation now handles close() errors internally. The new tests should follow the corrected pattern from the start, never having the dead suppress."
     },
     {
-      "decision": "Keep the comment '# Catch close() errors so CONFIG_PATH restoration below always runs.' above each call site",
-      "rationale": "The task description explicitly requests this. The comment explains WHY _safe_close is used at this specific location \u2014 it's about the control flow relationship between close() and CONFIG_PATH restoration, not about what _safe_close does internally."
+      "decision": "Add test_restores_config_path_when_close_raises to existing TestRunReindexEnvVarRestore class rather than creating a new class",
+      "rationale": "The existing class groups all env-var restoration tests. Adding the close-raises variant there maintains logical grouping and matches how test_cleanup_stale_edges.py and test_verify_zombie_edges.py organize their env-var tests."
     },
     {
-      "decision": "Do not modify existing test files",
-      "rationale": "Mock paths are object-level (mock_service.close), not module-import paths. Logger names are preserved via parameter passing. Warning messages are identical (Python's LogRecord.getMessage() applies %s formatting). All 3 test files were manually verified to require zero changes."
+      "decision": "Create a new TestRunReindexCloseWarning class for the warning test",
+      "rationale": "This matches the pattern in the other two files (TestRunCleanupCloseWarning, TestRunVerifyZombieEdgesCloseWarning) where close-warning tests get their own dedicated test class."
     },
     {
-      "decision": "Use TYPE_CHECKING guard for MemoryService import in utils.py",
-      "rationale": "Avoids importing MemoryService at runtime (which pulls in heavy dependencies like graphiti_core). The function accepts any object with an async close() method, so the type hint is purely for documentation/IDE support."
+      "decision": "Promote imports before adding new reindex tests but after suppress removal",
+      "rationale": "The import promotion (step 5) affects test_cleanup_stale_edges.py only and is independent of the reindex additions (steps 6-7). Doing import cleanup before new test additions keeps the diff history clean: first fix existing code quality, then add new tests."
     },
     {
-      "decision": "Name the function _safe_close with leading underscore",
-      "rationale": "This is an internal helper, not part of the public maintenance API. The underscore signals it's a private utility used by the run_* entrypoints. Matches the naming convention in the task description."
+      "decision": "Check whether contextlib import can be removed after suppress removal",
+      "rationale": "After removing all contextlib.suppress calls from test_cleanup_stale_edges.py and test_verify_zombie_edges.py, if no other code in those files uses contextlib, the import becomes dead code and should be removed. Step 8 includes this cleanup check."
+    },
+    {
+      "decision": "run_reindex mock result must be a dict, not a bare ReindexResult",
+      "rationale": "run_reindex returns the full dict from ReindexManager.reindex_and_replay, which has keys 'reindex_result', 'replay_count', and optionally 'indices_dropped'. The mock must match this structure \u2014 using a bare ReindexResult would cause a KeyError at line 188."
     }
   ],
   "reuse": [
     {
-      "what": "Identical try/except close pattern from all three entrypoints",
-      "where": "reindex.py:197-202, cleanup_stale_edges.py:133-138, verify_zombie_edges.py:173-181",
-      "how": "The 4-line try/except block is extracted verbatim into _safe_close(). The context_name parameter replaces the hardcoded function name in each warning message."
+      "what": "TestRunVerifyZombieEdgesCloseWarning test pattern",
+      "where": "fused-memory/tests/test_verify_zombie_edges.py lines 584-621",
+      "how": "Mirror this exact pattern for the new TestRunReindexCloseWarning class, substituting: run_verify_zombie_edges \u2192 run_reindex, VerifyResult \u2192 dict with ReindexResult, verify_zombie_edges patches \u2192 reindex patches (FusedMemoryConfig, MemoryService, OpenAIEmbedder, ReindexManager), and expected warning message 'run_verify_zombie_edges' \u2192 'run_reindex'."
     },
     {
-      "what": "Existing test infrastructure (conftest.py mock_config fixture, pytest-asyncio)",
-      "where": "fused-memory/tests/conftest.py",
-      "how": "New test_maintenance_utils.py uses the same pytest.mark.asyncio, AsyncMock, and caplog patterns established in the existing maintenance test files."
+      "what": "TestRunVerifyZombieEdgesEnvVarRestore.test_restores_config_path_when_close_raises pattern",
+      "where": "fused-memory/tests/test_verify_zombie_edges.py lines 543-576",
+      "how": "Mirror this for the new test in TestRunReindexEnvVarRestore. Adapt: (1) use reindex-specific patches (FusedMemoryConfig, MemoryService, OpenAIEmbedder, ReindexManager), (2) mock_config needs embedder.dimensions, embedder.providers.openai.api_key, embedder.model attributes, (3) mock result as dict with 'reindex_result' and 'replay_count' keys, (4) no contextlib.suppress \u2014 the corrected pattern."
     },
     {
-      "what": "AsyncMock + caplog test pattern from TestRunCleanupCloseWarning and TestRunVerifyZombieEdgesCloseWarning",
-      "where": "test_cleanup_stale_edges.py:503-544, test_verify_zombie_edges.py:584-621",
-      "how": "The new _safe_close tests follow the same pattern: set service.close to raise via side_effect, call the function, check caplog for WARNING records with expected message content."
+      "what": "Module-level import pattern from test_verify_zombie_edges.py",
+      "where": "fused-memory/tests/test_verify_zombie_edges.py lines 1-13",
+      "how": "Use the same import organization for test_cleanup_stale_edges.py: contextlib, logging, os as stdlib imports, then third-party (unittest.mock, pytest), then project imports including the run function and result type."
+    },
+    {
+      "what": "Mock config pattern for reindex tests",
+      "where": "fused-memory/tests/test_reindex.py TestRunReindexEnvVarRestore tests (lines 1046-1055, 1089-1096)",
+      "how": "Reuse the mock_config setup with embedder.dimensions=1536, embedder.providers.openai.api_key='test-key', embedder.model='text-embedding-3-small' for the new close-warning and env-restore tests."
     }
   ],
-  "_session_id": "150-d1f0eba3",
-  "_created_at": "2026-03-25T01:04:16.089579+00:00"
+  "_session_id": "151-0906256a",
+  "_created_at": "2026-03-25T01:03:48.612984+00:00"
 }

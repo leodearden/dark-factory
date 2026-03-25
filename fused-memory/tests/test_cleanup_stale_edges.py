@@ -1,12 +1,14 @@
 """Tests for cleanup_stale_edges maintenance: GraphitiBackend time-range queries and CleanupManager."""
 from __future__ import annotations
 
-import contextlib
+import logging
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrored from test_reindex.py)
@@ -223,7 +225,7 @@ class TestCleanupManager:
 
     @pytest.mark.asyncio
     async def test_cleanup_queries_and_deletes(self, mock_config):
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult
+        from fused_memory.maintenance.cleanup_stale_edges import CleanupManager
 
         edge_details = [
             {'uuid': 'u1', 'fact': 'f1', 'name': 'n1', 'valid_at': '2026-03-22T17:51:00', 'invalid_at': None},
@@ -243,7 +245,7 @@ class TestCleanupManager:
 
     @pytest.mark.asyncio
     async def test_dry_run_queries_but_does_not_delete(self, mock_config):
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult
+        from fused_memory.maintenance.cleanup_stale_edges import CleanupManager
 
         edge_details = [
             {'uuid': 'u1', 'fact': 'f1', 'name': 'n1', 'valid_at': '2026-03-22T17:51:00', 'invalid_at': None},
@@ -262,7 +264,7 @@ class TestCleanupManager:
 
     @pytest.mark.asyncio
     async def test_cleanup_empty_result(self, mock_config):
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult
+        from fused_memory.maintenance.cleanup_stale_edges import CleanupManager
 
         backend = _make_backend(mock_config)
         backend.query_edges_by_time_range = AsyncMock(return_value=[])
@@ -287,8 +289,6 @@ class TestRunCleanup:
     @pytest.mark.asyncio
     async def test_loads_config_and_runs_cleanup(self):
         """run_cleanup() initializes the MemoryService and calls cleanup with correct args."""
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
-
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
@@ -320,8 +320,6 @@ class TestRunCleanup:
     @pytest.mark.asyncio
     async def test_closes_service_on_success(self):
         """run_cleanup() calls service.close() in finally block after success."""
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
-
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
@@ -344,8 +342,6 @@ class TestRunCleanup:
     @pytest.mark.asyncio
     async def test_closes_service_on_error(self):
         """run_cleanup() calls service.close() in finally block even when cleanup raises."""
-        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
-
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
@@ -367,8 +363,6 @@ class TestRunCleanup:
     @pytest.mark.asyncio
     async def test_passes_dry_run_flag(self):
         """run_cleanup(dry_run=True) passes dry_run=True to cleanup."""
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
-
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
@@ -402,10 +396,6 @@ class TestRunCleanupEnvVarRestore:
     @pytest.mark.asyncio
     async def test_restores_env_var_when_config_constructor_fails(self):
         """CONFIG_PATH is restored when FusedMemoryConfig() raises."""
-        import os
-
-        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
-
         original = os.environ.get('CONFIG_PATH')
         try:
             with (
@@ -430,10 +420,6 @@ class TestRunCleanupEnvVarRestore:
     @pytest.mark.asyncio
     async def test_restores_env_var_when_service_constructor_fails(self):
         """CONFIG_PATH is restored when MemoryService() raises."""
-        import os
-
-        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
-
         original = os.environ.get('CONFIG_PATH')
         try:
             with (
@@ -458,10 +444,6 @@ class TestRunCleanupEnvVarRestore:
     @pytest.mark.asyncio
     async def test_restores_config_path_when_close_raises(self):
         """CONFIG_PATH is restored even when service.close() raises in the finally block."""
-        import os
-
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
-
         original = os.environ.get('CONFIG_PATH')
         try:
             mock_service = AsyncMock()
@@ -482,8 +464,7 @@ class TestRunCleanupEnvVarRestore:
                 mock_mgr.cleanup = AsyncMock(return_value=mock_result)
                 mock_mgr_cls.return_value = mock_mgr
 
-                with contextlib.suppress(RuntimeError):
-                    await run_cleanup(config_path='test.yaml')
+                await run_cleanup(config_path='test.yaml')
 
             # CONFIG_PATH must be restored regardless of close() raising
             assert os.environ.get('CONFIG_PATH') == original
@@ -506,10 +487,6 @@ class TestRunCleanupCloseWarning:
     @pytest.mark.asyncio
     async def test_logs_warning_when_close_raises(self, caplog):
         """A WARNING containing the function name is logged when service.close() raises."""
-        import logging
-
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
-
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
         mock_service.close = AsyncMock(side_effect=RuntimeError('close error'))
@@ -528,12 +505,9 @@ class TestRunCleanupCloseWarning:
             mock_mgr.cleanup = AsyncMock(return_value=mock_result)
             mock_mgr_cls.return_value = mock_mgr
 
-            with (
-                caplog.at_level(
-                    logging.WARNING,
-                    logger='fused_memory.maintenance.cleanup_stale_edges',
-                ),
-                contextlib.suppress(RuntimeError),
+            with caplog.at_level(
+                logging.WARNING,
+                logger='fused_memory.maintenance.cleanup_stale_edges',
             ):
                 await run_cleanup()
 
@@ -554,8 +528,6 @@ class TestRunCleanupServiceLifecycle:
     @pytest.mark.asyncio
     async def test_closes_service_when_cleanup_manager_constructor_fails(self):
         """service.close() is called when CleanupManager() raises."""
-        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
-
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
 

@@ -2,7 +2,6 @@
 ZombieEdgeVerifier, and run_verify_zombie_edges entrypoint."""
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -563,8 +562,7 @@ class TestRunVerifyZombieEdgesEnvVarRestore:
                 mock_verifier.cleanup = AsyncMock(return_value=mock_result)
                 mock_verifier_cls.return_value = mock_verifier
 
-                with contextlib.suppress(RuntimeError):
-                    await run_verify_zombie_edges(uuids=['test-uuid'], config_path='test.yaml')
+                await run_verify_zombie_edges(uuids=['test-uuid'], config_path='test.yaml')
 
             # CONFIG_PATH must be restored regardless of close() raising
             assert os.environ.get('CONFIG_PATH') == original
@@ -605,12 +603,9 @@ class TestRunVerifyZombieEdgesCloseWarning:
             mock_verifier.cleanup = AsyncMock(return_value=mock_result)
             mock_verifier_cls.return_value = mock_verifier
 
-            with (
-                caplog.at_level(
-                    logging.WARNING,
-                    logger='fused_memory.maintenance.verify_zombie_edges',
-                ),
-                contextlib.suppress(RuntimeError),
+            with caplog.at_level(
+                logging.WARNING,
+                logger='fused_memory.maintenance.verify_zombie_edges',
             ):
                 await run_verify_zombie_edges(uuids=['test-uuid'])
 
