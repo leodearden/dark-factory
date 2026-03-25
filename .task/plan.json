@@ -46,7 +46,7 @@
       "type": "test",
       "description": "Strengthen test_logs_warning_with_exc_info: Change the assertion on line 64 from `assert warning_records[0].exc_info is not None` to `assert warning_records[0].exc_info[0] is ValueError` to verify the correct exception type (ValueError, matching the side_effect on line 57) is captured in the exc_info tuple. Update the assertion message accordingly. Verify the test passes.",
       "status": "done",
-      "commit": null
+      "commit": "e68e5d5"
     }
   ],
   "design_decisions": [
