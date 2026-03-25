@@ -604,12 +604,9 @@ class TestRunVerifyZombieEdgesCloseWarning:
             mock_verifier.cleanup = AsyncMock(return_value=mock_result)
             mock_verifier_cls.return_value = mock_verifier
 
-            with (
-                caplog.at_level(
-                    logging.WARNING,
-                    logger='fused_memory.maintenance.verify_zombie_edges',
-                ),
-                contextlib.suppress(RuntimeError),
+            with caplog.at_level(
+                logging.WARNING,
+                logger='fused_memory.maintenance.verify_zombie_edges',
             ):
                 await run_verify_zombie_edges(uuids=['test-uuid'])
 
