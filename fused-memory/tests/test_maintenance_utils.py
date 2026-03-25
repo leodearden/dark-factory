@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from fused_memory.maintenance.utils import _safe_close
+
 
 class TestSafeClose:
     """Tests for _safe_close() async helper."""
@@ -13,8 +15,6 @@ class TestSafeClose:
     @pytest.mark.asyncio
     async def test_calls_service_close(self):
         """_safe_close awaits service.close() exactly once on the happy path."""
-        from fused_memory.maintenance.utils import _safe_close
-
         service = AsyncMock()
         logger = logging.getLogger('test_calls_service_close')
         await _safe_close(service, logger, 'test_context')
@@ -23,19 +23,16 @@ class TestSafeClose:
     @pytest.mark.asyncio
     async def test_does_not_raise_when_close_raises(self):
         """_safe_close does not propagate exceptions raised by service.close()."""
-        from fused_memory.maintenance.utils import _safe_close
-
         service = AsyncMock()
         service.close = AsyncMock(side_effect=RuntimeError('boom'))
         logger = logging.getLogger('test_does_not_raise')
         # Must not raise
         await _safe_close(service, logger, 'test_context')
+        service.close.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_logs_warning_with_context_name_on_close_error(self, caplog):
         """_safe_close logs a WARNING containing context_name when close() raises."""
-        from fused_memory.maintenance.utils import _safe_close
-
         service = AsyncMock()
         service.close = AsyncMock(side_effect=RuntimeError('boom'))
         logger = logging.getLogger('test_logs_warning')
@@ -51,8 +48,6 @@ class TestSafeClose:
     @pytest.mark.asyncio
     async def test_logs_warning_with_exc_info(self, caplog):
         """_safe_close includes exc_info in the WARNING log record."""
-        from fused_memory.maintenance.utils import _safe_close
-
         service = AsyncMock()
         service.close = AsyncMock(side_effect=ValueError('err'))
         logger = logging.getLogger('test_exc_info')
@@ -61,15 +56,13 @@ class TestSafeClose:
 
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warning_records, 'Expected at least one WARNING record'
-        assert warning_records[0].exc_info is not None, (
-            'Expected exc_info to be set on the WARNING record'
+        assert warning_records[0].exc_info[0] is ValueError, (
+            'Expected exc_info to capture a ValueError on the WARNING record'
         )
 
     @pytest.mark.asyncio
     async def test_uses_provided_logger_not_module_logger(self, caplog):
         """_safe_close emits the warning under the caller-supplied logger, not the utils logger."""
-        from fused_memory.maintenance.utils import _safe_close
-
         service = AsyncMock()
         service.close = AsyncMock(side_effect=RuntimeError('fail'))
         custom_logger = logging.getLogger('custom.test.logger')
@@ -96,8 +89,6 @@ class TestSafeClose:
     @pytest.mark.asyncio
     async def test_noop_when_close_succeeds_no_warning(self, caplog):
         """_safe_close emits no WARNING records when service.close() succeeds."""
-        from fused_memory.maintenance.utils import _safe_close
-
         service = AsyncMock()
         logger = logging.getLogger('test_noop')
         with caplog.at_level(logging.WARNING, logger='test_noop'):
@@ -105,3 +96,4 @@ class TestSafeClose:
 
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert not warning_records, f'Expected no warnings on success, got: {warning_records}'
+        service.close.assert_awaited_once()
