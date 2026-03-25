@@ -33,15 +33,15 @@
       "id": "step-3",
       "type": "test",
       "description": "Run existing test_cleanup_stale_edges.py to establish green baseline before refactoring cleanup_stale_edges.py. All TestRunCleanup, TestRunCleanupCloseWarning, TestRunCleanupEnvVarRestore, and TestRunCleanupServiceLifecycle tests must pass.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "a3a59f9"
     },
     {
       "id": "step-4",
       "type": "impl",
       "description": "Replace inline try/except in cleanup_stale_edges.py run_cleanup() finally block (lines 133-138) with:\n\n```python\n    finally:\n        if service is not None:\n            # Catch close() errors so CONFIG_PATH restoration below always runs.\n            await _safe_close(service, logger, 'run_cleanup')\n        if config_path is not None:\n```\n\nAdd import at top of file: `from fused_memory.maintenance.utils import _safe_close`\n\nRun test_cleanup_stale_edges.py to verify all existing tests pass without modification.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "3844cab"
     },
     {
       "id": "step-5",
