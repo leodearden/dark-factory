@@ -13,7 +13,7 @@
       "id": "pre-1",
       "description": "Run all 6 existing tests in test_maintenance_utils.py to establish a green baseline before making any changes",
       "status": "done",
-      "commit": null,
+      "commit": "8afff85",
       "tests": [
         "fused-memory/tests/test_maintenance_utils.py::TestSafeClose"
       ]
@@ -24,7 +24,7 @@
       "id": "step-1",
       "type": "test",
       "description": "Hoist import to module level: Remove the `from fused_memory.maintenance.utils import _safe_close` line from inside all 6 test method bodies (lines 16, 27, 38, 55, 72, 100) and add a single module-level import `from fused_memory.maintenance.utils import _safe_close` after the `import pytest` line. Verify all 6 tests still pass unchanged.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
