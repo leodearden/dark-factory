@@ -1,0 +1,26 @@
+{
+  "skill_name": "review-briefing",
+  "evals": [
+    {
+      "id": 0,
+      "name": "full-project-create",
+      "prompt": "/review-briefing",
+      "expected_output": "Creates review/briefing.yaml with all subprojects discovered, smoke tests drafted, critical paths traced, invariants derived, and known gaps classified. Conducts interactive interview with user on each section.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "scoped-single-subproject",
+      "prompt": "/review-briefing --scope fused-memory",
+      "expected_output": "Creates or updates review/briefing.yaml with only the fused-memory subproject section. Discovery agents run only for fused-memory. Interview covers fused-memory sections only.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "validate-existing",
+      "prompt": "/review-briefing --validate",
+      "expected_output": "Reads existing review/briefing.yaml and checks all references (files, functions, task IDs). Reports pass/fail with specific stale or missing references. Does not modify the briefing.",
+      "files": []
+    }
+  ]
+}

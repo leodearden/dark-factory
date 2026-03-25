@@ -34,16 +34,25 @@ Multiple flags can combine: `/review --scope fused-memory --phase integration`.
 
 Check for `review/briefing.yaml` (or the path from orchestrator config's `review.briefing_path`).
 
-**If it exists:** parse it. Extract the sections relevant to the current scope:
-- If `--scope X`: load only `subprojects.X`
-- If `--focused mod1 mod2`: load subproject sections whose `root` or `critical_paths[].key_modules` overlap with the specified modules
+**If it exists:** parse it. The briefing contains durable project context — purpose, key scenarios, conventions, key decisions, known gaps, and exclusions — not code details (you discover those fresh from the code).
+
+Extract the sections relevant to the current scope:
+- If `--scope X`: load only `subprojects.X` (plus top-level `conventions`)
+- If `--focused mod1 mod2`: load subproject sections whose purpose or key_scenarios relate to the specified modules
 - If no scope: load everything
 
-Keep the briefing data in working memory — you'll reference smoke tests, critical paths, invariants, and known gaps throughout all three phases.
+Keep the briefing data in working memory. Use it to:
+- **Prioritise** — `key_scenarios` tells you what to trace; focus review effort there
+- **Contextualise** — `key_decisions` explains choices that might otherwise look wrong
+- **Construct verification** — `what_working_means` tells you the intent; you build the actual test commands from the code
+- **Avoid false positives** — `known_gaps` are intentional; don't flag them. `conventions` are rules with teeth; DO flag violations
+- **Scope** — `exclude` patterns are areas to skip
+
+**Staleness check:** After loading the briefing, check its `last_updated` timestamp against recent git activity. Run `git log --oneline --since="<last_updated>" | wc -l` to count commits since the briefing was updated. If more than 20 commits have landed, warn the user: "Briefing was last updated {date} — {N} commits have landed since then. The briefing captures intent (not code details) so it's still useful, but known_gaps or conventions may have evolved. Consider running `/review-briefing --diff` after this review." Proceed regardless — a slightly stale briefing is much better than none.
 
 **If it doesn't exist:**
 1. Tell the user: "No review briefing found at `review/briefing.yaml`. Review effectiveness will be limited without one — consider running `/review-briefing` first. Proceeding with best-effort review using code inspection and project memory."
-2. Continue without briefing data. Skip smoke tests (Phase 1 step 3) and critical path tracing (Phase 2 step 2) — these require briefing input. Everything else works.
+2. Continue without briefing data. You can still run tests, lint, typecheck, and do architectural analysis — but you won't have prioritisation guidance, known-gap context, or convention rules. Everything is best-effort.
 
 ### 2. Load project context from memory
 
