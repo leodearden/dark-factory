@@ -482,8 +482,7 @@ class TestRunCleanupEnvVarRestore:
                 mock_mgr.cleanup = AsyncMock(return_value=mock_result)
                 mock_mgr_cls.return_value = mock_mgr
 
-                with contextlib.suppress(RuntimeError):
-                    await run_cleanup(config_path='test.yaml')
+                await run_cleanup(config_path='test.yaml')
 
             # CONFIG_PATH must be restored regardless of close() raising
             assert os.environ.get('CONFIG_PATH') == original
