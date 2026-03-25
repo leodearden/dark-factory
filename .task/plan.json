@@ -1,115 +1,61 @@
 {
-  "task_id": "149",
-  "title": "Polish task 145: consolidate EdgeWithNoneEpisodes, add provenance assertions and docstring",
+  "task_id": "152",
+  "title": "Add integration test for None-episodes edge through search path",
   "files": [
-    "fused-memory/tests/conftest.py",
-    "fused-memory/tests/test_memory_service.py",
-    "fused-memory/src/fused_memory/services/memory_service.py"
+    "fused-memory/tests/test_memory_service.py"
   ],
   "modules": [
-    "fused-memory/tests",
-    "fused-memory/src/fused_memory/services"
+    "fused-memory/tests"
   ],
-  "analysis": "Four small, independent polish items from the task 145 review. All surgical, low-risk changes.\n\n1. **EdgeWithNoneEpisodes → conftest.py** (test_memory_service.py:962-968): The inline class at line 962 contradicts the fixture-consolidation pattern established by task 145 (which moved EdgeWithoutUuid to conftest.py). The conftest pattern uses @dataclass with typed fields and defaults. Tests import locally via `from tests.conftest import ...`. The new dataclass needs `episodes: list[str] | None = None` to model the 'attribute present but None' case.\n\n2. **Docstring gap for provenance** (memory_service.py:769-827): _build_edge_dict documents uuid (lines 780-786) and temporal (lines 788-795) key semantics but omits provenance, despite the comment at line 816 saying 'see docstring'. The docstring's Key semantics section should be extended with a provenance entry, and the inline comment should be made self-contained.\n\n3. **Missing provenance assertion in unit test** (test_memory_service.py:865-870): test_edge_with_no_uuid_attr_returns_none uses EdgeWithoutUuid which has `episodes: list[str] = field(default_factory=list)`, producing `provenance == []`. Test only asserts `d['uuid'] is None`. Adding `assert d['provenance'] == []` catches regressions in the episodes→provenance mapping.\n\n4. **Missing provenance assertion in search integration test** (test_memory_service.py:478-496): test_none_uuid_edge_falls_back_to_index_in_search also uses EdgeWithoutUuid. MemoryResult has a `provenance: list[str]` field (models/memory.py:35). Test asserts `results[0].id == '0'` but should also verify `results[0].provenance == []`.\n\nAll items are additive (new assertions, docstring additions, fixture consolidation). TDD approach: write new assertions first (they pass immediately since behavior already exists), then do the refactoring (move class, update docstring).",
+  "analysis": "EdgeWithNoneEpisodes (conftest.py:58) simulates a Graphiti edge where episodes=None (attribute present but set to None). It has a unit test in TestBuildEdgeDict (line 961: test_none_episodes_attr_produces_empty_provenance) that calls _build_edge_dict directly. However, it lacks an integration test through the search() path. Its counterpart EdgeWithoutUuid has both a unit test (test_edge_with_no_uuid_attr_returns_none at line 870) and an integration test (test_none_uuid_edge_falls_back_to_index_in_search at line 478). The new test should mirror the pattern at line 478: mock graphiti.search to return [EdgeWithNoneEpisodes()], mock mem0.search to return empty, call service.search(), and assert results[0].provenance == []. The test goes at the end of TestSearch (after line 499, before the blank line at 501). Since EdgeWithNoneEpisodes has uuid='u-ep-none', the id assertion should check for that uuid (unlike EdgeWithoutUuid which falls back to index '0'). No implementation changes needed \u2014 _build_edge_dict already handles episodes=None correctly as proven by the unit test. The conftest fixture was already consolidated from inline to conftest.py by task 149.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Add provenance assertion to test_edge_with_no_uuid_attr_returns_none (test_memory_service.py:870). After the existing `assert d['uuid'] is None`, add: `assert d['provenance'] == [], f\"provenance should be [] when edge has empty episodes, got {d['provenance']!r}\"`. This should pass immediately — EdgeWithoutUuid has episodes=[] which _build_edge_dict maps to provenance=[].",
+      "description": "Add async integration test test_none_episodes_edge_produces_empty_provenance_in_search to TestSearch class in test_memory_service.py, inserted after test_none_uuid_edge_falls_back_to_index_in_search (after line 499, before the blank line at 501). The test: (1) imports EdgeWithNoneEpisodes from tests.conftest, (2) mocks service.graphiti.search = AsyncMock(return_value=[EdgeWithNoneEpisodes()]), (3) mocks service.mem0.search = AsyncMock(return_value={'results': []}), (4) calls results = await service.search(query='test', project_id='test'), (5) asserts len(results) == 1, (6) asserts results[0].id == 'u-ep-none' with descriptive f-string message, (7) asserts results[0].provenance == [] with descriptive f-string message. Docstring: 'An edge with episodes=None (attribute present but None) produces empty provenance in search results. Covers the full search() \u2192 _search_graphiti \u2192 _build_edge_dict pipeline with None episodes, complementing the unit test test_none_episodes_attr_produces_empty_provenance which only tests the helper in isolation.'",
       "status": "done",
-      "commit": "83fefba"
+      "commit": "83a9421"
     },
     {
       "id": "step-2",
-      "type": "test",
-      "description": "Add provenance assertion to test_none_uuid_edge_falls_back_to_index_in_search (test_memory_service.py:~496). After the existing `assert results[0].id == '0'` block, add: `assert results[0].provenance == [], f\"provenance should be [] when edge has empty episodes, got {results[0].provenance!r}\"`. This should pass immediately — the MemoryResult constructed from EdgeWithoutUuid carries provenance=[].",
-      "status": "done",
-      "commit": "83fefba"
-    },
-    {
-      "id": "step-3",
       "type": "impl",
-      "description": "Run both modified tests (test_edge_with_no_uuid_attr_returns_none and test_none_uuid_edge_falls_back_to_index_in_search) to verify the new assertions pass against existing code. No code changes — this validates the assertions are correct.",
+      "description": "Run the new test to verify it passes (no implementation change expected \u2014 _build_edge_dict already handles episodes=None). Run: pytest fused-memory/tests/test_memory_service.py::TestSearch::test_none_episodes_edge_produces_empty_provenance_in_search -v. If it fails, investigate the search path for a bug in provenance propagation and fix it.",
       "status": "done",
-      "commit": "83fefba"
-    },
-    {
-      "id": "step-4",
-      "type": "impl",
-      "description": "Add EdgeWithNoneEpisodes dataclass to conftest.py. Place it after EdgeWithoutUuid (after line 54). Fields: uuid: str = 'u-ep-none', fact: str = 'fact with none episodes', name: str | None = None, source_node: MockNode | None = None, target_node: MockNode | None = None, episodes: list[str] | None = None, valid_at: str | None = None, invalid_at: str | None = None. Docstring: 'Simulates a Graphiti edge where the episodes attribute is present but None. Tests the is-not-None semantic: None episodes must produce empty provenance, same as a missing episodes attribute.'",
-      "status": "done",
-      "commit": "016806e"
-    },
-    {
-      "id": "step-5",
-      "type": "impl",
-      "description": "Replace inline EdgeWithNoneEpisodes class in test_none_episodes_attr_produces_empty_provenance (test_memory_service.py:962-968) with an import: `from tests.conftest import EdgeWithNoneEpisodes`. Remove the 7-line inline class definition. Update `service._build_edge_dict(EdgeWithNoneEpisodes())` call — no change needed since dataclass defaults match the inline class exactly.",
-      "status": "done",
-      "commit": "016806e"
-    },
-    {
-      "id": "step-6",
-      "type": "test",
-      "description": "Run test_none_episodes_attr_produces_empty_provenance to confirm the refactored import from conftest works identically to the inline class.",
-      "status": "done",
-      "commit": "016806e"
-    },
-    {
-      "id": "step-7",
-      "type": "impl",
-      "description": "Update _build_edge_dict docstring (memory_service.py:769) to add provenance to the Key semantics section. After the ``temporal`` entry (line 795), add:\n\n``provenance``:\n    Empty list ``[]`` when the edge object lacks an ``episodes`` attribute\n    (``getattr(e, 'episodes', None)`` returns its default ``None``) or when\n    ``episodes is None`` (attribute present but explicitly ``None``).\n    When ``episodes`` is a non-``None`` iterable, each element is stringified\n    via ``str()``.  The ``is not None`` policy matches ``uuid`` and ``temporal``\n    — truthiness is deliberately avoided so that an empty list ``[]`` remains\n    a valid (if degenerate) input.\n\nAlso update the inline comment at line 816 to be self-contained: replace 'matches uuid/temporal pattern (see docstring)' with 'getattr default is None; None treated as absent → empty list (same is-not-None policy as uuid/temporal)'.",
-      "status": "done",
-      "commit": "6e00777"
-    },
-    {
-      "id": "step-8",
-      "type": "test",
-      "description": "Run the full TestBuildEdgeDict and TestSearch test classes to confirm all existing and new tests pass with all changes applied. This is the final validation that all four polish items are correct.",
-      "status": "done",
-      "commit": "6e00777"
+      "commit": "83a9421"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Write new assertions (steps 1-2) before refactoring (steps 4-5)",
-      "rationale": "TDD discipline: establish the new assertions as a safety net first, verify they pass against existing code, then do the structural refactoring. If the fixture move breaks the provenance mapping, the new assertions catch it."
+      "decision": "Place test at end of TestSearch class, immediately after test_none_uuid_edge_falls_back_to_index_in_search",
+      "rationale": "Groups related edge-case search tests together. The None-episodes test is a natural companion to the None-uuid test, both covering edge attribute edge cases through the full search path."
     },
     {
-      "decision": "EdgeWithNoneEpisodes uses typed field `episodes: list[str] | None = None` rather than bare `episodes = None`",
-      "rationale": "Matches the typed dataclass pattern in conftest.py (EdgeWithoutUuid, MockEdge). The union type explicitly documents that None is a valid value distinct from an empty list, which is the whole point of this fixture."
+      "decision": "Assert id == 'u-ep-none' (not fallback index '0')",
+      "rationale": "Unlike EdgeWithoutUuid which lacks a uuid attribute entirely and falls back to str(index), EdgeWithNoneEpisodes has uuid='u-ep-none'. The search path should use this uuid as the result id."
     },
     {
-      "decision": "Both extend the docstring AND make the inline comment self-contained",
-      "rationale": "The task offers option (a) or (b). Doing both is superior: the docstring should be complete (all three is-not-None fields documented uniformly), and the inline comment should be independently understandable without cross-referencing. The task description itself suggests this by listing both options."
-    },
-    {
-      "decision": "Keep EdgeWithNoneEpisodes default field values identical to the inline class",
-      "rationale": "uuid='u-ep-none', fact='fact with none episodes', etc. Preserving exact values means the test body needs zero changes beyond the import swap, minimizing risk."
+      "decision": "No implementation changes expected \u2014 test-only task",
+      "rationale": "The unit test already proves _build_edge_dict handles episodes=None. The integration test is purely for coverage of the full search() \u2192 _search_graphiti \u2192 _build_edge_dict pipeline with this edge case. Step 2 is a verification-only step."
     }
   ],
   "reuse": [
     {
-      "what": "EdgeWithoutUuid dataclass pattern in conftest.py",
-      "where": "fused-memory/tests/conftest.py:40-54",
-      "how": "EdgeWithNoneEpisodes follows the exact same structure: @dataclass, same field types as MockEdge with specific defaults to test a particular edge case. Place immediately after EdgeWithoutUuid."
+      "what": "EdgeWithNoneEpisodes fixture",
+      "where": "fused-memory/tests/conftest.py:58",
+      "how": "Import from tests.conftest and instantiate with defaults \u2014 same pattern used by the unit test at line 967"
     },
     {
-      "what": "Local import pattern for conftest fixtures",
-      "where": "test_memory_service.py:867, 487, 464, 984",
-      "how": "Tests import conftest fixtures locally with `from tests.conftest import X`. EdgeWithNoneEpisodes uses the same pattern."
+      "what": "test_none_uuid_edge_falls_back_to_index_in_search pattern",
+      "where": "fused-memory/tests/test_memory_service.py:478-499",
+      "how": "Mirror the exact test structure: mock graphiti.search with the edge fixture, mock mem0.search with empty results, call service.search(), assert on result fields with descriptive f-string messages"
     },
     {
-      "what": "Assertion message pattern with f-string and repr",
-      "where": "test_memory_service.py:870, 494-495, 951-953, 973-974",
-      "how": "All assertions use descriptive f-string messages with {value!r}. New provenance assertions follow this convention exactly."
-    },
-    {
-      "what": "Docstring Key semantics format in _build_edge_dict",
-      "where": "memory_service.py:778-795",
-      "how": "uuid and temporal entries use backtick-quoted key names, double-backtick code references, indented paragraphs explaining None vs empty-string semantics. The provenance entry mirrors this exact format."
+      "what": "service fixture with mocked backends",
+      "where": "fused-memory/tests/test_memory_service.py:12-39",
+      "how": "Use the existing service fixture \u2014 it already mocks graphiti and mem0 with AsyncMock. Override graphiti.search and mem0.search in the test body (same pattern as line 489-490)"
     }
   ],
-  "_session_id": "149-c55c6f30",
-  "_created_at": "2026-03-24T23:37:18.030374+00:00"
+  "_session_id": "152-da01523c",
+  "_created_at": "2026-03-25T01:02:07.466392+00:00"
 }
