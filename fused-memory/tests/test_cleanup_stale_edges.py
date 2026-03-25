@@ -1,7 +1,6 @@
 """Tests for cleanup_stale_edges maintenance: GraphitiBackend time-range queries and CleanupManager."""
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
 from unittest.mock import AsyncMock, MagicMock, patch

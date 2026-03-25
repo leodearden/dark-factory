@@ -2,7 +2,6 @@
 ZombieEdgeVerifier, and run_verify_zombie_edges entrypoint."""
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
