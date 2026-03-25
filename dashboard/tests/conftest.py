@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
+import aiosqlite
 import pytest
 from starlette.testclient import TestClient
 
@@ -305,3 +306,19 @@ def empty_reconciliation_db(tmp_path):
 def missing_db_path(tmp_path):
     """Return a path to a non-existent database file."""
     return tmp_path / 'nonexistent' / 'reconciliation.db'
+
+
+@pytest.fixture()
+async def recon_conn(reconciliation_db):
+    """Open an aiosqlite connection to the populated reconciliation DB."""
+    async with aiosqlite.connect(str(reconciliation_db)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
+
+
+@pytest.fixture()
+async def empty_recon_conn(empty_reconciliation_db):
+    """Open an aiosqlite connection to the empty reconciliation DB."""
+    async with aiosqlite.connect(str(empty_reconciliation_db)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn

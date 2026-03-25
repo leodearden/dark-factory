@@ -6,6 +6,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
+import aiosqlite
 import pytest
 
 from dashboard.data.performance import (
@@ -151,6 +152,20 @@ def empty_runs_db(tmp_path):
 
 
 @pytest.fixture()
+async def runs_conn(runs_db):
+    async with aiosqlite.connect(str(runs_db)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
+
+
+@pytest.fixture()
+async def empty_runs_conn(empty_runs_db):
+    async with aiosqlite.connect(str(empty_runs_db)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
+
+
+@pytest.fixture()
 def escalations_dir(tmp_path):
     """Escalation directory with sample files including a level-1 for task 106."""
     esc_dir = tmp_path / 'escalations'
@@ -198,8 +213,8 @@ def empty_escalations_dir(tmp_path):
 
 class TestCompletionPaths:
     @pytest.mark.asyncio
-    async def test_populated(self, runs_db, escalations_dir):
-        result = await get_completion_paths(runs_db, escalations_dir)
+    async def test_populated(self, runs_conn, escalations_dir):
+        result = await get_completion_paths(runs_conn, escalations_dir)
         assert 'dark_factory' in result
 
         paths = {p['path']: p for p in result['dark_factory']}
@@ -210,27 +225,26 @@ class TestCompletionPaths:
         assert paths['blocked']['count'] == 1
 
     @pytest.mark.asyncio
-    async def test_multi_project(self, runs_db, escalations_dir):
-        result = await get_completion_paths(runs_db, escalations_dir)
+    async def test_multi_project(self, runs_conn, escalations_dir):
+        result = await get_completion_paths(runs_conn, escalations_dir)
         assert 'reify' in result
         paths = {p['path']: p for p in result['reify']}
         assert paths['one-pass']['count'] == 1
         assert paths['multi-pass']['count'] == 1
 
     @pytest.mark.asyncio
-    async def test_empty_db(self, empty_runs_db, empty_escalations_dir):
-        result = await get_completion_paths(empty_runs_db, empty_escalations_dir)
+    async def test_empty_db(self, empty_runs_conn, empty_escalations_dir):
+        result = await get_completion_paths(empty_runs_conn, empty_escalations_dir)
         assert result == {}
 
     @pytest.mark.asyncio
     async def test_missing_db(self, tmp_path, empty_escalations_dir):
-        missing = tmp_path / 'nonexistent.db'
-        result = await get_completion_paths(missing, empty_escalations_dir)
+        result = await get_completion_paths(None, empty_escalations_dir)
         assert result == {}
 
     @pytest.mark.asyncio
-    async def test_percentages_sum(self, runs_db, escalations_dir):
-        result = await get_completion_paths(runs_db, escalations_dir)
+    async def test_percentages_sum(self, runs_conn, escalations_dir):
+        result = await get_completion_paths(runs_conn, escalations_dir)
         for _project_id, paths in result.items():
             total_pct = sum(p['pct'] for p in paths)
             assert abs(total_pct - 100.0) < 1.0  # within rounding
@@ -242,8 +256,8 @@ class TestCompletionPaths:
 
 class TestEscalationRates:
     @pytest.mark.asyncio
-    async def test_populated(self, runs_db, escalations_dir):
-        result = await get_escalation_rates(runs_db, escalations_dir)
+    async def test_populated(self, runs_conn, escalations_dir):
+        result = await get_escalation_rates(runs_conn, escalations_dir)
         df = result['dark_factory']
         assert df['total_tasks'] == 6
         assert df['steward_count'] == 1  # task 104
@@ -252,16 +266,16 @@ class TestEscalationRates:
         assert df['interactive_rate'] == pytest.approx(16.7, abs=0.1)
 
     @pytest.mark.asyncio
-    async def test_human_attention(self, runs_db, escalations_dir):
-        result = await get_escalation_rates(runs_db, escalations_dir)
+    async def test_human_attention(self, runs_conn, escalations_dir):
+        result = await get_escalation_rates(runs_conn, escalations_dir)
         attention = result['dark_factory']['human_attention']
         assert attention['significant'] == 1  # task 106: 3 turns >= 3
         assert attention['minimal'] == 0
         assert attention['zero'] == 0
 
     @pytest.mark.asyncio
-    async def test_empty(self, empty_runs_db, empty_escalations_dir):
-        result = await get_escalation_rates(empty_runs_db, empty_escalations_dir)
+    async def test_empty(self, empty_runs_conn, empty_escalations_dir):
+        result = await get_escalation_rates(empty_runs_conn, empty_escalations_dir)
         assert result == {}
 
 
@@ -271,8 +285,8 @@ class TestEscalationRates:
 
 class TestLoopHistograms:
     @pytest.mark.asyncio
-    async def test_populated(self, runs_db):
-        result = await get_loop_histograms(runs_db)
+    async def test_populated(self, runs_conn):
+        result = await get_loop_histograms(runs_conn)
         df = result['dark_factory']
 
         # Outer loop (review_cycles): tasks 101(0), 102(0), 103(2), 104(1), 106(0)
@@ -288,16 +302,16 @@ class TestLoopHistograms:
         assert inner['values'] == [1, 2, 1, 1, 0, 0]
 
     @pytest.mark.asyncio
-    async def test_reify_project(self, runs_db):
-        result = await get_loop_histograms(runs_db)
+    async def test_reify_project(self, runs_conn):
+        result = await get_loop_histograms(runs_conn)
         reify = result['reify']
         # task 201: rc=0, va=0; task 202: rc=1, va=1
         assert reify['outer']['values'] == [1, 1, 0, 0]
         assert reify['inner']['values'] == [1, 1, 0, 0, 0, 0]
 
     @pytest.mark.asyncio
-    async def test_empty(self, empty_runs_db):
-        result = await get_loop_histograms(empty_runs_db)
+    async def test_empty(self, empty_runs_conn):
+        result = await get_loop_histograms(empty_runs_conn)
         assert result == {}
 
 
@@ -307,8 +321,8 @@ class TestLoopHistograms:
 
 class TestTimeCentiles:
     @pytest.mark.asyncio
-    async def test_populated(self, runs_db):
-        result = await get_time_centiles(runs_db)
+    async def test_populated(self, runs_conn):
+        result = await get_time_centiles(runs_conn)
         df = result['dark_factory']
         # 5 done tasks: 200k, 300k, 450k, 600k, 900k ms
         assert df['count'] == 5
@@ -331,18 +345,19 @@ class TestTimeCentiles:
         conn.commit()
         conn.close()
 
-        result = await get_time_centiles(db_path)
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_time_centiles(aconn)
         assert result['proj']['p50'] == 42_000
         assert result['proj']['p95'] == 42_000
         assert result['proj']['count'] == 1
 
     @pytest.mark.asyncio
-    async def test_empty(self, empty_runs_db):
-        result = await get_time_centiles(empty_runs_db)
+    async def test_empty(self, empty_runs_conn):
+        result = await get_time_centiles(empty_runs_conn)
         assert result == {}
 
     @pytest.mark.asyncio
     async def test_missing_db(self, tmp_path):
-        missing = tmp_path / 'nope.db'
-        result = await get_time_centiles(missing)
+        result = await get_time_centiles(None)
         assert result == {}

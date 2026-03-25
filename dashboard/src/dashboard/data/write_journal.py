@@ -9,14 +9,13 @@ from __future__ import annotations
 import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import aiosqlite
 
 logger = logging.getLogger(__name__)
 
 
-async def get_memory_timeseries(db_path: Path, *, hours: int = 24) -> dict:
+async def get_memory_timeseries(db: aiosqlite.Connection | None, *, hours: int = 24) -> dict:
     """Hourly read/write counts for the last *hours* hours.
 
     Returns ``{labels: ["HH:00", ...], reads: [int, ...], writes: [int, ...]}``.
@@ -32,25 +31,22 @@ async def get_memory_timeseries(db_path: Path, *, hours: int = 24) -> dict:
         key = dt.strftime('%Y-%m-%dT%H:00')
         buckets[key] = {'read': 0, 'write': 0}
 
-    try:
-        async with (
-            aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db,
-            db.execute(
+    if db is not None:
+        try:
+            async with db.execute(
                 "SELECT strftime('%Y-%m-%dT%H:00', created_at) AS hour,"
                 ' kind, COUNT(*) AS cnt'
                 ' FROM write_ops WHERE created_at >= ?'
                 ' GROUP BY hour, kind',
                 (since.isoformat(),),
-            ) as cursor,
-        ):
-            rows = await cursor.fetchall()
-    except (FileNotFoundError, sqlite3.OperationalError):
-        logger.debug('get_memory_timeseries: DB unavailable at %s', db_path)
-        rows = []
+            ) as cursor:
+                rows = await cursor.fetchall()
 
-    for hour, kind, cnt in rows:
-        if hour in buckets and kind in ('read', 'write'):
-            buckets[hour][kind] = cnt
+            for hour, kind, cnt in rows:
+                if hour in buckets and kind in ('read', 'write'):
+                    buckets[hour][kind] = cnt
+        except sqlite3.OperationalError:
+            logger.debug('get_memory_timeseries: query failed', exc_info=True)
 
     sorted_keys = sorted(buckets)
     return {
@@ -60,24 +56,24 @@ async def get_memory_timeseries(db_path: Path, *, hours: int = 24) -> dict:
     }
 
 
-async def get_operations_breakdown(db_path: Path, *, hours: int = 24) -> dict:
+async def get_operations_breakdown(db: aiosqlite.Connection | None, *, hours: int = 24) -> dict:
     """Operation type distribution for the last *hours* hours.
 
     Returns ``{labels: [str, ...], values: [int, ...]}``.
     """
+    if db is None:
+        return {'labels': [], 'values': []}
+
     since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
     try:
-        async with (
-            aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db,
-            db.execute(
-                'SELECT operation, COUNT(*) AS cnt FROM write_ops'
-                ' WHERE created_at >= ? GROUP BY operation ORDER BY cnt DESC',
-                (since,),
-            ) as cursor,
-        ):
+        async with db.execute(
+            'SELECT operation, COUNT(*) AS cnt FROM write_ops'
+            ' WHERE created_at >= ? GROUP BY operation ORDER BY cnt DESC',
+            (since,),
+        ) as cursor:
             rows = await cursor.fetchall()
-    except (FileNotFoundError, sqlite3.OperationalError):
-        logger.debug('get_operations_breakdown: DB unavailable at %s', db_path)
+    except sqlite3.OperationalError:
+        logger.debug('get_operations_breakdown: query failed', exc_info=True)
         return {'labels': [], 'values': []}
 
     return {
@@ -86,25 +82,25 @@ async def get_operations_breakdown(db_path: Path, *, hours: int = 24) -> dict:
     }
 
 
-async def get_agent_breakdown(db_path: Path, *, hours: int = 24) -> dict:
+async def get_agent_breakdown(db: aiosqlite.Connection | None, *, hours: int = 24) -> dict:
     """Agent distribution for the last *hours* hours.
 
     Returns ``{labels: [str, ...], values: [int, ...]}``.
     """
+    if db is None:
+        return {'labels': [], 'values': []}
+
     since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
     try:
-        async with (
-            aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db,
-            db.execute(
-                "SELECT COALESCE(agent_id, 'unknown') AS agent, COUNT(*) AS cnt"
-                ' FROM write_ops WHERE created_at >= ?'
-                ' GROUP BY agent ORDER BY cnt DESC',
-                (since,),
-            ) as cursor,
-        ):
+        async with db.execute(
+            "SELECT COALESCE(agent_id, 'unknown') AS agent, COUNT(*) AS cnt"
+            ' FROM write_ops WHERE created_at >= ?'
+            ' GROUP BY agent ORDER BY cnt DESC',
+            (since,),
+        ) as cursor:
             rows = await cursor.fetchall()
-    except (FileNotFoundError, sqlite3.OperationalError):
-        logger.debug('get_agent_breakdown: DB unavailable at %s', db_path)
+    except sqlite3.OperationalError:
+        logger.debug('get_agent_breakdown: query failed', exc_info=True)
         return {'labels': [], 'values': []}
 
     return {

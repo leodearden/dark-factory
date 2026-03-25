@@ -1,57 +1,33 @@
 """Async SQLite queries for reconciliation metrics.
 
-Each function accepts a db_path, opens the database read-only via URI mode,
-and returns structured data. Missing database files return empty defaults.
+Each function accepts an optional ``aiosqlite.Connection`` (from the shared
+:class:`DbPool`) and returns structured data.  A ``None`` connection is
+treated as "database unavailable" and returns the declared default.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import sqlite3
-from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import TypeVar
 
 import aiosqlite
 
+from dashboard.data.db import with_db
+
 logger = logging.getLogger(__name__)
-
-_T = TypeVar('_T')
-
-
-async def _with_readonly_db(
-    db_path: Path,
-    fn: Callable[[aiosqlite.Connection], Awaitable[_T]],
-    default: _T,
-    *,
-    caller: str,
-) -> _T:
-    """Open db_path read-only, run fn(db), and return the result.
-
-    On FileNotFoundError or sqlite3.OperationalError, logs at DEBUG and
-    returns *default* instead.
-    """
-    try:
-        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
-            return await fn(db)
-    except (FileNotFoundError, sqlite3.OperationalError):
-        logger.debug('%s: DB unavailable at %s', caller, db_path, exc_info=True)
-        return default
 
 # Default burst cooldown matches EventBuffer.burst_cooldown_seconds
 _DEFAULT_BURST_COOLDOWN = 150
 
 
-async def get_recent_runs(db_path: Path, *, limit: int = 50) -> list[dict]:
+async def get_recent_runs(db: aiosqlite.Connection | None, *, limit: int = 50) -> list[dict]:
     """Return recent reconciliation runs ordered by started_at DESC.
 
     Each dict contains: id, project_id, run_type, trigger_reason, started_at,
     completed_at, events_processed, status, duration_seconds, journal_entry_count.
     """
     async def _query(db: aiosqlite.Connection) -> list[dict]:
-        db.row_factory = aiosqlite.Row
         async with db.execute(
             'SELECT r.id, r.project_id, r.run_type, r.trigger_reason,'
             ' r.started_at, r.completed_at, r.events_processed, r.status,'
@@ -86,17 +62,16 @@ async def get_recent_runs(db_path: Path, *, limit: int = 50) -> list[dict]:
             )
         return results
 
-    return await _with_readonly_db(db_path, _query, [], caller='get_recent_runs')
+    return await with_db(db, _query, [])
 
 
-async def get_journal_entries(db_path: Path, run_id: str) -> list[dict]:
+async def get_journal_entries(db: aiosqlite.Connection | None, run_id: str) -> list[dict]:
     """Return journal entries for a specific run, ordered by timestamp.
 
     Each dict contains: id, stage, timestamp, operation, target_system,
     before_state, after_state, reasoning, evidence.
     """
     async def _query(db: aiosqlite.Connection) -> list[dict]:
-        db.row_factory = aiosqlite.Row
         async with db.execute(
             'SELECT id, stage, timestamp, operation, target_system,'
             ' before_state, after_state, reasoning, evidence'
@@ -139,17 +114,16 @@ async def get_journal_entries(db_path: Path, run_id: str) -> list[dict]:
             })
         return results
 
-    return await _with_readonly_db(db_path, _query, [], caller='get_journal_entries')
+    return await with_db(db, _query, [])
 
 
-async def get_watermarks(db_path: Path) -> list[dict]:
+async def get_watermarks(db: aiosqlite.Connection | None) -> list[dict]:
     """Return watermark timestamps for all projects.
 
     Each dict contains: project_id, last_full_run_completed, last_episode_timestamp,
     last_memory_timestamp, last_task_change_timestamp.  Returns [] if none found.
     """
     async def _query(db: aiosqlite.Connection) -> list[dict]:
-        db.row_factory = aiosqlite.Row
         async with db.execute(
             'SELECT project_id, last_full_run_completed, last_episode_timestamp,'
             ' last_memory_timestamp, last_task_change_timestamp'
@@ -167,16 +141,15 @@ async def get_watermarks(db_path: Path) -> list[dict]:
             for row in rows
         ]
 
-    return await _with_readonly_db(db_path, _query, [], caller='get_watermarks')
+    return await with_db(db, _query, [])
 
 
-async def get_last_attempted_run(db_path: Path) -> dict[str, dict]:
+async def get_last_attempted_run(db: aiosqlite.Connection | None) -> dict[str, dict]:
     """Return the most recent run per project, regardless of status.
 
-    Returns a dict keyed by project_id → {id, status, started_at, completed_at}.
+    Returns a dict keyed by project_id -> {id, status, started_at, completed_at}.
     """
     async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
-        db.row_factory = aiosqlite.Row
         async with db.execute(
             'SELECT r.id, r.project_id, r.status, r.started_at, r.completed_at'
             ' FROM runs r'
@@ -195,13 +168,13 @@ async def get_last_attempted_run(db_path: Path) -> dict[str, dict]:
             for row in rows
         }
 
-    return await _with_readonly_db(db_path, _query, {}, caller='get_last_attempted_run')
+    return await with_db(db, _query, {})
 
 
 _BUFFER_STATS_DEFAULT = {'buffered_count': 0, 'oldest_event_age_seconds': None}
 
 
-async def get_buffer_stats(db_path: Path) -> dict:
+async def get_buffer_stats(db: aiosqlite.Connection | None) -> dict:
     """Return event buffer statistics: count and oldest event age.
 
     Returns dict with buffered_count (int) and oldest_event_age_seconds (float|None).
@@ -228,13 +201,11 @@ async def get_buffer_stats(db_path: Path) -> dict:
 
         return {'buffered_count': count, 'oldest_event_age_seconds': age}
 
-    return await _with_readonly_db(
-        db_path, _query, dict(_BUFFER_STATS_DEFAULT), caller='get_buffer_stats'
-    )
+    return await with_db(db, _query, dict(_BUFFER_STATS_DEFAULT))
 
 
 async def get_burst_state(
-    db_path: Path, *, burst_cooldown_seconds: int = _DEFAULT_BURST_COOLDOWN,
+    db: aiosqlite.Connection | None, *, burst_cooldown_seconds: int = _DEFAULT_BURST_COOLDOWN,
 ) -> list[dict]:
     """Return current burst state for all agents with cooldown applied.
 
@@ -246,7 +217,6 @@ async def get_burst_state(
     Each dict contains: agent_id, state, last_write_at, burst_started_at.
     """
     async def _query(db: aiosqlite.Connection) -> list[dict]:
-        db.row_factory = aiosqlite.Row
         async with db.execute(
             'SELECT agent_id, state, last_write_at, burst_started_at'
             ' FROM burst_state'
@@ -281,16 +251,15 @@ async def get_burst_state(
             })
         return results
 
-    return await _with_readonly_db(db_path, _query, [], caller='get_burst_state')
+    return await with_db(db, _query, [])
 
 
-async def get_latest_verdict(db_path: Path) -> dict | None:
+async def get_latest_verdict(db: aiosqlite.Connection | None) -> dict | None:
     """Return the most recent judge verdict, or None if none exist.
 
     Returns dict with: run_id, severity, action_taken, reviewed_at.
     """
     async def _query(db: aiosqlite.Connection) -> dict | None:
-        db.row_factory = aiosqlite.Row
         async with db.execute(
             'SELECT run_id, severity, action_taken, reviewed_at'
             ' FROM judge_verdicts ORDER BY reviewed_at DESC LIMIT 1',
@@ -305,4 +274,4 @@ async def get_latest_verdict(db_path: Path) -> dict | None:
             'reviewed_at': row['reviewed_at'],
         }
 
-    return await _with_readonly_db(db_path, _query, None, caller='get_latest_verdict')
+    return await with_db(db, _query, None)

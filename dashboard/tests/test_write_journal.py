@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
+import aiosqlite
 import pytest
 
 WRITE_OPS_SCHEMA = """
@@ -76,55 +77,69 @@ def empty_journal_db(tmp_path):
     return db_path
 
 
+@pytest.fixture()
+async def journal_conn(journal_db):
+    async with aiosqlite.connect(str(journal_db)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
+
+
+@pytest.fixture()
+async def empty_journal_conn(empty_journal_db):
+    async with aiosqlite.connect(str(empty_journal_db)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
+
+
 class TestGetMemoryTimeseries:
     @pytest.mark.asyncio
-    async def test_returns_24_buckets(self, journal_db):
+    async def test_returns_24_buckets(self, journal_conn):
         from dashboard.data.write_journal import get_memory_timeseries
 
-        result = await get_memory_timeseries(journal_db)
+        result = await get_memory_timeseries(journal_conn)
         assert len(result['labels']) == 24
         assert len(result['reads']) == 24
         assert len(result['writes']) == 24
 
     @pytest.mark.asyncio
-    async def test_labels_are_hhmm_format(self, journal_db):
+    async def test_labels_are_hhmm_format(self, journal_conn):
         from dashboard.data.write_journal import get_memory_timeseries
 
-        result = await get_memory_timeseries(journal_db)
+        result = await get_memory_timeseries(journal_conn)
         for label in result['labels']:
             assert len(label) == 5
             assert label[2] == ':'
 
     @pytest.mark.asyncio
-    async def test_excludes_old_data(self, journal_db):
+    async def test_excludes_old_data(self, journal_conn):
         from dashboard.data.write_journal import get_memory_timeseries
 
-        result = await get_memory_timeseries(journal_db)
+        result = await get_memory_timeseries(journal_conn)
         # op-7 is >24h old — total reads should be 3, not 4
         assert sum(result['reads']) == 3
 
     @pytest.mark.asyncio
-    async def test_counts_reads_and_writes(self, journal_db):
+    async def test_counts_reads_and_writes(self, journal_conn):
         from dashboard.data.write_journal import get_memory_timeseries
 
-        result = await get_memory_timeseries(journal_db)
+        result = await get_memory_timeseries(journal_conn)
         assert sum(result['reads']) == 3
         assert sum(result['writes']) == 3
 
     @pytest.mark.asyncio
-    async def test_empty_db_returns_zeros(self, empty_journal_db):
+    async def test_empty_db_returns_zeros(self, empty_journal_conn):
         from dashboard.data.write_journal import get_memory_timeseries
 
-        result = await get_memory_timeseries(empty_journal_db)
+        result = await get_memory_timeseries(empty_journal_conn)
         assert sum(result['reads']) == 0
         assert sum(result['writes']) == 0
         assert len(result['labels']) == 24
 
     @pytest.mark.asyncio
-    async def test_missing_db_returns_zeros(self, tmp_path):
+    async def test_missing_db_returns_zeros(self):
         from dashboard.data.write_journal import get_memory_timeseries
 
-        result = await get_memory_timeseries(tmp_path / 'nonexistent.db')
+        result = await get_memory_timeseries(None)
         assert len(result['labels']) == 24
         assert sum(result['reads']) == 0
         assert sum(result['writes']) == 0
@@ -132,73 +147,73 @@ class TestGetMemoryTimeseries:
 
 class TestGetOperationsBreakdown:
     @pytest.mark.asyncio
-    async def test_returns_all_operations(self, journal_db):
+    async def test_returns_all_operations(self, journal_conn):
         from dashboard.data.write_journal import get_operations_breakdown
 
-        result = await get_operations_breakdown(journal_db)
+        result = await get_operations_breakdown(journal_conn)
         assert set(result['labels']) == {'search', 'get_entity', 'add_memory', 'delete_memory'}
 
     @pytest.mark.asyncio
-    async def test_sorted_by_count_desc(self, journal_db):
+    async def test_sorted_by_count_desc(self, journal_conn):
         from dashboard.data.write_journal import get_operations_breakdown
 
-        result = await get_operations_breakdown(journal_db)
+        result = await get_operations_breakdown(journal_conn)
         assert result['values'] == sorted(result['values'], reverse=True)
 
     @pytest.mark.asyncio
-    async def test_excludes_old_data(self, journal_db):
+    async def test_excludes_old_data(self, journal_conn):
         from dashboard.data.write_journal import get_operations_breakdown
 
-        result = await get_operations_breakdown(journal_db)
+        result = await get_operations_breakdown(journal_conn)
         assert sum(result['values']) == 6  # not 7
 
     @pytest.mark.asyncio
-    async def test_empty_db(self, empty_journal_db):
+    async def test_empty_db(self, empty_journal_conn):
         from dashboard.data.write_journal import get_operations_breakdown
 
-        result = await get_operations_breakdown(empty_journal_db)
+        result = await get_operations_breakdown(empty_journal_conn)
         assert result == {'labels': [], 'values': []}
 
     @pytest.mark.asyncio
-    async def test_missing_db(self, tmp_path):
+    async def test_missing_db(self):
         from dashboard.data.write_journal import get_operations_breakdown
 
-        result = await get_operations_breakdown(tmp_path / 'nonexistent.db')
+        result = await get_operations_breakdown(None)
         assert result == {'labels': [], 'values': []}
 
 
 class TestGetAgentBreakdown:
     @pytest.mark.asyncio
-    async def test_returns_all_agents(self, journal_db):
+    async def test_returns_all_agents(self, journal_conn):
         from dashboard.data.write_journal import get_agent_breakdown
 
-        result = await get_agent_breakdown(journal_db)
+        result = await get_agent_breakdown(journal_conn)
         assert set(result['labels']) == {'claude-interactive', 'recon-stage-consolidator'}
 
     @pytest.mark.asyncio
-    async def test_sorted_by_count_desc(self, journal_db):
+    async def test_sorted_by_count_desc(self, journal_conn):
         from dashboard.data.write_journal import get_agent_breakdown
 
-        result = await get_agent_breakdown(journal_db)
+        result = await get_agent_breakdown(journal_conn)
         assert result['values'] == sorted(result['values'], reverse=True)
 
     @pytest.mark.asyncio
-    async def test_excludes_old_data(self, journal_db):
+    async def test_excludes_old_data(self, journal_conn):
         from dashboard.data.write_journal import get_agent_breakdown
 
-        result = await get_agent_breakdown(journal_db)
+        result = await get_agent_breakdown(journal_conn)
         assert sum(result['values']) == 6
 
     @pytest.mark.asyncio
-    async def test_empty_db(self, empty_journal_db):
+    async def test_empty_db(self, empty_journal_conn):
         from dashboard.data.write_journal import get_agent_breakdown
 
-        result = await get_agent_breakdown(empty_journal_db)
+        result = await get_agent_breakdown(empty_journal_conn)
         assert result == {'labels': [], 'values': []}
 
     @pytest.mark.asyncio
-    async def test_missing_db(self, tmp_path):
+    async def test_missing_db(self):
         from dashboard.data.write_journal import get_agent_breakdown
 
-        result = await get_agent_breakdown(tmp_path / 'nonexistent.db')
+        result = await get_agent_breakdown(None)
         assert result == {'labels': [], 'values': []}

@@ -10,33 +10,14 @@ from __future__ import annotations
 import json
 import logging
 import math
-import sqlite3
 from collections import defaultdict
-from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TypeVar
 
 import aiosqlite
 
+from dashboard.data.db import with_db
+
 logger = logging.getLogger(__name__)
-
-_T = TypeVar('_T')
-
-
-async def _with_readonly_db(
-    db_path: Path,
-    fn: Callable[[aiosqlite.Connection], Awaitable[_T]],
-    default: _T,
-    *,
-    caller: str,
-) -> _T:
-    """Open db_path read-only, run fn(db), and return the result."""
-    try:
-        async with aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True) as db:
-            return await fn(db)
-    except (FileNotFoundError, sqlite3.OperationalError):
-        logger.debug('%s: DB unavailable at %s', caller, db_path, exc_info=True)
-        return default
 
 
 def _load_escalations(escalations_dir: Path) -> list[dict]:
@@ -92,7 +73,7 @@ async def _project_cutoffs(
 # ---------------------------------------------------------------------------
 
 async def get_completion_paths(
-    db_path: Path,
+    db: aiosqlite.Connection | None,
     escalations_dir: Path,
     *,
     days: int = 7,
@@ -160,7 +141,7 @@ async def get_completion_paths(
 
         return result
 
-    return await _with_readonly_db(db_path, _query, {}, caller='get_completion_paths')
+    return await with_db(db, _query, {})
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +149,7 @@ async def get_completion_paths(
 # ---------------------------------------------------------------------------
 
 async def get_escalation_rates(
-    db_path: Path,
+    db: aiosqlite.Connection | None,
     escalations_dir: Path,
     *,
     days: int = 7,
@@ -247,7 +228,7 @@ async def get_escalation_rates(
 
         return result
 
-    return await _with_readonly_db(db_path, _query, {}, caller='get_escalation_rates')
+    return await with_db(db, _query, {})
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +236,7 @@ async def get_escalation_rates(
 # ---------------------------------------------------------------------------
 
 async def get_loop_histograms(
-    db_path: Path,
+    db: aiosqlite.Connection | None,
     *,
     days: int = 7,
 ) -> dict[str, dict]:
@@ -305,7 +286,7 @@ async def get_loop_histograms(
 
         return result
 
-    return await _with_readonly_db(db_path, _query, {}, caller='get_loop_histograms')
+    return await with_db(db, _query, {})
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +294,7 @@ async def get_loop_histograms(
 # ---------------------------------------------------------------------------
 
 async def get_time_centiles(
-    db_path: Path,
+    db: aiosqlite.Connection | None,
     *,
     days: int = 7,
 ) -> dict[str, dict]:
@@ -355,4 +336,4 @@ async def get_time_centiles(
 
         return result
 
-    return await _with_readonly_db(db_path, _query, {}, caller='get_time_centiles')
+    return await with_db(db, _query, {})

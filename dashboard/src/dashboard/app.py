@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
+from dashboard.data.db import DbPool
 from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.performance import (
     get_completion_paths,
@@ -75,12 +79,12 @@ def format_trigger(value: str | None) -> str:
     """Format a trigger_reason string for human-friendly display.
 
     Examples:
-        None          → ''
-        'manual'      → 'manual'
-        'quiescent:6' → 'quiescent (6)'
-        'buffer_size:10' → 'buffer (10)'
-        'max_staleness:<ISO>' → 'staleness (<relative>)'
-        'foo:bar'     → 'foo (bar)'
+        None          -> ''
+        'manual'      -> 'manual'
+        'quiescent:6' -> 'quiescent (6)'
+        'buffer_size:10' -> 'buffer (10)'
+        'max_staleness:<ISO>' -> 'staleness (<relative>)'
+        'foo:bar'     -> 'foo (bar)'
     """
     if value is None:
         return ''
@@ -115,10 +119,13 @@ templates.env.filters['format_duration_ms'] = format_duration_ms
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage httpx.AsyncClient lifecycle."""
+    """Manage shared resources: HTTP client, DB connection pool."""
     app.state.http_client = httpx.AsyncClient(follow_redirects=True)
     app.state.config = DashboardConfig.from_env()
+    app.state.db = DbPool()
+    app.state.start_time = time.monotonic()
     yield
+    await app.state.db.close_all()
     await app.state.http_client.aclose()
 
 
@@ -136,6 +143,56 @@ async def health():
     return {'status': 'ok'}
 
 
+_THREAD_LIMIT = 50
+_DB_PROBE_TIMEOUT = 5.0
+
+
+@app.get('/healthz')
+async def healthz(request: Request):
+    """Deep health check — detects thread leaks and unresponsive DB connections."""
+    checks: dict = {}
+    healthy = True
+
+    # 1. Thread count
+    thread_count = threading.active_count()
+    threads_ok = thread_count < _THREAD_LIMIT
+    checks['threads'] = {'count': thread_count, 'limit': _THREAD_LIMIT, 'ok': threads_ok}
+    if not threads_ok:
+        healthy = False
+
+    # 2. DB connectivity probe
+    pool: DbPool = request.app.state.db
+    config: DashboardConfig = request.app.state.config
+    checks['connections'] = {'open': pool.open_count}
+
+    for name, db_path in [
+        ('reconciliation', config.reconciliation_db),
+        ('write_journal', config.write_journal_db),
+        ('runs', config.runs_db),
+    ]:
+        conn = await pool.get(db_path)
+        if conn is None:
+            checks[f'db_{name}'] = 'unavailable'
+            continue
+        try:
+            async with conn.execute('SELECT 1') as cursor:
+                row = await asyncio.wait_for(cursor.fetchone(), timeout=_DB_PROBE_TIMEOUT)
+            checks[f'db_{name}'] = 'ok' if row is not None else 'failed'
+            if row is None:
+                healthy = False
+        except Exception:
+            checks[f'db_{name}'] = 'timeout'
+            healthy = False
+
+    # 3. Uptime
+    checks['uptime_seconds'] = round(time.monotonic() - request.app.state.start_time, 1)
+
+    return JSONResponse(
+        content={'status': 'healthy' if healthy else 'degraded', 'checks': checks},
+        status_code=200 if healthy else 503,
+    )
+
+
 @app.get('/partials/memory')
 async def memory_partial(request: Request):
     http_client = request.app.state.http_client
@@ -151,7 +208,8 @@ async def memory_partial(request: Request):
 async def memory_graphs_partial(request: Request):
     """Render the memory graphs partial (htmx fragment)."""
     config = request.app.state.config
-    db = config.write_journal_db
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.write_journal_db)
     timeseries, operations, agents = await asyncio.gather(
         get_memory_timeseries(db),
         get_operations_breakdown(db),
@@ -171,7 +229,8 @@ async def memory_graphs_partial(request: Request):
 async def partials_recon(request: Request):
     """Render the reconciliation panel partial (htmx fragment)."""
     config = request.app.state.config
-    db = config.reconciliation_db
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.reconciliation_db)
 
     buffer_stats, burst_state, watermarks_list, verdict, runs, last_attempted_map = (
         await asyncio.gather(
@@ -217,7 +276,9 @@ async def partials_recon(request: Request):
 async def partials_recon_run_detail(request: Request, run_id: str):
     """Render journal entries for a specific reconciliation run (htmx fragment)."""
     config = request.app.state.config
-    entries = await get_journal_entries(config.reconciliation_db, run_id)
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.reconciliation_db)
+    entries = await get_journal_entries(db, run_id)
     return templates.TemplateResponse(
         request, 'partials/recon_run_detail.html',
         context={'entries': entries},
@@ -238,7 +299,8 @@ async def partials_orchestrators(request: Request):
 async def partials_performance(request: Request):
     """Render the performance panel partial (htmx fragment)."""
     config = request.app.state.config
-    db = config.runs_db
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
     esc_dir = config.escalations_dir
 
     paths, escalations, histograms, ttc = await asyncio.gather(

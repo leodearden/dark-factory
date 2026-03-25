@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import logging
 
+import aiosqlite
 import pytest
 
 
 class TestGetRecentRuns:
     """Tests for get_recent_runs."""
 
-    async def test_happy_path_returns_runs_ordered_desc(self, reconciliation_db):
+    async def test_happy_path_returns_runs_ordered_desc(self, recon_conn):
         """Returns list of run dicts ordered by started_at DESC with correct fields."""
         from dashboard.data.reconciliation import get_recent_runs
 
-        runs = await get_recent_runs(reconciliation_db)
+        runs = await get_recent_runs(recon_conn)
 
         assert len(runs) == 2
         # Most recent first (run-002 started 10min ago, run-001 started 2h ago)
@@ -38,55 +39,55 @@ class TestGetRecentRuns:
             assert set(run.keys()) == expected_fields
         assert runs[0]['project_id'] == 'dark_factory'
 
-    async def test_journal_entry_count(self, reconciliation_db):
+    async def test_journal_entry_count(self, recon_conn):
         """Runs include journal_entry_count from correlated subquery."""
         from dashboard.data.reconciliation import get_recent_runs
 
-        runs = await get_recent_runs(reconciliation_db)
+        runs = await get_recent_runs(recon_conn)
         by_id = {r['id']: r for r in runs}
         # run-001 has 2 journal entries in fixture, run-002 has 0
         assert by_id['run-001']['journal_entry_count'] == 2
         assert by_id['run-002']['journal_entry_count'] == 0
 
-    async def test_completed_run_has_duration(self, reconciliation_db):
+    async def test_completed_run_has_duration(self, recon_conn):
         """Completed runs should have duration_seconds calculated."""
         from dashboard.data.reconciliation import get_recent_runs
 
-        runs = await get_recent_runs(reconciliation_db)
+        runs = await get_recent_runs(recon_conn)
         completed = [r for r in runs if r['status'] == 'completed'][0]
         assert completed['duration_seconds'] is not None
         # Completed run lasted 5 minutes = 300 seconds
         assert completed['duration_seconds'] == pytest.approx(300.0, abs=1.0)
 
-    async def test_running_run_has_no_duration(self, reconciliation_db):
+    async def test_running_run_has_no_duration(self, recon_conn):
         """Running (incomplete) runs should have duration_seconds=None."""
         from dashboard.data.reconciliation import get_recent_runs
 
-        runs = await get_recent_runs(reconciliation_db)
+        runs = await get_recent_runs(recon_conn)
         running = [r for r in runs if r['status'] == 'running'][0]
         assert running['duration_seconds'] is None
         assert running['completed_at'] is None
 
-    async def test_respects_limit(self, reconciliation_db):
+    async def test_respects_limit(self, recon_conn):
         """Limit parameter restricts number of results."""
         from dashboard.data.reconciliation import get_recent_runs
 
-        runs = await get_recent_runs(reconciliation_db, limit=1)
+        runs = await get_recent_runs(recon_conn, limit=1)
         assert len(runs) == 1
         assert runs[0]['id'] == 'run-002'  # Most recent
 
-    async def test_empty_table(self, empty_reconciliation_db):
+    async def test_empty_table(self, empty_recon_conn):
         """Returns empty list when runs table has no data."""
         from dashboard.data.reconciliation import get_recent_runs
 
-        runs = await get_recent_runs(empty_reconciliation_db)
+        runs = await get_recent_runs(empty_recon_conn)
         assert runs == []
 
-    async def test_missing_db_file(self, missing_db_path):
-        """Returns empty list when database file does not exist."""
+    async def test_missing_db_file(self):
+        """Returns empty list when database connection is None."""
         from dashboard.data.reconciliation import get_recent_runs
 
-        runs = await get_recent_runs(missing_db_path)
+        runs = await get_recent_runs(None)
         assert runs == []
 
 
@@ -94,11 +95,11 @@ class TestGetRecentRuns:
 class TestGetWatermarks:
     """Tests for get_watermarks."""
 
-    async def test_happy_path_returns_watermark_list(self, reconciliation_db):
+    async def test_happy_path_returns_watermark_list(self, recon_conn):
         """Returns list of dicts with watermark fields for all projects."""
         from dashboard.data.reconciliation import get_watermarks
 
-        result = await get_watermarks(reconciliation_db)
+        result = await get_watermarks(recon_conn)
 
         assert isinstance(result, list)
         assert len(result) == 1  # fixture only inserts dark_factory
@@ -116,18 +117,18 @@ class TestGetWatermarks:
         for key in expected_keys - {'project_id'}:
             assert wm[key] is not None
 
-    async def test_empty_table(self, empty_reconciliation_db):
+    async def test_empty_table(self, empty_recon_conn):
         """Returns empty list when watermarks table has no data."""
         from dashboard.data.reconciliation import get_watermarks
 
-        result = await get_watermarks(empty_reconciliation_db)
+        result = await get_watermarks(empty_recon_conn)
         assert result == []
 
-    async def test_missing_db_file(self, missing_db_path):
-        """Returns empty list when database file does not exist."""
+    async def test_missing_db_file(self):
+        """Returns empty list when database connection is None."""
         from dashboard.data.reconciliation import get_watermarks
 
-        result = await get_watermarks(missing_db_path)
+        result = await get_watermarks(None)
         assert result == []
 
     async def test_multiple_projects(self, tmp_path):
@@ -151,7 +152,9 @@ class TestGetWatermarks:
         conn.commit()
         conn.close()
 
-        result = await get_watermarks(db_path)
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await get_watermarks(db)
         assert len(result) == 2
         assert result[0]['project_id'] == 'alpha'
         assert result[1]['project_id'] == 'beta'
@@ -160,11 +163,11 @@ class TestGetWatermarks:
 class TestGetLastAttemptedRun:
     """Tests for get_last_attempted_run."""
 
-    async def test_happy_path_returns_per_project_dict(self, reconciliation_db):
+    async def test_happy_path_returns_per_project_dict(self, recon_conn):
         """Returns dict keyed by project_id with most recent run per project."""
         from dashboard.data.reconciliation import get_last_attempted_run
 
-        result = await get_last_attempted_run(reconciliation_db)
+        result = await get_last_attempted_run(recon_conn)
 
         assert isinstance(result, dict)
         assert 'dark_factory' in result
@@ -191,7 +194,9 @@ class TestGetLastAttemptedRun:
         conn.commit()
         conn.close()
 
-        result = await get_last_attempted_run(db_path)
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await get_last_attempted_run(db)
         assert 'dark_factory' in result
         assert result['dark_factory']['status'] == 'failed'
 
@@ -226,34 +231,36 @@ class TestGetLastAttemptedRun:
         conn.commit()
         conn.close()
 
-        result = await get_last_attempted_run(db_path)
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await get_last_attempted_run(db)
         assert len(result) == 2
         assert result['alpha']['id'] == 'a2'  # most recent for alpha
         assert result['beta']['id'] == 'b1'
 
-    async def test_empty_table(self, empty_reconciliation_db):
+    async def test_empty_table(self, empty_recon_conn):
         """Returns empty dict when runs table has no data."""
         from dashboard.data.reconciliation import get_last_attempted_run
 
-        result = await get_last_attempted_run(empty_reconciliation_db)
+        result = await get_last_attempted_run(empty_recon_conn)
         assert result == {}
 
-    async def test_missing_db_file(self, missing_db_path):
-        """Returns empty dict when database file does not exist."""
+    async def test_missing_db_file(self):
+        """Returns empty dict when database connection is None."""
         from dashboard.data.reconciliation import get_last_attempted_run
 
-        result = await get_last_attempted_run(missing_db_path)
+        result = await get_last_attempted_run(None)
         assert result == {}
 
 
 class TestGetBufferStats:
     """Tests for get_buffer_stats."""
 
-    async def test_happy_path_returns_count_and_age(self, reconciliation_db):
+    async def test_happy_path_returns_count_and_age(self, recon_conn):
         """Returns dict with buffered_count and oldest_event_age_seconds."""
         from dashboard.data.reconciliation import get_buffer_stats
 
-        result = await get_buffer_stats(reconciliation_db)
+        result = await get_buffer_stats(recon_conn)
 
         assert isinstance(result, dict)
         assert set(result.keys()) == {'buffered_count', 'oldest_event_age_seconds'}
@@ -263,19 +270,19 @@ class TestGetBufferStats:
         assert result['oldest_event_age_seconds'] is not None
         assert result['oldest_event_age_seconds'] >= 3500  # at least ~58 min
 
-    async def test_empty_table(self, empty_reconciliation_db):
+    async def test_empty_table(self, empty_recon_conn):
         """Returns zero count and None age when no buffered events."""
         from dashboard.data.reconciliation import get_buffer_stats
 
-        result = await get_buffer_stats(empty_reconciliation_db)
+        result = await get_buffer_stats(empty_recon_conn)
 
         assert result == {'buffered_count': 0, 'oldest_event_age_seconds': None}
 
-    async def test_missing_db_file(self, missing_db_path):
-        """Returns default dict when database file does not exist."""
+    async def test_missing_db_file(self):
+        """Returns default dict when database connection is None."""
         from dashboard.data.reconciliation import get_buffer_stats
 
-        result = await get_buffer_stats(missing_db_path)
+        result = await get_buffer_stats(None)
 
         assert result == {'buffered_count': 0, 'oldest_event_age_seconds': None}
 
@@ -283,11 +290,11 @@ class TestGetBufferStats:
 class TestGetBurstState:
     """Tests for get_burst_state."""
 
-    async def test_happy_path_returns_burst_state_list(self, reconciliation_db):
+    async def test_happy_path_returns_burst_state_list(self, recon_conn):
         """Returns list of dicts with correct fields for all agents."""
         from dashboard.data.reconciliation import get_burst_state
 
-        result = await get_burst_state(reconciliation_db)
+        result = await get_burst_state(recon_conn)
 
         assert isinstance(result, list)
         assert len(result) == 2
@@ -325,7 +332,9 @@ class TestGetBurstState:
         conn.commit()
         conn.close()
 
-        result = await get_burst_state(db_path)
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await get_burst_state(db)
         assert len(result) == 1
         assert result[0]['state'] == 'idle'
         assert result[0]['burst_started_at'] is None
@@ -352,34 +361,36 @@ class TestGetBurstState:
         conn.commit()
         conn.close()
 
-        result = await get_burst_state(db_path)
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await get_burst_state(db)
         assert len(result) == 1
         assert result[0]['state'] == 'bursting'
         assert result[0]['burst_started_at'] is not None
 
-    async def test_empty_table(self, empty_reconciliation_db):
+    async def test_empty_table(self, empty_recon_conn):
         """Returns empty list when burst_state table has no data."""
         from dashboard.data.reconciliation import get_burst_state
 
-        result = await get_burst_state(empty_reconciliation_db)
+        result = await get_burst_state(empty_recon_conn)
         assert result == []
 
-    async def test_missing_db_file(self, missing_db_path):
-        """Returns empty list when database file does not exist."""
+    async def test_missing_db_file(self):
+        """Returns empty list when database connection is None."""
         from dashboard.data.reconciliation import get_burst_state
 
-        result = await get_burst_state(missing_db_path)
+        result = await get_burst_state(None)
         assert result == []
 
 
 class TestGetLatestVerdict:
     """Tests for get_latest_verdict."""
 
-    async def test_happy_path_returns_verdict_dict(self, reconciliation_db):
+    async def test_happy_path_returns_verdict_dict(self, recon_conn):
         """Returns dict with verdict fields for the most recent verdict."""
         from dashboard.data.reconciliation import get_latest_verdict
 
-        result = await get_latest_verdict(reconciliation_db)
+        result = await get_latest_verdict(recon_conn)
 
         assert result is not None
         assert isinstance(result, dict)
@@ -389,65 +400,61 @@ class TestGetLatestVerdict:
         assert result['severity'] == 'low'
         assert result['action_taken'] == 'logged'
 
-    async def test_empty_table(self, empty_reconciliation_db):
+    async def test_empty_table(self, empty_recon_conn):
         """Returns None when judge_verdicts table has no data."""
         from dashboard.data.reconciliation import get_latest_verdict
 
-        result = await get_latest_verdict(empty_reconciliation_db)
+        result = await get_latest_verdict(empty_recon_conn)
         assert result is None
 
-    async def test_missing_db_file(self, missing_db_path):
-        """Returns None when database file does not exist."""
+    async def test_missing_db_file(self):
+        """Returns None when database connection is None."""
         from dashboard.data.reconciliation import get_latest_verdict
 
-        result = await get_latest_verdict(missing_db_path)
+        result = await get_latest_verdict(None)
         assert result is None
 
 
 class TestExceptionLogging:
-    """Tests that reconciliation functions emit DEBUG-level logs on DB unavailability."""
+    """Tests that with_db emits DEBUG-level logs on DB unavailability."""
 
-    async def test_missing_db_logs_debug(self, missing_db_path, caplog):
-        """get_recent_runs with a missing DB path emits a DEBUG log."""
+    async def test_missing_db_returns_default(self):
+        """get_recent_runs with None connection returns default."""
         from dashboard.data.reconciliation import get_recent_runs
 
-        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
-            result = await get_recent_runs(missing_db_path)
+        result = await get_recent_runs(None)
 
         assert result == []
-        assert any(
-            r.levelno == logging.DEBUG and 'dashboard.data.reconciliation' in r.name
-            for r in caplog.records
-        ), f'Expected DEBUG log from dashboard.data.reconciliation, got: {caplog.records}'
 
     async def test_operational_error_logs_debug(self, tmp_path, caplog):
-        """get_watermarks with an empty (no-tables) DB file emits a DEBUG log on OperationalError."""
+        """with_db emits a DEBUG log on OperationalError (no-table DB)."""
         from dashboard.data.reconciliation import get_watermarks
 
         # Create a valid SQLite file but with no tables — causes OperationalError
         db_path = tmp_path / 'empty.db'
         import sqlite3
-        conn = sqlite3.connect(str(db_path))
-        conn.close()
+        sqlite3.connect(str(db_path)).close()
 
-        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
-            result = await get_watermarks(db_path)
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            with caplog.at_level(logging.DEBUG, logger='dashboard.data.db'):
+                result = await get_watermarks(db)
 
         assert result == []
         assert any(
-            r.levelno == logging.DEBUG and 'dashboard.data.reconciliation' in r.name
+            r.levelno == logging.DEBUG and 'dashboard.data.db' in r.name
             for r in caplog.records
-        ), f'Expected DEBUG log from dashboard.data.reconciliation, got: {caplog.records}'
+        ), f'Expected DEBUG log from dashboard.data.db, got: {caplog.records}'
 
 
 class TestGetJournalEntries:
     """Tests for get_journal_entries."""
 
-    async def test_happy_path_returns_entries(self, reconciliation_db):
+    async def test_happy_path_returns_entries(self, recon_conn):
         """Returns list of journal entry dicts for a given run_id."""
         from dashboard.data.reconciliation import get_journal_entries
 
-        entries = await get_journal_entries(reconciliation_db, 'run-001')
+        entries = await get_journal_entries(recon_conn, 'run-001')
 
         assert len(entries) == 2
         expected_fields = {
@@ -462,72 +469,72 @@ class TestGetJournalEntries:
         assert entries[0]['operation'] == 'consolidate'
         assert entries[0]['target_system'] == 'mem0'
 
-    async def test_json_fields_parsed(self, reconciliation_db):
+    async def test_json_fields_parsed(self, recon_conn):
         """JSON fields (before_state, after_state, evidence) are parsed."""
         from dashboard.data.reconciliation import get_journal_entries
 
-        entries = await get_journal_entries(reconciliation_db, 'run-001')
+        entries = await get_journal_entries(recon_conn, 'run-001')
 
         assert entries[0]['before_state'] == {'count': 5}
         assert entries[0]['after_state'] == {'count': 3}
         assert entries[0]['evidence'] == [{'source': 'mem0', 'id': 'm-1'}]
 
-    async def test_null_json_fields(self, reconciliation_db):
+    async def test_null_json_fields(self, recon_conn):
         """NULL JSON fields return None/empty defaults."""
         from dashboard.data.reconciliation import get_journal_entries
 
-        entries = await get_journal_entries(reconciliation_db, 'run-001')
+        entries = await get_journal_entries(recon_conn, 'run-001')
 
         # je-002 has NULL before_state
         assert entries[1]['before_state'] is None
         assert entries[1]['after_state'] == {'entities': 2}
         assert entries[1]['evidence'] == []
 
-    async def test_empty_result_for_unknown_run(self, reconciliation_db):
+    async def test_empty_result_for_unknown_run(self, recon_conn):
         """Returns empty list for a run_id with no entries."""
         from dashboard.data.reconciliation import get_journal_entries
 
-        entries = await get_journal_entries(reconciliation_db, 'nonexistent-run')
+        entries = await get_journal_entries(recon_conn, 'nonexistent-run')
         assert entries == []
 
-    async def test_missing_db_file(self, missing_db_path):
-        """Returns empty list when database file does not exist."""
+    async def test_missing_db_file(self):
+        """Returns empty list when database connection is None."""
         from dashboard.data.reconciliation import get_journal_entries
 
-        entries = await get_journal_entries(missing_db_path, 'run-001')
+        entries = await get_journal_entries(None, 'run-001')
         assert entries == []
 
 
-class TestWithReadonlyDb:
-    """Unit tests for the _with_readonly_db helper function."""
+class TestWithDb:
+    """Unit tests for the with_db helper function."""
 
-    async def test_returns_callback_result_on_success(self, reconciliation_db):
+    async def test_returns_callback_result_on_success(self, recon_conn):
         """Helper returns the value returned by the callback on success."""
-        from dashboard.data.reconciliation import _with_readonly_db
+        from dashboard.data.db import with_db
 
         async def _fn(db):
             async with db.execute('SELECT 1') as cur:
                 row = await cur.fetchone()
             return row[0]
 
-        result = await _with_readonly_db(reconciliation_db, _fn, default=99, caller='test')
+        result = await with_db(recon_conn, _fn, default=99)
         assert result == 1
 
-    async def test_returns_default_on_file_not_found(self, missing_db_path):
-        """Helper returns the default value when the DB file does not exist."""
-        from dashboard.data.reconciliation import _with_readonly_db
+    async def test_returns_default_on_none_connection(self):
+        """Helper returns the default value when the connection is None."""
+        from dashboard.data.db import with_db
 
         async def _fn(db):
             return 'should not reach here'
 
-        result = await _with_readonly_db(missing_db_path, _fn, default=[], caller='test')
+        result = await with_db(None, _fn, default=[])
         assert result == []
 
     async def test_returns_default_on_operational_error(self, tmp_path):
         """Helper returns the default value on sqlite3.OperationalError (no-table DB)."""
         import sqlite3 as _sqlite3
 
-        from dashboard.data.reconciliation import _with_readonly_db
+        from dashboard.data.db import with_db
 
         # Valid SQLite file but with no tables — querying any table raises OperationalError
         db_path = tmp_path / 'notables.db'
@@ -537,39 +544,33 @@ class TestWithReadonlyDb:
             async with db.execute('SELECT * FROM nonexistent_table') as cur:
                 return await cur.fetchall()
 
-        result = await _with_readonly_db(db_path, _fn, default={}, caller='test')
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await with_db(db, _fn, default={})
         assert result == {}
 
-    async def test_emits_debug_log_with_caller_on_file_not_found(
-        self, missing_db_path, caplog
-    ):
-        """Helper emits a DEBUG log containing the caller name on FileNotFoundError."""
-        from dashboard.data.reconciliation import _with_readonly_db
+    async def test_returns_default_on_none_logs_nothing(self, caplog):
+        """Helper returns default for None connection without logging."""
+        from dashboard.data.db import with_db
 
         async def _fn(db):
             return 'noop'
 
-        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
-            await _with_readonly_db(
-                missing_db_path, _fn, default=None, caller='my_caller_fn'
-            )
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.db'):
+            await with_db(None, _fn, default=None)
 
-        debug_records = [
+        # None connection is a fast path — no log expected
+        db_records = [
             r for r in caplog.records
-            if r.levelno == logging.DEBUG and 'dashboard.data.reconciliation' in r.name
+            if 'dashboard.data.db' in r.name
         ]
-        assert debug_records, f'Expected DEBUG log, got: {caplog.records}'
-        assert any('my_caller_fn' in r.message for r in debug_records), (
-            f'Expected caller name in message, got: {[r.message for r in debug_records]}'
-        )
+        assert not db_records, f'Expected no logs for None path, got: {db_records}'
 
-    async def test_emits_debug_log_with_caller_on_operational_error(
-        self, tmp_path, caplog
-    ):
-        """Helper emits a DEBUG log containing the caller name on OperationalError."""
+    async def test_emits_debug_log_on_operational_error(self, tmp_path, caplog):
+        """Helper emits a DEBUG log on OperationalError."""
         import sqlite3 as _sqlite3
 
-        from dashboard.data.reconciliation import _with_readonly_db
+        from dashboard.data.db import with_db
 
         db_path = tmp_path / 'notables2.db'
         _sqlite3.connect(str(db_path)).close()
@@ -578,14 +579,13 @@ class TestWithReadonlyDb:
             async with db.execute('SELECT * FROM missing_table') as cur:
                 return await cur.fetchall()
 
-        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
-            await _with_readonly_db(db_path, _fn, default=None, caller='another_fn')
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            with caplog.at_level(logging.DEBUG, logger='dashboard.data.db'):
+                await with_db(db, _fn, default=None)
 
         debug_records = [
             r for r in caplog.records
-            if r.levelno == logging.DEBUG and 'dashboard.data.reconciliation' in r.name
+            if r.levelno == logging.DEBUG and 'dashboard.data.db' in r.name
         ]
         assert debug_records, f'Expected DEBUG log, got: {caplog.records}'
-        assert any('another_fn' in r.message for r in debug_records), (
-            f'Expected caller name in message, got: {[r.message for r in debug_records]}'
-        )
