@@ -1054,6 +1054,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 )
                 self.escalation_queue.submit(esc)
 
+            # Give the steward a chance to resolve the escalation
+            await self._ensure_steward_started()
+            if self._steward:
+                await self._await_steward_completion()
+
+                # If steward resolved all level-0 escalations, set task back
+                # to pending so the scheduler re-picks it on the next cycle.
+                remaining = self.escalation_queue.get_by_task(
+                    self.task_id, status='pending', level=0,
+                )
+                if not remaining:
+                    await self.scheduler.set_task_status(self.task_id, 'pending')
+                    logger.info(
+                        f'Task {self.task_id}: steward resolved blocking '
+                        f'escalation, reset to pending for re-scheduling'
+                    )
+                    return WorkflowOutcome.REQUEUED
+
         return WorkflowOutcome.BLOCKED
 
     async def _write_completion_to_memory(self) -> None:
