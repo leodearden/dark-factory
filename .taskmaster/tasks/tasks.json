@@ -2448,6 +2448,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 156,
+        "title": "Fix: targeted.py project_root fallback silently uses project_id as path",
+        "description": "In fused-memory/src/fused_memory/reconciliation/targeted.py:86-87, reconcile_task() falls back to using project_id (a logical name like 'dark_factory') as project_root (should be an absolute path like '/home/leo/src/dark-factory'). This violates the convention 'Task project_root must be an absolute path — empty/relative/None is rejected'.\n\nCurrently a dead code path (callers always pass project_root after MCP validation), but the fallback behavior is incorrect and could cause task tree corruption if ever triggered.\n\nFix: Replace the silent fallback with a ValueError, matching the validation pattern used in server/tools.py _validate_project_root().\n\nSource: review-cycle 2026-03-25, finding DR-4.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -2460,7 +2471,7 @@
       ],
       "created": "2026-03-25T22:15:02.383Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-25T22:15:08.633Z"
+      "updated": "2026-03-25T22:15:13.965Z"
     }
   }
 }
