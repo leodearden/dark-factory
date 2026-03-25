@@ -96,3 +96,4 @@ class TestSafeClose:
 
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert not warning_records, f'Expected no warnings on success, got: {warning_records}'
+        service.close.assert_awaited_once()

@@ -32,13 +32,13 @@
       "type": "test",
       "description": "Strengthen test_does_not_raise_when_close_raises: After the `await _safe_close(service, logger, 'test_context')` call (current line 32), add `service.close.assert_awaited_once()` to verify close was actually attempted, not just that no exception propagated. Verify the test passes.",
       "status": "done",
-      "commit": null
+      "commit": "03227de"
     },
     {
       "id": "step-3",
       "type": "test",
       "description": "Strengthen test_noop_when_close_succeeds_no_warning: After the caplog context manager block and the existing warning_records assertion, add `service.close.assert_awaited_once()` to verify close was actually called, not just that no warnings were emitted. Verify the test passes.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
