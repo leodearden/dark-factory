@@ -1,115 +1,126 @@
 {
-  "task_id": "149",
-  "title": "Polish task 145: consolidate EdgeWithNoneEpisodes, add provenance assertions and docstring",
+  "task_id": "151",
+  "title": "Maintenance test quality: remove dead suppress, add missing reindex tests, fix imports",
   "files": [
-    "fused-memory/tests/conftest.py",
-    "fused-memory/tests/test_memory_service.py",
-    "fused-memory/src/fused_memory/services/memory_service.py"
+    "fused-memory/tests/test_cleanup_stale_edges.py",
+    "fused-memory/tests/test_verify_zombie_edges.py",
+    "fused-memory/tests/test_reindex.py"
   ],
   "modules": [
-    "fused-memory/tests",
-    "fused-memory/src/fused_memory/services"
+    "fused-memory/tests"
   ],
-  "analysis": "Four small, independent polish items from the task 145 review. All surgical, low-risk changes.\n\n1. **EdgeWithNoneEpisodes → conftest.py** (test_memory_service.py:962-968): The inline class at line 962 contradicts the fixture-consolidation pattern established by task 145 (which moved EdgeWithoutUuid to conftest.py). The conftest pattern uses @dataclass with typed fields and defaults. Tests import locally via `from tests.conftest import ...`. The new dataclass needs `episodes: list[str] | None = None` to model the 'attribute present but None' case.\n\n2. **Docstring gap for provenance** (memory_service.py:769-827): _build_edge_dict documents uuid (lines 780-786) and temporal (lines 788-795) key semantics but omits provenance, despite the comment at line 816 saying 'see docstring'. The docstring's Key semantics section should be extended with a provenance entry, and the inline comment should be made self-contained.\n\n3. **Missing provenance assertion in unit test** (test_memory_service.py:865-870): test_edge_with_no_uuid_attr_returns_none uses EdgeWithoutUuid which has `episodes: list[str] = field(default_factory=list)`, producing `provenance == []`. Test only asserts `d['uuid'] is None`. Adding `assert d['provenance'] == []` catches regressions in the episodes→provenance mapping.\n\n4. **Missing provenance assertion in search integration test** (test_memory_service.py:478-496): test_none_uuid_edge_falls_back_to_index_in_search also uses EdgeWithoutUuid. MemoryResult has a `provenance: list[str]` field (models/memory.py:35). Test asserts `results[0].id == '0'` but should also verify `results[0].provenance == []`.\n\nAll items are additive (new assertions, docstring additions, fixture consolidation). TDD approach: write new assertions first (they pass immediately since behavior already exists), then do the refactoring (move class, update docstring).",
+  "analysis": "Three test quality issues across the maintenance test suite need cleanup:\n\n1. **Dead contextlib.suppress**: In test_cleanup_stale_edges.py and test_verify_zombie_edges.py, the `test_restores_config_path_when_close_raises` and `test_logs_warning_when_close_raises` tests wrap run_* calls with `contextlib.suppress(RuntimeError)`. This was needed before Task 146's defensive close alignment, which added try/except around service.close() in the implementation. Now the implementations catch close() errors internally and never propagate RuntimeError, so these suppresses are dead code. Removing them makes the tests document the contract that the entrypoint succeeds even when close() fails \u2014 and if a regression re-exposes the error, the test will correctly fail rather than silently suppressing it.\n\n2. **Missing reindex close-warning tests**: test_cleanup_stale_edges.py has TestRunCleanupCloseWarning and test_verify_zombie_edges.py has TestRunVerifyZombieEdgesCloseWarning, but test_reindex.py has no close-warning test despite run_reindex using the exact same try/except/logger.warning pattern (line 202 of reindex.py). Two tests are needed: (a) TestRunReindexCloseWarning.test_logs_warning_when_close_raises, and (b) TestRunReindexEnvVarRestore.test_restores_config_path_when_close_raises. These complete the three-way test symmetry.\n\n3. **Local imports in test_cleanup_stale_edges.py**: The close-warning and env-var-restore tests import `os`, `logging`, and `CleanupResult`/`run_cleanup` inside test methods (~lines 461, 509, 511) instead of at module level. test_verify_zombie_edges.py already has these at module level. Promoting the imports follows the established pattern and reduces per-test overhead.\n\nAll changes are test-only. No implementation code changes needed.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Add provenance assertion to test_edge_with_no_uuid_attr_returns_none (test_memory_service.py:870). After the existing `assert d['uuid'] is None`, add: `assert d['provenance'] == [], f\"provenance should be [] when edge has empty episodes, got {d['provenance']!r}\"`. This should pass immediately — EdgeWithoutUuid has episodes=[] which _build_edge_dict maps to provenance=[].",
+      "description": "Remove dead contextlib.suppress(RuntimeError) from test_cleanup_stale_edges.py test_restores_config_path_when_close_raises (~line 485). The run_cleanup implementation now catches close() errors internally, so await run_cleanup(...) no longer raises. Remove the `with contextlib.suppress(RuntimeError):` wrapper (lines 485-486) and dedent the `await run_cleanup(config_path='test.yaml')` call to align with the outer `with` block. Run the test to confirm it passes without the suppress.",
       "status": "done",
-      "commit": "83fefba"
+      "commit": "c0d4104"
     },
     {
       "id": "step-2",
       "type": "test",
-      "description": "Add provenance assertion to test_none_uuid_edge_falls_back_to_index_in_search (test_memory_service.py:~496). After the existing `assert results[0].id == '0'` block, add: `assert results[0].provenance == [], f\"provenance should be [] when edge has empty episodes, got {results[0].provenance!r}\"`. This should pass immediately — the MemoryResult constructed from EdgeWithoutUuid carries provenance=[].",
+      "description": "Remove dead contextlib.suppress(RuntimeError) from test_cleanup_stale_edges.py test_logs_warning_when_close_raises (~line 536). Remove the `contextlib.suppress(RuntimeError)` from the combined `with` block at lines 531-537, leaving only `caplog.at_level(...)` as the single context manager. The `await run_cleanup()` call stays at the same indentation. Run to confirm it still captures the warning log and passes.",
       "status": "done",
-      "commit": "83fefba"
+      "commit": "30cf5d7"
     },
     {
       "id": "step-3",
-      "type": "impl",
-      "description": "Run both modified tests (test_edge_with_no_uuid_attr_returns_none and test_none_uuid_edge_falls_back_to_index_in_search) to verify the new assertions pass against existing code. No code changes — this validates the assertions are correct.",
+      "type": "test",
+      "description": "Remove dead contextlib.suppress(RuntimeError) from test_verify_zombie_edges.py test_restores_config_path_when_close_raises (~line 566). Same pattern as step-1: remove the `with contextlib.suppress(RuntimeError):` wrapper and dedent the `await run_verify_zombie_edges(...)` call. Run the test to confirm it passes.",
       "status": "done",
-      "commit": "83fefba"
+      "commit": "49b7aa9"
     },
     {
       "id": "step-4",
-      "type": "impl",
-      "description": "Add EdgeWithNoneEpisodes dataclass to conftest.py. Place it after EdgeWithoutUuid (after line 54). Fields: uuid: str = 'u-ep-none', fact: str = 'fact with none episodes', name: str | None = None, source_node: MockNode | None = None, target_node: MockNode | None = None, episodes: list[str] | None = None, valid_at: str | None = None, invalid_at: str | None = None. Docstring: 'Simulates a Graphiti edge where the episodes attribute is present but None. Tests the is-not-None semantic: None episodes must produce empty provenance, same as a missing episodes attribute.'",
+      "type": "test",
+      "description": "Remove dead contextlib.suppress(RuntimeError) from test_verify_zombie_edges.py test_logs_warning_when_close_raises (~line 613). Same pattern as step-2: remove contextlib.suppress from the combined `with` block, keeping only caplog.at_level. Run to confirm it captures warnings and passes.",
       "status": "done",
-      "commit": "016806e"
+      "commit": "b068ef7"
     },
     {
       "id": "step-5",
       "type": "impl",
-      "description": "Replace inline EdgeWithNoneEpisodes class in test_none_episodes_attr_produces_empty_provenance (test_memory_service.py:962-968) with an import: `from tests.conftest import EdgeWithNoneEpisodes`. Remove the 7-line inline class definition. Update `service._build_edge_dict(EdgeWithNoneEpisodes())` call — no change needed since dataclass defaults match the inline class exactly.",
+      "description": "Promote local imports to module-level in test_cleanup_stale_edges.py. Add `import logging`, `import os` to the stdlib import block (after `import contextlib`, before `from unittest.mock`), and add `from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup` to the project import block (after the GraphitiBackend import). Remove the local `import os` (~line 461), `import logging` (~line 509), and `from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup` (~line 463, 511) from inside test methods. Run all tests in the file to confirm nothing breaks.",
       "status": "done",
-      "commit": "016806e"
+      "commit": "7eb8183"
     },
     {
       "id": "step-6",
       "type": "test",
-      "description": "Run test_none_episodes_attr_produces_empty_provenance to confirm the refactored import from conftest works identically to the inline class.",
+      "description": "Add test_restores_config_path_when_close_raises to the existing TestRunReindexEnvVarRestore class in test_reindex.py. This mirrors the pattern in test_verify_zombie_edges.py lines 543-576 (post-suppress removal). Create mock_config with embedder.dimensions=1536, embedder.providers.openai.api_key='test-key', embedder.model='text-embedding-3-small'. Create mock_service with close=AsyncMock(side_effect=RuntimeError('close error')). Patch FusedMemoryConfig, MemoryService, OpenAIEmbedder, and ReindexManager (with mock reindex_and_replay returning a dict with reindex_result and replay_count). Call await run_reindex(config_path='test.yaml') directly (no suppress). Assert os.environ.get('CONFIG_PATH') == original. Use try/finally safety net. Run test to confirm it passes.",
       "status": "done",
-      "commit": "016806e"
+      "commit": "1643f82"
     },
     {
       "id": "step-7",
-      "type": "impl",
-      "description": "Update _build_edge_dict docstring (memory_service.py:769) to add provenance to the Key semantics section. After the ``temporal`` entry (line 795), add:\n\n``provenance``:\n    Empty list ``[]`` when the edge object lacks an ``episodes`` attribute\n    (``getattr(e, 'episodes', None)`` returns its default ``None``) or when\n    ``episodes is None`` (attribute present but explicitly ``None``).\n    When ``episodes`` is a non-``None`` iterable, each element is stringified\n    via ``str()``.  The ``is not None`` policy matches ``uuid`` and ``temporal``\n    — truthiness is deliberately avoided so that an empty list ``[]`` remains\n    a valid (if degenerate) input.\n\nAlso update the inline comment at line 816 to be self-contained: replace 'matches uuid/temporal pattern (see docstring)' with 'getattr default is None; None treated as absent → empty list (same is-not-None policy as uuid/temporal)'.",
+      "type": "test",
+      "description": "Add new TestRunReindexCloseWarning class with test_logs_warning_when_close_raises to test_reindex.py. Place it after TestRunReindexEnvVarRestore, before TestRunReindexServiceLifecycle. This mirrors TestRunCleanupCloseWarning and TestRunVerifyZombieEdgesCloseWarning. Same mock setup as step-6 but no config_path (tests default path). Use caplog.at_level(logging.WARNING, logger='fused_memory.maintenance.reindex') \u2014 no suppress needed. Call await run_reindex(). Assert warning_messages contains 'Error closing service during run_reindex cleanup'. Add `import logging` to module-level imports in test_reindex.py. Run test to confirm it passes.",
       "status": "done",
-      "commit": "6e00777"
+      "commit": "aa24e6d"
     },
     {
       "id": "step-8",
-      "type": "test",
-      "description": "Run the full TestBuildEdgeDict and TestSearch test classes to confirm all existing and new tests pass with all changes applied. This is the final validation that all four polish items are correct.",
+      "type": "impl",
+      "description": "Final cleanup and full verification. Check if contextlib import is still needed in test_cleanup_stale_edges.py and test_verify_zombie_edges.py after removing all suppress calls \u2014 if no other contextlib usage remains, remove `import contextlib`. Run the full test suite for all three files: pytest fused-memory/tests/test_cleanup_stale_edges.py fused-memory/tests/test_verify_zombie_edges.py fused-memory/tests/test_reindex.py -v. Confirm zero failures.",
       "status": "done",
-      "commit": "6e00777"
+      "commit": "e0d209a"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Write new assertions (steps 1-2) before refactoring (steps 4-5)",
-      "rationale": "TDD discipline: establish the new assertions as a safety net first, verify they pass against existing code, then do the structural refactoring. If the fixture move breaks the provenance mapping, the new assertions catch it."
+      "decision": "Remove suppress rather than keep it as defensive code",
+      "rationale": "The implementation's try/except around service.close() is the contract. If a regression propagates the error, the test should fail loudly rather than silently suppressing it. This makes the tests document the contract and detect regressions."
     },
     {
-      "decision": "EdgeWithNoneEpisodes uses typed field `episodes: list[str] | None = None` rather than bare `episodes = None`",
-      "rationale": "Matches the typed dataclass pattern in conftest.py (EdgeWithoutUuid, MockEdge). The union type explicitly documents that None is a valid value distinct from an empty list, which is the whole point of this fixture."
+      "decision": "New reindex tests call run_reindex directly without contextlib.suppress",
+      "rationale": "The whole point of this task is that the implementation now handles close() errors internally. The new tests should follow the corrected pattern from the start, never having the dead suppress."
     },
     {
-      "decision": "Both extend the docstring AND make the inline comment self-contained",
-      "rationale": "The task offers option (a) or (b). Doing both is superior: the docstring should be complete (all three is-not-None fields documented uniformly), and the inline comment should be independently understandable without cross-referencing. The task description itself suggests this by listing both options."
+      "decision": "Add test_restores_config_path_when_close_raises to existing TestRunReindexEnvVarRestore class rather than creating a new class",
+      "rationale": "The existing class groups all env-var restoration tests. Adding the close-raises variant there maintains logical grouping and matches how test_cleanup_stale_edges.py and test_verify_zombie_edges.py organize their env-var tests."
     },
     {
-      "decision": "Keep EdgeWithNoneEpisodes default field values identical to the inline class",
-      "rationale": "uuid='u-ep-none', fact='fact with none episodes', etc. Preserving exact values means the test body needs zero changes beyond the import swap, minimizing risk."
+      "decision": "Create a new TestRunReindexCloseWarning class for the warning test",
+      "rationale": "This matches the pattern in the other two files (TestRunCleanupCloseWarning, TestRunVerifyZombieEdgesCloseWarning) where close-warning tests get their own dedicated test class."
+    },
+    {
+      "decision": "Promote imports before adding new reindex tests but after suppress removal",
+      "rationale": "The import promotion (step 5) affects test_cleanup_stale_edges.py only and is independent of the reindex additions (steps 6-7). Doing import cleanup before new test additions keeps the diff history clean: first fix existing code quality, then add new tests."
+    },
+    {
+      "decision": "Check whether contextlib import can be removed after suppress removal",
+      "rationale": "After removing all contextlib.suppress calls from test_cleanup_stale_edges.py and test_verify_zombie_edges.py, if no other code in those files uses contextlib, the import becomes dead code and should be removed. Step 8 includes this cleanup check."
+    },
+    {
+      "decision": "run_reindex mock result must be a dict, not a bare ReindexResult",
+      "rationale": "run_reindex returns the full dict from ReindexManager.reindex_and_replay, which has keys 'reindex_result', 'replay_count', and optionally 'indices_dropped'. The mock must match this structure \u2014 using a bare ReindexResult would cause a KeyError at line 188."
     }
   ],
   "reuse": [
     {
-      "what": "EdgeWithoutUuid dataclass pattern in conftest.py",
-      "where": "fused-memory/tests/conftest.py:40-54",
-      "how": "EdgeWithNoneEpisodes follows the exact same structure: @dataclass, same field types as MockEdge with specific defaults to test a particular edge case. Place immediately after EdgeWithoutUuid."
+      "what": "TestRunVerifyZombieEdgesCloseWarning test pattern",
+      "where": "fused-memory/tests/test_verify_zombie_edges.py lines 584-621",
+      "how": "Mirror this exact pattern for the new TestRunReindexCloseWarning class, substituting: run_verify_zombie_edges \u2192 run_reindex, VerifyResult \u2192 dict with ReindexResult, verify_zombie_edges patches \u2192 reindex patches (FusedMemoryConfig, MemoryService, OpenAIEmbedder, ReindexManager), and expected warning message 'run_verify_zombie_edges' \u2192 'run_reindex'."
     },
     {
-      "what": "Local import pattern for conftest fixtures",
-      "where": "test_memory_service.py:867, 487, 464, 984",
-      "how": "Tests import conftest fixtures locally with `from tests.conftest import X`. EdgeWithNoneEpisodes uses the same pattern."
+      "what": "TestRunVerifyZombieEdgesEnvVarRestore.test_restores_config_path_when_close_raises pattern",
+      "where": "fused-memory/tests/test_verify_zombie_edges.py lines 543-576",
+      "how": "Mirror this for the new test in TestRunReindexEnvVarRestore. Adapt: (1) use reindex-specific patches (FusedMemoryConfig, MemoryService, OpenAIEmbedder, ReindexManager), (2) mock_config needs embedder.dimensions, embedder.providers.openai.api_key, embedder.model attributes, (3) mock result as dict with 'reindex_result' and 'replay_count' keys, (4) no contextlib.suppress \u2014 the corrected pattern."
     },
     {
-      "what": "Assertion message pattern with f-string and repr",
-      "where": "test_memory_service.py:870, 494-495, 951-953, 973-974",
-      "how": "All assertions use descriptive f-string messages with {value!r}. New provenance assertions follow this convention exactly."
+      "what": "Module-level import pattern from test_verify_zombie_edges.py",
+      "where": "fused-memory/tests/test_verify_zombie_edges.py lines 1-13",
+      "how": "Use the same import organization for test_cleanup_stale_edges.py: contextlib, logging, os as stdlib imports, then third-party (unittest.mock, pytest), then project imports including the run function and result type."
     },
     {
-      "what": "Docstring Key semantics format in _build_edge_dict",
-      "where": "memory_service.py:778-795",
-      "how": "uuid and temporal entries use backtick-quoted key names, double-backtick code references, indented paragraphs explaining None vs empty-string semantics. The provenance entry mirrors this exact format."
+      "what": "Mock config pattern for reindex tests",
+      "where": "fused-memory/tests/test_reindex.py TestRunReindexEnvVarRestore tests (lines 1046-1055, 1089-1096)",
+      "how": "Reuse the mock_config setup with embedder.dimensions=1536, embedder.providers.openai.api_key='test-key', embedder.model='text-embedding-3-small' for the new close-warning and env-restore tests."
     }
   ],
-  "_session_id": "149-c55c6f30",
-  "_created_at": "2026-03-24T23:37:18.030374+00:00"
+  "_session_id": "151-0906256a",
+  "_created_at": "2026-03-25T01:03:48.612984+00:00"
 }
