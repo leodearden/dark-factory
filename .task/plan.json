@@ -47,15 +47,15 @@
       "id": "step-5",
       "type": "test",
       "description": "Run existing test_verify_zombie_edges.py to establish green baseline before refactoring verify_zombie_edges.py. All TestRunVerifyZombieEdges, TestRunVerifyZombieEdgesCloseWarning, TestRunVerifyZombieEdgesEnvVarRestore tests must pass.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "943b33b"
     },
     {
       "id": "step-6",
       "type": "impl",
       "description": "Replace inline try/except in verify_zombie_edges.py run_verify_zombie_edges() finally block (lines 173-181) with:\n\n```python\n    finally:\n        if service is not None:\n            # Catch close() errors so CONFIG_PATH restoration below always runs.\n            await _safe_close(service, logger, 'run_verify_zombie_edges')\n        if config_path is not None:\n```\n\nAdd import at top of file: `from fused_memory.maintenance.utils import _safe_close`\n\nRun test_verify_zombie_edges.py to verify all existing tests pass without modification.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "b07f695"
     },
     {
       "id": "step-7",
