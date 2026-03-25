@@ -10,7 +10,12 @@ TASKS_REL_PATH = ".taskmaster/tasks/tasks.json"
 
 
 class TaskFileCommitter:
-    """Fire-and-forget git add+commit of tasks.json, serialized per project_root."""
+    """Git add+commit of tasks.json, serialized per project_root.
+
+    Individual mutations schedule fire-and-forget commits; bulk operations
+    (parse_prd, expand_task) should await ``commit()`` directly so the full
+    batch is captured before the call returns.
+    """
 
     def __init__(self) -> None:
         self._locks: dict[str, asyncio.Lock] = {}

@@ -451,8 +451,8 @@ def interceptor_with_committer(taskmaster, reconciler, event_buffer, committer):
 
 
 @pytest.mark.asyncio
-async def test_write_methods_schedule_commit(interceptor_with_committer, committer):
-    """All 9 write methods should fire a commit."""
+async def test_write_methods_commit(interceptor_with_committer, committer):
+    """All 9 write methods should commit (7 fire-and-forget, 2 awaited for bulk ops)."""
     i = interceptor_with_committer
     pr = '/project'
 
@@ -510,3 +510,88 @@ async def test_terminal_state_rejection_no_commit(taskmaster, reconciler, event_
     result = await interceptor.set_task_status('1', 'blocked', '/project')
     assert result.get('success') is False
     committer.commit.assert_not_called()
+
+
+# ── Tests for bulk ops awaiting commit (not fire-and-forget) ─────────
+
+
+@pytest.mark.asyncio
+async def test_parse_prd_awaits_commit(taskmaster, reconciler, event_buffer):
+    """parse_prd should await the commit, not fire-and-forget."""
+    commit_order: list[str] = []
+
+    async def tracking_commit(project_root: str, operation: str) -> None:
+        commit_order.append(operation)
+
+    committer = AsyncMock()
+    committer.commit = AsyncMock(side_effect=tracking_commit)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, committer)
+
+    await interceptor.parse_prd('prd.md', '/project')
+
+    # Commit must have been called already (awaited, not background)
+    assert 'parse_prd' in commit_order
+    # No background commit tasks for this op
+    commit_tasks = [
+        t for t in interceptor._background_tasks
+        if 'auto-commit' in (t.get_name() or '')
+    ]
+    assert len(commit_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_expand_task_awaits_commit(taskmaster, reconciler, event_buffer):
+    """expand_task should await the commit, not fire-and-forget."""
+    committer = AsyncMock()
+    committer.commit = AsyncMock()
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, committer)
+
+    await interceptor.expand_task('1', '/project')
+
+    # Commit called synchronously (awaited) — verify it was called
+    committer.commit.assert_called_once()
+    assert 'expand_task(1)' in committer.commit.call_args[0][1]
+    # No background commit tasks
+    commit_tasks = [
+        t for t in interceptor._background_tasks
+        if 'auto-commit' in (t.get_name() or '')
+    ]
+    assert len(commit_tasks) == 0
+
+
+# ── Tests for drain ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_drain_empty(taskmaster, event_buffer):
+    """drain() with no pending tasks completes immediately."""
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+    await interceptor.drain()  # should not raise
+
+
+@pytest.mark.asyncio
+async def test_drain_awaits_pending_commits(taskmaster, event_buffer):
+    """drain() awaits all pending fire-and-forget commits."""
+    commit_done = asyncio.Event()
+
+    async def slow_commit(project_root: str, operation: str) -> None:
+        await commit_done.wait()
+
+    committer = AsyncMock()
+    committer.commit = AsyncMock(side_effect=slow_commit)
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer, committer)
+
+    # Fire-and-forget commits
+    await interceptor.add_task('/project', prompt='A')
+    await interceptor.add_task('/project', prompt='B')
+    await asyncio.sleep(0)  # let tasks start
+
+    # Background tasks should be pending
+    assert len(interceptor._background_tasks) >= 1
+
+    # Unblock the commits
+    commit_done.set()
+
+    # drain should await them all
+    await interceptor.drain()
+    assert len(interceptor._background_tasks) == 0

@@ -91,6 +91,27 @@ class TaskInterceptor:
         if exc:
             logger.error(f'Background auto-commit failed: {exc}')
 
+    async def _await_commit(self, project_root: str, operation: str) -> None:
+        """Await commit directly (used by bulk ops that must capture full batch)."""
+        if self.task_committer is None:
+            return
+        await self.task_committer.commit(project_root, operation)
+
+    async def drain(self) -> None:
+        """Await all pending background tasks (commits + reconciliation).
+
+        Call at shutdown or when you need to guarantee all fire-and-forget
+        work has completed.
+        """
+        if not self._background_tasks:
+            return
+        tasks = list(self._background_tasks)
+        logger.info('Draining %d background tasks', len(tasks))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error('Background task failed during drain: %s', result)
+
     # ── Status transitions (with targeted reconciliation) ──────────────
 
     async def set_task_status(
@@ -174,7 +195,7 @@ class TaskInterceptor:
             {'parent_task_id': task_id, 'operation': 'expand_task'},
         )
         await self.buffer.push(event)
-        self._schedule_commit(project_root, f'expand_task({task_id})')
+        await self._await_commit(project_root, f'expand_task({task_id})')
 
         if self.reconciler:
             task = asyncio.create_task(
@@ -209,7 +230,7 @@ class TaskInterceptor:
             {'input_path': input_path, 'operation': 'parse_prd'},
         )
         await self.buffer.push(event)
-        self._schedule_commit(project_root, 'parse_prd')
+        await self._await_commit(project_root, 'parse_prd')
 
         if self.reconciler:
             task = asyncio.create_task(
