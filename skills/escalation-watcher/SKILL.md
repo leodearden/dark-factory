@@ -18,8 +18,8 @@ Before starting, verify these are in place. If anything is missing, ask the user
 3. **Escalation queue directory** at `<project_root>/data/escalations/`
 
 Discover the terminal command for spawning interactive sessions:
-1. Check `$ESCALATION_TERMINAL_CMD` (e.g., `gnome-terminal --`, `kitty --`, `tmux new-window`)
-2. Try `x-terminal-emulator` (Linux, if in PATH)
+1. Check `$ESCALATION_TERMINAL_CMD` (e.g., `gnome-terminal`, `kitty`, `tmux new-window`)
+2. Try known emulators directly: `gnome-terminal`, `kitty`, `konsole`, `xterm` (avoid the `x-terminal-emulator` wrapper — it doesn't reliably pass command arguments)
 3. On macOS, `open -a Terminal`
 4. If nothing found, ask the user once. Suggest they set `ESCALATION_TERMINAL_CMD` for future sessions.
 
@@ -258,13 +258,15 @@ Merge conflicts, verification failures, build breaks. The task agent is stopped 
 
 ```python
 # Discover terminal command (do this once at startup, cache the result)
-# 1. Check $ESCALATION_TERMINAL_CMD
-# 2. Fall back to x-terminal-emulator (Linux) or open -a Terminal (macOS)
-# 3. If nothing found, ask the user
+# 1. Check $ESCALATION_TERMINAL_CMD env var
+# 2. Try gnome-terminal, kitty, or other known emulators directly
+#    (avoid x-terminal-emulator wrapper — it doesn't reliably pass command args)
+# 3. On macOS, open -a Terminal
+# 4. If nothing found, ask the user
 
-# Then spawn the session:
+# Then spawn the session (note: must cd to project root first):
 Bash(
-  command='$TERMINAL_CMD claude "/unblock <task_id>"',
+  command='gnome-terminal -- bash -c \'cd <project_root> && claude --dangerously-skip-permissions "/unblock <task_id>"\'',
   run_in_background=true
 )
 ```
