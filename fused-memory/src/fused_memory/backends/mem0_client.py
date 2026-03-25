@@ -20,6 +20,7 @@ class Mem0Backend:
         self._instances: dict[str, AsyncMemory] = {}
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
+        self._async_qdrant_client = None  # Lazy async client for count/list ops
 
     def _build_config_dict(self, collection_name: str) -> dict[str, Any]:
         """Build a Mem0 config dict from the unified config."""
@@ -171,17 +172,25 @@ class Mem0Backend:
             timeout=self._write_timeout,
         )
 
+    async def _get_async_qdrant(self):
+        """Get or create a shared async Qdrant client for lightweight ops."""
+        if self._async_qdrant_client is None:
+            from qdrant_client import AsyncQdrantClient
+
+            self._async_qdrant_client = AsyncQdrantClient(
+                url=self.config.mem0.qdrant_url,
+                timeout=int(self._read_timeout),
+            )
+        return self._async_qdrant_client
+
     async def count(self, scope: Scope) -> int:
-        """Count memories using native Qdrant count API."""
+        """Count memories using native async Qdrant count API."""
         instance = await self._get_instance(scope)
-        loop = asyncio.get_event_loop()
+        client = await self._get_async_qdrant()
         result = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: instance.vector_store.client.count(
-                    collection_name=instance.collection_name,
-                    exact=True,
-                ),
+            client.count(
+                collection_name=instance.collection_name,
+                exact=True,
             ),
             timeout=self._read_timeout,
         )
@@ -196,18 +205,21 @@ class Mem0Backend:
                 if client is not None and hasattr(client, 'close'):
                     await client.close()
         self._instances.clear()
+        if self._async_qdrant_client is not None:
+            with contextlib.suppress(Exception):
+                await self._async_qdrant_client.close()
+            self._async_qdrant_client = None
 
-    def list_projects(self) -> list[tuple[str, str]]:
+    async def list_projects(self) -> list[tuple[str, str]]:
         """Enumerate projects by scanning Qdrant collections matching the prefix.
 
         Returns list of (project_id, collection_name) tuples.
         """
-        from qdrant_client import QdrantClient
-
-        client = QdrantClient(url=self.config.mem0.qdrant_url)
+        client = await self._get_async_qdrant()
         prefix = f'{self.config.mem0.collection_prefix}_'
         result = []
-        for c in client.get_collections().collections:
+        collections = await client.get_collections()
+        for c in collections.collections:
             if c.name.startswith(prefix):
                 project_id = c.name[len(prefix):]
                 if project_id:

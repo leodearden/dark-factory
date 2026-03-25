@@ -724,18 +724,41 @@ class MemoryService:
         )
         results = []
         for i, edge in enumerate(edges):
-            d = self._build_edge_dict(edge)
+            fact = getattr(edge, 'fact', str(edge))
+            valid_at = getattr(edge, 'valid_at', None)
+            invalid_at = getattr(edge, 'invalid_at', None)
+            temporal = None
+            if valid_at or invalid_at:
+                temporal = {
+                    'valid_at': str(valid_at) if valid_at else None,
+                    'invalid_at': str(invalid_at) if invalid_at else None,
+                }
+
+            # Extract entity names from source/target nodes
+            entities = []
+            source_node = getattr(edge, 'source_node', None)
+            target_node = getattr(edge, 'target_node', None)
+            if source_node and hasattr(source_node, 'name'):
+                entities.append(source_node.name)
+            if target_node and hasattr(target_node, 'name'):
+                entities.append(target_node.name)
+
+            # Episode provenance
+            episodes = getattr(edge, 'episodes', []) or []
+            provenance = [str(ep) for ep in episodes]
+
             # Score: rank-based (no explicit score from Graphiti search)
             score = max(0.0, 1.0 - (i * 0.05))
+
             results.append(MemoryResult(
-                id=d['uuid'] if d['uuid'] is not None else str(i),
-                content=d['fact'],
+                id=getattr(edge, 'uuid', str(i)),
+                content=fact,
                 category=None,
                 source_store=SourceStore.graphiti,
                 relevance_score=score,
-                provenance=d['provenance'],
-                temporal=d['temporal'],
-                entities=d['entities'],
+                provenance=provenance,
+                temporal=temporal,
+                entities=entities,
             ))
         return results
 
@@ -766,77 +789,6 @@ class MemoryService:
             ))
         return results
 
-    def _build_edge_dict(self, e) -> dict:
-        """Build a plain dict from a Graphiti edge object.
-
-        Extracts the six standard fields shared by both _search_graphiti and
-        get_entity, eliminating the duplicated extraction logic.
-
-        Returns:
-            dict with keys: uuid, fact, name, temporal, entities, provenance
-
-        Key semantics (load-bearing — callers depend on these):
-
-        ``uuid``:
-            ``None`` when the edge object lacks a ``uuid`` attribute entirely
-            (``getattr(e, 'uuid', None)`` returns its default ``None``).
-            ``''`` (empty string) when the attribute exists but is blank.
-            Callers use ``is not None`` — not truthiness — to decide whether to
-            fall back to a synthetic id (``str(i)``), so these two cases are
-            intentionally distinct.
-
-        ``temporal``:
-            ``None`` when both ``valid_at`` and ``invalid_at`` are ``None``.
-            A dict ``{'valid_at': ..., 'invalid_at': ...}`` when either value
-            ``is not None`` (including empty string ``''``).  Values inside the
-            dict are ``str(x)`` when ``x is not None``, else ``None``.
-            Truthiness checks are deliberately avoided here for the same reason
-            as for ``uuid`` — an empty-string timestamp is a valid (if unusual)
-            value and must not be silently dropped.
-
-        ``provenance``:
-            Empty list ``[]`` when the edge object lacks an ``episodes``
-            attribute (``getattr(e, 'episodes', None)`` returns its default
-            ``None``) or when ``episodes is None`` (attribute present but
-            explicitly ``None``).  When ``episodes`` is a non-``None``
-            iterable, each element is stringified via ``str()``.  The
-            ``is not None`` policy matches ``uuid`` and ``temporal`` —
-            truthiness is deliberately avoided so that an empty list ``[]``
-            remains a valid (if degenerate) input.
-        """
-        fact = getattr(e, 'fact', str(e))
-        valid_at = getattr(e, 'valid_at', None)
-        invalid_at = getattr(e, 'invalid_at', None)
-        temporal = None
-        if valid_at is not None or invalid_at is not None:
-            temporal = {
-                'valid_at': str(valid_at) if valid_at is not None else None,
-                'invalid_at': str(invalid_at) if invalid_at is not None else None,
-            }
-
-        # Extract entity names from source/target nodes
-        entities = []
-        source_node = getattr(e, 'source_node', None)
-        target_node = getattr(e, 'target_node', None)
-        if source_node and hasattr(source_node, 'name'):
-            entities.append(source_node.name)
-        if target_node and hasattr(target_node, 'name'):
-            entities.append(target_node.name)
-
-        # Episode provenance — getattr default is None; None treated as absent → empty list
-        # (same is-not-None policy as uuid/temporal: an empty list [] is a valid input)
-        episodes = getattr(e, 'episodes', None)
-        provenance = [str(ep) for ep in (episodes if episodes is not None else [])]
-
-        return {
-            'uuid': getattr(e, 'uuid', None),
-            'fact': fact,
-            'name': getattr(e, 'name', None),
-            'temporal': temporal,
-            'entities': entities,
-            'provenance': provenance,
-        }
-
     # ------------------------------------------------------------------
     # Read: get_entity
     # ------------------------------------------------------------------
@@ -845,16 +797,8 @@ class MemoryService:
         self,
         name: str,
         project_id: str = 'main',
-        valid_only: bool = False,
     ) -> dict:
-        """Entity lookup in Graphiti — returns nodes + edges.
-
-        Args:
-            name: Entity name to look up (fuzzy matched).
-            project_id: Project scope.
-            valid_only: When True, exclude edges where invalid_at is set
-                (i.e. edges that have been historically invalidated).
-        """
+        """Entity lookup in Graphiti — returns nodes + edges."""
         nodes = await self.graphiti.search_nodes(
             query=name,
             group_ids=[project_id],
@@ -866,9 +810,6 @@ class MemoryService:
             num_results=10,
         )
 
-        if valid_only:
-            edges = [e for e in edges if getattr(e, 'invalid_at', None) is None]
-
         node_data = []
         for n in nodes:
             node_data.append({
@@ -878,7 +819,12 @@ class MemoryService:
                 'labels': getattr(n, 'labels', []),
             })
 
-        edge_data = [self._build_edge_dict(e) for e in edges]
+        edge_data = []
+        for e in edges:
+            edge_data.append({
+                'uuid': getattr(e, 'uuid', None),
+                'fact': getattr(e, 'fact', str(e)),
+            })
 
         return {'nodes': node_data, 'edges': edge_data}
 
@@ -1035,7 +981,7 @@ class MemoryService:
         # Mem0 connectivity + project discovery
         mem0_counts: dict[str, int] = {}
         try:
-            mem0_projects = self.mem0.list_projects()
+            mem0_projects = await self.mem0.list_projects()
             for pid, _collection_name in mem0_projects:
                 try:
                     scope = Scope(project_id=pid)

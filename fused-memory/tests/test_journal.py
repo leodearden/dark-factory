@@ -272,11 +272,3 @@ async def test_get_run_actions_combined_with_write_journal(journal, tmp_path):
     assert len(combined) == 2
 
     await wj.close()
-
-
-@pytest.mark.asyncio
-async def test_update_watermark_rejects_none_project_id(journal):
-    wm = Watermark()  # project_id defaults to None
-    assert wm.project_id is None
-    with pytest.raises(ValueError, match='Cannot persist watermark without project_id'):
-        await journal.update_watermark(wm)

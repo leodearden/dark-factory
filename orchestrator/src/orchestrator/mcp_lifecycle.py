@@ -229,24 +229,33 @@ class McpLifecycle:
             logger.warning('MCP server already running')
             return
 
-        cmd = self.config.server_command
-        config_path = (self.project_root / self.config.config_path).resolve()
-        cmd = [*cmd, '--config', str(config_path)]
+        if not self.config.server_command:
+            # External server mode — skip subprocess, just connect
+            logger.info(f'Connecting to external fused-memory at {self.config.url}')
+            if not await self._wait_for_health(timeout=30):
+                raise RuntimeError(
+                    f'External fused-memory at {self.config.url} not reachable within 30s'
+                )
+            logger.info(f'Fused-memory HTTP server ready at {self.config.url}')
+        else:
+            cmd = self.config.server_command
+            config_path = (self.project_root / self.config.config_path).resolve()
+            cmd = [*cmd, '--config', str(config_path)]
 
-        logger.info(f'Starting fused-memory HTTP server: {" ".join(cmd)}')
-        self._process = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(self.project_root),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+            logger.info(f'Starting fused-memory HTTP server: {" ".join(cmd)}')
+            self._process = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(self.project_root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
 
-        # Wait for health
-        if not await self._wait_for_health(timeout=30):
-            await self.stop()
-            raise RuntimeError('Fused-memory server failed to start within 30s')
+            # Wait for health
+            if not await self._wait_for_health(timeout=30):
+                await self.stop()
+                raise RuntimeError('Fused-memory server failed to start within 30s')
 
-        logger.info(f'Fused-memory HTTP server ready at {self.config.url}')
+            logger.info(f'Fused-memory HTTP server ready at {self.config.url}')
 
         # Initialize MCP session
         _session = McpSession(self.config.url)
@@ -285,11 +294,9 @@ class McpLifecycle:
 
     async def _wait_for_health(self, timeout: float = 30) -> bool:
         """Poll health endpoint until ready or timeout."""
-        if self._process is None:
-            return False
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
-            if self._process.returncode is not None:
+            if self._process is not None and self._process.returncode is not None:
                 stderr = await self._process.stderr.read() if self._process.stderr else b''
                 logger.error(f'Server exited prematurely: {stderr.decode()[-500:]}')
                 return False

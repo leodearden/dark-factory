@@ -9,7 +9,6 @@ from graphiti_core.embedder import OpenAIEmbedder
 from graphiti_core.embedder.openai import OpenAIEmbedderConfig
 
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.maintenance.utils import _safe_close
 from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
@@ -197,7 +196,10 @@ async def run_reindex(
     finally:
         if service is not None:
             # Catch close() errors so CONFIG_PATH restoration below always runs.
-            await _safe_close(service, logger, 'run_reindex')
+            try:
+                await service.close()
+            except Exception:
+                logger.warning('Error closing service during run_reindex cleanup', exc_info=True)
         if config_path is not None:
             if old_config_path is None:
                 os.environ.pop('CONFIG_PATH', None)

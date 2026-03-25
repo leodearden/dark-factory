@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -177,6 +178,20 @@ async def run_server():
     mcp.settings.stateless_http = config.server.stateless_http
     mcp.settings.json_response = config.server.json_response
 
+    # Thread monitor — log count every 60s, warn if growing unexpectedly
+    async def _thread_monitor():
+        prev = 0
+        while True:
+            await asyncio.sleep(60)
+            count = threading.active_count()
+            delta = count - prev
+            if delta != 0 or count > 30:
+                level = logging.WARNING if count > 30 else logging.INFO
+                logger.log(level, f'thread_monitor: threads={count} delta={delta:+d}')
+            prev = count
+
+    asyncio.create_task(_thread_monitor())
+
     # Run transport
     transport = config.server.transport
     logger.info(f'Starting MCP server with transport: {transport}')
@@ -209,7 +224,31 @@ async def run_server():
             await task_interceptor.drain()
 
 
+_singleton_socket = None  # Module-level ref to prevent GC
+
+
+def _acquire_singleton_lock() -> None:
+    """Acquire a system-wide singleton lock via a bound socket.
+
+    Raises SystemExit if another instance is already running.
+    """
+    global _singleton_socket
+    import socket
+
+    _singleton_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        # Abstract socket namespace — no filesystem cleanup needed
+        _singleton_socket.bind('\0fused-memory-singleton')
+    except OSError:
+        logger.error(
+            'Another fused-memory instance is already running. '
+            'Kill it first or use systemctl --user restart fused-memory'
+        )
+        raise SystemExit(1) from None
+
+
 def main():
+    _acquire_singleton_lock()
     try:
         asyncio.run(run_server())
     except KeyboardInterrupt:

@@ -43,8 +43,6 @@ invalidates task assumptions, completed work not reflected in tasks).
 - Preserve provenance: when merging, keep the stronger/more recent version.
 - When deleting, prefer the stale/duplicate/superseded entry.
 - Use search broadly to find related memories before making changes.
-- Always include the `project_id` from the payload context in every fused-memory MCP call \
-(search, add_memory, delete_memory, get_entity, get_episodes, get_status).
 - When you have completed your work, produce your final structured report as your response.
 
 ## Cycle Fence

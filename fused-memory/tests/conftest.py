@@ -29,45 +29,9 @@ class MockEdge:
 
     fact: str
     uuid: str = ''
-    name: str | None = None
     source_node: MockNode | None = None
     target_node: MockNode | None = None
     episodes: list[str] = field(default_factory=list)
-    valid_at: str | None = None
-    invalid_at: str | None = None
-
-
-@dataclass
-class EdgeWithoutUuid:
-    """Simulates a Graphiti edge that lacks a uuid attribute.
-
-    Deliberately omits the uuid field so that getattr(e, 'uuid', None) returns
-    None — modelling real-world edge objects that do not expose a uuid property.
-    """
-
-    fact: str = 'some fact'
-    name: str | None = None
-    source_node: MockNode | None = None
-    target_node: MockNode | None = None
-    episodes: list[str] = field(default_factory=list)
-    valid_at: str | None = None
-    invalid_at: str | None = None
-
-
-@dataclass
-class EdgeWithNoneEpisodes:
-    """Simulates a Graphiti edge where the episodes attribute is present but None.
-
-    Tests the is-not-None semantic: None episodes must produce empty provenance,
-    same as a missing episodes attribute.
-    """
-
-    uuid: str = 'u-ep-none'
-    fact: str = 'fact with none episodes'
-    name: str | None = None
-    source_node: MockNode | None = None
-    target_node: MockNode | None = None
-    episodes: list[str] | None = None
     valid_at: str | None = None
     invalid_at: str | None = None
 

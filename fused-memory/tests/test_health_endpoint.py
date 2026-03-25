@@ -639,4 +639,3 @@ async def test_set_task_status_all_trigger_statuses_pass_through(
     assert 'error' not in result, (
         f"STATUS_TRIGGERS value {status!r} should be accepted, got: {result}"
     )
-

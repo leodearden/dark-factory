@@ -183,8 +183,6 @@ class ReconciliationJournal:
         )
 
     async def update_watermark(self, watermark: Watermark) -> None:
-        if watermark.project_id is None:
-            raise ValueError('Cannot persist watermark without project_id')
         db = self._require_db()
         await db.execute(
             """INSERT INTO watermarks
