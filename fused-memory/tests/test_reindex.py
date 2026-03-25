@@ -1127,6 +1127,52 @@ class TestRunReindexEnvVarRestore:
             else:
                 os.environ['CONFIG_PATH'] = original
 
+    @pytest.mark.asyncio
+    async def test_restores_config_path_when_close_raises(self):
+        """CONFIG_PATH is restored even when service.close() raises in the finally block."""
+        import os
+
+        from fused_memory.maintenance.reindex import run_reindex
+
+        mock_config = MagicMock()
+        mock_config.embedder.dimensions = 1536
+        mock_config.embedder.providers.openai.api_key = 'test-key'
+        mock_config.embedder.model = 'text-embedding-3-small'
+
+        mock_service = AsyncMock()
+        mock_service.close = AsyncMock(side_effect=RuntimeError('close error'))
+
+        mock_result = {'reindex_result': MagicMock(), 'replay_count': 0}
+
+        original = os.environ.get('CONFIG_PATH')
+        try:
+            with (
+                patch(
+                    'fused_memory.maintenance.reindex.FusedMemoryConfig',
+                    return_value=mock_config,
+                ),
+                patch(
+                    'fused_memory.maintenance.reindex.MemoryService',
+                    return_value=mock_service,
+                ),
+                patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+                patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
+            ):
+                mock_mgr = MagicMock()
+                mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+                mock_mgr_cls.return_value = mock_mgr
+
+                await run_reindex(config_path='test.yaml')
+
+            # CONFIG_PATH must be restored regardless of close() raising
+            assert os.environ.get('CONFIG_PATH') == original
+        finally:
+            # Safety net: ensure env var is cleaned up even if the test itself errors
+            if original is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = original
+
 
 # ---------------------------------------------------------------------------
 # step-2: run_reindex service lifecycle — close() when ReindexManager raises
