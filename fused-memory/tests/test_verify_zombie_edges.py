@@ -563,8 +563,7 @@ class TestRunVerifyZombieEdgesEnvVarRestore:
                 mock_verifier.cleanup = AsyncMock(return_value=mock_result)
                 mock_verifier_cls.return_value = mock_verifier
 
-                with contextlib.suppress(RuntimeError):
-                    await run_verify_zombie_edges(uuids=['test-uuid'], config_path='test.yaml')
+                await run_verify_zombie_edges(uuids=['test-uuid'], config_path='test.yaml')
 
             # CONFIG_PATH must be restored regardless of close() raising
             assert os.environ.get('CONFIG_PATH') == original
