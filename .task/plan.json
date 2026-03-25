@@ -61,15 +61,15 @@
       "id": "step-7",
       "type": "test",
       "description": "Run existing test_reindex.py to establish green baseline before refactoring reindex.py. All TestRunReindex, TestRunReindexEnvVarRestore, TestRunReindexServiceLifecycle tests must pass.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "86fbe52"
     },
     {
       "id": "step-8",
       "type": "impl",
       "description": "Replace inline try/except in reindex.py run_reindex() finally block (lines 197-202) with:\n\n```python\n    finally:\n        if service is not None:\n            # Catch close() errors so CONFIG_PATH restoration below always runs.\n            await _safe_close(service, logger, 'run_reindex')\n        if config_path is not None:\n```\n\nAdd import at top of file: `from fused_memory.maintenance.utils import _safe_close`\n\nRun test_reindex.py to verify all existing tests pass without modification. Then run all three test files together as final regression check.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "pending"
     }
   ],
   "design_decisions": [
