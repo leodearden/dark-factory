@@ -181,28 +181,32 @@ async def run_server():
     transport = config.server.transport
     logger.info(f'Starting MCP server with transport: {transport}')
 
-    if transport == 'stdio':
-        await mcp.run_stdio_async()
-    elif transport == 'sse':
-        await mcp.run_sse_async()
-    elif transport == 'http':
-        import uvicorn
+    try:
+        if transport == 'stdio':
+            await mcp.run_stdio_async()
+        elif transport == 'sse':
+            await mcp.run_sse_async()
+        elif transport == 'http':
+            import uvicorn
 
-        display_host = 'localhost' if config.server.host == '0.0.0.0' else config.server.host
-        logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')
-        configure_uvicorn_logging()
-        starlette_app = mcp.streamable_http_app()
-        uv_config = uvicorn.Config(
-            starlette_app,
-            host=config.server.host,
-            port=config.server.port,
-            log_level='info',
-            timeout_keep_alive=config.server.keepalive_timeout,
-        )
-        server = uvicorn.Server(uv_config)
-        await server.serve()
-    else:
-        raise ValueError(f'Unsupported transport: {transport}')
+            display_host = 'localhost' if config.server.host == '0.0.0.0' else config.server.host
+            logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')
+            configure_uvicorn_logging()
+            starlette_app = mcp.streamable_http_app()
+            uv_config = uvicorn.Config(
+                starlette_app,
+                host=config.server.host,
+                port=config.server.port,
+                log_level='info',
+                timeout_keep_alive=config.server.keepalive_timeout,
+            )
+            server = uvicorn.Server(uv_config)
+            await server.serve()
+        else:
+            raise ValueError(f'Unsupported transport: {transport}')
+    finally:
+        if task_interceptor:
+            await task_interceptor.drain()
 
 
 def main():
