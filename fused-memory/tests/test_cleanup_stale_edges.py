@@ -527,12 +527,9 @@ class TestRunCleanupCloseWarning:
             mock_mgr.cleanup = AsyncMock(return_value=mock_result)
             mock_mgr_cls.return_value = mock_mgr
 
-            with (
-                caplog.at_level(
-                    logging.WARNING,
-                    logger='fused_memory.maintenance.cleanup_stale_edges',
-                ),
-                contextlib.suppress(RuntimeError),
+            with caplog.at_level(
+                logging.WARNING,
+                logger='fused_memory.maintenance.cleanup_stale_edges',
             ):
                 await run_cleanup()
 
