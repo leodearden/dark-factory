@@ -1,61 +1,120 @@
 {
-  "task_id": "152",
-  "title": "Add integration test for None-episodes edge through search path",
+  "task_id": "150",
+  "title": "Extract _safe_close() async helper for maintenance entrypoints",
   "files": [
-    "fused-memory/tests/test_memory_service.py"
+    "fused-memory/src/fused_memory/maintenance/utils.py",
+    "fused-memory/tests/test_maintenance_utils.py",
+    "fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py",
+    "fused-memory/src/fused_memory/maintenance/verify_zombie_edges.py",
+    "fused-memory/src/fused_memory/maintenance/reindex.py"
   ],
   "modules": [
+    "fused-memory/src/fused_memory/maintenance",
     "fused-memory/tests"
   ],
-  "analysis": "EdgeWithNoneEpisodes (conftest.py:58) simulates a Graphiti edge where episodes=None (attribute present but set to None). It has a unit test in TestBuildEdgeDict (line 961: test_none_episodes_attr_produces_empty_provenance) that calls _build_edge_dict directly. However, it lacks an integration test through the search() path. Its counterpart EdgeWithoutUuid has both a unit test (test_edge_with_no_uuid_attr_returns_none at line 870) and an integration test (test_none_uuid_edge_falls_back_to_index_in_search at line 478). The new test should mirror the pattern at line 478: mock graphiti.search to return [EdgeWithNoneEpisodes()], mock mem0.search to return empty, call service.search(), and assert results[0].provenance == []. The test goes at the end of TestSearch (after line 499, before the blank line at 501). Since EdgeWithNoneEpisodes has uuid='u-ep-none', the id assertion should check for that uuid (unlike EdgeWithoutUuid which falls back to index '0'). No implementation changes needed \u2014 _build_edge_dict already handles episodes=None correctly as proven by the unit test. The conftest fixture was already consolidated from inline to conftest.py by task 149.",
+  "analysis": "Three async maintenance entrypoints (run_reindex, run_cleanup, run_verify_zombie_edges) each contain an identical 4-line try/except block in their finally clause that defensively closes a MemoryService:\n\n```python\nif service is not None:\n    try:\n        await service.close()\n    except Exception:\n        logger.warning('Error closing service during <name> cleanup', exc_info=True)\n```\n\nThis pattern was added by Task 146 to ensure CONFIG_PATH env var restoration always runs even if close() raises. The duplication is across:\n- reindex.py lines 197-202\n- cleanup_stale_edges.py lines 133-138\n- verify_zombie_edges.py lines 173-181\n\nThe extraction is safe because:\n1. Each caller passes its own module-level `logger`, so log output is attributed to the correct module (no change in log source).\n2. The `context_name` parameter produces identical warning messages via `%s` formatting.\n3. Existing tests mock `service.close` at the object level (AsyncMock), not at a module import path, so mock paths don't change.\n4. Tests that check `caplog` for warning messages will see the same logger name and message content.\n5. Tests that check `mock_service.close.assert_awaited_once()` still work since `_safe_close` calls `service.close()` directly.\n\nI verified all 3 test files: test_reindex.py (TestRunReindex, TestRunReindexEnvVarRestore, TestRunReindexServiceLifecycle), test_cleanup_stale_edges.py (TestRunCleanup, TestRunCleanupCloseWarning, TestRunCleanupEnvVarRestore, TestRunCleanupServiceLifecycle), and test_verify_zombie_edges.py (TestRunVerifyZombieEdges, TestRunVerifyZombieEdgesCloseWarning, TestRunVerifyZombieEdgesEnvVarRestore). None require modification.",
   "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Add async integration test test_none_episodes_edge_produces_empty_provenance_in_search to TestSearch class in test_memory_service.py, inserted after test_none_uuid_edge_falls_back_to_index_in_search (after line 499, before the blank line at 501). The test: (1) imports EdgeWithNoneEpisodes from tests.conftest, (2) mocks service.graphiti.search = AsyncMock(return_value=[EdgeWithNoneEpisodes()]), (3) mocks service.mem0.search = AsyncMock(return_value={'results': []}), (4) calls results = await service.search(query='test', project_id='test'), (5) asserts len(results) == 1, (6) asserts results[0].id == 'u-ep-none' with descriptive f-string message, (7) asserts results[0].provenance == [] with descriptive f-string message. Docstring: 'An edge with episodes=None (attribute present but None) produces empty provenance in search results. Covers the full search() \u2192 _search_graphiti \u2192 _build_edge_dict pipeline with None episodes, complementing the unit test test_none_episodes_attr_produces_empty_provenance which only tests the helper in isolation.'",
+      "description": "Create fused-memory/tests/test_maintenance_utils.py with failing tests for _safe_close:\n\n1. test_calls_service_close \u2014 create an AsyncMock service, call _safe_close(service, logger, 'test_context'), assert service.close was awaited once.\n2. test_does_not_raise_when_close_raises \u2014 set service.close = AsyncMock(side_effect=RuntimeError('boom')), call _safe_close, assert no exception propagates.\n3. test_logs_warning_with_context_name_on_close_error \u2014 set service.close to raise, call _safe_close with context_name='run_reindex', assert caplog contains WARNING 'Error closing service during run_reindex cleanup'.\n4. test_logs_warning_with_exc_info \u2014 same as #3 but verify the log record has exc_info set (record.exc_info is not None).\n5. test_uses_provided_logger_not_module_logger \u2014 pass a custom logger (logging.getLogger('custom.test')), set caplog to capture that logger, verify warning appears under 'custom.test' not 'fused_memory.maintenance.utils'.\n6. test_noop_when_close_succeeds_no_warning \u2014 service.close succeeds, verify no WARNING records in caplog.\n\nAll tests import from fused_memory.maintenance.utils which doesn't exist yet, so they fail with ImportError.",
       "status": "done",
-      "commit": "83a9421"
+      "commit": "ec8d6f7"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "Run the new test to verify it passes (no implementation change expected \u2014 _build_edge_dict already handles episodes=None). Run: pytest fused-memory/tests/test_memory_service.py::TestSearch::test_none_episodes_edge_produces_empty_provenance_in_search -v. If it fails, investigate the search path for a bug in provenance propagation and fix it.",
+      "description": "Create fused-memory/src/fused_memory/maintenance/utils.py with:\n\n```python\n\"\"\"Shared helpers for maintenance entrypoints.\"\"\"\nfrom __future__ import annotations\n\nimport logging\nfrom typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from fused_memory.services.memory_service import MemoryService\n\n\nasync def _safe_close(\n    service: MemoryService,\n    logger: logging.Logger,\n    context_name: str,\n) -> None:\n    \"\"\"Close a MemoryService, logging but not raising on failure.\n\n    Ensures CONFIG_PATH restoration (or other finally-block cleanup)\n    always runs even if close() raises.\n    \"\"\"\n    try:\n        await service.close()\n    except Exception:\n        logger.warning(\n            'Error closing service during %s cleanup',\n            context_name,\n            exc_info=True,\n        )\n```\n\nRun the tests from step-1 to verify they all pass.",
       "status": "done",
-      "commit": "83a9421"
+      "commit": "c0ec152"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Run existing test_cleanup_stale_edges.py to establish green baseline before refactoring cleanup_stale_edges.py. All TestRunCleanup, TestRunCleanupCloseWarning, TestRunCleanupEnvVarRestore, and TestRunCleanupServiceLifecycle tests must pass.",
+      "status": "done",
+      "commit": "a3a59f9"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Replace inline try/except in cleanup_stale_edges.py run_cleanup() finally block (lines 133-138) with:\n\n```python\n    finally:\n        if service is not None:\n            # Catch close() errors so CONFIG_PATH restoration below always runs.\n            await _safe_close(service, logger, 'run_cleanup')\n        if config_path is not None:\n```\n\nAdd import at top of file: `from fused_memory.maintenance.utils import _safe_close`\n\nRun test_cleanup_stale_edges.py to verify all existing tests pass without modification.",
+      "status": "done",
+      "commit": "3844cab"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Run existing test_verify_zombie_edges.py to establish green baseline before refactoring verify_zombie_edges.py. All TestRunVerifyZombieEdges, TestRunVerifyZombieEdgesCloseWarning, TestRunVerifyZombieEdgesEnvVarRestore tests must pass.",
+      "status": "done",
+      "commit": "943b33b"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Replace inline try/except in verify_zombie_edges.py run_verify_zombie_edges() finally block (lines 173-181) with:\n\n```python\n    finally:\n        if service is not None:\n            # Catch close() errors so CONFIG_PATH restoration below always runs.\n            await _safe_close(service, logger, 'run_verify_zombie_edges')\n        if config_path is not None:\n```\n\nAdd import at top of file: `from fused_memory.maintenance.utils import _safe_close`\n\nRun test_verify_zombie_edges.py to verify all existing tests pass without modification.",
+      "status": "done",
+      "commit": "b07f695"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Run existing test_reindex.py to establish green baseline before refactoring reindex.py. All TestRunReindex, TestRunReindexEnvVarRestore, TestRunReindexServiceLifecycle tests must pass.",
+      "status": "done",
+      "commit": "86fbe52"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Replace inline try/except in reindex.py run_reindex() finally block (lines 197-202) with:\n\n```python\n    finally:\n        if service is not None:\n            # Catch close() errors so CONFIG_PATH restoration below always runs.\n            await _safe_close(service, logger, 'run_reindex')\n        if config_path is not None:\n```\n\nAdd import at top of file: `from fused_memory.maintenance.utils import _safe_close`\n\nRun test_reindex.py to verify all existing tests pass without modification. Then run all three test files together as final regression check.",
+      "status": "done",
+      "commit": "3c8fca4"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Place test at end of TestSearch class, immediately after test_none_uuid_edge_falls_back_to_index_in_search",
-      "rationale": "Groups related edge-case search tests together. The None-episodes test is a natural companion to the None-uuid test, both covering edge attribute edge cases through the full search path."
+      "decision": "Accept logger as a parameter rather than using a module-level logger in utils.py",
+      "rationale": "Each maintenance entrypoint has its own module-level logger (e.g., fused_memory.maintenance.reindex). If _safe_close used its own logger (fused_memory.maintenance.utils), warning messages would appear under a different logger name, breaking existing caplog-based tests and changing log attribution. Passing the caller's logger preserves exact behavioral equivalence."
     },
     {
-      "decision": "Assert id == 'u-ep-none' (not fallback index '0')",
-      "rationale": "Unlike EdgeWithoutUuid which lacks a uuid attribute entirely and falls back to str(index), EdgeWithNoneEpisodes has uuid='u-ep-none'. The search path should use this uuid as the result id."
+      "decision": "Use %s formatting instead of f-string for the warning message",
+      "rationale": "Python logging best practice: logger.warning('...%s...', arg) defers string formatting to the logging framework, which avoids formatting cost when the log level is disabled. It also matches the style used in verify_zombie_edges.py (lines 178-180) which already uses %s-style for its log messages."
     },
     {
-      "decision": "No implementation changes expected \u2014 test-only task",
-      "rationale": "The unit test already proves _build_edge_dict handles episodes=None. The integration test is purely for coverage of the full search() \u2192 _search_graphiti \u2192 _build_edge_dict pipeline with this edge case. Step 2 is a verification-only step."
+      "decision": "Keep the comment '# Catch close() errors so CONFIG_PATH restoration below always runs.' above each call site",
+      "rationale": "The task description explicitly requests this. The comment explains WHY _safe_close is used at this specific location \u2014 it's about the control flow relationship between close() and CONFIG_PATH restoration, not about what _safe_close does internally."
+    },
+    {
+      "decision": "Do not modify existing test files",
+      "rationale": "Mock paths are object-level (mock_service.close), not module-import paths. Logger names are preserved via parameter passing. Warning messages are identical (Python's LogRecord.getMessage() applies %s formatting). All 3 test files were manually verified to require zero changes."
+    },
+    {
+      "decision": "Use TYPE_CHECKING guard for MemoryService import in utils.py",
+      "rationale": "Avoids importing MemoryService at runtime (which pulls in heavy dependencies like graphiti_core). The function accepts any object with an async close() method, so the type hint is purely for documentation/IDE support."
+    },
+    {
+      "decision": "Name the function _safe_close with leading underscore",
+      "rationale": "This is an internal helper, not part of the public maintenance API. The underscore signals it's a private utility used by the run_* entrypoints. Matches the naming convention in the task description."
     }
   ],
   "reuse": [
     {
-      "what": "EdgeWithNoneEpisodes fixture",
-      "where": "fused-memory/tests/conftest.py:58",
-      "how": "Import from tests.conftest and instantiate with defaults \u2014 same pattern used by the unit test at line 967"
+      "what": "Identical try/except close pattern from all three entrypoints",
+      "where": "reindex.py:197-202, cleanup_stale_edges.py:133-138, verify_zombie_edges.py:173-181",
+      "how": "The 4-line try/except block is extracted verbatim into _safe_close(). The context_name parameter replaces the hardcoded function name in each warning message."
     },
     {
-      "what": "test_none_uuid_edge_falls_back_to_index_in_search pattern",
-      "where": "fused-memory/tests/test_memory_service.py:478-499",
-      "how": "Mirror the exact test structure: mock graphiti.search with the edge fixture, mock mem0.search with empty results, call service.search(), assert on result fields with descriptive f-string messages"
+      "what": "Existing test infrastructure (conftest.py mock_config fixture, pytest-asyncio)",
+      "where": "fused-memory/tests/conftest.py",
+      "how": "New test_maintenance_utils.py uses the same pytest.mark.asyncio, AsyncMock, and caplog patterns established in the existing maintenance test files."
     },
     {
-      "what": "service fixture with mocked backends",
-      "where": "fused-memory/tests/test_memory_service.py:12-39",
-      "how": "Use the existing service fixture \u2014 it already mocks graphiti and mem0 with AsyncMock. Override graphiti.search and mem0.search in the test body (same pattern as line 489-490)"
+      "what": "AsyncMock + caplog test pattern from TestRunCleanupCloseWarning and TestRunVerifyZombieEdgesCloseWarning",
+      "where": "test_cleanup_stale_edges.py:503-544, test_verify_zombie_edges.py:584-621",
+      "how": "The new _safe_close tests follow the same pattern: set service.close to raise via side_effect, call the function, check caplog for WARNING records with expected message content."
     }
   ],
-  "_session_id": "152-da01523c",
-  "_created_at": "2026-03-25T01:02:07.466392+00:00"
+  "_session_id": "150-d1f0eba3",
+  "_created_at": "2026-03-25T01:04:16.089579+00:00"
 }
