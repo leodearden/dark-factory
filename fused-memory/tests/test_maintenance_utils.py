@@ -56,8 +56,8 @@ class TestSafeClose:
 
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warning_records, 'Expected at least one WARNING record'
-        assert warning_records[0].exc_info is not None, (
-            'Expected exc_info to be set on the WARNING record'
+        assert warning_records[0].exc_info[0] is ValueError, (
+            'Expected exc_info to capture a ValueError on the WARNING record'
         )
 
     @pytest.mark.asyncio
