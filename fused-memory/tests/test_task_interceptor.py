@@ -433,3 +433,80 @@ async def test_background_tasks_retained_for_bulk_operations(taskmaster, reconci
     await asyncio.sleep(0)
 
     assert len(interceptor._background_tasks) == 0
+
+
+# ── Tests for auto-commit scheduling ────────────────────────────────
+
+
+@pytest.fixture
+def committer():
+    c = AsyncMock()
+    c.commit = AsyncMock()
+    return c
+
+
+@pytest.fixture
+def interceptor_with_committer(taskmaster, reconciler, event_buffer, committer):
+    return TaskInterceptor(taskmaster, reconciler, event_buffer, committer)
+
+
+@pytest.mark.asyncio
+async def test_write_methods_schedule_commit(interceptor_with_committer, committer):
+    """All 9 write methods should fire a commit."""
+    i = interceptor_with_committer
+    pr = '/project'
+
+    await i.set_task_status('1', 'in-progress', pr)
+    await i.add_task(pr, prompt='T')
+    await i.update_task('1', pr, prompt='U')
+    await i.add_subtask('1', pr, title='S')
+    await i.remove_task('1', pr)
+    await i.add_dependency('2', '1', pr)
+    await i.remove_dependency('2', '1', pr)
+    await i.expand_task('1', pr)
+    await i.parse_prd('prd.md', pr)
+
+    # Let background tasks run
+    await asyncio.sleep(0)
+
+    assert committer.commit.call_count == 9
+    # Verify project_root is always passed
+    for call in committer.commit.call_args_list:
+        assert call[0][0] == pr
+
+
+@pytest.mark.asyncio
+async def test_reads_do_not_schedule_commit(taskmaster, event_buffer, committer):
+    """get_tasks and get_task should not trigger commits."""
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer, committer)
+    await interceptor.get_tasks('/project')
+    await interceptor.get_task('1', '/project')
+    committer.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_noop_status_change_no_commit(taskmaster, reconciler, event_buffer, committer):
+    """Same-status no-op should not schedule a commit."""
+    taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, committer)
+    result = await interceptor.set_task_status('1', 'done', '/project')
+    assert result.get('no_op') is True
+    committer.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_no_committer_still_works(taskmaster, event_buffer):
+    """task_committer=None should not break any write methods."""
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer, None)
+    result = await interceptor.add_task('/project', prompt='T')
+    assert result == {'id': '2', 'title': 'New Task'}
+
+
+@pytest.mark.asyncio
+async def test_terminal_state_rejection_no_commit(taskmaster, reconciler, event_buffer, committer):
+    """Terminal state guard (done->blocked) should not schedule a commit."""
+    taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, committer)
+    result = await interceptor.set_task_status('1', 'blocked', '/project')
+    assert result.get('success') is False
+    committer.commit.assert_not_called()

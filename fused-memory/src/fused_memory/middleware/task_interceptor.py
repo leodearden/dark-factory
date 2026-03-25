@@ -16,6 +16,7 @@ from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 if TYPE_CHECKING:
+    from fused_memory.middleware.task_file_committer import TaskFileCommitter
     from fused_memory.reconciliation.targeted import TargetedReconciler
 
 logger = logging.getLogger(__name__)
@@ -32,10 +33,12 @@ class TaskInterceptor:
         taskmaster: TaskmasterBackend | None,
         targeted_reconciler: 'TargetedReconciler | None',
         event_buffer: EventBuffer,
+        task_committer: 'TaskFileCommitter | None' = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
         self.buffer = event_buffer
+        self.task_committer = task_committer
         self._background_tasks: set[asyncio.Task] = set()
 
     async def _ensure_taskmaster(self) -> TaskmasterBackend:
@@ -66,6 +69,27 @@ class TaskInterceptor:
         exc = task.exception()
         if exc:
             logger.error(f'Background reconciliation failed: {exc}')
+
+    def _schedule_commit(self, project_root: str, operation: str) -> None:
+        """Fire-and-forget auto-commit of tasks.json."""
+        if self.task_committer is None:
+            return
+        task = asyncio.create_task(
+            self.task_committer.commit(project_root, operation),
+            name=f'auto-commit-{operation}',
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(lambda t: self._background_tasks.discard(t))
+        task.add_done_callback(self._on_commit_done)
+
+    @staticmethod
+    def _on_commit_done(task: asyncio.Task) -> None:
+        """Callback for fire-and-forget commit tasks."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            logger.error(f'Background auto-commit failed: {exc}')
 
     # ── Status transitions (with targeted reconciliation) ──────────────
 
@@ -108,6 +132,7 @@ class TaskInterceptor:
             {'task_id': task_id, 'old_status': old_status, 'new_status': status},
         )
         await self.buffer.push(event)
+        self._schedule_commit(project_root, f'set_task_status({task_id}={status})')
 
         # 6. Targeted reconciliation for trigger statuses (fire-and-forget)
         if status in self.STATUS_TRIGGERS and self.reconciler:
@@ -149,6 +174,7 @@ class TaskInterceptor:
             {'parent_task_id': task_id, 'operation': 'expand_task'},
         )
         await self.buffer.push(event)
+        self._schedule_commit(project_root, f'expand_task({task_id})')
 
         if self.reconciler:
             task = asyncio.create_task(
@@ -183,6 +209,7 @@ class TaskInterceptor:
             {'input_path': input_path, 'operation': 'parse_prd'},
         )
         await self.buffer.push(event)
+        self._schedule_commit(project_root, 'parse_prd')
 
         if self.reconciler:
             task = asyncio.create_task(
@@ -211,6 +238,7 @@ class TaskInterceptor:
             {'operation': 'add_task'},
         )
         await self.buffer.push(event)
+        self._schedule_commit(project_root, 'add_task')
         return result
 
     async def update_task(
@@ -226,6 +254,7 @@ class TaskInterceptor:
             {'task_id': task_id, 'operation': 'update_task'},
         )
         await self.buffer.push(event)
+        self._schedule_commit(project_root, f'update_task({task_id})')
         return result
 
     async def add_subtask(
@@ -241,6 +270,7 @@ class TaskInterceptor:
             {'parent_id': parent_id, 'operation': 'add_subtask'},
         )
         await self.buffer.push(event)
+        self._schedule_commit(project_root, f'add_subtask({parent_id})')
         return result
 
     async def remove_task(
@@ -254,6 +284,7 @@ class TaskInterceptor:
             {'task_id': task_id, 'operation': 'remove_task'},
         )
         await self.buffer.push(event)
+        self._schedule_commit(project_root, f'remove_task({task_id})')
         return result
 
     async def add_dependency(
@@ -273,6 +304,7 @@ class TaskInterceptor:
             {'task_id': task_id, 'depends_on': depends_on, 'operation': 'add_dependency'},
         )
         await self.buffer.push(event)
+        self._schedule_commit(project_root, f'add_dependency({task_id}<-{depends_on})')
         return result
 
     async def remove_dependency(
@@ -292,6 +324,7 @@ class TaskInterceptor:
             {'task_id': task_id, 'depends_on': depends_on, 'operation': 'remove_dependency'},
         )
         await self.buffer.push(event)
+        self._schedule_commit(project_root, f'remove_dependency({task_id}<-{depends_on})')
         return result
 
     # ── Pure reads (direct pass-through) ───────────────────────────────

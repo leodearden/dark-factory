@@ -148,7 +148,10 @@ async def run_server():
                 memory_service, taskmaster, journal, config, event_buffer,
             )
 
-        task_interceptor = TaskInterceptor(taskmaster, targeted, event_buffer)
+        from fused_memory.middleware.task_file_committer import TaskFileCommitter
+
+        task_committer = TaskFileCommitter()
+        task_interceptor = TaskInterceptor(taskmaster, targeted, event_buffer, task_committer)
 
         # Full reconciliation harness (background loop)
         reconciliation_harness = ReconciliationHarness(
@@ -158,12 +161,14 @@ async def run_server():
         logger.info('  Reconciliation: enabled (background loop started)')
     else:
         # Always create task_interceptor for tool registration
+        from fused_memory.middleware.task_file_committer import TaskFileCommitter
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.event_buffer import EventBuffer
 
         event_buffer = EventBuffer(db_path=None)
         await event_buffer.initialize()
-        task_interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+        task_committer = TaskFileCommitter()
+        task_interceptor = TaskInterceptor(taskmaster, None, event_buffer, task_committer)
 
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(memory_service, task_interceptor, write_journal)
