@@ -2631,11 +2631,11 @@
         "description": "Hoist inline imports and add missing test coverage in maintenance utils tests. From review suggestions on task 144.",
         "details": "1. In fused-memory/tests/test_maintenance_utils.py: hoist `from fused_memory.maintenance._utils import override_config_path` and `import os` to module level, removing all 5+4 inline copies.\n2. Add exception-path test for override_config_path with a prior CONFIG_PATH value — assert restoration after exception.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T22:24:02.755Z"
+        "updatedAt": "2026-03-26T22:25:08.319Z"
       },
       {
         "id": "171",
@@ -2892,7 +2892,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T22:25:08.263Z",
+      "lastModified": "2026-03-26T22:25:08.319Z",
       "taskCount": 170,
       "completedCount": 124,
       "tags": [
