@@ -664,6 +664,18 @@ class TestGetEntity:
         )
 
     @pytest.mark.asyncio
+    async def test_default_project_id_is_main(self, service):
+        """get_entity uses project_id='main' when none is provided."""
+        await service.get_entity(name='Foo')
+
+        service.graphiti.search_nodes.assert_called_once_with(
+            query='Foo', group_ids=['main'], max_nodes=5
+        )
+        service.graphiti.search.assert_called_once_with(
+            query='Foo', group_ids=['main'], num_results=10
+        )
+
+    @pytest.mark.asyncio
     async def test_empty_results(self, service):
         """get_entity returns empty nodes and edges when both backends return []."""
         result = await service.get_entity(name='nonexistent', project_id='test')
