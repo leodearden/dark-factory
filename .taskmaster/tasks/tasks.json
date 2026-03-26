@@ -2145,11 +2145,11 @@
         "description": "In MemoryService.get_entity(), search_nodes() and search() are awaited sequentially but are independent I/O calls to Graphiti. Use asyncio.gather to run both queries in parallel:\n  nodes, edges = await asyncio.gather(self.graphiti.search_nodes(...), self.graphiti.search(...))\nThis is a pre-existing pattern also present in _search_graphiti() — both sites could be updated.\n\n## memory_hints\n- search: \"asyncio.gather concurrent search memory_service get_entity\"\n- search: \"sequential async calls search_nodes search Graphiti\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T07:14:55.520Z"
+        "updatedAt": "2026-03-26T07:19:26.648Z"
       },
       {
         "id": "133",
@@ -2489,7 +2489,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T07:14:56.023Z",
+      "lastModified": "2026-03-26T07:19:26.649Z",
       "taskCount": 137,
       "completedCount": 117,
       "tags": [
