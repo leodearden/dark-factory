@@ -16,7 +16,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle, mcp_call
 from orchestrator.review_checkpoint import ReviewCheckpoint
-from orchestrator.scheduler import Scheduler
+from orchestrator.scheduler import Scheduler, files_to_modules
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -481,9 +481,25 @@ Output JSON matching the schema. Every task must appear in the output.
                 if modules:
                     metadata['modules'] = modules
                 await self.scheduler.update_task(task_id, json.dumps(metadata))
+                # Also populate in-memory cache (update_task metadata persistence
+                # is broken — taskmaster lacks an update_task tool)
+                depth = self.config.lock_depth
+                if files:
+                    derived = files_to_modules(files, depth)
+                    if derived:
+                        self.scheduler._module_cache[task_id] = derived
+                elif modules:
+                    from orchestrator.scheduler import normalize_lock
+                    self.scheduler._module_cache[task_id] = [
+                        normalize_lock(m, depth) for m in modules
+                    ]
                 tagged_count += 1
 
         logger.info(f'Tagged {tagged_count}/{len(untagged)} tasks with module metadata')
+        logger.info(f'Module cache has {len(self.scheduler._module_cache)} entries')
+        if self.scheduler._module_cache:
+            sample = dict(list(self.scheduler._module_cache.items())[:3])
+            logger.info(f'Module cache sample: {sample}')
 
     async def _recover_crashed_tasks(self) -> None:
         """Scan surviving worktrees and recover plans with completed work.

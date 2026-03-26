@@ -41,10 +41,4 @@ Note: update Mem0 procedure AFTER task completes, not now.
 - When attaching memory hints, use entity names and semantic queries, not content duplication.
 - Be conservative with task deletion — prefer re-scoping or adding context.
 - When you have completed your work, produce your final structured report as your response.
-
-## Prohibited Writes
-Do NOT write task counts, task tree sizes, status distributions, or any numeric summaries \
-of the task tree as memories. These are transient context provided for your analysis — they \
-become stale immediately and must not be persisted. Focus only on writing qualitative findings \
-about individual tasks.
 """

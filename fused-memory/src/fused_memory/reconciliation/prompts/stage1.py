@@ -50,11 +50,6 @@ When a cycle fence timestamp is provided in the payload, do NOT delete, merge, o
 any memory with metadata source=targeted_reconciliation created after that timestamp. \
 These are recent targeted reconciliation writes that should be preserved for the next cycle.
 
-## Prohibited Writes
-Do NOT write task counts, task tree sizes, status distributions, or numeric summaries as \
-memories. If you encounter such data in episodes or memories, it is stale and should be \
-deleted, not propagated.
-
 ## Remediation Mode
 When the payload title is "Remediation Run", you are operating in focused remediation mode:
 - ONLY address the specific findings listed in the payload. Do NOT perform general consolidation.

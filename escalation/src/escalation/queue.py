@@ -75,7 +75,7 @@ class EscalationQueue:
             return None
         try:
             return Escalation.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError) as e:
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
             logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
             return None
 
@@ -94,7 +94,7 @@ class EscalationQueue:
                 if level is not None and esc.level != level:
                     continue
                 results.append(esc)
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, TypeError):
                 continue
         return results
 
@@ -106,7 +106,7 @@ class EscalationQueue:
                 esc = Escalation.from_json(path.read_text())
                 if esc.status == 'pending':
                     results.append(esc)
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, TypeError):
                 continue
         return results
 

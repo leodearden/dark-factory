@@ -756,7 +756,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
             # Advance main ref atomically
             assert merge_result.merge_commit is not None
-            if not await self.git_ops.advance_main(merge_result.merge_commit):
+            if not await self.git_ops.advance_main(merge_result.merge_commit, merge_wt):
                 await self.git_ops.cleanup_merge_worktree(merge_wt)
                 reason = 'Main branch advanced during merge; retry needed'
                 self._write_merge_failure_review('merge_ff_failed', reason)
@@ -789,7 +789,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 _, merge_sha, _ = await _run(
                     ['git', 'rev-parse', 'HEAD'], cwd=merge_wt,
                 )
-                if not await self.git_ops.advance_main(merge_sha):
+                if not await self.git_ops.advance_main(merge_sha, merge_wt):
                     await self.git_ops.cleanup_merge_worktree(merge_wt)
                     reason = 'Main advanced during conflict resolution'
                     self._write_merge_failure_review('merge_ff_failed', reason)

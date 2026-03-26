@@ -1,6 +1,9 @@
 # Dark Factory — project-specific orchestrator overrides.
 # Core defaults are in the orchestrator package (defaults.yaml).
 
+# Reduced concurrency — single token gets 401 auth errors at 12 concurrent
+max_concurrent_tasks: 4
+
 # Verification commands (dark-factory multi-subproject layout)
 test_command: "pytest"
 lint_command: "ruff check shared escalation fused-memory orchestrator dashboard"
@@ -12,16 +15,7 @@ fused_memory:
   url: "http://localhost:8002"
   project_id: "dark_factory"
   config_path: "fused-memory/config/config.yaml"
-  server_command:
-    - "uv"
-    - "run"
-    - "--project"
-    - "fused-memory"
-    - "python"
-    - "-m"
-    - "fused_memory.server.main"
-    - "--transport"
-    - "http"
+  server_command: []
 
 # Escalation — port 8102 (matches .mcp.json so interactive sessions share the server)
 escalation:

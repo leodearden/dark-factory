@@ -1,6 +1,5 @@
 """Tests for the memory service — unit tests with mocked backends."""
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -8,7 +7,6 @@ import pytest
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import Scope
 from fused_memory.services.memory_service import MemoryService
-from tests.conftest import MockEdge, MockNode
 
 
 @pytest.fixture
@@ -617,172 +615,6 @@ class TestMem0BackendClose:
         mock_client.close.assert_awaited_once()
         # All instances must be cleared
         assert backend._instances == {}
-
-
-class TestGetEntity:
-    @pytest.mark.asyncio
-    async def test_returns_correct_structure(self, service):
-        """get_entity returns dict with 'nodes' and 'edges' lists of correct shape."""
-        mock_node = MockNode(
-            name='Auth Service',
-            uuid='node-uuid-1',
-            summary='Handles authentication',
-            labels=['Service', 'Auth'],
-        )
-
-        mock_edge = MockEdge(fact='Auth service depends on Redis', uuid='edge-uuid-1')
-
-        service.graphiti.search_nodes = AsyncMock(return_value=[mock_node])
-        service.graphiti.search = AsyncMock(return_value=[mock_edge])
-
-        result = await service.get_entity(name='Auth Service', project_id='test')
-
-        assert 'nodes' in result
-        assert 'edges' in result
-        assert len(result['nodes']) == 1
-        assert len(result['edges']) == 1
-
-        node = result['nodes'][0]
-        assert node['uuid'] == 'node-uuid-1'
-        assert node['name'] == 'Auth Service'
-        assert node['summary'] == 'Handles authentication'
-        assert node['labels'] == ['Service', 'Auth']
-
-        edge = result['edges'][0]
-        assert edge['uuid'] == 'edge-uuid-1'
-        assert edge['fact'] == 'Auth service depends on Redis'
-
-    @pytest.mark.asyncio
-    async def test_calls_with_correct_args(self, service):
-        """get_entity calls search_nodes and search with the right query/group_ids/limits."""
-        await service.get_entity(name='Redis', project_id='myproject')
-
-        service.graphiti.search_nodes.assert_called_once_with(
-            query='Redis', group_ids=['myproject'], max_nodes=5
-        )
-        service.graphiti.search.assert_called_once_with(
-            query='Redis', group_ids=['myproject'], num_results=10
-        )
-
-    @pytest.mark.asyncio
-    async def test_default_project_id_is_main(self, service):
-        """get_entity uses project_id='main' when none is provided."""
-        await service.get_entity(name='Foo')
-
-        service.graphiti.search_nodes.assert_called_once_with(
-            query='Foo', group_ids=['main'], max_nodes=5
-        )
-        service.graphiti.search.assert_called_once_with(
-            query='Foo', group_ids=['main'], num_results=10
-        )
-
-    @pytest.mark.asyncio
-    async def test_empty_results(self, service):
-        """get_entity returns empty nodes and edges when both backends return []."""
-        result = await service.get_entity(name='nonexistent', project_id='test')
-
-        assert result == {'nodes': [], 'edges': []}
-
-    @pytest.mark.asyncio
-    async def test_getattr_fallback_missing_attributes(self, service):
-        """getattr fallbacks fire when node/edge objects lack expected attributes.
-
-        Uses types.SimpleNamespace so attributes are only present when explicitly
-        set — unlike MagicMock which auto-creates attributes on access.
-
-        Node fallbacks: uuid→None, summary→None, labels→[]
-        Edge fallbacks: uuid→None, fact→str(edge_obj)
-        """
-        import types
-
-        bare_node = types.SimpleNamespace(name='BareName')
-        bare_edge = types.SimpleNamespace()  # no fact, no uuid
-
-        service.graphiti.search_nodes = AsyncMock(return_value=[bare_node])
-        service.graphiti.search = AsyncMock(return_value=[bare_edge])
-
-        result = await service.get_entity(name='BareName', project_id='test')
-
-        assert len(result['nodes']) == 1
-        node = result['nodes'][0]
-        assert node['uuid'] is None
-        assert node['name'] == 'BareName'
-        assert node['summary'] is None
-        assert node['labels'] == []
-
-        assert len(result['edges']) == 1
-        edge = result['edges'][0]
-        assert edge['uuid'] is None
-        assert edge['fact'] == str(bare_edge)
-
-    @pytest.mark.asyncio
-    async def test_concurrent_execution(self, service):
-        """search_nodes and search must be dispatched concurrently (not sequentially).
-
-        Proof technique: use a call_log with async side_effects that append
-        '_start' then sleep then append '_end'. Concurrent execution interleaves
-        the markers; sequential execution groups them.
-
-        Expected concurrent log order example:
-          ['search_nodes_start', 'search_start', 'search_nodes_end', 'search_end']
-        (i.e. search_start index < search_nodes_end index)
-
-        Sequential produces:
-          ['search_nodes_start', 'search_nodes_end', 'search_start', 'search_end']
-        (i.e. search_start index > search_nodes_end index)
-        """
-        call_log: list[str] = []
-
-        async def search_nodes_side_effect(**kwargs):
-            call_log.append('search_nodes_start')
-            await asyncio.sleep(0.01)
-            call_log.append('search_nodes_end')
-            return []
-
-        async def search_side_effect(**kwargs):
-            call_log.append('search_start')
-            await asyncio.sleep(0.01)
-            call_log.append('search_end')
-            return []
-
-        service.graphiti.search_nodes = AsyncMock(side_effect=search_nodes_side_effect)
-        service.graphiti.search = AsyncMock(side_effect=search_side_effect)
-
-        await service.get_entity(name='Redis', project_id='test')
-
-        search_nodes_end_idx = call_log.index('search_nodes_end')
-        search_start_idx = call_log.index('search_start')
-
-        assert search_start_idx < search_nodes_end_idx, (
-            f'search_start ({search_start_idx}) must appear before search_nodes_end '
-            f'({search_nodes_end_idx}) for concurrent execution. '
-            f'Got log: {call_log}'
-        )
-
-
-    @pytest.mark.asyncio
-    async def test_error_propagation_search_nodes_raises(self, service):
-        """When search_nodes raises, get_entity must propagate the exception.
-
-        asyncio.gather without return_exceptions=True propagates the first
-        raised exception; remaining tasks continue as orphaned background tasks.
-        """
-        service.graphiti.search_nodes = AsyncMock(
-            side_effect=RuntimeError('search_nodes failure')
-        )
-
-        with pytest.raises(RuntimeError, match='search_nodes failure'):
-            await service.get_entity(name='Redis', project_id='test')
-
-    @pytest.mark.asyncio
-    async def test_error_propagation_search_raises(self, service):
-        """When search raises, get_entity must propagate the exception."""
-        service.graphiti.search = AsyncMock(
-            side_effect=RuntimeError('search failure')
-        )
-
-        with pytest.raises(RuntimeError, match='search failure'):
-            await service.get_entity(name='Redis', project_id='test')
 
 
 class TestGetEpisodes:

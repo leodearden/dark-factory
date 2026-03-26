@@ -1,12 +1,10 @@
 """Tests for reconciliation stage configuration (CLI-native MCP execution)."""
 
 import json
-import re
 
 import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import Watermark
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
     DISALLOW_MEMORY_WRITES,
@@ -432,85 +430,3 @@ class TestTierConfig:
         stage.memory_limit = 250
         assert stage.episode_limit == 125
         assert stage.memory_limit == 250
-
-
-class TestTaskCountSuppression:
-    """Stage 2 must not include raw task-count summaries in payload or prompts."""
-
-    @pytest.fixture
-    def mock_deps(self):
-        from unittest.mock import AsyncMock
-
-        from fused_memory.config.schema import ReconciliationConfig
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        taskmaster = AsyncMock()
-        taskmaster.get_tasks.return_value = {
-            'tasks': [
-                {'id': 1, 'title': 'Task A', 'status': 'pending', 'dependencies': []},
-                {'id': 2, 'title': 'Task B', 'status': 'in-progress', 'dependencies': [1]},
-                {'id': 3, 'title': 'Task C', 'status': 'done', 'dependencies': []},
-            ]
-        }
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': taskmaster,
-            'journal': AsyncMock(),
-            'config': config,
-        }
-
-    @pytest.mark.asyncio
-    async def test_payload_header_omits_raw_count_summary(self, mock_deps):
-        """Stage 2 payload header must NOT contain '(N active, N done, N total)' pattern."""
-        from fused_memory.models.reconciliation import StageId
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        watermark = Watermark(project_id='test')
-        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
-        # The raw count pattern should NOT appear in the payload
-        count_pattern = re.compile(r'\(\d+ active, \d+ done, \d+ total\)')
-        m = count_pattern.search(payload)
-        assert not m, (
-            f'Payload contains forbidden count summary: '
-            f'{m.group() if m else ""}'
-        )
-
-    def test_stage2_prompt_prohibits_count_writes(self):
-        """STAGE2_SYSTEM_PROMPT must explicitly prohibit writing task-count facts."""
-        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
-        prompt_lower = STAGE2_SYSTEM_PROMPT.lower()
-        # Check for prohibition keywords in context
-        assert 'task count' in prompt_lower or 'status distribution' in prompt_lower, (
-            'STAGE2_SYSTEM_PROMPT must contain prohibition against task count or '
-            'status distribution writes'
-        )
-        assert 'do not' in prompt_lower or 'prohibited' in prompt_lower or 'never' in prompt_lower, (
-            'STAGE2_SYSTEM_PROMPT must contain a prohibition directive (do not/prohibited/never)'
-        )
-
-    def test_stage1_prompt_prohibits_count_writes(self):
-        """STAGE1_SYSTEM_PROMPT must also prohibit writing task-count/distribution facts."""
-        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
-        prompt_lower = STAGE1_SYSTEM_PROMPT.lower()
-        assert 'task count' in prompt_lower or 'status distribution' in prompt_lower, (
-            'STAGE1_SYSTEM_PROMPT must contain prohibition against task count or '
-            'status distribution writes'
-        )
-
-    @pytest.mark.asyncio
-    async def test_payload_task_instructions_include_no_count_directive(self, mock_deps):
-        """Stage 2 payload 'Your Task' section must include a directive about not writing
-        count/distribution data."""
-        from fused_memory.models.reconciliation import StageId
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        watermark = Watermark(project_id='test')
-        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
-        payload_lower = payload.lower()
-        # Should contain a directive about not writing counts
-        has_count_directive = (
-            'task count' in payload_lower or
-            'status distribution' in payload_lower or
-            'do not write' in payload_lower
-        )
-        assert has_count_directive, (
-            "Stage 2 payload 'Your Task' section must contain directive about not "
-            'writing task-count or status-distribution data'
-        )

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import uuid as uuid_mod
 from datetime import UTC, datetime
 
@@ -17,7 +18,6 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
-from fused_memory.utils.validation import require_project_root
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,10 @@ class TargetedReconciler:
         project_root: str,
     ) -> dict:
         """Run targeted reconciliation for a single task state transition."""
-        require_project_root(project_root)
+        if not project_root or not os.path.isabs(project_root):
+            raise ValueError(
+                f'project_root must be a non-empty absolute path, got: {project_root!r}'
+            )
         run_id = str(uuid_mod.uuid4())
         start = datetime.now(UTC)
 
@@ -349,7 +352,10 @@ class TargetedReconciler:
         project_root: str,
     ) -> dict:
         """Reconcile after expand_task or parse_prd — cross-reference against knowledge."""
-        require_project_root(project_root)
+        if not project_root or not os.path.isabs(project_root):
+            raise ValueError(
+                f'project_root must be a non-empty absolute path, got: {project_root!r}'
+            )
         result: dict = {'parent_task_id': parent_task_id, 'actions': []}
 
         try:

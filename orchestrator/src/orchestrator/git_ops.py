@@ -439,7 +439,7 @@ class GitOps:
         )
         return sha
 
-    async def advance_main(self, merge_sha: str) -> bool:
+    async def advance_main(self, merge_sha: str, merge_worktree: Path | None = None) -> bool:
         """Advance main branch ref to *merge_sha* atomically.
 
         Uses ``update-ref`` so the project_root working tree is never touched.
@@ -467,6 +467,35 @@ class GitOps:
              self.config.main_branch, merge_sha],
             cwd=self.project_root,
         )
+        if rc != 0 and merge_worktree is not None:
+            # Main advanced (e.g. from taskmaster auto-commits).
+            # Rebase the merge commit onto current main and retry.
+            logger.info(
+                f'Main advanced past {merge_sha[:8]} — rebasing merge commit'
+            )
+            rebase_rc, _, rebase_err = await _run(
+                ['git', 'rebase', self.config.main_branch],
+                cwd=merge_worktree,
+            )
+            if rebase_rc == 0:
+                _, new_sha, _ = await _run(
+                    ['git', 'rev-parse', 'HEAD'], cwd=merge_worktree,
+                )
+                merge_sha = new_sha.strip()
+                try:
+                    await _assert_no_task_dir(
+                        merge_sha, self.project_root, 'advance_main(rebased)',
+                    )
+                except RuntimeError as e:
+                    logger.error(str(e))
+                    return False
+                rc, _, _ = await _run(
+                    ['git', 'merge-base', '--is-ancestor',
+                     self.config.main_branch, merge_sha],
+                    cwd=self.project_root,
+                )
+            else:
+                logger.warning(f'Rebase failed: {rebase_err}')
         if rc != 0:
             logger.warning(
                 f'Cannot fast-forward: {merge_sha[:8]} is not a descendant '

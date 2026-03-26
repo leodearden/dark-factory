@@ -799,17 +799,15 @@ class MemoryService:
         project_id: str = 'main',
     ) -> dict:
         """Entity lookup in Graphiti — returns nodes + edges."""
-        nodes, edges = await asyncio.gather(
-            self.graphiti.search_nodes(
-                query=name,
-                group_ids=[project_id],
-                max_nodes=5,
-            ),
-            self.graphiti.search(
-                query=name,
-                group_ids=[project_id],
-                num_results=10,
-            ),
+        nodes = await self.graphiti.search_nodes(
+            query=name,
+            group_ids=[project_id],
+            max_nodes=5,
+        )
+        edges = await self.graphiti.search(
+            query=name,
+            group_ids=[project_id],
+            num_results=10,
         )
 
         node_data = []
