@@ -2211,13 +2211,13 @@
         "description": "Test quality improvements for the TestProjectIdValidation class in test_stages.py.\n\nThree issues:\n1. **Duplicated fakes** — `fake_assemble_payload` and `fake_run_stage_via_cli` are defined identically (word-for-word) in three tests: test_run_allows_matching_watermark_project_id, test_run_allows_empty_watermark_project_id, and test_recon_context_includes_project_id. Extract into a shared fixture or helper method on the class.\n2. **Weak mismatch assertion** — test_run_raises_on_watermark_project_id_mismatch only asserts match='project_a' but not 'project_b'. Add assertion that both project_ids appear in the error message.\n3. **Missing return value assertions** — The two positive-path tests (matching and empty watermark) assert only \"no exception raised\" but never capture/check the StageReport return value. Capture result and assert `result is not None` or check specific fields.\n\nFiles: fused-memory/tests/test_stages.py\n\nmemory_hints:\n- search: \"TestProjectIdValidation test_stages.py fixture extraction\"\n- entity: \"TestProjectIdValidation\"",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [
           "135"
         ],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T23:38:07.739Z"
+        "updatedAt": "2026-03-26T23:43:07.778Z"
       },
       {
         "id": "138",
@@ -2914,7 +2914,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T23:41:48.250Z",
+      "lastModified": "2026-03-26T23:43:07.778Z",
       "taskCount": 172,
       "completedCount": 128,
       "tags": [
