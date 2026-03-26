@@ -2587,6 +2587,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 167,
+        "title": "Clean up test_stages.py: redundant import, misleading test names, meta-tests",
+        "description": "Fix convention violations and misleading test names in fused-memory/tests/test_stages.py. From review suggestions on task 142.",
+        "details": "1. Remove the local `from unittest.mock import AsyncMock` on line 307 — the module-level import on line 4 is sufficient.\n2. Either remove TestSharedFixtureContract entirely (lines 300-316) or move it adjacent to the fixture definitions near the top of the file. The fixture implementation is self-documenting.\n3. Rename test_default_limits to reflect actual test semantics (e.g. test_tier_limits_with_default_class_values) or add a comment noting the shared fixture config differs from framework defaults.\n4. Rename test_sonnet_tier_limits to test_limits_are_mutable, or replace it with a test that exercises _select_tier() with appropriate buffer sizes to verify actual sonnet tier selection.",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -2599,7 +2610,7 @@
       ],
       "created": "2026-03-26T10:25:51.987Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-26T10:25:51.989Z"
+      "updated": "2026-03-26T10:25:59.200Z"
     }
   }
 }
