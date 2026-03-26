@@ -78,7 +78,8 @@ async def test_on_task_done_fast_path_write(reconciler, mock_memory_service):
     """Done transition writes completion fact immediately before search/verify."""
     task_before = {'id': '1', 'title': 'Add tests', 'status': 'in-progress', 'description': 'Test suite'}
     result = await reconciler.reconcile_task(
-        task_id='1', transition='done', project_id='test-project', task_before=task_before
+        task_id='1', transition='done', project_id='test-project', task_before=task_before,
+        project_root='/tmp/test-project',
     )
     # First call should be the fast-path write (before any search)
     calls = mock_memory_service.add_memory.call_args_list
@@ -93,7 +94,8 @@ async def test_on_task_done_passes_causation_id(reconciler, mock_memory_service)
     """All memory calls during targeted recon pass causation_id=run_id."""
     task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
     await reconciler.reconcile_task(
-        task_id='1', transition='done', project_id='test-project', task_before=task_before
+        task_id='1', transition='done', project_id='test-project', task_before=task_before,
+        project_root='/tmp/test-project',
     )
     for call in mock_memory_service.add_memory.call_args_list:
         assert call.kwargs.get('causation_id') is not None, (
@@ -109,7 +111,8 @@ async def test_on_task_done_logs_run_actions(reconciler, journal):
     """Targeted recon logs run_actions to journal."""
     task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
     await reconciler.reconcile_task(
-        task_id='1', transition='done', project_id='test-project', task_before=task_before
+        task_id='1', transition='done', project_id='test-project', task_before=task_before,
+        project_root='/tmp/test-project',
     )
     # Find the run
     runs = await journal.get_recent_runs('test-project', limit=1)
@@ -128,7 +131,8 @@ async def test_on_task_done_sparse_knowledge(reconciler, mock_memory_service):
     task_before = {'id': '1', 'title': 'Add tests', 'status': 'in-progress', 'description': 'Test suite'}
 
     result = await reconciler.reconcile_task(
-        task_id='1', transition='done', project_id='test-project', task_before=task_before
+        task_id='1', transition='done', project_id='test-project', task_before=task_before,
+        project_root='/tmp/test-project',
     )
 
     assert any(a['type'] == 'knowledge_captured' for a in result.get('actions', []))
@@ -148,6 +152,7 @@ async def test_on_task_done_rich_knowledge(reconciler, mock_memory_service):
     await reconciler.reconcile_task(
         task_id='1', transition='done', project_id='test-project',
         task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
+        project_root='/tmp/test-project',
     )
 
     reconciler.verifier.verify.assert_not_called()
@@ -166,6 +171,7 @@ async def test_on_task_done_checks_dependents(reconciler, mock_taskmaster):
     result = await reconciler.reconcile_task(
         task_id='1', transition='done', project_id='test-project',
         task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+        project_root='/tmp/test-project',
     )
 
     unblocked = [a for a in result.get('actions', []) if a['type'] == 'dependent_unblocked']
@@ -183,6 +189,7 @@ async def test_on_task_blocked_attaches_hints(reconciler, mock_memory_service, m
     result = await reconciler.reconcile_task(
         task_id='1', transition='blocked', project_id='test-project',
         task_before={'id': '1', 'title': 'Blocked task', 'status': 'in-progress'},
+        project_root='/tmp/test-project',
     )
 
     hints_actions = [a for a in result.get('actions', []) if a['type'] == 'hints_attached']
@@ -202,6 +209,7 @@ async def test_on_task_cancelled_checks_subtasks(reconciler, mock_taskmaster):
                 {'id': '1.2', 'status': 'done', 'title': 'Sub2'},
             ],
         },
+        project_root='/tmp/test-project',
     )
 
     review_actions = [a for a in result.get('actions', []) if a['type'] == 'subtasks_need_review']
@@ -219,6 +227,7 @@ async def test_on_task_deferred_same_as_blocked(reconciler, mock_memory_service,
     result = await reconciler.reconcile_task(
         task_id='1', transition='deferred', project_id='test-project',
         task_before={'id': '1', 'title': 'Deferred task', 'status': 'in-progress'},
+        project_root='/tmp/test-project',
     )
 
     hints_actions = [a for a in result.get('actions', []) if a['type'] == 'hints_attached']
@@ -233,6 +242,7 @@ async def test_reconcile_task_failure_handling(reconciler, journal):
     result = await reconciler.reconcile_task(
         task_id='1', transition='done', project_id='test-project',
         task_before={'id': '1', 'title': 'Failing', 'status': 'in-progress'},
+        project_root='/tmp/test-project',
     )
 
     # Should still return a result (no unhandled exception)
@@ -351,6 +361,7 @@ async def test_done_defers_write_during_active_cycle(
     task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
     result = await r.reconcile_task(
         task_id='1', transition='done', project_id='test-project', task_before=task_before,
+        project_root='/tmp/test-project',
     )
 
     # Memory service should NOT have been called for writes
@@ -367,6 +378,7 @@ async def test_done_writes_normally_when_no_cycle(reconciler, mock_memory_servic
     task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
     result = await reconciler.reconcile_task(
         task_id='1', transition='done', project_id='test-project', task_before=task_before,
+        project_root='/tmp/test-project',
     )
 
     # Memory service should have been called
@@ -391,6 +403,7 @@ async def test_reads_proceed_during_active_cycle(
     task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
     await r.reconcile_task(
         task_id='1', transition='done', project_id='test-project', task_before=task_before,
+        project_root='/tmp/test-project',
     )
 
     # Search should still proceed
@@ -414,6 +427,7 @@ async def test_blocked_proceeds_during_active_cycle(
     task_before = {'id': '1', 'title': 'Blocked', 'status': 'in-progress'}
     result = await r.reconcile_task(
         task_id='1', transition='blocked', project_id='test-project', task_before=task_before,
+        project_root='/tmp/test-project',
     )
 
     # Search and taskmaster update should still work
@@ -431,7 +445,43 @@ async def test_no_buffer_writes_normally(mock_memory_service, mock_taskmaster, j
     task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
     result = await r.reconcile_task(
         task_id='1', transition='done', project_id='test-project', task_before=task_before,
+        project_root='/tmp/test-project',
     )
 
     assert mock_memory_service.add_memory.call_count >= 1
     assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+# ── Validation tests (project_root required, no fallback) ─────────────
+
+
+@pytest.mark.asyncio
+async def test_reconcile_task_rejects_invalid_project_root(reconciler):
+    """reconcile_task raises ValueError when project_root is empty or relative."""
+    task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
+
+    with pytest.raises(ValueError):
+        await reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            task_before=task_before, project_root='',
+        )
+
+    with pytest.raises(ValueError):
+        await reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            task_before=task_before, project_root='relative/path',
+        )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_bulk_tasks_rejects_invalid_project_root(reconciler):
+    """reconcile_bulk_tasks raises ValueError when project_root is empty or relative."""
+    with pytest.raises(ValueError):
+        await reconciler.reconcile_bulk_tasks(
+            parent_task_id=None, project_id='test-project', project_root='',
+        )
+
+    with pytest.raises(ValueError):
+        await reconciler.reconcile_bulk_tasks(
+            parent_task_id=None, project_id='test-project', project_root='relative/path',
+        )
