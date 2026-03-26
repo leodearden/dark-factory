@@ -1093,3 +1093,96 @@ class TestRunReindexEnvVarRestore:
                 os.environ.pop('CONFIG_PATH', None)
             else:
                 os.environ['CONFIG_PATH'] = old
+
+
+# ---------------------------------------------------------------------------
+# step-3: run_reindex() service lifecycle edge cases
+# ---------------------------------------------------------------------------
+
+class TestRunReindexServiceLifecycle:
+    """run_reindex() close() and service-creation sentinel edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_close_exception_does_not_mask_original_error(self):
+        """When both reindex_and_replay and close() raise, the original error propagates."""
+        from fused_memory.maintenance.reindex import run_reindex
+
+        mock_config = MagicMock()
+        mock_service = AsyncMock()
+        mock_service.close = AsyncMock(side_effect=RuntimeError('close error'))
+
+        with (
+            patch('fused_memory.maintenance.reindex.FusedMemoryConfig', return_value=mock_config),
+            patch('fused_memory.maintenance.reindex.MemoryService', return_value=mock_service),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig'),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.reindex_and_replay = AsyncMock(side_effect=RuntimeError('original'))
+            mock_mgr_cls.return_value = mock_mgr
+
+            with pytest.raises(RuntimeError, match='original'):
+                await run_reindex()
+
+    @pytest.mark.asyncio
+    async def test_skips_close_when_service_never_created(self):
+        """When FusedMemoryConfig raises, service is None and close() is never called."""
+        from fused_memory.maintenance.reindex import run_reindex
+
+        with (
+            patch(
+                'fused_memory.maintenance.reindex.FusedMemoryConfig',
+                side_effect=RuntimeError('config failed'),
+            ),
+            patch('fused_memory.maintenance.reindex.MemoryService') as mock_svc_cls,
+        ):
+            with pytest.raises(RuntimeError, match='config failed'):
+                await run_reindex()
+
+        mock_svc_cls.assert_not_called()  # MemoryService never instantiated
+        mock_svc_cls.return_value.close.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_closes_service_when_embedder_constructor_fails(self):
+        """When OpenAIEmbedderConfig raises after service creation, close() is still called."""
+        from fused_memory.maintenance.reindex import run_reindex
+
+        mock_config = MagicMock()
+        mock_service = AsyncMock()
+
+        with (
+            patch('fused_memory.maintenance.reindex.FusedMemoryConfig', return_value=mock_config),
+            patch('fused_memory.maintenance.reindex.MemoryService', return_value=mock_service),
+            patch(
+                'fused_memory.maintenance.reindex.OpenAIEmbedderConfig',
+                side_effect=ValueError('invalid embedder config'),
+            ),
+        ):
+            with pytest.raises(ValueError, match='invalid embedder config'):
+                await run_reindex()
+
+        mock_service.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_closes_service_when_manager_constructor_fails(self):
+        """When ReindexManager raises after service creation, close() is still called."""
+        from fused_memory.maintenance.reindex import run_reindex
+
+        mock_config = MagicMock()
+        mock_service = AsyncMock()
+
+        with (
+            patch('fused_memory.maintenance.reindex.FusedMemoryConfig', return_value=mock_config),
+            patch('fused_memory.maintenance.reindex.MemoryService', return_value=mock_service),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig'),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch(
+                'fused_memory.maintenance.reindex.ReindexManager',
+                side_effect=RuntimeError('manager init failed'),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match='manager init failed'):
+                await run_reindex()
+
+        mock_service.close.assert_awaited_once()
