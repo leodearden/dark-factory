@@ -43,7 +43,7 @@ class TaskKnowledgeSync(BaseStage):
         tasks_data: dict = {}
         if self.taskmaster:
             try:
-                tasks_data = await self.taskmaster.get_tasks(project_root=self.project_id)
+                tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
             except Exception:
                 tasks_data = {}
 
