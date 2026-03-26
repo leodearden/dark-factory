@@ -2703,11 +2703,11 @@
         "description": "Reconciliation journal entry count badges are span elements with @click — not recognized as interactive by screen readers or keyboard navigation. Convert to button elements with proper aria-label, hover/focus states.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (line 153). Change span to button, add aria-label=\"Show N journal entries\", add focus:ring styles. Also add hover:bg-blue-800 for visual feedback.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T22:24:02.786Z"
+        "updatedAt": "2026-03-26T22:28:09.161Z"
       },
       {
         "id": "177",
@@ -2914,7 +2914,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T22:28:09.059Z",
+      "lastModified": "2026-03-26T22:28:09.161Z",
       "taskCount": 172,
       "completedCount": 125,
       "tags": [
