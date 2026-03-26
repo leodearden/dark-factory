@@ -146,7 +146,7 @@ async def run_server():
             burst_window_seconds=config.reconciliation.burst_window_seconds,
             burst_cooldown_seconds=config.reconciliation.burst_cooldown_seconds,
             stale_lock_seconds=config.reconciliation.stale_lock_seconds,
-            queue_stats_fn=memory_service.durable_queue.get_stats,
+            queue_stats_fn=memory_service.durable_queue.get_stats if memory_service.durable_queue else None,
         )
         await event_buffer.initialize()
 
