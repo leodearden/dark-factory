@@ -1,21 +1,28 @@
 {
-  "task_id": "153",
-  "title": "Clean up test_maintenance_utils: module-level imports and stronger assertions",
+  "task_id": "124",
+  "title": "Register update_task tool in fused-memory MCP server",
   "files": [
-    "fused-memory/tests/test_maintenance_utils.py"
+    "fused-memory/tests/test_health_endpoint.py"
   ],
   "modules": [
-    "fused-memory/tests"
+    "fused-memory/tests",
+    "fused-memory/src/fused_memory/server"
   ],
-  "analysis": "This is a test-only cleanup task targeting fused-memory/tests/test_maintenance_utils.py. The file has 6 test methods, each with an identical inline `from fused_memory.maintenance.utils import _safe_close` import (6 occurrences). All sibling test files (test_reindex.py, test_durable_queue.py, test_cleanup_stale_edges.py, etc.) use module-level imports \u2014 this is a clear project convention. Additionally, three tests have weak assertions: (1) test_does_not_raise_when_close_raises only checks no exception propagated but never verifies close was actually called, (2) test_noop_when_close_succeeds_no_warning only checks no warnings emitted but never verifies close was called, and (3) test_logs_warning_with_exc_info only asserts exc_info is not None without verifying the captured exception type. The existing _safe_close implementation (utils.py) already satisfies all stronger assertions \u2014 it calls service.close() exactly once and passes exc_info=True to logger.warning. No source code changes needed; this is purely test polish.",
+  "analysis": "The update_task tool IS ALREADY REGISTERED in tools.py at line 875 with @mcp.tool() decorator. The full three-tier implementation chain (MCP tool \u2192 TaskInterceptor middleware \u2192 TaskmasterBackend client) is intact and operational. The -32601 'Unknown tool' error reported on 2026-03-23 was caused by the systemd fused-memory service on port 8002 running stale code \u2014 not a code-level regression. The defensive always-on registration pattern (commit 3d6fe0c, ~2026-03-19) ensures all 11 task tools are unconditionally registered, returning structured errors when Taskmaster is unavailable rather than -32601. The e2fce78 simplify commit (most recent tools.py change) only touched get_entity and mem0 list_projects \u2014 no impact on update_task. There are 7 existing update_task tests in test_health_endpoint.py covering: metadata dict\u2192JSON coercion, string passthrough, None passthrough, prompt forwarding, append forwarding, error dict return, and defensive registration. Two minor test coverage gaps identified: (1) the error_type field in error responses is returned by code but never asserted in tests, (2) the tag parameter is accepted and forwarded by the tool but has no dedicated forwarding test. No production code changes are needed \u2014 only test hardening to prevent future regression.",
   "prerequisites": [
     {
       "id": "pre-1",
-      "description": "Run all 6 existing tests in test_maintenance_utils.py to establish a green baseline before making any changes",
+      "description": "Run all existing update_task tests in test_health_endpoint.py to establish green baseline: test_update_task_metadata_dict_coerced_to_json_string, test_update_task_metadata_string_passed_through, test_update_task_metadata_none_passed_through, test_update_task_prompt_forwarded_to_interceptor, test_update_task_append_true_forwarded_to_interceptor, test_update_task_interceptor_error_returns_error_dict, test_task_tools_registered_without_interceptor",
       "status": "done",
-      "commit": "8afff85",
+      "commit": null,
       "tests": [
-        "fused-memory/tests/test_maintenance_utils.py::TestSafeClose"
+        "fused-memory/tests/test_health_endpoint.py::test_update_task_metadata_dict_coerced_to_json_string",
+        "fused-memory/tests/test_health_endpoint.py::test_update_task_metadata_string_passed_through",
+        "fused-memory/tests/test_health_endpoint.py::test_update_task_metadata_none_passed_through",
+        "fused-memory/tests/test_health_endpoint.py::test_update_task_prompt_forwarded_to_interceptor",
+        "fused-memory/tests/test_health_endpoint.py::test_update_task_append_true_forwarded_to_interceptor",
+        "fused-memory/tests/test_health_endpoint.py::test_update_task_interceptor_error_returns_error_dict",
+        "fused-memory/tests/test_health_endpoint.py::test_task_tools_registered_without_interceptor"
       ]
     }
   ],
@@ -23,62 +30,65 @@
     {
       "id": "step-1",
       "type": "test",
-      "description": "Hoist import to module level: Remove the `from fused_memory.maintenance.utils import _safe_close` line from inside all 6 test method bodies (lines 16, 27, 38, 55, 72, 100) and add a single module-level import `from fused_memory.maintenance.utils import _safe_close` after the `import pytest` line. Verify all 6 tests still pass unchanged.",
-      "status": "done",
-      "commit": "2099c71"
+      "description": "Add test_update_task_tag_forwarded_to_interceptor: Call update_task via _tool_manager.call_tool with tag='v2' alongside id and project_root. Assert task_interceptor.update_task was called with tag='v2'. Place after test_update_task_append_true_forwarded_to_interceptor (after line 151) using the same mcp_server_with_tasks and task_interceptor fixtures. Test will pass immediately (characterization test \u2014 code already forwards tag).",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-2",
       "type": "test",
-      "description": "Strengthen test_does_not_raise_when_close_raises: After the `await _safe_close(service, logger, 'test_context')` call (current line 32), add `service.close.assert_awaited_once()` to verify close was actually attempted, not just that no exception propagated. Verify the test passes.",
-      "status": "done",
-      "commit": "03227de"
+      "description": "Strengthen test_update_task_interceptor_error_returns_error_dict: Add assertion `assert result['error_type'] == 'RuntimeError'` after the existing `assert 'backend unavailable' in result['error']` line (line 171). This verifies the error_type field that tools.py returns via `type(e).__name__` is present and correct. Test will pass immediately (characterization test \u2014 code already returns error_type).",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-3",
-      "type": "test",
-      "description": "Strengthen test_noop_when_close_succeeds_no_warning: After the caplog context manager block and the existing warning_records assertion, add `service.close.assert_awaited_once()` to verify close was actually called, not just that no warnings were emitted. Verify the test passes.",
-      "status": "done",
-      "commit": "e5a8fe9"
-    },
-    {
-      "id": "step-4",
-      "type": "test",
-      "description": "Strengthen test_logs_warning_with_exc_info: Change the assertion on line 64 from `assert warning_records[0].exc_info is not None` to `assert warning_records[0].exc_info[0] is ValueError` to verify the correct exception type (ValueError, matching the side_effect on line 57) is captured in the exc_info tuple. Update the assertion message accordingly. Verify the test passes.",
-      "status": "done",
-      "commit": "e68e5d5"
+      "type": "impl",
+      "description": "Run the full test_health_endpoint.py test suite to verify all existing and new tests pass. No production code changes needed \u2014 the update_task registration and implementation are already complete. This step confirms the characterization tests accurately describe the existing behavior.",
+      "status": "pending",
+      "commit": null
     }
   ],
   "design_decisions": [
     {
-      "decision": "All 4 changes applied to a single file in separate atomic steps",
-      "rationale": "Separating the import refactor from each assertion strengthening allows independent verification. If a stronger assertion unexpectedly fails, the import refactor is already safely committed."
+      "decision": "No production code changes to tools.py, task_interceptor.py, or taskmaster_client.py",
+      "rationale": "update_task is already fully registered (line 875) and implemented across all three layers. The -32601 error was a stale-service issue (systemd on port 8002 running old code), not a code regression. Adding redundant code would be misleading."
     },
     {
-      "decision": "exc_info assertion uses `exc_info[0] is ValueError` (identity check on class)",
-      "rationale": "Python logging stores exc_info as a 3-tuple (type, value, traceback) from sys.exc_info(). Index [0] is the exception class. Using `is` for identity comparison is idiomatic for type checks and more precise than isinstance, since we want to confirm the exact type, not a subclass."
+      "decision": "Characterization tests instead of red-green TDD",
+      "rationale": "Since the implementation already exists and is correct, new tests are characterization tests that document and lock existing behavior. They pass immediately, which is expected \u2014 their value is preventing future regression, not driving new implementation."
     },
     {
-      "decision": "No implementation (type: impl) steps needed \u2014 all steps are type: test",
-      "rationale": "The existing _safe_close implementation already satisfies all stronger assertions. It calls service.close() exactly once (satisfying assert_awaited_once) and passes exc_info=True to logger.warning (satisfying the ValueError type check). This task is purely test cleanup."
+      "decision": "Only two new test assertions added (tag forwarding + error_type)",
+      "rationale": "These are the only genuine gaps in the existing 7-test suite. All other parameters (id, project_root, prompt, metadata, append) and behaviors (coercion, error handling, defensive registration) are already covered. Scope discipline avoids unnecessary churn."
     },
     {
-      "decision": "Import placed after `import pytest` and before the class definition",
-      "rationale": "Following PEP 8 import ordering (stdlib, then third-party, then local) and matching the exact style seen in sibling test files like test_reindex.py and test_cleanup_stale_edges.py."
+      "decision": "Test file is the only file modified",
+      "rationale": "The task's root cause was operational (stale service), not code. Service restart is outside code scope. The test hardening ensures future code changes don't silently remove update_task."
     }
   ],
   "reuse": [
     {
-      "what": "Module-level import convention from sibling test files",
-      "where": "fused-memory/tests/test_reindex.py, test_durable_queue.py, test_cleanup_stale_edges.py",
-      "how": "All sibling tests use `from fused_memory.xxx import yyy` at module top level. Apply the same pattern: `from fused_memory.maintenance.utils import _safe_close` after the pytest import."
+      "what": "mcp_server_with_tasks fixture",
+      "where": "fused-memory/tests/test_health_endpoint.py line 37",
+      "how": "Reuse existing fixture that creates MCP server with mocked task interceptor via create_mcp_server(mock_service, task_interceptor=task_interceptor)"
     },
     {
-      "what": "AsyncMock.assert_awaited_once() pattern from existing test",
-      "where": "test_maintenance_utils.py::test_calls_service_close (line 21)",
-      "how": "The first test already uses `service.close.assert_awaited_once()`. Apply the identical assertion to test_does_not_raise_when_close_raises and test_noop_when_close_succeeds_no_warning."
+      "what": "task_interceptor fixture",
+      "where": "fused-memory/tests/test_health_endpoint.py line 30",
+      "how": "Reuse existing AsyncMock fixture with update_task pre-configured to return {'success': True}"
+    },
+    {
+      "what": "Existing parameter forwarding test pattern",
+      "where": "fused-memory/tests/test_health_endpoint.py lines 120-151",
+      "how": "Follow identical pattern: call_tool \u2192 assert_called_once \u2192 destructure call_args \u2192 assert kwargs['param'] == expected. Used by prompt and append tests."
+    },
+    {
+      "what": "Existing error assertion pattern",
+      "where": "fused-memory/tests/test_health_endpoint.py lines 159-171",
+      "how": "Extend existing test_update_task_interceptor_error_returns_error_dict with one additional assertion line for error_type field."
     }
   ],
-  "_session_id": "153-dfca4ea5",
-  "_created_at": "2026-03-25T01:23:37.818999+00:00"
+  "_session_id": "124-5d4e6bad",
+  "_created_at": "2026-03-26T07:20:36.440262+00:00"
 }
