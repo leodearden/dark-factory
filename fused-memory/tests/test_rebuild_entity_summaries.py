@@ -70,19 +70,6 @@ class TestSummaryRebuilderRebuild:
         await rebuilder.rebuild(project_id='my_project')
         mock_backend.build_communities.assert_called_once_with(group_ids=['my_project'])
 
-    @pytest.mark.asyncio
-    async def test_rebuild_passes_group_ids_as_list(self, mock_backend):
-        """group_ids is always passed as a list, even for single project."""
-        from fused_memory.maintenance.rebuild_entity_summaries import SummaryRebuilder
-        rebuilder = SummaryRebuilder(backend=mock_backend)
-        await rebuilder.rebuild(project_id='dark_factory')
-        call_kwargs = mock_backend.build_communities.call_args
-        assert call_kwargs.kwargs.get('group_ids') == ['dark_factory'] or \
-               call_kwargs.args[0] == ['dark_factory'] if call_kwargs.args else True
-        # Verify via keyword arg
-        assert mock_backend.build_communities.call_args[1].get('group_ids') == ['dark_factory'] or \
-               ('dark_factory' in str(mock_backend.build_communities.call_args))
-
 
 class TestRunRebuildEntrypoint:
     """run_rebuild() initializes service, runs rebuild + inspect, returns results."""
