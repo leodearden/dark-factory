@@ -36,6 +36,7 @@ graphiti:
     uri: "redis://falkordb:6379"
     password: ${FALKORDB_PASSWORD:}
     database: "default_db"
+    graph_timeout_ms: ${FALKORDB_GRAPH_TIMEOUT_MS:30000}
 
 mem0:
   qdrant_url: "http://qdrant:6333"

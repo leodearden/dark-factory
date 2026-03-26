@@ -38,6 +38,7 @@ graphiti:
     uri: ${FALKORDB_URI:redis://localhost:6379}
     password: ${FALKORDB_PASSWORD:}
     database: ${FALKORDB_DATABASE:default_db}
+    graph_timeout_ms: ${FALKORDB_GRAPH_TIMEOUT_MS:30000}
 
 mem0:
   qdrant_url: ${QDRANT_URL:http://localhost:6333}
