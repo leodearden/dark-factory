@@ -30,35 +30,35 @@
       "type": "test",
       "description": "Write tests for shared validators in new test_validation.py: (a) validate_project_root \u2014 returns error dict for empty string, relative path, None-cast; returns None for valid absolute path like '/home/user/project'. (b) validate_project_id \u2014 returns error dict for empty string; returns None for valid id. (c) require_project_root \u2014 raises ValueError for empty string, relative path; returns None for valid absolute path. Tests will FAIL because utils/validation.py doesn't exist yet.",
       "status": "done",
-      "commit": null
+      "commit": "d531c32"
     },
     {
       "id": "step-2",
       "type": "impl",
       "description": "Create utils/validation.py with three functions: (1) validate_project_root(project_root: str) -> dict[str,str] | None \u2014 core condition `not project_root or not os.path.isabs(project_root)`, returns error dict with 'error' and 'error_type' keys. (2) validate_project_id(project_id: str) -> dict[str,str] | None \u2014 checks `not project_id`. (3) require_project_root(project_root: str) -> None \u2014 same condition as validate_project_root but raises ValueError. All test_validation.py tests pass.",
       "status": "done",
-      "commit": null
+      "commit": "d531c32"
     },
     {
       "id": "step-3",
       "type": "impl",
       "description": "Refactor tools.py: replace local _validate_project_root (lines 223-230) and _validate_project_id (lines 214-221) with imports from fused_memory.utils.validation. Add `from fused_memory.utils.validation import validate_project_id, validate_project_root` near top. Remove the two local function definitions. All 11 task-tool call sites (`if err := validate_project_root(...)`) and 9+ memory-tool call sites (`if err := validate_project_id(...)`) keep the same walrus-operator pattern \u2014 only the import source changes. No behavior change. Existing test_health_endpoint.py tests continue to pass.",
       "status": "done",
-      "commit": null
+      "commit": "ca24f08"
     },
     {
       "id": "step-4",
       "type": "test",
       "description": "Update test_targeted.py in two parts: (a) Add explicit project_root='/tmp/test-project' to all 15 existing test calls that currently omit it \u2014 these are at lines 80-82, 95-97, 111-113, 130-132, 148-151, 166-169, 183-186, 196-205, 219-222, 233-236, 352-354, 368-370, 392-394, 415-417, 432-434. This is backward-compatible with current code. (b) Add two new test functions: test_reconcile_task_rejects_invalid_project_root (calls with project_root='' and project_root='relative/path', expects ValueError) and test_reconcile_bulk_tasks_rejects_invalid_project_root (same pattern). New tests will FAIL because targeted.py still has fallback logic instead of raising.",
       "status": "done",
-      "commit": null
+      "commit": "8aa7364"
     },
     {
       "id": "step-5",
       "type": "impl",
       "description": "Update targeted.py: (1) Add import `from fused_memory.utils.validation import require_project_root` at top. (2) Remove `= ''` default from project_root parameter in reconcile_task() signature (line 82) and reconcile_bulk_tasks() signature (line 350). (3) Replace inline fallback logic at lines 85-87 (`if not project_root: project_root = project_id`) with `require_project_root(project_root)`. (4) Replace inline fallback at lines 353-354 with same call. All tests now pass \u2014 both the 15 updated existing tests and the 2 new validation tests.",
       "status": "done",
-      "commit": null
+      "commit": "5f58154"
     }
   ],
   "design_decisions": [
