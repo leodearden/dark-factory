@@ -1,7 +1,7 @@
 """Tests for the _graceful_shutdown helper in fused_memory.server.main."""
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -86,3 +86,31 @@ class TestGracefulShutdownCancelsHarnessLoopTask:
         )
 
         assert harness_loop_task.cancelled()
+
+
+class TestGracefulShutdownLogsHarnessTaskException:
+    @pytest.mark.asyncio
+    async def test_harness_task_exception_logged_not_swallowed(self):
+        """Non-CancelledError from harness_loop_task must be logged via logger.exception().
+
+        This test FAILS with the current code because the except clause catches
+        (CancelledError, Exception) with bare ``pass``, silently discarding real errors.
+        """
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock()
+
+        # Create a task that raises RuntimeError (not CancelledError)
+        async def _raises_runtime_error():
+            raise RuntimeError('unexpected harness crash')
+
+        harness_loop_task = asyncio.create_task(_raises_runtime_error())
+
+        with patch('fused_memory.server.main.logger') as mock_logger:
+            await _graceful_shutdown(
+                memory_service=memory_service,
+                task_interceptor=None,
+                harness_loop_task=harness_loop_task,
+                recon_journal=None,
+            )
+
+        mock_logger.exception.assert_called_once()
