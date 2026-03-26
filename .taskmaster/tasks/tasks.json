@@ -2631,6 +2631,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 171,
+        "title": "Fix stale CONFIG_PATH comments in maintenance entrypoints",
+        "description": "Update misleading comments in three maintenance files. From review suggestions on task 144.",
+        "details": "Update the comment '# Catch close() errors so CONFIG_PATH restoration below always runs.' in:\n- fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py:131\n- fused-memory/src/fused_memory/maintenance/verify_zombie_edges.py:170\n- fused-memory/src/fused_memory/maintenance/reindex.py:194\n\nThe comment is factually wrong post-refactor. CONFIG_PATH restoration is handled by the outer override_config_path context manager, not by code below the try/except. Replace with e.g. '# Catch close() errors so they do not propagate out of the with block.'",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -2643,7 +2654,7 @@
       ],
       "created": "2026-03-26T10:25:51.987Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-26T10:26:20.999Z"
+      "updated": "2026-03-26T10:26:25.435Z"
     }
   }
 }
