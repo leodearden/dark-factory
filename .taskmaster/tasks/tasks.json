@@ -2643,11 +2643,11 @@
         "description": "Update misleading comments in three maintenance files. From review suggestions on task 144.",
         "details": "Update the comment '# Catch close() errors so CONFIG_PATH restoration below always runs.' in:\n- fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py:131\n- fused-memory/src/fused_memory/maintenance/verify_zombie_edges.py:170\n- fused-memory/src/fused_memory/maintenance/reindex.py:194\n\nThe comment is factually wrong post-refactor. CONFIG_PATH restoration is handled by the outer override_config_path context manager, not by code below the try/except. Replace with e.g. '# Catch close() errors so they do not propagate out of the with block.'",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T22:25:08.538Z"
+        "updatedAt": "2026-03-26T22:28:08.008Z"
       },
       {
         "id": "172",
@@ -2727,11 +2727,11 @@
         "description": "Event buffer shows \"Oldest: 1045m 36s\" which is unreadable. Should display as \"17h 25m\" for values over 60 minutes. Use the existing timeago filter or add a duration formatter.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (line 16). The template computes age // 60 for minutes and age % 60 for seconds. For large values, convert to hours+minutes instead. Could reuse the format_duration_ms Jinja filter from app.py (adapted for seconds input).",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T22:25:07.938Z"
+        "updatedAt": "2026-03-26T22:28:08.037Z"
       },
       {
         "id": "179",
@@ -2914,7 +2914,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T22:28:07.981Z",
+      "lastModified": "2026-03-26T22:28:08.037Z",
       "taskCount": 172,
       "completedCount": 125,
       "tags": [
