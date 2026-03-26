@@ -2775,11 +2775,11 @@
         "description": "Users see content change with no indication the dashboard is auto-refreshing. Add a subtle \"updated Xs ago\" timestamp per section, and a brief visual pulse or indicator when data refreshes successfully.",
         "details": "Implementation: Use htmx:afterSwap event on each section to update a small timestamp element. Could use a Jinja macro that renders a \"last updated\" line, or inject via JS after successful HTMX swap. Keep it minimal — small gray text like \"Updated 3s ago\" below each section heading.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:19:56.714Z"
+        "updatedAt": "2026-03-26T18:22:16.401Z"
       },
       {
         "id": "183",
@@ -2832,7 +2832,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T18:22:14.700Z",
+      "lastModified": "2026-03-26T18:22:16.401Z",
       "taskCount": 165,
       "completedCount": 122,
       "tags": [
