@@ -14,7 +14,7 @@
       "id": "pre-1",
       "description": "Run all existing update_task tests in test_health_endpoint.py to establish green baseline: test_update_task_metadata_dict_coerced_to_json_string, test_update_task_metadata_string_passed_through, test_update_task_metadata_none_passed_through, test_update_task_prompt_forwarded_to_interceptor, test_update_task_append_true_forwarded_to_interceptor, test_update_task_interceptor_error_returns_error_dict, test_task_tools_registered_without_interceptor",
       "status": "done",
-      "commit": null,
+      "commit": "7a7ae68",
       "tests": [
         "fused-memory/tests/test_health_endpoint.py::test_update_task_metadata_dict_coerced_to_json_string",
         "fused-memory/tests/test_health_endpoint.py::test_update_task_metadata_string_passed_through",
@@ -32,21 +32,21 @@
       "type": "test",
       "description": "Add test_update_task_tag_forwarded_to_interceptor: Call update_task via _tool_manager.call_tool with tag='v2' alongside id and project_root. Assert task_interceptor.update_task was called with tag='v2'. Place after test_update_task_append_true_forwarded_to_interceptor (after line 151) using the same mcp_server_with_tasks and task_interceptor fixtures. Test will pass immediately (characterization test — code already forwards tag).",
       "status": "done",
-      "commit": null
+      "commit": "4f5f233"
     },
     {
       "id": "step-2",
       "type": "test",
       "description": "Strengthen test_update_task_interceptor_error_returns_error_dict: Add assertion `assert result['error_type'] == 'RuntimeError'` after the existing `assert 'backend unavailable' in result['error']` line (line 171). This verifies the error_type field that tools.py returns via `type(e).__name__` is present and correct. Test will pass immediately (characterization test — code already returns error_type).",
       "status": "done",
-      "commit": null
+      "commit": "4f5f233"
     },
     {
       "id": "step-3",
       "type": "impl",
       "description": "Run the full test_health_endpoint.py test suite to verify all existing and new tests pass. No production code changes needed — the update_task registration and implementation are already complete. This step confirms the characterization tests accurately describe the existing behavior.",
       "status": "done",
-      "commit": null
+      "commit": "4f5f233"
     }
   ],
   "design_decisions": [
