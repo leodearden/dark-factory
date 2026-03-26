@@ -610,7 +610,13 @@ Output JSON matching the schema. Every task must appear in the output.
 
         async def _serve():
             try:
-                await mcp_server.run_http_async(host=host, port=port)
+                import uvicorn
+                app = mcp_server.http_app()
+                uv_config = uvicorn.Config(
+                    app, host=host, port=port, log_level='warning',
+                )
+                server = uvicorn.Server(uv_config)
+                await server.serve()
             except Exception as e:
                 logger.error(f'Escalation server error: {e}')
 
