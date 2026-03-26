@@ -6,6 +6,7 @@ import re
 import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.reconciliation import Watermark
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
     DISALLOW_MEMORY_WRITES,
@@ -383,12 +384,14 @@ class TestTaskCountSuppression:
         """Stage 2 payload header must NOT contain '(N active, N done, N total)' pattern."""
         from fused_memory.models.reconciliation import StageId
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        payload = await stage.assemble_payload(events=[], watermark=None, prior_reports=[])
+        watermark = Watermark(project_id='test')
+        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
         # The raw count pattern should NOT appear in the payload
         count_pattern = re.compile(r'\(\d+ active, \d+ done, \d+ total\)')
-        assert not count_pattern.search(payload), (
+        m = count_pattern.search(payload)
+        assert not m, (
             f'Payload contains forbidden count summary: '
-            f'{count_pattern.search(payload).group()}'
+            f'{m.group() if m else ""}'
         )
 
     def test_stage2_prompt_prohibits_count_writes(self):
@@ -419,7 +422,8 @@ class TestTaskCountSuppression:
         count/distribution data."""
         from fused_memory.models.reconciliation import StageId
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        payload = await stage.assemble_payload(events=[], watermark=None, prior_reports=[])
+        watermark = Watermark(project_id='test')
+        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
         payload_lower = payload.lower()
         # Should contain a directive about not writing counts
         has_count_directive = (

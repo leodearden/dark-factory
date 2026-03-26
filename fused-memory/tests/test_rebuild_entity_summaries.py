@@ -1,7 +1,7 @@
 """Tests for the SummaryRebuilder maintenance utility."""
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
