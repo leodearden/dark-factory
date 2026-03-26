@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.config.schema import FalkorDBProviderConfig, GraphitiBackendConfig
 
 
 # ---------------------------------------------------------------------------
@@ -133,3 +134,43 @@ class TestEnsureGraphTimeoutOptOut:
             await backend.ensure_graph_timeout(0)
 
         assert any(record.levelno == logging.DEBUG for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# step-9: initialize() wires ensure_graph_timeout
+# ---------------------------------------------------------------------------
+
+class TestInitializeCallsEnsureGraphTimeout:
+    """GraphitiBackend.initialize() calls ensure_graph_timeout with configured value."""
+
+    @pytest.mark.asyncio
+    async def test_initialize_calls_ensure_graph_timeout_with_configured_value(self, mock_config):
+        """initialize() should await ensure_graph_timeout(config.graphiti.falkordb.graph_timeout_ms)."""
+        # Use a custom timeout value to distinguish it from any default
+        from fused_memory.config.schema import FalkorDBProviderConfig, GraphitiBackendConfig
+        from dataclasses import replace as dc_replace
+
+        # Build config with custom timeout
+        mock_config.graphiti = GraphitiBackendConfig(
+            falkordb=FalkorDBProviderConfig(
+                uri='redis://localhost:6379',
+                graph_timeout_ms=12345,
+            )
+        )
+
+        backend = GraphitiBackend(mock_config)
+
+        with (
+            patch('fused_memory.backends.graphiti_client.FalkorDriver') as mock_driver_cls,
+            patch('fused_memory.backends.graphiti_client.Graphiti') as mock_graphiti_cls,
+            patch.object(backend, 'ensure_graph_timeout', new=AsyncMock()) as mock_ensure,
+        ):
+            mock_driver_inst = MagicMock()
+            mock_driver_cls.return_value = mock_driver_inst
+            mock_graphiti_inst = MagicMock()
+            mock_graphiti_inst.build_indices_and_constraints = AsyncMock()
+            mock_graphiti_cls.return_value = mock_graphiti_inst
+
+            await backend.initialize()
+
+        mock_ensure.assert_awaited_once_with(12345)
