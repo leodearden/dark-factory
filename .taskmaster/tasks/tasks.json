@@ -2037,11 +2037,11 @@
         "description": "FalkorDB's default TIMEOUT is 1000ms which causes \"Query timed out\" errors for Graphiti entity resolution queries at scale (1800+ nodes). Currently set to 30000ms at runtime via GRAPH.CONFIG SET, but this resets on restart since there's no config file. Need a persistent solution.",
         "details": "FalkorDB runs as root from /var/lib/falkordb/redis-server on port 6379 with no config file and no systemd unit accessible without sudo. Options: (1) Create a redis.conf with the module TIMEOUT param, (2) Add a systemd ExecStartPost to run GRAPH.CONFIG SET, (3) Add a fused-memory startup hook that sets the config on connect. Option 3 is most self-contained. Memory hints: search \"FalkorDB timeout\" and \"dead letter queue\"; entity \"FalkorDB\".",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T07:20:08.471Z"
+        "updatedAt": "2026-03-26T07:32:49.555Z"
       },
       {
         "id": "124",
@@ -2556,7 +2556,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T07:32:49.450Z",
+      "lastModified": "2026-03-26T07:32:49.555Z",
       "taskCount": 142,
       "completedCount": 119,
       "tags": [
