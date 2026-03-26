@@ -162,6 +162,20 @@ async def test_update_task_interceptor_error_returns_error_dict(
     assert result['error_type'] == 'RuntimeError'
 
 
+@pytest.mark.asyncio
+async def test_update_task_relative_path_returns_validation_error(
+    mcp_server_with_tasks,
+):
+    """When project_root is a relative path, update_task returns a ValidationError dict."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': 'relative/path'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert result['error_type'] == 'ValidationError'
+
+
 # ------------------------------------------------------------------
 # Defensive tool registration (always registered, even without Taskmaster)
 # ------------------------------------------------------------------
