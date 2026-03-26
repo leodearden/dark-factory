@@ -2730,6 +2730,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 180,
+        "title": "Replace Tailwind CDN with built CSS and add favicon",
+        "description": "base.html loads Tailwind via cdn.tailwindcss.com which is not for production (console warning) and favicon.ico returns 404 (console error). Bundle Tailwind via CLI or PostCSS build step, and add a basic favicon.",
+        "details": "File: dashboard/src/dashboard/templates/base.html (line 7). Options: (1) Use Tailwind CLI standalone to generate a built CSS file at build/dev time. (2) Add a simple SVG favicon served from /static/. Also pin the other CDN deps (htmx, idiomorph, chart.js, alpine) to exact versions or vendor them.",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -2742,7 +2753,7 @@
       ],
       "created": "2026-03-26T10:25:51.987Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-26T15:13:40.269Z"
+      "updated": "2026-03-26T15:13:50.483Z"
     }
   }
 }
