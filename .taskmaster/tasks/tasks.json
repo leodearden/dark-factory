@@ -2355,11 +2355,11 @@
         "description": "Several test gaps exist in the maintenance entrypoint tests (primarily test_reindex.py). Missing branches: pre-existing CONFIG_PATH restoration, config_path=None with pre-existing env var, close() exception masking. Weak assertions: sentinel test has no assert. Fragile mocking: four tests don't patch OpenAIEmbedderConfig.",
         "details": "## Steps\n\n1. **Pre-existing CONFIG_PATH restoration** (test_reindex.py TestRunReindexEnvVarRestore):\n   Add `test_restores_preexisting_env_var_when_constructor_fails`: set `os.environ['CONFIG_PATH'] = 'preexisting.yaml'`, call `run_reindex(config_path='test.yaml')` with FusedMemoryConfig raising, assert CONFIG_PATH restored to 'preexisting.yaml'. This exercises the `else` branch of the finally restore logic.\n\n2. **config_path=None leaves env untouched** (test_reindex.py):\n   Add `test_does_not_touch_env_var_when_config_path_is_none`: set CONFIG_PATH='existing.yaml', patch FusedMemoryConfig to raise, call `run_reindex()` (no config_path), assert CONFIG_PATH still 'existing.yaml'.\n\n3. **close() exception doesn't mask original** (test_reindex.py TestRunReindexServiceLifecycle):\n   Add `test_close_exception_does_not_mask_original_error`: patch ReindexManager to raise RuntimeError('original'), configure mock_service.close to raise RuntimeError('close error'), assert propagated exception is 'original'.\n\n4. **Strengthen sentinel test assertion** (test_reindex.py:1203-1216):\n   In `test_skips_close_when_service_never_created`, also patch MemoryService and assert `mock_service.close.assert_not_awaited()`.\n\n5. **Patch OpenAIEmbedderConfig in 4 fragile tests** (test_reindex.py lines 1046, 1088, 1139, 1172):\n   Add `patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig')` to: `test_restores_env_var_when_embedder_constructor_fails`, `test_restores_env_var_when_manager_constructor_fails`, `test_closes_service_when_manager_constructor_fails`, `test_closes_service_when_embedder_constructor_fails`.\n\n6. Apply analogous missing tests to test_cleanup_stale_edges.py and test_verify_zombie_edges.py where applicable.\n\n7. Verify all tests pass.\n\n## Memory Hints\n- Search: \"reindex env var test edge cases CONFIG_PATH branches\"\n- Search: \"service.close exception masking test maintenance\"\n\n## Origin\nReview suggestions from Task 143 triage (suggestions #7, #8, #9, #10, #11).",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:14:13.257Z"
+        "updatedAt": "2026-03-26T18:22:41.435Z"
       },
       {
         "id": "149",
@@ -2832,7 +2832,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T18:22:41.255Z",
+      "lastModified": "2026-03-26T18:22:41.436Z",
       "taskCount": 165,
       "completedCount": 122,
       "tags": [
