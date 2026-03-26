@@ -8,7 +8,7 @@
     "fused-memory/tests",
     "fused-memory/src/fused_memory/server"
   ],
-  "analysis": "The update_task tool IS ALREADY REGISTERED in tools.py at line 875 with @mcp.tool() decorator. The full three-tier implementation chain (MCP tool \u2192 TaskInterceptor middleware \u2192 TaskmasterBackend client) is intact and operational. The -32601 'Unknown tool' error reported on 2026-03-23 was caused by the systemd fused-memory service on port 8002 running stale code \u2014 not a code-level regression. The defensive always-on registration pattern (commit 3d6fe0c, ~2026-03-19) ensures all 11 task tools are unconditionally registered, returning structured errors when Taskmaster is unavailable rather than -32601. The e2fce78 simplify commit (most recent tools.py change) only touched get_entity and mem0 list_projects \u2014 no impact on update_task. There are 7 existing update_task tests in test_health_endpoint.py covering: metadata dict\u2192JSON coercion, string passthrough, None passthrough, prompt forwarding, append forwarding, error dict return, and defensive registration. Two minor test coverage gaps identified: (1) the error_type field in error responses is returned by code but never asserted in tests, (2) the tag parameter is accepted and forwarded by the tool but has no dedicated forwarding test. No production code changes are needed \u2014 only test hardening to prevent future regression.",
+  "analysis": "The update_task tool IS ALREADY REGISTERED in tools.py at line 875 with @mcp.tool() decorator. The full three-tier implementation chain (MCP tool → TaskInterceptor middleware → TaskmasterBackend client) is intact and operational. The -32601 'Unknown tool' error reported on 2026-03-23 was caused by the systemd fused-memory service on port 8002 running stale code — not a code-level regression. The defensive always-on registration pattern (commit 3d6fe0c, ~2026-03-19) ensures all 11 task tools are unconditionally registered, returning structured errors when Taskmaster is unavailable rather than -32601. The e2fce78 simplify commit (most recent tools.py change) only touched get_entity and mem0 list_projects — no impact on update_task. There are 7 existing update_task tests in test_health_endpoint.py covering: metadata dict→JSON coercion, string passthrough, None passthrough, prompt forwarding, append forwarding, error dict return, and defensive registration. Two minor test coverage gaps identified: (1) the error_type field in error responses is returned by code but never asserted in tests, (2) the tag parameter is accepted and forwarded by the tool but has no dedicated forwarding test. No production code changes are needed — only test hardening to prevent future regression.",
   "prerequisites": [
     {
       "id": "pre-1",
@@ -30,22 +30,22 @@
     {
       "id": "step-1",
       "type": "test",
-      "description": "Add test_update_task_tag_forwarded_to_interceptor: Call update_task via _tool_manager.call_tool with tag='v2' alongside id and project_root. Assert task_interceptor.update_task was called with tag='v2'. Place after test_update_task_append_true_forwarded_to_interceptor (after line 151) using the same mcp_server_with_tasks and task_interceptor fixtures. Test will pass immediately (characterization test \u2014 code already forwards tag).",
-      "status": "pending",
+      "description": "Add test_update_task_tag_forwarded_to_interceptor: Call update_task via _tool_manager.call_tool with tag='v2' alongside id and project_root. Assert task_interceptor.update_task was called with tag='v2'. Place after test_update_task_append_true_forwarded_to_interceptor (after line 151) using the same mcp_server_with_tasks and task_interceptor fixtures. Test will pass immediately (characterization test — code already forwards tag).",
+      "status": "done",
       "commit": null
     },
     {
       "id": "step-2",
       "type": "test",
-      "description": "Strengthen test_update_task_interceptor_error_returns_error_dict: Add assertion `assert result['error_type'] == 'RuntimeError'` after the existing `assert 'backend unavailable' in result['error']` line (line 171). This verifies the error_type field that tools.py returns via `type(e).__name__` is present and correct. Test will pass immediately (characterization test \u2014 code already returns error_type).",
-      "status": "pending",
+      "description": "Strengthen test_update_task_interceptor_error_returns_error_dict: Add assertion `assert result['error_type'] == 'RuntimeError'` after the existing `assert 'backend unavailable' in result['error']` line (line 171). This verifies the error_type field that tools.py returns via `type(e).__name__` is present and correct. Test will pass immediately (characterization test — code already returns error_type).",
+      "status": "done",
       "commit": null
     },
     {
       "id": "step-3",
       "type": "impl",
-      "description": "Run the full test_health_endpoint.py test suite to verify all existing and new tests pass. No production code changes needed \u2014 the update_task registration and implementation are already complete. This step confirms the characterization tests accurately describe the existing behavior.",
-      "status": "pending",
+      "description": "Run the full test_health_endpoint.py test suite to verify all existing and new tests pass. No production code changes needed — the update_task registration and implementation are already complete. This step confirms the characterization tests accurately describe the existing behavior.",
+      "status": "done",
       "commit": null
     }
   ],
@@ -56,7 +56,7 @@
     },
     {
       "decision": "Characterization tests instead of red-green TDD",
-      "rationale": "Since the implementation already exists and is correct, new tests are characterization tests that document and lock existing behavior. They pass immediately, which is expected \u2014 their value is preventing future regression, not driving new implementation."
+      "rationale": "Since the implementation already exists and is correct, new tests are characterization tests that document and lock existing behavior. They pass immediately, which is expected — their value is preventing future regression, not driving new implementation."
     },
     {
       "decision": "Only two new test assertions added (tag forwarding + error_type)",
@@ -81,7 +81,7 @@
     {
       "what": "Existing parameter forwarding test pattern",
       "where": "fused-memory/tests/test_health_endpoint.py lines 120-151",
-      "how": "Follow identical pattern: call_tool \u2192 assert_called_once \u2192 destructure call_args \u2192 assert kwargs['param'] == expected. Used by prompt and append tests."
+      "how": "Follow identical pattern: call_tool → assert_called_once → destructure call_args → assert kwargs['param'] == expected. Used by prompt and append tests."
     },
     {
       "what": "Existing error assertion pattern",
