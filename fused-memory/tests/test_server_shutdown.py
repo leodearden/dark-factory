@@ -25,6 +25,26 @@ class TestGracefulShutdownCallsMemoryServiceClose:
         memory_service.close.assert_called_once()
 
 
+class TestGracefulShutdownResilientToDrainError:
+    @pytest.mark.asyncio
+    async def test_shutdown_resilient_to_drain_error(self):
+        """memory_service.close() must be called even if task_interceptor.drain() raises."""
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock()
+
+        task_interceptor = MagicMock()
+        task_interceptor.drain = AsyncMock(side_effect=RuntimeError('drain failed'))
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=task_interceptor,
+            harness_loop_task=None,
+            recon_journal=None,
+        )
+
+        memory_service.close.assert_called_once()
+
+
 class TestGracefulShutdownCancelsHarnessLoopTask:
     @pytest.mark.asyncio
     async def test_shutdown_cancels_harness_loop_task(self):
