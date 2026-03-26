@@ -113,6 +113,8 @@ async def run_server():
             logger.warning(f'  Taskmaster: failed to connect ({e}), will retry on next tool call')
 
     # Initialize reconciliation system
+    harness_loop_task = None
+    recon_journal = None
     reconciliation_harness = None
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -121,9 +123,10 @@ async def run_server():
         from fused_memory.reconciliation.journal import ReconciliationJournal
         from fused_memory.reconciliation.targeted import TargetedReconciler
 
-        journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
-        await journal.initialize()
-        journal.set_write_journal(write_journal)
+        recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
+        await recon_journal.initialize()
+        recon_journal.set_write_journal(write_journal)
+        journal = recon_journal
 
         db_path = Path(config.reconciliation.data_dir) / 'reconciliation.db'
         assert memory_service.durable_queue is not None  # set by initialize()
@@ -158,7 +161,7 @@ async def run_server():
         reconciliation_harness = ReconciliationHarness(
             memory_service, taskmaster, journal, event_buffer, config
         )
-        asyncio.create_task(reconciliation_harness.run_loop())
+        harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
     else:
         # Always create task_interceptor for tool registration
@@ -220,8 +223,54 @@ async def run_server():
         else:
             raise ValueError(f'Unsupported transport: {transport}')
     finally:
-        if task_interceptor:
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=task_interceptor,
+            harness_loop_task=harness_loop_task,
+            recon_journal=recon_journal,
+        )
+
+
+async def _graceful_shutdown(
+    memory_service,
+    task_interceptor,
+    harness_loop_task,
+    recon_journal,
+) -> None:
+    """Perform an ordered, exception-resilient server shutdown.
+
+    Shutdown order:
+    1. Drain task_interceptor (flush pending commits / targeted reconciliation).
+    2. Cancel harness loop task (stops background reconciliation + escalation server).
+    3. Close memory_service (backends, durable queue, write journal, event buffer).
+    4. Close reconciliation journal (separate SQLite connection).
+
+    Each step is independently guarded so a failure in one step does not
+    prevent subsequent steps from running.
+    """
+    if task_interceptor is not None:
+        try:
             await task_interceptor.drain()
+        except Exception:
+            logger.exception('_graceful_shutdown: error draining task_interceptor')
+
+    if harness_loop_task is not None:
+        try:
+            harness_loop_task.cancel()
+            await harness_loop_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    try:
+        await memory_service.close()
+    except Exception:
+        logger.exception('_graceful_shutdown: error closing memory_service')
+
+    if recon_journal is not None:
+        try:
+            await recon_journal.close()
+        except Exception:
+            logger.exception('_graceful_shutdown: error closing recon_journal')
 
 
 _singleton_socket = None  # Module-level ref to prevent GC
