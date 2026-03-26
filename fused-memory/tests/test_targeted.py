@@ -479,3 +479,24 @@ async def test_reconcile_task_rejects_dot_project_root(reconciler):
             project_root='.',
             task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
         )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_bulk_rejects_empty_project_root(reconciler):
+    """reconcile_bulk_tasks() with project_root='' (default) raises ValueError."""
+    with pytest.raises(ValueError, match='absolute path'):
+        await reconciler.reconcile_bulk_tasks(
+            parent_task_id=None,
+            project_id='test-project',
+        )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_bulk_rejects_relative_project_root(reconciler):
+    """reconcile_bulk_tasks() with project_root='dark_factory' raises ValueError."""
+    with pytest.raises(ValueError, match='absolute path'):
+        await reconciler.reconcile_bulk_tasks(
+            parent_task_id=None,
+            project_id='test-project',
+            project_root='dark_factory',
+        )
