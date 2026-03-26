@@ -2835,10 +2835,11 @@
         "description": "The reconciliation pipeline currently writes task-count and status-distribution edges to Graphiti (e.g., \"reify task tree has 443 total tasks\"). These become stale immediately and accumulate contradictory count lines in entity summaries. Graphiti does not rebuild summaries on edge deletion — only on new edge addition — so even after deleting the edges, 11+ entities retain baked-in stale count data in their summaries.\\n\\nTwo sub-items:\\n1. Modify reconciliation pipeline code to stop writing task-count/status-distribution edges entirely.\\n2. Investigate Graphiti entity summary rebuild mechanism to clear stale count lines from affected entities.\\n\\nAffected entities (by UUID): ae174332, 0d096eab, c618eb5d, 4931ffbf, 65b3db28, 48fd2a98, 8693932c, fe4a7314, 9daca3e0, ce4fa3fd, 4d20f360.\\n\\nmemory_hints:\\n  entities: [\\\"entity summaries\\\", \\\"reify task tree\\\", \\\"tasks\\\", \\\"Graphiti\\\"]\\n  queries: [\\\"task count edges reconciliation pipeline stale\\\", \\\"entity summary rebuild mechanism Graphiti\\\", \\\"count-data diagnostic edges deleted\\\"]",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-26T21:58:36.446Z"
       },
       {
         "id": "188",
@@ -2865,7 +2866,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T21:58:36.360Z",
+      "lastModified": "2026-03-26T21:58:36.448Z",
       "taskCount": 168,
       "completedCount": 122,
       "tags": [
