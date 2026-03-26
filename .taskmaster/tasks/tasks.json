@@ -2531,13 +2531,13 @@
         "description": "The harness loop task cancellation in _graceful_shutdown has no timeout: `harness_loop_task.cancel()` followed by bare `await harness_loop_task`. If run_loop() is mid-LLM-call when cancelled, CancelledError propagation is gated on I/O completing (10-60+ seconds). Worse, run_loop's finally block calls _stop_escalation_server() which itself does `await self._escalation_task` without a timeout. A stuck escalation task blocks shutdown indefinitely.\n\nFix: Wrap the harness task cancellation in `asyncio.wait_for(..., timeout=10.0)` and handle TimeoutError alongside CancelledError. Example:\n```python\nif harness_loop_task is not None:\n    try:\n        harness_loop_task.cancel()\n        await asyncio.wait_for(asyncio.shield(harness_loop_task), timeout=10.0)\n    except (asyncio.CancelledError, asyncio.TimeoutError):\n        pass\n    except Exception:\n        logger.exception('_graceful_shutdown: error awaiting harness_loop_task')\n```\n\nFile: fused-memory/src/fused_memory/server/main.py, lines 257-262.\nSource: Task 154 review, suggestion 5.\n\nmemory_hints: search \"harness shutdown timeout\", get_entity \"ReconciliationHarness\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "154"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:08:20.307Z"
+        "updatedAt": "2026-03-26T18:08:21.129Z"
       },
       {
         "id": "163",
@@ -2815,7 +2815,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T18:08:20.854Z",
+      "lastModified": "2026-03-26T18:08:21.129Z",
       "taskCount": 165,
       "completedCount": 122,
       "tags": [
