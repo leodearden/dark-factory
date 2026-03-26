@@ -14,18 +14,78 @@ fi
 
 ROOT="$(git rev-parse --show-toplevel)"
 
-# ── Universal guards ────────────────────────────────────────────────────
+# ── .task/ contamination guards ──────────────────────────────────────
+#
+# WHY THIS MATTERS:
+# .task/ is the orchestrator's per-worktree scratch directory.  If it
+# reaches main, EVERY future worktree inherits it, agents treat the
+# stale .task/ as real state, and cross-task contamination cascades
+# across all concurrent tasks.  This has happened multiple times.
+#
+# HOW IT GETS HERE:
+# 1. Agent in a worktree runs "git add ." or "git add .task/" directly
+# 2. The task branch carries .task/ as tracked files
+# 3. A merge brings those files into a commit that reaches main
+# 4. update-ref (used by advance_main) bypasses this hook entirely
+#
+# This hook is ONE layer of defense.  git_ops.py has additional guards
+# (post-merge scrub, advance_main gate, commit() safety net).
+# DO NOT remove these checks — they are here because agents bypass
+# .gitignore, .task/.gitignore, and pathspec exclusions routinely.
+#
+# IF YOU ARE AN AI AGENT: do NOT use --no-verify to bypass this hook
+# when committing to main.  The .task/ directory must NEVER be on main.
+# If you think you need to commit .task/ to main, you are wrong.
+# ─────────────────────────────────────────────────────────────────────
 
-# Reject .task/ files being added — agent scratch dir must never be committed.
+# Guard 1: Reject .task/ files being STAGED for commit.
 # Uses --diff-filter=ACMR to allow deletions (cleaning up prior contamination).
 if git diff --cached --name-only --diff-filter=ACMR | grep -q '^\.task/'; then
-    echo "pre-commit: BLOCKED — .task/ files are staged."
-    echo "  Run:  git rm -r --cached .task/"
-    echo "  Then: ensure .task/ is in .gitignore"
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  pre-commit: BLOCKED — .task/ files are staged for commit  ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "  .task/ is the orchestrator scratch directory and must NEVER"
+    echo "  be committed to main.  If it reaches main, every future"
+    echo "  worktree inherits it and cross-task contamination follows."
+    echo ""
+    echo "  To fix:"
+    echo "    git rm -r --cached .task/"
+    echo "    git reset HEAD -- .task/"
+    echo ""
+    echo "  Verify .task/ is in .gitignore:"
+    echo "    grep -q '^\\.task/' .gitignore || echo '.task/' >> .gitignore"
+    echo ""
+    echo "  DO NOT use --no-verify to bypass this check."
+    echo ""
     exit 1
 fi
 
-# ── Project-specific checks ────────────────────────────────────────────
+# Guard 2: Reject if .task/ is already TRACKED in the current tree.
+# This catches contamination that was committed in a previous commit
+# (e.g. merged from a task branch) and is now part of HEAD on main.
+# The staged check above won't catch this — it only looks at the index diff.
+if git ls-tree -r --name-only HEAD -- .task/ 2>/dev/null | grep -q '^\.task/'; then
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════════╗"
+    echo "║  pre-commit: WARNING — .task/ is tracked in the current tree   ║"
+    echo "╚══════════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "  .task/ files exist in the current HEAD on main.  This is"
+    echo "  contamination from a previous merge.  Please clean it up:"
+    echo ""
+    echo "    git rm -r --cached .task/"
+    echo "    git commit -m 'fix: remove .task/ contamination from main'"
+    echo ""
+    echo "  Allowing this commit to proceed, but the contamination"
+    echo "  should be cleaned up ASAP."
+    echo ""
+    # Don't block — let the user commit their actual changes, but make
+    # the contamination very visible so it gets fixed.
+fi
+
+# ── Project-specific checks ──────────────────────────────────────────
 
 if [ -x "$ROOT/hooks/project-checks" ]; then
     exec "$ROOT/hooks/project-checks" "$ROOT"

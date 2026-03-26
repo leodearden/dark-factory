@@ -202,6 +202,30 @@ class TaskWorkflow:
                 base_commit=base_commit,
             )
 
+            # ── .task/ contamination guard ────────────────────────────
+            # After init() creates the .task/ scratch directory, verify it
+            # is NOT tracked in git.  If it is (inherited from a contaminated
+            # main), untrack it so agents don't accidentally commit it.
+            # This is defense-in-depth: create_worktree() should have already
+            # scrubbed, but the guard here catches the eval-mode path and
+            # any race conditions.
+            rc, tracked, _ = await _run(
+                ['git', 'ls-files', '--', '.task/'],
+                cwd=self.worktree,
+            )
+            if rc == 0 and tracked.strip():
+                logger.warning(
+                    'Task %s: .task/ is tracked in git (inherited contamination) '
+                    '— removing from index. Files: %s',
+                    self.task_id, tracked.strip()[:200],
+                )
+                await _run(
+                    ['git', 'rm', '-r', '--cached', '--', '.task/'],
+                    cwd=self.worktree,
+                )
+                # Don't commit the removal separately — it'll be part of
+                # the first real commit the agent makes.
+
             # PLAN (skip if initial_plan was provided — eval mode)
             if self.initial_plan:
                 self.artifacts.write_plan(self.initial_plan)
