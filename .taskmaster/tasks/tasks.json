@@ -2037,11 +2037,11 @@
         "description": "FalkorDB's default TIMEOUT is 1000ms which causes \"Query timed out\" errors for Graphiti entity resolution queries at scale (1800+ nodes). Currently set to 30000ms at runtime via GRAPH.CONFIG SET, but this resets on restart since there's no config file. Need a persistent solution.",
         "details": "FalkorDB runs as root from /var/lib/falkordb/redis-server on port 6379 with no config file and no systemd unit accessible without sudo. Options: (1) Create a redis.conf with the module TIMEOUT param, (2) Add a systemd ExecStartPost to run GRAPH.CONFIG SET, (3) Add a fused-memory startup hook that sets the config on connect. Option 3 is most self-contained. Memory hints: search \"FalkorDB timeout\" and \"dead letter queue\"; entity \"FalkorDB\".",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:16:39.260Z"
+        "updatedAt": "2026-03-26T18:33:00.198Z"
       },
       {
         "id": "124",
@@ -2061,11 +2061,11 @@
         "description": "Reconciliation retrospective summaries that describe past state can pollute the temporal knowledge graph. Graphiti assigns valid_at = ingestion_time when no temporal_context is provided. Episode 1e560d42 (ingested 2026-03-23 20:24 UTC, describing 2026-03-22 state) caused 7 stale edges with wrong timestamps, requiring manual deletion in Stage 1 run 0ee2c5a9.\\n\\nFix: Add a mechanism to pass a temporal_context hint (valid_at override or historical_date annotation) when ingesting retrospective episodes, so Graphiti assigns historical valid_at rather than ingestion time. Options:\\n1. Pass `valid_at` to `add_episode` calls for retrospective content\\n2. Add an `episode_type: retrospective` flag that suppresses valid_at assignment\\n3. Document the pattern in reconciliation agent prompts: \\\"when ingesting retrospective summaries, set valid_at to the date the described state was current, not today\\\"\\n\\n## memory_hints\\n- search: \\\"historical episode temporal contamination retrospective valid_at ingestion time\\\"\\n- search: \\\"add_episode valid_at temporal context annotation Graphiti\\\"\\n- entity: \\\"add_episode\\\"\\n- search: \\\"reconciliation retrospective summary episode ingestion pattern\\\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:28:17.597Z"
+        "updatedAt": "2026-03-26T18:33:00.235Z"
       },
       {
         "id": "126",
@@ -2073,11 +2073,11 @@
         "description": "Graphiti entity node summaries persist stale text from invalidated edges. After Stage 1 bulk-invalidated 3 of 4 duplicate edges on the reconciliation.py entity, the node summary still showed the duplicate fact 4× even though only 1 valid edge remained. Implement a post-invalidation entity summary refresh step in the Stage 1 memory_consolidator so that entity nodes with recently-invalidated edges have their summaries regenerated to reflect only the currently-valid edge set.",
         "details": "Background: Stage 1 run 0ee2c5a9 invalidated/deleted 3 duplicate edges on reconciliation.py entity (uuid 16ae33d1-5bbc-4df8-90bf-469a937509db). Despite cleanup, the entity node summary still reads \"Task 84 refactored the duplicate try/except pattern in reconciliation.py.\" 4×. Graphiti does not auto-recompute entity summaries on edge invalidation.\n\nAcceptance criteria:\n1. After Stage 1 bulk-invalidates edges on an entity, the entity's node summary is refreshed/regenerated via Graphiti to reflect only valid edges.\n2. The reconciliation.py entity summary shows the fact exactly once after the fix.\n3. No regression: summary refresh should not affect valid edges.\n\nImplementation notes:\n- Check Graphiti's API for entity summary refresh (e.g. graphiti_core build_indices_and_ingest or similar recompute triggers)\n- The Stage 1 consolidator (fused-memory/src/reconciliation/memory_consolidator.py) should call a refresh after batch edge invalidations\n- Track which entity UUIDs had edges invalidated and refresh each one once after the batch\n\nmemory_hints:\n- entity: reconciliation.py (uuid 16ae33d1-5bbc-4df8-90bf-469a937509db)\n- search: \"Graphiti entity summary refresh after edge invalidation\"\n- search: \"Graphiti node summary recomputation stale cached invalidated edges\"\n- search: \"memory_consolidator Stage 1 edge invalidation pipeline\"",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:20:44.519Z"
+        "updatedAt": "2026-03-26T18:33:00.257Z"
       },
       {
         "id": "127",
@@ -2145,11 +2145,11 @@
         "description": "In MemoryService.get_entity(), search_nodes() and search() are awaited sequentially but are independent I/O calls to Graphiti. Use asyncio.gather to run both queries in parallel:\n  nodes, edges = await asyncio.gather(self.graphiti.search_nodes(...), self.graphiti.search(...))\nThis is a pre-existing pattern also present in _search_graphiti() — both sites could be updated.\n\n## memory_hints\n- search: \"asyncio.gather concurrent search memory_service get_entity\"\n- search: \"sequential async calls search_nodes search Graphiti\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:22:41.255Z"
+        "updatedAt": "2026-03-26T18:33:00.277Z"
       },
       {
         "id": "133",
@@ -2157,11 +2157,11 @@
         "description": "Two related issues in fused-memory temporal metadata handling:\n\n1. Production code uses str(valid_at) on datetime objects, which produces Python-default format ('2026-01-01 00:00:00+00:00' with space separator) rather than ISO 8601 ('2026-01-01T00:00:00+00:00' with T separator). Fix: use valid_at.isoformat() if hasattr(valid_at, 'isoformat') else str(valid_at). Affects both _search_graphiti() and get_entity() in memory_service.py.\n\n2. MockEdge in tests/conftest.py types valid_at/invalid_at as str|None. Real Graphiti edges carry datetime objects. Tests pass strings through str() which is a no-op, never exercising the actual datetime→str conversion. Fix: change MockEdge to use datetime objects and update test assertions accordingly.\n\n## memory_hints\n- search: \"str valid_at isoformat datetime temporal edge serialization\"\n- search: \"MockEdge conftest temporal type fidelity\"",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:11:04.427Z"
+        "updatedAt": "2026-03-26T18:33:00.309Z"
       },
       {
         "id": "134",
@@ -2169,13 +2169,13 @@
         "description": "The project_id reminder line is copy-pasted into all three stage prompts (stage1.py:46, stage2.py:43, stage3.py:37) with near-identical wording — only the parenthetical tool list differs. Additionally, Stage 2's tool list omits the task-mutation tools (add_task, update_task, add_subtask, set_task_status, add_dependency, remove_dependency) that Stage 2 actually has access to, making the instruction incomplete.\n\nFix:\n1. Extract a shared constant (e.g. _PROJECT_ID_GUIDELINE in prompts/_shared.py or prompts/__init__.py) that can be interpolated with stage-specific tool lists.\n2. Extend Stage 2's tool list to include the task-mutation tools it has access to.\n3. Consider using the unambiguous phrasing 'from the Reconciliation Context block' instead of 'from the payload context' to match the label in base.py's injection.\n\nFiles: fused-memory/src/fused_memory/reconciliation/prompts/stage1.py, stage2.py, stage3.py\n\nmemory_hints:\n- search: \"reconciliation prompt project_id stage prompts DRY\"\n- search: \"Stage 2 task-mutation tools project_id guideline\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [
           "127"
         ],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:14:05.256Z"
+        "updatedAt": "2026-03-26T18:33:00.322Z"
       },
       {
         "id": "135",
@@ -2211,13 +2211,13 @@
         "description": "Test quality improvements for the TestProjectIdValidation class in test_stages.py.\n\nThree issues:\n1. **Duplicated fakes** — `fake_assemble_payload` and `fake_run_stage_via_cli` are defined identically (word-for-word) in three tests: test_run_allows_matching_watermark_project_id, test_run_allows_empty_watermark_project_id, and test_recon_context_includes_project_id. Extract into a shared fixture or helper method on the class.\n2. **Weak mismatch assertion** — test_run_raises_on_watermark_project_id_mismatch only asserts match='project_a' but not 'project_b'. Add assertion that both project_ids appear in the error message.\n3. **Missing return value assertions** — The two positive-path tests (matching and empty watermark) assert only \"no exception raised\" but never capture/check the StageReport return value. Capture result and assert `result is not None` or check specific fields.\n\nFiles: fused-memory/tests/test_stages.py\n\nmemory_hints:\n- search: \"TestProjectIdValidation test_stages.py fixture extraction\"\n- entity: \"TestProjectIdValidation\"",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [
           "135"
         ],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:18:48.745Z"
+        "updatedAt": "2026-03-26T18:33:00.335Z"
       },
       {
         "id": "138",
@@ -2279,13 +2279,13 @@
         "description": "Post-merge cleanup from Task 136 review. test_stages.py has accumulated significant duplication:\n\n1. **mock_deps fixture** — Identical fixture defined in 4+ test classes (TestStageSubclasses, TestProjectIdValidation, TestPaddedStageProjectId, TestPerStageReportSchema). Extract to module level or conftest.py.\n\n2. **fake_assemble_payload / fake_run_stage_via_cli** — Defined inline ~6-7 times across test classes. Every copy is functionally identical. Extract as shared module-level async functions or fixtures.\n\nCentralizing prevents silent divergence when ReconciliationConfig or StageResult signatures change.\n\nFiles: fused-memory/tests/test_stages.py (possibly fused-memory/tests/conftest.py)\n\nmemory_hints:\n- search: \"test_stages.py mock_deps fixture deduplication\"\n- search: \"fake_assemble_payload fake_run_stage_via_cli test helper\"",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [
           "136"
         ],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:10:27.166Z"
+        "updatedAt": "2026-03-26T18:33:00.346Z"
       },
       {
         "id": "143",
@@ -2305,11 +2305,11 @@
         "description": "The 6-line CONFIG_PATH env-var save/restore pattern in the finally block is now byte-for-byte identical across cleanup_stale_edges.py, verify_zombie_edges.py, and (once fixed) reindex.py. Extract a shared context manager or async helper (e.g. `@contextmanager def override_config_path(config_path)` in `fused_memory/maintenance/_utils.py`) to eliminate future drift and make any additional entrypoints get the pattern right automatically.",
         "details": "## Steps\n\n1. Create `fused-memory/src/fused_memory/maintenance/_utils.py` with:\n   - `@contextlib.contextmanager def override_config_path(config_path: str | None)` that handles save/set/restore\n   - Consider also wrapping the service close pattern per convention (memory id: 458388ca about wrapping service.close() in try/except)\n\n2. Refactor all three entrypoints (cleanup_stale_edges.py, verify_zombie_edges.py, reindex.py) to use the shared utility.\n\n3. Update tests to verify the utility works correctly.\n\n## Memory Hints\n- Search: \"CONFIG_PATH env var save restore pattern maintenance\"\n- Search: \"finally block exception suppression service close convention\"\n- Entity: cleanup_stale_edges, verify_zombie_edges, reindex",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:13:53.177Z"
+        "updatedAt": "2026-03-26T18:33:00.358Z"
       },
       {
         "id": "145",
@@ -2343,11 +2343,11 @@
         "description": "The CONFIG_PATH save/restore boilerplate is copy-pasted 8 times across test_reindex.py (4x), test_cleanup_stale_edges.py (2x), and test_verify_zombie_edges.py (2x). The mock_config attribute setup (dimensions, api_key, model) is duplicated 10 times in test_reindex.py alone. Module-level imports are repeated inside individual test method bodies.",
         "details": "## Steps\n\n1. Create a shared pytest fixture for CONFIG_PATH save/restore:\n   ```python\n   @pytest.fixture(autouse=True)\n   def preserve_config_path():\n       original = os.environ.get('CONFIG_PATH')\n       yield original\n       if original is None:\n           os.environ.pop('CONFIG_PATH', None)\n       else:\n           os.environ['CONFIG_PATH'] = original\n   ```\n   Place in a conftest.py or as a class-level fixture. Remove the try/finally teardown blocks from all 8 test methods.\n\n2. Create a mock_config factory fixture:\n   ```python\n   @pytest.fixture\n   def standard_mock_config():\n       m = MagicMock()\n       m.embedder.dimensions = 1536\n       m.embedder.providers.openai.api_key = 'test-key'\n       m.embedder.model = 'text-embedding-3-small'\n       return m\n   ```\n   Use in all 10+ tests that need it. The 768-dimension variant overrides `.dimensions`.\n\n3. Move `import os` and `from fused_memory.maintenance.reindex import run_reindex` to module-level imports in test_reindex.py. Do the same for equivalent imports in the other two test files.\n\n4. Verify all tests still pass.\n\n## Memory Hints\n- Search: \"test boilerplate CONFIG_PATH fixture maintenance tests DRY\"\n- Search: \"mock_config setup reindex test duplication\"\n\n## Origin\nReview suggestions from Task 143 triage (suggestions #3, #4, #5, #6).",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:22:40.822Z"
+        "updatedAt": "2026-03-26T18:33:00.374Z"
       },
       {
         "id": "148",
@@ -2355,11 +2355,11 @@
         "description": "Several test gaps exist in the maintenance entrypoint tests (primarily test_reindex.py). Missing branches: pre-existing CONFIG_PATH restoration, config_path=None with pre-existing env var, close() exception masking. Weak assertions: sentinel test has no assert. Fragile mocking: four tests don't patch OpenAIEmbedderConfig.",
         "details": "## Steps\n\n1. **Pre-existing CONFIG_PATH restoration** (test_reindex.py TestRunReindexEnvVarRestore):\n   Add `test_restores_preexisting_env_var_when_constructor_fails`: set `os.environ['CONFIG_PATH'] = 'preexisting.yaml'`, call `run_reindex(config_path='test.yaml')` with FusedMemoryConfig raising, assert CONFIG_PATH restored to 'preexisting.yaml'. This exercises the `else` branch of the finally restore logic.\n\n2. **config_path=None leaves env untouched** (test_reindex.py):\n   Add `test_does_not_touch_env_var_when_config_path_is_none`: set CONFIG_PATH='existing.yaml', patch FusedMemoryConfig to raise, call `run_reindex()` (no config_path), assert CONFIG_PATH still 'existing.yaml'.\n\n3. **close() exception doesn't mask original** (test_reindex.py TestRunReindexServiceLifecycle):\n   Add `test_close_exception_does_not_mask_original_error`: patch ReindexManager to raise RuntimeError('original'), configure mock_service.close to raise RuntimeError('close error'), assert propagated exception is 'original'.\n\n4. **Strengthen sentinel test assertion** (test_reindex.py:1203-1216):\n   In `test_skips_close_when_service_never_created`, also patch MemoryService and assert `mock_service.close.assert_not_awaited()`.\n\n5. **Patch OpenAIEmbedderConfig in 4 fragile tests** (test_reindex.py lines 1046, 1088, 1139, 1172):\n   Add `patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig')` to: `test_restores_env_var_when_embedder_constructor_fails`, `test_restores_env_var_when_manager_constructor_fails`, `test_closes_service_when_manager_constructor_fails`, `test_closes_service_when_embedder_constructor_fails`.\n\n6. Apply analogous missing tests to test_cleanup_stale_edges.py and test_verify_zombie_edges.py where applicable.\n\n7. Verify all tests pass.\n\n## Memory Hints\n- Search: \"reindex env var test edge cases CONFIG_PATH branches\"\n- Search: \"service.close exception masking test maintenance\"\n\n## Origin\nReview suggestions from Task 143 triage (suggestions #7, #8, #9, #10, #11).",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:22:41.435Z"
+        "updatedAt": "2026-03-26T18:33:00.384Z"
       },
       {
         "id": "149",
@@ -2445,11 +2445,11 @@
         "description": "Two port consistency issues:\n\n1. dashboard/src/dashboard/config.py:9-13 has _DEFAULT_FUSED_MEMORY_URLS listing ports 8002, 8000, and 8001. Per convention, only port 8002 is canonical — 8000/8001 are stale Claude Code MCP instances running old code. The dashboard will silently fall back to stale instances.\n\n2. fused-memory/src/fused_memory/config/schema.py:73 defaults ServerConfig.port to 8000, but config.yaml and the convention use 8002. Anyone starting the server without config.yaml gets the wrong port.\n\nFix: (1) Remove 8000 and 8001 from _DEFAULT_FUSED_MEMORY_URLS. (2) Change schema.py port default from 8000 to 8002.\n\nSource: review-cycle 2026-03-25, findings DR-2 and DR-3.",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T07:32:49.450Z"
+        "updatedAt": "2026-03-26T18:33:00.397Z"
       },
       {
         "id": "156",
@@ -2469,11 +2469,11 @@
         "description": "Four pieces of confirmed dead code to remove:\n\n1. fused-memory/src/fused_memory/services/queue_service.py — legacy in-memory queue, superseded by DurableWriteQueue. Zero imports.\n2. orchestrator/src/orchestrator/protocols.py — defines SchedulerProtocol, BriefingProtocol, McpProtocol but none are imported anywhere. workflow.py defines its own inline Protocol classes.\n3. fused-memory/src/fused_memory/reconciliation/stages/integrity_check.py — 9-line shim that re-exports IntegrityCheck from task_knowledge_sync.py. Nothing imports it; harness.py imports directly from task_knowledge_sync.\n4. fused-memory/src/fused_memory/services/__init__.py — stale QueueService re-export in __all__. Remove import and clean __all__.\n\nOptional: fused-memory/src/fused_memory/backends/__init__.py has unused aggregate exports (GraphitiBackend, Mem0Backend). All callers import from submodules directly. Can be cleaned but is not harmful.\n\nSource: review-cycle 2026-03-25, dead code audit.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:20:44.931Z"
+        "updatedAt": "2026-03-26T18:33:00.411Z"
       },
       {
         "id": "158",
@@ -2481,11 +2481,11 @@
         "description": "Graphiti entity summaries accumulate stale and duplicated lines over time as new edges are added. This is a systemic issue (observed across reify entities for M5, M5 decomposition, M5 types, Task 139, Task 147, and others with recurrence >= 4). Entity summaries should be periodically rebuilt or deduplicated to reflect only current, non-invalidated edge facts.\n\nAcceptance criteria:\n1. Identify the Graphiti entity summary update path and understand why stale/duplicate lines persist\n2. Implement a mechanism to rebuild entity summaries from current valid edges (either on-write dedup or periodic batch rebuild)\n3. Expose this as a fused-memory management operation (e.g. rebuild_entity_summaries) \n4. Validate against known affected entities (reify project: M5, M5 decomposition, M5 types)\n\nmemory_hints:\n- entities: [\"M5\", \"M5 decomposition\", \"M5 types\", \"Task 139\"]\n- search queries: [\"entity summary accumulation stale\", \"Graphiti entity summary rebuild\"]",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:28:19.485Z"
+        "updatedAt": "2026-03-26T18:33:00.421Z"
       },
       {
         "id": "159",
@@ -2493,11 +2493,11 @@
         "description": "test_health_endpoint.py has grown beyond its original health-endpoint scope and now contains 8+ update_task tests plus other task-tool tests. Extract all task-tool tests into a dedicated test_task_tools.py file. While extracting, apply these improvements from code review:\n\n1. Parametrize the three structurally identical forwarding tests (prompt, append, tag) into a single @pytest.mark.parametrize test\n2. Add coverage for tag=None default (assert kwargs['tag'] is None when tag is omitted)\n3. Add test for _validate_project_root validation path on update_task (relative path → ValidationError)\n4. Use ExceptionClass.__name__ instead of bare strings for error_type assertions\n\n## memory_hints\n- search: \"test_health_endpoint.py task tool tests extract refactor\"\n- search: \"update_task MCP tool test coverage\"",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:21:11.065Z"
+        "updatedAt": "2026-03-26T18:33:00.433Z"
       },
       {
         "id": "160",
@@ -2517,13 +2517,13 @@
         "description": "Improve code quality in _graceful_shutdown (fused-memory/src/fused_memory/server/main.py).\n\nThree changes:\n1. Add parameter type annotations to _graceful_shutdown (currently untyped despite codebase convention of explicit types on all async functions). Use TYPE_CHECKING-guarded imports to avoid circular imports.\n2. Remove the `journal = recon_journal` alias on line 129. Either propagate the rename to all downstream uses (lines 152, 162) or revert to using `journal` throughout.\n3. Split the `except (asyncio.CancelledError, Exception): pass` in the harness cancellation block (lines 261-262) into two clauses: catch CancelledError silently (expected), but log unexpected exceptions via `logger.exception()` — consistent with every other step in the function.\n\nSource: Task 154 review, suggestions 1, 2, 3, 6, 8, 10, 17.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [
           "154"
         ],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:28:22.238Z"
+        "updatedAt": "2026-03-26T18:33:00.443Z"
       },
       {
         "id": "162",
@@ -2531,13 +2531,13 @@
         "description": "The harness loop task cancellation in _graceful_shutdown has no timeout: `harness_loop_task.cancel()` followed by bare `await harness_loop_task`. If run_loop() is mid-LLM-call when cancelled, CancelledError propagation is gated on I/O completing (10-60+ seconds). Worse, run_loop's finally block calls _stop_escalation_server() which itself does `await self._escalation_task` without a timeout. A stuck escalation task blocks shutdown indefinitely.\n\nFix: Wrap the harness task cancellation in `asyncio.wait_for(..., timeout=10.0)` and handle TimeoutError alongside CancelledError. Example:\n```python\nif harness_loop_task is not None:\n    try:\n        harness_loop_task.cancel()\n        await asyncio.wait_for(asyncio.shield(harness_loop_task), timeout=10.0)\n    except (asyncio.CancelledError, asyncio.TimeoutError):\n        pass\n    except Exception:\n        logger.exception('_graceful_shutdown: error awaiting harness_loop_task')\n```\n\nFile: fused-memory/src/fused_memory/server/main.py, lines 257-262.\nSource: Task 154 review, suggestion 5.\n\nmemory_hints: search \"harness shutdown timeout\", get_entity \"ReconciliationHarness\"",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [
           "154"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:28:16.915Z"
+        "updatedAt": "2026-03-26T18:33:00.454Z"
       },
       {
         "id": "163",
@@ -2545,13 +2545,13 @@
         "description": "Improve fused-memory/tests/test_server_shutdown.py in several ways:\n\n1. Replace `assert_called_once()` with `assert_awaited_once()` on all AsyncMock assertions (lines 25, 45, 65). The current assertions pass even if `await` is accidentally dropped. The codebase already uses `assert_awaited_once()` in test_reindex.py and test_cleanup_stale_edges.py.\n\n2. Replace `asyncio.ensure_future(_infinite())` (line 79) with `asyncio.create_task(_infinite())` — ensure_future is deprecated in Python 3.10+ and emits DeprecationWarning in 3.12+.\n\n3. Add missing test scenarios:\n   a. **Happy-path drain** — verify task_interceptor.drain() is actually awaited (currently only tested when it raises).\n   b. **Drain error + journal resilience** — test_shutdown_resilient_to_drain_error currently passes recon_journal=None. Add a recon_journal mock and assert it's still closed after drain failure.\n   c. **memory_service.close() error → journal still closed** — verify recon_journal.close() runs even when memory_service.close() raises.\n   d. **Shutdown ordering** — verify drain → cancel_harness → close_memory → close_journal ordering via a shared call_log with side_effect callbacks.\n\nSource: Task 154 review, suggestions 4, 9, 12, 13, 14, 15, 16, 18.",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [
           "154"
         ],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:13:21.150Z"
+        "updatedAt": "2026-03-26T18:33:00.463Z"
       },
       {
         "id": "164",
@@ -2559,11 +2559,11 @@
         "description": "Address deferred review suggestions from task 156:\n\n1. **Extract shared validation helper** (reuse auditor S2): The identical validation block `if not project_root or not os.path.isabs(project_root): raise ValueError(...)` appears in both `reconcile_task()` and `reconcile_bulk_tasks()` in targeted.py, and `_validate_project_root()` in tools.py has the same condition with a different interface (returns error dict). Extract a shared helper to `fused_memory/utils/validation.py` or similar, usable from both layers.\n  - Files: `fused-memory/src/fused_memory/reconciliation/targeted.py:86,355`, `fused-memory/src/fused_memory/server/tools.py:223`\n\n2. **Parametrize validation tests** (reuse auditor + test analyst S4): Collapse 6 structurally identical rejection tests into 2 parametrized tests (one for reconcile_task, one for reconcile_bulk_tasks) using `@pytest.mark.parametrize('project_root', ['', 'dark_factory', '.'])`. Optionally make match patterns more specific by including the repr of the bad value.\n  - Files: `fused-memory/tests/test_targeted.py:449-515`\n\n3. **Journal gap for pre-start ValueError** (robustness S5): ValueError for invalid project_root fires before `journal.start_run()`, so failures leave no journal trace. Consider wrapping validation in try/except before start_run, or moving it to the interceptor layer.\n  - Files: `fused-memory/src/fused_memory/reconciliation/targeted.py:86-89`",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:18:48.857Z"
+        "updatedAt": "2026-03-26T18:33:00.474Z"
       },
       {
         "id": "165",
@@ -2583,11 +2583,11 @@
         "description": "Consolidate and strengthen update_task forwarding and error-path tests in fused-memory/tests/test_health_endpoint.py. From review suggestions on task 124.",
         "details": "1. Parametrize the prompt/append/tag forwarding tests (lines ~120-170) into a single @pytest.mark.parametrize test, eliminating 3x structural duplication.\n2. Use assert_called_once_with() instead of manual call_args unpacking for stricter assertions.\n3. Assert the return value (== {'success': True}) in forwarding tests.\n4. Add a parametrize case or standalone test asserting tag=None is forwarded when tag is omitted.\n5. Add test_update_task_invalid_project_root_returns_error_dict: call update_task with project_root='relative/path', assert error dict with error_type='ValidationError'.",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:19:40.945Z"
+        "updatedAt": "2026-03-26T18:33:00.482Z"
       },
       {
         "id": "167",
@@ -2595,11 +2595,11 @@
         "description": "Fix convention violations and misleading test names in fused-memory/tests/test_stages.py. From review suggestions on task 142.",
         "details": "1. Remove the local `from unittest.mock import AsyncMock` on line 307 — the module-level import on line 4 is sufficient.\n2. Either remove TestSharedFixtureContract entirely (lines 300-316) or move it adjacent to the fixture definitions near the top of the file. The fixture implementation is self-documenting.\n3. Rename test_default_limits to reflect actual test semantics (e.g. test_tier_limits_with_default_class_values) or add a comment noting the shared fixture config differs from framework defaults.\n4. Rename test_sonnet_tier_limits to test_limits_are_mutable, or replace it with a test that exercises _select_tier() with appropriate buffer sizes to verify actual sonnet tier selection.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:18:48.917Z"
+        "updatedAt": "2026-03-26T18:33:00.493Z"
       },
       {
         "id": "168",
@@ -2607,11 +2607,11 @@
         "description": "Address temporal serialization bugs and test gaps in memory_service.py. From review suggestions on task 133.",
         "details": "Production code (fused-memory/src/fused_memory/services/memory_service.py):\n1. Fix get_episodes() str(None)==\"None\" bug at line 854 — if created_at is None, callers get string \"None\" instead of Python None.\n2. Change outer guard at line 731 from truthiness (`if valid_at or invalid_at:`) to `if valid_at is not None or invalid_at is not None:` for consistency with inner checks.\n3. Consider extracting a _serialize_temporal() helper to DRY the 4 isoformat-guard expressions across _search_graphiti and get_entity (lines 733-734, 825-826).\n\nTests (fused-memory/tests/test_memory_service.py):\n4. Move inline imports (`from datetime import UTC, datetime` and `from tests.conftest import MockEdge`) to module level.\n5. Add test for get_entity with both valid_at and invalid_at as datetimes.\n6. Add test for _search_graphiti with valid_at=None and only invalid_at set.\n7. Add assertion for temporal['invalid_at'] is None in the single-field test case.",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:20:44.306Z"
+        "updatedAt": "2026-03-26T18:33:00.503Z"
       },
       {
         "id": "169",
@@ -2619,11 +2619,11 @@
         "description": "Improve shutdown reliability in main.py and test coverage in test_server_shutdown.py. From review suggestions on task 154.",
         "details": "Production code (fused-memory/src/fused_memory/server/main.py):\n1. Add type annotations to _graceful_shutdown parameters (MemoryService, Optional[TaskInterceptor], Optional[asyncio.Task], Optional[ReconciliationJournal]).\n2. Remove the journal = recon_journal alias at line 129; use recon_journal directly at lines 152 and 162.\n3. Split harness_loop_task exception handling: catch CancelledError silently, log other exceptions via logger.exception().\n4. Add asyncio.wait_for timeout (~5s) to harness_loop_task await to prevent indefinite shutdown hangs.\n5. Add None guard for memory_service or make it non-optional via type annotation.\n6. Consider removing redundant try/except around memory_service.close() (it internally suppresses all exceptions).\n\nTests (fused-memory/tests/test_server_shutdown.py):\n7. Replace asyncio.ensure_future with asyncio.create_task at line 79.\n8. Change all assert_called_once() to assert_awaited_once() for AsyncMock objects.\n9. Add test: recon_journal.close() called even when task_interceptor.drain() raises.\n10. Add test: recon_journal.close() called even when memory_service.close() raises.\n11. Add test: verify four-step shutdown ordering (drain → cancel harness → close memory → close journal).",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:28:20.905Z"
+        "updatedAt": "2026-03-26T18:33:00.514Z"
       },
       {
         "id": "170",
@@ -2631,11 +2631,11 @@
         "description": "Hoist inline imports and add missing test coverage in maintenance utils tests. From review suggestions on task 144.",
         "details": "1. In fused-memory/tests/test_maintenance_utils.py: hoist `from fused_memory.maintenance._utils import override_config_path` and `import os` to module level, removing all 5+4 inline copies.\n2. Add exception-path test for override_config_path with a prior CONFIG_PATH value — assert restoration after exception.",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:19:50.054Z"
+        "updatedAt": "2026-03-26T18:33:00.525Z"
       },
       {
         "id": "171",
@@ -2643,11 +2643,11 @@
         "description": "Update misleading comments in three maintenance files. From review suggestions on task 144.",
         "details": "Update the comment '# Catch close() errors so CONFIG_PATH restoration below always runs.' in:\n- fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py:131\n- fused-memory/src/fused_memory/maintenance/verify_zombie_edges.py:170\n- fused-memory/src/fused_memory/maintenance/reindex.py:194\n\nThe comment is factually wrong post-refactor. CONFIG_PATH restoration is handled by the outer override_config_path context manager, not by code below the try/except. Replace with e.g. '# Catch close() errors so they do not propagate out of the with block.'",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:17:35.318Z"
+        "updatedAt": "2026-03-26T18:33:00.535Z"
       },
       {
         "id": "172",
@@ -2655,11 +2655,11 @@
         "description": "Add integration tests for config_path propagation and document thread-safety limitation. From review suggestions on task 144.",
         "details": "1. In test_cleanup_stale_edges.py and test_reindex.py, add a shallow integration test that calls the entrypoint with config_path set and mocks FusedMemoryConfig to verify CONFIG_PATH is set at construction time and restored after the call.\n2. In fused-memory/src/fused_memory/maintenance/_utils.py, add a docstring note to override_config_path that it is not safe for concurrent use within the same process (os.environ mutation is unguarded).",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:22:43.377Z"
+        "updatedAt": "2026-03-26T18:33:00.545Z"
       },
       {
         "id": "173",
@@ -2667,11 +2667,11 @@
         "description": "All 6 Chart.js charts (performance histograms, completion paths doughnut, memory timeseries, memory ops/agent doughnuts) appear blank on initial load and after every HTMX morph refresh. Root cause: double requestAnimationFrame pattern in performance.html and memory_graphs.html conflicts with Idiomorph's DOM replacement cycle. Charts have data but canvas never visually renders until manually forced.",
         "details": "Files: dashboard/src/dashboard/templates/partials/performance.html (lines 211-213), dashboard/src/dashboard/templates/partials/memory_graphs.html (lines 121-123).\n\nFix approach: Replace double-rAF with HTMX afterSettle/afterSwap event listener, or use MutationObserver to detect when canvas elements are in the DOM and then initialize charts. Alternatively, listen for htmx:afterSettle on the parent section and call renderAll() directly.\n\nmemory_hint: search \"chart rendering htmx morph\" for prior discussion; get_entity \"Chart.js\" for any conventions.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:14:07.701Z"
+        "updatedAt": "2026-03-26T18:33:00.555Z"
       },
       {
         "id": "174",
@@ -2679,11 +2679,11 @@
         "description": "Regression: The orchestrator card renders the task table visible on load but the toggle button says \"Show tasks\". Clicking toggles to \"Hide tasks\" (still visible), then a second click hides the table correctly. On HTMX refresh (every 10s), state resets to the broken initial state. The Alpine x-data state is lost on morph.",
         "details": "Files: dashboard/src/dashboard/templates/partials/orchestrators.html.\n\nTwo issues: (1) Initial Alpine state should default to table hidden (x-show with open:false, but the table HTML is not wrapped in x-show or the logic is inverted). (2) Alpine state resets on every HTMX morph because Idiomorph replaces the x-data element, losing the toggled state. Fix: use Alpine.store('panels') which persists across morphs, or use hx-swap=\"morph:outerHTML\" which Idiomorph handles better for preserving Alpine state.\n\nmemory_hint: search \"Alpine state HTMX morph\" for prior patterns.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:22:13.894Z"
+        "updatedAt": "2026-03-26T18:33:00.564Z"
       },
       {
         "id": "175",
@@ -2691,11 +2691,11 @@
         "description": "The reconciliation Recent Runs table shows \"Loading...\" text between every run row. Detail rows use x-show=\"open\" with x-cloak and hx-trigger=\"revealed\", but Idiomorph morphing every 15s briefly makes hidden rows visible, triggering unnecessary HTMX fetches. The \"Loading...\" text from in-flight fetches remains visible.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 159-164).\n\nFix approach: (1) Change hx-trigger from \"revealed\" to a manual trigger fired by the Alpine @click handler (e.g. hx-trigger=\"load-detail\" and dispatch the event on click). This prevents morph-triggered fetches. (2) Use Alpine.store or id-based state preservation to maintain open/closed state across morphs.\n\nmemory_hint: search \"reconciliation detail HTMX\" for prior discussion.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:22:14.700Z"
+        "updatedAt": "2026-03-26T18:33:00.580Z"
       },
       {
         "id": "176",
@@ -2703,11 +2703,11 @@
         "description": "Reconciliation journal entry count badges are span elements with @click — not recognized as interactive by screen readers or keyboard navigation. Convert to button elements with proper aria-label, hover/focus states.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (line 153). Change span to button, add aria-label=\"Show N journal entries\", add focus:ring styles. Also add hover:bg-blue-800 for visual feedback.",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:14:06.959Z"
+        "updatedAt": "2026-03-26T18:33:00.588Z"
       },
       {
         "id": "177",
@@ -2715,11 +2715,11 @@
         "description": "Burst State table lists ~70 agents, most idle for hours/days, flooding the reconciliation left column. Default should show only bursting/active agents with a \"Show N idle agents\" expandable toggle.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 22-48). Partition agents into active (state != 'idle' or last_write < 1h) and stale. Show active by default, hide stale behind Alpine toggle. Consider also adding a max-height with overflow-y-auto as a fallback.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:14:08.510Z"
+        "updatedAt": "2026-03-26T18:33:00.598Z"
       },
       {
         "id": "178",
@@ -2727,11 +2727,11 @@
         "description": "Event buffer shows \"Oldest: 1045m 36s\" which is unreadable. Should display as \"17h 25m\" for values over 60 minutes. Use the existing timeago filter or add a duration formatter.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (line 16). The template computes age // 60 for minutes and age % 60 for seconds. For large values, convert to hours+minutes instead. Could reuse the format_duration_ms Jinja filter from app.py (adapted for seconds input).",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:14:09.262Z"
+        "updatedAt": "2026-03-26T18:33:00.609Z"
       },
       {
         "id": "179",
@@ -2739,11 +2739,11 @@
         "description": "Watermarks section displays raw absolute paths like \"/home/leo/src/dark-factory\" instead of project names like \"dark_factory\". Extract basename or use the project_id from the data source.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 54-57). The watermarks data uses project_id as key which currently contains the filesystem path. Either fix at the data layer (dashboard/src/dashboard/data/reconciliation.py get_watermarks) to return project names, or add a Jinja filter to extract the last path component.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:14:10.266Z"
+        "updatedAt": "2026-03-26T18:33:00.618Z"
       },
       {
         "id": "180",
@@ -2751,11 +2751,11 @@
         "description": "base.html loads Tailwind via cdn.tailwindcss.com which is not for production (console warning) and favicon.ico returns 404 (console error). Bundle Tailwind via CLI or PostCSS build step, and add a basic favicon.",
         "details": "File: dashboard/src/dashboard/templates/base.html (line 7). Options: (1) Use Tailwind CLI standalone to generate a built CSS file at build/dev time. (2) Add a simple SVG favicon served from /static/. Also pin the other CDN deps (htmx, idiomorph, chart.js, alpine) to exact versions or vendor them.",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:22:13.451Z"
+        "updatedAt": "2026-03-26T18:33:00.626Z"
       },
       {
         "id": "181",
@@ -2763,11 +2763,11 @@
         "description": "Several chart UX issues: (1) Histogram bars have legend disabled — no way to know what colors mean. (2) Memory \"By operation\" doughnut legend text is truncated when many labels. (3) Memory \"By agent\" chart dominated by \"unknown\" (91%) making pie chart unhelpful. (4) Timeseries chart only uses ~40% of container width. (5) No data labels on doughnut slices.",
         "details": "Files: dashboard/src/dashboard/templates/partials/performance.html (line 192 legend:display:false), dashboard/src/dashboard/templates/partials/memory_graphs.html (lines 106-116 legend config).\n\nFixes: (1) Enable legend on histograms or add x-axis labels. (2) For pie charts with dominant slice, consider \"top N + other\" grouping. (3) Investigate why timeseries doesn't fill container — likely Chart.js responsive:true with maintainAspectRatio:false should work but canvas container may need explicit width. (4) Add tooltips with values for all chart types (already default in Chart.js, verify working).",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:13:48.878Z"
+        "updatedAt": "2026-03-26T18:33:00.635Z"
       },
       {
         "id": "182",
@@ -2775,11 +2775,11 @@
         "description": "Users see content change with no indication the dashboard is auto-refreshing. Add a subtle \"updated Xs ago\" timestamp per section, and a brief visual pulse or indicator when data refreshes successfully.",
         "details": "Implementation: Use htmx:afterSwap event on each section to update a small timestamp element. Could use a Jinja macro that renders a \"last updated\" line, or inject via JS after successful HTMX swap. Keep it minimal — small gray text like \"Updated 3s ago\" below each section heading.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:22:16.401Z"
+        "updatedAt": "2026-03-26T18:33:00.645Z"
       },
       {
         "id": "183",
@@ -2787,11 +2787,11 @@
         "description": "Two layout issues: (1) Right column uses lg:absolute lg:inset-0 which causes scroll/overlap issues when left column height differs. (2) \"When\" and \"Detail\" column headers truncated at right edge on 1440px viewport.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 110-111). Fix: Replace absolute positioning with a simpler flex or grid layout that allows both columns to scroll independently. For truncation: ensure table uses table-layout:auto or add min-width to the container with overflow-x-auto.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:22:18.770Z"
+        "updatedAt": "2026-03-26T18:33:00.658Z"
       },
       {
         "id": "184",
@@ -2799,11 +2799,11 @@
         "description": "Two information clarity issues: (1) Queue indicator shows \"0p/0r/15d\" — cryptic abbreviation needs tooltip or expanded label (0 pending / 0 retry / 15 dead letters). (2) Latest Verdict (\"serious / Action: halt\") is buried at the very bottom of the page with no context about what it means or requires.",
         "details": "Files: dashboard/src/dashboard/templates/partials/memory.html (Queue indicator), dashboard/src/dashboard/templates/partials/recon.html (lines 93-105 Latest Verdict).\n\nFor Queue: Add title attribute with expanded text, or show as \"0 pending · 0 retry · 15 dead\" inline. For Verdict: Consider moving to a top-level alert banner when severity is serious/critical, or at minimum add a brief explanation of what the verdict means.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:22:20.009Z"
+        "updatedAt": "2026-03-26T18:33:00.667Z"
       },
       {
         "id": "185",
@@ -2811,11 +2811,11 @@
         "description": "All dashboard sections poll at fixed intervals (10s, 15s, 30s, 60s) with no randomization. Multiple browser tabs or dashboard instances will hit the backend simultaneously. Add random jitter to polling intervals.",
         "details": "File: dashboard/src/dashboard/templates/index.html (lines 8, 22, 36, 50, 60).\n\nHTMX doesn't natively support jitter, but workaround: use hx-trigger=\"load, every 10s\" with a small JS script that randomizes the initial delay per section, or use htmx:configRequest to add small random delays. Alternative: use a single polling heartbeat that triggers all sections with staggered offsets.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:22:22.235Z"
+        "updatedAt": "2026-03-26T18:33:00.675Z"
       },
       {
         "id": "186",
@@ -2823,16 +2823,16 @@
         "description": "task_knowledge_sync.py has two bugs that cause contaminated data for non-dark-factory projects:\n\n1. Line 46: `get_tasks(project_root=self.project_id)` passes project_id (e.g. \"reify\") instead of project_root (e.g. \"/home/leo/src/reify\"). This means the task tree fetch fails or returns wrong data for every non-dark-factory project.\n\n2. Line 99: `project_root=\"/home/leo/src/dark-factory\"` is hardcoded instead of using `self.project_root`. This causes every Stage 2 agent to use dark-factory's task operations regardless of which project is being reconciled.\n\nBoth `self.project_id` and `self.project_root` are defined in base.py. The fixes are straightforward:\n- Line 46: Change `self.project_id` → `self.project_root`\n- Line 99: Change the hardcoded path → `self.project_root`\n\nThis bug has persisted for 4+ reconciliation cycles and is the root cause of repeated reify task count contamination in the knowledge graph.",
         "details": "File: fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py\n\nFix 1 (line 46):\n```python\n# Before:\ntasks_data = await self.taskmaster.get_tasks(project_root=self.project_id)\n# After:\ntasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)\n```\n\nFix 2 (line 99):\n```python\n# Before:\nUse project_root=\"/home/leo/src/dark-factory\" for all task operations.\n# After:\nUse project_root=\"{self.project_root}\" for all task operations.\n```\n\nBoth self.project_id and self.project_root are available from BaseStage (base.py lines 53-54).\n\nmemory_hints:\n- Search: \"task_knowledge_sync project_root bug contamination\" (project: dark_factory)\n- Entity: \"task_knowledge_sync.py\"\n- Entity: \"/home/leo/src/reify/.taskmaster/tasks/tasks.json\" (to see contamination history)",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:13:55.426Z"
+        "updatedAt": "2026-03-26T18:33:00.691Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T18:28:22.238Z",
+      "lastModified": "2026-03-26T18:33:00.691Z",
       "taskCount": 165,
       "completedCount": 122,
       "tags": [
