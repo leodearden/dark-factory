@@ -2305,11 +2305,11 @@
         "description": "The 6-line CONFIG_PATH env-var save/restore pattern in the finally block is now byte-for-byte identical across cleanup_stale_edges.py, verify_zombie_edges.py, and (once fixed) reindex.py. Extract a shared context manager or async helper (e.g. `@contextmanager def override_config_path(config_path)` in `fused_memory/maintenance/_utils.py`) to eliminate future drift and make any additional entrypoints get the pattern right automatically.",
         "details": "## Steps\n\n1. Create `fused-memory/src/fused_memory/maintenance/_utils.py` with:\n   - `@contextlib.contextmanager def override_config_path(config_path: str | None)` that handles save/set/restore\n   - Consider also wrapping the service close pattern per convention (memory id: 458388ca about wrapping service.close() in try/except)\n\n2. Refactor all three entrypoints (cleanup_stale_edges.py, verify_zombie_edges.py, reindex.py) to use the shared utility.\n\n3. Update tests to verify the utility works correctly.\n\n## Memory Hints\n- Search: \"CONFIG_PATH env var save restore pattern maintenance\"\n- Search: \"finally block exception suppression service close convention\"\n- Entity: cleanup_stale_edges, verify_zombie_edges, reindex",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T07:43:43.506Z"
+        "updatedAt": "2026-03-26T18:08:20.134Z"
       },
       {
         "id": "145",
@@ -2811,7 +2811,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T18:08:20.106Z",
+      "lastModified": "2026-03-26T18:08:20.134Z",
       "taskCount": 165,
       "completedCount": 122,
       "tags": [
