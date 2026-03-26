@@ -16,8 +16,9 @@ ROOT="$(git rev-parse --show-toplevel)"
 
 # ── Universal guards ────────────────────────────────────────────────────
 
-# Reject staged .task/ files — agent scratch dir must never be committed.
-if git diff --cached --name-only | grep -q '^\.task/'; then
+# Reject .task/ files being added — agent scratch dir must never be committed.
+# Uses --diff-filter=ACMR to allow deletions (cleaning up prior contamination).
+if git diff --cached --name-only --diff-filter=ACMR | grep -q '^\.task/'; then
     echo "pre-commit: BLOCKED — .task/ files are staged."
     echo "  Run:  git rm -r --cached .task/"
     echo "  Then: ensure .task/ is in .gitignore"
