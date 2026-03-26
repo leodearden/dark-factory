@@ -261,7 +261,7 @@ async def _graceful_shutdown(
     if harness_loop_task is not None:
         try:
             harness_loop_task.cancel()
-            await harness_loop_task
+            await asyncio.wait_for(harness_loop_task, timeout=_HARNESS_CANCEL_TIMEOUT)
         except asyncio.CancelledError:
             pass
         except asyncio.TimeoutError:
