@@ -2619,11 +2619,11 @@
         "description": "Improve shutdown reliability in main.py and test coverage in test_server_shutdown.py. From review suggestions on task 154.",
         "details": "Production code (fused-memory/src/fused_memory/server/main.py):\n1. Add type annotations to _graceful_shutdown parameters (MemoryService, Optional[TaskInterceptor], Optional[asyncio.Task], Optional[ReconciliationJournal]).\n2. Remove the journal = recon_journal alias at line 129; use recon_journal directly at lines 152 and 162.\n3. Split harness_loop_task exception handling: catch CancelledError silently, log other exceptions via logger.exception().\n4. Add asyncio.wait_for timeout (~5s) to harness_loop_task await to prevent indefinite shutdown hangs.\n5. Add None guard for memory_service or make it non-optional via type annotation.\n6. Consider removing redundant try/except around memory_service.close() (it internally suppresses all exceptions).\n\nTests (fused-memory/tests/test_server_shutdown.py):\n7. Replace asyncio.ensure_future with asyncio.create_task at line 79.\n8. Change all assert_called_once() to assert_awaited_once() for AsyncMock objects.\n9. Add test: recon_journal.close() called even when task_interceptor.drain() raises.\n10. Add test: recon_journal.close() called even when memory_service.close() raises.\n11. Add test: verify four-step shutdown ordering (drain → cancel harness → close memory → close journal).",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:14:05.152Z"
+        "updatedAt": "2026-03-26T18:28:20.905Z"
       },
       {
         "id": "170",
@@ -2832,7 +2832,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T18:28:19.485Z",
+      "lastModified": "2026-03-26T18:28:20.905Z",
       "taskCount": 165,
       "completedCount": 122,
       "tags": [
