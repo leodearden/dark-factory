@@ -24,7 +24,7 @@ def validate_project_root(project_root: str) -> dict[str, str] | None:
 
 def validate_project_id(project_id: str) -> dict[str, str] | None:
     """Return an error dict if project_id is empty, else None."""
-    if not project_id:
+    if not project_id or not project_id.strip():
         return {
             'error': 'project_id is required and must be non-empty',
             'error_type': 'ValidationError',
