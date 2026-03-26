@@ -131,7 +131,7 @@ async def run_cleanup(
         return result
     finally:
         if service is not None:
-            # Catch close() errors so CONFIG_PATH restoration below always runs.
+            # Catch close() errors so they do not propagate out of the finally block.
             try:
                 await service.close()
             except Exception:
