@@ -22,7 +22,7 @@ class TestGracefulShutdownCallsMemoryServiceClose:
             recon_journal=None,
         )
 
-        memory_service.close.assert_called_once()
+        memory_service.close.assert_awaited_once()
 
 
 class TestGracefulShutdownClosesReconciliationJournal:
@@ -42,7 +42,7 @@ class TestGracefulShutdownClosesReconciliationJournal:
             recon_journal=recon_journal,
         )
 
-        recon_journal.close.assert_called_once()
+        recon_journal.close.assert_awaited_once()
 
 
 class TestGracefulShutdownResilientToDrainError:
@@ -62,7 +62,7 @@ class TestGracefulShutdownResilientToDrainError:
             recon_journal=None,
         )
 
-        memory_service.close.assert_called_once()
+        memory_service.close.assert_awaited_once()
 
 
 class TestGracefulShutdownCancelsHarnessLoopTask:
@@ -76,7 +76,7 @@ class TestGracefulShutdownCancelsHarnessLoopTask:
         async def _infinite():
             await asyncio.sleep(9999)
 
-        harness_loop_task = asyncio.ensure_future(_infinite())
+        harness_loop_task = asyncio.create_task(_infinite())
 
         await _graceful_shutdown(
             memory_service=memory_service,
