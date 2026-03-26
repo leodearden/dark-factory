@@ -1,6 +1,7 @@
 """Tests for shared validation utilities in fused_memory.utils.validation."""
 
 import pytest
+from unittest.mock import patch
 
 from fused_memory.utils.validation import (
     require_project_root,
@@ -104,3 +105,10 @@ class TestRequireProjectRoot:
     def test_error_message_mentions_bad_value(self):
         with pytest.raises(ValueError, match='bad/path'):
             require_project_root('bad/path')
+
+    def test_delegates_to_validate_project_root(self):
+        error_dict = {'error': 'sentinel error', 'error_type': 'ValidationError'}
+        with patch('fused_memory.utils.validation.validate_project_root', return_value=error_dict) as mock_vpr:
+            with pytest.raises(ValueError):
+                require_project_root('/any/path')
+            mock_vpr.assert_called_once_with('/any/path')
