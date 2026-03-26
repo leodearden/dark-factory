@@ -2,7 +2,7 @@
 # Per-project config files override individual keys via deep merge.
 
 # Concurrency
-max_concurrent_tasks: 12
+max_concurrent_tasks: 24
 max_per_module: 1
 lock_depth: 4
 module_overrides: {}
@@ -17,6 +17,9 @@ steward_lifetime_budget: 12.0
 steward_max_retries: 3
 steward_completion_timeout: 300.0
 
+# Wall-clock backstop for any single agent invocation (seconds)
+invocation_timeout: 1200.0
+
 # Models per role
 models:
   architect: "opus"
@@ -30,7 +33,7 @@ models:
 
 # Budget per invocation (USD)
 budgets:
-  architect: 5.0
+  architect: 8.0
   implementer: 10.0
   debugger: 5.0
   reviewer: 2.0
@@ -41,7 +44,7 @@ budgets:
 
 # Turn limits per invocation
 max_turns:
-  architect: 50
+  architect: 75
   implementer: 80
   debugger: 50
   reviewer: 30
@@ -75,7 +78,7 @@ backends:
 # Review checkpoints
 review:
   enabled: true
-  interval: 5
+  interval: 12
   full_review_on_complete: true
   briefing_path: "review/briefing.yaml"
   reports_dir: "data/review-checkpoints"
@@ -105,11 +108,11 @@ usage_cap:
   probe_interval_secs: 300
   max_probe_interval_secs: 1800
   accounts:
-    - name: max-d
-      oauth_token_env: CLAUDE_OAUTH_TOKEN_D
     - name: max-c
       oauth_token_env: CLAUDE_OAUTH_TOKEN_C
     - name: max-b
       oauth_token_env: CLAUDE_OAUTH_TOKEN_B
+    - name: max-d
+      oauth_token_env: CLAUDE_OAUTH_TOKEN_D
 #    - name: max-a
 #      oauth_token_env: CLAUDE_OAUTH_TOKEN_A

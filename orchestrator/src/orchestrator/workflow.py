@@ -916,6 +916,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             sandbox_modules=sandbox_modules,
             effort=effort_val,
             backend=backend_val,
+            timeout_seconds=self.config.invocation_timeout,
         )
 
         # Track metrics

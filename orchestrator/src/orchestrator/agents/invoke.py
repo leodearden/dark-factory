@@ -105,6 +105,7 @@ async def invoke_agent(
     backend: str = 'claude',
     oauth_token: str | None = None,
     resume_session_id: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
 
@@ -112,6 +113,7 @@ async def invoke_agent(
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
     *resume_session_id*, when set, resumes an existing Claude session.
+    *timeout_seconds*, when set, kills the subprocess after this many seconds.
     """
     if backend == 'claude':
         return await _invoke_claude_with_sandbox(
@@ -122,18 +124,21 @@ async def invoke_agent(
             permission_mode=permission_mode, sandbox_modules=sandbox_modules,
             effort=effort, oauth_token=oauth_token,
             resume_session_id=resume_session_id,
+            timeout_seconds=timeout_seconds,
         )
     elif backend == 'codex':
         return await _invoke_codex(
             prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
             max_budget_usd=max_budget_usd, mcp_config=mcp_config,
             sandbox_modules=sandbox_modules, effort=effort,
+            timeout_seconds=timeout_seconds,
         )
     elif backend == 'gemini':
         return await _invoke_gemini(
             prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
             max_budget_usd=max_budget_usd, mcp_config=mcp_config,
             sandbox_modules=sandbox_modules, effort=effort,
+            timeout_seconds=timeout_seconds,
         )
     else:
         raise ValueError(f'Unknown backend: {backend!r}')
@@ -159,6 +164,7 @@ async def _invoke_claude_with_sandbox(
     effort: str | None,
     oauth_token: str | None = None,
     resume_session_id: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI with optional bwrap sandboxing.
 
@@ -206,7 +212,7 @@ async def _invoke_claude_with_sandbox(
                 env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
 
             try:
-                result = await _run_subprocess(cmd, cwd, env, model)
+                result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds)
                 return _parse_claude_output(result)
             finally:
                 if mcp_config_path:
@@ -222,6 +228,7 @@ async def _invoke_claude_with_sandbox(
         mcp_config=mcp_config, output_schema=output_schema,
         permission_mode=permission_mode, effort=effort,
         oauth_token=oauth_token, resume_session_id=resume_session_id,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -238,6 +245,7 @@ async def _invoke_codex(
     mcp_config: dict | None,
     sandbox_modules: list[str] | None,
     effort: str | None,
+    timeout_seconds: float | None = None,
 ) -> AgentResult:
     """Invoke OpenAI Codex CLI."""
     temp_files: list[Path] = []
@@ -273,7 +281,7 @@ async def _invoke_codex(
         # Strip OPENAI_API_KEY if using OAuth
         env = dict(os.environ)
 
-        result = await _run_subprocess_local(cmd, cwd, env, 'codex', model, max_budget_usd)
+        result = await _run_subprocess_local(cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds)
         return _parse_codex_output(result, model)
 
     finally:
@@ -409,6 +417,7 @@ async def _invoke_gemini(
     mcp_config: dict | None,
     sandbox_modules: list[str] | None,
     effort: str | None,
+    timeout_seconds: float | None = None,
 ) -> AgentResult:
     """Invoke Google Gemini CLI."""
     temp_files: list[Path] = []
@@ -436,7 +445,7 @@ async def _invoke_gemini(
 
         env = dict(os.environ)
 
-        result = await _run_subprocess_local(cmd, cwd, env, 'gemini', model, max_budget_usd)
+        result = await _run_subprocess_local(cmd, cwd, env, 'gemini', model, max_budget_usd, timeout_seconds)
         return _parse_gemini_output(result, model)
 
     finally:
@@ -531,6 +540,7 @@ async def _run_subprocess_local(
     backend: str,
     model: str,
     max_budget_usd: float,
+    timeout_seconds: float | None = None,
 ) -> _SubprocessResult:
     """Run a subprocess, log output, enforce budget timeout."""
     logger.info(f'Invoking agent: backend={backend} model={model} cwd={cwd} budget=${max_budget_usd}')
@@ -545,7 +555,22 @@ async def _run_subprocess_local(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        duration_ms = int(time.monotonic() * 1000) - start_ms
+        return _SubprocessResult(
+            stdout='',
+            stderr=f'Process killed after {timeout_seconds}s timeout',
+            returncode=1,
+            duration_ms=duration_ms,
+        )
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
 

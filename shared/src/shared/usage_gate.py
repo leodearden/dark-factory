@@ -3,6 +3,8 @@
 Supports multiple Claude Max accounts for failover: when one account hits its
 usage cap, the gate returns the next available account's token. Only blocks
 when *all* accounts are capped.
+
+Works with 1 or N accounts — there is no separate "single-account" path.
 """
 
 from __future__ import annotations
@@ -56,6 +58,9 @@ GEMINI_CAP_PATTERNS = ['quota exceeded', 'rate limit', 'resource exhausted',
 CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
 USAGE_API_URL = 'https://claude.ai/api/oauth/usage'
 
+# Consecutive API failures required before tentative uncap (after resets_at)
+_TENTATIVE_UNCAP_THRESHOLD = 2
+
 
 @dataclass
 class AccountState:
@@ -67,6 +72,7 @@ class AccountState:
     resets_at: datetime | None = None
     pause_started_at: datetime | None = None
     resume_task: asyncio.Task | None = field(default=None, repr=False)
+    api_fail_count: int = 0    # consecutive _query_usage_api failures
 
 
 class SessionBudgetExhausted(Exception):
@@ -80,12 +86,9 @@ class SessionBudgetExhausted(Exception):
 class UsageGate:
     """Shared gate that pauses all agent invocations when a usage cap is hit.
 
-    When multiple accounts are configured, the gate tracks cap status per
-    account and returns the first available account's token from
-    ``before_invoke()``. Only blocks when *all* accounts are capped.
-
-    With no accounts configured (backwards compat), behaves as a simple
-    open/closed gate and ``before_invoke()`` returns ``None``.
+    Tracks cap status per account and returns the first available account's
+    token from ``before_invoke()``. Only blocks when *all* accounts are
+    capped.  Works with 1 or N accounts.
     """
 
     def __init__(self, config: UsageCapConfig):
@@ -94,17 +97,18 @@ class UsageGate:
         self._open.set()  # start open
         self._lock = asyncio.Lock()
         self._cumulative_cost: float = 0.0
-        self._resets_at: datetime | None = None
         self._paused_reason: str = ''
-        self._resume_task: asyncio.Task | None = None
         self._pause_started_at: datetime | None = None
         self._total_pause_secs: float = 0.0
 
-        # Multi-account state
         self._accounts: list[AccountState] = self._init_accounts()
 
     def _init_accounts(self) -> list[AccountState]:
-        """Resolve account tokens from env vars. Empty list = legacy single-account mode."""
+        """Resolve account tokens from env vars.
+
+        If no accounts are configured, falls back to reading the default
+        credential from ``~/.claude/.credentials.json``.
+        """
         accounts: list[AccountState] = []
         for acct_cfg in self._config.accounts:
             token = os.environ.get(acct_cfg.oauth_token_env)
@@ -116,50 +120,23 @@ class UsageGate:
                 continue
             accounts.append(AccountState(name=acct_cfg.name, token=token))
 
+        if not accounts:
+            token = _read_oauth_token()
+            if token:
+                accounts.append(AccountState(name='default', token=token))
+                logger.info('Single-account mode: using default credential')
+            else:
+                logger.warning('No accounts configured and no default credential found')
+
         if accounts:
             logger.info(
-                f'Multi-account failover: {len(accounts)} accounts active — '
+                f'Failover: {len(accounts)} account(s) active — '
                 + ', '.join(a.name for a in accounts)
             )
         return accounts
 
-    @property
-    def _multi_account(self) -> bool:
-        return len(self._accounts) > 0
-
     async def check_at_startup(self) -> None:
         """Query /api/oauth/usage for each account. Pause if all are over threshold."""
-        if self._multi_account:
-            await self._check_at_startup_multi()
-        else:
-            await self._check_at_startup_single()
-
-    async def _check_at_startup_single(self) -> None:
-        """Legacy single-account startup check."""
-        usage = await self._query_usage_api()
-        if usage is None:
-            logger.info('Usage API unavailable at startup — proceeding without cap check')
-            return
-
-        for tier_name, tier_data in usage.items():
-            if not isinstance(tier_data, dict):
-                continue
-            utilization = tier_data.get('utilization', 0)
-            resets_at_str = tier_data.get('resets_at')
-
-            logger.info(f'Usage tier {tier_name}: {utilization:.0%} utilized'
-                        + (f', resets at {resets_at_str}' if resets_at_str else ''))
-
-            if utilization >= self._config.pause_threshold:
-                resets_at = _parse_iso_timestamp(resets_at_str) if resets_at_str else None
-                await self._pause(
-                    f'Startup check: {tier_name} at {utilization:.0%} (threshold {self._config.pause_threshold:.0%})',
-                    resets_at,
-                )
-                return
-
-    async def _check_at_startup_multi(self) -> None:
-        """Multi-account startup check — mark individual accounts as capped."""
         for acct in self._accounts:
             usage = await self._query_usage_api(token=acct.token)
             if usage is None:
@@ -186,27 +163,28 @@ class UsageGate:
                     break  # one capped tier is enough
 
         # If ALL accounts are capped, close the global gate
-        if all(a.capped for a in self._accounts):
-            await self._pause(
-                f'All {len(self._accounts)} accounts capped at startup',
-                min((a.resets_at for a in self._accounts if a.resets_at), default=None),
-            )
+        if self._accounts and all(a.capped for a in self._accounts):
+            self._open.clear()
+            self._paused_reason = f'All {len(self._accounts)} account(s) capped at startup'
+            self._pause_started_at = datetime.now(UTC)
+            logger.warning(f'Usage gate PAUSED: {self._paused_reason}')
 
     async def before_invoke(self) -> str | None:
         """Block until at least one account is available. Return its OAuth token.
 
-        Returns ``None`` in legacy single-account mode (no token override needed).
+        Returns ``None`` if no accounts are configured (no token override).
         """
-        # Session budget check (common to both modes)
+        # Session budget check
         if (self._config.session_budget_usd is not None
                 and self._cumulative_cost >= self._config.session_budget_usd):
             raise SessionBudgetExhausted(self._cumulative_cost)
 
-        if not self._multi_account:
-            await self._open.wait()
-            return None
+        if not self._accounts:
+            raise RuntimeError(
+                'No OAuth accounts available — configure accounts or provide credentials'
+            )
 
-        # Multi-account: find first non-capped account
+        # Find first non-capped account (works with 1 or N)
         while True:
             for acct in self._accounts:
                 if not acct.capped:
@@ -234,12 +212,9 @@ class UsageGate:
     ) -> bool:
         """Scan stderr and result text for cap-hit patterns.
 
-        In multi-account mode, marks the specific account identified by
-        ``oauth_token`` as capped and starts its resume probe. Returns True
-        so the retry loop re-calls ``before_invoke()`` to pick the next
-        available account.
-
-        In single-account mode, closes the global gate as before.
+        Marks the specific account identified by ``oauth_token`` as capped
+        and starts its resume probe. Returns True so the retry loop re-calls
+        ``before_invoke()`` to pick the next available account.
         """
         combined = f'{stderr}\n{result_text}'
 
@@ -275,43 +250,32 @@ class UsageGate:
         resets_at: datetime | None,
         oauth_token: str | None,
     ) -> None:
-        """Mark the right account (or global gate) as capped."""
-        if self._multi_account and oauth_token is not None:
-            acct = self._find_account_by_token(oauth_token)
-            if acct is not None:
-                acct.capped = True
-                acct.resets_at = resets_at
-                if acct.pause_started_at is None:
-                    acct.pause_started_at = datetime.now(UTC)
-                logger.warning(f'Account {acct.name} CAPPED: {reason}')
-                self._start_account_resume_probe(acct)
+        """Mark the matching account as capped."""
+        acct = self._find_account_by_token(oauth_token) if oauth_token else None
+        if acct is None:
+            # Unknown token — try first uncapped account as best guess
+            for a in self._accounts:
+                if not a.capped:
+                    acct = a
+                    break
+        if acct is None:
+            logger.warning(f'Cap detected but no matching account: {reason}')
+            return
 
-                # If all accounts are now capped, close the global gate
-                if all(a.capped for a in self._accounts):
-                    self._open.clear()
-                    self._paused_reason = f'All accounts capped (last: {reason})'
-                    if self._pause_started_at is None:
-                        self._pause_started_at = datetime.now(UTC)
-                    logger.warning(f'Usage gate PAUSED: {self._paused_reason}')
-                return
+        acct.capped = True
+        acct.resets_at = resets_at
+        if acct.pause_started_at is None:
+            acct.pause_started_at = datetime.now(UTC)
+        logger.warning(f'Account {acct.name} CAPPED: {reason}')
+        self._start_account_resume_probe(acct)
 
-        # Single-account / fallback: close global gate
-        self._open.clear()
-        self._paused_reason = reason
-        self._resets_at = resets_at
-        if self._pause_started_at is None:
-            self._pause_started_at = datetime.now(UTC)
-        logger.warning(f'Usage gate PAUSED: {reason}')
-        if self._config.wait_for_reset:
-            try:
-                loop = asyncio.get_running_loop()
-                if self._resume_task is None or self._resume_task.done():
-                    self._resume_task = loop.create_task(
-                        self._resume_probe_loop(),
-                        name='usage-gate-resume-probe',
-                    )
-            except RuntimeError:
-                pass
+        # If all accounts are now capped, close the global gate
+        if all(a.capped for a in self._accounts):
+            self._open.clear()
+            self._paused_reason = f'All accounts capped (last: {reason})'
+            if self._pause_started_at is None:
+                self._pause_started_at = datetime.now(UTC)
+            logger.warning(f'Usage gate PAUSED: {self._paused_reason}')
 
     def _find_account_by_token(self, token: str) -> AccountState | None:
         for acct in self._accounts:
@@ -341,12 +305,28 @@ class UsageGate:
                 continue
             usage = await self._query_usage_api(token=acct.token)
             if usage is None:
-                logger.warning(
-                    f'Account {acct.name}: usage API unavailable during '
-                    f'refresh — keeping capped (will retry via probe)'
+                acct.api_fail_count += 1
+                past_reset = (
+                    acct.resets_at is not None
+                    and datetime.now(UTC) > acct.resets_at
                 )
+                if past_reset and acct.api_fail_count >= _TENTATIVE_UNCAP_THRESHOLD:
+                    logger.warning(
+                        f'Account {acct.name}: usage API unavailable after '
+                        f'expected reset — tentatively uncapping'
+                    )
+                    acct.capped = False
+                    acct.pause_started_at = None
+                    acct.api_fail_count = 0
+                    any_uncapped = True
+                else:
+                    logger.warning(
+                        f'Account {acct.name}: usage API unavailable during '
+                        f'refresh — keeping capped (will retry via probe)'
+                    )
                 continue
 
+            acct.api_fail_count = 0
             still_capped = False
             for _tier_name, tier_data in usage.items():
                 if not isinstance(tier_data, dict):
@@ -375,79 +355,6 @@ class UsageGate:
         """Accumulate cost for session budget tracking."""
         self._cumulative_cost += cost
 
-    async def _pause(self, reason: str, resets_at: datetime | None) -> None:
-        """Close gate, optionally start resume probe task."""
-        async with self._lock:
-            if not self._open.is_set():
-                return  # already paused
-
-            self._open.clear()
-            self._paused_reason = reason
-            self._resets_at = resets_at
-            self._pause_started_at = datetime.now(UTC)
-            logger.warning(f'Usage gate PAUSED: {reason}')
-            if resets_at:
-                logger.info(f'Expected reset at: {resets_at.isoformat()}')
-
-            if self._config.wait_for_reset and not self._multi_account:
-                # Cancel any existing probe task
-                if self._resume_task and not self._resume_task.done():
-                    self._resume_task.cancel()
-                self._resume_task = asyncio.create_task(
-                    self._resume_probe_loop(),
-                    name='usage-gate-resume-probe',
-                )
-
-    async def _resume_probe_loop(self) -> None:
-        """Sleep until resets_at, call /api/oauth/usage once, reopen if under threshold."""
-        interval = self._config.probe_interval_secs
-
-        # If we know when the cap resets, sleep until then first
-        if self._resets_at:
-            wait_secs = max(0, (self._resets_at - datetime.now(UTC)).total_seconds())
-            if wait_secs > 0:
-                logger.info(f'Usage gate: sleeping {wait_secs:.0f}s until expected reset')
-                try:
-                    await asyncio.sleep(wait_secs)
-                except asyncio.CancelledError:
-                    return
-
-        # Probe loop with exponential backoff
-        while True:
-            usage = await self._query_usage_api()
-            if usage is not None:
-                # Check if any tier is still over threshold
-                still_capped = False
-                for tier_name, tier_data in usage.items():
-                    if not isinstance(tier_data, dict):
-                        continue
-                    utilization = tier_data.get('utilization', 0)
-                    if utilization >= self._config.pause_threshold:
-                        still_capped = True
-                        # Update resets_at from fresh data
-                        resets_at_str = tier_data.get('resets_at')
-                        if resets_at_str:
-                            self._resets_at = _parse_iso_timestamp(resets_at_str)
-                        logger.info(f'Usage gate probe: {tier_name} still at {utilization:.0%}')
-                        break
-
-                if not still_capped:
-                    await self._resume()
-                    return
-            else:
-                # API unavailable — optimistically resume
-                logger.warning('Usage API unavailable during probe — resuming optimistically')
-                await self._resume()
-                return
-
-            # Exponential backoff: interval doubles each time, capped at max
-            try:
-                logger.info(f'Usage gate: still capped, retrying in {interval}s')
-                await asyncio.sleep(interval)
-            except asyncio.CancelledError:
-                return
-            interval = min(interval * 2, self._config.max_probe_interval_secs)
-
     async def _account_resume_probe_loop(self, acct: AccountState) -> None:
         """Per-account resume probe. When the account reopens, mark it available."""
         interval = self._config.probe_interval_secs
@@ -464,6 +371,7 @@ class UsageGate:
         while True:
             usage = await self._query_usage_api(token=acct.token)
             if usage is not None:
+                acct.api_fail_count = 0
                 still_capped = False
                 for tier_name, tier_data in usage.items():
                     if not isinstance(tier_data, dict):
@@ -490,6 +398,21 @@ class UsageGate:
                     self._open.set()
                     return
             else:
+                acct.api_fail_count += 1
+                past_reset = (
+                    acct.resets_at is not None
+                    and datetime.now(UTC) > acct.resets_at
+                )
+                if past_reset and acct.api_fail_count >= _TENTATIVE_UNCAP_THRESHOLD:
+                    logger.warning(
+                        f'Account {acct.name}: usage API unavailable after '
+                        f'expected reset — tentatively uncapping'
+                    )
+                    acct.capped = False
+                    acct.pause_started_at = None
+                    acct.api_fail_count = 0
+                    self._open.set()
+                    return
                 logger.warning(
                     f'Account {acct.name}: usage API unavailable — '
                     f'keeping capped (will retry in {interval}s)'
@@ -502,25 +425,8 @@ class UsageGate:
                 return
             interval = min(interval * 2, self._config.max_probe_interval_secs)
 
-    async def _resume(self) -> None:
-        """Reopen the gate."""
-        async with self._lock:
-            if self._pause_started_at:
-                pause_duration = (datetime.now(UTC) - self._pause_started_at).total_seconds()
-                self._total_pause_secs += pause_duration
-            self._open.set()
-            self._paused_reason = ''
-            self._pause_started_at = None
-            logger.info('Usage gate RESUMED')
-
     async def _query_usage_api(self, token: str | None = None) -> dict[str, Any] | None:
-        """GET /api/oauth/usage with the given OAuth token.
-
-        If *token* is ``None``, falls back to reading from
-        ``~/.claude/.credentials.json`` (legacy single-account mode).
-        """
-        if token is None:
-            token = _read_oauth_token()
+        """GET /api/oauth/usage with the given OAuth token."""
         if not token:
             logger.debug('No OAuth token found — cannot query usage API')
             return None
@@ -544,7 +450,6 @@ class UsageGate:
 
     async def shutdown(self) -> None:
         """Cancel all resume probe tasks."""
-        # Per-account probes
         for acct in self._accounts:
             if acct.resume_task and not acct.resume_task.done():
                 acct.resume_task.cancel()
@@ -552,18 +457,11 @@ class UsageGate:
                     await acct.resume_task
                 acct.resume_task = None
 
-        # Legacy single-account probe
-        if self._resume_task and not self._resume_task.done():
-            self._resume_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._resume_task
-            self._resume_task = None
-
     @property
     def is_paused(self) -> bool:
-        if self._multi_account:
-            return all(a.capped for a in self._accounts)
-        return not self._open.is_set()
+        if not self._accounts:
+            return False
+        return all(a.capped for a in self._accounts)
 
     @property
     def paused_reason(self) -> str:

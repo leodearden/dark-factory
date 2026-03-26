@@ -106,7 +106,7 @@ class ModelsConfig(BaseModel):
 class BudgetsConfig(BaseModel):
     """Max USD spend per invocation, by role."""
 
-    architect: float = Field(default=5.0)
+    architect: float = Field(default=8.0)
     implementer: float = Field(default=10.0)
     debugger: float = Field(default=5.0)
     reviewer: float = Field(default=2.0)
@@ -119,7 +119,7 @@ class BudgetsConfig(BaseModel):
 class TurnsConfig(BaseModel):
     """Max conversation turns per invocation, by role."""
 
-    architect: int = Field(default=50)
+    architect: int = Field(default=75)
     implementer: int = Field(default=80)
     debugger: int = Field(default=50)
     reviewer: int = Field(default=30)
@@ -266,6 +266,9 @@ class OrchestratorConfig(BaseSettings):
     steward_lifetime_budget: float = Field(default=12.0)
     steward_max_retries: int = Field(default=3)
     steward_completion_timeout: float = Field(default=300.0)
+
+    # Wall-clock backstop for any single agent invocation (seconds)
+    invocation_timeout: float = Field(default=1200.0)
 
     # Models, budgets, turns per role
     models: ModelsConfig = Field(default_factory=ModelsConfig)
