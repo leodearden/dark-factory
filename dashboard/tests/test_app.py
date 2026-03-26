@@ -412,6 +412,20 @@ class TestMainModule:
             )
 
 
+class TestFavicon:
+    """Tests for SVG favicon in base.html and static serving."""
+
+    def test_favicon_link_in_html(self, client):
+        html = client.get('/').text
+        assert '/static/favicon.svg' in html
+        assert 'rel="icon"' in html
+
+    def test_favicon_svg_served(self, client):
+        resp = client.get('/static/favicon.svg')
+        assert resp.status_code == 200
+        assert 'image/svg+xml' in resp.headers['content-type']
+
+
 class TestAriaLivePollingsections:
     """Tests that all three auto-polling sections have aria-live='polite'."""
 
