@@ -285,6 +285,7 @@ async def _graceful_shutdown(
             logger.exception('_graceful_shutdown: error closing recon_journal')
 
 
+
 _singleton_socket = None  # Module-level ref to prevent GC
 
 
