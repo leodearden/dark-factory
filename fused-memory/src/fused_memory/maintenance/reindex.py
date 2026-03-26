@@ -9,6 +9,7 @@ from graphiti_core.embedder import OpenAIEmbedder
 from graphiti_core.embedder.openai import OpenAIEmbedderConfig
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.maintenance._utils import override_config_path
 from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
@@ -150,61 +151,51 @@ async def run_reindex(
         Dict with 'reindex_result' (ReindexResult), 'replay_count' (int), and
         'indices_dropped' (list of {label, field} dicts).
     """
-    import os
-
-    old_config_path = os.environ.get('CONFIG_PATH')
     service = None
-    try:
-        if config_path is not None:
-            os.environ['CONFIG_PATH'] = config_path
+    with override_config_path(config_path):
+        try:
+            config = FusedMemoryConfig()
+            service = MemoryService(config)
 
-        config = FusedMemoryConfig()
-        service = MemoryService(config)
+            # Build a dedicated embedder for re-embedding stale content.
+            emb_cfg = config.embedder
+            openai_provider = emb_cfg.providers.openai
+            openai_api_key: str | None = None
+            if openai_provider is not None:
+                openai_api_key = openai_provider.api_key
+            embedder_config = OpenAIEmbedderConfig(
+                api_key=openai_api_key,
+                embedding_model=emb_cfg.model,
+                embedding_dim=emb_cfg.dimensions,
+            )
+            embedder = OpenAIEmbedder(config=embedder_config)
 
-        # Build a dedicated embedder for re-embedding stale content.
-        emb_cfg = config.embedder
-        openai_provider = emb_cfg.providers.openai
-        openai_api_key: str | None = None
-        if openai_provider is not None:
-            openai_api_key = openai_provider.api_key
-        embedder_config = OpenAIEmbedderConfig(
-            api_key=openai_api_key,
-            embedding_model=emb_cfg.model,
-            embedding_dim=emb_cfg.dimensions,
-        )
-        embedder = OpenAIEmbedder(config=embedder_config)
+            manager = ReindexManager(
+                backend=service.graphiti,
+                embedder=embedder,
+                expected_dim=config.embedder.dimensions,
+            )
 
-        manager = ReindexManager(
-            backend=service.graphiti,
-            embedder=embedder,
-            expected_dim=config.embedder.dimensions,
-        )
-
-        await service.initialize()
-        result = await manager.reindex_and_replay(
-            service.durable_queue,
-            drop_indices=drop_indices,
-        )
-        ri = result['reindex_result']
-        logger.info(
-            f'run_reindex complete: nodes={ri.nodes_updated}, '
-            f'edges={ri.edges_updated}, errors={ri.errors}, '
-            f'replayed={result["replay_count"]}, '
-            f'indices_dropped={len(result.get("indices_dropped", []))}'
-        )
-        return result
-    finally:
-        if service is not None:
-            # Catch close() errors so CONFIG_PATH restoration below always runs.
-            try:
-                await service.close()
-            except Exception:
-                logger.warning('Error closing service during run_reindex cleanup', exc_info=True)
-        if config_path is not None:
-            if old_config_path is None:
-                os.environ.pop('CONFIG_PATH', None)
-            else:
-                os.environ['CONFIG_PATH'] = old_config_path
+            await service.initialize()
+            result = await manager.reindex_and_replay(
+                service.durable_queue,
+                drop_indices=drop_indices,
+            )
+            ri = result['reindex_result']
+            logger.info(
+                f'run_reindex complete: nodes={ri.nodes_updated}, '
+                f'edges={ri.edges_updated}, errors={ri.errors}, '
+                f'replayed={result["replay_count"]}, '
+                f'indices_dropped={len(result.get("indices_dropped", []))}'
+            )
+            return result
+        finally:
+            if service is not None:
+                # Catch close() errors so CONFIG_PATH restoration below always runs.
+                try:
+                    await service.close()
+                except Exception:
+                    logger.warning('Error closing service during run_reindex cleanup', exc_info=True)
 
 
 if __name__ == '__main__':
