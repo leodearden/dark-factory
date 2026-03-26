@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from fused_memory.config.schema import (
     EmbedderConfig,
+    FalkorDBProviderConfig,
     FusedMemoryConfig,
     GraphitiBackendConfig,
     LLMConfig,
@@ -182,3 +183,30 @@ class TestYamlSettingsSourceEnvVarExpansion:
     def test_non_env_string_unchanged(self):
         result = self.source._expand_env_vars('plain-string')
         assert result == 'plain-string'
+
+
+class TestFalkorDBGraphTimeout:
+    """Tests for FalkorDBProviderConfig.graph_timeout_ms field."""
+
+    def test_default_graph_timeout_ms_is_30000(self):
+        config = FalkorDBProviderConfig()
+        assert config.graph_timeout_ms == 30000
+
+    def test_custom_graph_timeout_ms_accepted(self):
+        config = FalkorDBProviderConfig(graph_timeout_ms=60000)
+        assert config.graph_timeout_ms == 60000
+
+    def test_zero_graph_timeout_ms_accepted(self):
+        """0 means opt-out of timeout override."""
+        config = FalkorDBProviderConfig(graph_timeout_ms=0)
+        assert config.graph_timeout_ms == 0
+
+    def test_graph_timeout_ms_accessible_via_graphiti_config(self):
+        config = GraphitiBackendConfig()
+        assert config.falkordb.graph_timeout_ms == 30000
+
+    def test_graph_timeout_ms_custom_via_nested_config(self):
+        config = GraphitiBackendConfig(
+            falkordb=FalkorDBProviderConfig(graph_timeout_ms=15000)
+        )
+        assert config.falkordb.graph_timeout_ms == 15000
