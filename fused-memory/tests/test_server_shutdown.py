@@ -119,3 +119,47 @@ class TestGracefulShutdownLogsHarnessTaskException:
             )
 
         mock_logger.exception.assert_called_once()
+
+
+class TestGracefulShutdownHarnessTaskTimeout:
+    @pytest.mark.timeout(2)
+    @pytest.mark.asyncio
+    async def test_shutdown_completes_even_when_harness_task_hangs_in_cleanup(self):
+        """_graceful_shutdown must complete within a bounded time even if the harness task
+        hangs in its cancellation-cleanup phase (e.g. doing long cleanup work after
+        catching CancelledError).
+
+        This test FAILS with the current code because the bare ``await harness_loop_task``
+        has no timeout — once the task catches the first CancelledError and enters its
+        cleanup branch it hangs indefinitely, blocking shutdown forever.
+
+        After step-4 wraps the await in
+        ``asyncio.wait_for(harness_loop_task, timeout=_HARNESS_CANCEL_TIMEOUT)``
+        the patched 0.01s timeout fires, the cleanup sleep is interrupted by a second
+        cancel, and _graceful_shutdown proceeds within the pytest-timeout window.
+        """
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock()
+
+        # Simulates a harness that hangs indefinitely in its cleanup after being cancelled.
+        # It DOES respond to a *second* cancellation (no uncancel()), so asyncio.wait_for
+        # can interrupt it — but without an internal timeout the first await is stuck.
+        async def _hangs_in_cleanup():
+            try:
+                await asyncio.sleep(9999)
+            except asyncio.CancelledError:
+                await asyncio.sleep(9999)  # cleanup work that hangs; cancellable
+
+        harness_loop_task = asyncio.create_task(_hangs_in_cleanup())
+        await asyncio.sleep(0)  # let the task start and reach its first await
+
+        with patch('fused_memory.server.main._HARNESS_CANCEL_TIMEOUT', 0.01):
+            await _graceful_shutdown(
+                memory_service=memory_service,
+                task_interceptor=None,
+                harness_loop_task=harness_loop_task,
+                recon_journal=None,
+            )
+
+        # If we reach here, _graceful_shutdown completed (didn't hang indefinitely)
+        memory_service.close.assert_awaited_once()

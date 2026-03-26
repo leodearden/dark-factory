@@ -31,6 +31,10 @@ logging.getLogger('mcp.server.streamable_http_manager').setLevel(logging.WARNING
 
 logger = logging.getLogger(__name__)
 
+# Maximum seconds to wait for harness_loop_task to honour cancellation before
+# giving up and continuing with the rest of the shutdown sequence.
+_HARNESS_CANCEL_TIMEOUT = 5.0
+
 
 def configure_uvicorn_logging():
     for logger_name in ['uvicorn', 'uvicorn.error', 'uvicorn.access']:
