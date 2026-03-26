@@ -2607,11 +2607,11 @@
         "description": "Address temporal serialization bugs and test gaps in memory_service.py. From review suggestions on task 133.",
         "details": "Production code (fused-memory/src/fused_memory/services/memory_service.py):\n1. Fix get_episodes() str(None)==\"None\" bug at line 854 — if created_at is None, callers get string \"None\" instead of Python None.\n2. Change outer guard at line 731 from truthiness (`if valid_at or invalid_at:`) to `if valid_at is not None or invalid_at is not None:` for consistency with inner checks.\n3. Consider extracting a _serialize_temporal() helper to DRY the 4 isoformat-guard expressions across _search_graphiti and get_entity (lines 733-734, 825-826).\n\nTests (fused-memory/tests/test_memory_service.py):\n4. Move inline imports (`from datetime import UTC, datetime` and `from tests.conftest import MockEdge`) to module level.\n5. Add test for get_entity with both valid_at and invalid_at as datetimes.\n6. Add test for _search_graphiti with valid_at=None and only invalid_at set.\n7. Add assertion for temporal['invalid_at'] is None in the single-field test case.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T22:58:29.748Z"
+        "updatedAt": "2026-03-26T23:10:15.206Z"
       },
       {
         "id": "169",
@@ -2914,7 +2914,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T23:10:15.162Z",
+      "lastModified": "2026-03-26T23:10:15.206Z",
       "taskCount": 172,
       "completedCount": 126,
       "tags": [
