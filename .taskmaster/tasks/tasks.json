@@ -2643,11 +2643,11 @@
         "description": "Update misleading comments in three maintenance files. From review suggestions on task 144.",
         "details": "Update the comment '# Catch close() errors so CONFIG_PATH restoration below always runs.' in:\n- fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py:131\n- fused-memory/src/fused_memory/maintenance/verify_zombie_edges.py:170\n- fused-memory/src/fused_memory/maintenance/reindex.py:194\n\nThe comment is factually wrong post-refactor. CONFIG_PATH restoration is handled by the outer override_config_path context manager, not by code below the try/except. Replace with e.g. '# Catch close() errors so they do not propagate out of the with block.'",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "blocked",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T22:08:44.200Z"
+        "updatedAt": "2026-03-26T22:16:26.362Z"
       },
       {
         "id": "172",
@@ -2892,7 +2892,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T22:15:34.414Z",
+      "lastModified": "2026-03-26T22:16:26.362Z",
       "taskCount": 170,
       "completedCount": 123,
       "tags": [
