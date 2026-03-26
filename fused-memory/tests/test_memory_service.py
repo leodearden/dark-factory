@@ -683,6 +683,38 @@ class TestGetEntity:
         assert result == {'nodes': [], 'edges': []}
 
     @pytest.mark.asyncio
+    async def test_getattr_fallback_missing_attributes(self, service):
+        """getattr fallbacks fire when node/edge objects lack expected attributes.
+
+        Uses types.SimpleNamespace so attributes are only present when explicitly
+        set — unlike MagicMock which auto-creates attributes on access.
+
+        Node fallbacks: uuid→None, summary→None, labels→[]
+        Edge fallbacks: uuid→None, fact→str(edge_obj)
+        """
+        import types
+
+        bare_node = types.SimpleNamespace(name='BareName')
+        bare_edge = types.SimpleNamespace()  # no fact, no uuid
+
+        service.graphiti.search_nodes = AsyncMock(return_value=[bare_node])
+        service.graphiti.search = AsyncMock(return_value=[bare_edge])
+
+        result = await service.get_entity(name='BareName', project_id='test')
+
+        assert len(result['nodes']) == 1
+        node = result['nodes'][0]
+        assert node['uuid'] is None
+        assert node['name'] == 'BareName'
+        assert node['summary'] is None
+        assert node['labels'] == []
+
+        assert len(result['edges']) == 1
+        edge = result['edges'][0]
+        assert edge['uuid'] is None
+        assert edge['fact'] == str(bare_edge)
+
+    @pytest.mark.asyncio
     async def test_concurrent_execution(self, service):
         """search_nodes and search must be dispatched concurrently (not sequentially).
 
