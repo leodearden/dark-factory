@@ -2583,11 +2583,11 @@
         "description": "Consolidate and strengthen update_task forwarding and error-path tests in fused-memory/tests/test_health_endpoint.py. From review suggestions on task 124.",
         "details": "1. Parametrize the prompt/append/tag forwarding tests (lines ~120-170) into a single @pytest.mark.parametrize test, eliminating 3x structural duplication.\n2. Use assert_called_once_with() instead of manual call_args unpacking for stricter assertions.\n3. Assert the return value (== {'success': True}) in forwarding tests.\n4. Add a parametrize case or standalone test asserting tag=None is forwarded when tag is omitted.\n5. Add test_update_task_invalid_project_root_returns_error_dict: call update_task with project_root='relative/path', assert error dict with error_type='ValidationError'.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "blocked",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T22:51:11.529Z"
+        "updatedAt": "2026-03-26T22:52:45.900Z"
       },
       {
         "id": "167",
@@ -2914,7 +2914,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T22:52:38.904Z",
+      "lastModified": "2026-03-26T22:52:45.900Z",
       "taskCount": 172,
       "completedCount": 126,
       "tags": [
