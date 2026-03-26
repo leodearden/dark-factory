@@ -402,6 +402,178 @@ class TestTaskKnowledgeSyncPayload:
         assert 'project_id="reify"' in payload
 
 
+class TestProjectIdValidation:
+    """BaseStage.run() validates project_id and watermark.project_id."""
+
+    @staticmethod
+    async def _fake_assemble_payload(
+        events,
+        watermark,
+        prior_reports,
+    ) -> str:
+        return 'fake payload'
+
+    @staticmethod
+    async def _fake_run_stage_via_cli(**kwargs):
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+        return StageResult(
+            success=True,
+            report={'summary': 'ok'},
+        )
+
+    @pytest.fixture
+    def mock_deps(self):
+        from unittest.mock import AsyncMock
+
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def _patch_stage(self, stage):
+        """Return a context manager that patches assemble_payload and run_stage_via_cli."""
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        @contextmanager
+        def _ctx():
+            with (
+                patch.object(stage, 'assemble_payload', side_effect=self._fake_assemble_payload),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    side_effect=self._fake_run_stage_via_cli,
+                ),
+            ):
+                yield
+
+        return _ctx()
+
+    @pytest.mark.asyncio
+    async def test_run_raises_on_empty_project_id(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId, Watermark
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = ''
+
+        with self._patch_stage(stage), pytest.raises(ValueError, match='project_id'):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id=''),
+                prior_reports=[],
+                run_id='test-run-1',
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_raises_on_whitespace_project_id(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId, Watermark
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = '   '
+
+        with self._patch_stage(stage), pytest.raises(ValueError, match='project_id'):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='some_project'),
+                prior_reports=[],
+                run_id='test-run-2',
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_raises_on_watermark_project_id_mismatch(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId, Watermark
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'project_a'
+
+        with self._patch_stage(stage), pytest.raises(ValueError) as exc_info:
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='project_b'),
+                prior_reports=[],
+                run_id='test-run-3',
+            )
+        error_msg = str(exc_info.value)
+        assert 'project_a' in error_msg
+        assert 'project_b' in error_msg
+
+    @pytest.mark.asyncio
+    async def test_run_allows_matching_watermark_project_id(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId, Watermark
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        with self._patch_stage(stage):
+            result = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[],
+                run_id='test-run-4',
+            )
+        assert result is not None
+        assert result.stage == StageId.memory_consolidator
+        assert result.completed_at is not None
+
+    @pytest.mark.asyncio
+    async def test_run_allows_empty_watermark_project_id(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId, Watermark
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        with self._patch_stage(stage):
+            result = await stage.run(
+                events=[],
+                watermark=Watermark(project_id=''),
+                prior_reports=[],
+                run_id='test-run-5',
+            )
+        assert result is not None
+        assert result.stage == StageId.memory_consolidator
+        assert result.completed_at is not None
+
+    @pytest.mark.asyncio
+    async def test_recon_context_includes_project_id(self, mock_deps):
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, Watermark
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        captured_kwargs = {}
+
+        async def capture_run_stage_via_cli(**kwargs):
+            captured_kwargs.update(kwargs)
+            return StageResult(success=True, report={'summary': 'ok'})
+
+        with (
+            patch.object(stage, 'assemble_payload', side_effect=self._fake_assemble_payload),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                side_effect=capture_run_stage_via_cli,
+            ),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[],
+                run_id='test-run-6',
+            )
+        assert 'dark_factory' in captured_kwargs.get('payload', '')
+
+
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 

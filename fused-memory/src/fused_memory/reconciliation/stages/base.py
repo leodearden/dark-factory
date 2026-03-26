@@ -20,6 +20,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE_REPORT_SCHEMA,
     run_stage_via_cli,
 )
+from fused_memory.utils.validation import validate_project_id
 
 if TYPE_CHECKING:
     from fused_memory.backends.taskmaster_client import TaskmasterBackend
@@ -88,6 +89,17 @@ class BaseStage:
         model: str | None = None,
     ) -> StageReport:
         """Execute this stage via Claude CLI with MCP tools."""
+        # Validate project_id
+        if err := validate_project_id(self.project_id):
+            raise ValueError(err['error'])
+
+        # Validate watermark.project_id consistency (skip if watermark has no project_id)
+        if watermark.project_id and watermark.project_id != self.project_id:
+            raise ValueError(
+                f'project_id mismatch: stage has {self.project_id!r} but '
+                f'watermark has {watermark.project_id!r}'
+            )
+
         payload = await self.assemble_payload(events, watermark, prior_reports)
 
         # Inject reconciliation context so CLI agents include causation_id in writes
@@ -95,7 +107,8 @@ class BaseStage:
             f'\n\n## Reconciliation Context\n'
             f'run_id: {run_id}\n'
             f'stage: {self.stage_id.value}\n'
-            f'agent_id: recon-stage-{self.stage_id.value}\n\n'
+            f'agent_id: recon-stage-{self.stage_id.value}\n'
+            f'- `project_id`: "{self.project_id}"\n\n'
             f'**IMPORTANT**: For every fused-memory write call, include:\n'
             f'- `agent_id`: "recon-stage-{self.stage_id.value}"\n'
             f'- In `metadata`: include `"_causation_id": "{run_id}"`\n'
