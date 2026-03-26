@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # step-7: run_verify_zombie_edges() env-var / close() edge cases
 # ---------------------------------------------------------------------------
@@ -21,6 +20,7 @@ class TestRunVerifyZombieEdgesEdgeCases:
     async def test_restores_preexisting_env_var_when_constructor_fails(self):
         """When CONFIG_PATH already set and FusedMemoryConfig raises, old value is restored."""
         import os
+
         from fused_memory.maintenance.verify_zombie_edges import run_verify_zombie_edges
 
         old = os.environ.get('CONFIG_PATH')
@@ -29,11 +29,10 @@ class TestRunVerifyZombieEdgesEdgeCases:
             with patch(
                 'fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig',
                 side_effect=RuntimeError('config load failed'),
-            ):
-                with pytest.raises(RuntimeError, match='config load failed'):
-                    await run_verify_zombie_edges(
-                        uuids=['dummy-uuid'], config_path='test.yaml'
-                    )
+            ), pytest.raises(RuntimeError, match='config load failed'):
+                await run_verify_zombie_edges(
+                    uuids=['dummy-uuid'], config_path='test.yaml'
+                )
 
             assert os.environ.get('CONFIG_PATH') == 'preexisting.yaml'
         finally:
@@ -46,6 +45,7 @@ class TestRunVerifyZombieEdgesEdgeCases:
     async def test_does_not_touch_env_var_when_config_path_is_none(self):
         """When config_path is None, CONFIG_PATH env var is left completely untouched."""
         import os
+
         from fused_memory.maintenance.verify_zombie_edges import run_verify_zombie_edges
 
         old = os.environ.get('CONFIG_PATH')
@@ -54,9 +54,8 @@ class TestRunVerifyZombieEdgesEdgeCases:
             with patch(
                 'fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig',
                 side_effect=RuntimeError('config load failed'),
-            ):
-                with pytest.raises(RuntimeError, match='config load failed'):
-                    await run_verify_zombie_edges(uuids=['dummy-uuid'])  # no config_path
+            ), pytest.raises(RuntimeError, match='config load failed'):
+                await run_verify_zombie_edges(uuids=['dummy-uuid'])  # no config_path
 
             assert os.environ.get('CONFIG_PATH') == 'existing.yaml'
         finally:
@@ -107,9 +106,9 @@ class TestRunVerifyZombieEdgesEdgeCases:
             patch(
                 'fused_memory.maintenance.verify_zombie_edges.MemoryService'
             ) as mock_svc_cls,
+            pytest.raises(RuntimeError, match='config failed'),
         ):
-            with pytest.raises(RuntimeError, match='config failed'):
-                await run_verify_zombie_edges(uuids=['dummy-uuid'])
+            await run_verify_zombie_edges(uuids=['dummy-uuid'])
 
         mock_svc_cls.assert_not_called()  # MemoryService never instantiated
         mock_svc_cls.return_value.close.assert_not_called()

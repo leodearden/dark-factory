@@ -990,6 +990,7 @@ class TestRunReindexEnvVarRestore:
     async def test_restores_preexisting_env_var_when_constructor_fails(self):
         """When CONFIG_PATH already set and FusedMemoryConfig raises, old value is restored."""
         import os
+
         from fused_memory.maintenance.reindex import run_reindex
 
         old = os.environ.get('CONFIG_PATH')
@@ -998,9 +999,8 @@ class TestRunReindexEnvVarRestore:
             with patch(
                 'fused_memory.maintenance.reindex.FusedMemoryConfig',
                 side_effect=RuntimeError('config load failed'),
-            ):
-                with pytest.raises(RuntimeError, match='config load failed'):
-                    await run_reindex(config_path='test.yaml')
+            ), pytest.raises(RuntimeError, match='config load failed'):
+                await run_reindex(config_path='test.yaml')
 
             assert os.environ.get('CONFIG_PATH') == 'preexisting.yaml'
         finally:
@@ -1013,6 +1013,7 @@ class TestRunReindexEnvVarRestore:
     async def test_does_not_touch_env_var_when_config_path_is_none(self):
         """When config_path is None, CONFIG_PATH env var is left completely untouched."""
         import os
+
         from fused_memory.maintenance.reindex import run_reindex
 
         old = os.environ.get('CONFIG_PATH')
@@ -1021,9 +1022,8 @@ class TestRunReindexEnvVarRestore:
             with patch(
                 'fused_memory.maintenance.reindex.FusedMemoryConfig',
                 side_effect=RuntimeError('config load failed'),
-            ):
-                with pytest.raises(RuntimeError, match='config load failed'):
-                    await run_reindex()  # no config_path → guard skips
+            ), pytest.raises(RuntimeError, match='config load failed'):
+                await run_reindex()  # no config_path → guard skips
 
             assert os.environ.get('CONFIG_PATH') == 'existing.yaml'
         finally:
@@ -1036,6 +1036,7 @@ class TestRunReindexEnvVarRestore:
     async def test_restores_env_var_when_embedder_constructor_fails(self):
         """When OpenAIEmbedderConfig raises, CONFIG_PATH is still restored to old value."""
         import os
+
         from fused_memory.maintenance.reindex import run_reindex
 
         old = os.environ.get('CONFIG_PATH')
@@ -1051,9 +1052,9 @@ class TestRunReindexEnvVarRestore:
                     'fused_memory.maintenance.reindex.OpenAIEmbedderConfig',
                     side_effect=ValueError('invalid embedder config'),
                 ),
+                pytest.raises(ValueError, match='invalid embedder config'),
             ):
-                with pytest.raises(ValueError, match='invalid embedder config'):
-                    await run_reindex(config_path='test.yaml')
+                await run_reindex(config_path='test.yaml')
 
             assert os.environ.get('CONFIG_PATH') == 'preexisting.yaml'
         finally:
@@ -1066,6 +1067,7 @@ class TestRunReindexEnvVarRestore:
     async def test_restores_env_var_when_manager_constructor_fails(self):
         """When ReindexManager raises, CONFIG_PATH is still restored to old value."""
         import os
+
         from fused_memory.maintenance.reindex import run_reindex
 
         old = os.environ.get('CONFIG_PATH')
@@ -1083,9 +1085,9 @@ class TestRunReindexEnvVarRestore:
                     'fused_memory.maintenance.reindex.ReindexManager',
                     side_effect=RuntimeError('manager init failed'),
                 ),
+                pytest.raises(RuntimeError, match='manager init failed'),
             ):
-                with pytest.raises(RuntimeError, match='manager init failed'):
-                    await run_reindex(config_path='test.yaml')
+                await run_reindex(config_path='test.yaml')
 
             assert os.environ.get('CONFIG_PATH') == 'preexisting.yaml'
         finally:
@@ -1136,9 +1138,9 @@ class TestRunReindexServiceLifecycle:
                 side_effect=RuntimeError('config failed'),
             ),
             patch('fused_memory.maintenance.reindex.MemoryService') as mock_svc_cls,
+            pytest.raises(RuntimeError, match='config failed'),
         ):
-            with pytest.raises(RuntimeError, match='config failed'):
-                await run_reindex()
+            await run_reindex()
 
         mock_svc_cls.assert_not_called()  # MemoryService never instantiated
         mock_svc_cls.return_value.close.assert_not_called()
@@ -1157,10 +1159,9 @@ class TestRunReindexServiceLifecycle:
             patch(
                 'fused_memory.maintenance.reindex.OpenAIEmbedderConfig',
                 side_effect=ValueError('invalid embedder config'),
-            ),
+            ),pytest.raises(ValueError, match='invalid embedder config')
         ):
-            with pytest.raises(ValueError, match='invalid embedder config'):
-                await run_reindex()
+            await run_reindex()
 
         mock_service.close.assert_awaited_once()
 
@@ -1180,9 +1181,8 @@ class TestRunReindexServiceLifecycle:
             patch(
                 'fused_memory.maintenance.reindex.ReindexManager',
                 side_effect=RuntimeError('manager init failed'),
-            ),
+            ),pytest.raises(RuntimeError, match='manager init failed')
         ):
-            with pytest.raises(RuntimeError, match='manager init failed'):
-                await run_reindex()
+            await run_reindex()
 
         mock_service.close.assert_awaited_once()
