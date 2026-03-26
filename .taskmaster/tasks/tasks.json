@@ -2806,15 +2806,16 @@
         "description": "task_knowledge_sync.py has two bugs that cause contaminated data for non-dark-factory projects:\n\n1. Line 46: `get_tasks(project_root=self.project_id)` passes project_id (e.g. \"reify\") instead of project_root (e.g. \"/home/leo/src/reify\"). This means the task tree fetch fails or returns wrong data for every non-dark-factory project.\n\n2. Line 99: `project_root=\"/home/leo/src/dark-factory\"` is hardcoded instead of using `self.project_root`. This causes every Stage 2 agent to use dark-factory's task operations regardless of which project is being reconciled.\n\nBoth `self.project_id` and `self.project_root` are defined in base.py. The fixes are straightforward:\n- Line 46: Change `self.project_id` → `self.project_root`\n- Line 99: Change the hardcoded path → `self.project_root`\n\nThis bug has persisted for 4+ reconciliation cycles and is the root cause of repeated reify task count contamination in the knowledge graph.",
         "details": "File: fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py\n\nFix 1 (line 46):\n```python\n# Before:\ntasks_data = await self.taskmaster.get_tasks(project_root=self.project_id)\n# After:\ntasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)\n```\n\nFix 2 (line 99):\n```python\n# Before:\nUse project_root=\"/home/leo/src/dark-factory\" for all task operations.\n# After:\nUse project_root=\"{self.project_root}\" for all task operations.\n```\n\nBoth self.project_id and self.project_root are available from BaseStage (base.py lines 53-54).\n\nmemory_hints:\n- Search: \"task_knowledge_sync project_root bug contamination\" (project: dark_factory)\n- Entity: \"task_knowledge_sync.py\"\n- Entity: \"/home/leo/src/reify/.taskmaster/tasks/tasks.json\" (to see contamination history)",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-26T18:08:20.607Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T18:08:20.561Z",
+      "lastModified": "2026-03-26T18:08:20.607Z",
       "taskCount": 165,
       "completedCount": 122,
       "tags": [
