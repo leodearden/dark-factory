@@ -43,7 +43,7 @@
       "id": "step-3",
       "type": "impl",
       "description": "Refactor tools.py: replace local _validate_project_root (lines 223-230) and _validate_project_id (lines 214-221) with imports from fused_memory.utils.validation. Add `from fused_memory.utils.validation import validate_project_id, validate_project_root` near top. Remove the two local function definitions. All 11 task-tool call sites (`if err := validate_project_root(...)`) and 9+ memory-tool call sites (`if err := validate_project_id(...)`) keep the same walrus-operator pattern \u2014 only the import source changes. No behavior change. Existing test_health_endpoint.py tests continue to pass.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
