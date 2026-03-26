@@ -151,6 +151,31 @@ def partition_burst_state(
     return active, idle
 
 
+def format_duration(value: int | float | None) -> str:
+    """Format a duration in seconds to a human-readable compound string.
+
+    Tiers:
+        < 60s   → 'Xs'      (e.g. '45s')
+        < 3600s → 'Xm Ys'   (e.g. '10m 0s')
+        ≥ 3600s → 'Xh Ym'   (e.g. '17h 25m')
+    """
+    if value is None:
+        return '-'
+    total = int(value)
+    if total < 60:
+        return f'{total}s'
+    if total < 3600:
+        minutes = total // 60
+        seconds = total % 60
+        return f'{minutes}m {seconds}s'
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    return f'{hours}h {minutes}m'
+
+
+templates.env.filters['format_duration'] = format_duration
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage shared resources: HTTP client, DB connection pool."""
