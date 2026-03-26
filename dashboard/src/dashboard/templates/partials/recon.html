@@ -13,7 +13,7 @@
       {% if buffer_stats.oldest_event_age_seconds is not none %}
         {% set age = buffer_stats.oldest_event_age_seconds %}
         <p class="text-sm mt-2 {% if age > 300 %}text-yellow-400{% else %}text-gray-400{% endif %}">
-          Oldest: {{ (age // 60)|int }}m {{ (age % 60)|int }}s
+          Oldest: {{ age | format_duration }}
         </p>
       {% endif %}
     </div>
