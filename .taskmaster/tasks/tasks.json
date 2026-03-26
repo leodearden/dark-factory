@@ -2921,6 +2921,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 195,
+        "title": "Harden prompt interpolation: fix format and validate project_id character set",
+        "description": "Two issues with how project_id is interpolated into the reconciliation context prompt:\n\n1. The injected project_id line (base.py:111) uses markdown list syntax while adjacent lines use plain `key: value`. Fix: change to `project_id: {self.project_id}` to match run_id/stage/agent_id lines.\n\n2. project_id is not validated for special characters or newlines before f-string interpolation into the prompt. Add a character-set check (e.g., `^[a-zA-Z0-9_-]+$`) to validate_project_id in validation.py.\n\n3. Strengthen the test assertion in test_recon_context_includes_project_id to check the exact injected line format, not just substring presence.",
+        "details": "Files: fused-memory/src/fused_memory/reconciliation/stages/base.py, fused-memory/src/fused_memory/utils/validation.py, fused-memory/tests/test_stages.py\n\nSource: review suggestions from task 137 (esc-137-8).\n\nmemory_hint: search \"prompt injection fix routing layer\" for prior pattern.",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -2933,7 +2944,7 @@
       ],
       "created": "2026-03-26T23:48:41.990Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-26T23:48:41.991Z"
+      "updated": "2026-03-26T23:48:45.118Z"
     }
   }
 }
