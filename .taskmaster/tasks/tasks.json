@@ -2655,11 +2655,11 @@
         "description": "Add integration tests for config_path propagation and document thread-safety limitation. From review suggestions on task 144.",
         "details": "1. In test_cleanup_stale_edges.py and test_reindex.py, add a shallow integration test that calls the entrypoint with config_path set and mocks FusedMemoryConfig to verify CONFIG_PATH is set at construction time and restored after the call.\n2. In fused-memory/src/fused_memory/maintenance/_utils.py, add a docstring note to override_config_path that it is not safe for concurrent use within the same process (os.environ mutation is unguarded).",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T22:09:42.539Z"
+        "updatedAt": "2026-03-26T22:13:30.809Z"
       },
       {
         "id": "173",
@@ -2868,7 +2868,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T22:13:09.709Z",
+      "lastModified": "2026-03-26T22:13:30.809Z",
       "taskCount": 168,
       "completedCount": 122,
       "tags": [
