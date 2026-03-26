@@ -64,6 +64,19 @@ class TestValidateProjectId:
         result = validate_project_id('x')
         assert result is None
 
+    def test_whitespace_only_returns_error_dict(self):
+        result = validate_project_id('   ')
+        assert result is not None
+        assert 'error' in result
+        assert result['error_type'] == 'ValidationError'
+
+    def test_tab_and_newline_returns_error_dict(self):
+        for ws in ['\t', '\n']:
+            result = validate_project_id(ws)
+            assert result is not None, f'Expected error dict for {ws!r}, got None'
+            assert 'error' in result
+            assert result['error_type'] == 'ValidationError'
+
 
 class TestRequireProjectRoot:
     """Tests for require_project_root (raises ValueError)."""
