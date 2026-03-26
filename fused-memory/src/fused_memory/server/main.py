@@ -258,8 +258,12 @@ async def _graceful_shutdown(
         try:
             harness_loop_task.cancel()
             await harness_loop_task
-        except (asyncio.CancelledError, Exception):
+        except asyncio.CancelledError:
             pass
+        except asyncio.TimeoutError:
+            logger.warning('_graceful_shutdown: harness_loop_task timed out during cancellation')
+        except Exception:
+            logger.exception('_graceful_shutdown: unexpected error from harness_loop_task')
 
     try:
         await memory_service.close()

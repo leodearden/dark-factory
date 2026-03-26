@@ -95,15 +95,20 @@ class TestGracefulShutdownLogsHarnessTaskException:
 
         This test FAILS with the current code because the except clause catches
         (CancelledError, Exception) with bare ``pass``, silently discarding real errors.
+
+        The task is allowed to run and raise RuntimeError *before* _graceful_shutdown
+        is called.  cancel() becomes a no-op (task already done), and await raises the
+        stored RuntimeError — which must be logged, not swallowed.
         """
         memory_service = MagicMock()
         memory_service.close = AsyncMock()
 
-        # Create a task that raises RuntimeError (not CancelledError)
         async def _raises_runtime_error():
             raise RuntimeError('unexpected harness crash')
 
         harness_loop_task = asyncio.create_task(_raises_runtime_error())
+        # Let the task run and store the RuntimeError before we pass it to _graceful_shutdown
+        await asyncio.sleep(0)
 
         with patch('fused_memory.server.main.logger') as mock_logger:
             await _graceful_shutdown(
