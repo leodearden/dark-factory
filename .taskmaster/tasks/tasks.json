@@ -2493,11 +2493,11 @@
         "description": "test_health_endpoint.py has grown beyond its original health-endpoint scope and now contains 8+ update_task tests plus other task-tool tests. Extract all task-tool tests into a dedicated test_task_tools.py file. While extracting, apply these improvements from code review:\n\n1. Parametrize the three structurally identical forwarding tests (prompt, append, tag) into a single @pytest.mark.parametrize test\n2. Add coverage for tag=None default (assert kwargs['tag'] is None when tag is omitted)\n3. Add test for _validate_project_root validation path on update_task (relative path → ValidationError)\n4. Use ExceptionClass.__name__ instead of bare strings for error_type assertions\n\n## memory_hints\n- search: \"test_health_endpoint.py task tool tests extract refactor\"\n- search: \"update_task MCP tool test coverage\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "blocked",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:10:27.219Z"
+        "updatedAt": "2026-03-26T18:21:11.065Z"
       },
       {
         "id": "160",
@@ -2832,7 +2832,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T18:20:44.931Z",
+      "lastModified": "2026-03-26T18:21:11.065Z",
       "taskCount": 165,
       "completedCount": 122,
       "tags": [
