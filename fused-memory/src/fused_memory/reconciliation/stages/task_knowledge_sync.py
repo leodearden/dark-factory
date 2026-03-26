@@ -76,7 +76,7 @@ class TaskKnowledgeSync(BaseStage):
 ### Stage 1 Flagged Items (Task-Relevant)
 {_format_flagged(stage1_report.items_flagged if stage1_report else [])}
 
-### Active Task Tree ({len(active_tasks)} active, {len(done_tasks)} done, {len(all_tasks)} total)
+### Active Task Tree
 {_format_tasks(active_tasks[:50])}
 
 ### Recently Completed Tasks
@@ -93,7 +93,9 @@ delete tasks. Update dependent tasks.
 Use entity references + semantic queries, NOT inline content.
 5. Check if any knowledge implies new tasks should be created or existing tasks unblocked.
 6. Hints on completed tasks are static — don't update them.
-7. When you have completed your work, produce your final structured report as your response.
+7. Do NOT write task counts, status distributions, or task tree size data as memories. \
+These numbers are transient context — never persist them.
+8. When you have completed your work, produce your final structured report as your response.
 
 Always pass project_id="{self.project_id}" when calling fused-memory MCP tools.
 Use project_root="/home/leo/src/dark-factory" for all task operations.
