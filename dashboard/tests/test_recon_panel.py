@@ -537,7 +537,7 @@ class TestReconJournalBadge:
             html = client.get('/partials/recon').text
         # MOCK_RUNS has journal_entry_count=3
         assert 'data-testid="journal-badge"' in html
-        assert '>3<' in html or '>\n                    3\n' in html or '3</span>' in html
+        assert '>3<' in html or '>\n                    3\n' in html or '3</button>' in html
 
     def test_badge_hidden_when_count_zero(self, client):
         runs_no_journal = [
