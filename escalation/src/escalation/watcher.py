@@ -42,6 +42,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='Watch for escalation events')
     parser.add_argument('--queue-dir', required=True, help='Escalation queue directory')
     parser.add_argument('--task-id', default=None, help='Filter to a specific task ID')
+    parser.add_argument('--level', type=int, default=None, help='Filter to a specific escalation level')
     parser.add_argument('--ntfy-url', default=None, help='ntfy.sh topic URL for push notifications')
     args = parser.parse_args()
 
@@ -68,6 +69,9 @@ def main() -> None:
                 continue
 
             if args.task_id and esc.task_id != args.task_id:
+                continue
+
+            if args.level is not None and esc.level != args.level:
                 continue
 
             print(json.dumps(esc.to_dict(), indent=2))

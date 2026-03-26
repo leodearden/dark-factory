@@ -126,3 +126,64 @@ class TestMainLoop:
                 main()
 
             mock_exit.assert_called_once_with(0)
+
+
+class TestLevelFilter:
+    """--level argument filters by escalation level."""
+
+    def _run_watcher(self, tmp_path, escalation, argv_extra=None):
+        """Run main() with a single inotify event, return whether sys.exit was called."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir(exist_ok=True)
+
+        esc_path = queue_dir / f'{escalation.id}.json'
+        esc_path.write_text(escalation.to_json())
+
+        mock_event = MagicMock()
+        mock_event.name = f'{escalation.id}.json'
+
+        argv = ['watcher', '--queue-dir', str(queue_dir)]
+        if argv_extra:
+            argv.extend(argv_extra)
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.exit') as mock_exit,
+            patch('escalation.watcher.sys.argv', argv),
+        ):
+            mock_inotify = MockINotify.return_value
+            mock_inotify.read.side_effect = [[mock_event], KeyboardInterrupt]
+
+            from escalation.watcher import main
+
+            with contextlib.suppress(KeyboardInterrupt):
+                main()
+
+            return mock_exit.called
+
+    def test_level_filter_matches(self, tmp_path):
+        """--level 0 passes level-0 escalation."""
+        esc = Escalation(
+            id='esc-10-1', task_id='10', agent_role='implementer',
+            severity='blocking', category='task_failure', summary='fail',
+            level=0,
+        )
+        assert self._run_watcher(tmp_path, esc, ['--level', '0']) is True
+
+    def test_level_filter_skips_non_matching(self, tmp_path):
+        """--level 0 skips level-1 escalation (no exit)."""
+        esc = Escalation(
+            id='esc-10-2', task_id='10', agent_role='steward',
+            severity='blocking', category='task_failure', summary='reesc',
+            level=1,
+        )
+        assert self._run_watcher(tmp_path, esc, ['--level', '0']) is False
+
+    def test_no_level_filter_passes_all(self, tmp_path):
+        """Without --level, level-1 escalation is returned (backward compat)."""
+        esc = Escalation(
+            id='esc-10-3', task_id='10', agent_role='steward',
+            severity='blocking', category='task_failure', summary='reesc',
+            level=1,
+        )
+        assert self._run_watcher(tmp_path, esc) is True

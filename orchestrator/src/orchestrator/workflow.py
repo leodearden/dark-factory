@@ -1032,6 +1032,27 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         await self.scheduler.set_task_status(self.task_id, 'blocked')
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
 
+        if self.escalation_queue and skip_escalation:
+            # Defensive cleanup: L0 should already be cleared by
+            # _wait_for_resolution, but dismiss any stragglers (race
+            # between the L0-empty check and the L1 check).
+            remaining_l0 = self.escalation_queue.get_by_task(
+                self.task_id, status='pending', level=0,
+            )
+            if remaining_l0:
+                logger.warning(
+                    'Task %s: %d L0 escalation(s) still pending at '
+                    'mark_blocked(skip_escalation=True) — dismissing',
+                    self.task_id, len(remaining_l0),
+                )
+                for esc in remaining_l0:
+                    self.escalation_queue.resolve(
+                        esc.id,
+                        'Auto-dismissed: task blocked after steward re-escalation',
+                        dismiss=True,
+                        resolved_by='auto-dismissed',
+                    )
+
         if self.escalation_queue and not skip_escalation:
             # Don't create a duplicate if level-1 already pending
             existing_l1 = self.escalation_queue.get_by_task(

@@ -403,10 +403,25 @@ class TestStewardRunLoop:
         steward._stopped = True
         await steward._run_loop()
 
-    async def test_stops_when_no_escalation(self, steward):
-        with patch.object(steward, '_next_escalation', new_callable=AsyncMock) as mock_next:
-            mock_next.return_value = None
+    async def test_continues_on_none_and_stops_via_flag(self, steward):
+        """_run_loop does NOT exit on None — it retries until _stopped."""
+        call_count = 0
+
+        async def _next_esc():
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 3:
+                steward._stopped = True
+            return None
+
+        with (
+            patch.object(steward, '_next_escalation', side_effect=_next_esc),
+            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+        ):
             await steward._run_loop()
+            # Should have retried (slept) at least once before _stopped was set
+            assert mock_sleep.call_count >= 1
+            mock_sleep.assert_called_with(1)
 
     async def test_handles_multiple_sequential_escalations(self, steward):
         esc1 = _make_escalation(id='esc-42-1')
@@ -420,15 +435,41 @@ class TestStewardRunLoop:
                 return esc1
             elif call_count == 2:
                 return esc2
+            steward._stopped = True
             return None
 
         handle_mock = AsyncMock()
         with (
             patch.object(steward, '_next_escalation', side_effect=_next_esc),
             patch.object(steward, '_handle_escalation', handle_mock),
+            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock),
         ):
             await steward._run_loop()
             assert handle_mock.call_count == 2
+
+    async def test_continues_after_transient_none(self, steward):
+        """A transient None doesn't prevent handling the next escalation."""
+        esc = _make_escalation(id='esc-42-1')
+        call_count = 0
+
+        async def _next_esc():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return None  # transient failure
+            if call_count == 2:
+                return esc
+            steward._stopped = True
+            return None
+
+        handle_mock = AsyncMock()
+        with (
+            patch.object(steward, '_next_escalation', side_effect=_next_esc),
+            patch.object(steward, '_handle_escalation', handle_mock),
+            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await steward._run_loop()
+            handle_mock.assert_called_once_with(esc)
 
 
 # ---------------------------------------------------------------------------
@@ -468,3 +509,31 @@ class TestNextEscalation:
             mock_exec.return_value = proc
             result = await steward._next_escalation()
             assert result is None
+
+    async def test_returns_none_for_non_level0_from_watcher(self, steward):
+        """Defense-in-depth: discard watcher results that aren't level 0."""
+        level1_esc = _make_escalation(level=1)
+        steward.escalation_queue.get_by_task.return_value = []
+        with patch('asyncio.create_subprocess_exec', new_callable=AsyncMock) as mock_exec:
+            proc = AsyncMock()
+            proc.returncode = 0
+            proc.communicate.return_value = (
+                level1_esc.to_json().encode(), b'',
+            )
+            mock_exec.return_value = proc
+            result = await steward._next_escalation()
+            assert result is None
+
+    async def test_passes_level_filter_to_watcher(self, steward):
+        """Steward spawns watcher with --level 0."""
+        steward.escalation_queue.get_by_task.return_value = []
+        with patch('asyncio.create_subprocess_exec', new_callable=AsyncMock) as mock_exec:
+            proc = AsyncMock()
+            proc.returncode = 1
+            proc.communicate.return_value = (b'', b'')
+            mock_exec.return_value = proc
+            await steward._watch_for_escalation()
+            cmd = mock_exec.call_args[0]
+            assert '--level' in cmd
+            level_idx = cmd.index('--level')
+            assert cmd[level_idx + 1] == '0'

@@ -112,8 +112,13 @@ class TaskSteward:
         while not self._stopped:
             try:
                 escalation = await self._next_escalation()
-                if escalation is None or self._stopped:
+                if self._stopped:
                     break
+                if escalation is None:
+                    # Transient failure (watcher crash, non-level-0 event,
+                    # parse error).  Brief backoff before retrying.
+                    await asyncio.sleep(1)
+                    continue
                 await self._handle_escalation(escalation)
             except asyncio.CancelledError:
                 raise
@@ -153,6 +158,7 @@ class TaskSteward:
             'python', '-m', 'escalation.watcher',
             '--queue-dir', str(queue_dir),
             '--task-id', self.task_id,
+            '--level', '0',
         ]
 
         try:
