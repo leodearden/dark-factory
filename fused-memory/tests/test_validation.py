@@ -1,7 +1,8 @@
 """Tests for shared validation utilities in fused_memory.utils.validation."""
 
-import pytest
 from unittest.mock import patch
+
+import pytest
 
 from fused_memory.utils.validation import (
     require_project_root,
