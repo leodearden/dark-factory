@@ -2675,6 +2675,17 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 175,
+        "title": "Fix reconciliation detail rows leaking \"Loading...\" between run rows",
+        "description": "The reconciliation Recent Runs table shows \"Loading...\" text between every run row. Detail rows use x-show=\"open\" with x-cloak and hx-trigger=\"revealed\", but Idiomorph morphing every 15s briefly makes hidden rows visible, triggering unnecessary HTMX fetches. The \"Loading...\" text from in-flight fetches remains visible.",
+        "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 159-164).\n\nFix approach: (1) Change hx-trigger from \"revealed\" to a manual trigger fired by the Alpine @click handler (e.g. hx-trigger=\"load-detail\" and dispatch the event on click). This prevents morph-triggered fetches. (2) Use Alpine.store or id-based state preservation to maintain open/closed state across morphs.\n\nmemory_hint: search \"reconciliation detail HTMX\" for prior discussion.",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -2687,7 +2698,7 @@
       ],
       "created": "2026-03-26T10:25:51.987Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-26T15:13:13.386Z"
+      "updated": "2026-03-26T15:13:18.364Z"
     }
   }
 }
