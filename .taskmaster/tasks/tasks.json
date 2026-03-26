@@ -2445,11 +2445,11 @@
         "description": "Two port consistency issues:\n\n1. dashboard/src/dashboard/config.py:9-13 has _DEFAULT_FUSED_MEMORY_URLS listing ports 8002, 8000, and 8001. Per convention, only port 8002 is canonical — 8000/8001 are stale Claude Code MCP instances running old code. The dashboard will silently fall back to stale instances.\n\n2. fused-memory/src/fused_memory/config/schema.py:73 defaults ServerConfig.port to 8000, but config.yaml and the convention use 8002. Anyone starting the server without config.yaml gets the wrong port.\n\nFix: (1) Remove 8000 and 8001 from _DEFAULT_FUSED_MEMORY_URLS. (2) Change schema.py port default from 8000 to 8002.\n\nSource: review-cycle 2026-03-25, findings DR-2 and DR-3.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "blocked",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T07:14:55.073Z"
+        "updatedAt": "2026-03-26T07:32:49.450Z"
       },
       {
         "id": "156",
@@ -2556,7 +2556,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T07:31:49.926Z",
+      "lastModified": "2026-03-26T07:32:49.450Z",
       "taskCount": 142,
       "completedCount": 119,
       "tags": [
