@@ -2883,15 +2883,16 @@
         "description": "In MemoryService.get_entity() (memory_service.py:802), asyncio.gather() runs search_nodes and search concurrently. When one raises, the exception propagates immediately but the sibling coroutine continues as an orphaned background task. In a stability-focused project this is surprising behavior:\n\n- Retry-on-failure callers can produce overlapping concurrent calls to the same Graphiti connection pool\n- The orphaned task's exception (if it also fails) surfaces as an unraisable exception in logs\n\nOptions to evaluate:\n(a) Use `return_exceptions=True`, inspect results, raise first exception found — ensures both settle cleanly\n(b) Use TaskGroup (Python 3.11+) which auto-cancels siblings on first failure\n(c) Accept current behavior with explicit documentation\n\nBoth searches are read-only so no data-corruption risk, but connection pool exhaustion under retry is the concern.\n\n## memory_hints\n- search: \"asyncio.gather concurrent search get_entity\"\n- search: \"stability robustness error handling current focus\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-26T22:14:49.305Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T22:14:48.933Z",
+      "lastModified": "2026-03-26T22:14:49.306Z",
       "taskCount": 170,
       "completedCount": 123,
       "tags": [
