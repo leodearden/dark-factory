@@ -57,7 +57,7 @@
       "id": "step-5",
       "type": "impl",
       "description": "Update targeted.py: (1) Add import `from fused_memory.utils.validation import require_project_root` at top. (2) Remove `= ''` default from project_root parameter in reconcile_task() signature (line 82) and reconcile_bulk_tasks() signature (line 350). (3) Replace inline fallback logic at lines 85-87 (`if not project_root: project_root = project_id`) with `require_project_root(project_root)`. (4) Replace inline fallback at lines 353-354 with same call. All tests now pass \u2014 both the 15 updated existing tests and the 2 new validation tests.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     }
   ],

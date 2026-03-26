@@ -17,6 +17,7 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.utils.validation import require_project_root
 
 logger = logging.getLogger(__name__)
 
@@ -79,12 +80,10 @@ class TargetedReconciler:
         transition: str,
         project_id: str,
         task_before: dict,
-        project_root: str = '',
+        project_root: str,
     ) -> dict:
         """Run targeted reconciliation for a single task state transition."""
-        # Use project_root for taskmaster ops; fall back to project_id for backwards compat
-        if not project_root:
-            project_root = project_id
+        require_project_root(project_root)
         run_id = str(uuid_mod.uuid4())
         start = datetime.now(UTC)
 
@@ -347,11 +346,10 @@ class TargetedReconciler:
         self,
         parent_task_id: str | None,
         project_id: str,
-        project_root: str = '',
+        project_root: str,
     ) -> dict:
         """Reconcile after expand_task or parse_prd — cross-reference against knowledge."""
-        if not project_root:
-            project_root = project_id
+        require_project_root(project_root)
         result: dict = {'parent_task_id': parent_task_id, 'actions': []}
 
         try:
