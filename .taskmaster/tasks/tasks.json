@@ -2799,11 +2799,11 @@
         "description": "Two information clarity issues: (1) Queue indicator shows \"0p/0r/15d\" — cryptic abbreviation needs tooltip or expanded label (0 pending / 0 retry / 15 dead letters). (2) Latest Verdict (\"serious / Action: halt\") is buried at the very bottom of the page with no context about what it means or requires.",
         "details": "Files: dashboard/src/dashboard/templates/partials/memory.html (Queue indicator), dashboard/src/dashboard/templates/partials/recon.html (lines 93-105 Latest Verdict).\n\nFor Queue: Add title attribute with expanded text, or show as \"0 pending · 0 retry · 15 dead\" inline. For Verdict: Consider moving to a top-level alert banner when severity is serious/critical, or at minimum add a brief explanation of what the verdict means.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:16:50.713Z"
+        "updatedAt": "2026-03-26T18:22:20.009Z"
       },
       {
         "id": "185",
@@ -2832,7 +2832,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T18:22:18.770Z",
+      "lastModified": "2026-03-26T18:22:20.009Z",
       "taskCount": 165,
       "completedCount": 122,
       "tags": [
