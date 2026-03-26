@@ -98,7 +98,7 @@ These numbers are transient context — never persist them.
 8. When you have completed your work, produce your final structured report as your response.
 
 Always pass project_id="{self.project_id}" when calling fused-memory MCP tools.
-Use project_root="/home/leo/src/dark-factory" for all task operations.
+Use project_root="{self.project_root}" for all task operations.
 """
 
 
