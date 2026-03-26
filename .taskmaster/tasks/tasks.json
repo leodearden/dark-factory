@@ -2211,13 +2211,13 @@
         "description": "Test quality improvements for the TestProjectIdValidation class in test_stages.py.\n\nThree issues:\n1. **Duplicated fakes** — `fake_assemble_payload` and `fake_run_stage_via_cli` are defined identically (word-for-word) in three tests: test_run_allows_matching_watermark_project_id, test_run_allows_empty_watermark_project_id, and test_recon_context_includes_project_id. Extract into a shared fixture or helper method on the class.\n2. **Weak mismatch assertion** — test_run_raises_on_watermark_project_id_mismatch only asserts match='project_a' but not 'project_b'. Add assertion that both project_ids appear in the error message.\n3. **Missing return value assertions** — The two positive-path tests (matching and empty watermark) assert only \"no exception raised\" but never capture/check the StageReport return value. Capture result and assert `result is not None` or check specific fields.\n\nFiles: fused-memory/tests/test_stages.py\n\nmemory_hints:\n- search: \"TestProjectIdValidation test_stages.py fixture extraction\"\n- entity: \"TestProjectIdValidation\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [
           "135"
         ],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T07:53:39.713Z"
+        "updatedAt": "2026-03-26T18:08:20.082Z"
       },
       {
         "id": "138",
@@ -2279,13 +2279,13 @@
         "description": "Post-merge cleanup from Task 136 review. test_stages.py has accumulated significant duplication:\n\n1. **mock_deps fixture** — Identical fixture defined in 4+ test classes (TestStageSubclasses, TestProjectIdValidation, TestPaddedStageProjectId, TestPerStageReportSchema). Extract to module level or conftest.py.\n\n2. **fake_assemble_payload / fake_run_stage_via_cli** — Defined inline ~6-7 times across test classes. Every copy is functionally identical. Extract as shared module-level async functions or fixtures.\n\nCentralizing prevents silent divergence when ReconciliationConfig or StageResult signatures change.\n\nFiles: fused-memory/tests/test_stages.py (possibly fused-memory/tests/conftest.py)\n\nmemory_hints:\n- search: \"test_stages.py mock_deps fixture deduplication\"\n- search: \"fake_assemble_payload fake_run_stage_via_cli test helper\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [
           "136"
         ],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T07:36:22.302Z"
+        "updatedAt": "2026-03-26T18:08:20.106Z"
       },
       {
         "id": "143",
@@ -2811,7 +2811,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T18:08:20.055Z",
+      "lastModified": "2026-03-26T18:08:20.106Z",
       "taskCount": 165,
       "completedCount": 122,
       "tags": [
