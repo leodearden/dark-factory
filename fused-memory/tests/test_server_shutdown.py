@@ -25,6 +25,26 @@ class TestGracefulShutdownCallsMemoryServiceClose:
         memory_service.close.assert_called_once()
 
 
+class TestGracefulShutdownClosesReconciliationJournal:
+    @pytest.mark.asyncio
+    async def test_shutdown_closes_reconciliation_journal(self):
+        """_graceful_shutdown must await recon_journal.close() once."""
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock()
+
+        recon_journal = MagicMock()
+        recon_journal.close = AsyncMock()
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=None,
+            harness_loop_task=None,
+            recon_journal=recon_journal,
+        )
+
+        recon_journal.close.assert_called_once()
+
+
 class TestGracefulShutdownResilientToDrainError:
     @pytest.mark.asyncio
     async def test_shutdown_resilient_to_drain_error(self):
