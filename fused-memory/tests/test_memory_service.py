@@ -1,5 +1,6 @@
 """Tests for the memory service — unit tests with mocked backends."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import Scope
 from fused_memory.services.memory_service import MemoryService
+from tests.conftest import MockEdge, MockNode
 
 
 @pytest.fixture
@@ -621,13 +623,12 @@ class TestGetEntity:
     @pytest.mark.asyncio
     async def test_returns_correct_structure(self, service):
         """get_entity returns dict with 'nodes' and 'edges' lists of correct shape."""
-        from tests.conftest import MockEdge
-
-        mock_node = MagicMock()
-        mock_node.uuid = 'node-uuid-1'
-        mock_node.name = 'Auth Service'
-        mock_node.summary = 'Handles authentication'
-        mock_node.labels = ['Service', 'Auth']
+        mock_node = MockNode(
+            name='Auth Service',
+            uuid='node-uuid-1',
+            summary='Handles authentication',
+            labels=['Service', 'Auth'],
+        )
 
         mock_edge = MockEdge(fact='Auth service depends on Redis', uuid='edge-uuid-1')
 
@@ -664,11 +665,55 @@ class TestGetEntity:
         )
 
     @pytest.mark.asyncio
+    async def test_default_project_id_is_main(self, service):
+        """get_entity uses project_id='main' when none is provided."""
+        await service.get_entity(name='Foo')
+
+        service.graphiti.search_nodes.assert_called_once_with(
+            query='Foo', group_ids=['main'], max_nodes=5
+        )
+        service.graphiti.search.assert_called_once_with(
+            query='Foo', group_ids=['main'], num_results=10
+        )
+
+    @pytest.mark.asyncio
     async def test_empty_results(self, service):
         """get_entity returns empty nodes and edges when both backends return []."""
         result = await service.get_entity(name='nonexistent', project_id='test')
 
         assert result == {'nodes': [], 'edges': []}
+
+    @pytest.mark.asyncio
+    async def test_getattr_fallback_missing_attributes(self, service):
+        """getattr fallbacks fire when node/edge objects lack expected attributes.
+
+        Uses types.SimpleNamespace so attributes are only present when explicitly
+        set — unlike MagicMock which auto-creates attributes on access.
+
+        Node fallbacks: uuid→None, summary→None, labels→[]
+        Edge fallbacks: uuid→None, fact→str(edge_obj)
+        """
+        import types
+
+        bare_node = types.SimpleNamespace(name='BareName')
+        bare_edge = types.SimpleNamespace()  # no fact, no uuid
+
+        service.graphiti.search_nodes = AsyncMock(return_value=[bare_node])
+        service.graphiti.search = AsyncMock(return_value=[bare_edge])
+
+        result = await service.get_entity(name='BareName', project_id='test')
+
+        assert len(result['nodes']) == 1
+        node = result['nodes'][0]
+        assert node['uuid'] is None
+        assert node['name'] == 'BareName'
+        assert node['summary'] is None
+        assert node['labels'] == []
+
+        assert len(result['edges']) == 1
+        edge = result['edges'][0]
+        assert edge['uuid'] is None
+        assert edge['fact'] == str(bare_edge)
 
     @pytest.mark.asyncio
     async def test_concurrent_execution(self, service):
@@ -686,8 +731,6 @@ class TestGetEntity:
           ['search_nodes_start', 'search_nodes_end', 'search_start', 'search_end']
         (i.e. search_start index > search_nodes_end index)
         """
-        import asyncio
-
         call_log: list[str] = []
 
         async def search_nodes_side_effect(**kwargs):
@@ -721,9 +764,8 @@ class TestGetEntity:
     async def test_error_propagation_search_nodes_raises(self, service):
         """When search_nodes raises, get_entity must propagate the exception.
 
-        asyncio.gather without return_exceptions=True cancels remaining tasks
-        and re-raises the first exception — identical semantics to sequential
-        await.
+        asyncio.gather without return_exceptions=True propagates the first
+        raised exception; remaining tasks continue as orphaned background tasks.
         """
         service.graphiti.search_nodes = AsyncMock(
             side_effect=RuntimeError('search_nodes failure')

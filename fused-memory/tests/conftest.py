@@ -21,6 +21,9 @@ class MockNode:
     """Simulates a Graphiti entity node (source/target of an edge)."""
 
     name: str
+    uuid: str | None = None
+    summary: str | None = None
+    labels: list[str] = field(default_factory=list)
 
 
 @dataclass
