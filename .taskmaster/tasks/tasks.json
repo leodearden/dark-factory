@@ -2763,6 +2763,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 183,
+        "title": "Fix reconciliation Recent Runs table layout — absolute positioning and column truncation",
+        "description": "Two layout issues: (1) Right column uses lg:absolute lg:inset-0 which causes scroll/overlap issues when left column height differs. (2) \"When\" and \"Detail\" column headers truncated at right edge on 1440px viewport.",
+        "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 110-111). Fix: Replace absolute positioning with a simpler flex or grid layout that allows both columns to scroll independently. For truncation: ensure table uses table-layout:auto or add min-width to the container with overflow-x-auto.",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -2775,7 +2786,7 @@
       ],
       "created": "2026-03-26T10:25:51.987Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-26T15:14:03.131Z"
+      "updated": "2026-03-26T15:14:07.993Z"
     }
   }
 }
