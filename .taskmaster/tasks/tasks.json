@@ -2667,11 +2667,11 @@
         "description": "All 6 Chart.js charts (performance histograms, completion paths doughnut, memory timeseries, memory ops/agent doughnuts) appear blank on initial load and after every HTMX morph refresh. Root cause: double requestAnimationFrame pattern in performance.html and memory_graphs.html conflicts with Idiomorph's DOM replacement cycle. Charts have data but canvas never visually renders until manually forced.",
         "details": "Files: dashboard/src/dashboard/templates/partials/performance.html (lines 211-213), dashboard/src/dashboard/templates/partials/memory_graphs.html (lines 121-123).\n\nFix approach: Replace double-rAF with HTMX afterSettle/afterSwap event listener, or use MutationObserver to detect when canvas elements are in the DOM and then initialize charts. Alternatively, listen for htmx:afterSettle on the parent section and call renderAll() directly.\n\nmemory_hint: search \"chart rendering htmx morph\" for prior discussion; get_entity \"Chart.js\" for any conventions.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:12:54.025Z"
+        "updatedAt": "2026-03-26T18:14:07.701Z"
       },
       {
         "id": "174",
@@ -2832,7 +2832,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T18:14:06.959Z",
+      "lastModified": "2026-03-26T18:14:07.701Z",
       "taskCount": 165,
       "completedCount": 122,
       "tags": [
