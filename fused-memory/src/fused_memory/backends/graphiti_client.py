@@ -105,6 +105,7 @@ class GraphitiBackend:
             max_coroutines=cfg.queue.graphiti_max_coroutines,
         )
 
+        assert self.client is not None
         await self.client.build_indices_and_constraints()
         await self.ensure_graph_timeout(falkor_cfg.graph_timeout_ms)
         logger.info(f'GraphitiBackend initialized (FalkorDB {host}:{port})')

@@ -29,6 +29,8 @@ dark-factory-shared = { path = "../shared", editable = true }
 [tool.pyright]
 include = ["src", "tests"]
 extraPaths = ["src", "../shared/src", "../escalation/src"]
+venvPath = "."
+venv = ".venv"
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 
