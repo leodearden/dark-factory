@@ -9,7 +9,6 @@ import pytest
 from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.config.schema import FalkorDBProviderConfig, GraphitiBackendConfig
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -147,8 +146,6 @@ class TestInitializeCallsEnsureGraphTimeout:
     async def test_initialize_calls_ensure_graph_timeout_with_configured_value(self, mock_config):
         """initialize() should await ensure_graph_timeout(config.graphiti.falkordb.graph_timeout_ms)."""
         # Use a custom timeout value to distinguish it from any default
-        from fused_memory.config.schema import FalkorDBProviderConfig, GraphitiBackendConfig
-        from dataclasses import replace as dc_replace
 
         # Build config with custom timeout
         mock_config.graphiti = GraphitiBackendConfig(
