@@ -1,4 +1,4 @@
-"""CLI entry point: `orchestrator run --prd X`."""
+"""CLI entry point: `orchestrator run [--prd X]`."""
 
 import asyncio
 import json
@@ -31,13 +31,13 @@ def main(verbose: bool):
 
 
 @main.command()
-@click.option('--prd', type=click.Path(exists=True, path_type=Path), required=True,
-              help='Path to PRD markdown file')
+@click.option('--prd', type=click.Path(exists=True, path_type=Path), default=None,
+              help='Path to PRD markdown file (omit to run existing tasks)')
 @click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
               default=None, help='Path to config YAML')
 @click.option('--dry-run', is_flag=True, help='Populate tasks only, do not execute')
-def run(prd: Path, config_path: Path | None, dry_run: bool):
-    """Run the orchestrator against a PRD."""
+def run(prd: Path | None, config_path: Path | None, dry_run: bool):
+    """Run the orchestrator against a PRD, or execute existing tasks if no PRD given."""
     from orchestrator.harness import Harness
 
     config = load_config(config_path)

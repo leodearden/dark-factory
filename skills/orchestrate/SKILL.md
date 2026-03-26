@@ -21,6 +21,7 @@ The user will be in one of these situations. Read the request and jump to the ma
 |-----------|-------|
 | "Implement this PRD" / hands you a .md file | [Decompose PRD](#decompose-prd), then [Execute Tasks](#execute-tasks) |
 | "Do task X" / "Run task 7" / "Execute the tasks" | [Execute Tasks](#execute-tasks) |
+| No arguments given (bare `/orchestrate`) | [Execute Tasks](#execute-tasks) — run all pending tasks |
 | "What's the status?" / "How are the tasks going?" | [Check Status](#check-status) |
 | "Task X is blocked" / "Something failed" | [Resolve Blocks](#resolve-blocks) |
 | "An agent escalated" / escalation notification | [Handle Escalations](#handle-escalations) |
@@ -120,14 +121,18 @@ Before launching, verify:
 
 ### Launch
 
-The orchestrator CLI still requires `--prd` even when tasks already exist (it calls `parse_prd` but Taskmaster will see existing tasks and skip decomposition). Pass the original PRD path:
+Run with no `--prd` to execute existing tasks, or pass a PRD to decompose first:
 
 ```bash
 cd /home/leo/src/dark-factory
+# Run existing tasks (no PRD parsing)
+uv run --project orchestrator orchestrator run
+# Or decompose a PRD first, then run
 uv run --project orchestrator orchestrator run --prd <path-to-prd>
 ```
 
 **Options:**
+- `--prd <path>` — path to PRD markdown file. If omitted, skips PRD parsing and runs existing pending tasks.
 - `--dry-run` — verify task tree and module tags, but don't execute workflows.
 - `--config <path>` — override default config (at `orchestrator/config.yaml`). Useful for adjusting concurrency, models, or budgets.
 - `--verbose` — debug-level logging.
