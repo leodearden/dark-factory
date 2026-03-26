@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
@@ -15,6 +16,10 @@ load_dotenv()
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
 from fused_memory.server.tools import create_mcp_server  # noqa: E402
 from fused_memory.services.memory_service import MemoryService  # noqa: E402
+
+if TYPE_CHECKING:
+    from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.reconciliation.journal import ReconciliationJournal
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -130,7 +135,6 @@ async def run_server():
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await recon_journal.initialize()
         recon_journal.set_write_journal(write_journal)
-        journal = recon_journal
 
         db_path = Path(config.reconciliation.data_dir) / 'reconciliation.db'
         assert memory_service.durable_queue is not None  # set by initialize()
@@ -153,7 +157,7 @@ async def run_server():
         targeted = None
         if taskmaster and taskmaster.connected:
             targeted = TargetedReconciler(
-                memory_service, taskmaster, journal, config, event_buffer,
+                memory_service, taskmaster, recon_journal, config, event_buffer,
             )
 
         from fused_memory.middleware.task_file_committer import TaskFileCommitter
@@ -163,7 +167,7 @@ async def run_server():
 
         # Full reconciliation harness (background loop)
         reconciliation_harness = ReconciliationHarness(
-            memory_service, taskmaster, journal, event_buffer, config
+            memory_service, taskmaster, recon_journal, event_buffer, config
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
@@ -236,10 +240,10 @@ async def run_server():
 
 
 async def _graceful_shutdown(
-    memory_service,
-    task_interceptor,
-    harness_loop_task,
-    recon_journal,
+    memory_service: MemoryService,
+    task_interceptor: 'TaskInterceptor | None',
+    harness_loop_task: 'asyncio.Task[None] | None',
+    recon_journal: 'ReconciliationJournal | None',
 ) -> None:
     """Perform an ordered, exception-resilient server shutdown.
 
