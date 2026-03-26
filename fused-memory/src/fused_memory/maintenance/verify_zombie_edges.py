@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass, field
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.maintenance._utils import override_config_path
 from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
@@ -138,8 +139,6 @@ async def run_verify_zombie_edges(
     Returns:
         VerifyResult with found, missing, and deleted counts.
     """
-    import os
-
     if uuids is None:
         uuids = TASK_111_ZOMBIE_UUIDS
 
@@ -149,41 +148,33 @@ async def run_verify_zombie_edges(
             'were never confirmed. Provide them via --uuids <uuid1> <uuid2> ...'
         )
 
-    old_config_path = os.environ.get('CONFIG_PATH')
     service = None
-    try:
-        if config_path is not None:
-            os.environ['CONFIG_PATH'] = config_path
+    with override_config_path(config_path):
+        try:
+            config = FusedMemoryConfig()
+            service = MemoryService(config)
+            verifier = ZombieEdgeVerifier(backend=service.graphiti)
 
-        config = FusedMemoryConfig()
-        service = MemoryService(config)
-        verifier = ZombieEdgeVerifier(backend=service.graphiti)
-
-        await service.initialize()
-        result = await verifier.cleanup(uuids=uuids, dry_run=dry_run)
-        logger.info(
-            'run_verify_zombie_edges complete: found=%d, missing=%d, deleted=%d, dry_run=%s',
-            len(result.found),
-            len(result.missing),
-            result.deleted,
-            dry_run,
-        )
-        return result
-    finally:
-        if service is not None:
-            # Catch close() errors so CONFIG_PATH restoration below always runs.
-            try:
-                await service.close()
-            except Exception:
-                logger.warning(
-                    'Error closing service during run_verify_zombie_edges cleanup',
-                    exc_info=True,
-                )
-        if config_path is not None:
-            if old_config_path is None:
-                os.environ.pop('CONFIG_PATH', None)
-            else:
-                os.environ['CONFIG_PATH'] = old_config_path
+            await service.initialize()
+            result = await verifier.cleanup(uuids=uuids, dry_run=dry_run)
+            logger.info(
+                'run_verify_zombie_edges complete: found=%d, missing=%d, deleted=%d, dry_run=%s',
+                len(result.found),
+                len(result.missing),
+                result.deleted,
+                dry_run,
+            )
+            return result
+        finally:
+            if service is not None:
+                # Catch close() errors so CONFIG_PATH restoration below always runs.
+                try:
+                    await service.close()
+                except Exception:
+                    logger.warning(
+                        'Error closing service during run_verify_zombie_edges cleanup',
+                        exc_info=True,
+                    )
 
 
 if __name__ == '__main__':
