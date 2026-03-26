@@ -2145,11 +2145,11 @@
         "description": "In MemoryService.get_entity(), search_nodes() and search() are awaited sequentially but are independent I/O calls to Graphiti. Use asyncio.gather to run both queries in parallel:\n  nodes, edges = await asyncio.gather(self.graphiti.search_nodes(...), self.graphiti.search(...))\nThis is a pre-existing pattern also present in _search_graphiti() — both sites could be updated.\n\n## memory_hints\n- search: \"asyncio.gather concurrent search memory_service get_entity\"\n- search: \"sequential async calls search_nodes search Graphiti\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T07:39:52.584Z"
+        "updatedAt": "2026-03-26T18:08:20.010Z"
       },
       {
         "id": "133",
@@ -2157,11 +2157,11 @@
         "description": "Two related issues in fused-memory temporal metadata handling:\n\n1. Production code uses str(valid_at) on datetime objects, which produces Python-default format ('2026-01-01 00:00:00+00:00' with space separator) rather than ISO 8601 ('2026-01-01T00:00:00+00:00' with T separator). Fix: use valid_at.isoformat() if hasattr(valid_at, 'isoformat') else str(valid_at). Affects both _search_graphiti() and get_entity() in memory_service.py.\n\n2. MockEdge in tests/conftest.py types valid_at/invalid_at as str|None. Real Graphiti edges carry datetime objects. Tests pass strings through str() which is a no-op, never exercising the actual datetime→str conversion. Fix: change MockEdge to use datetime objects and update test assertions accordingly.\n\n## memory_hints\n- search: \"str valid_at isoformat datetime temporal edge serialization\"\n- search: \"MockEdge conftest temporal type fidelity\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T07:39:52.546Z"
+        "updatedAt": "2026-03-26T18:08:20.033Z"
       },
       {
         "id": "134",
@@ -2811,7 +2811,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T18:08:19.983Z",
+      "lastModified": "2026-03-26T18:08:20.033Z",
       "taskCount": 165,
       "completedCount": 122,
       "tags": [
