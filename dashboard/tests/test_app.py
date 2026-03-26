@@ -412,6 +412,26 @@ class TestMainModule:
             )
 
 
+class TestCustomStyles:
+    """Tests for custom CSS rules merged into tailwind.css and no separate style.css."""
+
+    def test_tailwind_css_has_xcloak(self, client):
+        css = client.get('/static/tailwind.css').text
+        assert '[x-cloak]' in css
+
+    def test_tailwind_css_has_htmx_settling(self, client):
+        css = client.get('/static/tailwind.css').text
+        assert '.htmx-settling' in css
+
+    def test_tailwind_css_has_htmx_swapping(self, client):
+        css = client.get('/static/tailwind.css').text
+        assert '.htmx-swapping' in css
+
+    def test_no_separate_style_css_link(self, client):
+        html = client.get('/').text
+        assert 'style.css' not in html
+
+
 class TestTailwindBuild:
     """Tests for local Tailwind CSS build replacing CDN."""
 
