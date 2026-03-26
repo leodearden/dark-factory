@@ -43,9 +43,9 @@ class TestOverrideConfigPath:
 
     def test_noop_when_config_path_is_none(self, monkeypatch):
         """Does not touch CONFIG_PATH at all when config_path is None."""
-        from fused_memory.maintenance._utils import override_config_path
-
         import os
+
+        from fused_memory.maintenance._utils import override_config_path
 
         # Case 1: env var already set — should remain unchanged
         monkeypatch.setenv('CONFIG_PATH', '/existing/config.yaml')
@@ -65,9 +65,8 @@ class TestOverrideConfigPath:
 
         monkeypatch.delenv('CONFIG_PATH', raising=False)
 
-        with pytest.raises(RuntimeError, match='boom'):
-            with override_config_path('/some/path/config.yaml'):
-                raise RuntimeError('boom')
+        with pytest.raises(RuntimeError, match='boom'), override_config_path('/some/path/config.yaml'):
+            raise RuntimeError('boom')
 
         import os
         assert 'CONFIG_PATH' not in os.environ
