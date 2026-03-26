@@ -1,94 +1,114 @@
 {
-  "task_id": "124",
-  "title": "Register update_task tool in fused-memory MCP server",
+  "task_id": "160",
+  "title": "Extract shared _validate_project_root and remove trap defaults",
   "files": [
-    "fused-memory/tests/test_health_endpoint.py"
+    "fused-memory/src/fused_memory/utils/__init__.py",
+    "fused-memory/src/fused_memory/utils/validation.py",
+    "fused-memory/src/fused_memory/server/tools.py",
+    "fused-memory/src/fused_memory/reconciliation/targeted.py",
+    "fused-memory/tests/test_validation.py",
+    "fused-memory/tests/test_targeted.py"
   ],
   "modules": [
-    "fused-memory/tests",
-    "fused-memory/src/fused_memory/server"
+    "fused_memory/utils",
+    "fused_memory/server",
+    "fused_memory/reconciliation"
   ],
-  "analysis": "The update_task tool IS ALREADY REGISTERED in tools.py at line 875 with @mcp.tool() decorator. The full three-tier implementation chain (MCP tool → TaskInterceptor middleware → TaskmasterBackend client) is intact and operational. The -32601 'Unknown tool' error reported on 2026-03-23 was caused by the systemd fused-memory service on port 8002 running stale code — not a code-level regression. The defensive always-on registration pattern (commit 3d6fe0c, ~2026-03-19) ensures all 11 task tools are unconditionally registered, returning structured errors when Taskmaster is unavailable rather than -32601. The e2fce78 simplify commit (most recent tools.py change) only touched get_entity and mem0 list_projects — no impact on update_task. There are 7 existing update_task tests in test_health_endpoint.py covering: metadata dict→JSON coercion, string passthrough, None passthrough, prompt forwarding, append forwarding, error dict return, and defensive registration. Two minor test coverage gaps identified: (1) the error_type field in error responses is returned by code but never asserted in tests, (2) the tag parameter is accepted and forwarded by the tool but has no dedicated forwarding test. No production code changes are needed — only test hardening to prevent future regression.",
+  "analysis": "Three related changes: (1) Extract _validate_project_root from tools.py into a shared utils/validation.py module with two variants \u2014 dict-returning for MCP tools and raising for internal code. (2) Remove the trap `= ''` default from project_root in targeted.py's reconcile_task() and reconcile_bulk_tasks() \u2014 the empty string always triggers the fallback-to-project_id path which is now dead code, so making it required surfaces errors at type-check time. (3) Update both tools.py and targeted.py to import from the shared module.\n\nCurrently tools.py:223-230 has `_validate_project_root()` returning `dict[str,str]|None`, used by 11 task-related MCP tools via walrus operator. targeted.py:85-87 and 353-354 have inline fallback logic (`if not project_root: project_root = project_id`) which silently masks missing values. All three callers in task_interceptor.py already pass project_root explicitly, so the `= ''` default is unreachable in production \u2014 it's only triggered by tests that omit it. 15 existing test calls in test_targeted.py don't pass project_root and rely on the default \u2014 these must be updated to pass an explicit absolute path before removing the default. Also co-extracting _validate_project_id (tools.py:214-221) since it follows the same pattern and keeps the shared module complete.",
   "prerequisites": [
     {
       "id": "pre-1",
-      "description": "Run all existing update_task tests in test_health_endpoint.py to establish green baseline: test_update_task_metadata_dict_coerced_to_json_string, test_update_task_metadata_string_passed_through, test_update_task_metadata_none_passed_through, test_update_task_prompt_forwarded_to_interceptor, test_update_task_append_true_forwarded_to_interceptor, test_update_task_interceptor_error_returns_error_dict, test_task_tools_registered_without_interceptor",
+      "description": "Create fused_memory/utils/ package with empty __init__.py",
       "status": "done",
-      "commit": "7a7ae68",
-      "tests": [
-        "fused-memory/tests/test_health_endpoint.py::test_update_task_metadata_dict_coerced_to_json_string",
-        "fused-memory/tests/test_health_endpoint.py::test_update_task_metadata_string_passed_through",
-        "fused-memory/tests/test_health_endpoint.py::test_update_task_metadata_none_passed_through",
-        "fused-memory/tests/test_health_endpoint.py::test_update_task_prompt_forwarded_to_interceptor",
-        "fused-memory/tests/test_health_endpoint.py::test_update_task_append_true_forwarded_to_interceptor",
-        "fused-memory/tests/test_health_endpoint.py::test_update_task_interceptor_error_returns_error_dict",
-        "fused-memory/tests/test_health_endpoint.py::test_task_tools_registered_without_interceptor"
-      ]
+      "commit": null,
+      "tests": []
     }
   ],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Add test_update_task_tag_forwarded_to_interceptor: Call update_task via _tool_manager.call_tool with tag='v2' alongside id and project_root. Assert task_interceptor.update_task was called with tag='v2'. Place after test_update_task_append_true_forwarded_to_interceptor (after line 151) using the same mcp_server_with_tasks and task_interceptor fixtures. Test will pass immediately (characterization test — code already forwards tag).",
-      "status": "done",
-      "commit": "4f5f233"
+      "description": "Write tests for shared validators in new test_validation.py: (a) validate_project_root \u2014 returns error dict for empty string, relative path, None-cast; returns None for valid absolute path like '/home/user/project'. (b) validate_project_id \u2014 returns error dict for empty string; returns None for valid id. (c) require_project_root \u2014 raises ValueError for empty string, relative path; returns None for valid absolute path. Tests will FAIL because utils/validation.py doesn't exist yet.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-2",
-      "type": "test",
-      "description": "Strengthen test_update_task_interceptor_error_returns_error_dict: Add assertion `assert result['error_type'] == 'RuntimeError'` after the existing `assert 'backend unavailable' in result['error']` line (line 171). This verifies the error_type field that tools.py returns via `type(e).__name__` is present and correct. Test will pass immediately (characterization test — code already returns error_type).",
-      "status": "done",
-      "commit": "4f5f233"
+      "type": "impl",
+      "description": "Create utils/validation.py with three functions: (1) validate_project_root(project_root: str) -> dict[str,str] | None \u2014 core condition `not project_root or not os.path.isabs(project_root)`, returns error dict with 'error' and 'error_type' keys. (2) validate_project_id(project_id: str) -> dict[str,str] | None \u2014 checks `not project_id`. (3) require_project_root(project_root: str) -> None \u2014 same condition as validate_project_root but raises ValueError. All test_validation.py tests pass.",
+      "status": "pending",
+      "commit": null
     },
     {
       "id": "step-3",
       "type": "impl",
-      "description": "Run the full test_health_endpoint.py test suite to verify all existing and new tests pass. No production code changes needed — the update_task registration and implementation are already complete. This step confirms the characterization tests accurately describe the existing behavior.",
-      "status": "done",
-      "commit": "4f5f233"
+      "description": "Refactor tools.py: replace local _validate_project_root (lines 223-230) and _validate_project_id (lines 214-221) with imports from fused_memory.utils.validation. Add `from fused_memory.utils.validation import validate_project_id, validate_project_root` near top. Remove the two local function definitions. All 11 task-tool call sites (`if err := validate_project_root(...)`) and 9+ memory-tool call sites (`if err := validate_project_id(...)`) keep the same walrus-operator pattern \u2014 only the import source changes. No behavior change. Existing test_health_endpoint.py tests continue to pass.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-4",
+      "type": "test",
+      "description": "Update test_targeted.py in two parts: (a) Add explicit project_root='/tmp/test-project' to all 15 existing test calls that currently omit it \u2014 these are at lines 80-82, 95-97, 111-113, 130-132, 148-151, 166-169, 183-186, 196-205, 219-222, 233-236, 352-354, 368-370, 392-394, 415-417, 432-434. This is backward-compatible with current code. (b) Add two new test functions: test_reconcile_task_rejects_invalid_project_root (calls with project_root='' and project_root='relative/path', expects ValueError) and test_reconcile_bulk_tasks_rejects_invalid_project_root (same pattern). New tests will FAIL because targeted.py still has fallback logic instead of raising.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-5",
+      "type": "impl",
+      "description": "Update targeted.py: (1) Add import `from fused_memory.utils.validation import require_project_root` at top. (2) Remove `= ''` default from project_root parameter in reconcile_task() signature (line 82) and reconcile_bulk_tasks() signature (line 350). (3) Replace inline fallback logic at lines 85-87 (`if not project_root: project_root = project_id`) with `require_project_root(project_root)`. (4) Replace inline fallback at lines 353-354 with same call. All tests now pass \u2014 both the 15 updated existing tests and the 2 new validation tests.",
+      "status": "pending",
+      "commit": null
     }
   ],
   "design_decisions": [
     {
-      "decision": "No production code changes to tools.py, task_interceptor.py, or taskmaster_client.py",
-      "rationale": "update_task is already fully registered (line 875) and implemented across all three layers. The -32601 error was a stale-service issue (systemd on port 8002 running old code), not a code regression. Adding redundant code would be misleading."
+      "decision": "Two-variant API: validate_project_root (dict) and require_project_root (raises)",
+      "rationale": "MCP tools must return error dicts to the client (can't raise). Internal code (reconciliation) should raise to fail-fast. Sharing the core condition (`not project_root or not os.path.isabs(project_root)`) avoids drift between the two validation paths."
     },
     {
-      "decision": "Characterization tests instead of red-green TDD",
-      "rationale": "Since the implementation already exists and is correct, new tests are characterization tests that document and lock existing behavior. They pass immediately, which is expected — their value is preventing future regression, not driving new implementation."
+      "decision": "Place shared validators in new fused_memory/utils/validation.py package",
+      "rationale": "No existing utils/ package exists. validation.py is a natural home for validators used across server/ and reconciliation/. The utils/ package can later house other cross-cutting utilities."
     },
     {
-      "decision": "Only two new test assertions added (tag forwarding + error_type)",
-      "rationale": "These are the only genuine gaps in the existing 7-test suite. All other parameters (id, project_root, prompt, metadata, append) and behaviors (coercion, error handling, defensive registration) are already covered. Scope discipline avoids unnecessary churn."
+      "decision": "Co-extract validate_project_id alongside validate_project_root",
+      "rationale": "tools.py:214-221 has a parallel _validate_project_id helper with the same pattern. Extracting both keeps the validation module complete and avoids a half-done refactor."
     },
     {
-      "decision": "Test file is the only file modified",
-      "rationale": "The task's root cause was operational (stale service), not code. Service restart is outside code scope. The test hardening ensures future code changes don't silently remove update_task."
+      "decision": "Update 15 existing tests to pass project_root BEFORE changing targeted.py signature",
+      "rationale": "These tests currently rely on the `= ''` default which triggers fallback to project_id. Adding explicit project_root is backward-compatible (passes with both old and new code), isolating the behavior change to the new validation-specific tests."
+    },
+    {
+      "decision": "Use '/tmp/test-project' as project_root in updated existing tests",
+      "rationale": "These tests mock the taskmaster so the path doesn't need to exist on disk. Using a clear, short absolute path satisfies the validator and keeps tests readable. Tests that already use '/home/leo/src/dark-factory' (the separation tests at line 248+) are left as-is."
+    },
+    {
+      "decision": "Remove the fallback-to-project_id logic entirely rather than validating then falling back",
+      "rationale": "All three callers in task_interceptor.py already pass project_root explicitly. The fallback path is dead code in production \u2014 only reached by tests that omit the parameter. Making project_root required is the cleaner contract."
     }
   ],
   "reuse": [
     {
-      "what": "mcp_server_with_tasks fixture",
-      "where": "fused-memory/tests/test_health_endpoint.py line 37",
-      "how": "Reuse existing fixture that creates MCP server with mocked task interceptor via create_mcp_server(mock_service, task_interceptor=task_interceptor)"
+      "what": "Existing _validate_project_root condition and error format",
+      "where": "fused-memory/src/fused_memory/server/tools.py:223-230",
+      "how": "Extract the exact condition (`not project_root or not os.path.isabs(project_root)`) and error dict format into shared module. The dict variant is a direct lift with the underscore prefix removed."
     },
     {
-      "what": "task_interceptor fixture",
-      "where": "fused-memory/tests/test_health_endpoint.py line 30",
-      "how": "Reuse existing AsyncMock fixture with update_task pre-configured to return {'success': True}"
+      "what": "Existing _validate_project_id condition and error format",
+      "where": "fused-memory/src/fused_memory/server/tools.py:214-221",
+      "how": "Extract alongside project_root validator. Same lift pattern."
     },
     {
-      "what": "Existing parameter forwarding test pattern",
-      "where": "fused-memory/tests/test_health_endpoint.py lines 120-151",
-      "how": "Follow identical pattern: call_tool → assert_called_once → destructure call_args → assert kwargs['param'] == expected. Used by prompt and append tests."
+      "what": "Walrus-operator validation pattern in tools.py",
+      "where": "fused-memory/src/fused_memory/server/tools.py:763 (and 10+ more sites)",
+      "how": "Keep the existing `if err := validate_project_root(project_root): return err` pattern at all call sites \u2014 only the import source changes."
     },
     {
-      "what": "Existing error assertion pattern",
-      "where": "fused-memory/tests/test_health_endpoint.py lines 159-171",
-      "how": "Extend existing test_update_task_interceptor_error_returns_error_dict with one additional assertion line for error_type field."
+      "what": "Existing test fixtures in test_targeted.py",
+      "where": "fused-memory/tests/test_targeted.py:16-73",
+      "how": "Reuse journal, mock_memory_service, mock_taskmaster, config, mock_event_buffer, and reconciler fixtures for new validation tests in the same file."
     }
   ],
-  "_session_id": "124-5d4e6bad",
-  "_created_at": "2026-03-26T07:20:36.440262+00:00"
+  "_session_id": "160-eadf243b",
+  "_created_at": "2026-03-26T07:31:50.213122+00:00"
 }
