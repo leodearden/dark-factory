@@ -6,8 +6,6 @@ from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
-import pytest
-
 
 class TestFormatTriggerFilter:
     """Tests for the format_trigger Jinja2 filter function."""
