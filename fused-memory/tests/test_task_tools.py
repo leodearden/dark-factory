@@ -70,61 +70,28 @@ async def test_update_task_metadata_none_passed_through(
 
 
 # ------------------------------------------------------------------
-# update_task prompt parameter forwarding
+# update_task parameter forwarding (prompt, append, tag)
 # ------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_update_task_prompt_forwarded_to_interceptor(
+@pytest.mark.parametrize('param_name,tool_args,expected_key,expected_value', [
+    ('prompt', {'prompt': 'Update desc'}, 'prompt', 'Update desc'),
+    ('append', {'prompt': 'Extra', 'append': True}, 'append', True),
+    ('tag', {'tag': 'v2'}, 'tag', 'v2'),
+])
+async def test_update_task_param_forwarded_to_interceptor(
+    param_name, tool_args, expected_key, expected_value,
     mcp_server_with_tasks, task_interceptor,
 ):
-    """When prompt is provided, it should be forwarded to the interceptor."""
+    """When a parameter is provided, it should be forwarded to the interceptor."""
     await mcp_server_with_tasks._tool_manager.call_tool(
         'update_task',
-        {'id': '1', 'project_root': '/project', 'prompt': 'Update the description'},
+        {'id': '1', 'project_root': '/project', **tool_args},
     )
     task_interceptor.update_task.assert_called_once()
     _, kwargs = task_interceptor.update_task.call_args
-    assert kwargs['prompt'] == 'Update the description'
-    assert kwargs['append'] is False  # default value when not provided
-
-
-# ------------------------------------------------------------------
-# update_task append parameter forwarding
-# ------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_update_task_append_true_forwarded_to_interceptor(
-    mcp_server_with_tasks, task_interceptor,
-):
-    """When append=True, the value should be forwarded to the interceptor."""
-    await mcp_server_with_tasks._tool_manager.call_tool(
-        'update_task',
-        {'id': '1', 'project_root': '/project', 'prompt': 'Extra info', 'append': True},
-    )
-    task_interceptor.update_task.assert_called_once()
-    _, kwargs = task_interceptor.update_task.call_args
-    assert kwargs['append'] is True
-
-
-# ------------------------------------------------------------------
-# update_task tag parameter forwarding
-# ------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_update_task_tag_forwarded_to_interceptor(
-    mcp_server_with_tasks, task_interceptor,
-):
-    """When tag is provided, it should be forwarded to the interceptor."""
-    await mcp_server_with_tasks._tool_manager.call_tool(
-        'update_task',
-        {'id': '1', 'project_root': '/project', 'tag': 'v2'},
-    )
-    task_interceptor.update_task.assert_called_once()
-    _, kwargs = task_interceptor.update_task.call_args
-    assert kwargs['tag'] == 'v2'
+    assert kwargs[expected_key] == expected_value
 
 
 @pytest.mark.asyncio
