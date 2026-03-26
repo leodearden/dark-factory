@@ -38,9 +38,9 @@ max_turns:
   merger: 50
 
 # Verification commands
-test_command: "uv run --project dashboard pytest dashboard/tests/"
-lint_command: "uv run --project dashboard ruff check dashboard/"
-type_check_command: "uv run --project dashboard pyright dashboard/src/"
+test_command: "uv run --project dashboard --directory dashboard pytest tests/"
+lint_command: "uv run --project dashboard --directory dashboard ruff check src/ tests/"
+type_check_command: "uv run --project dashboard --directory dashboard pyright src/ tests/"
 
 # Fused memory HTTP server — port 8002
 fused_memory:

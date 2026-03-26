@@ -150,9 +150,9 @@
               <td class="py-2 text-gray-400">{{ run.started_at | timeago }}</td>
               <td class="py-2">
                 {% if run.journal_entry_count > 0 %}
-                  <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-900 text-blue-200 cursor-pointer" @click="open = !open" data-testid="journal-badge">
+                  <button class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-900 text-blue-200 hover:bg-blue-800 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:ring-offset-1 focus:ring-offset-gray-800" @click="open = !open" aria-label="Show {{ run.journal_entry_count }} journal entries" data-testid="journal-badge">
                     {{ run.journal_entry_count }}
-                  </span>
+                  </button>
                 {% endif %}
               </td>
             </tr>

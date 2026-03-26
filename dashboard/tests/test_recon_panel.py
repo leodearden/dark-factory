@@ -537,7 +537,7 @@ class TestReconJournalBadge:
             html = client.get('/partials/recon').text
         # MOCK_RUNS has journal_entry_count=3
         assert 'data-testid="journal-badge"' in html
-        assert '>3<' in html or '>\n                    3\n' in html or '3</span>' in html
+        assert '>3<' in html or '>\n                    3\n' in html or '3</button>' in html
 
     def test_badge_hidden_when_count_zero(self, client):
         runs_no_journal = [
@@ -554,6 +554,57 @@ class TestReconJournalBadge:
         with _patch_recon_data():
             html = client.get('/partials/recon').text
         assert '>Detail<' in html or 'Detail</th>' in html
+
+    def test_badge_is_button_element(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert '<button' in html and 'data-testid="journal-badge"' in html
+        # Extract the badge element and verify it's a button, not a span
+        badge_start = html.find('data-testid="journal-badge"')
+        assert badge_start != -1
+        # Walk back to find the opening tag
+        tag_start = html.rfind('<', 0, badge_start)
+        assert html[tag_start:tag_start + 7] == '<button'
+        assert '</button>' in html
+
+    def test_badge_has_aria_label(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        # MOCK_RUNS has journal_entry_count=3
+        assert 'aria-label="Show 3 journal entries"' in html
+
+    def test_badge_has_hover_style(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'hover:bg-blue-800' in html
+
+    def test_badge_has_focus_ring_styles(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'focus:ring-2' in html
+        assert 'focus:ring-blue-400' in html
+
+    def test_badge_no_cursor_pointer(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        badge_start = html.find('data-testid="journal-badge"')
+        assert badge_start != -1
+        tag_start = html.rfind('<', 0, badge_start)
+        # Find closing > of opening tag
+        tag_end = html.find('>', tag_start)
+        opening_tag = html[tag_start:tag_end + 1]
+        assert 'cursor-pointer' not in opening_tag
+
+    def test_badge_aria_label_dynamic_count(self, client):
+        runs_5 = [
+            {
+                **MOCK_RUNS[0],
+                'journal_entry_count': 5,
+            }
+        ]
+        with _patch_recon_data(runs=runs_5):
+            html = client.get('/partials/recon').text
+        assert 'aria-label="Show 5 journal entries"' in html
 
 
 class TestReconRunDetailRoute:
