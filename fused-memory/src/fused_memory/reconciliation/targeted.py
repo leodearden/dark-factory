@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import uuid as uuid_mod
 from datetime import UTC, datetime
 
@@ -82,9 +83,10 @@ class TargetedReconciler:
         project_root: str = '',
     ) -> dict:
         """Run targeted reconciliation for a single task state transition."""
-        # Use project_root for taskmaster ops; fall back to project_id for backwards compat
-        if not project_root:
-            project_root = project_id
+        if not project_root or not os.path.isabs(project_root):
+            raise ValueError(
+                f'project_root must be a non-empty absolute path, got: {project_root!r}'
+            )
         run_id = str(uuid_mod.uuid4())
         start = datetime.now(UTC)
 
