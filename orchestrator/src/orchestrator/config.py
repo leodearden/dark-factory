@@ -100,6 +100,7 @@ class ModelsConfig(BaseModel):
     merger: str = Field(default='opus')
     steward: str = Field(default='opus')
     module_tagger: str = Field(default='sonnet')
+    deep_reviewer: str = Field(default='opus')
 
 
 class BudgetsConfig(BaseModel):
@@ -112,6 +113,7 @@ class BudgetsConfig(BaseModel):
     merger: float = Field(default=5.0)
     steward: float = Field(default=5.0)
     module_tagger: float = Field(default=2.0)
+    deep_reviewer: float = Field(default=15.0)
 
 
 class TurnsConfig(BaseModel):
@@ -124,6 +126,7 @@ class TurnsConfig(BaseModel):
     merger: int = Field(default=50)
     steward: int = Field(default=100)
     module_tagger: int = Field(default=30)
+    deep_reviewer: int = Field(default=100)
 
 
 class EffortConfig(BaseModel):
@@ -136,6 +139,7 @@ class EffortConfig(BaseModel):
     merger: str = Field(default='high')
     steward: str = Field(default='high')
     module_tagger: str = Field(default='medium')
+    deep_reviewer: str = Field(default='max')
 
 
 class BackendsConfig(BaseModel):
@@ -148,6 +152,17 @@ class BackendsConfig(BaseModel):
     merger: str = Field(default='claude')
     steward: str = Field(default='claude')
     module_tagger: str = Field(default='claude')
+    deep_reviewer: str = Field(default='claude')
+
+
+class ReviewConfig(BaseModel):
+    """Periodic deep review checkpoint configuration."""
+
+    enabled: bool = Field(default=True)
+    interval: int = Field(default=5, description='Trigger checkpoint every N merges')
+    full_review_on_complete: bool = Field(default=True)
+    briefing_path: str = Field(default='review/briefing.yaml')
+    reports_dir: str = Field(default='data/review-checkpoints')
 
 
 class FusedMemoryConfig(BaseModel):
@@ -272,6 +287,9 @@ class OrchestratorConfig(BaseSettings):
 
     # Escalation
     escalation: EscalationConfig = Field(default_factory=EscalationConfig)
+
+    # Review checkpoints
+    review: ReviewConfig = Field(default_factory=ReviewConfig)
 
     # Git
     git: GitConfig = Field(default_factory=GitConfig)

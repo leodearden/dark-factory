@@ -15,6 +15,7 @@ from orchestrator.agents.invoke import invoke_with_cap_retry
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle, mcp_call
+from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.scheduler import Scheduler
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -63,6 +64,10 @@ class HarnessReport:
     task_reports: list[TaskReport] = field(default_factory=list)
     paused_for_cap: bool = False
     cap_pause_duration_secs: float = 0.0
+    review_checkpoints: int = 0
+    review_findings: int = 0
+    review_tasks_created: int = 0
+    review_cost_usd: float = 0.0
 
     def summary(self) -> str:
         lines = [
@@ -74,6 +79,13 @@ class HarnessReport:
         ]
         if self.paused_for_cap:
             lines.append(f'  Cap pause: {self.cap_pause_duration_secs:.0f}s total')
+        if self.review_checkpoints > 0:
+            lines.append(
+                f'  Review checkpoints: {self.review_checkpoints} '
+                f'({self.review_findings} findings, '
+                f'{self.review_tasks_created} tasks, '
+                f'${self.review_cost_usd:.2f})'
+            )
         lines.extend([
             '',
             'Per-task results:',
@@ -103,13 +115,25 @@ class Harness:
             UsageGate(config.usage_cap) if config.usage_cap.enabled else None
         )
 
+        # Review checkpoints
+        self.review_checkpoint: ReviewCheckpoint | None = (
+            ReviewCheckpoint(config, self.mcp, self.usage_gate)
+            if config.review.enabled else None
+        )
+        self._review_running = False
+        self._pending_review_task: asyncio.Task | None = None
+        self._task_modules: dict[str, list[str]] = {}  # task_id -> modules
+
         # Escalation support
         self._escalation_queue: EscalationQueue | None = None
         self._escalation_events: dict[str, asyncio.Event] = {}
         self._escalation_task: asyncio.Task | None = None
 
-    async def run(self, prd_path: Path, dry_run: bool = False) -> HarnessReport:
-        """Execute the full orchestration pipeline."""
+    async def run(self, prd_path: Path | None = None, dry_run: bool = False) -> HarnessReport:
+        """Execute the full orchestration pipeline.
+
+        If *prd_path* is ``None``, skip PRD parsing and run existing tasks.
+        """
         self.report.started_at = datetime.now(UTC).isoformat()
 
         # 1. Start fused-memory HTTP server
@@ -139,13 +163,22 @@ class Harness:
                     # wait_for_reset=True: probe loop is already running,
                     # workflows will block in before_invoke until gate reopens
 
-            # 2. Parse PRD into tasks
-            logger.info(f'Parsing PRD: {prd_path}')
-            pre_ids = {str(t.get('id', '')) for t in await self.scheduler.get_tasks()}
-            await self._populate_tasks(prd_path)
+            # 2. Parse PRD into tasks (skipped when no PRD given)
+            if prd_path is not None:
+                logger.info(f'Parsing PRD: {prd_path}')
+                pre_ids = {str(t.get('id', '')) for t in await self.scheduler.get_tasks()}
+                await self._populate_tasks(prd_path)
 
-            # 2a. Tag newly-created tasks with PRD source
-            await self._tag_prd_metadata(prd_path, pre_ids)
+                # 2a. Tag newly-created tasks with PRD source
+                await self._tag_prd_metadata(prd_path, pre_ids)
+            else:
+                logger.info('No PRD given — running existing tasks')
+                existing = await self.scheduler.get_tasks()
+                if not any(t.get('status') == 'pending' for t in existing):
+                    raise RuntimeError(
+                        'No PRD given and no pending tasks found. '
+                        'Pass --prd to decompose a PRD, or create tasks first.'
+                    )
 
             # 2b. Tag tasks with code modules for concurrency locking
             logger.info('Tagging tasks with code modules...')
@@ -168,6 +201,22 @@ class Harness:
             task_reports: list[TaskReport] = []
 
             while True:
+                # Pick up any pending review task spawned by _collect_done_reports
+                if self._pending_review_task is not None:
+                    active.add(self._pending_review_task)
+                    self._pending_review_task = None
+
+                # If a review checkpoint is running, don't acquire new tasks —
+                # wait for in-flight tasks (and the review) to complete.
+                if self._review_running:
+                    if not active:
+                        break  # shouldn't happen — review task is in active
+                    done, active = await asyncio.wait(
+                        active, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    self._collect_done_reports(done, task_reports)
+                    continue
+
                 assignment = await self.scheduler.acquire_next()
 
                 if assignment is None:
@@ -177,16 +226,11 @@ class Harness:
                     done, active = await asyncio.wait(
                         active, return_when=asyncio.FIRST_COMPLETED
                     )
-                    for t in done:
-                        try:
-                            report = t.result()
-                            if report:
-                                task_reports.append(report)
-                        except Exception as e:
-                            logger.error(f'Workflow slot error: {e}')
+                    self._collect_done_reports(done, task_reports)
                     continue
 
                 await sem.acquire()
+                self._task_modules[assignment.task_id] = list(assignment.modules)
                 task = asyncio.create_task(
                     self._run_slot(assignment, sem),
                     name=f'workflow-{assignment.task_id}',
@@ -197,13 +241,7 @@ class Harness:
             # Drain remaining
             if active:
                 done, _ = await asyncio.wait(active)
-                for t in done:
-                    try:
-                        report = t.result()
-                        if report:
-                            task_reports.append(report)
-                    except Exception as e:
-                        logger.error(f'Workflow slot error: {e}')
+                self._collect_done_reports(done, task_reports)
 
             self.report.task_reports = task_reports
             self.report.completed = sum(
@@ -216,6 +254,25 @@ class Harness:
                 1 for r in task_reports if r.outcome == WorkflowOutcome.ESCALATED
             )
             self.report.total_cost_usd = sum(r.cost_usd for r in task_reports)
+
+            # 3b. Optional full review after all tasks complete
+            if (self.review_checkpoint
+                    and self.config.review.full_review_on_complete
+                    and self.report.completed > 0):
+                logger.info('Running full post-completion review...')
+                try:
+                    review_report = await self.review_checkpoint.run_full()
+                    self.report.review_checkpoints += 1
+                    self.report.review_findings += review_report.findings_count
+                    self.report.review_tasks_created += len(review_report.tasks_created)
+                    self.report.review_cost_usd += review_report.cost_usd
+                    logger.info(
+                        'Full review complete: %d findings, %d tasks created',
+                        review_report.findings_count,
+                        len(review_report.tasks_created),
+                    )
+                except Exception as e:
+                    logger.error(f'Full review failed: {e}')
 
             # Commit accumulated task status changes so they survive
             # working-tree resets and are visible to future merge worktrees.
@@ -237,10 +294,14 @@ class Harness:
                 store.save_run(
                     self.report,
                     self.config.fused_memory.project_id,
-                    str(prd_path),
+                    str(prd_path) if prd_path else '',
                 )
             except Exception as e:
                 logger.warning(f'Failed to persist run metrics: {e}')
+
+            # Save HarnessReport alongside review checkpoint reports
+            if self.report.review_checkpoints > 0:
+                self._save_harness_report()
 
             if self.usage_gate:
                 if self.usage_gate.total_pause_secs > 0:
@@ -590,6 +651,118 @@ Output JSON matching the schema. Every task must appear in the output.
             self._escalation_events.pop(assignment.task_id, None)
             self.scheduler.release(assignment.task_id)
             sem.release()
+
+    def _collect_done_reports(
+        self, done: set[asyncio.Task], task_reports: list[TaskReport]
+    ) -> None:
+        """Extract TaskReports from completed asyncio.Tasks and track merges for review."""
+        for t in done:
+            # Handle review checkpoint completion
+            if t.get_name() == 'review-checkpoint':
+                self._review_running = False
+                try:
+                    t.result()  # propagate exceptions
+                except Exception as e:
+                    logger.error(f'Review checkpoint error: {e}')
+                continue
+
+            try:
+                report = t.result()
+                if report:
+                    task_reports.append(report)
+                    # Track module merges for review checkpoints
+                    if (report.outcome == WorkflowOutcome.DONE
+                            and self.review_checkpoint):
+                        modules = self._task_modules.pop(report.task_id, [])
+                        self.review_checkpoint.record_merge(modules)
+                        # Check if review should trigger
+                        if (self.review_checkpoint.should_trigger()
+                                and not self._review_running):
+                            self._trigger_review_checkpoint()
+            except Exception as e:
+                logger.error(f'Workflow slot error: {e}')
+
+    def _trigger_review_checkpoint(self) -> None:
+        """Spawn a review checkpoint as a concurrent task.
+
+        The main loop will pause task acquisition while the review runs
+        (``_review_running`` flag) but in-flight tasks continue in their
+        worktrees.
+        """
+        self._review_running = True
+        # We can't add to active here — the caller's done set is immutable.
+        # Instead, the review task is spawned and tracked; the main loop checks
+        # _review_running and waits on active (which includes this task after
+        # the next iteration adds it).
+
+        # Actually, we need the task in `active` for the main loop's asyncio.wait.
+        # The caller iterates `done`, so we store the task on self for the loop
+        # to pick up.
+        self._pending_review_task = asyncio.create_task(
+            self._run_review_checkpoint(), name='review-checkpoint',
+        )
+
+    async def _run_review_checkpoint(self) -> None:
+        """Execute a focused review checkpoint."""
+        assert self.review_checkpoint is not None
+        logger.info('Starting review checkpoint...')
+        try:
+            review_report = await self.review_checkpoint.run_focused()
+            self.report.review_checkpoints += 1
+            self.report.review_findings += review_report.findings_count
+            self.report.review_tasks_created += len(review_report.tasks_created)
+            self.report.review_cost_usd += review_report.cost_usd
+            logger.info(
+                'Review checkpoint complete: %d findings, %d tasks created, '
+                'cost=$%.2f',
+                review_report.findings_count,
+                len(review_report.tasks_created),
+                review_report.cost_usd,
+            )
+        except Exception as e:
+            logger.error(f'Review checkpoint failed: {e}')
+
+    def _save_harness_report(self) -> None:
+        """Persist HarnessReport as JSON alongside review checkpoint reports."""
+        reports_dir = self.config.project_root / self.config.review.reports_dir
+        reports_dir.mkdir(parents=True, exist_ok=True)
+
+        ts = self.report.started_at.replace(':', '').replace('-', '')[:15]
+        path = reports_dir / f'harness-{ts}.json'
+
+        data = {
+            'started_at': self.report.started_at,
+            'completed_at': self.report.completed_at,
+            'total_tasks': self.report.total_tasks,
+            'completed': self.report.completed,
+            'blocked': self.report.blocked,
+            'escalated': self.report.escalated,
+            'total_cost_usd': self.report.total_cost_usd,
+            'paused_for_cap': self.report.paused_for_cap,
+            'cap_pause_duration_secs': self.report.cap_pause_duration_secs,
+            'review_checkpoints': self.report.review_checkpoints,
+            'review_findings': self.report.review_findings,
+            'review_tasks_created': self.report.review_tasks_created,
+            'review_cost_usd': self.report.review_cost_usd,
+            'task_reports': [
+                {
+                    'task_id': r.task_id,
+                    'title': r.title,
+                    'outcome': r.outcome.value,
+                    'cost_usd': r.cost_usd,
+                    'duration_ms': r.duration_ms,
+                    'agent_invocations': r.agent_invocations,
+                    'completed_at': r.completed_at,
+                }
+                for r in self.report.task_reports
+            ],
+        }
+
+        try:
+            path.write_text(json.dumps(data, indent=2))
+            logger.info('HarnessReport saved: %s', path)
+        except OSError as e:
+            logger.warning('Failed to save HarnessReport: %s', e)
 
     async def _start_escalation_server(self) -> None:
         """Start the escalation MCP server as a background asyncio task."""

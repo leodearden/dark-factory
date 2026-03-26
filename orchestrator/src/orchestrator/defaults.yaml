@@ -26,6 +26,7 @@ models:
   merger: "opus"
   steward: "opus"
   module_tagger: "sonnet"
+  deep_reviewer: "opus"
 
 # Budget per invocation (USD)
 budgets:
@@ -36,6 +37,7 @@ budgets:
   merger: 5.0
   steward: 5.0
   module_tagger: 2.0
+  deep_reviewer: 15.0
 
 # Turn limits per invocation
 max_turns:
@@ -46,6 +48,7 @@ max_turns:
   merger: 50
   steward: 100
   module_tagger: 30
+  deep_reviewer: 100
 
 # Reasoning effort per role
 effort:
@@ -56,6 +59,7 @@ effort:
   merger: "max"
   steward: "high"
   module_tagger: "medium"
+  deep_reviewer: "max"
 
 # Backend CLI per role (claude, codex, gemini)
 backends:
@@ -66,6 +70,15 @@ backends:
   merger: "claude"
   steward: "claude"
   module_tagger: "claude"
+  deep_reviewer: "claude"
+
+# Review checkpoints
+review:
+  enabled: true
+  interval: 5
+  full_review_on_complete: true
+  briefing_path: "review/briefing.yaml"
+  reports_dir: "data/review-checkpoints"
 
 # Sandbox
 sandbox:

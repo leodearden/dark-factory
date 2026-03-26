@@ -250,6 +250,33 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
     )
 
 
+async def run_full_verification(
+    project_root: Path,
+    config: OrchestratorConfig,
+) -> VerifyResult:
+    """Run verification for ALL subprojects against the project root.
+
+    Unlike run_scoped_verification, this runs full (unscoped) test suites
+    for every subproject that has an orchestrator.yaml. Used by review
+    checkpoints to check integration health across the whole codebase.
+    """
+    from orchestrator.config import _discover_module_configs
+
+    module_configs = _discover_module_configs(project_root)
+    if not module_configs:
+        logger.info('Full verification: no subproject configs — using global')
+        return await run_verification(project_root, config)
+
+    logger.info(
+        'Full verification: running %d subprojects in parallel',
+        len(module_configs),
+    )
+    results = await asyncio.gather(
+        *(run_verification(project_root, config, mc) for mc in module_configs.values())
+    )
+    return _aggregate_results(list(results))
+
+
 async def run_scoped_verification(
     worktree: Path,
     config: OrchestratorConfig,
