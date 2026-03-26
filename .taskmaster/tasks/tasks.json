@@ -2433,10 +2433,11 @@
         "description": "The finally block in fused-memory/src/fused_memory/server/main.py:222-224 only calls task_interceptor.drain(). It never calls memory_service.close(), which means DurableWriteQueue, Graphiti connection, Mem0 connection, WriteJournal, and EventBuffer are all leaked on shutdown. The reconciliation harness background loop is also never cancelled.\n\nMemoryService.close() (line 95-108) exists and properly shuts down all resources — it is simply never invoked.\n\nTask 108 ('Add graceful shutdown') added the drain() call but missed the main service cleanup.\n\nFix: In the finally block of run_server(), add `await memory_service.close()`. Also store the reconciliation harness loop task reference and cancel it on shutdown.\n\nSource: review-cycle 2026-03-25, finding DR-1.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-26T07:14:54.873Z"
       },
       {
         "id": "155",
@@ -2485,7 +2486,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T07:14:54.825Z",
+      "lastModified": "2026-03-26T07:14:54.873Z",
       "taskCount": 137,
       "completedCount": 117,
       "tags": [
