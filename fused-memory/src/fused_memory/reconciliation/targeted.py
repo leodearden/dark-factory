@@ -352,8 +352,10 @@ class TargetedReconciler:
         project_root: str = '',
     ) -> dict:
         """Reconcile after expand_task or parse_prd — cross-reference against knowledge."""
-        if not project_root:
-            project_root = project_id
+        if not project_root or not os.path.isabs(project_root):
+            raise ValueError(
+                f'project_root must be a non-empty absolute path, got: {project_root!r}'
+            )
         result: dict = {'parent_task_id': parent_task_id, 'actions': []}
 
         try:
