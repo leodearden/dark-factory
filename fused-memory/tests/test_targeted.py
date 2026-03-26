@@ -444,3 +444,38 @@ async def test_no_buffer_writes_normally(mock_memory_service, mock_taskmaster, j
 
     assert mock_memory_service.add_memory.call_count >= 1
     assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+# ── Tests for project_root validation (task-156) ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reconcile_task_rejects_empty_project_root(reconciler):
+    """reconcile_task() with project_root='' (default) raises ValueError."""
+    with pytest.raises(ValueError, match='absolute path'):
+        await reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
+        )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_task_rejects_relative_project_root(reconciler):
+    """reconcile_task() with project_root='dark_factory' (logical name) raises ValueError."""
+    with pytest.raises(ValueError, match='absolute path'):
+        await reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='dark_factory',
+            task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
+        )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_task_rejects_dot_project_root(reconciler):
+    """reconcile_task() with project_root='.' raises ValueError."""
+    with pytest.raises(ValueError, match='absolute path'):
+        await reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='.',
+            task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
+        )
