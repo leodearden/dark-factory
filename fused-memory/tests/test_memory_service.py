@@ -670,6 +670,52 @@ class TestGetEntity:
 
         assert result == {'nodes': [], 'edges': []}
 
+    @pytest.mark.asyncio
+    async def test_concurrent_execution(self, service):
+        """search_nodes and search must be dispatched concurrently (not sequentially).
+
+        Proof technique: use a call_log with async side_effects that append
+        '_start' then sleep then append '_end'. Concurrent execution interleaves
+        the markers; sequential execution groups them.
+
+        Expected concurrent log order example:
+          ['search_nodes_start', 'search_start', 'search_nodes_end', 'search_end']
+        (i.e. search_start index < search_nodes_end index)
+
+        Sequential produces:
+          ['search_nodes_start', 'search_nodes_end', 'search_start', 'search_end']
+        (i.e. search_start index > search_nodes_end index)
+        """
+        import asyncio
+
+        call_log: list[str] = []
+
+        async def search_nodes_side_effect(**kwargs):
+            call_log.append('search_nodes_start')
+            await asyncio.sleep(0.01)
+            call_log.append('search_nodes_end')
+            return []
+
+        async def search_side_effect(**kwargs):
+            call_log.append('search_start')
+            await asyncio.sleep(0.01)
+            call_log.append('search_end')
+            return []
+
+        service.graphiti.search_nodes = AsyncMock(side_effect=search_nodes_side_effect)
+        service.graphiti.search = AsyncMock(side_effect=search_side_effect)
+
+        await service.get_entity(name='Redis', project_id='test')
+
+        search_nodes_end_idx = call_log.index('search_nodes_end')
+        search_start_idx = call_log.index('search_start')
+
+        assert search_start_idx < search_nodes_end_idx, (
+            f'search_start ({search_start_idx}) must appear before search_nodes_end '
+            f'({search_nodes_end_idx}) for concurrent execution. '
+            f'Got log: {call_log}'
+        )
+
 
 class TestGetEpisodes:
     @pytest.mark.asyncio
