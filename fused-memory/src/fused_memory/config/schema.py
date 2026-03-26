@@ -125,6 +125,14 @@ class FalkorDBProviderConfig(BaseModel):
     uri: str = 'redis://localhost:6379'
     password: str | None = None
     database: str = 'default_db'
+    graph_timeout_ms: int = Field(
+        default=30000,
+        description=(
+            'FalkorDB GRAPH.CONFIG TIMEOUT value in milliseconds. '
+            'Set on every server start via GRAPH.CONFIG SET. '
+            '0 disables the override entirely.'
+        ),
+    )
 
 
 class GraphitiBackendConfig(BaseModel):
