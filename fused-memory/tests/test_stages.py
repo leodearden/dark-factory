@@ -325,6 +325,85 @@ class TestStage3PromptAlignment:
         assert 'Output Format' in STAGE3_SYSTEM_PROMPT
 
 
+class TestTaskKnowledgeSyncPayload:
+    """TaskKnowledgeSync.assemble_payload() uses correct project attributes."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        from unittest.mock import AsyncMock
+
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        from fused_memory.models.reconciliation import Watermark
+        return Watermark(project_id='reify')
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_uses_project_root_not_project_id(self, mock_deps, watermark):
+        """assemble_payload() must pass self.project_root (not self.project_id) to get_tasks."""
+        from fused_memory.models.reconciliation import StageId
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        await stage.assemble_payload([], watermark, [])
+
+        mock_deps['taskmaster'].get_tasks.assert_called_once_with(
+            project_root='/home/leo/src/reify'
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_uses_dynamic_project_root_in_instructions(self, mock_deps, watermark):
+        """assemble_payload() instruction text must use self.project_root, not hardcoded path."""
+        from fused_memory.models.reconciliation import StageId
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert 'project_root="/home/leo/src/reify"' in payload
+        assert 'project_root="/home/leo/src/dark-factory"' not in payload
+
+    @pytest.mark.asyncio
+    async def test_payload_dark_factory_project_still_works(self, mock_deps, watermark):
+        """When project_root IS dark-factory, payload still contains the correct path."""
+        from fused_memory.models.reconciliation import StageId, Watermark
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/home/leo/src/dark-factory'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        wm = Watermark(project_id='dark_factory')
+
+        payload = await stage.assemble_payload([], wm, [])
+
+        assert 'project_root="/home/leo/src/dark-factory"' in payload
+
+    @pytest.mark.asyncio
+    async def test_payload_contains_project_id_for_memory_tools(self, mock_deps, watermark):
+        """assemble_payload() instruction text still uses self.project_id for fused-memory calls."""
+        from fused_memory.models.reconciliation import StageId
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # The project_id should appear in the memory tools instruction (line 98)
+        assert 'project_id="reify"' in payload
+
+
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
