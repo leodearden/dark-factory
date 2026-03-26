@@ -1,84 +1,118 @@
 {
-  "task_id": "153",
-  "title": "Clean up test_maintenance_utils: module-level imports and stronger assertions",
+  "task_id": "154",
+  "title": "Fix: Server shutdown does not call memory_service.close() \u2014 resources leaked",
   "files": [
-    "fused-memory/tests/test_maintenance_utils.py"
+    "fused-memory/src/fused_memory/server/main.py",
+    "fused-memory/tests/test_server_shutdown.py"
   ],
   "modules": [
+    "fused-memory/src/fused_memory/server",
     "fused-memory/tests"
   ],
-  "analysis": "This is a test-only cleanup task targeting fused-memory/tests/test_maintenance_utils.py. The file has 6 test methods, each with an identical inline `from fused_memory.maintenance.utils import _safe_close` import (6 occurrences). All sibling test files (test_reindex.py, test_durable_queue.py, test_cleanup_stale_edges.py, etc.) use module-level imports \u2014 this is a clear project convention. Additionally, three tests have weak assertions: (1) test_does_not_raise_when_close_raises only checks no exception propagated but never verifies close was actually called, (2) test_noop_when_close_succeeds_no_warning only checks no warnings emitted but never verifies close was called, and (3) test_logs_warning_with_exc_info only asserts exc_info is not None without verifying the captured exception type. The existing _safe_close implementation (utils.py) already satisfies all stronger assertions \u2014 it calls service.close() exactly once and passes exc_info=True to logger.warning. No source code changes needed; this is purely test polish.",
-  "prerequisites": [
-    {
-      "id": "pre-1",
-      "description": "Run all 6 existing tests in test_maintenance_utils.py to establish a green baseline before making any changes",
-      "status": "done",
-      "commit": "8afff85",
-      "tests": [
-        "fused-memory/tests/test_maintenance_utils.py::TestSafeClose"
-      ]
-    }
-  ],
+  "analysis": "The server's finally block in run_server() (main.py:222-224) only calls task_interceptor.drain(). It never invokes memory_service.close(), which properly shuts down DurableWriteQueue, GraphitiBackend, Mem0Backend, WriteJournal, and EventBuffer. Additionally, the reconciliation harness background loop task (created at line 161 via asyncio.create_task) is fire-and-forget \u2014 the task reference is discarded, so it can never be cancelled on shutdown.\n\nMemoryService.close() (lines 95-108) already exists and properly closes all sub-resources with contextlib.suppress(Exception) guards. The fix is surgical: (1) store the harness loop task reference, (2) extract a _graceful_shutdown() helper for testability, (3) replace the bare drain() in the finally block with a full shutdown sequence.\n\nThe shutdown order must be: drain interceptor (flush pending commits/reconciliation) \u2192 cancel harness loop (stops background reconciliation + escalation server) \u2192 close memory service (backends + queues + journals) \u2192 close reconciliation journal (separate SQLite connection not managed by MemoryService). Each step is guarded against exceptions so subsequent steps still run.\n\nThere are no existing tests for run_server() or the shutdown path. The _graceful_shutdown helper makes this testable without mocking the entire server initialization chain.",
+  "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Hoist import to module level: Remove the `from fused_memory.maintenance.utils import _safe_close` line from inside all 6 test method bodies (lines 16, 27, 38, 55, 72, 100) and add a single module-level import `from fused_memory.maintenance.utils import _safe_close` after the `import pytest` line. Verify all 6 tests still pass unchanged.",
+      "description": "Write failing test: test_shutdown_calls_memory_service_close \u2014 create fused-memory/tests/test_server_shutdown.py, import the not-yet-existing _graceful_shutdown function from fused_memory.server.main, call it with an AsyncMock memory_service and None for other params, assert memory_service.close was awaited once. Test fails with ImportError since _graceful_shutdown does not exist yet.",
       "status": "done",
-      "commit": "2099c71"
+      "commit": "4a2fb8e"
     },
     {
       "id": "step-2",
-      "type": "test",
-      "description": "Strengthen test_does_not_raise_when_close_raises: After the `await _safe_close(service, logger, 'test_context')` call (current line 32), add `service.close.assert_awaited_once()` to verify close was actually attempted, not just that no exception propagated. Verify the test passes.",
+      "type": "impl",
+      "description": "Implement _graceful_shutdown(memory_service, task_interceptor, harness_loop_task, recon_journal) as a module-level async function in main.py. Initially: drain interceptor if present, then await memory_service.close(). Replace the finally block contents with: await _graceful_shutdown(memory_service, task_interceptor, harness_loop_task, recon_journal). Pre-initialize harness_loop_task=None and recon_journal=None before the try block. Step-1 test now passes.",
       "status": "done",
-      "commit": "03227de"
+      "commit": "e1a0e9d"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Strengthen test_noop_when_close_succeeds_no_warning: After the caplog context manager block and the existing warning_records assertion, add `service.close.assert_awaited_once()` to verify close was actually called, not just that no warnings were emitted. Verify the test passes.",
+      "description": "Write failing test: test_shutdown_cancels_harness_loop_task \u2014 create a real asyncio.Task wrapping an infinite asyncio.sleep, pass it as harness_loop_task to _graceful_shutdown, assert the task is cancelled after shutdown completes. Test fails because _graceful_shutdown does not yet cancel the task.",
       "status": "done",
-      "commit": "e5a8fe9"
+      "commit": "59e63fd"
     },
     {
       "id": "step-4",
-      "type": "test",
-      "description": "Strengthen test_logs_warning_with_exc_info: Change the assertion on line 64 from `assert warning_records[0].exc_info is not None` to `assert warning_records[0].exc_info[0] is ValueError` to verify the correct exception type (ValueError, matching the side_effect on line 57) is captured in the exc_info tuple. Update the assertion message accordingly. Verify the test passes.",
+      "type": "impl",
+      "description": "Add harness loop task cancellation to _graceful_shutdown: if harness_loop_task is not None, cancel it, suppress CancelledError, and await it. In run_server(), store the return of asyncio.create_task(reconciliation_harness.run_loop()) into the harness_loop_task variable. Step-3 test now passes.",
       "status": "done",
-      "commit": "e68e5d5"
+      "commit": "e1a0e9d"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing test: test_shutdown_resilient_to_drain_error \u2014 configure task_interceptor.drain() to raise RuntimeError, verify memory_service.close() is still called afterward. Test fails because current _graceful_shutdown lets the drain exception propagate and skip close().",
+      "status": "done",
+      "commit": "c9e6e5a"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Wrap each step in _graceful_shutdown with try/except Exception that logs the error and continues. This ensures memory_service.close() runs even if drain() or task cancellation fails. Step-5 test now passes.",
+      "status": "done",
+      "commit": "e1a0e9d"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing test: test_shutdown_closes_reconciliation_journal \u2014 pass an AsyncMock recon_journal to _graceful_shutdown, verify its close() is awaited. Test fails because _graceful_shutdown does not yet close the journal.",
+      "status": "done",
+      "commit": "e200ac4"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Add recon_journal.close() as the final step in _graceful_shutdown (guarded with try/except). In run_server(), assign recon_journal=journal (line 124) when reconciliation is enabled, so it passes to _graceful_shutdown. Step-7 test now passes.",
+      "status": "done",
+      "commit": "e1a0e9d"
     }
   ],
   "design_decisions": [
     {
-      "decision": "All 4 changes applied to a single file in separate atomic steps",
-      "rationale": "Separating the import refactor from each assertion strengthening allows independent verification. If a stronger assertion unexpectedly fails, the import refactor is already safely committed."
+      "decision": "Extract _graceful_shutdown() as a module-level async helper rather than inlining all logic in the finally block",
+      "rationale": "run_server() is monolithic and untested. A standalone async function accepting its dependencies as parameters is directly testable with AsyncMock without mocking the entire server initialization chain. The finally block becomes a single line."
     },
     {
-      "decision": "exc_info assertion uses `exc_info[0] is ValueError` (identity check on class)",
-      "rationale": "Python logging stores exc_info as a 3-tuple (type, value, traceback) from sys.exc_info(). Index [0] is the exception class. Using `is` for identity comparison is idiomatic for type checks and more precise than isinstance, since we want to confirm the exact type, not a subclass."
+      "decision": "Shutdown order: drain interceptor \u2192 cancel harness \u2192 close memory_service \u2192 close journal",
+      "rationale": "drain() flushes pending targeted reconciliation and task file commits \u2014 these may write to backends, so backends must still be open. Harness cancellation triggers its own finally block (_stop_escalation_server). memory_service.close() shuts down backends + durable queue. ReconciliationJournal is closed last as it is a passive log."
     },
     {
-      "decision": "No implementation (type: impl) steps needed \u2014 all steps are type: test",
-      "rationale": "The existing _safe_close implementation already satisfies all stronger assertions. It calls service.close() exactly once (satisfying assert_awaited_once) and passes exc_info=True to logger.warning (satisfying the ValueError type check). This task is purely test cleanup."
+      "decision": "Each shutdown step is independently guarded with try/except + logging",
+      "rationale": "The current code has a latent bug: if drain() raises, nothing else runs. Each cleanup step must be independent so a failure in one does not cascade and leak remaining resources."
     },
     {
-      "decision": "Import placed after `import pytest` and before the class definition",
-      "rationale": "Following PEP 8 import ordering (stdlib, then third-party, then local) and matching the exact style seen in sibling test files like test_reindex.py and test_cleanup_stale_edges.py."
+      "decision": "Include ReconciliationJournal.close() even though the task description only mentions MemoryService resources",
+      "rationale": "ReconciliationJournal holds its own aiosqlite connection (journal.py:157-159) created at main.py:124-125. It is not managed by MemoryService.close(). Since we are fixing the shutdown path, closing this connection is a natural extension and prevents a SQLite connection leak."
+    },
+    {
+      "decision": "Do NOT cancel the _thread_monitor task explicitly",
+      "rationale": "The thread monitor is a lightweight diagnostic loop with no external resources. When the event loop shuts down, all pending tasks are cancelled automatically. Adding explicit cancellation would add complexity for no resource-safety benefit."
     }
   ],
   "reuse": [
     {
-      "what": "Module-level import convention from sibling test files",
-      "where": "fused-memory/tests/test_reindex.py, test_durable_queue.py, test_cleanup_stale_edges.py",
-      "how": "All sibling tests use `from fused_memory.xxx import yyy` at module top level. Apply the same pattern: `from fused_memory.maintenance.utils import _safe_close` after the pytest import."
+      "what": "MemoryService.close() method",
+      "where": "fused-memory/src/fused_memory/services/memory_service.py:95-108",
+      "how": "Already exists and properly closes all sub-resources (durable_queue, graphiti, mem0, write_journal, event_buffer) with contextlib.suppress guards. Just needs to be called."
     },
     {
-      "what": "AsyncMock.assert_awaited_once() pattern from existing test",
-      "where": "test_maintenance_utils.py::test_calls_service_close (line 21)",
-      "how": "The first test already uses `service.close.assert_awaited_once()`. Apply the identical assertion to test_does_not_raise_when_close_raises and test_noop_when_close_succeeds_no_warning."
+      "what": "ReconciliationHarness.run_loop() finally block",
+      "where": "fused-memory/src/fused_memory/reconciliation/harness.py:328-329",
+      "how": "The harness loop's own finally block calls _stop_escalation_server(). Cancelling the task triggers this cleanup automatically \u2014 no need to duplicate escalation server shutdown logic."
+    },
+    {
+      "what": "TestClose test pattern for MemoryService",
+      "where": "fused-memory/tests/test_memory_service.py:536-560",
+      "how": "Reuse the same AsyncMock + assert_called_once pattern for verifying close() calls in the new shutdown tests."
+    },
+    {
+      "what": "TaskInterceptor.drain() existing call",
+      "where": "fused-memory/src/fused_memory/server/main.py:223-224",
+      "how": "Already called in the finally block. Move into _graceful_shutdown as the first step, preserving existing behavior."
     }
   ],
-  "_session_id": "153-dfca4ea5",
-  "_created_at": "2026-03-25T01:23:37.818999+00:00"
+  "_session_id": "154-6a910aab",
+  "_created_at": "2026-03-26T07:21:45.434723+00:00"
 }
