@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass, field
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.maintenance._utils import override_config_path
 from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
@@ -112,35 +113,26 @@ async def run_cleanup(
     Returns:
         CleanupResult with edges_found, edges_deleted, and edge_details.
     """
-    import os
-
-    old_config_path = os.environ.get('CONFIG_PATH')
     service = None
-    try:
-        if config_path is not None:
-            os.environ['CONFIG_PATH'] = config_path
-        config = FusedMemoryConfig()
-        service = MemoryService(config)
-        manager = CleanupManager(backend=service.graphiti)
-        await service.initialize()
-        result = await manager.cleanup(start=start, end=end, dry_run=dry_run)
-        logger.info(
-            f'run_cleanup complete: found={result.edges_found}, '
-            f'deleted={result.edges_deleted}, dry_run={dry_run}'
-        )
-        return result
-    finally:
-        if service is not None:
-            # Catch close() errors so CONFIG_PATH restoration below always runs.
-            try:
-                await service.close()
-            except Exception:
-                logger.warning('Error closing service during run_cleanup cleanup', exc_info=True)
-        if config_path is not None:
-            if old_config_path is None:
-                os.environ.pop('CONFIG_PATH', None)
-            else:
-                os.environ['CONFIG_PATH'] = old_config_path
+    with override_config_path(config_path):
+        try:
+            config = FusedMemoryConfig()
+            service = MemoryService(config)
+            manager = CleanupManager(backend=service.graphiti)
+            await service.initialize()
+            result = await manager.cleanup(start=start, end=end, dry_run=dry_run)
+            logger.info(
+                f'run_cleanup complete: found={result.edges_found}, '
+                f'deleted={result.edges_deleted}, dry_run={dry_run}'
+            )
+            return result
+        finally:
+            if service is not None:
+                # Catch close() errors so CONFIG_PATH restoration below always runs.
+                try:
+                    await service.close()
+                except Exception:
+                    logger.warning('Error closing service during run_cleanup cleanup', exc_info=True)
 
 
 if __name__ == '__main__':
