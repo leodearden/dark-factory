@@ -152,6 +152,25 @@ async def test_update_task_append_true_forwarded_to_interceptor(
 
 
 # ------------------------------------------------------------------
+# update_task tag parameter forwarding
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_task_tag_forwarded_to_interceptor(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """When tag is provided, it should be forwarded to the interceptor."""
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': '/project', 'tag': 'v2'},
+    )
+    task_interceptor.update_task.assert_called_once()
+    _, kwargs = task_interceptor.update_task.call_args
+    assert kwargs['tag'] == 'v2'
+
+
+# ------------------------------------------------------------------
 # update_task error handling
 # ------------------------------------------------------------------
 
@@ -169,6 +188,7 @@ async def test_update_task_interceptor_error_returns_error_dict(
     assert isinstance(result, dict)
     assert 'error' in result
     assert 'backend unavailable' in result['error']
+    assert result['error_type'] == 'RuntimeError'
 
 
 # ------------------------------------------------------------------
