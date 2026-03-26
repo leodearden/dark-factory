@@ -24,7 +24,7 @@ def validate_project_root(project_root: str) -> dict[str, str] | None:
 
 def validate_project_id(project_id: str) -> dict[str, str] | None:
     """Return an error dict if project_id is empty, else None."""
-    if not project_id:
+    if not project_id or not project_id.strip():
         return {
             'error': 'project_id is required and must be non-empty',
             'error_type': 'ValidationError',
@@ -34,7 +34,5 @@ def validate_project_id(project_id: str) -> dict[str, str] | None:
 
 def require_project_root(project_root: str) -> None:
     """Raise ValueError if project_root is not a non-empty absolute path."""
-    if not project_root or not os.path.isabs(project_root):
-        raise ValueError(
-            f'project_root must be a non-empty absolute path, got: {project_root!r}'
-        )
+    if err := validate_project_root(project_root):
+        raise ValueError(err['error'])

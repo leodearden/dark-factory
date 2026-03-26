@@ -1,5 +1,7 @@
 """Tests for shared validation utilities in fused_memory.utils.validation."""
 
+from unittest.mock import patch
+
 import pytest
 
 from fused_memory.utils.validation import (
@@ -64,6 +66,19 @@ class TestValidateProjectId:
         result = validate_project_id('x')
         assert result is None
 
+    def test_whitespace_only_returns_error_dict(self):
+        result = validate_project_id('   ')
+        assert result is not None
+        assert 'error' in result
+        assert result['error_type'] == 'ValidationError'
+
+    def test_tab_and_newline_returns_error_dict(self):
+        for ws in ['\t', '\n']:
+            result = validate_project_id(ws)
+            assert result is not None, f'Expected error dict for {ws!r}, got None'
+            assert 'error' in result
+            assert result['error_type'] == 'ValidationError'
+
 
 class TestRequireProjectRoot:
     """Tests for require_project_root (raises ValueError)."""
@@ -91,3 +106,10 @@ class TestRequireProjectRoot:
     def test_error_message_mentions_bad_value(self):
         with pytest.raises(ValueError, match='bad/path'):
             require_project_root('bad/path')
+
+    def test_delegates_to_validate_project_root(self):
+        error_dict = {'error': 'sentinel error', 'error_type': 'ValidationError'}
+        with patch('fused_memory.utils.validation.validate_project_root', return_value=error_dict) as mock_vpr:
+            with pytest.raises(ValueError):
+                require_project_root('/any/path')
+            mock_vpr.assert_called_once_with('/any/path')
