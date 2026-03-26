@@ -977,3 +977,119 @@ class TestRunReindex:
         mock_cfg_cls.assert_called_once()
         call_kwargs = mock_cfg_cls.call_args[1]
         assert call_kwargs.get('embedding_dim') == 768
+
+
+# ---------------------------------------------------------------------------
+# step-1: run_reindex() CONFIG_PATH env-var save/restore edge cases
+# ---------------------------------------------------------------------------
+
+class TestRunReindexEnvVarRestore:
+    """run_reindex() correctly saves and restores CONFIG_PATH in all branches."""
+
+    @pytest.mark.asyncio
+    async def test_restores_preexisting_env_var_when_constructor_fails(self):
+        """When CONFIG_PATH already set and FusedMemoryConfig raises, old value is restored."""
+        import os
+        from fused_memory.maintenance.reindex import run_reindex
+
+        old = os.environ.get('CONFIG_PATH')
+        os.environ['CONFIG_PATH'] = 'preexisting.yaml'
+        try:
+            with patch(
+                'fused_memory.maintenance.reindex.FusedMemoryConfig',
+                side_effect=RuntimeError('config load failed'),
+            ):
+                with pytest.raises(RuntimeError, match='config load failed'):
+                    await run_reindex(config_path='test.yaml')
+
+            assert os.environ.get('CONFIG_PATH') == 'preexisting.yaml'
+        finally:
+            if old is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = old
+
+    @pytest.mark.asyncio
+    async def test_does_not_touch_env_var_when_config_path_is_none(self):
+        """When config_path is None, CONFIG_PATH env var is left completely untouched."""
+        import os
+        from fused_memory.maintenance.reindex import run_reindex
+
+        old = os.environ.get('CONFIG_PATH')
+        os.environ['CONFIG_PATH'] = 'existing.yaml'
+        try:
+            with patch(
+                'fused_memory.maintenance.reindex.FusedMemoryConfig',
+                side_effect=RuntimeError('config load failed'),
+            ):
+                with pytest.raises(RuntimeError, match='config load failed'):
+                    await run_reindex()  # no config_path → guard skips
+
+            assert os.environ.get('CONFIG_PATH') == 'existing.yaml'
+        finally:
+            if old is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = old
+
+    @pytest.mark.asyncio
+    async def test_restores_env_var_when_embedder_constructor_fails(self):
+        """When OpenAIEmbedderConfig raises, CONFIG_PATH is still restored to old value."""
+        import os
+        from fused_memory.maintenance.reindex import run_reindex
+
+        old = os.environ.get('CONFIG_PATH')
+        os.environ['CONFIG_PATH'] = 'preexisting.yaml'
+        try:
+            mock_config = MagicMock()
+            mock_service = AsyncMock()
+
+            with (
+                patch('fused_memory.maintenance.reindex.FusedMemoryConfig', return_value=mock_config),
+                patch('fused_memory.maintenance.reindex.MemoryService', return_value=mock_service),
+                patch(
+                    'fused_memory.maintenance.reindex.OpenAIEmbedderConfig',
+                    side_effect=ValueError('invalid embedder config'),
+                ),
+            ):
+                with pytest.raises(ValueError, match='invalid embedder config'):
+                    await run_reindex(config_path='test.yaml')
+
+            assert os.environ.get('CONFIG_PATH') == 'preexisting.yaml'
+        finally:
+            if old is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = old
+
+    @pytest.mark.asyncio
+    async def test_restores_env_var_when_manager_constructor_fails(self):
+        """When ReindexManager raises, CONFIG_PATH is still restored to old value."""
+        import os
+        from fused_memory.maintenance.reindex import run_reindex
+
+        old = os.environ.get('CONFIG_PATH')
+        os.environ['CONFIG_PATH'] = 'preexisting.yaml'
+        try:
+            mock_config = MagicMock()
+            mock_service = AsyncMock()
+
+            with (
+                patch('fused_memory.maintenance.reindex.FusedMemoryConfig', return_value=mock_config),
+                patch('fused_memory.maintenance.reindex.MemoryService', return_value=mock_service),
+                patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig'),
+                patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+                patch(
+                    'fused_memory.maintenance.reindex.ReindexManager',
+                    side_effect=RuntimeError('manager init failed'),
+                ),
+            ):
+                with pytest.raises(RuntimeError, match='manager init failed'):
+                    await run_reindex(config_path='test.yaml')
+
+            assert os.environ.get('CONFIG_PATH') == 'preexisting.yaml'
+        finally:
+            if old is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = old
