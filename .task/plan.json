@@ -1,84 +1,89 @@
 {
-  "task_id": "153",
-  "title": "Clean up test_maintenance_utils: module-level imports and stronger assertions",
+  "task_id": "155",
+  "title": "Fix: Remove stale port 8000/8001 fallbacks from dashboard and align ServerConfig default to 8002",
   "files": [
-    "fused-memory/tests/test_maintenance_utils.py"
+    "fused-memory/src/fused_memory/config/schema.py",
+    "fused-memory/tests/test_config_schema.py",
+    "dashboard/src/dashboard/config.py",
+    "dashboard/tests/test_scaffold.py",
+    "dashboard/tests/test_memory.py"
   ],
   "modules": [
-    "fused-memory/tests"
+    "fused-memory/src/fused_memory/config",
+    "fused-memory/tests",
+    "dashboard/src/dashboard",
+    "dashboard/tests"
   ],
-  "analysis": "This is a test-only cleanup task targeting fused-memory/tests/test_maintenance_utils.py. The file has 6 test methods, each with an identical inline `from fused_memory.maintenance.utils import _safe_close` import (6 occurrences). All sibling test files (test_reindex.py, test_durable_queue.py, test_cleanup_stale_edges.py, etc.) use module-level imports \u2014 this is a clear project convention. Additionally, three tests have weak assertions: (1) test_does_not_raise_when_close_raises only checks no exception propagated but never verifies close was actually called, (2) test_noop_when_close_succeeds_no_warning only checks no warnings emitted but never verifies close was called, and (3) test_logs_warning_with_exc_info only asserts exc_info is not None without verifying the captured exception type. The existing _safe_close implementation (utils.py) already satisfies all stronger assertions \u2014 it calls service.close() exactly once and passes exc_info=True to logger.warning. No source code changes needed; this is purely test polish.",
-  "prerequisites": [
-    {
-      "id": "pre-1",
-      "description": "Run all 6 existing tests in test_maintenance_utils.py to establish a green baseline before making any changes",
-      "status": "done",
-      "commit": "8afff85",
-      "tests": [
-        "fused-memory/tests/test_maintenance_utils.py::TestSafeClose"
-      ]
-    }
-  ],
+  "analysis": "Two port consistency issues: (1) dashboard config.py lists stale ports 8000/8001 as fallback URLs alongside the canonical 8002 \u2014 the dashboard will silently fall back to stale Claude Code MCP instances running old code. (2) fused-memory ServerConfig.port defaults to 8000 but config.yaml and convention use 8002. Fix is straightforward: remove stale ports from _DEFAULT_FUSED_MEMORY_URLS, change ServerConfig.port default from 8000 to 8002. Test impacts: dashboard/tests/test_scaffold.py asserts the 3-URL default list and count; dashboard/tests/test_memory.py has fallback/aggregation tests that relied on 3 default URLs (test_first_server_down_falls_through, test_successful_stats with 3xN aggregation, test_partial_failure_aggregates_available). These tests need to use explicit multi-URL configs to continue testing the fallback logic, which remains valid for env-var overrides. The mcp_tool_call unit tests use hardcoded URLs in mocks and are unaffected. fused-memory/tests/test_config_schema.py needs a new test for the port default.",
+  "prerequisites": [],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Hoist import to module level: Remove the `from fused_memory.maintenance.utils import _safe_close` line from inside all 6 test method bodies (lines 16, 27, 38, 55, 72, 100) and add a single module-level import `from fused_memory.maintenance.utils import _safe_close` after the `import pytest` line. Verify all 6 tests still pass unchanged.",
+      "description": "Add test_default_port_is_8002 to TestServerConfigTransport in fused-memory/tests/test_config_schema.py asserting ServerConfig().port == 8002. This test will FAIL because the current default is 8000.",
       "status": "done",
-      "commit": "2099c71"
+      "commit": "7ce117a"
     },
     {
       "id": "step-2",
-      "type": "test",
-      "description": "Strengthen test_does_not_raise_when_close_raises: After the `await _safe_close(service, logger, 'test_context')` call (current line 32), add `service.close.assert_awaited_once()` to verify close was actually attempted, not just that no exception propagated. Verify the test passes.",
+      "type": "impl",
+      "description": "Change ServerConfig.port default from 8000 to 8002 in fused-memory/src/fused_memory/config/schema.py line 73. Update the Field description to 'Server port (canonical: 8002)' for clarity.",
       "status": "done",
-      "commit": "03227de"
+      "commit": "c5618dd"
     },
     {
       "id": "step-3",
       "type": "test",
-      "description": "Strengthen test_noop_when_close_succeeds_no_warning: After the caplog context manager block and the existing warning_records assertion, add `service.close.assert_awaited_once()` to verify close was actually called, not just that no warnings were emitted. Verify the test passes.",
+      "description": "Update TestConfigDefaults.test_config_defaults in dashboard/tests/test_scaffold.py to assert fused_memory_urls == ['http://localhost:8002'] (single canonical URL). Update TestConfigEnvOverrides.test_env_overrides to assert len(cfg.fused_memory_urls) == 1. These tests will FAIL because the defaults still include 8000/8001.",
       "status": "done",
-      "commit": "e5a8fe9"
+      "commit": "28b484b"
     },
     {
       "id": "step-4",
-      "type": "test",
-      "description": "Strengthen test_logs_warning_with_exc_info: Change the assertion on line 64 from `assert warning_records[0].exc_info is not None` to `assert warning_records[0].exc_info[0] is ValueError` to verify the correct exception type (ValueError, matching the side_effect on line 57) is captured in the exc_info tuple. Update the assertion message accordingly. Verify the test passes.",
+      "type": "impl",
+      "description": "Remove 'http://localhost:8000' and 'http://localhost:8001' from _DEFAULT_FUSED_MEMORY_URLS in dashboard/src/dashboard/config.py, leaving only ['http://localhost:8002'].",
       "status": "done",
-      "commit": "e68e5d5"
+      "commit": "b40d50e"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Update dashboard/tests/test_memory.py tests that relied on 3-URL defaults: (a) TestGetMemoryStatus.test_first_server_down_falls_through \u2014 provide explicit multi-URL dashboard_config with 2 URLs (e.g. ports 9000, 9001) so one can fail and the other succeeds; update handler to fail on port 9000 instead of 8000. (b) TestGetQueueStats.test_successful_stats \u2014 change assertion from pending==9 (3x3) to pending==3 (1 server), since default config now has 1 URL. (c) TestGetQueueStats.test_partial_failure_aggregates_available \u2014 provide explicit multi-URL dashboard_config with 2 URLs (e.g. ports 9000, 9001), update handler to fail on port 9000 instead of 8000, assert pending==3 (1 successful x 3 pending).",
+      "status": "done",
+      "commit": "4eb917d"
     }
   ],
   "design_decisions": [
     {
-      "decision": "All 4 changes applied to a single file in separate atomic steps",
-      "rationale": "Separating the import refactor from each assertion strengthening allows independent verification. If a stronger assertion unexpectedly fails, the import refactor is already safely committed."
+      "decision": "Keep fallback logic in get_memory_status and get_queue_stats even though defaults now have only one URL",
+      "rationale": "Users can still configure multiple URLs via DASHBOARD_FUSED_MEMORY_URLS env var. The fallback iteration logic is correct and useful \u2014 the problem was only the defaults including stale ports."
     },
     {
-      "decision": "exc_info assertion uses `exc_info[0] is ValueError` (identity check on class)",
-      "rationale": "Python logging stores exc_info as a 3-tuple (type, value, traceback) from sys.exc_info(). Index [0] is the exception class. Using `is` for identity comparison is idiomatic for type checks and more precise than isinstance, since we want to confirm the exact type, not a subclass."
+      "decision": "Update memory fallback/aggregation tests to use explicit multi-URL configs rather than deleting them",
+      "rationale": "The fallback behavior is still valid functionality that should remain tested. Tests should construct explicit configs with synthetic ports (e.g. 9000, 9001) to exercise the multi-URL iteration path without depending on defaults."
     },
     {
-      "decision": "No implementation (type: impl) steps needed \u2014 all steps are type: test",
-      "rationale": "The existing _safe_close implementation already satisfies all stronger assertions. It calls service.close() exactly once (satisfying assert_awaited_once) and passes exc_info=True to logger.warning (satisfying the ValueError type check). This task is purely test cleanup."
-    },
-    {
-      "decision": "Import placed after `import pytest` and before the class definition",
-      "rationale": "Following PEP 8 import ordering (stdlib, then third-party, then local) and matching the exact style seen in sibling test files like test_reindex.py and test_cleanup_stale_edges.py."
+      "decision": "Leave mcp_tool_call unit tests using arbitrary port numbers (8000, 9998, 9999) unchanged",
+      "rationale": "These tests mock the transport entirely and pass explicit URLs to the low-level function. The port numbers in these tests are arbitrary mock endpoints, not references to the canonical fused-memory port. Changing them would be churn with no value."
     }
   ],
   "reuse": [
     {
-      "what": "Module-level import convention from sibling test files",
-      "where": "fused-memory/tests/test_reindex.py, test_durable_queue.py, test_cleanup_stale_edges.py",
-      "how": "All sibling tests use `from fused_memory.xxx import yyy` at module top level. Apply the same pattern: `from fused_memory.maintenance.utils import _safe_close` after the pytest import."
+      "what": "DashboardConfig dataclass constructor with explicit fused_memory_urls",
+      "where": "dashboard/tests/test_memory.py fallback tests",
+      "how": "Construct DashboardConfig(project_root=tmp_path, fused_memory_urls=['http://localhost:9000', 'http://localhost:9001']) to test multi-URL fallback without depending on defaults."
     },
     {
-      "what": "AsyncMock.assert_awaited_once() pattern from existing test",
-      "where": "test_maintenance_utils.py::test_calls_service_close (line 21)",
-      "how": "The first test already uses `service.close.assert_awaited_once()`. Apply the identical assertion to test_does_not_raise_when_close_raises and test_noop_when_close_succeeds_no_warning."
+      "what": "Existing _SessionAwareHandler and mock transport pattern",
+      "where": "dashboard/tests/test_memory.py",
+      "how": "Reuse the same port-discriminating handler pattern but with different port numbers matching the explicit config URLs."
+    },
+    {
+      "what": "Existing TestServerConfigTransport test class",
+      "where": "fused-memory/tests/test_config_schema.py",
+      "how": "Add the new port default test as a method in the existing test class to maintain organization."
     }
   ],
-  "_session_id": "153-dfca4ea5",
-  "_created_at": "2026-03-25T01:23:37.818999+00:00"
+  "_session_id": "155-a7c96d70",
+  "_created_at": "2026-03-26T07:17:23.183349+00:00"
 }
