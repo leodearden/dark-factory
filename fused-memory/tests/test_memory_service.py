@@ -717,6 +717,32 @@ class TestGetEntity:
         )
 
 
+    @pytest.mark.asyncio
+    async def test_error_propagation_search_nodes_raises(self, service):
+        """When search_nodes raises, get_entity must propagate the exception.
+
+        asyncio.gather without return_exceptions=True cancels remaining tasks
+        and re-raises the first exception — identical semantics to sequential
+        await.
+        """
+        service.graphiti.search_nodes = AsyncMock(
+            side_effect=RuntimeError('search_nodes failure')
+        )
+
+        with pytest.raises(RuntimeError, match='search_nodes failure'):
+            await service.get_entity(name='Redis', project_id='test')
+
+    @pytest.mark.asyncio
+    async def test_error_propagation_search_raises(self, service):
+        """When search raises, get_entity must propagate the exception."""
+        service.graphiti.search = AsyncMock(
+            side_effect=RuntimeError('search failure')
+        )
+
+        with pytest.raises(RuntimeError, match='search failure'):
+            await service.get_entity(name='Redis', project_id='test')
+
+
 class TestGetEpisodes:
     @pytest.mark.asyncio
     async def test_returns_list(self, service):
