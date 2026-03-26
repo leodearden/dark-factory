@@ -45,6 +45,31 @@ class TestGracefulShutdownClosesReconciliationJournal:
         recon_journal.close.assert_awaited_once()
 
 
+class TestGracefulShutdownJournalClosedDespiteMemoryServiceError:
+    @pytest.mark.asyncio
+    async def test_recon_journal_closed_even_when_memory_service_close_raises(self):
+        """recon_journal.close() must be called even when memory_service.close() raises.
+
+        Verifies the independent try/except guard around memory_service.close() is
+        load-bearing — a mock that raises proves the guard is needed.  If the guard
+        were removed the RuntimeError would propagate and journal close would never run.
+        """
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock(side_effect=RuntimeError('memory close failed'))
+
+        recon_journal = MagicMock()
+        recon_journal.close = AsyncMock()
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=None,
+            harness_loop_task=None,
+            recon_journal=recon_journal,
+        )
+
+        recon_journal.close.assert_awaited_once()
+
+
 class TestGracefulShutdownResilientToDrainError:
     @pytest.mark.asyncio
     async def test_shutdown_resilient_to_drain_error(self):
@@ -163,3 +188,30 @@ class TestGracefulShutdownHarnessTaskTimeout:
 
         # If we reach here, _graceful_shutdown completed (didn't hang indefinitely)
         memory_service.close.assert_awaited_once()
+
+
+class TestGracefulShutdownJournalClosedDespiteDrainError:
+    @pytest.mark.asyncio
+    async def test_recon_journal_closed_even_when_drain_raises(self):
+        """recon_journal.close() must be called even when task_interceptor.drain() raises.
+
+        Verifies the independent try/except guard around drain() — a drain failure
+        must not prevent journal cleanup.
+        """
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock()
+
+        task_interceptor = MagicMock()
+        task_interceptor.drain = AsyncMock(side_effect=RuntimeError('drain failed'))
+
+        recon_journal = MagicMock()
+        recon_journal.close = AsyncMock()
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=task_interceptor,
+            harness_loop_task=None,
+            recon_journal=recon_journal,
+        )
+
+        recon_journal.close.assert_awaited_once()
