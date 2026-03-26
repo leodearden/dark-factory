@@ -127,6 +127,20 @@ async def test_update_task_tag_forwarded_to_interceptor(
     assert kwargs['tag'] == 'v2'
 
 
+@pytest.mark.asyncio
+async def test_update_task_tag_default_is_none(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """When tag is omitted, it should default to None in the interceptor call."""
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': '/project'},
+    )
+    task_interceptor.update_task.assert_called_once()
+    _, kwargs = task_interceptor.update_task.call_args
+    assert kwargs['tag'] is None
+
+
 # ------------------------------------------------------------------
 # update_task error handling
 # ------------------------------------------------------------------
