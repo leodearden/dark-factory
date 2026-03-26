@@ -126,7 +126,7 @@ async def test_update_task_interceptor_error_returns_error_dict(
     assert isinstance(result, dict)
     assert 'error' in result
     assert 'backend unavailable' in result['error']
-    assert result['error_type'] == 'RuntimeError'
+    assert result['error_type'] == RuntimeError.__name__
 
 
 @pytest.mark.asyncio
@@ -243,7 +243,7 @@ async def test_set_task_status_exception_includes_error_type(
     assert isinstance(result, dict)
     assert 'error' in result
     assert 'backend unavailable' in result['error']
-    assert result.get('error_type') == 'RuntimeError'
+    assert result.get('error_type') == RuntimeError.__name__
 
 
 @pytest.mark.asyncio
@@ -261,7 +261,7 @@ async def test_update_task_exception_includes_error_type(
     assert isinstance(result, dict)
     assert 'error' in result
     assert 'invalid field' in result['error']
-    assert result.get('error_type') == 'ValueError'
+    assert result.get('error_type') == ValueError.__name__
 
 
 # ------------------------------------------------------------------
