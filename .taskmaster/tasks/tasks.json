@@ -2157,11 +2157,11 @@
         "description": "Two related issues in fused-memory temporal metadata handling:\n\n1. Production code uses str(valid_at) on datetime objects, which produces Python-default format ('2026-01-01 00:00:00+00:00' with space separator) rather than ISO 8601 ('2026-01-01T00:00:00+00:00' with T separator). Fix: use valid_at.isoformat() if hasattr(valid_at, 'isoformat') else str(valid_at). Affects both _search_graphiti() and get_entity() in memory_service.py.\n\n2. MockEdge in tests/conftest.py types valid_at/invalid_at as str|None. Real Graphiti edges carry datetime objects. Tests pass strings through str() which is a no-op, never exercising the actual datetime→str conversion. Fix: change MockEdge to use datetime objects and update test assertions accordingly.\n\n## memory_hints\n- search: \"str valid_at isoformat datetime temporal edge serialization\"\n- search: \"MockEdge conftest temporal type fidelity\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "blocked",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T22:52:11.022Z"
+        "updatedAt": "2026-03-26T22:52:54.063Z"
       },
       {
         "id": "134",
@@ -2914,7 +2914,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T22:52:49.623Z",
+      "lastModified": "2026-03-26T22:52:54.063Z",
       "taskCount": 172,
       "completedCount": 126,
       "tags": [
