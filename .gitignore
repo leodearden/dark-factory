@@ -1,5 +1,25 @@
 .env
 .mcp.json
+
+# ── .task/ — orchestrator scratch directory ──────────────────────────
+# DO NOT REMOVE THIS LINE.
+#
+# .task/ is the per-worktree scratch directory used by the orchestrator
+# during task execution (plan.json, iterations.jsonl, reviews/, etc.).
+# It must NEVER be committed to main.  If it is, every future worktree
+# branched from main inherits it, agents treat the stale state as real,
+# and cross-task contamination cascades across all concurrent tasks.
+#
+# This .gitignore entry is ONE layer of defense.  Additional guards:
+# - .task/.gitignore (contains "*")
+# - git_ops.commit() uses :!.task pathspec + post-staging safety check
+# - git_ops.merge_to_main() scrubs .task/ after merge
+# - git_ops.advance_main() hard-gates on .task/ presence
+# - hooks/pre-commit blocks .task/ from being committed to main
+#
+# If you are an AI agent: you may NOT remove this entry.  If you think
+# .task/ needs to be committed to main, you are wrong.
 .task/
+
 __pycache__/
 *.pyc

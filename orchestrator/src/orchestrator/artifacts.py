@@ -55,12 +55,34 @@ class TaskArtifacts:
         task_description: str,
         base_commit: str | None = None,
     ) -> None:
-        """Create .task/ with initial metadata.json and .gitignore."""
+        """Create .task/ with initial metadata.json and .gitignore.
+
+        IMPORTANT: This method is safe to call when .task/ already exists
+        (e.g. inherited from a contaminated main).  It unconditionally
+        writes .task/.gitignore to ensure git ignores the contents even
+        if the directory was pre-existing and tracked.
+        """
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / 'reviews').mkdir(exist_ok=True)
 
-        # Exclude all orchestrator artifacts from git
-        (self.root / '.gitignore').write_text('*\n')
+        # ── .task/.gitignore — always written unconditionally ─────────
+        # This file tells git to ignore everything inside .task/.
+        # We write it every time init() is called, not just on first
+        # creation, because:
+        # 1. If .task/ was inherited from a contaminated main, the
+        #    .gitignore may be missing or have different contents.
+        # 2. An agent may have deleted or modified it.
+        # 3. It's idempotent and cheap.
+        #
+        # This is ONE layer of defense.  See git_ops.py module docstring
+        # for the full list of .task/ contamination safeguards.
+        (self.root / '.gitignore').write_text(
+            '# Ignore ALL orchestrator scratch files.\n'
+            '# DO NOT remove or modify this file.  .task/ must never be\n'
+            '# committed to any branch that will be merged to main.\n'
+            '# See git_ops.py module docstring for why this matters.\n'
+            '*\n'
+        )
 
         metadata = {
             'task_id': task_id,

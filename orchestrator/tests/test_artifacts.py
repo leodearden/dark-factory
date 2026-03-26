@@ -30,7 +30,11 @@ class TestInit:
     def test_creates_gitignore(self, artifacts: TaskArtifacts):
         gitignore = artifacts.root / '.gitignore'
         assert gitignore.exists()
-        assert gitignore.read_text() == '*\n'
+        content = gitignore.read_text()
+        # Must contain the wildcard that ignores all scratch files
+        assert '*\n' in content
+        # Must contain warning comments to dissuade agents from removing it
+        assert 'DO NOT' in content
 
     def test_metadata_contents(self, artifacts: TaskArtifacts):
         metadata = json.loads((artifacts.root / 'metadata.json').read_text())
