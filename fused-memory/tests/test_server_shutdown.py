@@ -215,3 +215,53 @@ class TestGracefulShutdownJournalClosedDespiteDrainError:
         )
 
         recon_journal.close.assert_awaited_once()
+
+
+class TestGracefulShutdownFourStepOrdering:
+    @pytest.mark.asyncio
+    async def test_shutdown_steps_execute_in_correct_order(self):
+        """_graceful_shutdown must execute exactly four steps in order:
+        1. drain  2. harness_cancel  3. memory_close  4. journal_close.
+
+        Uses side_effect callbacks to append step names to a shared list,
+        then asserts the list matches the expected sequence.
+        """
+        call_order: list[str] = []
+
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock(
+            side_effect=lambda: call_order.append('memory_close')
+        )
+
+        task_interceptor = MagicMock()
+        task_interceptor.drain = AsyncMock(
+            side_effect=lambda: call_order.append('drain')
+        )
+
+        recon_journal = MagicMock()
+        recon_journal.close = AsyncMock(
+            side_effect=lambda: call_order.append('journal_close')
+        )
+
+        # Real asyncio Task that cancels quickly and records the cancel step
+        async def _harness():
+            await asyncio.sleep(9999)
+
+        harness_loop_task = asyncio.create_task(_harness())
+
+        original_cancel = harness_loop_task.cancel
+
+        def _tracking_cancel(*args, **kwargs):
+            call_order.append('harness_cancel')
+            return original_cancel(*args, **kwargs)
+
+        harness_loop_task.cancel = _tracking_cancel
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=task_interceptor,
+            harness_loop_task=harness_loop_task,
+            recon_journal=recon_journal,
+        )
+
+        assert call_order == ['drain', 'harness_cancel', 'memory_close', 'journal_close']
