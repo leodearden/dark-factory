@@ -1,12 +1,14 @@
 """Tests for the memory service — unit tests with mocked backends."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import Scope
-from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.memory_service import MemoryService, _serialize_temporal
+from tests.conftest import MockEdge
 
 
 @pytest.fixture
@@ -137,6 +139,32 @@ class TestReplayFromStore:
 
 class TestSearch:
     @pytest.mark.asyncio
+    async def test_search_graphiti_only_invalid_at_returns_temporal(self, service):
+        """When only invalid_at is set (valid_at=None), temporal dict is returned with valid_at=None."""
+        ts = datetime(2024, 6, 1, 12, 0, 0, tzinfo=UTC)
+        edge = MockEdge(fact='some fact', valid_at=None, invalid_at=ts)
+        service.graphiti.search = AsyncMock(return_value=[edge])
+        results = await service.search(query='test', project_id='test', stores=['graphiti'])
+        assert len(results) == 1
+        temporal = results[0].temporal
+        assert temporal is not None
+        assert temporal['valid_at'] is None
+        assert temporal['invalid_at'] == ts.isoformat()
+
+    @pytest.mark.asyncio
+    async def test_search_graphiti_temporal_valid_at_only(self, service):
+        """When only valid_at is set, temporal dict has valid_at set and invalid_at=None."""
+        ts = datetime(2024, 5, 15, 9, 30, 0, tzinfo=UTC)
+        edge = MockEdge(fact='some fact', valid_at=ts, invalid_at=None)
+        service.graphiti.search = AsyncMock(return_value=[edge])
+        results = await service.search(query='test', project_id='test', stores=['graphiti'])
+        assert len(results) == 1
+        temporal = results[0].temporal
+        assert temporal is not None
+        assert temporal['valid_at'] == ts.isoformat()
+        assert temporal['invalid_at'] is None
+
+    @pytest.mark.asyncio
     async def test_search_returns_list(self, service):
         results = await service.search(query='test query', project_id='test')
         assert isinstance(results, list)
@@ -201,3 +229,80 @@ class TestGetEpisodes:
     async def test_returns_list(self, service):
         episodes = await service.get_episodes(project_id='test')
         assert isinstance(episodes, list)
+
+    @pytest.mark.asyncio
+    async def test_none_created_at_returns_none(self, service):
+        """created_at=None on an episode should serialize to Python None (not the string 'None')."""
+        mock_ep = MagicMock()
+        mock_ep.uuid = 'ep-uuid-1'
+        mock_ep.name = 'test episode'
+        mock_ep.content = 'some content'
+        mock_ep.created_at = None
+        mock_ep.source = 'text'
+        mock_ep.group_id = 'test'
+        service.graphiti.retrieve_episodes = AsyncMock(return_value=[mock_ep])
+        episodes = await service.get_episodes(project_id='test')
+        assert len(episodes) == 1
+        assert episodes[0]['created_at'] is None
+
+
+class TestGetEntity:
+    @pytest.mark.asyncio
+    async def test_edges_include_temporal(self, service):
+        """Edges returned by get_entity include serialized temporal data."""
+        valid_dt = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+        invalid_dt = datetime(2024, 6, 30, 18, 0, 0, tzinfo=UTC)
+        edge = MockEdge(fact='auth depends on redis', valid_at=valid_dt, invalid_at=invalid_dt)
+        service.graphiti.search = AsyncMock(return_value=[edge])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        result = await service.get_entity(name='auth', project_id='test')
+        assert len(result['edges']) == 1
+        temporal = result['edges'][0]['temporal']
+        assert temporal is not None
+        assert temporal['valid_at'] == valid_dt.isoformat()
+        assert temporal['invalid_at'] == invalid_dt.isoformat()
+
+    @pytest.mark.asyncio
+    async def test_edges_only_valid_at_has_null_invalid_at(self, service):
+        """When only valid_at is set on an edge, temporal['invalid_at'] is None."""
+        valid_dt = datetime(2024, 3, 1, 8, 0, 0, tzinfo=UTC)
+        edge = MockEdge(fact='some relation', valid_at=valid_dt, invalid_at=None)
+        service.graphiti.search = AsyncMock(return_value=[edge])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        result = await service.get_entity(name='test', project_id='test')
+        assert len(result['edges']) == 1
+        temporal = result['edges'][0]['temporal']
+        assert temporal is not None
+        assert temporal['valid_at'] == valid_dt.isoformat()
+        assert temporal['invalid_at'] is None
+
+
+class TestSerializeTemporal:
+    def test_both_none_returns_none(self):
+        """Both fields None → returns None (no temporal data)."""
+        assert _serialize_temporal(None, None) is None
+
+    def test_both_set_returns_isoformat_dict(self):
+        """Both fields set → returns dict with isoformat strings."""
+        valid_dt = datetime(2024, 1, 1, tzinfo=UTC)
+        invalid_dt = datetime(2024, 12, 31, tzinfo=UTC)
+        result = _serialize_temporal(valid_dt, invalid_dt)
+        assert result is not None
+        assert result['valid_at'] == valid_dt.isoformat()
+        assert result['invalid_at'] == invalid_dt.isoformat()
+
+    def test_only_valid_at(self):
+        """Only valid_at set → invalid_at is None in dict."""
+        valid_dt = datetime(2024, 6, 15, tzinfo=UTC)
+        result = _serialize_temporal(valid_dt, None)
+        assert result is not None
+        assert result['valid_at'] == valid_dt.isoformat()
+        assert result['invalid_at'] is None
+
+    def test_only_invalid_at(self):
+        """Only invalid_at set → valid_at is None in dict."""
+        invalid_dt = datetime(2024, 9, 1, tzinfo=UTC)
+        result = _serialize_temporal(None, invalid_dt)
+        assert result is not None
+        assert result['valid_at'] is None
+        assert result['invalid_at'] == invalid_dt.isoformat()

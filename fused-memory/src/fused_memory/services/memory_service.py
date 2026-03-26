@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid as uuid_mod
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from graphiti_core.nodes import EpisodeType
@@ -22,7 +23,6 @@ from fused_memory.models.enums import (
 from fused_memory.models.memory import (
     AddEpisodeResponse,
     AddMemoryResponse,
-    ClassificationResult,
     MemoryResult,
     ReadRouteResult,
 )
@@ -40,6 +40,19 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
 
 logger = logging.getLogger(__name__)
+
+
+def _serialize_temporal(
+    valid_at: Any,
+    invalid_at: Any,
+) -> dict | None:
+    """Serialize temporal fields to a dict, or return None if both are absent."""
+    if valid_at is None and invalid_at is None:
+        return None
+    return {
+        'valid_at': valid_at.isoformat() if valid_at is not None else None,
+        'invalid_at': invalid_at.isoformat() if invalid_at is not None else None,
+    }
 
 
 class MemoryService:
@@ -171,7 +184,7 @@ class MemoryService:
             type=EventType.episode_added,
             source=EventSource.agent,
             project_id=project_id,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             payload={'episode_id': episode_id, 'content_preview': content[:200]},
             agent_id=agent_id,
         ))
@@ -284,7 +297,7 @@ class MemoryService:
             type=EventType.memory_added,
             source=EventSource.agent,
             project_id=project_id,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             payload={
                 'memory_ids': memory_ids,
                 'category': resolved_category.value,
@@ -436,12 +449,7 @@ class MemoryService:
             fact = getattr(edge, 'fact', str(edge))
             valid_at = getattr(edge, 'valid_at', None)
             invalid_at = getattr(edge, 'invalid_at', None)
-            temporal = None
-            if valid_at or invalid_at:
-                temporal = {
-                    'valid_at': str(valid_at) if valid_at else None,
-                    'invalid_at': str(invalid_at) if invalid_at else None,
-                }
+            temporal = _serialize_temporal(valid_at, invalid_at)
 
             # Extract entity names from source/target nodes
             entities = []
@@ -485,10 +493,8 @@ class MemoryService:
 
             category = None
             if 'category' in meta:
-                try:
+                with contextlib.suppress(ValueError):
                     category = MemoryCategory(meta['category'])
-                except ValueError:
-                    pass
 
             results.append(MemoryResult(
                 id=item.get('id', ''),
@@ -535,6 +541,10 @@ class MemoryService:
             edge_data.append({
                 'uuid': getattr(e, 'uuid', None),
                 'fact': getattr(e, 'fact', str(e)),
+                'temporal': _serialize_temporal(
+                    getattr(e, 'valid_at', None),
+                    getattr(e, 'invalid_at', None),
+                ),
             })
 
         return {'nodes': node_data, 'edges': edge_data}
@@ -558,7 +568,7 @@ class MemoryService:
                 'uuid': getattr(ep, 'uuid', None),
                 'name': getattr(ep, 'name', None),
                 'content': getattr(ep, 'content', None),
-                'created_at': str(getattr(ep, 'created_at', '')) or None,
+                'created_at': str(_ca) if (_ca := getattr(ep, 'created_at', None)) is not None else None,
                 'source': getattr(ep, 'source', None),
                 'group_id': getattr(ep, 'group_id', None),
             }
@@ -591,7 +601,7 @@ class MemoryService:
             type=EventType.memory_deleted,
             source=EventSource.agent,
             project_id=project_id,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             payload={'memory_id': memory_id, 'store': store},
         ))
 

@@ -1,6 +1,7 @@
 """Shared test fixtures."""
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import pytest
 
@@ -21,6 +22,8 @@ class MockEdge:
     """Simulates a Graphiti entity edge returned from add_episode."""
 
     fact: str
+    valid_at: Any = None
+    invalid_at: Any = None
 
 
 @dataclass
