@@ -2571,18 +2571,18 @@
         "description": "Two small fixes in fused_memory/utils/validation.py:\n\n1. **Eliminate condition duplication** — `require_project_root()` duplicates the boolean condition from `validate_project_root()`. Implement `require_project_root` by calling `validate_project_root` and raising on non-None result:\n   ```python\n   def require_project_root(project_root: str) -> None:\n       if err := validate_project_root(project_root):\n           raise ValueError(err['error'])\n   ```\n\n2. **Reject whitespace-only project_id** — `validate_project_id(' ')` currently returns None (passes) because `not ' '` is False. Add `.strip()` check so whitespace-only strings are rejected. Add test coverage for this edge case.\n\nSource: task 160 review suggestions #3, #4, #8.\n\nmemory_hints:\n- search: \"validation.py validate_project_root require_project_root DRY\"\n- search: \"project_id whitespace validation\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T07:53:38.729Z"
+        "updatedAt": "2026-03-26T08:02:01.354Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T07:56:33.953Z",
+      "lastModified": "2026-03-26T08:02:01.354Z",
       "taskCount": 144,
-      "completedCount": 121,
+      "completedCount": 122,
       "tags": [
         "master"
       ]
