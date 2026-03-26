@@ -13,16 +13,23 @@ from fused_memory.config.schema import FalkorDBProviderConfig, GraphitiBackendCo
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_backend(config) -> GraphitiBackend:
-    """Build a GraphitiBackend with a mock Graphiti client and mock _driver."""
+def _make_backend(config) -> tuple[GraphitiBackend, AsyncMock]:
+    """Build a GraphitiBackend with a mock Graphiti client and mock _driver.
+
+    Returns:
+        (backend, execute_command_mock) — the execute_command mock is returned
+        directly so tests can set return_value / side_effect / assert calls
+        without traversing backend._driver (which is typed Optional).
+    """
     backend = GraphitiBackend(config)
     backend.client = MagicMock()
     # Inject a mock driver whose .client.execute_command is an AsyncMock
+    mock_exec = AsyncMock()
     mock_driver = MagicMock()
     mock_driver.client = MagicMock()
-    mock_driver.client.execute_command = AsyncMock()
-    backend._driver = mock_driver
-    return backend
+    mock_driver.client.execute_command = mock_exec
+    backend._driver = mock_driver  # type: ignore[assignment]
+    return backend, mock_exec
 
 
 # ---------------------------------------------------------------------------
@@ -34,32 +41,32 @@ class TestEnsureGraphTimeout:
 
     @pytest.mark.asyncio
     async def test_sends_graph_config_set_timeout(self, mock_config):
-        backend = _make_backend(mock_config)
+        backend, mock_exec = _make_backend(mock_config)
         # Mock GET response: [b'TIMEOUT', b'30000']
-        backend._driver.client.execute_command.return_value = [b'TIMEOUT', b'30000']
+        mock_exec.return_value = [b'TIMEOUT', b'30000']
 
         await backend.ensure_graph_timeout(30000)
 
         # First call should be SET
-        set_call = backend._driver.client.execute_command.call_args_list[0]
+        set_call = mock_exec.call_args_list[0]
         assert set_call.args == ('GRAPH.CONFIG', 'SET', 'TIMEOUT', 30000)
 
     @pytest.mark.asyncio
     async def test_sends_graph_config_get_timeout_after_set(self, mock_config):
-        backend = _make_backend(mock_config)
-        backend._driver.client.execute_command.return_value = [b'TIMEOUT', b'30000']
+        backend, mock_exec = _make_backend(mock_config)
+        mock_exec.return_value = [b'TIMEOUT', b'30000']
 
         await backend.ensure_graph_timeout(30000)
 
         # Two calls total: SET then GET
-        assert backend._driver.client.execute_command.call_count == 2
-        get_call = backend._driver.client.execute_command.call_args_list[1]
+        assert mock_exec.call_count == 2
+        get_call = mock_exec.call_args_list[1]
         assert get_call.args == ('GRAPH.CONFIG', 'GET', 'TIMEOUT')
 
     @pytest.mark.asyncio
     async def test_logs_confirmed_timeout_at_info(self, mock_config, caplog):
-        backend = _make_backend(mock_config)
-        backend._driver.client.execute_command.return_value = [b'TIMEOUT', b'30000']
+        backend, mock_exec = _make_backend(mock_config)
+        mock_exec.return_value = [b'TIMEOUT', b'30000']
 
         with caplog.at_level(logging.INFO, logger='fused_memory.backends.graphiti_client'):
             await backend.ensure_graph_timeout(30000)
@@ -77,8 +84,8 @@ class TestEnsureGraphTimeoutErrorResilience:
 
     @pytest.mark.asyncio
     async def test_does_not_raise_when_set_fails(self, mock_config, caplog):
-        backend = _make_backend(mock_config)
-        backend._driver.client.execute_command.side_effect = Exception('connection refused')
+        backend, mock_exec = _make_backend(mock_config)
+        mock_exec.side_effect = Exception('connection refused')
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'):
             # Should not raise
@@ -89,9 +96,9 @@ class TestEnsureGraphTimeoutErrorResilience:
 
     @pytest.mark.asyncio
     async def test_does_not_raise_when_get_fails_after_set(self, mock_config, caplog):
-        backend = _make_backend(mock_config)
+        backend, mock_exec = _make_backend(mock_config)
         # First call (SET) succeeds, second (GET) fails
-        backend._driver.client.execute_command.side_effect = [
+        mock_exec.side_effect = [
             None,  # SET succeeds
             Exception('get failed'),  # GET fails
         ]
@@ -118,16 +125,16 @@ class TestEnsureGraphTimeoutOptOut:
 
     @pytest.mark.asyncio
     async def test_skips_execute_command_when_zero(self, mock_config, caplog):
-        backend = _make_backend(mock_config)
+        backend, mock_exec = _make_backend(mock_config)
 
         with caplog.at_level(logging.DEBUG, logger='fused_memory.backends.graphiti_client'):
             await backend.ensure_graph_timeout(0)
 
-        backend._driver.client.execute_command.assert_not_called()
+        mock_exec.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_logs_debug_when_opt_out(self, mock_config, caplog):
-        backend = _make_backend(mock_config)
+        backend, _ = _make_backend(mock_config)
 
         with caplog.at_level(logging.DEBUG, logger='fused_memory.backends.graphiti_client'):
             await backend.ensure_graph_timeout(0)
