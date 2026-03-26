@@ -2073,11 +2073,11 @@
         "description": "Graphiti entity node summaries persist stale text from invalidated edges. After Stage 1 bulk-invalidated 3 of 4 duplicate edges on the reconciliation.py entity, the node summary still showed the duplicate fact 4× even though only 1 valid edge remained. Implement a post-invalidation entity summary refresh step in the Stage 1 memory_consolidator so that entity nodes with recently-invalidated edges have their summaries regenerated to reflect only the currently-valid edge set.",
         "details": "Background: Stage 1 run 0ee2c5a9 invalidated/deleted 3 duplicate edges on reconciliation.py entity (uuid 16ae33d1-5bbc-4df8-90bf-469a937509db). Despite cleanup, the entity node summary still reads \"Task 84 refactored the duplicate try/except pattern in reconciliation.py.\" 4×. Graphiti does not auto-recompute entity summaries on edge invalidation.\n\nAcceptance criteria:\n1. After Stage 1 bulk-invalidates edges on an entity, the entity's node summary is refreshed/regenerated via Graphiti to reflect only valid edges.\n2. The reconciliation.py entity summary shows the fact exactly once after the fix.\n3. No regression: summary refresh should not affect valid edges.\n\nImplementation notes:\n- Check Graphiti's API for entity summary refresh (e.g. graphiti_core build_indices_and_ingest or similar recompute triggers)\n- The Stage 1 consolidator (fused-memory/src/reconciliation/memory_consolidator.py) should call a refresh after batch edge invalidations\n- Track which entity UUIDs had edges invalidated and refresh each one once after the batch\n\nmemory_hints:\n- entity: reconciliation.py (uuid 16ae33d1-5bbc-4df8-90bf-469a937509db)\n- search: \"Graphiti entity summary refresh after edge invalidation\"\n- search: \"Graphiti node summary recomputation stale cached invalidated edges\"\n- search: \"memory_consolidator Stage 1 edge invalidation pipeline\"",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T22:51:46.851Z"
+        "updatedAt": "2026-03-26T22:51:47.161Z"
       },
       {
         "id": "127",
@@ -2914,7 +2914,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T22:51:46.851Z",
+      "lastModified": "2026-03-26T22:51:47.161Z",
       "taskCount": 172,
       "completedCount": 125,
       "tags": [
