@@ -623,11 +623,12 @@ class TestGetEntity:
     @pytest.mark.asyncio
     async def test_returns_correct_structure(self, service):
         """get_entity returns dict with 'nodes' and 'edges' lists of correct shape."""
-        mock_node = MagicMock()
-        mock_node.uuid = 'node-uuid-1'
-        mock_node.name = 'Auth Service'
-        mock_node.summary = 'Handles authentication'
-        mock_node.labels = ['Service', 'Auth']
+        mock_node = MockNode(
+            name='Auth Service',
+            uuid='node-uuid-1',
+            summary='Handles authentication',
+            labels=['Service', 'Auth'],
+        )
 
         mock_edge = MockEdge(fact='Auth service depends on Redis', uuid='edge-uuid-1')
 
