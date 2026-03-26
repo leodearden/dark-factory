@@ -1,5 +1,6 @@
 """Tests for the memory service — unit tests with mocked backends."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import Scope
 from fused_memory.services.memory_service import MemoryService
+from tests.conftest import MockEdge, MockNode
 
 
 @pytest.fixture
@@ -621,8 +623,6 @@ class TestGetEntity:
     @pytest.mark.asyncio
     async def test_returns_correct_structure(self, service):
         """get_entity returns dict with 'nodes' and 'edges' lists of correct shape."""
-        from tests.conftest import MockEdge
-
         mock_node = MagicMock()
         mock_node.uuid = 'node-uuid-1'
         mock_node.name = 'Auth Service'
@@ -686,8 +686,6 @@ class TestGetEntity:
           ['search_nodes_start', 'search_nodes_end', 'search_start', 'search_end']
         (i.e. search_start index > search_nodes_end index)
         """
-        import asyncio
-
         call_log: list[str] = []
 
         async def search_nodes_side_effect(**kwargs):
@@ -721,9 +719,8 @@ class TestGetEntity:
     async def test_error_propagation_search_nodes_raises(self, service):
         """When search_nodes raises, get_entity must propagate the exception.
 
-        asyncio.gather without return_exceptions=True cancels remaining tasks
-        and re-raises the first exception — identical semantics to sequential
-        await.
+        asyncio.gather without return_exceptions=True propagates the first
+        raised exception; remaining tasks continue as orphaned background tasks.
         """
         service.graphiti.search_nodes = AsyncMock(
             side_effect=RuntimeError('search_nodes failure')
