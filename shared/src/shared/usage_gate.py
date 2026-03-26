@@ -341,14 +341,10 @@ class UsageGate:
                 continue
             usage = await self._query_usage_api(token=acct.token)
             if usage is None:
-                # API unavailable — optimistically uncap
                 logger.warning(
                     f'Account {acct.name}: usage API unavailable during '
-                    f'refresh — resuming optimistically'
+                    f'refresh — keeping capped (will retry via probe)'
                 )
-                acct.capped = False
-                acct.pause_started_at = None
-                any_uncapped = True
                 continue
 
             still_capped = False
@@ -494,12 +490,10 @@ class UsageGate:
                     self._open.set()
                     return
             else:
-                # API unavailable — optimistically mark available
-                logger.warning(f'Account {acct.name}: usage API unavailable — resuming optimistically')
-                acct.capped = False
-                acct.pause_started_at = None
-                self._open.set()
-                return
+                logger.warning(
+                    f'Account {acct.name}: usage API unavailable — '
+                    f'keeping capped (will retry in {interval}s)'
+                )
 
             try:
                 logger.info(f'Account {acct.name}: still capped, retrying in {interval}s')
