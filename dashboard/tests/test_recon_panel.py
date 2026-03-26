@@ -774,6 +774,37 @@ class TestReconJournalBadge:
         assert 'aria-label="Show 5 journal entries"' in html
 
 
+class TestReconBufferAgeDisplay:
+    """Integration tests for the buffer age display using format_duration filter."""
+
+    def test_large_age_displays_hours_and_minutes(self, client):
+        # 62736 seconds = 17h 25m 36s → should render '17h 25m'
+        stats = {'buffered_count': 5, 'oldest_event_age_seconds': 62736}
+        with _patch_recon_data(buffer_stats=stats):
+            html = client.get('/partials/recon').text
+        assert '17h 25m' in html
+
+    def test_small_age_displays_minutes_and_seconds(self, client):
+        # 600 seconds = 10m 0s
+        stats = {'buffered_count': 3, 'oldest_event_age_seconds': 600}
+        with _patch_recon_data(buffer_stats=stats):
+            html = client.get('/partials/recon').text
+        assert '10m 0s' in html
+
+    def test_large_age_does_not_show_raw_minutes_seconds(self, client):
+        # Old template would produce '1045m 36s' for 62736s — must not appear
+        stats = {'buffered_count': 5, 'oldest_event_age_seconds': 62736}
+        with _patch_recon_data(buffer_stats=stats):
+            html = client.get('/partials/recon').text
+        assert '1045m' not in html
+
+    def test_sub_60s_age_displays_seconds_only(self, client):
+        stats = {'buffered_count': 1, 'oldest_event_age_seconds': 45}
+        with _patch_recon_data(buffer_stats=stats):
+            html = client.get('/partials/recon').text
+        assert '45s' in html
+
+
 class TestReconRunDetailRoute:
     """Tests for GET /partials/recon/run/{run_id}."""
 
