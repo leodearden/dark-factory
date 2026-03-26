@@ -2505,15 +2505,16 @@
         "description": "Three related improvements to project_root validation:\n\n1. **Remove `= ''` default** from `project_root` parameter in `targeted.py` `reconcile_task()` (line 83) and `reconcile_bulk_tasks()` (line 352). The empty-string default is now a trap — it always raises ValueError. Making `project_root` a required parameter surfaces the error at type-check time instead of runtime.\n\n2. **Extract shared validator** — `tools.py:223` already has `_validate_project_root()` (returns error dict) and `targeted.py:86,355` has inline validation (raises ValueError). Move the core condition to a shared module (e.g. `fused_memory/utils/validation.py`) with both a dict-returning variant (for MCP tools) and a raising variant (for internal code).\n\n3. **Update both call sites** — `tools.py` and `targeted.py` import from the shared module.\n\nSource: review-cycle 2026-03-25, suggestions 1/4/5/10 on task 156.\n\nmemory_hints:\n- search: \"project_root validation _validate_project_root convention\"\n- entity: \"_validate_project_root\"\n- search: \"task 156 project_root fallback\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-26T07:27:28.387Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T07:27:28.324Z",
+      "lastModified": "2026-03-26T07:27:28.387Z",
       "taskCount": 139,
       "completedCount": 118,
       "tags": [
