@@ -2746,10 +2746,11 @@
         "description": "base.html loads Tailwind via cdn.tailwindcss.com which is not for production (console warning) and favicon.ico returns 404 (console error). Bundle Tailwind via CLI or PostCSS build step, and add a basic favicon.",
         "details": "File: dashboard/src/dashboard/templates/base.html (line 7). Options: (1) Use Tailwind CLI standalone to generate a built CSS file at build/dev time. (2) Add a simple SVG favicon served from /static/. Also pin the other CDN deps (htmx, idiomorph, chart.js, alpine) to exact versions or vendor them.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-26T18:08:21.993Z"
       },
       {
         "id": "181",
@@ -2821,7 +2822,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T18:08:21.917Z",
+      "lastModified": "2026-03-26T18:08:21.993Z",
       "taskCount": 165,
       "completedCount": 122,
       "tags": [
