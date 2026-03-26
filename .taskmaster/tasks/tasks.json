@@ -2686,6 +2686,17 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 176,
+        "title": "Make journal badges accessible — convert span to button with keyboard/focus support",
+        "description": "Reconciliation journal entry count badges are span elements with @click — not recognized as interactive by screen readers or keyboard navigation. Convert to button elements with proper aria-label, hover/focus states.",
+        "details": "File: dashboard/src/dashboard/templates/partials/recon.html (line 153). Change span to button, add aria-label=\"Show N journal entries\", add focus:ring styles. Also add hover:bg-blue-800 for visual feedback.",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -2698,7 +2709,7 @@
       ],
       "created": "2026-03-26T10:25:51.987Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-26T15:13:18.364Z"
+      "updated": "2026-03-26T15:13:27.101Z"
     }
   }
 }
