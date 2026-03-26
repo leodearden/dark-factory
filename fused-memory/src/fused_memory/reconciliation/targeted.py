@@ -80,7 +80,7 @@ class TargetedReconciler:
         transition: str,
         project_id: str,
         task_before: dict,
-        project_root: str = '',
+        project_root: str,
     ) -> dict:
         """Run targeted reconciliation for a single task state transition."""
         if not project_root or not os.path.isabs(project_root):
@@ -349,7 +349,7 @@ class TargetedReconciler:
         self,
         parent_task_id: str | None,
         project_id: str,
-        project_root: str = '',
+        project_root: str,
     ) -> dict:
         """Reconcile after expand_task or parse_prd — cross-reference against knowledge."""
         if not project_root or not os.path.isabs(project_root):

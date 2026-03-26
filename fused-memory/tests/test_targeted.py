@@ -451,10 +451,11 @@ async def test_no_buffer_writes_normally(mock_memory_service, mock_taskmaster, j
 
 @pytest.mark.asyncio
 async def test_reconcile_task_rejects_empty_project_root(reconciler):
-    """reconcile_task() with project_root='' (default) raises ValueError."""
+    """reconcile_task() with project_root='' raises ValueError."""
     with pytest.raises(ValueError, match='absolute path'):
         await reconciler.reconcile_task(
             task_id='1', transition='done', project_id='test-project',
+            project_root='',
             task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
         )
 
@@ -483,11 +484,12 @@ async def test_reconcile_task_rejects_dot_project_root(reconciler):
 
 @pytest.mark.asyncio
 async def test_reconcile_bulk_rejects_empty_project_root(reconciler):
-    """reconcile_bulk_tasks() with project_root='' (default) raises ValueError."""
+    """reconcile_bulk_tasks() with project_root='' raises ValueError."""
     with pytest.raises(ValueError, match='absolute path'):
         await reconciler.reconcile_bulk_tasks(
             parent_task_id=None,
             project_id='test-project',
+            project_root='',
         )
 
 
@@ -499,4 +501,15 @@ async def test_reconcile_bulk_rejects_relative_project_root(reconciler):
             parent_task_id=None,
             project_id='test-project',
             project_root='dark_factory',
+        )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_bulk_rejects_dot_project_root(reconciler):
+    """reconcile_bulk_tasks() with project_root='.' raises ValueError."""
+    with pytest.raises(ValueError, match='absolute path'):
+        await reconciler.reconcile_bulk_tasks(
+            parent_task_id=None,
+            project_id='test-project',
+            project_root='.',
         )
