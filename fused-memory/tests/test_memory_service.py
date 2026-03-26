@@ -617,6 +617,60 @@ class TestMem0BackendClose:
         assert backend._instances == {}
 
 
+class TestGetEntity:
+    @pytest.mark.asyncio
+    async def test_returns_correct_structure(self, service):
+        """get_entity returns dict with 'nodes' and 'edges' lists of correct shape."""
+        from tests.conftest import MockEdge
+
+        mock_node = MagicMock()
+        mock_node.uuid = 'node-uuid-1'
+        mock_node.name = 'Auth Service'
+        mock_node.summary = 'Handles authentication'
+        mock_node.labels = ['Service', 'Auth']
+
+        mock_edge = MockEdge(fact='Auth service depends on Redis', uuid='edge-uuid-1')
+
+        service.graphiti.search_nodes = AsyncMock(return_value=[mock_node])
+        service.graphiti.search = AsyncMock(return_value=[mock_edge])
+
+        result = await service.get_entity(name='Auth Service', project_id='test')
+
+        assert 'nodes' in result
+        assert 'edges' in result
+        assert len(result['nodes']) == 1
+        assert len(result['edges']) == 1
+
+        node = result['nodes'][0]
+        assert node['uuid'] == 'node-uuid-1'
+        assert node['name'] == 'Auth Service'
+        assert node['summary'] == 'Handles authentication'
+        assert node['labels'] == ['Service', 'Auth']
+
+        edge = result['edges'][0]
+        assert edge['uuid'] == 'edge-uuid-1'
+        assert edge['fact'] == 'Auth service depends on Redis'
+
+    @pytest.mark.asyncio
+    async def test_calls_with_correct_args(self, service):
+        """get_entity calls search_nodes and search with the right query/group_ids/limits."""
+        await service.get_entity(name='Redis', project_id='myproject')
+
+        service.graphiti.search_nodes.assert_called_once_with(
+            query='Redis', group_ids=['myproject'], max_nodes=5
+        )
+        service.graphiti.search.assert_called_once_with(
+            query='Redis', group_ids=['myproject'], num_results=10
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_results(self, service):
+        """get_entity returns empty nodes and edges when both backends return []."""
+        result = await service.get_entity(name='nonexistent', project_id='test')
+
+        assert result == {'nodes': [], 'edges': []}
+
+
 class TestGetEpisodes:
     @pytest.mark.asyncio
     async def test_returns_list(self, service):
