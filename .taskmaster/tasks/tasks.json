@@ -2739,11 +2739,11 @@
         "description": "Watermarks section displays raw absolute paths like \"/home/leo/src/dark-factory\" instead of project names like \"dark_factory\". Extract basename or use the project_id from the data source.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 54-57). The watermarks data uses project_id as key which currently contains the filesystem path. Either fix at the data layer (dashboard/src/dashboard/data/reconciliation.py get_watermarks) to return project names, or add a Jinja filter to extract the last path component.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T18:10:52.444Z"
+        "updatedAt": "2026-03-26T18:14:10.266Z"
       },
       {
         "id": "180",
@@ -2832,7 +2832,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-26T18:14:09.262Z",
+      "lastModified": "2026-03-26T18:14:10.266Z",
       "taskCount": 165,
       "completedCount": 122,
       "tags": [
