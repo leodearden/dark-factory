@@ -70,3 +70,15 @@ class TestOverrideConfigPath:
 
         import os
         assert 'CONFIG_PATH' not in os.environ
+
+    def test_restores_prior_value_on_exception(self, monkeypatch):
+        """Restores previous CONFIG_PATH value when the body raises an exception."""
+        from fused_memory.maintenance._utils import override_config_path
+
+        monkeypatch.setenv('CONFIG_PATH', '/original/config.yaml')
+
+        with pytest.raises(RuntimeError, match='boom'), override_config_path('/new/path/config.yaml'):
+            raise RuntimeError('boom')
+
+        import os
+        assert os.environ.get('CONFIG_PATH') == '/original/config.yaml'
