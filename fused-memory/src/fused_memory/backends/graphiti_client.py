@@ -480,6 +480,40 @@ class GraphitiBackend:
         result = await graph.query('MATCH (n) RETURN count(n) as count')
         return result.result_set[0][0] if result.result_set else 0
 
+    async def ensure_graph_timeout(self, timeout_ms: int) -> None:
+        """Set the FalkorDB GRAPH.CONFIG TIMEOUT value.
+
+        Sends ``GRAPH.CONFIG SET TIMEOUT <timeout_ms>`` via the underlying
+        Redis client, then verifies with ``GRAPH.CONFIG GET TIMEOUT`` and logs
+        the confirmed value.
+
+        Args:
+            timeout_ms: Timeout in milliseconds. 0 (or negative) disables the
+                override entirely — no GRAPH.CONFIG command is sent.
+
+        Raises:
+            RuntimeError: if self._driver is None (backend not initialized).
+        """
+        if self._driver is None:
+            raise RuntimeError('GraphitiBackend not initialized — call initialize() first')
+
+        if timeout_ms <= 0:
+            logger.debug('FalkorDB graph timeout override disabled (timeout_ms=%d)', timeout_ms)
+            return
+
+        try:
+            await self._driver.client.execute_command('GRAPH.CONFIG', 'SET', 'TIMEOUT', timeout_ms)
+            result = await self._driver.client.execute_command('GRAPH.CONFIG', 'GET', 'TIMEOUT')
+            # result is typically [b'TIMEOUT', b'<value>']
+            confirmed = result[1] if result and len(result) > 1 else timeout_ms
+            logger.info('FalkorDB GRAPH.CONFIG TIMEOUT set to %s ms', confirmed)
+        except Exception as exc:
+            logger.warning(
+                'Failed to set FalkorDB GRAPH.CONFIG TIMEOUT=%d: %s',
+                timeout_ms,
+                exc,
+            )
+
     async def close(self) -> None:
         """Shut down the driver."""
         if self._driver is not None:
