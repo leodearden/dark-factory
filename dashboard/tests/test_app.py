@@ -412,6 +412,25 @@ class TestMainModule:
             )
 
 
+class TestCdnVersionPinning:
+    """Tests that all CDN dependencies use exact semver versions."""
+
+    def test_alpinejs_exact_version(self, client):
+        html = client.get('/').text
+        assert 'alpinejs@3.15.8' in html
+
+    def test_chartjs_exact_version(self, client):
+        html = client.get('/').text
+        assert 'chart.js@4.5.1' in html
+
+    def test_no_wildcard_versions(self, client):
+        import re
+        html = client.get('/').text
+        # Should not contain @N.x or @N/ patterns in script src attributes
+        assert not re.search(r'@\d+\.x', html)
+        assert not re.search(r'@\d+/', html)
+
+
 class TestCustomStyles:
     """Tests for custom CSS rules merged into tailwind.css and no separate style.css."""
 
