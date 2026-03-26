@@ -1,105 +1,114 @@
 {
-  "task_id": "156",
-  "title": "Fix: targeted.py project_root fallback silently uses project_id as path",
+  "task_id": "160",
+  "title": "Extract shared _validate_project_root and remove trap defaults",
   "files": [
+    "fused-memory/src/fused_memory/utils/__init__.py",
+    "fused-memory/src/fused_memory/utils/validation.py",
+    "fused-memory/src/fused_memory/server/tools.py",
     "fused-memory/src/fused_memory/reconciliation/targeted.py",
+    "fused-memory/tests/test_validation.py",
     "fused-memory/tests/test_targeted.py"
   ],
   "modules": [
-    "fused-memory/src/fused_memory/reconciliation",
-    "fused-memory/tests"
+    "fused_memory/utils",
+    "fused_memory/server",
+    "fused_memory/reconciliation"
   ],
-  "analysis": "In targeted.py, both reconcile_task() (line 86-87) and reconcile_bulk_tasks() (line 353-354) silently fall back to using project_id (a logical name like 'dark_factory') as project_root (should be an absolute filesystem path) when project_root is empty. This violates the convention that project_root must be an absolute path. All production callers in task_interceptor.py always pass project_root explicitly after MCP-layer validation via _validate_project_root(), so this is dead code \u2014 but the fallback is incorrect and could cause task tree corruption if ever triggered.\n\nFix: Replace the silent fallback with a ValueError, matching the validation pattern in _base_args() (raises ValueError) and _validate_project_root() (checks non-empty + os.path.isabs). This requires adding 'import os' to targeted.py.\n\n15 existing tests call reconcile_task/reconcile_bulk_tasks without project_root and rely on the default empty string. These must be updated to pass a valid absolute path before the validation is added, or they will break.",
+  "analysis": "Three related changes: (1) Extract _validate_project_root from tools.py into a shared utils/validation.py module with two variants \u2014 dict-returning for MCP tools and raising for internal code. (2) Remove the trap `= ''` default from project_root in targeted.py's reconcile_task() and reconcile_bulk_tasks() \u2014 the empty string always triggers the fallback-to-project_id path which is now dead code, so making it required surfaces errors at type-check time. (3) Update both tools.py and targeted.py to import from the shared module.\n\nCurrently tools.py:223-230 has `_validate_project_root()` returning `dict[str,str]|None`, used by 11 task-related MCP tools via walrus operator. targeted.py:85-87 and 353-354 have inline fallback logic (`if not project_root: project_root = project_id`) which silently masks missing values. All three callers in task_interceptor.py already pass project_root explicitly, so the `= ''` default is unreachable in production \u2014 it's only triggered by tests that omit it. 15 existing test calls in test_targeted.py don't pass project_root and rely on the default \u2014 these must be updated to pass an explicit absolute path before removing the default. Also co-extracting _validate_project_id (tools.py:214-221) since it follows the same pattern and keeps the shared module complete.",
   "prerequisites": [
     {
       "id": "pre-1",
-      "description": "Update 15 existing tests in test_targeted.py that call reconcile_task() or reconcile_bulk_tasks() without project_root to pass project_root='/tmp/test'. This ensures they survive the new validation without changing test semantics \u2014 they test other behaviors (fast-path writes, causation IDs, journal logging, hints, deferral, etc.) and just need a valid project_root to avoid ValueError. Affected tests: test_on_task_done_fast_path_write, test_on_task_done_passes_causation_id, test_on_task_done_logs_run_actions, test_on_task_done_sparse_knowledge, test_on_task_done_rich_knowledge, test_on_task_done_checks_dependents, test_on_task_blocked_attaches_hints, test_on_task_cancelled_checks_subtasks, test_on_task_deferred_same_as_blocked, test_reconcile_task_failure_handling, test_done_defers_write_during_active_cycle, test_done_writes_normally_when_no_cycle, test_reads_proceed_during_active_cycle, test_blocked_proceeds_during_active_cycle, test_no_buffer_writes_normally.",
+      "description": "Create fused_memory/utils/ package with empty __init__.py",
       "status": "done",
-      "commit": "96643f4",
-      "tests": [
-        "test_on_task_done_fast_path_write",
-        "test_on_task_done_passes_causation_id",
-        "test_on_task_done_logs_run_actions",
-        "test_on_task_done_sparse_knowledge",
-        "test_on_task_done_rich_knowledge",
-        "test_on_task_done_checks_dependents",
-        "test_on_task_blocked_attaches_hints",
-        "test_on_task_cancelled_checks_subtasks",
-        "test_on_task_deferred_same_as_blocked",
-        "test_reconcile_task_failure_handling",
-        "test_done_defers_write_during_active_cycle",
-        "test_done_writes_normally_when_no_cycle",
-        "test_reads_proceed_during_active_cycle",
-        "test_blocked_proceeds_during_active_cycle",
-        "test_no_buffer_writes_normally"
-      ]
+      "commit": "6de991b",
+      "tests": []
     }
   ],
   "steps": [
     {
       "id": "step-1",
       "type": "test",
-      "description": "Write failing tests for reconcile_task() validation in a new section '# \u2500\u2500 Tests for project_root validation (task-156) \u2500\u2500' at the end of test_targeted.py. Three tests: (1) test_reconcile_task_rejects_empty_project_root \u2014 calls with project_root='' (default), expects ValueError with match 'absolute path'. (2) test_reconcile_task_rejects_relative_project_root \u2014 calls with project_root='dark_factory' (logical name), expects ValueError. (3) test_reconcile_task_rejects_dot_project_root \u2014 calls with project_root='.', expects ValueError. All use pytest.raises(ValueError, match='absolute path').",
+      "description": "Write tests for shared validators in new test_validation.py: (a) validate_project_root \u2014 returns error dict for empty string, relative path, None-cast; returns None for valid absolute path like '/home/user/project'. (b) validate_project_id \u2014 returns error dict for empty string; returns None for valid id. (c) require_project_root \u2014 raises ValueError for empty string, relative path; returns None for valid absolute path. Tests will FAIL because utils/validation.py doesn't exist yet.",
       "status": "done",
-      "commit": "320af55"
+      "commit": "d531c32"
     },
     {
       "id": "step-2",
       "type": "impl",
-      "description": "In targeted.py reconcile_task(): add 'import os' at top of file (after 'import json'). Replace lines 85-87 (comment + if/fallback) with validation: 'if not project_root or not os.path.isabs(project_root): raise ValueError(f\"project_root must be a non-empty absolute path, got: {project_root!r}\")'. All step-1 tests and all pre-1 updated tests should now pass.",
+      "description": "Create utils/validation.py with three functions: (1) validate_project_root(project_root: str) -> dict[str,str] | None \u2014 core condition `not project_root or not os.path.isabs(project_root)`, returns error dict with 'error' and 'error_type' keys. (2) validate_project_id(project_id: str) -> dict[str,str] | None \u2014 checks `not project_id`. (3) require_project_root(project_root: str) -> None \u2014 same condition as validate_project_root but raises ValueError. All test_validation.py tests pass.",
       "status": "done",
-      "commit": "723f573"
+      "commit": "d531c32"
     },
     {
       "id": "step-3",
-      "type": "test",
-      "description": "Write failing tests for reconcile_bulk_tasks() validation in the same section. Two tests: (1) test_reconcile_bulk_rejects_empty_project_root \u2014 calls reconcile_bulk_tasks with project_root='' (default), expects ValueError. (2) test_reconcile_bulk_rejects_relative_project_root \u2014 calls with project_root='dark_factory', expects ValueError. Both use pytest.raises(ValueError, match='absolute path').",
+      "type": "impl",
+      "description": "Refactor tools.py: replace local _validate_project_root (lines 223-230) and _validate_project_id (lines 214-221) with imports from fused_memory.utils.validation. Add `from fused_memory.utils.validation import validate_project_id, validate_project_root` near top. Remove the two local function definitions. All 11 task-tool call sites (`if err := validate_project_root(...)`) and 9+ memory-tool call sites (`if err := validate_project_id(...)`) keep the same walrus-operator pattern \u2014 only the import source changes. No behavior change. Existing test_health_endpoint.py tests continue to pass.",
       "status": "done",
-      "commit": "a7977e0"
+      "commit": "ca24f08"
     },
     {
       "id": "step-4",
-      "type": "impl",
-      "description": "In targeted.py reconcile_bulk_tasks(): replace lines 353-354 (comment + if/fallback) with the same ValueError validation: 'if not project_root or not os.path.isabs(project_root): raise ValueError(f\"project_root must be a non-empty absolute path, got: {project_root!r}\")'. All step-3 tests should now pass. Run full test suite to confirm no regressions.",
+      "type": "test",
+      "description": "Update test_targeted.py in two parts: (a) Add explicit project_root='/tmp/test-project' to all 15 existing test calls that currently omit it \u2014 these are at lines 80-82, 95-97, 111-113, 130-132, 148-151, 166-169, 183-186, 196-205, 219-222, 233-236, 352-354, 368-370, 392-394, 415-417, 432-434. This is backward-compatible with current code. (b) Add two new test functions: test_reconcile_task_rejects_invalid_project_root (calls with project_root='' and project_root='relative/path', expects ValueError) and test_reconcile_bulk_tasks_rejects_invalid_project_root (same pattern). New tests will FAIL because targeted.py still has fallback logic instead of raising.",
       "status": "done",
-      "commit": "17d5d24"
+      "commit": "8aa7364"
+    },
+    {
+      "id": "step-5",
+      "type": "impl",
+      "description": "Update targeted.py: (1) Add import `from fused_memory.utils.validation import require_project_root` at top. (2) Remove `= ''` default from project_root parameter in reconcile_task() signature (line 82) and reconcile_bulk_tasks() signature (line 350). (3) Replace inline fallback logic at lines 85-87 (`if not project_root: project_root = project_id`) with `require_project_root(project_root)`. (4) Replace inline fallback at lines 353-354 with same call. All tests now pass \u2014 both the 15 updated existing tests and the 2 new validation tests.",
+      "status": "done",
+      "commit": "5f58154"
     }
   ],
   "design_decisions": [
     {
-      "decision": "Raise ValueError instead of returning error dict",
-      "rationale": "reconcile_task() and reconcile_bulk_tasks() are internal methods called by task_interceptor.py, not MCP tool handlers. The MCP tools layer returns error dicts (via _validate_project_root), but internal code raises ValueError (as in _base_args). ValueError is the correct pattern at this layer \u2014 it will be caught by the except block in reconcile_task (line 128) and logged, preventing silent corruption."
+      "decision": "Two-variant API: validate_project_root (dict) and require_project_root (raises)",
+      "rationale": "MCP tools must return error dicts to the client (can't raise). Internal code (reconciliation) should raise to fail-fast. Sharing the core condition (`not project_root or not os.path.isabs(project_root)`) avoids drift between the two validation paths."
     },
     {
-      "decision": "Validate with os.path.isabs() in addition to non-empty check",
-      "rationale": "Matching the _validate_project_root() pattern which checks both conditions. This catches the specific bug (logical name like 'dark_factory' is non-empty but not absolute) as well as other invalid inputs like relative paths or '.'."
+      "decision": "Place shared validators in new fused_memory/utils/validation.py package",
+      "rationale": "No existing utils/ package exists. validation.py is a natural home for validators used across server/ and reconciliation/. The utils/ package can later house other cross-cutting utilities."
     },
     {
-      "decision": "Update existing tests to pass project_root='/tmp/test' as a prerequisite",
-      "rationale": "15 existing tests use the default project_root='' because they test other behaviors (causation IDs, journal logging, hints, deferral). Updating them first keeps the prerequisite separate from the TDD cycle and avoids a mass breakage at step-2. The path '/tmp/test' is consistent with the config fixture's explore_codebase_root."
+      "decision": "Co-extract validate_project_id alongside validate_project_root",
+      "rationale": "tools.py:214-221 has a parallel _validate_project_id helper with the same pattern. Extracting both keeps the validation module complete and avoids a half-done refactor."
     },
     {
-      "decision": "Apply same fix to both reconcile_task and reconcile_bulk_tasks",
-      "rationale": "Both methods have the identical silent fallback bug (lines 86-87 and 353-354). The task description focuses on reconcile_task but reconcile_bulk_tasks has the same pattern and should be fixed for consistency."
+      "decision": "Update 15 existing tests to pass project_root BEFORE changing targeted.py signature",
+      "rationale": "These tests currently rely on the `= ''` default which triggers fallback to project_id. Adding explicit project_root is backward-compatible (passes with both old and new code), isolating the behavior change to the new validation-specific tests."
+    },
+    {
+      "decision": "Use '/tmp/test-project' as project_root in updated existing tests",
+      "rationale": "These tests mock the taskmaster so the path doesn't need to exist on disk. Using a clear, short absolute path satisfies the validator and keeps tests readable. Tests that already use '/home/leo/src/dark-factory' (the separation tests at line 248+) are left as-is."
+    },
+    {
+      "decision": "Remove the fallback-to-project_id logic entirely rather than validating then falling back",
+      "rationale": "All three callers in task_interceptor.py already pass project_root explicitly. The fallback path is dead code in production \u2014 only reached by tests that omit the parameter. Making project_root required is the cleaner contract."
     }
   ],
   "reuse": [
     {
-      "what": "Validation pattern from _validate_project_root() in server/tools.py",
+      "what": "Existing _validate_project_root condition and error format",
       "where": "fused-memory/src/fused_memory/server/tools.py:223-230",
-      "how": "Reuse the same condition (not project_root or not os.path.isabs(project_root)) and similar error message format. Raise ValueError instead of returning error dict since this is internal code, matching _base_args() in taskmaster_client.py."
+      "how": "Extract the exact condition (`not project_root or not os.path.isabs(project_root)`) and error dict format into shared module. The dict variant is a direct lift with the underscore prefix removed."
     },
     {
-      "what": "Existing test fixtures (reconciler, journal, mock_memory_service, etc.)",
+      "what": "Existing _validate_project_id condition and error format",
+      "where": "fused-memory/src/fused_memory/server/tools.py:214-221",
+      "how": "Extract alongside project_root validator. Same lift pattern."
+    },
+    {
+      "what": "Walrus-operator validation pattern in tools.py",
+      "where": "fused-memory/src/fused_memory/server/tools.py:763 (and 10+ more sites)",
+      "how": "Keep the existing `if err := validate_project_root(project_root): return err` pattern at all call sites \u2014 only the import source changes."
+    },
+    {
+      "what": "Existing test fixtures in test_targeted.py",
       "where": "fused-memory/tests/test_targeted.py:16-73",
-      "how": "New validation tests reuse the same reconciler fixture. Tests use pytest.raises(ValueError, match=...) pattern."
-    },
-    {
-      "what": "Error message format from _base_args()",
-      "where": "fused-memory/src/fused_memory/backends/taskmaster_client.py:149-155",
-      "how": "Follow the same ValueError pattern with descriptive message including the invalid value repr."
+      "how": "Reuse journal, mock_memory_service, mock_taskmaster, config, mock_event_buffer, and reconciler fixtures for new validation tests in the same file."
     }
   ],
-  "_session_id": "156-357d5fe4",
-  "_created_at": "2026-03-26T07:18:25.227620+00:00"
+  "_session_id": "160-eadf243b",
+  "_created_at": "2026-03-26T07:31:50.213122+00:00"
 }
