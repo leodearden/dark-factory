@@ -89,6 +89,20 @@
       "description": "Post-rebase verification: run TestProjectIdValidation suite (uv run pytest tests/test_stages.py::TestProjectIdValidation -v) and ruff check on test_stages.py to confirm no regressions. Quick verification since the rebase only incorporated a tasks.json change.",
       "status": "done",
       "commit": "1b96903"
+    },
+    {
+      "id": "step-11",
+      "type": "impl",
+      "description": "Resolve third merge_ff_failed: main advanced again during the previous merge attempt. Fetch latest main, check for divergence between task/137 and main. If task/137 is behind main, rebase onto current main tip. If already at the same commit (branches converged from prior rebases absorbing all task work), reset task/137 to main tip to ensure exact alignment. Force-push branch to origin. Expected outcome: task/137 at or ahead of main with a clean FF path.",
+      "status": "done",
+      "commit": "32aa812"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Post-rebase verification: run TestProjectIdValidation suite (uv run pytest tests/test_stages.py::TestProjectIdValidation -v) and ruff check on test_stages.py. Confirm all 7 TestProjectIdValidation tests pass and no lint violations. This is the final gate before the orchestrator retries the FF-merge.",
+      "status": "done",
+      "commit": "32aa812"
     }
   ],
   "design_decisions": [
@@ -111,6 +125,10 @@
     {
       "decision": "Rebase onto main rather than merge commit",
       "rationale": "The orchestrator expects fast-forward merges. A rebase produces a linear history that can be FF-merged into main. The conflicts are limited to the imports section of test_stages.py \u2014 our branch needs `re` and `Watermark` which main removed (because the TestTaskCountSuppression class that used them was deleted by another task, but our TestProjectIdValidation class also uses them)."
+    },
+    {
+      "decision": "Handle converged branches (task/137 == main) by resetting to main tip rather than rebasing",
+      "rationale": "After three rebase cycles, all task/137 commits have been absorbed into main via prior merges. When the branch IS main (same SHA), a rebase is a no-op. Simply ensuring the branch points to main's tip and force-pushing guarantees the orchestrator's FF-merge succeeds. This avoids unnecessary rebase operations that produce no change."
     }
   ],
   "reuse": [
@@ -131,5 +149,5 @@
     }
   ],
   "_session_id": "137-f0a99f11",
-  "_created_at": "2026-03-27T03:37:10.717515+00:00"
+  "_created_at": "2026-03-27T03:49:59.258255+00:00"
 }
