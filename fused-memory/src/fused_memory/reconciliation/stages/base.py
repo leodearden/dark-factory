@@ -94,12 +94,15 @@ class BaseStage:
             raise ValueError(err['error'])
 
         # Validate watermark.project_id consistency (skip if watermark has no project_id)
-        if watermark.project_id and watermark.project_id.strip() and watermark.project_id != self.project_id:
-            raise ValueError(
-                f'project_id mismatch: stage has {self.project_id!r} but '
-                f'watermark has {watermark.project_id!r}'
-            )
-        elif not (watermark.project_id and watermark.project_id.strip()):
+        # watermark.project_id is normalized by the model validator: whitespace-only → ''
+        wm_pid = watermark.project_id
+        if wm_pid:
+            if wm_pid != self.project_id:
+                raise ValueError(
+                    f'project_id mismatch: stage has {self.project_id!r} but '
+                    f'watermark has {wm_pid!r}'
+                )
+        else:
             logger.debug(
                 'Watermark has no project_id — skipping mismatch check '
                 '(stage project_id=%r)',
