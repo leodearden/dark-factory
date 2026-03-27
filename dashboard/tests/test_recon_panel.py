@@ -213,6 +213,16 @@ class TestPartitionBurstState:
         assert len(active) == 0
         assert len(idle) == 1
 
+    def test_missing_last_write_at_key_treated_as_idle(self):
+        from dashboard.app import partition_burst_state
+
+        # Idle agent with no 'last_write_at' key — should not raise KeyError;
+        # treated as idle (except block falls through to idle.append)
+        agents = [{'agent_id': 'a1', 'state': 'idle'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
 
 class TestFormatDuration:
     """Tests for the format_duration Jinja2 filter (accepts seconds)."""
