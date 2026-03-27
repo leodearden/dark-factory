@@ -626,6 +626,15 @@ class TestReconRightColumnLayout:
         assert 'h-full' in html
 
 
+class TestReconTableHeaderNoWrap:
+    """Test that thead tr has whitespace-nowrap to prevent header truncation."""
+
+    def test_thead_row_has_whitespace_nowrap(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'whitespace-nowrap' in html
+
+
 class TestReconRunDetailRoute:
     """Tests for GET /partials/recon/run/{run_id}."""
 
