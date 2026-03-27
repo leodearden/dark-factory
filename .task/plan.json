@@ -1,0 +1,199 @@
+{
+  "task_id": "168",
+  "title": "Fix temporal serialization in memory_service.py and add test coverage",
+  "files": [
+    "fused-memory/src/fused_memory/services/memory_service.py",
+    "fused-memory/tests/test_memory_service.py",
+    "fused-memory/tests/conftest.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/services",
+    "fused-memory/tests"
+  ],
+  "analysis": "The task addresses three production bugs and four test improvements in memory_service.py.\n\nBug 1 (line 850): get_episodes uses `str(getattr(ep, 'created_at', '')) or None` — when created_at is None, `str(None)` yields the string 'None' which is truthy, so callers get 'None' instead of Python None. Fix: use an explicit None check.\n\nBug 2 (line 731): _search_graphiti outer guard uses `if valid_at or invalid_at:` which skips falsy-but-not-None values (though datetimes are generally truthy, consistency with the inner `if x else None` pattern matters — and the inner checks already use truthiness, so the real fix per task is changing outer to `is not None` for correctness).\n\nBug 3 (DRY): Lines 733-734 in _search_graphiti and the planned temporal addition to get_entity edges both need isoformat serialization. Extract a `_serialize_temporal(valid_at, invalid_at)` static/module helper.\n\nTest improvements: (a) Move inline imports to module level, (b) add TestGetEntity class with temporal datetime test, (c) add _search_graphiti test for valid_at=None + invalid_at set, (d) assert invalid_at is None in existing single-field temporal test.\n\nThe MockEdge in conftest already has valid_at/invalid_at fields (str | None). For datetime testing, these need to accept datetime objects too — the type hint should be relaxed or the tests should use datetime objects directly (MockEdge uses dataclass, so it accepts Any). The existing type hint `str | None` on MockEdge needs updating to `Any` to accept datetimes.\n\nget_entity currently does NOT serialize temporal data for edges (lines 822-827 only have uuid and fact). The task item 5 implies adding temporal to get_entity edge_data, which also motivates the DRY extraction.\n\n--- POST-REVIEW UPDATE (iteration 2) ---\n\nMerge to main failed verification. Root cause: main diverged while this task was in progress. A parallel task added `TestGetEntity` tests (structure, args, concurrent execution, error propagation) and changed `get_entity` to use `asyncio.gather` for concurrency. Also added `uuid`/`summary`/`labels` fields to `MockNode` in conftest.\n\nThree-way merge analysis:\n- **conftest.py**: Auto-merges correctly. Main added MockNode fields (uuid, summary, labels); ours added `Any` type for MockEdge temporal fields. No overlap.\n- **memory_service.py**: Auto-merges correctly. Main changed sequential awaits → `asyncio.gather` in get_entity; ours added temporal serialization to edge_data and `_serialize_temporal` helper. Git correctly combines both since they touch different lines of the same function.\n- **test_memory_service.py**: CONFLICT in imports (main added `import asyncio`; ours added `from datetime import UTC, datetime`). Also creates DUPLICATE `TestGetEntity` classes — main's at line ~647 (8 tests) and ours at line ~842 (2 temporal tests). Resolution: merge imports, consolidate into single `TestGetEntity` class with all 10 tests.\n\n--- POST-REVIEW UPDATE (iteration 3) ---\n\nMerger-verify failed: the merger agent could not cleanly merge this branch into main because the branch accumulated 219+ stray changed files from parallel tasks (169, 155, 171, 176, 186, etc.) that committed to the shared worktree. The merger faced conflicts across files entirely outside task-168's scope, causing test/lint/type failures in the merged result.\n\nCritically, main does NOT have the parallel-task changes that this branch absorbed (e.g., task-169's TestGetEntity/asyncio.gather, MockNode additions). Main's current state of the 3 task files:\n- **memory_service.py**: Original sequential get_entity, buggy `if valid_at or invalid_at:`, buggy `str(getattr(ep, 'created_at', '')) or None`, no `_serialize_temporal`\n- **conftest.py**: MockEdge with only `fact: str`, no MockNode, no `Any` import\n- **test_memory_service.py**: 203 lines, no TestGetEntity, no TestSerializeTemporal, no temporal tests, inline imports\n\nFix: Reset the branch to origin/main and re-apply ONLY task-168 changes cleanly:\n1. memory_service.py: Add `_serialize_temporal` helper, fix get_episodes str(None) bug, fix _search_graphiti outer guard, refactor to use helper, add temporal to get_entity edge_data\n2. conftest.py: Add `from typing import Any`, add `valid_at: Any = None` and `invalid_at: Any = None` to MockEdge\n3. test_memory_service.py: Add module-level imports, add TestGetEntity (2 temporal tests only), add TestSerializeTemporal, add test_get_episodes_none_created_at, add test_search_graphiti_only_invalid_at\n\n--- POST-REVIEW UPDATE (iteration 4) ---\n\nMerger-verify failed AGAIN. Root cause: step-11 reset to a STALE `origin/main` (a88fbb9) because the worktree's remote refs were not fetched. The real `origin/main` has advanced ~60 commits past that, with many parallel tasks now merged (task-176 etc.) that heavily modified all 3 task-168 files.\n\nReal main's current state (verified via fresh clone):\n- **memory_service.py** (line 850): Still has buggy `str(getattr(ep, 'created_at', '')) or None`. Still has buggy `if valid_at or invalid_at:` (line 731). Still has no temporal in get_entity edge_data (lines 822-827: only uuid+fact). Still has no `_serialize_temporal` helper. BUT now imports `EpisodeStatus`, has `DurableWriteQueue`/`WriteJournal`, and other new features from merged tasks.\n- **conftest.py**: MockEdge now has `uuid: str = ''`, `source_node: MockNode | None = None`, `target_node: MockNode | None = None`, `episodes: list[str] = field(default_factory=list)`, `valid_at: str | None = None`, `invalid_at: str | None = None`. MockNode exists with just `name: str`. No `from typing import Any`.\n- **test_memory_service.py**: 624 lines, many new test classes (TestAddMemory has 6 tests, TestSearch has 6 tests, TestDeleteMemory has 3, etc.). NO TestGetEntity. Inline imports remain in test bodies (MockEdge/MockNode/MockAddEpisodeResult at lines 255, 278, 357, 397, 434, 490; patch/backend imports at 568, 570, 596).\n\nAll 3 bugs are STILL present on real main. Fix: fetch real remote, hard-reset to real origin/main, re-apply task-168 changes against the current code structure. Key differences from step-11:\n- conftest: keep main's 6 MockEdge fields, only change valid_at/invalid_at types to Any\n- memory_service: same bug locations (731, 822-827, 850), helper goes after logger (line 43)\n- test file: 624 lines, add new tests at end, add module-level imports for task-168 needs only (don't touch other tasks' inline imports)",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Update MockEdge.valid_at and invalid_at type hints in conftest.py from `str | None` to accept datetime objects (change to `Any`). Also update module-level imports in test_memory_service.py: add `from datetime import UTC, datetime` and `from tests.conftest import MockEdge, MockNode` at top.",
+      "status": "done",
+      "commit": "5f08ceb",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing test: test_get_episodes_none_created_at_returns_none — mock an episode with created_at=None, assert the serialized dict has created_at as Python None (not the string 'None').",
+      "status": "done",
+      "commit": "3cb6383"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Fix get_episodes str(None) bug at line 850: replace `str(getattr(ep, 'created_at', '')) or None` with an explicit check: `_ca = getattr(ep, 'created_at', None); 'created_at': str(_ca) if _ca is not None else None`.",
+      "status": "done",
+      "commit": "b9f7c95"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing test: test_search_graphiti_only_invalid_at_returns_temporal — mock edge with valid_at=None and invalid_at set as a datetime. Assert temporal dict is not None, temporal['valid_at'] is None, and temporal['invalid_at'] is the isoformat string.",
+      "status": "done",
+      "commit": "bf75b20"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Fix _search_graphiti outer guard at line 731: change `if valid_at or invalid_at:` to `if valid_at is not None or invalid_at is not None:`. Also change inner guards from truthiness (`if valid_at else None`) to `if valid_at is not None` for consistency.",
+      "status": "done",
+      "commit": "83727dd"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing test: test_get_entity_edges_include_temporal — mock edges with both valid_at and invalid_at as datetime objects. Assert get_entity result edge_data includes temporal dict with correct isoformat strings for both fields.",
+      "status": "done",
+      "commit": "f7c54f7"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Extract `_serialize_temporal(valid_at, invalid_at) -> dict | None` as a module-level helper in memory_service.py. Refactor _search_graphiti (lines 730-735) to use it. Add temporal serialization to get_entity edge_data (lines 822-827) using the same helper.",
+      "status": "done",
+      "commit": "6aebf4b"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Add assertion for temporal['invalid_at'] is None in existing single-field test case (the test that only sets valid_at). Also verify the _serialize_temporal helper directly with edge cases: both None → returns None, both set → returns dict with both isoformat strings.",
+      "status": "done",
+      "commit": "aa98b98"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Final pass: ensure all tests pass. Remove any remaining inline imports in test_memory_service.py that were moved to module level in pre-1. Verify no regressions.",
+      "status": "done",
+      "commit": "c02be2a"
+    },
+    {
+      "id": "step-9",
+      "type": "impl",
+      "description": "Merge main into branch, resolving conflicts in test_memory_service.py. Three fixes required:\n\n1. **Import conflict**: Combine both sides — keep `import asyncio` (main) and `from datetime import UTC, datetime` (ours). Use `from fused_memory.services.memory_service import MemoryService, _serialize_temporal` (ours, superset). Use `from tests.conftest import MockAddEpisodeResult, MockEdge, MockNode` (ours, superset).\n\n2. **Duplicate TestGetEntity class**: Main added TestGetEntity at line ~647 with 8 tests (returns_correct_structure, calls_with_correct_args, default_project_id_is_main, empty_results, getattr_fallback_missing_attributes, concurrent_execution, error_propagation_search_nodes_raises, error_propagation_search_raises). Our branch has a second TestGetEntity at line ~842 with 2 temporal tests. Merge into single class: keep main's 8 tests, append our 2 temporal tests (test_edges_include_temporal, test_edges_only_valid_at_has_null_invalid_at).\n\n3. **conftest.py and memory_service.py**: Auto-merged correctly (no manual fix needed). Verify conftest has both MockNode fields from main AND `Any` types from ours. Verify memory_service has asyncio.gather from main AND _serialize_temporal from ours.",
+      "status": "done",
+      "commit": "e00336d"
+    },
+    {
+      "id": "step-10",
+      "type": "test",
+      "description": "Verify merge correctness: run full test suite (all 51+ tests including main's 8 TestGetEntity tests + our temporal tests + TestSerializeTemporal), lint (ruff check), and type check (pyright) on all three changed files. All must pass.",
+      "status": "done",
+      "commit": "e00336d"
+    },
+    {
+      "id": "step-11",
+      "type": "impl",
+      "description": "Reset branch to clean state: create a fresh branch from origin/main to eliminate 219+ stray files from parallel tasks that contaminated the worktree. The branch currently has commits from tasks 169, 155, 171, 176, 186 etc. that do not belong here.\n\nProcedure:\n1. `git reset --hard origin/main` to reset the task/168 branch to main\n2. Re-apply ONLY the task-168-specific changes to the 3 in-scope files\n\nChanges to apply on top of main's current code:\n\n**conftest.py** (main has MockEdge with only `fact: str`):\n- Add `from typing import Any` import\n- Add two fields to MockEdge: `valid_at: Any = None` and `invalid_at: Any = None`\n\n**memory_service.py** (main has buggy temporal code, no helper, no get_entity temporal):\n- Add `_serialize_temporal(valid_at, invalid_at) -> dict | None` module-level helper (after `logger = logging.getLogger(...)`, before `class MemoryService`). The helper returns None when both args are None, otherwise returns `{'valid_at': x.isoformat() if x is not None else None, 'invalid_at': ...}`\n- Fix `_search_graphiti`: Replace lines 440-443 (`if valid_at or invalid_at: temporal = {'valid_at': str(valid_at) if valid_at else None, ...}`) with `temporal = _serialize_temporal(valid_at, invalid_at)`\n- Fix `get_entity` edge_data (lines 536-538): Add `'temporal': _serialize_temporal(getattr(e, 'valid_at', None), getattr(e, 'invalid_at', None))` to the dict\n- Fix `get_episodes` created_at (line 567): Change `'created_at': str(getattr(ep, 'created_at', '')) or None` to `'created_at': str(_ca) if (_ca := getattr(ep, 'created_at', None)) is not None else None`\n\n**test_memory_service.py** (main has 203 lines, inline imports, no temporal tests):\n- Add module-level imports: `from datetime import UTC, datetime`, `from fused_memory.services.memory_service import MemoryService, _serialize_temporal`, `from tests.conftest import MockAddEpisodeResult, MockEdge`\n- Remove corresponding inline imports from test bodies (check `test_graphiti_group_id`, `test_mem0_collection_name`, `test_mem0_user_id`, and `test_episode_enqueued`)\n- Add to TestGetEpisodes: `test_none_created_at_returns_none` — mock episode with created_at=None, assert result created_at is None (not 'None')\n- Add to TestSearch (or new subclass): `test_search_graphiti_only_invalid_at_returns_temporal` — mock edge with valid_at=None, invalid_at=datetime, assert temporal dict correct\n- Add to TestSearch (or existing test): assertion for invalid_at is None in single-field valid_at test\n- Add new class TestGetEntity with 2 temporal tests: `test_edges_include_temporal` (both valid_at+invalid_at as datetimes), `test_edges_only_valid_at_has_null_invalid_at` (only valid_at set)\n- Add new class TestSerializeTemporal: `test_both_none_returns_none`, `test_both_set_returns_isoformat_dict`, `test_only_valid_at`, `test_only_invalid_at`",
+      "status": "done",
+      "commit": "2539937"
+    },
+    {
+      "id": "step-12",
+      "type": "test",
+      "description": "Verify clean branch passes all verification checks that merger_verify runs:\n1. `cd fused-memory && uv run pytest tests/test_memory_service.py -x --tb=short` — all tests pass\n2. `cd fused-memory && uv run ruff check src/fused_memory/services/memory_service.py tests/test_memory_service.py tests/conftest.py` — no lint issues\n3. `cd fused-memory && uv run pyright src/fused_memory/services/memory_service.py tests/test_memory_service.py tests/conftest.py` — no type errors\n4. Run the FULL fused-memory test suite `cd fused-memory && uv run pytest tests/ -x --tb=short` to verify no regressions from touching shared conftest\n5. Verify `git diff origin/main --stat` shows ONLY the 3 task-168 files (no stray files from other tasks)\n6. Verify `git diff origin/main --name-only` lists exactly: fused-memory/src/fused_memory/services/memory_service.py, fused-memory/tests/test_memory_service.py, fused-memory/tests/conftest.py",
+      "status": "done",
+      "commit": "2539937"
+    },
+    {
+      "id": "step-13",
+      "type": "impl",
+      "description": "Re-sync with real origin/main and re-apply task-168 changes. Step-11 used a stale origin/main (a88fbb9) because `git fetch` was not run. Real origin/main has advanced ~60 commits with many parallel tasks now merged (task-176, etc.) that modified all 3 task-168 files. All 3 bugs STILL exist on real main.\n\nProcedure:\n1. `git fetch origin main` to get real remote state\n2. `git reset --hard origin/main` to reset task/168 branch to real current main\n3. Re-apply ONLY task-168 changes to the 3 files, accounting for main's current code structure:\n\n**conftest.py** (main now has MockEdge with uuid, source_node, target_node, episodes, valid_at: str|None, invalid_at: str|None; MockNode with name: str):\n- Add `from typing import Any` import after `from dataclasses import dataclass, field`\n- Change MockEdge's `valid_at: str | None = None` → `valid_at: Any = None`\n- Change MockEdge's `invalid_at: str | None = None` → `invalid_at: Any = None`\n- Keep ALL other MockEdge fields (uuid, source_node, target_node, episodes) untouched\n\n**memory_service.py** (main now has EpisodeStatus import, DurableWriteQueue, WriteJournal, but same bugs at lines 731, 822-827, 850):\n- Add `_serialize_temporal(valid_at, invalid_at) -> dict | None` module-level helper after `logger = logging.getLogger(__name__)` (line 43), before `class MemoryService:` (line 46). Returns None when both args are None, otherwise `{'valid_at': x.isoformat() if x is not None else None, 'invalid_at': ...}`\n- Fix _search_graphiti (line 731): Replace `if valid_at or invalid_at: temporal = {'valid_at': str(valid_at) if valid_at else None, 'invalid_at': str(invalid_at) if invalid_at else None,}` with `temporal = _serialize_temporal(valid_at, invalid_at)` (replaces 5 lines with 1)\n- Fix get_entity edge_data (lines 822-827): Add `'temporal': _serialize_temporal(getattr(e, 'valid_at', None), getattr(e, 'invalid_at', None)),` to the dict alongside uuid and fact\n- Fix get_episodes created_at (line 850): Replace `'created_at': str(getattr(ep, 'created_at', '')) or None,` with `'created_at': str(_ca) if (_ca := getattr(ep, 'created_at', None)) is not None else None,`\n\n**test_memory_service.py** (main is 624 lines, has inline imports in bodies, no temporal tests, no TestGetEntity):\n- Add module-level imports: `from datetime import UTC, datetime` after line 2, `from fused_memory.services.memory_service import MemoryService, _serialize_temporal` replacing the existing `from fused_memory.services.memory_service import MemoryService`, `from tests.conftest import MockEdge` after Scope import\n- Do NOT remove other tests' inline imports (MockNode, MockAddEpisodeResult, patch, backends — they belong to other tasks' code)\n- Append at end of file (after TestGetEpisodes at line 624):\n  - Add `test_none_created_at_returns_none` to TestGetEpisodes class\n  - Add new class TestGetEntity with 2 tests: test_edges_include_temporal, test_edges_only_valid_at_has_null_invalid_at\n  - Add new class TestSerializeTemporal with 4 tests: test_both_none_returns_none, test_both_set_returns_isoformat_dict, test_only_valid_at, test_only_invalid_at\n  - Add `test_search_graphiti_only_invalid_at_returns_temporal` to TestSearch class (insert after existing search tests)\n  - Add cross-field `invalid_at is None` assertion to test_search_category_filter_includes_graphiti_when_graphiti_primary_requested",
+      "status": "done",
+      "commit": "2539937"
+    },
+    {
+      "id": "step-14",
+      "type": "test",
+      "description": "Full verification against real main:\n1. `uv run pytest tests/test_memory_service.py -x --tb=short` — all tests pass (expect ~34+ tests: main's 24 + our 10 new)\n2. `uv run ruff check src/fused_memory/services/memory_service.py tests/test_memory_service.py tests/conftest.py` — no lint issues\n3. `uv run pyright src/fused_memory/services/memory_service.py tests/test_memory_service.py tests/conftest.py` — no type errors\n4. `uv run pytest tests/ -x --tb=short` — full test suite passes\n5. `git diff origin/main --name-only` shows exactly the 3 task files\n6. Simulate merge: create temp branch from origin/main, merge task/168, verify no conflicts\n7. Force-push the rebased branch: `git push --force-with-lease origin task/168`",
+      "status": "done",
+      "commit": "2539937"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Extract _serialize_temporal as a module-level function (not a method)",
+      "rationale": "It's a pure function with no dependency on self — stateless serialization logic. Module-level keeps it easily testable and avoids polluting the class interface."
+    },
+    {
+      "decision": "Use `is not None` checks consistently for temporal fields (not truthiness)",
+      "rationale": "While datetime objects are always truthy, using `is not None` is semantically correct and protects against edge cases. The task explicitly requests this for the outer guard, and inner guards should match for consistency."
+    },
+    {
+      "decision": "Add temporal data to get_entity edge_data",
+      "rationale": "Task item 5 requires testing get_entity with temporal datetimes, implying the production code should serialize temporal data for edges in get_entity. This is consistent with _search_graphiti behavior and enables the DRY extraction."
+    },
+    {
+      "decision": "Update MockEdge type hints to accept datetime, not just str",
+      "rationale": "Production edges have valid_at/invalid_at as datetime objects. Tests that verify temporal serialization need to pass datetimes to MockEdge. Changing the type hint from `str | None` to `Any` (or `datetime | str | None`) avoids type confusion."
+    },
+    {
+      "decision": "Move inline imports to module-level in test file",
+      "rationale": "Task item 4 explicitly requests this. Module-level imports are standard Python practice — inline imports were likely accidental and reduce readability."
+    },
+    {
+      "decision": "Merge main into branch (not rebase) to resolve conflicts",
+      "rationale": "Merge preserves commit history from both branches and is safer than rebase for worktree branches. The conflict is localized to test_memory_service.py imports and duplicate TestGetEntity classes — auto-merged files (conftest.py, memory_service.py) resolved correctly."
+    },
+    {
+      "decision": "Consolidate duplicate TestGetEntity into single class with all tests",
+      "rationale": "Main added 8 get_entity tests (structure, concurrency, error propagation); our branch added 2 temporal tests. Both belong in the same TestGetEntity class. Main's tests are compatible with our temporal addition since they don't assert against exact edge dict keys."
+    },
+    {
+      "decision": "Hard-reset branch to origin/main and re-apply only task-168 changes",
+      "rationale": "The branch accumulated 219+ stray files from parallel tasks (169, 155, 171, 176, 186) that committed to the shared worktree. The merger agent cannot cleanly merge this massive diff into main. By resetting to origin/main and applying only the 3 task-168 files, the branch diff becomes minimal and merge-safe. The parallel-task changes are NOT on main yet and belong to their own task branches — including them here would bypass their own review/merge cycles."
+    },
+    {
+      "decision": "Do NOT include task-169 changes (TestGetEntity 8 tests, asyncio.gather, MockNode) in the clean branch",
+      "rationale": "Main does not have task-169 changes yet. Including them would couple task-168's merge to task-169's unreviewed work. Task-168's TestGetEntity class should contain only the 2 temporal tests. If task-169 merges first later, the merger can handle the simple addition."
+    },
+    {
+      "decision": "Fetch real origin/main before reset (step-13 fix)",
+      "rationale": "Step-11 failed because the worktree had stale remote refs — `origin/main` pointed to a88fbb9 while real main was ~60 commits ahead. The worktree's git fetch scope may be limited. Must explicitly `git fetch origin main` before resetting to ensure we're working against the actual current main."
+    },
+    {
+      "decision": "Do NOT hoist other tasks' inline imports in step-13",
+      "rationale": "Main's test file (624 lines) has inline imports in test bodies added by other tasks (MockNode, MockAddEpisodeResult at lines 255/278/357/397/434/490, patch/backend at 568/570/596). Hoisting these would modify code from other tasks' scope and create unnecessary merge risk. Only add module-level imports needed by task-168's new tests (MockEdge, datetime, _serialize_temporal)."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "MockEdge and MockNode dataclasses from conftest",
+      "where": "fused-memory/tests/conftest.py",
+      "how": "Use existing mock objects for edges with temporal fields. MockEdge already has valid_at and invalid_at fields — just need to relax the type hint to accept datetime objects."
+    },
+    {
+      "what": "Existing service fixture with mocked backends",
+      "where": "fused-memory/tests/test_memory_service.py (service fixture)",
+      "how": "All new tests use the same service fixture pattern. Override graphiti.search or graphiti.retrieve_episodes return values per test."
+    },
+    {
+      "what": "MemoryResult model's temporal field",
+      "where": "fused-memory/src/fused_memory/models/memory.py",
+      "how": "The temporal field is already `dict | None` — the _serialize_temporal helper returns this exact shape."
+    },
+    {
+      "what": "Existing test patterns for _search_graphiti",
+      "where": "TestSearch class, e.g. test_search_category_filter_includes_graphiti_when_graphiti_primary_requested",
+      "how": "Follow the same pattern: mock graphiti.search to return MockEdge list, call service.search(), assert on results. New temporal tests follow this shape."
+    },
+    {
+      "what": "Proven task-168 implementation from step-11 branch HEAD",
+      "where": "Current HEAD (2539937) of task/168 branch — verified working against stale main",
+      "how": "Step-13 re-applies the same proven code patterns (_serialize_temporal helper, get_episodes fix, _search_graphiti fix, get_entity temporal addition, all test classes/methods) against the current main. The logic is identical; only line numbers and surrounding context differ."
+    }
+  ],
+  "_session_id": "168-6dddefd9",
+  "_created_at": "2026-03-26T23:59:54.288384+00:00",
+  "_schema_version": 1
+}
