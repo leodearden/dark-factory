@@ -623,3 +623,158 @@ class TestGuardIntegration:
             result = await backend.add_episode(name='ep', content='content')
 
             assert result is fake_result
+
+
+# ---------------------------------------------------------------------------
+# Step-23 / Step-24: Guard exception is non-fatal (try/except)
+# ---------------------------------------------------------------------------
+
+
+class TestGuardExceptionHandling:
+    """Guard exceptions must never propagate to add_episode() callers."""
+
+    @pytest.mark.asyncio
+    async def test_guard_runtime_error_is_caught_and_result_returned(self, mock_config):
+        """When guard.guard() raises RuntimeError, add_episode() still returns the result."""
+        backend = GraphitiBackend(mock_config)
+        fake_result = FakeAddEpisodeResults(nodes=[], edges=[])
+        mock_client = MagicMock()
+        mock_client.add_episode = AsyncMock(return_value=fake_result)
+        backend.client = mock_client
+
+        with patch(
+            'fused_memory.backends.graphiti_client.InvalidationGuard',
+        ) as MockGuardClass:
+            mock_guard_instance = MagicMock()
+            mock_guard_instance.guard = AsyncMock(
+                side_effect=RuntimeError('FalkorDB connection refused')
+            )
+            MockGuardClass.return_value = mock_guard_instance
+
+            result = await backend.add_episode(name='ep', content='content')
+
+            # Episode was committed — result must be returned despite guard failure
+            assert result is fake_result
+
+    @pytest.mark.asyncio
+    async def test_guard_runtime_error_logs_nonfatal_error(self, mock_config):
+        """When guard.guard() raises RuntimeError, logger.error is called with 'non-fatal'."""
+        import logging
+
+        backend = GraphitiBackend(mock_config)
+        fake_result = FakeAddEpisodeResults(nodes=[], edges=[])
+        mock_client = MagicMock()
+        mock_client.add_episode = AsyncMock(return_value=fake_result)
+        backend.client = mock_client
+
+        with patch(
+            'fused_memory.backends.graphiti_client.InvalidationGuard',
+        ) as MockGuardClass:
+            mock_guard_instance = MagicMock()
+            mock_guard_instance.guard = AsyncMock(
+                side_effect=RuntimeError('DB error')
+            )
+            MockGuardClass.return_value = mock_guard_instance
+
+            with patch('fused_memory.backends.graphiti_client.logger') as mock_logger:
+                await backend.add_episode(name='ep', content='content')
+
+                # Should log an error mentioning 'non-fatal'
+                assert mock_logger.error.called
+                error_msg = mock_logger.error.call_args[0][0]
+                assert 'non-fatal' in error_msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_guard_exception_does_not_affect_return_value(self, mock_config):
+        """Any Exception subclass from guard still returns the result, not raises."""
+        backend = GraphitiBackend(mock_config)
+        fake_result = FakeAddEpisodeResults(nodes=[], edges=[])
+        mock_client = MagicMock()
+        mock_client.add_episode = AsyncMock(return_value=fake_result)
+        backend.client = mock_client
+
+        with patch(
+            'fused_memory.backends.graphiti_client.InvalidationGuard',
+        ) as MockGuardClass:
+            mock_guard_instance = MagicMock()
+            mock_guard_instance.guard = AsyncMock(
+                side_effect=AttributeError('unexpected attribute')
+            )
+            MockGuardClass.return_value = mock_guard_instance
+
+            result = await backend.add_episode(name='ep', content='content')
+            assert result is fake_result
+
+
+# ---------------------------------------------------------------------------
+# Step-25 / Step-26: Guard timeout via asyncio.wait_for
+# ---------------------------------------------------------------------------
+
+
+class TestGuardTimeout:
+    """Guard invocation is wrapped in asyncio.wait_for with _guard_timeout."""
+
+    @pytest.mark.asyncio
+    async def test_guard_timeout_error_is_caught_and_result_returned(self, mock_config):
+        """When guard raises asyncio.TimeoutError, add_episode() still returns the result."""
+        import asyncio
+
+        backend = GraphitiBackend(mock_config)
+        fake_result = FakeAddEpisodeResults(nodes=[], edges=[])
+        mock_client = MagicMock()
+        mock_client.add_episode = AsyncMock(return_value=fake_result)
+        backend.client = mock_client
+
+        with patch(
+            'fused_memory.backends.graphiti_client.InvalidationGuard',
+        ) as MockGuardClass:
+            mock_guard_instance = MagicMock()
+            mock_guard_instance.guard = AsyncMock(
+                side_effect=asyncio.TimeoutError()
+            )
+            MockGuardClass.return_value = mock_guard_instance
+
+            result = await backend.add_episode(name='ep', content='content')
+            assert result is fake_result
+
+    @pytest.mark.asyncio
+    async def test_guard_invoked_via_wait_for_with_guard_timeout(self, mock_config):
+        """guard.guard() is called inside asyncio.wait_for with self._guard_timeout."""
+        import asyncio
+
+        backend = GraphitiBackend(mock_config)
+        # Verify the backend has _guard_timeout from config
+        assert backend._guard_timeout == mock_config.graphiti.invalidation_guard_timeout_seconds
+
+        fake_result = FakeAddEpisodeResults(nodes=[], edges=[])
+        mock_client = MagicMock()
+        mock_client.add_episode = AsyncMock(return_value=fake_result)
+        backend.client = mock_client
+
+        wait_for_calls = []
+
+        original_wait_for = asyncio.wait_for
+
+        async def capturing_wait_for(coro, timeout=None, **kwargs):
+            wait_for_calls.append({'timeout': timeout})
+            return await original_wait_for(coro, timeout=timeout, **kwargs)
+
+        with patch(
+            'fused_memory.backends.graphiti_client.InvalidationGuard',
+        ) as MockGuardClass:
+            mock_guard_instance = MagicMock()
+            mock_guard_instance.guard = AsyncMock(return_value=[])
+            MockGuardClass.return_value = mock_guard_instance
+
+            with patch('fused_memory.backends.graphiti_client.asyncio.wait_for', capturing_wait_for):
+                await backend.add_episode(name='ep', content='content')
+
+        # Should have two wait_for calls: one for the main add_episode, one for the guard
+        guard_call = next(
+            (c for c in wait_for_calls if c['timeout'] == backend._guard_timeout),
+            None,
+        )
+        assert guard_call is not None, (
+            f'Expected wait_for call with timeout={backend._guard_timeout}, '
+            f'got: {wait_for_calls}'
+        )
