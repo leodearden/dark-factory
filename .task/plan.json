@@ -1,0 +1,95 @@
+{
+  "task_id": "192",
+  "title": "Use structured concurrency in get_entity's asyncio.gather",
+  "files": [
+    "fused-memory/src/fused_memory/services/memory_service.py",
+    "fused-memory/tests/test_memory_service.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/services",
+    "fused-memory/tests"
+  ],
+  "analysis": "get_entity() in memory_service.py (lines 796-854) currently uses asyncio.gather(return_exceptions=True) to run two Graphiti calls concurrently (search_nodes and search). While this prevents orphaned tasks by waiting for both to settle, it does NOT cancel the sibling when one fails \u2014 both tasks always run to completion, holding connections and resources unnecessarily. Under repeated error conditions this accumulates wasted work.\n\nThe fix is to replace asyncio.gather with asyncio.TaskGroup (Python 3.11+, confirmed by pyproject.toml requires-python='>=3.11'). TaskGroup provides true structured concurrency: when one task raises, all siblings are cancelled immediately. The ExceptionGroup raised by TaskGroup is unwrapped to re-raise the first exception, preserving the existing API contract.\n\nExisting test suite in TestGetEntity (test_memory_service.py, lines 627-781) has 6 tests covering success, error propagation, concurrency, and logging. Most will continue to pass with TaskGroup since they use fast AsyncMocks. New tests are needed that use blocking mocks to prove cancellation behavior. The existing error tests assert that both mocks were 'called once' \u2014 this still holds with TaskGroup since mocks are invoked (coroutine started) even though the task may be cancelled afterward.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write test_search_nodes_failure_cancels_blocking_sibling: when search_nodes raises, a forever-blocking search() mock is cancelled promptly. Uses asyncio.wait_for(timeout=2.0) so the test fails fast with current gather implementation (TimeoutError instead of RuntimeError) but passes with TaskGroup (sibling cancelled, RuntimeError propagated immediately).",
+      "status": "done",
+      "commit": "6d3d76c"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Replace asyncio.gather(return_exceptions=True) in get_entity with asyncio.TaskGroup. Create both tasks via tg.create_task(). Catch BaseExceptionGroup, log each exception via logger.warning (preserving existing log format), and re-raise eg.exceptions[0]. Update the method docstring to document structured concurrency and cancellation semantics.",
+      "status": "done",
+      "commit": "94418cc"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write test_search_failure_cancels_blocking_sibling: mirror of step-1 for the reverse direction \u2014 when search() raises, a forever-blocking search_nodes() mock is cancelled promptly. Validates TaskGroup cancels in both directions.",
+      "status": "done",
+      "commit": "fd1fa29"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Verify step-3 test passes (should already work from step-2 since TaskGroup cancels all siblings regardless of which task fails). Fix if any adjustment needed.",
+      "status": "done",
+      "commit": "fd1fa29"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Update docstrings on existing tests test_search_nodes_failure_raises_and_search_settles and test_search_failure_raises_and_search_nodes_settles to reflect cancellation semantics (the mock IS called but the task is cancelled, not 'settled'). Run the full TestGetEntity suite to confirm all 8 tests pass (6 existing + 2 new).",
+      "status": "done",
+      "commit": "680b3b1"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Fix any regressions in the existing test suite. The test_concurrent_execution event-gate test should still pass since both tasks complete normally in the success path. Verify test_failure_emits_warning_log still works with the BaseExceptionGroup \u2192 logger.warning flow.",
+      "status": "done",
+      "commit": "ad45e62"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use asyncio.TaskGroup over explicit ensure_future + cancel pattern",
+      "rationale": "TaskGroup is the idiomatic Python 3.11+ structured concurrency primitive. It automatically cancels all siblings when any task raises, with no manual cancellation code needed. The codebase already requires Python >=3.11 (pyproject.toml). This is cleaner than the ensure_future + try/except cancel pattern shown in the task description, and makes the cancellation guarantee a property of the language construct rather than manual error handling."
+    },
+    {
+      "decision": "Catch BaseExceptionGroup and re-raise eg.exceptions[0] to preserve API contract",
+      "rationale": "Callers of get_entity expect to catch specific exceptions (RuntimeError, ConnectionError, etc.), not ExceptionGroup. Unwrapping the group and re-raising the first exception maintains backward compatibility. Using 'raise eg.exceptions[0]' (without 'from None') preserves the ExceptionGroup in __context__ for debugging."
+    },
+    {
+      "decision": "Use asyncio.Event().wait() in cancellation tests (blocking forever) with asyncio.wait_for timeout guard",
+      "rationale": "A never-completing mock (Event().wait()) is the clearest way to prove the sibling is cancelled, not just raced. With gather(return_exceptions=True) the test would hang (triggering wait_for TimeoutError), failing fast and clearly. With TaskGroup, the sibling is cancelled immediately and the test passes. This avoids time-based assertions (elapsed < X) which are fragile in CI."
+    },
+    {
+      "decision": "Keep existing test assertions (assert_called_once) alongside new cancellation tests",
+      "rationale": "With TaskGroup, AsyncMock IS still invoked (the coroutine is created and started), so assert_called_once() remains valid. The existing tests verify error propagation semantics; the new tests verify cancellation semantics. Both are needed."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "TestGetEntity class and service fixture",
+      "where": "fused-memory/tests/test_memory_service.py (lines 12-39, 627-781)",
+      "how": "New tests are added to the existing TestGetEntity class, reusing the service fixture with mocked Graphiti backend. Follow the existing pattern of step-N comments and descriptive docstrings."
+    },
+    {
+      "what": "MockNode and MockEdge from conftest",
+      "where": "fused-memory/tests/conftest.py (lines 19-37)",
+      "how": "Imported in existing success test; available for new tests if needed (though cancellation tests primarily use side_effect mocks, not return value mocks)."
+    },
+    {
+      "what": "asyncio.gather patterns in durable_queue.py and task_interceptor.py",
+      "where": "fused-memory/src/fused_memory/services/durable_queue.py (line 133), middleware/task_interceptor.py (line 108)",
+      "how": "These use gather(return_exceptions=True) for shutdown/drain scenarios where waiting for all tasks IS correct (fire-and-forget cleanup). They should NOT be changed \u2014 the TaskGroup migration is only for get_entity where fail-fast cancellation is desired."
+    }
+  ],
+  "_session_id": "192-c2f9f21e",
+  "_created_at": "2026-03-27T05:21:36.920820+00:00"
+}
