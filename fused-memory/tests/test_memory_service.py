@@ -1,12 +1,13 @@
 """Tests for the memory service — unit tests with mocked backends."""
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import Scope
-from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.memory_service import MemoryService, _serialize_temporal
 
 
 @pytest.fixture
@@ -453,6 +454,49 @@ class TestSearch:
         # Should have the inferred category, not None
         assert results[0].category == MemoryCategory.entities_and_relations
 
+    @pytest.mark.asyncio
+    async def test_search_graphiti_temporal_valid_at_only(self, service):
+        """When an edge has only valid_at set, temporal dict has valid_at ISO string and null invalid_at."""
+        from tests.conftest import MockEdge
+
+        dt = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='edge with valid_at only', valid_at=dt, invalid_at=None),
+        ])
+        service.mem0.search = AsyncMock(return_value={'results': []})
+
+        results = await service.search(query='edge', project_id='test')
+
+        assert len(results) == 1
+        temporal = results[0].temporal
+        assert temporal is not None
+        assert temporal['valid_at'] == '2024-01-15T12:00:00+00:00'
+        assert temporal['invalid_at'] is None
+
+    @pytest.mark.asyncio
+    async def test_search_graphiti_only_invalid_at_returns_temporal(self, service):
+        """When only invalid_at is set (valid_at is None/falsy), temporal is still returned.
+
+        This tests the outer guard truthiness bug fix: the old code used
+        `if valid_at or invalid_at` which is correct for truthiness, but the helper
+        must handle the case where valid_at is falsy while invalid_at is truthy.
+        """
+        from tests.conftest import MockEdge
+
+        dt = datetime(2024, 6, 1, 0, 0, 0, tzinfo=UTC)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='expired edge', valid_at=None, invalid_at=dt),
+        ])
+        service.mem0.search = AsyncMock(return_value={'results': []})
+
+        results = await service.search(query='expired', project_id='test')
+
+        assert len(results) == 1
+        temporal = results[0].temporal
+        assert temporal is not None, 'temporal should be set when only invalid_at is present'
+        assert temporal['valid_at'] is None
+        assert temporal['invalid_at'] == '2024-06-01T00:00:00+00:00'
+
 
 class TestDeleteMemory:
     @pytest.mark.asyncio
@@ -622,6 +666,25 @@ class TestGetEpisodes:
     async def test_returns_list(self, service):
         episodes = await service.get_episodes(project_id='test')
         assert isinstance(episodes, list)
+
+    @pytest.mark.asyncio
+    async def test_none_created_at_returns_none(self, service):
+        """When an episode has created_at=None, the dict value should be None (not 'None')."""
+        mock_ep = MagicMock()
+        mock_ep.uuid = 'ep-uuid-1'
+        mock_ep.name = 'test episode'
+        mock_ep.content = 'some content'
+        mock_ep.created_at = None
+        mock_ep.source = None
+        mock_ep.group_id = 'test'
+        service.graphiti.retrieve_episodes = AsyncMock(return_value=[mock_ep])
+
+        episodes = await service.get_episodes(project_id='test')
+
+        assert len(episodes) == 1
+        assert episodes[0]['created_at'] is None, (
+            f"Expected None but got {episodes[0]['created_at']!r} — str(None) bug"
+        )
 
 
 class TestGetEntity:
@@ -862,3 +925,120 @@ class TestGetEntity:
                 service.get_entity('entity', project_id='test'),
                 timeout=2.0,
             )
+
+    # ------------------------------------------------------------------
+    # task-168: temporal serialization in edge_data
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_edges_include_temporal(self, service):
+        """Edge dicts in get_entity result include a 'temporal' key with ISO 8601 strings."""
+        from tests.conftest import MockEdge
+
+        dt_valid = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
+        dt_invalid = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
+        mock_edge = MockEdge(
+            fact='Service A calls Service B',
+            uuid='edge-temporal-1',
+            valid_at=dt_valid,
+            invalid_at=dt_invalid,
+        )
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(return_value=[mock_edge])
+
+        result = await service.get_entity('Service A', project_id='test')
+
+        assert len(result['edges']) == 1
+        edge = result['edges'][0]
+        assert 'temporal' in edge
+        temporal = edge['temporal']
+        assert temporal is not None
+        assert temporal['valid_at'] == '2024-03-01T10:00:00+00:00'
+        assert temporal['invalid_at'] == '2024-09-01T10:00:00+00:00'
+
+    @pytest.mark.asyncio
+    async def test_edges_only_valid_at_has_null_invalid_at(self, service):
+        """When edge has only valid_at, temporal['invalid_at'] is None (not 'None')."""
+        from tests.conftest import MockEdge
+
+        dt_valid = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
+        mock_edge = MockEdge(
+            fact='Service A calls Service B',
+            uuid='edge-temporal-2',
+            valid_at=dt_valid,
+            invalid_at=None,
+        )
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(return_value=[mock_edge])
+
+        result = await service.get_entity('Service A', project_id='test')
+
+        assert len(result['edges']) == 1
+        edge = result['edges'][0]
+        assert edge['temporal'] is not None
+        assert edge['temporal']['valid_at'] == '2024-03-01T10:00:00+00:00'
+        assert edge['temporal']['invalid_at'] is None
+
+
+class TestSerializeTemporal:
+    """Unit tests for the _serialize_temporal module-level helper."""
+
+    def test_both_none_returns_none(self):
+        """When both valid_at and invalid_at are None, returns None."""
+        result = _serialize_temporal(None, None)
+        assert result is None
+
+    def test_both_set_returns_isoformat_dict(self):
+        """When both are set, returns dict with ISO 8601 strings."""
+        dt_valid = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
+        dt_invalid = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+        result = _serialize_temporal(dt_valid, dt_invalid)
+        assert result is not None
+        assert result['valid_at'] == '2024-01-15T12:00:00+00:00'
+        assert result['invalid_at'] == '2024-06-15T12:00:00+00:00'
+
+    def test_only_valid_at(self):
+        """When only valid_at is set, returns dict with valid_at string and invalid_at=None."""
+        dt = datetime(2024, 3, 1, 0, 0, 0, tzinfo=UTC)
+        result = _serialize_temporal(dt, None)
+        assert result is not None
+        assert result['valid_at'] == '2024-03-01T00:00:00+00:00'
+        assert result['invalid_at'] is None
+
+    def test_only_invalid_at(self):
+        """When only invalid_at is set, returns dict with valid_at=None and invalid_at string.
+
+        This covers the old truthiness bug: the original code used `if valid_at or invalid_at`
+        as the outer guard — which IS correct for truthiness. The fix ensures isoformat() is
+        used instead of str() for proper ISO 8601 format.
+        """
+        dt = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
+        result = _serialize_temporal(None, dt)
+        assert result is not None
+        assert result['valid_at'] is None
+        assert result['invalid_at'] == '2024-09-01T00:00:00+00:00'
+
+    def test_string_input_uses_str_fallback(self):
+        """Raw ISO 8601 strings pass through str() instead of raising AttributeError.
+
+        Graphiti may return temporal values as pre-serialized strings rather than
+        datetime objects. _serialize_temporal must not call .isoformat() on a string.
+        """
+        iso_valid = '2024-01-15T12:00:00+00:00'
+        iso_invalid = '2024-06-15T12:00:00+00:00'
+        result = _serialize_temporal(iso_valid, iso_invalid)
+        assert result is not None
+        assert result['valid_at'] == iso_valid
+        assert result['invalid_at'] == iso_invalid
+
+    def test_integer_timestamp_uses_str_fallback(self):
+        """Integer timestamps pass through str() instead of raising AttributeError.
+
+        If a caller passes an integer Unix timestamp, _serialize_temporal must not
+        call .isoformat() on it. str(int) is returned as the fallback.
+        """
+        ts = 1705320000
+        result = _serialize_temporal(ts, None)
+        assert result is not None
+        assert result['valid_at'] == str(ts)
+        assert result['invalid_at'] is None

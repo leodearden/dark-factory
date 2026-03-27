@@ -44,6 +44,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _serialize_temporal(
+    valid_at: Any,
+    invalid_at: Any,
+) -> dict[str, str | None] | None:
+    """Serialize valid_at/invalid_at to an ISO 8601 dict or None.
+
+    Returns None when both values are falsy (common case — no temporal context).
+    Uses .isoformat() instead of str() to guarantee the standard
+    'YYYY-MM-DDTHH:MM:SS+00:00' format for datetime objects.
+    """
+    if not valid_at and not invalid_at:
+        return None
+    return {
+        'valid_at': valid_at.isoformat() if hasattr(valid_at, 'isoformat') else str(valid_at) if valid_at else None,
+        'invalid_at': invalid_at.isoformat() if hasattr(invalid_at, 'isoformat') else str(invalid_at) if invalid_at else None,
+    }
+
+
 class MemoryService:
     """Central orchestration — fused read/write across Graphiti + Mem0."""
 
@@ -727,12 +745,7 @@ class MemoryService:
             fact = getattr(edge, 'fact', str(edge))
             valid_at = getattr(edge, 'valid_at', None)
             invalid_at = getattr(edge, 'invalid_at', None)
-            temporal = None
-            if valid_at or invalid_at:
-                temporal = {
-                    'valid_at': str(valid_at) if valid_at else None,
-                    'invalid_at': str(invalid_at) if invalid_at else None,
-                }
+            temporal = _serialize_temporal(valid_at, invalid_at)
 
             # Extract entity names from source/target nodes
             entities = []
@@ -856,6 +869,10 @@ class MemoryService:
             edge_data.append({
                 'uuid': getattr(e, 'uuid', None),
                 'fact': getattr(e, 'fact', str(e)),
+                'temporal': _serialize_temporal(
+                    getattr(e, 'valid_at', None),
+                    getattr(e, 'invalid_at', None),
+                ),
             })
 
         return {'nodes': node_data, 'edges': edge_data}
@@ -879,7 +896,7 @@ class MemoryService:
                 'uuid': getattr(ep, 'uuid', None),
                 'name': getattr(ep, 'name', None),
                 'content': getattr(ep, 'content', None),
-                'created_at': str(getattr(ep, 'created_at', '')) or None,
+                'created_at': str(_ca) if (_ca := getattr(ep, 'created_at', None)) is not None else None,
                 'source': getattr(ep, 'source', None),
                 'group_id': getattr(ep, 'group_id', None),
             }

@@ -1,6 +1,7 @@
 """Shared test fixtures."""
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import pytest
 
@@ -33,8 +34,8 @@ class MockEdge:
     source_node: MockNode | None = None
     target_node: MockNode | None = None
     episodes: list[str] = field(default_factory=list)
-    valid_at: str | None = None
-    invalid_at: str | None = None
+    valid_at: Any = None
+    invalid_at: Any = None
 
 
 @dataclass
