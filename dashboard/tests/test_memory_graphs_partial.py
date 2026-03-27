@@ -69,6 +69,23 @@ class TestMemoryGraphsPartial:
             assert 'By operation' in html
             assert 'By agent' in html
 
+    def test_data_matches_mock(self, client):
+        """Verify _patch_journal_app() correctly intercepts bound imports in dashboard.app.
+
+        This test MUST use _patch_journal_app() (not _patch_journal()) because app.py binds
+        the functions via 'from X import Y', so patching at the source module has no effect.
+        If _patch_journal() were used here, the extracted data would come from the real DB
+        rather than the mock, and the exact-match assertions below would fail.
+        """
+        p1, p2, p3 = _patch_journal_app()
+        with p1, p2, p3:
+            html = client.get('/partials/memory-graphs').text
+        ops_data = _extract_js_var(html, 'opsData')
+        agent_data = _extract_js_var(html, 'agentData')
+        # These exact labels come from _OPERATIONS and _AGENTS mocks — not the real DB
+        assert ops_data['labels'] == ['search', 'add_memory']
+        assert agent_data['labels'] == ['claude-interactive', 'recon-consolidator']
+
 
 # --- Helper to extract JS variable value from rendered HTML ---
 
