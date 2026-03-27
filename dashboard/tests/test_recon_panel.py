@@ -7,6 +7,41 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 
+class TestProjectNameFilter:
+    """Tests for the project_name Jinja2 filter function."""
+
+    def test_path_returns_basename(self):
+        from dashboard.app import project_name
+
+        assert project_name('/home/leo/src/dark-factory') == 'dark-factory'
+
+    def test_non_path_returned_unchanged(self):
+        from dashboard.app import project_name
+
+        assert project_name('dark_factory') == 'dark_factory'
+
+    def test_none_returns_empty_string(self):
+        from dashboard.app import project_name
+
+        assert project_name(None) == ''
+
+    def test_empty_string_returns_empty_string(self):
+        from dashboard.app import project_name
+
+        assert project_name('') == ''
+
+    def test_trailing_slash_returns_basename(self):
+        from dashboard.app import project_name
+
+        assert project_name('/home/leo/src/dark-factory/') == 'dark-factory'
+
+    def test_filter_registered_on_jinja2_env(self):
+        from dashboard.app import project_name, templates
+
+        assert 'project_name' in templates.env.filters
+        assert templates.env.filters['project_name'] is project_name
+
+
 class TestFormatTriggerFilter:
     """Tests for the format_trigger Jinja2 filter function."""
 
