@@ -692,3 +692,36 @@ class TestTierConfig:
         stage.memory_limit = 250
         assert stage.episode_limit == 125
         assert stage.memory_limit == 250
+
+
+class TestProjectIdGuideline:
+    """_PROJECT_ID_GUIDELINE shared constant in prompts/__init__.py."""
+
+    def test_guideline_is_importable_from_prompts_package(self):
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        assert _PROJECT_ID_GUIDELINE is not None
+
+    def test_guideline_contains_tools_placeholder(self):
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        assert '{tools}' in _PROJECT_ID_GUIDELINE
+
+    def test_guideline_contains_reconciliation_context_block_phrasing(self):
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        assert 'Reconciliation Context block' in _PROJECT_ID_GUIDELINE
+
+    def test_guideline_contains_project_id_instruction(self):
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        assert 'project_id' in _PROJECT_ID_GUIDELINE
+
+    def test_guideline_format_replaces_tools_placeholder(self):
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        result = _PROJECT_ID_GUIDELINE.format(tools='search, add_memory')
+        assert '{tools}' not in result
+        assert 'search, add_memory' in result
+
+    def test_guideline_format_produces_correct_string(self):
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        result = _PROJECT_ID_GUIDELINE.format(tools='search, get_entity')
+        assert 'project_id' in result
+        assert 'Reconciliation Context block' in result
+        assert 'search, get_entity' in result
