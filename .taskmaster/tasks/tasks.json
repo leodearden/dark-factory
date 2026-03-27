@@ -2563,11 +2563,11 @@
         "description": "Graphiti entity summaries accumulate stale and duplicated lines over time as new edges are added. This is a systemic issue (observed across reify entities for M5, M5 decomposition, M5 types, Task 139, Task 147, and others with recurrence >= 4). Entity summaries should be periodically rebuilt or deduplicated to reflect only current, non-invalidated edge facts.\n\nAcceptance criteria:\n1. Identify the Graphiti entity summary update path and understand why stale/duplicate lines persist\n2. Implement a mechanism to rebuild entity summaries from current valid edges (either on-write dedup or periodic batch rebuild)\n3. Expose this as a fused-memory management operation (e.g. rebuild_entity_summaries) \n4. Validate against known affected entities (reify project: M5, M5 decomposition, M5 types)\n\nmemory_hints:\n- entities: [\"M5\", \"M5 decomposition\", \"M5 types\", \"Task 139\"]\n- search queries: [\"entity summary accumulation stale\", \"Graphiti entity summary rebuild\"]",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-27T11:16:28.038Z",
+        "updatedAt": "2026-03-27T12:00:18.417Z",
         "metadata": {
           "files": [
             "fused-memory/src/fused_memory/backends/graphiti_client.py",
@@ -2651,13 +2651,13 @@
         "description": "Improve fused-memory/tests/test_server_shutdown.py in several ways:\n\n1. Replace `assert_called_once()` with `assert_awaited_once()` on all AsyncMock assertions (lines 25, 45, 65). The current assertions pass even if `await` is accidentally dropped. The codebase already uses `assert_awaited_once()` in test_reindex.py and test_cleanup_stale_edges.py.\n\n2. Replace `asyncio.ensure_future(_infinite())` (line 79) with `asyncio.create_task(_infinite())` — ensure_future is deprecated in Python 3.10+ and emits DeprecationWarning in 3.12+.\n\n3. Add missing test scenarios:\n   a. **Happy-path drain** — verify task_interceptor.drain() is actually awaited (currently only tested when it raises).\n   b. **Drain error + journal resilience** — test_shutdown_resilient_to_drain_error currently passes recon_journal=None. Add a recon_journal mock and assert it's still closed after drain failure.\n   c. **memory_service.close() error → journal still closed** — verify recon_journal.close() runs even when memory_service.close() raises.\n   d. **Shutdown ordering** — verify drain → cancel_harness → close_memory → close_journal ordering via a shared call_log with side_effect callbacks.\n\nSource: Task 154 review, suggestions 4, 9, 12, 13, 14, 15, 16, 18.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [
           "154"
         ],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-27T11:25:45.174Z",
+        "updatedAt": "2026-03-27T12:00:18.457Z",
         "metadata": {
           "files": [
             "fused-memory/tests/test_server_shutdown.py"
@@ -3620,7 +3620,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T12:00:18.362Z",
+      "lastModified": "2026-03-27T12:00:18.457Z",
       "taskCount": 193,
       "completedCount": 148,
       "tags": [
