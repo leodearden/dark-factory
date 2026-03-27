@@ -2859,11 +2859,11 @@
         "description": "Graphiti's temporal invalidation mechanism is spuriously invalidating task-status edges when unrelated task episodes are written. Observed: writing an episode about Task 481 invalidated edge b3150b06 about Task 208's in-progress status, despite no semantic connection between the two tasks.\n\nThe invalidation appears to match on surface-level similarity (both are 'task status' facts) rather than verifying the episode actually references the same task entity.\n\nInvestigation needed:\n1. Understand Graphiti's edge invalidation heuristic (temporal_invalidation in graphiti_core)\n2. Determine if we can scope invalidation to require entity overlap (same task entity referenced)\n3. Assess whether task-status edges need a different edge type or metadata to reduce false invalidation\n4. If upstream fix not possible, consider a post-write validation step in fused-memory that checks invalidated edges for spurious matches\n\nmemory_hints:\n- search: \"Graphiti temporal invalidation edge heuristic\"\n- search: \"spurious invalidation task status edges\"\n- entity: \"Graphiti\"\n- search: \"graphiti_core invalidation mechanism\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-27T04:07:22.999Z"
+        "updatedAt": "2026-03-27T04:59:38.450Z"
       },
       {
         "id": "190",
@@ -2950,9 +2950,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T04:49:24.308Z",
+      "lastModified": "2026-03-27T04:59:38.450Z",
       "taskCount": 175,
-      "completedCount": 131,
+      "completedCount": 132,
       "tags": [
         "master"
       ]
