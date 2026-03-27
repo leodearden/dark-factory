@@ -2824,11 +2824,11 @@
         "description": "Burst State table lists ~70 agents, most idle for hours/days, flooding the reconciliation left column. Default should show only bursting/active agents with a \"Show N idle agents\" expandable toggle.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 22-48). Partition agents into active (state != 'idle' or last_write < 1h) and stale. Show active by default, hide stale behind Alpine toggle. Consider also adding a max-height with overflow-y-auto as a fallback.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-27T03:56:37.166Z",
+        "updatedAt": "2026-03-27T11:04:10.900Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/recon.html",
@@ -2846,11 +2846,11 @@
         "description": "Event buffer shows \"Oldest: 1045m 36s\" which is unreadable. Should display as \"17h 25m\" for values over 60 minutes. Use the existing timeago filter or add a duration formatter.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (line 16). The template computes age // 60 for minutes and age % 60 for seconds. For large values, convert to hours+minutes instead. Could reuse the format_duration_ms Jinja filter from app.py (adapted for seconds input).",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-27T04:25:44.080Z",
+        "updatedAt": "2026-03-27T11:04:10.927Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/recon.html",
@@ -3314,7 +3314,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T11:04:10.872Z",
+      "lastModified": "2026-03-27T11:04:10.927Z",
       "taskCount": 182,
       "completedCount": 138,
       "tags": [
