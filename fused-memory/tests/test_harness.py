@@ -874,10 +874,10 @@ async def test_sonnet_tier_selection_sets_consolidator_limits(journal, event_buf
 
     # Part 1: verify _select_tier() returns correct sonnet TierConfig
     tier = await harness._select_tier('test-project')
+    assert isinstance(tier, TierConfig)
     assert tier.model == 'sonnet', f"Expected model='sonnet', got '{tier.model}'"
     assert tier.episode_limit == 125, f"Expected episode_limit=125, got {tier.episode_limit}"
     assert tier.memory_limit == 250, f"Expected memory_limit=250, got {tier.memory_limit}"
-    assert isinstance(tier, TierConfig)
 
     # Part 2: mock stage.run() to capture MemoryConsolidator limits at call time
     captured_consolidator_limits: dict = {}
