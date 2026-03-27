@@ -3123,11 +3123,11 @@
         "description": "Three related issues in the project_id validation added by task 137:\n\n1. Watermark mismatch guard at base.py:97 uses bare truthiness (`if watermark.project_id`) but validate_project_id checks `.strip()`. A whitespace-only watermark.project_id bypasses the intended skip and produces a misleading mismatch error. Fix: `if watermark.project_id and watermark.project_id.strip()`.\n\n2. Add test for whitespace-only watermark.project_id in TestProjectIdValidation (test_stages.py) to cover this edge case.\n\n3. Log a debug/warning when watermark.project_id is falsy and the mismatch check is skipped, to aid in diagnosing misconfiguration.",
         "details": "Files: fused-memory/src/fused_memory/reconciliation/stages/base.py, fused-memory/tests/test_stages.py\n\nSource: review suggestions from task 137 (esc-137-8).",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-27T04:27:08.111Z",
+        "updatedAt": "2026-03-27T11:04:11.738Z",
         "metadata": {
           "files": [
             "fused-memory/src/fused_memory/reconciliation/stages/base.py",
@@ -3314,7 +3314,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T11:04:11.674Z",
+      "lastModified": "2026-03-27T11:04:11.738Z",
       "taskCount": 182,
       "completedCount": 138,
       "tags": [
