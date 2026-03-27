@@ -3523,7 +3523,17 @@
             "fused-memory/src/fused_memory/models",
             "fused-memory/src/fused_memory/reconciliation",
             "fused-memory/tests/test_enum_models.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "Watermark"
+            ],
+            "queries": [
+              "Watermark model project_id validation base.py Pydantic field_validator",
+              "task 194 validation asymmetry edge cases journal watermarks SQL UPSERT",
+              "project_id empty whitespace BaseStage guard normalization"
+            ]
+          }
         }
       },
       {
