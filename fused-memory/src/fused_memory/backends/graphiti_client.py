@@ -36,6 +36,7 @@ class GraphitiBackend:
         self._driver: FalkorDriver | None = None
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
+        self._guard_timeout: float = config.graphiti.invalidation_guard_timeout_seconds
 
     async def initialize(self) -> None:
         """Create FalkorDriver + Graphiti client from unified config."""
