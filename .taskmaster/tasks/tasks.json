@@ -3282,7 +3282,15 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-27T06:34:47.468Z"
+        "updatedAt": "2026-03-27T06:34:47.468Z",
+        "metadata": {
+          "files": [
+            "fused-memory/tests/test_harness.py"
+          ],
+          "modules": [
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 203,
@@ -3293,7 +3301,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "fused-memory/tests/test_harness.py"
+          ],
+          "modules": [
+            "fused-memory/tests"
+          ]
+        }
       }
     ],
     "metadata": {
