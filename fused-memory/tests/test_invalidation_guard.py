@@ -13,6 +13,7 @@ Organised by concern:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -557,6 +558,7 @@ class TestGuardIntegration:
             MockGuardClass.return_value = mock_guard_instance
 
             await backend.add_episode(name='ep', content='content')
+            await asyncio.sleep(0)  # yield to let background guard task run
 
             mock_guard_instance.guard.assert_called_once_with(fake_result)
 
@@ -601,6 +603,7 @@ class TestGuardIntegration:
             MockGuardClass.return_value = mock_guard_instance
 
             await backend.add_episode(name='ep', content='content')
+            await asyncio.sleep(0)  # yield to let background guard task run
 
             mock_guard_instance.guard.assert_called_once()
 
@@ -676,6 +679,7 @@ class TestGuardExceptionHandling:
 
             with patch('fused_memory.backends.graphiti_client.logger') as mock_logger:
                 await backend.add_episode(name='ep', content='content')
+                await asyncio.sleep(0)  # yield to let background guard task run
 
                 # Should log an error mentioning 'non-fatal'
                 assert mock_logger.error.called
@@ -710,7 +714,7 @@ class TestGuardExceptionHandling:
 
 
 class TestGuardTimeout:
-    """Guard invocation is wrapped in asyncio.wait_for with _guard_timeout."""
+    """Guard runs as a background task with asyncio.wait_for timeout."""
 
     @pytest.mark.asyncio
     async def test_guard_timeout_error_is_caught_and_result_returned(self, mock_config):
@@ -736,8 +740,6 @@ class TestGuardTimeout:
     @pytest.mark.asyncio
     async def test_guard_invoked_via_wait_for_with_guard_timeout(self, mock_config):
         """guard.guard() is called inside asyncio.wait_for with self._guard_timeout."""
-        import asyncio
-
         backend = GraphitiBackend(mock_config)
         # Verify the backend has _guard_timeout from config
         assert backend._guard_timeout == mock_config.graphiti.invalidation_guard_timeout_seconds
@@ -764,6 +766,7 @@ class TestGuardTimeout:
 
             with patch('fused_memory.backends.graphiti_client.asyncio.wait_for', capturing_wait_for):
                 await backend.add_episode(name='ep', content='content')
+                await asyncio.sleep(0)  # yield to let background guard task run
 
         # Should have two wait_for calls: one for the main add_episode, one for the guard
         guard_call = next(
@@ -774,3 +777,71 @@ class TestGuardTimeout:
             f'Expected wait_for call with timeout={backend._guard_timeout}, '
             f'got: {wait_for_calls}'
         )
+
+    @pytest.mark.asyncio
+    async def test_guard_cancelled_error_is_caught_and_does_not_propagate(self, mock_config):
+        """CancelledError in the guard task is caught; it does not poison the write."""
+        backend = GraphitiBackend(mock_config)
+        fake_result = FakeAddEpisodeResults(nodes=[], edges=[])
+        mock_client = MagicMock()
+        mock_client.add_episode = AsyncMock(return_value=fake_result)
+        backend.client = mock_client
+
+        with patch(
+            'fused_memory.backends.graphiti_client.InvalidationGuard',
+        ) as MockGuardClass:
+            mock_guard_instance = MagicMock()
+            mock_guard_instance.guard = AsyncMock(
+                side_effect=asyncio.CancelledError()
+            )
+            MockGuardClass.return_value = mock_guard_instance
+
+            with patch('fused_memory.backends.graphiti_client.logger') as mock_logger:
+                result = await backend.add_episode(name='ep', content='content')
+                await asyncio.sleep(0)  # yield to let background guard task run
+
+                # Result is returned despite CancelledError in guard
+                assert result is fake_result
+                # Should log a warning (not crash)
+                assert mock_logger.warning.called
+                warning_msg = mock_logger.warning.call_args[0][0]
+                assert 'non-fatal' in warning_msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_guard_runs_as_background_task(self, mock_config):
+        """Guard is detached from the caller — add_episode returns before guard completes."""
+        backend = GraphitiBackend(mock_config)
+        fake_result = FakeAddEpisodeResults(nodes=[], edges=[])
+        mock_client = MagicMock()
+        mock_client.add_episode = AsyncMock(return_value=fake_result)
+        backend.client = mock_client
+
+        guard_started = asyncio.Event()
+        guard_release = asyncio.Event()
+
+        async def slow_guard(result):
+            guard_started.set()
+            await guard_release.wait()
+            return []
+
+        with patch(
+            'fused_memory.backends.graphiti_client.InvalidationGuard',
+        ) as MockGuardClass:
+            mock_guard_instance = MagicMock()
+            mock_guard_instance.guard = slow_guard
+            MockGuardClass.return_value = mock_guard_instance
+
+            # add_episode returns immediately, guard is still running
+            result = await backend.add_episode(name='ep', content='content')
+            assert result is fake_result
+
+            # Guard task is now in _background_tasks
+            assert len(backend._background_tasks) == 1
+
+            # Let the guard complete
+            guard_release.set()
+            await asyncio.sleep(0)  # let the guard coroutine finish
+            await asyncio.sleep(0)  # let the done_callback fire
+
+            # Background task cleaned up
+            assert len(backend._background_tasks) == 0

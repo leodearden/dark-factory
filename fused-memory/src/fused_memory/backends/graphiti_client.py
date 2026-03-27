@@ -37,6 +37,7 @@ class GraphitiBackend:
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
         self._guard_timeout: float = config.graphiti.invalidation_guard_timeout_seconds
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     async def initialize(self) -> None:
         """Create FalkorDriver + Graphiti client from unified config."""
@@ -147,12 +148,23 @@ class GraphitiBackend:
         )
         # Post-write invalidation guard: detect and reverse spurious invalidations.
         # The guard is best-effort: failures must never poison a successful write.
+        # Fired as a detached background task so that outer cancellation (e.g. from
+        # the durable queue's asyncio.wait_for timeout) cannot propagate into the
+        # guard and leave queue items stuck in 'in_flight' state.
         if self.config.graphiti.invalidation_guard_enabled and result is not None:
             guard = InvalidationGuard(self)
-            try:
-                await asyncio.wait_for(guard.guard(result), timeout=self._guard_timeout)
-            except Exception as exc:
-                logger.error('InvalidationGuard failed (non-fatal): %s', exc)
+
+            async def _run_guard() -> None:
+                try:
+                    await asyncio.wait_for(guard.guard(result), timeout=self._guard_timeout)
+                except asyncio.CancelledError:
+                    logger.warning('InvalidationGuard cancelled (non-fatal)')
+                except Exception as exc:
+                    logger.error('InvalidationGuard failed (non-fatal): %s', exc)
+
+            task = asyncio.ensure_future(_run_guard())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
         return result
 
     async def search(
@@ -545,7 +557,11 @@ class GraphitiBackend:
         return result.result_set[0][0] if result.result_set else 0
 
     async def close(self) -> None:
-        """Shut down the driver."""
+        """Shut down the driver and cancel pending background tasks."""
+        # Cancel any pending guard tasks
+        for task in list(self._background_tasks):
+            task.cancel()
+        self._background_tasks.clear()
         if self._driver is not None:
             with contextlib.suppress(Exception):
                 await self._driver.close()
