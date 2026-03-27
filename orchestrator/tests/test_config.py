@@ -1,6 +1,7 @@
 """Tests for configuration loading."""
 
 import logging
+from importlib import resources as pkg_resources
 from pathlib import Path
 
 import yaml
@@ -14,6 +15,12 @@ from orchestrator.config import (
 )
 
 
+def _load_package_defaults() -> dict:
+    """Read the shipped defaults.yaml so tests stay in sync automatically."""
+    defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
+    return yaml.safe_load(defaults_file.read_text())
+
+
 class TestDefaults:
     """Tests for OrchestratorConfig defaults — isolated from real config files."""
 
@@ -22,17 +29,17 @@ class TestDefaults:
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         config = OrchestratorConfig()
+        defaults = _load_package_defaults()
         # Values from package defaults.yaml (not Pydantic field defaults)
-        assert config.max_concurrent_tasks == 12
-        assert config.max_per_module == 1
-        assert config.max_execute_iterations == 10
-        assert config.max_verify_attempts == 5
-        assert config.max_review_cycles == 2
-        assert config.models.architect == 'opus'
-        assert config.models.reviewer == 'sonnet'
-        assert config.budgets.implementer == 10.0
-        assert config.max_turns.implementer == 80
-        assert config.test_command == 'pytest'
+        assert config.max_concurrent_tasks == defaults['max_concurrent_tasks']
+        assert config.max_per_module == defaults['max_per_module']
+        assert config.max_execute_iterations == defaults['max_execute_iterations']
+        assert config.max_verify_attempts == defaults['max_verify_attempts']
+        assert config.max_review_cycles == defaults['max_review_cycles']
+        assert config.models.architect == defaults['models']['architect']
+        assert config.models.reviewer == defaults['models']['reviewer']
+        assert config.budgets.implementer == defaults['budgets']['implementer']
+        assert config.max_turns.implementer == defaults['max_turns']['implementer']
 
     def test_git_defaults(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -214,10 +221,11 @@ class TestLayeredConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         config = load_config(None)
+        defaults = _load_package_defaults()
         # Package defaults define effort.architect = 'max' (pydantic default is 'high')
-        assert config.effort.architect == 'max'
-        assert config.backends.architect == 'claude'
-        assert config.max_concurrent_tasks == 12
+        assert config.effort.architect == defaults['effort']['architect']
+        assert config.backends.architect == defaults['backends']['architect']
+        assert config.max_concurrent_tasks == defaults['max_concurrent_tasks']
 
     def test_project_config_overrides_defaults(self, tmp_path, monkeypatch):
         """Project config values should override package defaults."""

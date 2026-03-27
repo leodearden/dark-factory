@@ -162,6 +162,8 @@ class AgentStub:
         effort: str | None = None,
         backend: str = 'claude',
         oauth_token: str | None = None,
+        resume_session_id: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> AgentResult:
         """Determine role from system_prompt content, perform side effects."""
         role = self._detect_role(system_prompt)
@@ -326,7 +328,8 @@ class FakeBriefing:
         return f'Plan task: {task.get("title", "")}'
 
     async def build_implementer_prompt(
-        self, plan: dict, iteration_log: list, context: str | None = None
+        self, plan: dict, iteration_log: list, context: str | None = None,
+        rebase_notice: dict | None = None,
     ) -> str:
         return 'Implement the plan'
 
