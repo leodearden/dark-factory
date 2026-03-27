@@ -551,8 +551,6 @@ class TestProjectIdValidation:
 
     @pytest.mark.asyncio
     async def test_recon_context_includes_project_id(self, mock_deps):
-        from unittest.mock import patch
-
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.cli_stage_runner import StageResult
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
@@ -566,13 +564,7 @@ class TestProjectIdValidation:
             captured_kwargs.update(kwargs)
             return StageResult(success=True, report={'summary': 'ok'})
 
-        with (
-            patch.object(stage, 'assemble_payload', side_effect=self._fake_assemble_payload),
-            patch(
-                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                side_effect=capture_run_stage_via_cli,
-            ),
-        ):
+        with self._patch_stage(stage, cli_side_effect=capture_run_stage_via_cli):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id='dark_factory'),
