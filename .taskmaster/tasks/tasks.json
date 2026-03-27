@@ -3423,11 +3423,11 @@
         "description": "partition_burst_state in dashboard/src/dashboard/app.py has several robustness gaps when agent dicts have missing or malformed keys. Fix the implementation and add test coverage.",
         "details": "## Problem\n\n1. `agent['state']` on line 137 is accessed outside any try/except — a missing `state` key raises `KeyError` that propagates as a 500 to the `/partials/recon` endpoint.\n2. The except clause on line 148 catches `(ValueError, TypeError)` but NOT `KeyError`. If `last_write_at` is missing from the dict, `agent['last_write_at']` raises `KeyError`.\n3. No test covers a missing `last_write_at` key, a `None` value for `last_write_at`, or a missing `state` key.\n4. `test_burst_idle_agents_in_html` only checks `'agent-2' in html` — doesn't verify it's paired with `x-show=\"showIdle\"`.\n\n## Fix\n\n1. Use `agent.get('state', 'idle')` instead of `agent['state']` for safe default.\n2. Add `KeyError` to the except tuple: `except (KeyError, ValueError, TypeError): pass`.\n3. Add tests for: missing `last_write_at` key, `last_write_at: None`, missing `state` key.\n4. Strengthen `test_burst_idle_agents_in_html` to assert idle agent rows carry `x-show=\"showIdle\"`.\n\n## Memory hints\n\n- search: \"partition_burst_state burst state dashboard robustness\"\n- search: \"dashboard stability concerns\"",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-27T11:12:20.979Z",
+        "updatedAt": "2026-03-27T11:16:27.226Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/app.py",
@@ -3494,7 +3494,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T11:16:27.130Z",
+      "lastModified": "2026-03-27T11:16:27.229Z",
       "taskCount": 188,
       "completedCount": 140,
       "tags": [
