@@ -52,8 +52,8 @@
       "id": "step-6",
       "type": "impl",
       "description": "Verify all tests pass (step-5 test should already pass given step-2 implementation). Run full dashboard test suite to confirm no regressions in existing TestMorphSwap, TestHtmxTimeout, TestAriaLivePollingsections, or TestIndex tests",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "5eaac9f"
     }
   ],
   "design_decisions": [
