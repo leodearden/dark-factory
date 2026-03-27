@@ -145,10 +145,14 @@ class GraphitiBackend:
             ),
             timeout=self._write_timeout,
         )
-        # Post-write invalidation guard: detect and reverse spurious invalidations
+        # Post-write invalidation guard: detect and reverse spurious invalidations.
+        # The guard is best-effort: failures must never poison a successful write.
         if self.config.graphiti.invalidation_guard_enabled and result is not None:
             guard = InvalidationGuard(self)
-            await guard.guard(result)
+            try:
+                await asyncio.wait_for(guard.guard(result), timeout=self._guard_timeout)
+            except Exception as exc:
+                logger.error('InvalidationGuard failed (non-fatal): %s', exc)
         return result
 
     async def search(

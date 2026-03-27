@@ -659,8 +659,6 @@ class TestGuardExceptionHandling:
     @pytest.mark.asyncio
     async def test_guard_runtime_error_logs_nonfatal_error(self, mock_config):
         """When guard.guard() raises RuntimeError, logger.error is called with 'non-fatal'."""
-        import logging
-
         backend = GraphitiBackend(mock_config)
         fake_result = FakeAddEpisodeResults(nodes=[], edges=[])
         mock_client = MagicMock()
@@ -716,9 +714,7 @@ class TestGuardTimeout:
 
     @pytest.mark.asyncio
     async def test_guard_timeout_error_is_caught_and_result_returned(self, mock_config):
-        """When guard raises asyncio.TimeoutError, add_episode() still returns the result."""
-        import asyncio
-
+        """When guard raises TimeoutError, add_episode() still returns the result."""
         backend = GraphitiBackend(mock_config)
         fake_result = FakeAddEpisodeResults(nodes=[], edges=[])
         mock_client = MagicMock()
@@ -730,7 +726,7 @@ class TestGuardTimeout:
         ) as MockGuardClass:
             mock_guard_instance = MagicMock()
             mock_guard_instance.guard = AsyncMock(
-                side_effect=asyncio.TimeoutError()
+                side_effect=TimeoutError()
             )
             MockGuardClass.return_value = mock_guard_instance
 
