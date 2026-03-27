@@ -1,0 +1,109 @@
+{
+  "task_id": "191",
+  "title": "Handle asyncio.gather orphaned tasks in get_entity error path",
+  "files": [
+    "fused-memory/src/fused_memory/services/memory_service.py",
+    "fused-memory/tests/test_memory_service.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/services",
+    "fused-memory/tests"
+  ],
+  "analysis": "The MemoryService.get_entity() method (memory_service.py:796-829) currently runs two Graphiti read operations sequentially: search_nodes() then search(). These are independent read-only queries that can safely run concurrently. The task is to (1) make them concurrent for performance, and (2) handle the error path properly to avoid orphaned background tasks.\n\nThe codebase already has two established patterns for concurrent async work:\n- asyncio.gather(return_exceptions=True) \u2014 used in task_interceptor.py:110 and durable_queue.py:133 for cleanup/drain scenarios\n- asyncio.wait() with explicit cancellation \u2014 used in the search() method (memory_service.py:648) for cross-store fan-out with timeout\n\nOption (a) \u2014 asyncio.gather(return_exceptions=True) with result inspection \u2014 is the right choice because:\n1. It matches the existing codebase pattern (task_interceptor, durable_queue)\n2. Both coroutines settle cleanly; no orphaned tasks\n3. Under retry-on-failure, no overlapping concurrent calls to the same Graphiti connection pool\n4. Simpler than TaskGroup for this two-call case\n5. Preserves current error semantics (exception re-raised to caller) while ensuring clean teardown\n\nPython 3.11+ TaskGroup (option b) would cancel the sibling on first failure, which is fine for read-only ops but adds a new pattern not yet used in the codebase. Option (c) is N/A since the current code is sequential \u2014 no orphan risk exists yet, but concurrency would introduce it.\n\nThe test file (test_memory_service.py) has no TestGetEntity class. The existing service fixture with mocked graphiti/mem0 backends is the right foundation. Tests will use AsyncMock side_effect to simulate failures and verify both calls settle before any exception propagates.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write test: get_entity returns correct node and edge data on success \u2014 baseline regression test before refactoring to concurrent execution. Uses MockNode/MockEdge from conftest to simulate Graphiti results.",
+      "status": "done",
+      "commit": "f803053"
+    },
+    {
+      "id": "step-2",
+      "type": "test",
+      "description": "Write test: when search_nodes raises an exception, get_entity still raises BUT the sibling search() call is not orphaned (both settle). Use AsyncMock side_effect on search_nodes to raise RuntimeError, verify the exception propagates to the caller.",
+      "status": "done",
+      "commit": "f803053"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write test: when search raises an exception, get_entity still raises BUT the sibling search_nodes() call is not orphaned (both settle). Mirror of step-2 for the other call.",
+      "status": "done",
+      "commit": "f803053"
+    },
+    {
+      "id": "step-4",
+      "type": "test",
+      "description": "Write test: when both search_nodes and search raise exceptions, get_entity raises the first exception. Verifies deterministic error behavior when both concurrent calls fail.",
+      "status": "done",
+      "commit": "f803053"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write test: verify get_entity runs both calls concurrently (not sequentially). Use asyncio.Event gates in side_effects \u2014 each call sets its own event and waits on the other's. If sequential, this deadlocks; if concurrent, both proceed. Use asyncio.wait_for with a short timeout to detect deadlock.",
+      "status": "done",
+      "commit": "f803053"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Refactor get_entity to use asyncio.gather(search_nodes_coro, search_coro, return_exceptions=True). After gather, inspect results: if any is an Exception instance, log a warning and raise the first exception found. Otherwise unpack nodes/edges from the result tuple. This makes tests from steps 1-5 pass.",
+      "status": "done",
+      "commit": "9e76090"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write test: error logging \u2014 when one call fails, verify logger.warning is called with a message mentioning the failed operation. Ensures observability of partial failures before re-raise.",
+      "status": "done",
+      "commit": "4a7c2df"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Add structured warning log in the error inspection path: log which call(s) failed and the exception message before re-raising. Make step-7 test pass.",
+      "status": "done",
+      "commit": "4a7c2df"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use asyncio.gather(return_exceptions=True) over TaskGroup",
+      "rationale": "TaskGroup (Python 3.11+) auto-cancels siblings on first failure, which is correct but unnecessary for two read-only queries. gather(return_exceptions=True) ensures both settle cleanly and matches the existing codebase pattern (task_interceptor.py:110, durable_queue.py:133). It also avoids introducing a new concurrency primitive not yet used anywhere in the project."
+    },
+    {
+      "decision": "Re-raise exception rather than return partial results",
+      "rationale": "Current get_entity has no partial-result semantics \u2014 callers expect either a full dict with nodes+edges or an exception. Changing to partial results would alter the API contract. The stability goal is to prevent orphaned tasks, not change error semantics. Both calls hit the same Graphiti backend, so a single failure likely indicates backend issues that would affect both."
+    },
+    {
+      "decision": "No timeout wrapper on get_entity (unlike search)",
+      "rationale": "The search() method uses asyncio.wait with search_timeout because it fans out across different backends (Graphiti + Mem0). get_entity only calls a single backend (Graphiti) which has its own connection-level timeouts. Adding a method-level timeout would be a separate concern and not part of this task's scope."
+    },
+    {
+      "decision": "Concurrency test uses asyncio.Event gates rather than timing checks",
+      "rationale": "Timing-based concurrency tests are flaky. Using Event gates creates a deterministic deadlock-or-pass scenario: if calls are sequential, the first call blocks waiting for the second's event (which never fires because the second hasn't started), causing a timeout. If concurrent, both start and unblock each other."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "service fixture with mocked backends",
+      "where": "fused-memory/tests/test_memory_service.py, lines 12-39",
+      "how": "Reuse the existing `service` fixture which provides a MemoryService with mocked graphiti.search_nodes and graphiti.search AsyncMocks. All new tests go in a new TestGetEntity class using this fixture."
+    },
+    {
+      "what": "MockNode and MockEdge dataclasses",
+      "where": "fused-memory/tests/conftest.py, lines 19-37",
+      "how": "Use MockNode/MockEdge to create realistic Graphiti return values for the success-path test."
+    },
+    {
+      "what": "asyncio.gather(return_exceptions=True) pattern",
+      "where": "fused-memory/src/fused_memory/middleware/task_interceptor.py:110, fused-memory/src/fused_memory/services/durable_queue.py:133",
+      "how": "Follow the same pattern: gather with return_exceptions=True, iterate results, check isinstance(result, Exception). The existing drain() in task_interceptor logs and continues; get_entity will log and re-raise."
+    }
+  ],
+  "_session_id": "191-ab3dbf33",
+  "_created_at": "2026-03-27T05:02:49.200161+00:00"
+}
