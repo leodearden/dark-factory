@@ -1,6 +1,7 @@
 """Tests for reconciliation stage configuration (CLI-native MCP execution)."""
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -64,7 +65,6 @@ class TestStageSubclasses:
 
     @pytest.fixture
     def mock_deps(self, config):
-        from unittest.mock import AsyncMock
         return {
             'memory_service': AsyncMock(),
             'taskmaster': AsyncMock(),
@@ -250,8 +250,6 @@ class TestPerStageReportSchema:
 
     @pytest.fixture
     def mock_deps(self):
-        from unittest.mock import AsyncMock
-
         from fused_memory.config.schema import ReconciliationConfig
         config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
         return {
@@ -282,8 +280,6 @@ class TestMcpConfig:
 
     @pytest.fixture
     def stage(self):
-        from unittest.mock import AsyncMock
-
         from fused_memory.models.reconciliation import StageId
         from fused_memory.reconciliation.stages.base import BaseStage
         config = ReconciliationConfig(explore_codebase_root='/tmp/test')
@@ -328,8 +324,6 @@ class TestTaskKnowledgeSyncPayload:
 
     @pytest.fixture
     def mock_deps(self):
-        from unittest.mock import AsyncMock
-
         from fused_memory.config.schema import ReconciliationConfig
         config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
         return {
@@ -423,8 +417,6 @@ class TestProjectIdValidation:
 
     @pytest.fixture
     def mock_deps(self):
-        from unittest.mock import AsyncMock
-
         from fused_memory.config.schema import ReconciliationConfig
         config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
         return {
@@ -585,9 +577,8 @@ class TestProjectIdValidation:
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
-    def test_default_limits(self):
-        from unittest.mock import AsyncMock
-
+    def test_tier_limits_with_default_class_values(self):
+        """MemoryConsolidator class defaults (500/1000) match opus tier, not ReconciliationConfig sonnet defaults (125/250)."""
         from fused_memory.models.reconciliation import StageId
         config = ReconciliationConfig()
         stage = MemoryConsolidator(
@@ -597,9 +588,8 @@ class TestTierConfig:
         assert stage.episode_limit == 500
         assert stage.memory_limit == 1000
 
-    def test_sonnet_tier_limits(self):
-        from unittest.mock import AsyncMock
-
+    def test_limits_are_mutable(self):
+        """episode_limit and memory_limit are mutable — the harness sets them from TierConfig before each run."""
         from fused_memory.models.reconciliation import StageId
         config = ReconciliationConfig()
         stage = MemoryConsolidator(
