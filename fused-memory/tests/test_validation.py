@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fused_memory.utils.validation import validate_project_id
+from fused_memory.utils.validation import validate_project_id, validate_project_root
 
 
 class TestValidateProjectId:
@@ -94,3 +94,66 @@ class TestValidateProjectId:
         result = validate_project_id('\t')
         assert result is not None
         assert result.get('error_type') == 'ValidationError'
+
+
+class TestValidateProjectRoot:
+    """Unit tests for validate_project_root path validation."""
+
+    # --- Valid: non-empty absolute paths ---
+
+    def test_accepts_root_slash(self):
+        """The filesystem root is a valid absolute path."""
+        assert validate_project_root('/') is None
+
+    def test_accepts_absolute_path(self):
+        """A typical absolute path should pass without error."""
+        assert validate_project_root('/home/user/myproject') is None
+
+    def test_accepts_deep_absolute_path(self):
+        """Deep nested absolute paths are valid."""
+        assert validate_project_root('/opt/workspace/dark-factory/fused-memory') is None
+
+    # --- Invalid: empty or relative paths ---
+
+    def test_rejects_empty_string(self):
+        """Empty string must return an error dict."""
+        result = validate_project_root('')
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'project_root' in result.get('error', '').lower()
+
+    def test_rejects_relative_path(self):
+        """Relative paths are not valid project roots."""
+        result = validate_project_root('relative/path')
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'project_root' in result.get('error', '').lower()
+
+    def test_rejects_dot_relative_path(self):
+        """Dot-prefixed relative paths are not valid project roots."""
+        result = validate_project_root('./local/path')
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_rejects_parent_relative_path(self):
+        """Double-dot relative paths are not valid project roots."""
+        result = validate_project_root('../parent/path')
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    # --- Error dict shape ---
+
+    def test_error_dict_has_required_keys(self):
+        """Error dict must contain both 'error' and 'error_type' keys."""
+        result = validate_project_root('not/absolute')
+        assert result is not None
+        assert 'error' in result
+        assert 'error_type' in result
+        assert result['error_type'] == 'ValidationError'
+
+    def test_error_message_includes_bad_value(self):
+        """Error message should include the bad value for diagnostics."""
+        bad_value = 'my/relative/path'
+        result = validate_project_root(bad_value)
+        assert result is not None
+        assert bad_value in result.get('error', '')
