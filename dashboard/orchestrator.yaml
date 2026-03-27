@@ -38,7 +38,7 @@ max_turns:
   merger: 50
 
 # Verification commands
-test_command: "uv run --project dashboard --directory dashboard pytest tests/"
+test_command: "uv run --project dashboard --directory dashboard pytest tests/ --tb=short -q"
 lint_command: "uv run --project dashboard --directory dashboard ruff check src/ tests/"
 type_check_command: "uv run --project dashboard --directory dashboard pyright src/ tests/"
 

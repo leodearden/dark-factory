@@ -21,27 +21,48 @@
     <!-- Burst State -->
     <div class="bg-gray-800 rounded-lg p-6">
       <h3 class="text-lg font-semibold text-gray-100 mb-4">Burst State</h3>
-      {% if burst_state %}
-        <table class="w-full text-sm">
-          <thead>
-            <tr class="text-gray-400 border-b border-gray-700">
-              <th class="text-left pb-2">Agent</th>
-              <th class="text-left pb-2">State</th>
-              <th class="text-left pb-2">Last Write</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for agent in burst_state %}
-              <tr class="border-b border-gray-700">
-                <td class="py-2 text-gray-100">{{ agent.agent_id }}</td>
-                <td class="py-2">
-                  {{ status_badge(agent.state, aria_label='Burst state') }}
-                </td>
-                <td class="py-2 text-gray-400">{{ agent.last_write_at | timeago }}</td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
+      {% if active_agents or idle_agents %}
+        <div x-data="{ showIdle: false }">
+          <div class="max-h-64 overflow-y-auto">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="text-gray-400 border-b border-gray-700">
+                  <th class="text-left pb-2">Agent</th>
+                  <th class="text-left pb-2">State</th>
+                  <th class="text-left pb-2">Last Write</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for agent in active_agents %}
+                  <tr class="border-b border-gray-700">
+                    <td class="py-2 text-gray-100">{{ agent.agent_id }}</td>
+                    <td class="py-2">
+                      {{ status_badge(agent.state, aria_label='Burst state') }}
+                    </td>
+                    <td class="py-2 text-gray-400">{{ agent.last_write_at | timeago }}</td>
+                  </tr>
+                {% endfor %}
+                {% for agent in idle_agents %}
+                  <tr class="border-b border-gray-700" x-show="showIdle" x-cloak>
+                    <td class="py-2 text-gray-100">{{ agent.agent_id }}</td>
+                    <td class="py-2">
+                      {{ status_badge(agent.state, aria_label='Burst state') }}
+                    </td>
+                    <td class="py-2 text-gray-400">{{ agent.last_write_at | timeago }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% if idle_agents %}
+            <button @click="showIdle = !showIdle"
+                    class="mt-3 text-sm text-gray-400 hover:text-gray-200 cursor-pointer"
+                    data-testid="idle-toggle">
+              <span x-text="showIdle ? 'Hide' : 'Show'"></span>
+              {{ idle_agents | length }} idle agent{{ 's' if idle_agents | length != 1 else '' }}
+            </button>
+          {% endif %}
+        </div>
       {% else %}
         <p class="text-gray-400">No agents</p>
       {% endif %}
