@@ -2895,10 +2895,11 @@
         "description": "In `memory_service.py:get_entity()`, `asyncio.gather` is used without `return_exceptions=True` and without cancelling sibling tasks on failure. When one task (e.g. `search_nodes`) raises, the other (`search`) continues as an orphaned background task, holding connections/resources until it completes or the event loop tears down. Under repeated error conditions this accumulates uncollected tasks.\n\nFix: Wrap in explicit tasks with try/except cancel, or use `asyncio.TaskGroup` (Python 3.11+):\n\n```python\ntask_nodes = asyncio.ensure_future(self.graphiti.search_nodes(...))\ntask_edges = asyncio.ensure_future(self.graphiti.search(...))\ntry:\n    nodes, edges = await asyncio.gather(task_nodes, task_edges)\nexcept Exception:\n    task_nodes.cancel()\n    task_edges.cancel()\n    raise\n```\n\nAlso update the test `test_error_propagation_search_nodes_raises` to verify the sibling task is cancelled (not just that the exception propagates).\n\n## memory_hints\n- search: \"asyncio.gather get_entity memory_service structured concurrency\"\n- search: \"orphaned background tasks resource leak\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-27T05:15:20.368Z"
       },
       {
         "id": "193",
@@ -2961,7 +2962,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T05:15:20.058Z",
+      "lastModified": "2026-03-27T05:15:20.368Z",
       "taskCount": 176,
       "completedCount": 133,
       "tags": [
