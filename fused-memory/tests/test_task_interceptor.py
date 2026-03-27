@@ -275,21 +275,15 @@ async def test_ensure_taskmaster_error_propagates(event_buffer):
 
 
 @pytest.mark.asyncio
-async def test_set_task_status_rejects_done_to_blocked(taskmaster, reconciler, event_buffer):
-    """Interceptor rejects done->blocked transitions without calling taskmaster."""
+async def test_set_task_status_allows_done_to_blocked(taskmaster, reconciler, event_buffer):
+    """Transitions from terminal states (done->blocked) are allowed."""
     taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status('1', 'blocked', '/project')
 
-    # Taskmaster.set_task_status must NOT have been called
-    taskmaster.set_task_status.assert_not_called()
-    # Result contains an error indicator
-    assert result.get('success') is False
-    assert 'error' in result
-    # No event should be buffered
-    stats = await event_buffer.get_buffer_stats('project')
-    assert stats['size'] == 0
+    taskmaster.set_task_status.assert_called_once()
+    assert 'error' not in result
 
 
 @pytest.mark.asyncio
@@ -503,13 +497,13 @@ async def test_no_committer_still_works(taskmaster, event_buffer):
 
 
 @pytest.mark.asyncio
-async def test_terminal_state_rejection_no_commit(taskmaster, reconciler, event_buffer, committer):
-    """Terminal state guard (done->blocked) should not schedule a commit."""
+async def test_terminal_state_transition_commits(taskmaster, reconciler, event_buffer, committer):
+    """Transitions from terminal states (done->blocked) schedule a commit."""
     taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, committer)
     result = await interceptor.set_task_status('1', 'blocked', '/project')
-    assert result.get('success') is False
-    committer.commit.assert_not_called()
+    assert 'error' not in result
+    committer.commit.assert_called_once()
 
 
 # ── Tests for bulk ops awaiting commit (not fire-and-forget) ─────────

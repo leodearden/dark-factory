@@ -131,19 +131,7 @@ class TaskInterceptor:
         if status == old_status:
             return {'success': True, 'no_op': True, 'task_id': task_id}
 
-        # 3. Terminal state guard (defense in depth)
-        _TERMINAL = frozenset({'done', 'cancelled'})
-        if old_status in _TERMINAL and status != old_status:
-            logger.warning(
-                'Task %s: rejecting %s->%s (terminal state)', task_id, old_status, status
-            )
-            return {
-                'success': False,
-                'error': f'Cannot transition from terminal status {old_status!r} to {status!r}',
-                'task_id': task_id,
-            }
-
-        # 4. Execute status change
+        # 3. Execute status change
         result = await tm.set_task_status(task_id, status, project_root, tag)
 
         # 5. Emit event
