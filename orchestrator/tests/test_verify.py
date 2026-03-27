@@ -9,6 +9,7 @@ from orchestrator.verify import (
     _build_fallback_config,
     _run_cmd,
     _scope_command,
+    _strip_directory_flag,
     run_scoped_verification,
     run_verification,
     scope_module_config,
@@ -343,6 +344,37 @@ class TestScopeCommand:
 # ---------------------------------------------------------------------------
 
 
+class TestStripDirectoryFlag:
+    """Tests for _strip_directory_flag(cmd, module_prefix)."""
+
+    def test_strips_space_separated(self):
+        """--directory prefix with space is removed."""
+        cmd = 'uv run --project orch --directory orch ruff check f.py'
+        assert _strip_directory_flag(cmd, 'orch') == 'uv run --project orch ruff check f.py'
+
+    def test_strips_equals_separated(self):
+        """--directory=prefix is removed."""
+        cmd = 'uv run --project orch --directory=orch ruff check f.py'
+        assert _strip_directory_flag(cmd, 'orch') == 'uv run --project orch ruff check f.py'
+
+    def test_returns_none_for_none(self):
+        assert _strip_directory_flag(None, 'orch') is None
+
+    def test_no_directory_flag_unchanged(self):
+        cmd = 'uv run --project orch ruff check f.py'
+        assert _strip_directory_flag(cmd, 'orch') == cmd
+
+    def test_cleans_double_spaces(self):
+        cmd = 'uv run  --directory orch  ruff check f.py'
+        result = _strip_directory_flag(cmd, 'orch')
+        assert result is not None
+        assert '  ' not in result
+
+    def test_flag_at_end_of_string(self):
+        cmd = 'uv run --directory orch'
+        assert _strip_directory_flag(cmd, 'orch') == 'uv run'
+
+
 class TestScopeModuleConfig:
     """Tests for scope_module_config(mc, task_files)."""
 
@@ -354,43 +386,54 @@ class TestScopeModuleConfig:
             test_command='uv run --project orchestrator --directory orchestrator pytest tests/ --tb=short -q',
         )
 
-    def test_strips_prefix_and_scopes_files(self):
-        """Task files with matching prefix are stripped of prefix before scoping."""
+    def test_keeps_prefix_and_scopes_files(self):
+        """Task files keep their full worktree-relative path in scoped commands."""
         mc = self._make_mc()
         result = scope_module_config(mc, ['orchestrator/src/orchestrator/verify.py'])
-        # The command should contain the stripped path
         assert result.lint_command is not None
-        assert 'src/orchestrator/verify.py' in result.lint_command
+        assert 'orchestrator/src/orchestrator/verify.py' in result.lint_command
         # Should NOT contain the original directory args
         assert 'src/ tests/' not in result.lint_command
+
+    def test_strips_directory_flag_from_scoped_commands(self):
+        """--directory is removed from scoped commands since paths are worktree-relative."""
+        mc = self._make_mc()
+        result = scope_module_config(mc, ['orchestrator/src/orchestrator/verify.py'])
+        assert result.lint_command is not None
+        assert result.type_check_command is not None
+        assert '--directory' not in result.lint_command
+        assert '--directory' not in result.type_check_command
+        # --project is preserved for venv resolution
+        assert '--project orchestrator' in result.lint_command
+        assert '--project orchestrator' in result.type_check_command
 
     def test_classifies_test_files_by_test_prefix(self):
         """Files with test_ prefix are classified as test files."""
         mc = self._make_mc()
         result = scope_module_config(mc, ['orchestrator/tests/test_verify.py'])
         assert result.test_command is not None
-        assert 'tests/test_verify.py' in result.test_command
+        assert 'orchestrator/tests/test_verify.py' in result.test_command
 
     def test_classifies_test_files_by_suffix(self):
         """Files ending in _test.py are classified as test files."""
         mc = self._make_mc()
         result = scope_module_config(mc, ['orchestrator/tests/verify_test.py'])
         assert result.test_command is not None
-        assert 'tests/verify_test.py' in result.test_command
+        assert 'orchestrator/tests/verify_test.py' in result.test_command
 
     def test_classifies_conftest_as_test_file(self):
         """conftest.py is classified as a test file."""
         mc = self._make_mc()
         result = scope_module_config(mc, ['orchestrator/tests/conftest.py'])
         assert result.test_command is not None
-        assert 'tests/conftest.py' in result.test_command
+        assert 'orchestrator/tests/conftest.py' in result.test_command
 
     def test_classifies_tests_dir_as_test_file(self):
         """Files under /tests/ directory are classified as test files."""
         mc = self._make_mc()
         result = scope_module_config(mc, ['orchestrator/tests/helpers/util.py'])
         assert result.test_command is not None
-        assert 'tests/helpers/util.py' in result.test_command
+        assert 'orchestrator/tests/helpers/util.py' in result.test_command
 
     def test_test_command_none_when_no_test_files(self):
         """No test files in task_files → test_command is None."""
@@ -420,10 +463,10 @@ class TestScopeModuleConfig:
         ]
         result = scope_module_config(mc, task_files)
         assert result.lint_command is not None
-        assert 'src/orchestrator/verify.py' in result.lint_command
-        assert 'tests/test_verify.py' in result.lint_command
+        assert 'orchestrator/src/orchestrator/verify.py' in result.lint_command
+        assert 'orchestrator/tests/test_verify.py' in result.lint_command
         assert result.test_command is not None
-        assert 'tests/test_verify.py' in result.test_command
+        assert 'orchestrator/tests/test_verify.py' in result.test_command
 
 
 # ---------------------------------------------------------------------------

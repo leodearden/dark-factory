@@ -55,34 +55,55 @@ def _is_test_file(path: str) -> bool:
     )
 
 
+def _strip_directory_flag(cmd: str | None, module_prefix: str) -> str | None:
+    """Remove ``--directory <module_prefix>`` from a ``uv run`` command.
+
+    When scoping to worktree-relative file paths, the ``--directory`` flag
+    would cause tools to resolve paths relative to the module subdirectory,
+    leading to double-prefixed paths that don't exist.  The ``--project``
+    flag is kept so ``uv`` still activates the correct venv.
+    """
+    if cmd is None:
+        return None
+    cmd = cmd.replace(f'--directory {module_prefix} ', '')
+    cmd = cmd.replace(f'--directory={module_prefix} ', '')
+    # Handle flag at end of string (no trailing space)
+    cmd = cmd.replace(f'--directory {module_prefix}', '')
+    cmd = cmd.replace(f'--directory={module_prefix}', '')
+    return ' '.join(cmd.split())
+
+
 def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig:
     """Narrow *mc*'s commands to the specific *task_files* it covers.
 
-    Filters *task_files* to those matching ``mc.prefix + '/'``, strips the
-    prefix, then calls :func:`_scope_command` to replace broad path args with
-    the specific files.
+    Filters *task_files* to ``.py`` files matching ``mc.prefix + '/'`` and
+    keeps full worktree-relative paths.  The ``--directory`` flag is stripped
+    from scoped commands so that tools resolve paths from the worktree root,
+    where the full paths are valid.
 
     Returns the original *mc* when no ``.py`` files from *task_files* fall
     under the prefix.
     """
     prefix = mc.prefix + '/'
-    # Strip prefix and filter to .py files
+    # Keep full worktree-relative paths, filter to .py files under this module
     scoped: list[str] = []
     for f in task_files:
-        if f.startswith(prefix):
-            stripped = f[len(prefix):]
-            if stripped.endswith('.py'):
-                scoped.append(stripped)
+        if f.startswith(prefix) and f.endswith('.py'):
+            scoped.append(f)
 
     if not scoped:
         return mc
 
     test_files = [f for f in scoped if _is_test_file(f)]
 
-    # Build scoped commands; None when no applicable files exist
-    lint_cmd = _scope_command(mc.lint_command, 'ruff check', scoped)
-    type_cmd = _scope_command(mc.type_check_command, 'pyright', scoped)
-    test_cmd = _scope_command(mc.test_command, 'pytest', test_files) if test_files else None
+    # Build scoped commands with worktree-relative paths, then strip
+    # --directory so tools resolve paths from the worktree root
+    lint_cmd = _strip_directory_flag(
+        _scope_command(mc.lint_command, 'ruff check', scoped), mc.prefix)
+    type_cmd = _strip_directory_flag(
+        _scope_command(mc.type_check_command, 'pyright', scoped), mc.prefix)
+    test_cmd = _strip_directory_flag(
+        _scope_command(mc.test_command, 'pytest', test_files), mc.prefix) if test_files else None
 
     return ModuleConfig(
         prefix=mc.prefix,
