@@ -221,3 +221,149 @@ class TestDetectSpuriousInvalidations:
         spurious = detect_spurious_invalidations(results)
         assert len(spurious) == 1
         assert spurious[0].uuid == 'edge-spurious'
+
+
+# ---------------------------------------------------------------------------
+# Step-7 / Step-8: restore_edge_validity() — single-edge Cypher clear
+# ---------------------------------------------------------------------------
+
+
+class TestRestoreEdgeValidity:
+    """GraphitiBackend.restore_edge_validity() executes correct Cypher."""
+
+    @pytest.mark.asyncio
+    async def test_restore_edge_validity_executes_set_null_cypher(self, mock_config):
+        """restore_edge_validity() runs SET e.invalid_at = NULL, e.expired_at = NULL Cypher."""
+        backend = GraphitiBackend(mock_config)
+        mock_graph = MagicMock()
+        mock_graph.query = AsyncMock(return_value=MagicMock(result_set=[]))
+        mock_driver = MagicMock()
+        mock_driver._get_graph = MagicMock(return_value=mock_graph)
+        mock_client = MagicMock()
+        mock_client.driver = mock_driver
+        backend.client = mock_client
+
+        await backend.restore_edge_validity('edge-uuid-123')
+
+        mock_graph.query.assert_called_once()
+        call_args = mock_graph.query.call_args
+        cypher = call_args[0][0]
+        params = call_args[0][1]
+
+        assert 'RELATES_TO' in cypher
+        assert 'invalid_at' in cypher
+        assert 'expired_at' in cypher
+        assert 'NULL' in cypher.upper() or 'null' in cypher or 'None' in cypher
+        assert params.get('uuid') == 'edge-uuid-123'
+
+    @pytest.mark.asyncio
+    async def test_restore_edge_validity_passes_uuid_as_param(self, mock_config):
+        """The edge UUID is passed as a query parameter, not interpolated."""
+        backend = GraphitiBackend(mock_config)
+        mock_graph = MagicMock()
+        mock_graph.query = AsyncMock(return_value=MagicMock(result_set=[]))
+        mock_driver = MagicMock()
+        mock_driver._get_graph = MagicMock(return_value=mock_graph)
+        mock_client = MagicMock()
+        mock_client.driver = mock_driver
+        backend.client = mock_client
+
+        await backend.restore_edge_validity('specific-edge-uuid')
+
+        params = mock_graph.query.call_args[0][1]
+        assert params['uuid'] == 'specific-edge-uuid'
+
+
+# ---------------------------------------------------------------------------
+# Step-9 / Step-10: bulk_restore_edge_validity() — batch Cypher update
+# ---------------------------------------------------------------------------
+
+
+class TestBulkRestoreEdgeValidity:
+    """GraphitiBackend.bulk_restore_edge_validity() handles multiple UUIDs."""
+
+    @pytest.mark.asyncio
+    async def test_bulk_restore_returns_count_of_matching_edges(self, mock_config):
+        """bulk_restore_edge_validity() returns count of edges actually found."""
+        backend = GraphitiBackend(mock_config)
+        mock_graph = MagicMock()
+        # pre-count query returns 2, update query returns empty
+        mock_graph.query = AsyncMock(
+            side_effect=[
+                MagicMock(result_set=[[2]]),  # count query
+                MagicMock(result_set=[]),     # update query
+            ]
+        )
+        mock_driver = MagicMock()
+        mock_driver._get_graph = MagicMock(return_value=mock_graph)
+        mock_client = MagicMock()
+        mock_client.driver = mock_driver
+        backend.client = mock_client
+
+        count = await backend.bulk_restore_edge_validity(['uuid-1', 'uuid-2', 'uuid-3'])
+        assert count == 2
+
+    @pytest.mark.asyncio
+    async def test_bulk_restore_empty_list_returns_zero_without_query(self, mock_config):
+        """bulk_restore_edge_validity([]) returns 0 without executing any query."""
+        backend = GraphitiBackend(mock_config)
+        mock_graph = MagicMock()
+        mock_graph.query = AsyncMock()
+        mock_driver = MagicMock()
+        mock_driver._get_graph = MagicMock(return_value=mock_graph)
+        mock_client = MagicMock()
+        mock_client.driver = mock_driver
+        backend.client = mock_client
+
+        count = await backend.bulk_restore_edge_validity([])
+        assert count == 0
+        mock_graph.query.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bulk_restore_executes_set_null_cypher(self, mock_config):
+        """bulk_restore_edge_validity() uses SET Cypher to clear invalid_at and expired_at."""
+        backend = GraphitiBackend(mock_config)
+        mock_graph = MagicMock()
+        mock_graph.query = AsyncMock(
+            side_effect=[
+                MagicMock(result_set=[[1]]),
+                MagicMock(result_set=[]),
+            ]
+        )
+        mock_driver = MagicMock()
+        mock_driver._get_graph = MagicMock(return_value=mock_graph)
+        mock_client = MagicMock()
+        mock_client.driver = mock_driver
+        backend.client = mock_client
+
+        await backend.bulk_restore_edge_validity(['uuid-X'])
+
+        # The second call (update query) should set both fields to NULL
+        update_call = mock_graph.query.call_args_list[1]
+        update_cypher = update_call[0][0]
+        assert 'invalid_at' in update_cypher
+        assert 'expired_at' in update_cypher
+
+    @pytest.mark.asyncio
+    async def test_bulk_restore_passes_uuids_as_param(self, mock_config):
+        """UUID list is passed as a query parameter."""
+        backend = GraphitiBackend(mock_config)
+        mock_graph = MagicMock()
+        uuids = ['uuid-1', 'uuid-2']
+        mock_graph.query = AsyncMock(
+            side_effect=[
+                MagicMock(result_set=[[2]]),
+                MagicMock(result_set=[]),
+            ]
+        )
+        mock_driver = MagicMock()
+        mock_driver._get_graph = MagicMock(return_value=mock_graph)
+        mock_client = MagicMock()
+        mock_client.driver = mock_driver
+        backend.client = mock_client
+
+        await backend.bulk_restore_edge_validity(uuids)
+
+        # First call is the count query — check it uses $uuids param
+        count_call = mock_graph.query.call_args_list[0]
+        assert count_call[0][1].get('uuids') == uuids
