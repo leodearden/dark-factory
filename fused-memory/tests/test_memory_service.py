@@ -1017,3 +1017,28 @@ class TestSerializeTemporal:
         assert result is not None
         assert result['valid_at'] is None
         assert result['invalid_at'] == '2024-09-01T00:00:00+00:00'
+
+    def test_string_input_uses_str_fallback(self):
+        """Raw ISO 8601 strings pass through str() instead of raising AttributeError.
+
+        Graphiti may return temporal values as pre-serialized strings rather than
+        datetime objects. _serialize_temporal must not call .isoformat() on a string.
+        """
+        iso_valid = '2024-01-15T12:00:00+00:00'
+        iso_invalid = '2024-06-15T12:00:00+00:00'
+        result = _serialize_temporal(iso_valid, iso_invalid)
+        assert result is not None
+        assert result['valid_at'] == iso_valid
+        assert result['invalid_at'] == iso_invalid
+
+    def test_integer_timestamp_uses_str_fallback(self):
+        """Integer timestamps pass through str() instead of raising AttributeError.
+
+        If a caller passes an integer Unix timestamp, _serialize_temporal must not
+        call .isoformat() on it. str(int) is returned as the fallback.
+        """
+        ts = 1705320000
+        result = _serialize_temporal(ts, None)
+        assert result is not None
+        assert result['valid_at'] == str(ts)
+        assert result['invalid_at'] is None

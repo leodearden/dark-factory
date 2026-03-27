@@ -57,8 +57,8 @@ def _serialize_temporal(
     if not valid_at and not invalid_at:
         return None
     return {
-        'valid_at': valid_at.isoformat() if valid_at else None,
-        'invalid_at': invalid_at.isoformat() if invalid_at else None,
+        'valid_at': valid_at.isoformat() if hasattr(valid_at, 'isoformat') else str(valid_at) if valid_at else None,
+        'invalid_at': invalid_at.isoformat() if hasattr(invalid_at, 'isoformat') else str(invalid_at) if invalid_at else None,
     }
 
 
