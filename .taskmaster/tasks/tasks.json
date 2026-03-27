@@ -3513,11 +3513,11 @@
         "description": "The Watermark model (reconciliation.py:135) declares `project_id: str` with no Pydantic validator, allowing whitespace-only strings to pass construction. This forces BaseStage.run() to compensate with strip()/skip logic, creates asymmetric error handling (ValueError for stage.project_id vs silent DEBUG for watermark.project_id), and risks SQL corruption in journal.py save_watermark where project_id is the UPSERT key.\n\nFix:\n1. Add a `@field_validator('project_id')` to Watermark that strips whitespace and normalizes whitespace-only values to empty string (the legitimate 'no project' sentinel).\n2. Simplify the base.py:97-107 guard — with model-level normalization, the strip() checks become redundant. Extract to a local variable and use plain `else:` instead of the logically equivalent `elif`.\n3. Consider whether asymmetric handling (ValueError for stage vs DEBUG for watermark) is intentional. If whitespace-only watermark project_id is a caller bug, raise ValueError consistently. If empty watermarks are a valid bootstrap case, document the contract.\n\nmemory_hints:\n- search: \"Watermark model project_id validation base.py\"\n- search: \"task 194 validation asymmetry edge cases\"",
         "details": "Files: fused-memory/src/fused_memory/models/reconciliation.py, fused-memory/src/fused_memory/reconciliation/stages/base.py, fused-memory/src/fused_memory/reconciliation/journal.py\n\nSource: review suggestions from task 194 (esc-194-4), suggestions 3/4/5/8/15/17.\n\nKey risk: journal.py:200 uses watermark.project_id as SQL UPSERT key. An empty/whitespace project_id would corrupt the watermarks table. Model-level validation prevents this.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-27T23:30:34.417Z",
+        "updatedAt": "2026-03-27T23:30:58.345Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/models",
@@ -3676,9 +3676,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T23:30:34.452Z",
+      "lastModified": "2026-03-27T23:30:58.345Z",
       "taskCount": 194,
-      "completedCount": 148,
+      "completedCount": 149,
       "tags": [
         "master"
       ]
