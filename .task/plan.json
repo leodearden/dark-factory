@@ -13,7 +13,7 @@
     "fused-memory/src/fused_memory/config",
     "fused-memory/tests"
   ],
-  "analysis": "## Root Cause\n\nGraphiti's `resolve_extracted_edges()` in `graphiti_core/utils/maintenance/edge_operations.py` (lines 298-309) gathers invalidation candidates via a **broad semantic search** with an empty `SearchFilters()` — no entity-node filtering. When an episode about Task 481 is written, edge extraction produces facts like 'Task 481 has status in-progress'. The semantic search retrieves ALL similar edges including 'Task 208 has status in-progress' because they share 'task status' semantics.\n\nThe `related_edges` (duplicate candidates) ARE properly scoped via `EntityEdge.get_between_nodes()` — they only include edges between the same source/target entity nodes. But the `edge_invalidation_candidates` use EDGE_HYBRID_SEARCH_RRF with no entity filtering.\n\nThese unfiltered candidates go to the LLM via `dedupe_edges.resolve_edge()` which only sees fact text (no entity information). The small model (gpt-4o-mini) may judge 'Task 481 is in-progress' and 'Task 208 is in-progress' as contradictory, then `resolve_edge_contradictions()` temporally invalidates the older edge.\n\n## Solution: Post-Write Invalidation Guard\n\nSince `graphiti_core` is a third-party library, we cannot modify the invalidation candidate search directly. Instead, we add a **post-write validation layer** in fused-memory that detects and reverses spurious invalidations.\n\nThe guard inspects `AddEpisodeResults` after each `add_episode()` call:\n- `results.nodes` = entity nodes extracted from the episode\n- `results.edges` = `resolved_edges + invalidated_edges`\n- Invalidated edges have `expired_at` set to ~now\n- For each invalidated edge, check if its source/target entity UUIDs overlap with the episode's entity UUIDs\n- If NO overlap → spurious invalidation → restore by clearing `invalid_at`/`expired_at` via Cypher\n\n## Key Insight\n\nNew edges (resolved from episode extraction) always connect entities in `results.nodes`. Invalidated edges may connect entities NOT in `results.nodes`. If an invalidated edge shares NO entity endpoint with the episode's entities, the invalidation was driven purely by surface-level semantic similarity, not by actual factual contradiction about the same entities.",
+  "analysis": "## Root Cause\n\nGraphiti's `resolve_extracted_edges()` in `graphiti_core/utils/maintenance/edge_operations.py` (lines 298-309) gathers invalidation candidates via a **broad semantic search** with an empty `SearchFilters()` — no entity-node filtering. When an episode about Task 481 is written, edge extraction produces facts like 'Task 481 has status in-progress'. The semantic search retrieves ALL similar edges including 'Task 208 has status in-progress' because they share 'task status' semantics.\n\nThe `related_edges` (duplicate candidates) ARE properly scoped via `EntityEdge.get_between_nodes()` — they only include edges between the same source/target entity nodes. But the `edge_invalidation_candidates` use EDGE_HYBRID_SEARCH_RRF with no entity filtering.\n\nThese unfiltered candidates go to the LLM via `dedupe_edges.resolve_edge()` which only sees fact text (no entity information). The small model (gpt-4o-mini) may judge 'Task 481 is in-progress' and 'Task 208 is in-progress' as contradictory, then `resolve_edge_contradictions()` temporally invalidates the older edge.\n\n## Solution: Post-Write Invalidation Guard\n\nSince `graphiti_core` is a third-party library, we cannot modify the invalidation candidate search directly. Instead, we add a **post-write validation layer** in fused-memory that detects and reverses spurious invalidations.\n\nThe guard inspects `AddEpisodeResults` after each `add_episode()` call:\n- `results.nodes` = entity nodes extracted from the episode\n- `results.edges` = `resolved_edges + invalidated_edges`\n- Invalidated edges have `expired_at` set to ~now\n- For each invalidated edge, check if its source/target entity UUIDs overlap with the episode's entity UUIDs\n- If NO overlap → spurious invalidation → restore by clearing `invalid_at`/`expired_at` via Cypher\n\n## Key Insight\n\nNew edges (resolved from episode extraction) always connect entities in `results.nodes`. Invalidated edges may connect entities NOT in `results.nodes`. If an invalidated edge shares NO entity endpoint with the episode's entities, the invalidation was driven purely by surface-level semantic similarity, not by actual factual contradiction about the same entities.\n\n## Review Fix: Guard Boundary Robustness (steps 23-26)\n\nTwo blocking issues identified in review:\n1. Guard exceptions propagate to caller after episode is already committed, risking duplicate retries.\n2. Guard runs without timeout — `bulk_restore_edge_validity()` graph queries can hang indefinitely.\n\nFix: wrap guard invocation in try/except (non-fatal logging) and asyncio.wait_for (configurable timeout). The guard is best-effort post-write correction; its failures must never poison a successful write.",
   "prerequisites": [
     {
       "id": "pre-1",
@@ -27,6 +27,13 @@
       "description": "Add MockNode.uuid field to conftest.py MockNode dataclass (needed for entity-overlap checks in tests)",
       "status": "done",
       "commit": "84b8d08e9e2dab7ca74cf23f14e7c1bf7a226c69",
+      "tests": []
+    },
+    {
+      "id": "pre-3",
+      "description": "Add invalidation_guard_timeout_seconds field to GraphitiBackendConfig in config/schema.py (default 30.0) and read it into GraphitiBackend._guard_timeout in __init__",
+      "status": "done",
+      "commit": "67ac476",
       "tests": []
     }
   ],
@@ -184,6 +191,34 @@
       "description": "Verify step-21 passes with existing implementation (detection and restoration are independent per edge)",
       "status": "done",
       "commit": "055ec24"
+    },
+    {
+      "id": "step-23",
+      "type": "test",
+      "description": "Write failing test: when guard.guard() raises an exception (e.g. RuntimeError from FalkorDB connectivity), add_episode() catches it, logs a non-fatal error, and still returns the successfully-written result. Test by patching InvalidationGuard.guard to raise RuntimeError, then assert add_episode returns the result and logger.error was called with 'non-fatal'.",
+      "status": "done",
+      "commit": "8383040"
+    },
+    {
+      "id": "step-24",
+      "type": "impl",
+      "description": "Wrap the guard invocation in graphiti_client.py add_episode() in try/except Exception: `try: await guard.guard(result) except Exception as exc: logger.error('InvalidationGuard failed (non-fatal): %s', exc)`. The episode is already committed — log and continue rather than raising.",
+      "status": "done",
+      "commit": "475b499"
+    },
+    {
+      "id": "step-25",
+      "type": "test",
+      "description": "Write failing test: when guard.guard() hangs beyond the configured timeout, add_episode() catches the asyncio.TimeoutError as non-fatal and returns the result. Test by patching InvalidationGuard.guard to raise asyncio.TimeoutError (simulating wait_for timeout), assert add_episode returns result and logs the timeout. Also verify that guard is invoked via asyncio.wait_for by patching asyncio.wait_for to confirm the _guard_timeout value is passed.",
+      "status": "done",
+      "commit": "8383040"
+    },
+    {
+      "id": "step-26",
+      "type": "impl",
+      "description": "Wrap guard.guard(result) in asyncio.wait_for(guard.guard(result), timeout=self._guard_timeout) inside the existing try/except. Read _guard_timeout from config.graphiti.invalidation_guard_timeout_seconds in __init__. The TimeoutError is already caught by the Exception handler from step-24.",
+      "status": "done",
+      "commit": "475b499"
     }
   ],
   "design_decisions": [
@@ -210,6 +245,14 @@
     {
       "decision": "Detection uses expired_at presence, not timestamp comparison",
       "rationale": "Checking `expired_at is not None` is simpler and more robust than comparing timestamps. In the AddEpisodeResults, invalidated edges always have expired_at set. New edges only have expired_at if immediately expired by more recent data, but those always share entity endpoints — so the overlap check correctly skips them."
+    },
+    {
+      "decision": "Guard failures are non-fatal: try/except around guard invocation",
+      "rationale": "The guard is best-effort post-write correction. By the time guard.guard() runs, the episode has already been committed to Graphiti via asyncio.wait_for. If the guard raises (FalkorDB error, AttributeError from edge attributes, etc.), the caller should see a successful write — not an error that triggers retry and creates duplicate episodes. Log the error for operator awareness, but never let guard failures poison successful writes."
+    },
+    {
+      "decision": "Separate guard timeout (30s) rather than reusing _write_timeout (120s)",
+      "rationale": "The guard issues at most two graph queries (count + restore) — much lighter than a full add_episode() which involves LLM calls, embedding, and graph mutations. 30s matches backend_read_timeout_seconds which covers similar graph-query workloads. A 120s hang from the guard would be unacceptable for a best-effort correction. The timeout is configurable via invalidation_guard_timeout_seconds for tuning."
     }
   ],
   "reuse": [
@@ -237,8 +280,18 @@
       "what": "GraphitiBackendConfig in config/schema.py",
       "where": "fused-memory/src/fused_memory/config/schema.py lines 130-134",
       "how": "Add invalidation_guard_enabled: bool = Field(default=True) to existing GraphitiBackendConfig class."
+    },
+    {
+      "what": "Existing non-fatal error pattern in search methods",
+      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py lines 168-173",
+      "how": "Search methods already catch TimeoutError and log warnings. Apply the same pattern (try/except + logger.warning/error) for guard failures in add_episode(). Consistent error-handling style."
+    },
+    {
+      "what": "backend_read_timeout_seconds as precedent for guard timeout default",
+      "where": "fused-memory/src/fused_memory/config/schema.py line 169",
+      "how": "Guard timeout default (30.0s) matches backend_read_timeout because the guard's graph queries are read-class operations, not write-class."
     }
   ],
   "_session_id": "189-c2427221",
-  "_created_at": "2026-03-27T04:14:01.437159+00:00"
+  "_created_at": "2026-03-27T04:29:02.784215+00:00"
 }
