@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,7 +24,6 @@ from fused_memory.backends.invalidation_guard import (
     InvalidationGuard,
     detect_spurious_invalidations,
 )
-
 
 # ---------------------------------------------------------------------------
 # Local mock helpers
