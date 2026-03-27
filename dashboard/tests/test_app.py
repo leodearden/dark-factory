@@ -910,6 +910,32 @@ class TestPollingJitter:
         assert 'hx-trigger="load, poll"' in section_html
 
 
+class TestPollingJitterScript:
+    """Tests that base.html contains the jitter polling script with required markers."""
+
+    def test_script_listens_to_htmx_after_settle(self, client):
+        html = client.get('/').text
+        assert 'htmx:afterSettle' in html
+
+    def test_script_reads_data_poll_base(self, client):
+        html = client.get('/').text
+        assert 'data-poll-base' in html
+        # The script must read the attribute — check for JS attribute access
+        assert 'dataset.pollBase' in html or 'getAttribute' in html
+
+    def test_script_calls_htmx_trigger(self, client):
+        html = client.get('/').text
+        assert 'htmx.trigger' in html
+
+    def test_script_uses_set_timeout(self, client):
+        html = client.get('/').text
+        assert 'setTimeout' in html
+
+    def test_script_uses_math_random_for_jitter(self, client):
+        html = client.get('/').text
+        assert 'Math.random' in html
+
+
 class TestAriaLivePollingsections:
     """Tests that all five auto-polling sections have aria-live='polite'."""
 
