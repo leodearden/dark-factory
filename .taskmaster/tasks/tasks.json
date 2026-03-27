@@ -2966,7 +2966,15 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-27T06:15:37.781Z"
+        "updatedAt": "2026-03-27T06:15:37.781Z",
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/partials/recon.html"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates"
+          ]
+        }
       },
       {
         "id": 184,
@@ -2990,7 +2998,19 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-27T06:16:40.636Z"
+        "updatedAt": "2026-03-27T06:16:40.636Z",
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/partials/recon.html",
+            "dashboard/src/dashboard/templates/partials/orchestrators.html",
+            "dashboard/src/dashboard/templates/partials/memory.html",
+            "dashboard/src/dashboard/templates/partials/performance.html",
+            "dashboard/src/dashboard/templates/base.html"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates"
+          ]
+        }
       },
       {
         "id": 186,
