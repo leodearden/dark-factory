@@ -2674,7 +2674,15 @@
           ],
           "modules": [
             "fused-memory/tests"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "shutdown sequence drain cancel_harness close_memory close_journal ordering",
+              "AsyncMock assert_awaited_once vs assert_called_once test_server_shutdown",
+              "asyncio.create_task vs ensure_future deprecation Python 3.12"
+            ]
+          }
         }
       },
       {
