@@ -843,26 +843,10 @@ async def test_sonnet_tier_selection_sets_consolidator_limits(journal, event_buf
     memory_limit=250, and that run_full_cycle() propagates those limits to the
     MemoryConsolidator stage before calling stage.run().
     """
-    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
-    from fused_memory.reconciliation.harness import ReconciliationHarness, TierConfig
+    from fused_memory.reconciliation.harness import TierConfig
     from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-    config = FusedMemoryConfig(
-        reconciliation=ReconciliationConfig(
-            enabled=True,
-            explore_codebase_root='/tmp/test',
-            agent_llm_provider='anthropic',
-            agent_llm_model='claude-sonnet-4-20250514',
-        )
-    )
-
-    harness = ReconciliationHarness(
-        memory_service=mock_memory_service,
-        taskmaster=AsyncMock(),
-        journal=journal,
-        event_buffer=event_buffer,
-        config=config,
-    )
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
 
     # Push events before mocking, so drain() has real events to return
     await event_buffer.push(_make_event())
