@@ -3183,7 +3183,18 @@
             "fused-memory/src/fused_memory/reconciliation/stages",
             "fused-memory/src/fused_memory/utils",
             "fused-memory/tests"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "BaseStage"
+            ],
+            "queries": [
+              "prompt injection fix routing layer system user message split f-string interpolation",
+              "project_id validation BaseStage whitespace reconciliation stage prompt",
+              "reconciliation prompt project_id stage prompts DRY"
+            ]
+          },
+          "_causation_id": "0a2dc790-e788-44ff-bece-7e734501facb"
         }
       },
       {
