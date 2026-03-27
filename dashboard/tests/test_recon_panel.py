@@ -170,6 +170,67 @@ class TestPartitionBurstState:
         assert len(idle) == 0
 
 
+class TestFormatDuration:
+    """Tests for the format_duration Jinja2 filter (accepts seconds)."""
+
+    def test_under_60s_returns_seconds_only(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(45) == '45s'
+
+    def test_zero_seconds_returns_0s(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(0) == '0s'
+
+    def test_exactly_59s_returns_seconds(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(59) == '59s'
+
+    def test_exactly_60s_returns_minutes_seconds(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(60) == '1m 0s'
+
+    def test_600s_returns_10m_0s(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(600) == '10m 0s'
+
+    def test_90s_returns_1m_30s(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(90) == '1m 30s'
+
+    def test_3599s_returns_minutes_seconds(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(3599) == '59m 59s'
+
+    def test_exactly_3600s_returns_hours_minutes(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(3600) == '1h 0m'
+
+    def test_large_value_returns_hours_minutes(self):
+        from dashboard.app import format_duration
+
+        # 62736 seconds = 17h 25m 36s → '17h 25m'
+        assert format_duration(62736) == '17h 25m'
+
+    def test_float_input_is_handled(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(600.0) == '10m 0s'
+
+    def test_filter_registered_on_jinja2_env(self):
+        from dashboard.app import format_duration, templates
+
+        assert 'format_duration' in templates.env.filters
+        assert templates.env.filters['format_duration'] is format_duration
+
+
 # --- Mock data for route tests ---
 
 MOCK_BUFFER_STATS = {'buffered_count': 3, 'oldest_event_age_seconds': 600.0}
@@ -711,6 +772,37 @@ class TestReconJournalBadge:
         with _patch_recon_data(runs=runs_5):
             html = client.get('/partials/recon').text
         assert 'aria-label="Show 5 journal entries"' in html
+
+
+class TestReconBufferAgeDisplay:
+    """Integration tests for the buffer age display using format_duration filter."""
+
+    def test_large_age_displays_hours_and_minutes(self, client):
+        # 62736 seconds = 17h 25m 36s → should render '17h 25m'
+        stats = {'buffered_count': 5, 'oldest_event_age_seconds': 62736}
+        with _patch_recon_data(buffer_stats=stats):
+            html = client.get('/partials/recon').text
+        assert '17h 25m' in html
+
+    def test_small_age_displays_minutes_and_seconds(self, client):
+        # 600 seconds = 10m 0s
+        stats = {'buffered_count': 3, 'oldest_event_age_seconds': 600}
+        with _patch_recon_data(buffer_stats=stats):
+            html = client.get('/partials/recon').text
+        assert '10m 0s' in html
+
+    def test_large_age_does_not_show_raw_minutes_seconds(self, client):
+        # Old template would produce '1045m 36s' for 62736s — must not appear
+        stats = {'buffered_count': 5, 'oldest_event_age_seconds': 62736}
+        with _patch_recon_data(buffer_stats=stats):
+            html = client.get('/partials/recon').text
+        assert '1045m' not in html
+
+    def test_sub_60s_age_displays_seconds_only(self, client):
+        stats = {'buffered_count': 1, 'oldest_event_age_seconds': 45}
+        with _patch_recon_data(buffer_stats=stats):
+            html = client.get('/partials/recon').text
+        assert '45s' in html
 
 
 class TestReconRunDetailRoute:
