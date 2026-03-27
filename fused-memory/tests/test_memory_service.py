@@ -622,3 +622,131 @@ class TestGetEpisodes:
     async def test_returns_list(self, service):
         episodes = await service.get_episodes(project_id='test')
         assert isinstance(episodes, list)
+
+
+class TestGetEntity:
+    # ------------------------------------------------------------------
+    # step-1: baseline success regression test
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_success_returns_nodes_and_edges(self, service):
+        """Baseline regression: get_entity returns correct node and edge data."""
+        from tests.conftest import MockEdge, MockNode
+
+        mock_node = MockNode(name='Auth Service', uuid='node-uuid-1')
+        mock_edge = MockEdge(fact='Auth service depends on Redis', uuid='edge-uuid-1')
+
+        service.graphiti.search_nodes = AsyncMock(return_value=[mock_node])
+        service.graphiti.search = AsyncMock(return_value=[mock_edge])
+
+        result = await service.get_entity('Auth Service', project_id='test')
+
+        assert isinstance(result, dict)
+        assert 'nodes' in result
+        assert 'edges' in result
+        assert len(result['nodes']) == 1
+        assert result['nodes'][0]['name'] == 'Auth Service'
+        assert result['nodes'][0]['uuid'] == 'node-uuid-1'
+        assert len(result['edges']) == 1
+        assert result['edges'][0]['fact'] == 'Auth service depends on Redis'
+        assert result['edges'][0]['uuid'] == 'edge-uuid-1'
+
+    # ------------------------------------------------------------------
+    # step-2: search_nodes failure — sibling search() must still settle
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_search_nodes_failure_raises_and_search_settles(self, service):
+        """When search_nodes raises, exception propagates AND search() was still called.
+
+        In a concurrent gather() implementation both coroutines are started together,
+        so search() is awaited even when search_nodes fails.  With the current
+        sequential implementation search() is never called — this test fails.
+        """
+        service.graphiti.search_nodes = AsyncMock(
+            side_effect=RuntimeError('search_nodes failed')
+        )
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        with pytest.raises(RuntimeError, match='search_nodes failed'):
+            await service.get_entity('entity', project_id='test')
+
+        # Both calls must have settled — search() called even when search_nodes fails
+        service.graphiti.search.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # step-3: search failure — sibling search_nodes() must still settle
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_search_failure_raises_and_search_nodes_settles(self, service):
+        """When search raises, exception propagates AND search_nodes() was still called."""
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(
+            side_effect=RuntimeError('search failed')
+        )
+
+        with pytest.raises(RuntimeError, match='search failed'):
+            await service.get_entity('entity', project_id='test')
+
+        # search_nodes() must have been called (settled before or alongside the exception)
+        service.graphiti.search_nodes.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # step-4: both calls fail — first exception is re-raised
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_both_failures_raises_first_exception(self, service):
+        """When both calls fail, get_entity raises (the first exception found)."""
+        service.graphiti.search_nodes = AsyncMock(
+            side_effect=RuntimeError('search_nodes failed')
+        )
+        service.graphiti.search = AsyncMock(
+            side_effect=RuntimeError('search failed')
+        )
+
+        with pytest.raises(RuntimeError):
+            await service.get_entity('entity', project_id='test')
+
+    # ------------------------------------------------------------------
+    # step-5: concurrency test using asyncio.Event gates
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_concurrent_execution(self, service):
+        """Both calls must run concurrently, not sequentially.
+
+        Each side_effect sets its own event then waits on the other's.
+        If calls are sequential the first waiter never unblocks (inner
+        asyncio.wait_for times out with TimeoutError).
+        If calls are concurrent both events fire and both calls proceed.
+        """
+        import asyncio
+
+        nodes_started = asyncio.Event()
+        search_started = asyncio.Event()
+
+        async def search_nodes_gate(*args, **kwargs):
+            nodes_started.set()
+            await asyncio.wait_for(search_started.wait(), timeout=0.5)
+            return []
+
+        async def search_gate(*args, **kwargs):
+            search_started.set()
+            await asyncio.wait_for(nodes_started.wait(), timeout=0.5)
+            return []
+
+        service.graphiti.search_nodes = AsyncMock(side_effect=search_nodes_gate)
+        service.graphiti.search = AsyncMock(side_effect=search_gate)
+
+        # With sequential execution the first gate times out → TimeoutError.
+        # With concurrent execution both gates fire → result returned normally.
+        result = await asyncio.wait_for(
+            service.get_entity('entity', project_id='test'),
+            timeout=2.0,
+        )
+
+        assert result['nodes'] == []
+        assert result['edges'] == []
