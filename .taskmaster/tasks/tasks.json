@@ -3216,7 +3216,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-27T05:32:35.775Z"
+        "updatedAt": "2026-03-27T05:32:35.775Z",
+        "metadata": {
+          "files": [
+            "fused-memory/src/fused_memory/services/memory_service.py",
+            "fused-memory/tests/test_memory_service.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/services",
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 199,
@@ -3228,7 +3238,15 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-27T06:16:40.583Z"
+        "updatedAt": "2026-03-27T06:16:40.583Z",
+        "metadata": {
+          "files": [
+            "fused-memory/tests/test_stages.py"
+          ],
+          "modules": [
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 200,
