@@ -271,6 +271,11 @@ class Harness:
                         review_report.findings_count,
                         len(review_report.tasks_created),
                     )
+                    if review_report.tasks_created:
+                        try:
+                            await self._tag_task_modules()
+                        except Exception as tag_err:
+                            logger.warning(f'Post-review module tagging failed: {tag_err}')
                 except Exception as e:
                     logger.error(f'Full review failed: {e}')
 
@@ -481,8 +486,8 @@ Output JSON matching the schema. Every task must appear in the output.
                 if modules:
                     metadata['modules'] = modules
                 await self.scheduler.update_task(task_id, json.dumps(metadata))
-                # Also populate in-memory cache (update_task metadata persistence
-                # is broken — taskmaster lacks an update_task tool)
+                # Also populate in-memory cache so modules are available
+                # immediately without re-fetching from taskmaster
                 depth = self.config.lock_depth
                 if files:
                     derived = files_to_modules(files, depth)
@@ -735,6 +740,14 @@ Output JSON matching the schema. Every task must appear in the output.
                 len(review_report.tasks_created),
                 review_report.cost_usd,
             )
+            # Tag newly created tasks with module metadata (agents may have
+            # included modules, but re-run the batch tagger as a fallback
+            # for any tasks that lack them).
+            if review_report.tasks_created:
+                try:
+                    await self._tag_task_modules()
+                except Exception as tag_err:
+                    logger.warning(f'Post-review module tagging failed: {tag_err}')
         except Exception as e:
             logger.error(f'Review checkpoint failed: {e}')
 

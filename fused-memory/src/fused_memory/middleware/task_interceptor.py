@@ -239,12 +239,28 @@ class TaskInterceptor:
     # ── Write pass-throughs (emit event, no targeted reconciliation) ───
 
     async def add_task(self, project_root: str, **kwargs: Any) -> dict:
+        # Extract metadata before forwarding — taskmaster's add_task doesn't accept it
+        metadata = kwargs.pop('metadata', None)
+
         tm = await self._ensure_taskmaster()
         result = await tm.add_task(project_root=project_root, **kwargs)
+
+        # Persist metadata via follow-up update_task if provided
+        task_id = None
+        if isinstance(result, dict):
+            task_id = str(result.get('id', ''))
+        if metadata and task_id:
+            try:
+                await tm.update_task(
+                    task_id=task_id, metadata=metadata, project_root=project_root
+                )
+            except Exception as e:
+                logger.warning(f'add_task: metadata update for task {task_id} failed: {e}')
+
         event = self._make_event(
             EventType.task_created,
             project_root,
-            {'operation': 'add_task'},
+            {'operation': 'add_task', 'task_id': task_id},
         )
         await self.buffer.push(event)
         self._schedule_commit(project_root, 'add_task')

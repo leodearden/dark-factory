@@ -291,7 +291,7 @@ violations are always bugs. Pay special attention to `stability_concerns`.
 2. **Read code** — trace critical paths, audit stubs, check cross-module consistency.
 
 3. **Triage each finding** and act:
-   - Clear-cut issues → `add_task(title=..., description=..., priority=..., metadata={{"source": "review-cycle", "review_id": "{review_id}"}}, project_root="{project_root}")`
+   - Clear-cut issues → `add_task(title=..., description=..., priority=..., metadata={{"source": "review-cycle", "review_id": "{review_id}", "modules": ["path/to/module", ...]}}, project_root="{project_root}")`
    - Ambiguous/architectural → `escalate_info(category=..., summary=...)`
    - Known/accepted → dismiss (don't report)
 

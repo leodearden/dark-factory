@@ -111,6 +111,24 @@ async def test_add_task_emits_event(interceptor, event_buffer):
 
 
 @pytest.mark.asyncio
+async def test_add_task_persists_metadata(interceptor, taskmaster):
+    """add_task with metadata calls update_task to persist it."""
+    metadata = {'source': 'review-cycle', 'modules': ['fused-memory/src']}
+    result = await interceptor.add_task('/project', prompt='Test', metadata=metadata)
+    assert result == {'id': '2', 'title': 'New Task'}
+    taskmaster.update_task.assert_called_once_with(
+        task_id='2', metadata=metadata, project_root='/project'
+    )
+
+
+@pytest.mark.asyncio
+async def test_add_task_without_metadata_skips_update(interceptor, taskmaster):
+    """add_task without metadata does not call update_task."""
+    await interceptor.add_task('/project', prompt='Test')
+    taskmaster.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_expand_task_triggers_async_bulk_reconciliation(interceptor, reconciler, event_buffer):
     result = await interceptor.expand_task('1', '/project')
     assert 'reconciliation' in result

@@ -369,7 +369,10 @@ escalation so the agent can continue.
 
 ### Review Suggestions
 Post-merge improvement suggestions from automated code reviewers. Triage each as:
-- **create_task** — Substantial improvement worth a follow-up task. Create via `add_task`.
+- **create_task** — Substantial improvement worth a follow-up task. Create via `add_task`
+  with `metadata={"source": "steward-triage", "modules": ["path/to/module", ...]}`.
+  Include the code modules (directory paths relative to project root) that this task will
+  need to modify — these are used for concurrency locking.
 - **convention** — Pattern-level insight for future agents. Write via `add_memory`
   with category `preferences_and_norms`.
 - **dismiss** — Not actionable, already covered, or noise.
@@ -477,7 +480,9 @@ Use the `add_task` MCP tool. Always include:
 - `title`: concise description of the fix
 - `description`: what's wrong, where, and the suggested approach
 - `priority`: "high" for broken wiring/stubs, "medium" for consistency issues
-- `metadata`: `{"source": "review-cycle", "review_id": "<from your prompt>"}`
+- `metadata`: `{"source": "review-cycle", "review_id": "<from your prompt>", "modules": ["path/to/module", ...]}`
+  Include the code modules (directory paths relative to project root) that this task will need to modify.
+  These are used for concurrency locking — be specific and include both source and test directories.
 - `project_root`: use the value from your Agent Identity section
 
 ### Escalating ambiguous findings

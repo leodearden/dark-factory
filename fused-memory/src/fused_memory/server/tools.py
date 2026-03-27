@@ -837,6 +837,7 @@ def create_mcp_server(
         details: str | None = None,
         dependencies: str | None = None,
         priority: str | None = None,
+        metadata: str | dict[str, Any] | None = None,
         tag: str | None = None,
     ) -> dict[str, Any]:
         """Add a new task to the project.
@@ -853,6 +854,8 @@ def create_mcp_server(
             details: Manual task details
             dependencies: Comma-separated dependency task IDs
             priority: high, medium, or low
+            metadata: Task metadata (e.g. {"source": "review-cycle", "modules": ["path/to/module"]}).
+                Persisted via a follow-up update_task call after creation.
             tag: Tag context (optional)
         """
         if err := _validate_project_root(project_root):
@@ -866,6 +869,7 @@ def create_mcp_server(
                 details=details,
                 dependencies=dependencies,
                 priority=priority,
+                metadata=metadata,
                 tag=tag,
             )
         except Exception as e:
