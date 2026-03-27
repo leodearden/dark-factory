@@ -7,6 +7,41 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 
+class TestProjectNameFilter:
+    """Tests for the project_name Jinja2 filter function."""
+
+    def test_path_returns_basename(self):
+        from dashboard.app import project_name
+
+        assert project_name('/home/leo/src/dark-factory') == 'dark-factory'
+
+    def test_non_path_returned_unchanged(self):
+        from dashboard.app import project_name
+
+        assert project_name('dark_factory') == 'dark_factory'
+
+    def test_none_returns_empty_string(self):
+        from dashboard.app import project_name
+
+        assert project_name(None) == ''
+
+    def test_empty_string_returns_empty_string(self):
+        from dashboard.app import project_name
+
+        assert project_name('') == ''
+
+    def test_trailing_slash_returns_basename(self):
+        from dashboard.app import project_name
+
+        assert project_name('/home/leo/src/dark-factory/') == 'dark-factory'
+
+    def test_filter_registered_on_jinja2_env(self):
+        from dashboard.app import project_name, templates
+
+        assert 'project_name' in templates.env.filters
+        assert templates.env.filters['project_name'] is project_name
+
+
 class TestFormatTriggerFilter:
     """Tests for the format_trigger Jinja2 filter function."""
 
@@ -803,6 +838,78 @@ class TestReconBufferAgeDisplay:
         with _patch_recon_data(buffer_stats=stats):
             html = client.get('/partials/recon').text
         assert '45s' in html
+
+
+class TestProjectNameFilterInTemplate:
+    """Tests that project_name filter is applied in the recon template."""
+
+    def test_watermarks_heading_shows_basename_not_full_path(self, client):
+        """When project_id is a filesystem path, watermarks heading shows basename."""
+        path_watermarks = [
+            {
+                'project_id': '/home/leo/src/dark-factory',
+                'last_full_run_completed': '2026-03-19T10:00:00+00:00',
+                'last_episode_timestamp': '2026-03-19T10:30:00+00:00',
+                'last_memory_timestamp': '2026-03-19T10:40:00+00:00',
+                'last_task_change_timestamp': '2026-03-19T10:50:00+00:00',
+            },
+            {
+                'project_id': '/home/leo/src/other-project',
+                'last_full_run_completed': '2026-03-19T09:00:00+00:00',
+                'last_episode_timestamp': None,
+                'last_memory_timestamp': None,
+                'last_task_change_timestamp': None,
+            },
+        ]
+        path_last_attempted = {
+            '/home/leo/src/dark-factory': {
+                'id': 'run-001',
+                'status': 'completed',
+                'started_at': '2026-03-19T10:00:00+00:00',
+                'completed_at': '2026-03-19T10:05:00+00:00',
+            },
+        }
+        with _patch_recon_data(watermarks=path_watermarks, last_attempted=path_last_attempted):
+            html = client.get('/partials/recon').text
+        assert 'dark-factory' in html
+        assert 'other-project' in html
+        assert '/home/leo/src/dark-factory' not in html
+        assert '/home/leo/src/other-project' not in html
+
+    def test_runs_table_shows_basename_not_full_path(self, client):
+        """When run.project_id is a filesystem path, runs table shows basename."""
+        path_runs = [
+            {
+                'id': 'run-001',
+                'project_id': '/home/leo/src/dark-factory',
+                'run_type': 'full',
+                'trigger_reason': 'staleness_timer',
+                'started_at': '2026-03-19T08:00:00+00:00',
+                'completed_at': '2026-03-19T08:05:00+00:00',
+                'events_processed': 7,
+                'status': 'completed',
+                'duration_seconds': 300.0,
+                'journal_entry_count': 0,
+            },
+            {
+                'id': 'run-002',
+                'project_id': '/home/leo/src/other-project',
+                'run_type': 'full',
+                'trigger_reason': 'manual',
+                'started_at': '2026-03-19T09:00:00+00:00',
+                'completed_at': '2026-03-19T09:05:00+00:00',
+                'events_processed': 3,
+                'status': 'completed',
+                'duration_seconds': 300.0,
+                'journal_entry_count': 0,
+            },
+        ]
+        with _patch_recon_data(runs=path_runs):
+            html = client.get('/partials/recon').text
+        assert 'dark-factory' in html
+        assert 'other-project' in html
+        assert '/home/leo/src/dark-factory' not in html
+        assert '/home/leo/src/other-project' not in html
 
 
 class TestReconRunDetailRoute:

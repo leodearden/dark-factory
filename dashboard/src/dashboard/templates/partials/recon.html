@@ -74,7 +74,7 @@
       {% if projects %}
         {% for project_id, proj in projects.items() %}
           {% if projects | length > 1 %}
-            <h4 class="text-sm font-medium text-gray-300 mt-{{ '0' if loop.first else '4' }} mb-2">{{ project_id }}</h4>
+            <h4 class="text-sm font-medium text-gray-300 mt-{{ '0' if loop.first else '4' }} mb-2">{{ project_id | project_name }}</h4>
           {% endif %}
           <div class="space-y-3 {% if not loop.last and projects | length > 1 %}border-b border-gray-700 pb-4{% endif %}">
             <div class="flex justify-between items-center">
@@ -153,7 +153,7 @@
           <tbody x-data="{ open: false }" id="run-{{ run.id }}">
             <tr class="border-b border-gray-700">
               {% if multi_project_runs %}
-                <td class="py-2 text-gray-300">{{ run.project_id }}</td>
+                <td class="py-2 text-gray-300">{{ run.project_id | project_name }}</td>
               {% endif %}
               <td class="py-2 text-gray-100"><span title="{{ run.trigger_reason }}">{{ run.trigger_reason | format_trigger }}</span></td>
               <td class="py-2 text-gray-100">{{ run.run_type }}</td>

@@ -176,6 +176,29 @@ def format_duration(value: int | float | None) -> str:
 templates.env.filters['format_duration'] = format_duration
 
 
+def project_name(value: str | None) -> str:
+    """Extract a display-friendly project name from a project_id string.
+
+    If the value looks like a filesystem path (contains '/'), return the
+    last path component (basename). Otherwise return the value as-is.
+
+    Examples:
+        None                          -> ''
+        ''                            -> ''
+        'dark_factory'                -> 'dark_factory'
+        '/home/leo/src/dark-factory'  -> 'dark-factory'
+        '/home/leo/src/dark-factory/' -> 'dark-factory'
+    """
+    if not value:
+        return ''
+    if '/' not in value:
+        return value
+    return value.rstrip('/').rsplit('/', 1)[-1]
+
+
+templates.env.filters['project_name'] = project_name
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage shared resources: HTTP client, DB connection pool."""
