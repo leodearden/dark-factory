@@ -204,6 +204,15 @@ class TestPartitionBurstState:
         assert len(active) == 1
         assert len(idle) == 0
 
+    def test_missing_state_key_defaults_to_idle(self):
+        from dashboard.app import partition_burst_state
+
+        # Agent dict has no 'state' key — should not raise KeyError; treated as idle
+        agents = [{'agent_id': 'a1', 'last_write_at': '2020-01-01T00:00:00+00:00'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
 
 class TestFormatDuration:
     """Tests for the format_duration Jinja2 filter (accepts seconds)."""
