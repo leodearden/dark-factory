@@ -145,7 +145,7 @@ def partition_burst_state(
             if (now - last_write).total_seconds() < active_threshold_seconds:
                 active.append(agent)
                 continue
-        except (ValueError, TypeError):
+        except (KeyError, ValueError, TypeError):
             pass
         idle.append(agent)
     return active, idle
