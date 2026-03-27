@@ -90,6 +90,26 @@ class TestGracefulShutdownResilientToDrainError:
         memory_service.close.assert_awaited_once()
 
 
+class TestGracefulShutdownDrainsTaskInterceptor:
+    @pytest.mark.asyncio
+    async def test_shutdown_drains_task_interceptor(self):
+        """_graceful_shutdown must await task_interceptor.drain() on happy path."""
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock()
+
+        task_interceptor = MagicMock()
+        task_interceptor.drain = AsyncMock()
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=task_interceptor,
+            harness_loop_task=None,
+            recon_journal=None,
+        )
+
+        task_interceptor.drain.assert_awaited_once()
+
+
 class TestGracefulShutdownCancelsHarnessLoopTask:
     @pytest.mark.asyncio
     async def test_shutdown_cancels_harness_loop_task(self):
