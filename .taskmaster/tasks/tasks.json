@@ -2479,7 +2479,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T23:36:27.727Z"
+        "updatedAt": "2026-03-26T23:36:27.727Z",
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/config.py",
+            "fused-memory/src/fused_memory/config/schema.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard",
+            "fused-memory/src/fused_memory/config"
+          ]
+        }
       },
       {
         "id": 156,
