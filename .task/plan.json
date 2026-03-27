@@ -225,14 +225,14 @@
       "type": "test",
       "description": "Fix three trivially-true test methods that assert `result is fake_result` without yielding to the event loop. Because the guard runs as a detached background task (`asyncio.ensure_future`), the assertion passes trivially — the guard never executes. Fix each test: (1) `test_guard_runtime_error_is_caught_and_result_returned` — wrap in `patch('fused_memory.backends.graphiti_client.logger')`, add `await asyncio.sleep(0)` after `add_episode()`, assert `mock_logger.error.called` and 'non-fatal' in the error message, in addition to `result is fake_result`. (2) `test_guard_exception_does_not_affect_return_value` — same pattern: patch logger, yield, assert `mock_logger.error.called` with 'non-fatal'. (3) `test_guard_timeout_error_is_caught_and_result_returned` — same pattern: patch logger, yield, assert `mock_logger.error.called` with 'non-fatal'. Without these changes, the tests provide zero coverage of the non-fatal exception path they claim to verify.",
       "status": "done",
-      "commit": "PENDING"
+      "commit": "7fce364"
     },
     {
       "id": "step-28",
       "type": "impl",
       "description": "Verify all three fixed tests pass with the existing production code. No production code changes needed — the try/except in `_run_guard()` already handles these exceptions correctly. The fix is purely test-side: the tests now actually exercise the background task exception path instead of passing trivially before the guard runs.",
       "status": "done",
-      "commit": "PENDING"
+      "commit": "7fce364"
     }
   ],
   "design_decisions": [
