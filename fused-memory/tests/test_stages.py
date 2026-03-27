@@ -727,6 +727,62 @@ class TestProjectIdGuideline:
         assert 'search, get_entity' in result
 
 
+class TestStage3ProjectIdGuideline:
+    """STAGE3_SYSTEM_PROMPT embeds the project_id guideline with read-only tools."""
+
+    _STAGE3_READ_TOOLS = [
+        'search',
+        'get_entity',
+        'get_episodes',
+        'get_status',
+        'get_tasks',
+        'get_task',
+    ]
+
+    _STAGE3_WRITE_TOOLS = [
+        'add_memory',
+        'delete_memory',
+        'set_task_status',
+        'add_task',
+        'update_task',
+        'add_subtask',
+        'remove_task',
+        'add_dependency',
+        'remove_dependency',
+    ]
+
+    def test_stage3_prompt_contains_project_id_guideline(self):
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+        assert 'project_id' in STAGE3_SYSTEM_PROMPT
+        assert 'Reconciliation Context block' in STAGE3_SYSTEM_PROMPT
+
+    def test_stage3_prompt_guideline_lists_read_only_tools(self):
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+        guideline_line = next(
+            (line for line in STAGE3_SYSTEM_PROMPT.splitlines()
+             if 'Reconciliation Context block' in line),
+            None,
+        )
+        assert guideline_line is not None, 'Guideline line not found in STAGE3_SYSTEM_PROMPT'
+        for tool in self._STAGE3_READ_TOOLS:
+            assert tool in guideline_line, (
+                f"STAGE3 guideline missing read tool: {tool}"
+            )
+
+    def test_stage3_prompt_guideline_does_not_list_write_tools(self):
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+        guideline_line = next(
+            (line for line in STAGE3_SYSTEM_PROMPT.splitlines()
+             if 'Reconciliation Context block' in line),
+            None,
+        )
+        assert guideline_line is not None, 'Guideline line not found in STAGE3_SYSTEM_PROMPT'
+        for tool in self._STAGE3_WRITE_TOOLS:
+            assert tool not in guideline_line, (
+                f"Stage 3 guideline should NOT list write tool: {tool}"
+            )
+
+
 class TestStage2ProjectIdGuideline:
     """STAGE2_SYSTEM_PROMPT embeds the project_id guideline with ALL tools (memory + task mutation)."""
 
