@@ -3321,6 +3321,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 205,
+        "title": "Add YAML config loading regression test and get_field_value intent comment",
+        "description": "Two related improvements in the fused-memory config module:\n\n1. **Missing regression test for YAML loading path** (test_config_schema.py):\n   `TestFusedMemoryConfigDefaults.test_all_defaults_load_successfully` deliberately points CONFIG_PATH at a missing file, so `YamlSettingsSource.__call__` returns `{}` and `get_field_value` is never invoked. Add a test that writes a minimal YAML file to tmp_path, sets CONFIG_PATH to it, and asserts `FusedMemoryConfig()` picks up the values. This exercises the full pydantic-settings machinery including `get_field_value`.\n\n2. **Intent comment on get_field_value** (schema.py:55):\n   The method is an intentional no-op that satisfies the pydantic-settings abstract interface while delegating all resolution to `__call__`. Add a one-line comment: `# Resolution handled in __call__; satisfy abstract interface with no-op.`\n\nSource: review-cycle task 155, suggestions from reviewer_test_analyst, reviewer_architect_reviewer.\n\nmemory_hints:\n- search: \"YamlSettingsSource pydantic settings config loading\"\n- search: \"fused-memory config schema test coverage\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -3333,7 +3344,7 @@
       ],
       "created": "2026-03-27T11:09:20.646Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-27T11:09:20.650Z"
+      "updated": "2026-03-27T11:09:28.285Z"
     }
   }
 }
