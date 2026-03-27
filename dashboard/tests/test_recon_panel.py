@@ -840,6 +840,78 @@ class TestReconBufferAgeDisplay:
         assert '45s' in html
 
 
+class TestProjectNameFilterInTemplate:
+    """Tests that project_name filter is applied in the recon template."""
+
+    def test_watermarks_heading_shows_basename_not_full_path(self, client):
+        """When project_id is a filesystem path, watermarks heading shows basename."""
+        path_watermarks = [
+            {
+                'project_id': '/home/leo/src/dark-factory',
+                'last_full_run_completed': '2026-03-19T10:00:00+00:00',
+                'last_episode_timestamp': '2026-03-19T10:30:00+00:00',
+                'last_memory_timestamp': '2026-03-19T10:40:00+00:00',
+                'last_task_change_timestamp': '2026-03-19T10:50:00+00:00',
+            },
+            {
+                'project_id': '/home/leo/src/other-project',
+                'last_full_run_completed': '2026-03-19T09:00:00+00:00',
+                'last_episode_timestamp': None,
+                'last_memory_timestamp': None,
+                'last_task_change_timestamp': None,
+            },
+        ]
+        path_last_attempted = {
+            '/home/leo/src/dark-factory': {
+                'id': 'run-001',
+                'status': 'completed',
+                'started_at': '2026-03-19T10:00:00+00:00',
+                'completed_at': '2026-03-19T10:05:00+00:00',
+            },
+        }
+        with _patch_recon_data(watermarks=path_watermarks, last_attempted=path_last_attempted):
+            html = client.get('/partials/recon').text
+        assert 'dark-factory' in html
+        assert 'other-project' in html
+        assert '/home/leo/src/dark-factory' not in html
+        assert '/home/leo/src/other-project' not in html
+
+    def test_runs_table_shows_basename_not_full_path(self, client):
+        """When run.project_id is a filesystem path, runs table shows basename."""
+        path_runs = [
+            {
+                'id': 'run-001',
+                'project_id': '/home/leo/src/dark-factory',
+                'run_type': 'full',
+                'trigger_reason': 'staleness_timer',
+                'started_at': '2026-03-19T08:00:00+00:00',
+                'completed_at': '2026-03-19T08:05:00+00:00',
+                'events_processed': 7,
+                'status': 'completed',
+                'duration_seconds': 300.0,
+                'journal_entry_count': 0,
+            },
+            {
+                'id': 'run-002',
+                'project_id': '/home/leo/src/other-project',
+                'run_type': 'full',
+                'trigger_reason': 'manual',
+                'started_at': '2026-03-19T09:00:00+00:00',
+                'completed_at': '2026-03-19T09:05:00+00:00',
+                'events_processed': 3,
+                'status': 'completed',
+                'duration_seconds': 300.0,
+                'journal_entry_count': 0,
+            },
+        ]
+        with _patch_recon_data(runs=path_runs):
+            html = client.get('/partials/recon').text
+        assert 'dark-factory' in html
+        assert 'other-project' in html
+        assert '/home/leo/src/dark-factory' not in html
+        assert '/home/leo/src/other-project' not in html
+
+
 class TestReconRunDetailRoute:
     """Tests for GET /partials/recon/run/{run_id}."""
 
