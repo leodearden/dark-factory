@@ -38,9 +38,12 @@ max_turns:
   merger: 50
 
 # Verification commands
-test_command: "uv run --project dashboard pytest dashboard/tests/"
-lint_command: "uv run --project dashboard ruff check dashboard/"
-type_check_command: "uv run --project dashboard pyright dashboard/src/"
+# Use "cd dashboard &&" prefix so that when the orchestrator scopes commands to
+# specific files, the stripped paths (e.g. "tests/test_app.py") are resolved
+# relative to the dashboard/ directory rather than the worktree root.
+test_command: "cd dashboard && uv run pytest tests/"
+lint_command: "cd dashboard && uv run ruff check ."
+type_check_command: "cd dashboard && uv run pyright src/"
 
 # Fused memory HTTP server — port 8002
 fused_memory:
