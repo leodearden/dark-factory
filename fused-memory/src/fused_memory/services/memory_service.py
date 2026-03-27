@@ -819,16 +819,17 @@ class MemoryService:
             return_exceptions=True,
         )
 
-        # Inspect results — re-raise the first exception found.
+        # Inspect results — log all failures then re-raise the first exception.
         # Both coroutines have already settled at this point (no orphans).
-        for result in results:
-            if isinstance(result, BaseException):
+        exceptions = [r for r in results if isinstance(r, BaseException)]
+        if exceptions:
+            for exc in exceptions:
                 logger.warning(
                     'get_entity: Graphiti call failed: %s: %s',
-                    type(result).__name__,
-                    result,
+                    type(exc).__name__,
+                    exc,
                 )
-                raise result
+            raise exceptions[0]
 
         nodes, edges = results
 

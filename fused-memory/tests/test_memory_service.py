@@ -750,3 +750,33 @@ class TestGetEntity:
 
         assert result['nodes'] == []
         assert result['edges'] == []
+
+    # ------------------------------------------------------------------
+    # step-7: error logging — warning emitted on failure
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_failure_emits_warning_log(self, service):
+        """When one call fails, logger.warning is called with a message mentioning
+        the failed operation, before the exception is re-raised."""
+        import logging
+        from unittest.mock import patch
+
+        service.graphiti.search_nodes = AsyncMock(
+            side_effect=RuntimeError('node lookup error')
+        )
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        with patch(
+            'fused_memory.services.memory_service.logger'
+        ) as mock_logger:
+            with pytest.raises(RuntimeError, match='node lookup error'):
+                await service.get_entity('entity', project_id='test')
+
+        mock_logger.warning.assert_called_once()
+        warning_args = mock_logger.warning.call_args[0]
+        # The warning message must mention RuntimeError or the exception message
+        full_message = ' '.join(str(a) for a in warning_args)
+        assert 'RuntimeError' in full_message or 'node lookup error' in full_message, (
+            f'Expected warning to mention the error, got: {full_message!r}'
+        )
