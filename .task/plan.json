@@ -1,0 +1,178 @@
+{
+  "task_id": "180",
+  "title": "Replace Tailwind CDN with built CSS and add favicon",
+  "files": [
+    "dashboard/src/dashboard/templates/base.html",
+    "dashboard/src/dashboard/static/favicon.svg",
+    "dashboard/src/dashboard/static/input.css",
+    "dashboard/src/dashboard/static/tailwind.css",
+    "dashboard/src/dashboard/static/style.css",
+    "dashboard/Makefile",
+    "dashboard/tests/test_app.py",
+    "dashboard/tests/test_scaffold.py"
+  ],
+  "modules": [
+    "dashboard/src/dashboard/templates",
+    "dashboard/src/dashboard/static",
+    "dashboard/tests",
+    "dashboard"
+  ],
+  "analysis": "The dashboard loads Tailwind CSS via cdn.tailwindcss.com (a dev-only CDN that prints console warnings in production) and has no favicon (causing 404 errors). Additionally, Alpine.js uses an imprecise version pin (@3.x.x) and Chart.js uses a major-only pin (@4/). The fix involves: (1) replacing the Tailwind CDN with a locally-built CSS file using the Tailwind v4 standalone CLI, (2) adding an SVG favicon, (3) pinning all CDN deps to exact semver versions. The existing custom styles in style.css (x-cloak hiding, htmx transition effects) must be merged into the Tailwind build input so there's a single CSS output. The dashboard is a pure Python/FastAPI project with no Node.js infrastructure, making the standalone CLI the ideal choice \u2014 no package.json or npm needed. The built tailwind.css will be committed so the app works without a build step; the Makefile provides regeneration when templates change.\n\nPost-review update: Review found 3 blocking issues. Issues 1 (broken_static_reference in base.html) and 2 (broken_test in test_scaffold.py) were already resolved by step-6 (commit c547928) \u2014 the reviewer was likely reviewing the diff rather than the final state. Issue 3 (silent_failure_at_boundary in Makefile curl) is still present: curl is invoked with -sL but without --fail, meaning a failed download (404, 403, rate-limit) exits 0 and writes error HTML to bin/tailwindcss, which Make then considers up-to-date. Steps 9-10 added to fix this with TDD.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Create dashboard/Makefile with css and css-watch targets using the Tailwind v4 standalone CLI. The Makefile should download the standalone binary to a local bin/ if not present, then run it against input.css to produce tailwind.css. Include a clean target.",
+      "status": "done",
+      "commit": "29b276e",
+      "tests": []
+    },
+    {
+      "id": "pre-2",
+      "description": "Create dashboard/src/dashboard/static/input.css \u2014 the Tailwind build input file. Use @import 'tailwindcss' and @source '../templates' (Tailwind v4 CSS-first config). Include all custom styles currently in style.css: [x-cloak] hide rule, .htmx-settling and .htmx-swapping transition rules.",
+      "status": "done",
+      "commit": "29b276e",
+      "tests": []
+    },
+    {
+      "id": "pre-3",
+      "description": "Create dashboard/src/dashboard/static/favicon.svg \u2014 a simple dark-themed SVG favicon representing Dark Factory (e.g., a gear or 'DF' monogram on a gray-900 rounded rect background with blue-400 accent). Keep it minimal (<1KB).",
+      "status": "done",
+      "commit": "29b276e",
+      "tests": []
+    },
+    {
+      "id": "pre-4",
+      "description": "Run Tailwind CLI to generate dashboard/src/dashboard/static/tailwind.css from input.css. Verify the output contains Tailwind utility classes used in templates (bg-gray-900, text-gray-100, animate-pulse, etc.) and the custom rules from input.css.",
+      "status": "done",
+      "commit": "29b276e",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing tests in test_app.py: (1) TestFavicon.test_favicon_link_in_html \u2014 GET / HTML contains <link rel=\"icon\" referencing /static/favicon.svg, (2) TestFavicon.test_favicon_svg_served \u2014 GET /static/favicon.svg returns 200 with image/svg+xml content type.",
+      "status": "done",
+      "commit": "2de646c"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Add <link rel=\"icon\" type=\"image/svg+xml\" href=\"/static/favicon.svg\"> to the <head> of base.html. The favicon.svg file was created in pre-3. Both tests from step-1 should now pass.",
+      "status": "done",
+      "commit": "f31cd8f"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing tests in test_app.py: (1) TestTailwindBuild.test_no_cdn_tailwind \u2014 GET / HTML does NOT contain 'cdn.tailwindcss.com', (2) TestTailwindBuild.test_local_tailwind_css_linked \u2014 GET / HTML contains href=\"/static/tailwind.css\", (3) TestTailwindBuild.test_tailwind_css_served \u2014 GET /static/tailwind.css returns 200 with text/css content type, (4) TestTailwindBuild.test_tailwind_css_has_utilities \u2014 GET /static/tailwind.css body contains key utility classes (bg-gray-900, text-gray-100).",
+      "status": "done",
+      "commit": "aa89abd"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Update base.html: remove <script src=\"https://cdn.tailwindcss.com\"></script>, add <link rel=\"stylesheet\" href=\"/static/tailwind.css\">. The built tailwind.css from pre-4 is already in static/. All tests from step-3 should pass.",
+      "status": "done",
+      "commit": "d752e1b"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing tests in test_app.py: (1) TestCustomStyles.test_tailwind_css_has_xcloak \u2014 GET /static/tailwind.css contains '[x-cloak]', (2) TestCustomStyles.test_tailwind_css_has_htmx_settling \u2014 contains '.htmx-settling', (3) TestCustomStyles.test_tailwind_css_has_htmx_swapping \u2014 contains '.htmx-swapping'. Also: (4) TestCustomStyles.test_no_separate_style_css_link \u2014 GET / HTML does NOT contain 'style.css'.",
+      "status": "done",
+      "commit": "c14e34c"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Remove the <link rel=\"stylesheet\" href=\"/static/style.css\"> line from base.html (custom styles are now in tailwind.css via input.css). Delete dashboard/src/dashboard/static/style.css. Update test_scaffold.py: change TestStaticFiles.test_static_css_served to check /static/tailwind.css instead of /static/style.css.",
+      "status": "done",
+      "commit": "c547928"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing tests in test_app.py: TestCdnVersionPinning class \u2014 (1) test_alpinejs_exact_version \u2014 GET / HTML contains 'alpinejs@3.15.8' (not '@3.x.x'), (2) test_chartjs_exact_version \u2014 GET / HTML contains 'chart.js@4.5.1' (not '@4/'), (3) test_no_wildcard_versions \u2014 GET / HTML does NOT match pattern '@\\d+\\.x' or '@\\d+/' in any script src.",
+      "status": "done",
+      "commit": "65c502d"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Update base.html script tags: change alpinejs@3.x.x to alpinejs@3.15.8, change chart.js@4/dist to chart.js@4.5.1/dist. Verify htmx@2.0.4 and idiomorph@0.3.0 are already exact-pinned (no change needed).",
+      "status": "done",
+      "commit": "1494038"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write failing test in test_scaffold.py: TestMakefileCurlSafety.test_curl_uses_fail_flag \u2014 read the Makefile content, find all lines containing 'curl', and assert each includes --fail or the -f short flag (e.g., -fsSL). This catches the silent_failure_at_boundary issue where a failed HTTP download (404/403/rate-limit) would exit 0 and write error HTML to bin/tailwindcss.",
+      "status": "done",
+      "commit": "43ec552"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Fix Makefile curl invocation: change 'curl -sL' to 'curl -fsSL' on line 13 (the $(TAILWIND_BIN) target). Also add '|| (rm -f $(TAILWIND_BIN); exit 1)' to ensure a failed download never leaves a partial file that satisfies the Make target. The test from step-9 should now pass.",
+      "status": "done",
+      "commit": "3b65078"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use Tailwind v4 standalone CLI instead of PostCSS/npm build",
+      "rationale": "The dashboard is a pure Python project with no Node.js infrastructure (no package.json, no node_modules). The standalone CLI is a single binary that requires no Node.js runtime, keeping the build dependency minimal. A Makefile wraps the binary for ergonomics."
+    },
+    {
+      "decision": "Use Tailwind v4 CSS-first config instead of v3 tailwind.config.js",
+      "rationale": "Tailwind v4 uses @import 'tailwindcss' and @source directives directly in the input CSS file, eliminating the need for a separate tailwind.config.js. This is simpler and keeps all CSS configuration in one place."
+    },
+    {
+      "decision": "Commit built tailwind.css rather than .gitignore it",
+      "rationale": "The dashboard must work without a build step (e.g., after git clone + uv sync + run). Committing the built CSS ensures the app is deployable immediately. The Makefile is for regeneration when templates change during development."
+    },
+    {
+      "decision": "Merge style.css into Tailwind input rather than keeping two CSS files",
+      "rationale": "The existing style.css has only 3 rules (x-cloak, htmx-settling, htmx-swapping). Merging into input.css produces a single built CSS output, reducing HTTP requests and simplifying the template. The custom rules are appended after @import 'tailwindcss' in input.css."
+    },
+    {
+      "decision": "Pin CDN deps to exact versions rather than vendoring",
+      "rationale": "Vendoring htmx/Alpine/Chart.js/idiomorph would add ~500KB of JS to the repo and require manual updates. Pinning to exact semver versions (e.g., @3.15.8 not @3.x.x) on jsdelivr/unpkg CDNs provides reproducibility with near-zero maintenance. Can vendor later if offline support is needed."
+    },
+    {
+      "decision": "Use SVG favicon instead of ICO/PNG",
+      "rationale": "SVG favicons are vector (sharp at any size), tiny (<1KB), and supported by all modern browsers. An ICO would require multiple raster sizes and a larger file. The dashboard is an internal tool so legacy browser support is not a concern."
+    },
+    {
+      "decision": "Use curl --fail plus cleanup guard in Makefile download target",
+      "rationale": "Without --fail, curl exits 0 on HTTP errors (404, 403, rate-limit) and writes the error-page HTML to the binary path. Make considers the target up-to-date, so subsequent invocations skip the download. The --fail flag makes curl exit non-zero on HTTP errors, and the '|| rm -f' guard ensures no partial file satisfies the Make target on failure."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "client fixture (TestClient for FastAPI app)",
+      "where": "dashboard/tests/conftest.py",
+      "how": "Use the existing `client` fixture for all new HTTP-level tests (favicon serving, CSS serving, HTML content checks). All existing test classes use this pattern."
+    },
+    {
+      "what": "TestStaticFiles pattern from test_scaffold.py",
+      "where": "dashboard/tests/test_scaffold.py",
+      "how": "Follow the same pattern of testing static file serving (GET /static/X returns 200 with correct content-type). Update the existing test to check tailwind.css instead of style.css."
+    },
+    {
+      "what": "HTML content assertion pattern from TestIndex/TestHtmxErrorHandling",
+      "where": "dashboard/tests/test_app.py",
+      "how": "Follow the established pattern of `html = client.get('/').text` followed by `assert 'expected' in html` for checking base.html content (favicon link, CSS link, version strings)."
+    },
+    {
+      "what": "Existing custom CSS rules from style.css",
+      "where": "dashboard/src/dashboard/static/style.css",
+      "how": "Copy the 3 custom rule blocks ([x-cloak], .htmx-settling, .htmx-swapping) into input.css after the @import directive, preserving exact property values."
+    }
+  ],
+  "_session_id": "180-6fc371fd",
+  "_created_at": "2026-03-27T12:00:20.244804+00:00",
+  "_schema_version": 1
+}
