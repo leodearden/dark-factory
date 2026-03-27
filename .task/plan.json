@@ -75,6 +75,20 @@
       "description": "Post-rebase verification: run full test_stages.py suite (uv run pytest tests/test_stages.py -v) and ruff check to confirm no regressions from the rebase. All TestProjectIdValidation tests (7) plus all other test classes must pass.",
       "status": "done",
       "commit": "ebbe2b0"
+    },
+    {
+      "id": "step-9",
+      "type": "impl",
+      "description": "Rebase task/137 onto current main to resolve second merge_ff_failed. Main advanced by 1 commit (1b96903 \u2014 task 169 status update, only touches .taskmaster/tasks/tasks.json). Branch has no unique commits beyond main \u2014 all task-137 work was already merged. This is a trivial fast-forward rebase with zero conflict risk since the advancing commit touches no files modified by this task. After rebase, force-push branch.",
+      "status": "done",
+      "commit": "1b96903"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Post-rebase verification: run TestProjectIdValidation suite (uv run pytest tests/test_stages.py::TestProjectIdValidation -v) and ruff check on test_stages.py to confirm no regressions. Quick verification since the rebase only incorporated a tasks.json change.",
+      "status": "done",
+      "commit": "1b96903"
     }
   ],
   "design_decisions": [
@@ -117,5 +131,5 @@
     }
   ],
   "_session_id": "137-f0a99f11",
-  "_created_at": "2026-03-27T03:10:38.398163+00:00"
+  "_created_at": "2026-03-27T03:37:10.717515+00:00"
 }
