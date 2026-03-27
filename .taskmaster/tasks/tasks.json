@@ -2661,13 +2661,13 @@
         "description": "Improve fused-memory/tests/test_server_shutdown.py in several ways:\n\n1. Replace `assert_called_once()` with `assert_awaited_once()` on all AsyncMock assertions (lines 25, 45, 65). The current assertions pass even if `await` is accidentally dropped. The codebase already uses `assert_awaited_once()` in test_reindex.py and test_cleanup_stale_edges.py.\n\n2. Replace `asyncio.ensure_future(_infinite())` (line 79) with `asyncio.create_task(_infinite())` — ensure_future is deprecated in Python 3.10+ and emits DeprecationWarning in 3.12+.\n\n3. Add missing test scenarios:\n   a. **Happy-path drain** — verify task_interceptor.drain() is actually awaited (currently only tested when it raises).\n   b. **Drain error + journal resilience** — test_shutdown_resilient_to_drain_error currently passes recon_journal=None. Add a recon_journal mock and assert it's still closed after drain failure.\n   c. **memory_service.close() error → journal still closed** — verify recon_journal.close() runs even when memory_service.close() raises.\n   d. **Shutdown ordering** — verify drain → cancel_harness → close_memory → close_journal ordering via a shared call_log with side_effect callbacks.\n\nSource: Task 154 review, suggestions 4, 9, 12, 13, 14, 15, 16, 18.",
         "details": "",
         "testStrategy": "",
-        "status": "done",
+        "status": "blocked",
         "dependencies": [
           "154"
         ],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-27T23:40:23.256Z",
+        "updatedAt": "2026-03-27T23:44:38.352Z",
         "metadata": {
           "files": [
             "fused-memory/tests/test_server_shutdown.py"
@@ -3689,9 +3689,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T23:40:23.256Z",
+      "lastModified": "2026-03-27T23:44:38.352Z",
       "taskCount": 195,
-      "completedCount": 152,
+      "completedCount": 151,
       "tags": [
         "master"
       ]
