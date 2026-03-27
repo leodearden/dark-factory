@@ -798,17 +798,39 @@ class MemoryService:
         name: str,
         project_id: str = 'main',
     ) -> dict:
-        """Entity lookup in Graphiti — returns nodes + edges."""
-        nodes = await self.graphiti.search_nodes(
-            query=name,
-            group_ids=[project_id],
-            max_nodes=5,
+        """Entity lookup in Graphiti — returns nodes + edges.
+
+        Both Graphiti calls run concurrently via asyncio.gather(return_exceptions=True).
+        This ensures neither call becomes an orphaned background task in the error path:
+        gather() awaits both coroutines to settlement before returning, even when one
+        (or both) raise an exception.  If any call fails the first exception is re-raised.
+        """
+        results = await asyncio.gather(
+            self.graphiti.search_nodes(
+                query=name,
+                group_ids=[project_id],
+                max_nodes=5,
+            ),
+            self.graphiti.search(
+                query=name,
+                group_ids=[project_id],
+                num_results=10,
+            ),
+            return_exceptions=True,
         )
-        edges = await self.graphiti.search(
-            query=name,
-            group_ids=[project_id],
-            num_results=10,
-        )
+
+        # Inspect results — re-raise the first exception found.
+        # Both coroutines have already settled at this point (no orphans).
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning(
+                    'get_entity: Graphiti call failed: %s: %s',
+                    type(result).__name__,
+                    result,
+                )
+                raise result
+
+        nodes, edges = results
 
         node_data = []
         for n in nodes:
