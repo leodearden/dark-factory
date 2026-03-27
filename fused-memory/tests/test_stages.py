@@ -725,3 +725,52 @@ class TestProjectIdGuideline:
         assert 'project_id' in result
         assert 'Reconciliation Context block' in result
         assert 'search, get_entity' in result
+
+
+class TestStage1ProjectIdGuideline:
+    """STAGE1_SYSTEM_PROMPT embeds the project_id guideline with memory-only tools."""
+
+    _STAGE1_MEMORY_TOOLS = [
+        'search',
+        'add_memory',
+        'delete_memory',
+        'get_entity',
+        'get_episodes',
+        'get_status',
+    ]
+
+    def test_stage1_prompt_contains_project_id_guideline(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        assert 'project_id' in STAGE1_SYSTEM_PROMPT
+        assert 'Reconciliation Context block' in STAGE1_SYSTEM_PROMPT
+
+    def test_stage1_prompt_guideline_lists_all_memory_tools(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        for tool in self._STAGE1_MEMORY_TOOLS:
+            assert tool in STAGE1_SYSTEM_PROMPT, (
+                f"STAGE1_SYSTEM_PROMPT guideline missing memory tool: {tool}"
+            )
+
+    def test_stage1_prompt_guideline_does_not_list_task_mutation_tools(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        # The guideline in Stage 1 should only reference memory tools, not task mutations
+        task_mutation_indicators = [
+            'set_task_status',
+            'add_task',
+            'update_task',
+            'add_subtask',
+            'remove_task',
+            'add_dependency',
+            'remove_dependency',
+        ]
+        # Find the guideline line containing 'Reconciliation Context block'
+        guideline_line = next(
+            (line for line in STAGE1_SYSTEM_PROMPT.splitlines()
+             if 'Reconciliation Context block' in line),
+            None,
+        )
+        assert guideline_line is not None, 'Guideline line not found in STAGE1_SYSTEM_PROMPT'
+        for tool in task_mutation_indicators:
+            assert tool not in guideline_line, (
+                f"Stage 1 guideline should NOT list task mutation tool: {tool}"
+            )
