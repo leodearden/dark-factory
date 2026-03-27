@@ -25,3 +25,35 @@ class TestSectionDataAttributes:
     def test_recon_section_has_data_section(self, client):
         html = client.get('/').text
         assert 'data-section="recon"' in html
+
+
+class TestTimestampElements:
+    """Tests that each section has a corresponding timestamp element."""
+
+    def test_orchestrators_timestamp_element(self, client):
+        html = client.get('/').text
+        assert 'data-updated-for="orchestrators"' in html
+
+    def test_performance_timestamp_element(self, client):
+        html = client.get('/').text
+        assert 'data-updated-for="performance"' in html
+
+    def test_memory_timestamp_element(self, client):
+        html = client.get('/').text
+        assert 'data-updated-for="memory"' in html
+
+    def test_memory_graphs_timestamp_element(self, client):
+        html = client.get('/').text
+        assert 'data-updated-for="memory-graphs"' in html
+
+    def test_recon_timestamp_element(self, client):
+        html = client.get('/').text
+        assert 'data-updated-for="recon"' in html
+
+    def test_timestamp_elements_have_subtle_styling(self, client):
+        html = client.get('/').text
+        assert 'text-gray-500' in html
+
+    def test_timestamp_elements_are_aria_hidden(self, client):
+        html = client.get('/').text
+        assert 'aria-hidden="true"' in html
