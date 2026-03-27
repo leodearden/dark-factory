@@ -778,3 +778,41 @@ class TestGetEntity:
         assert 'RuntimeError' in full_message or 'node lookup error' in full_message, (
             f'Expected warning to mention the error, got: {full_message!r}'
         )
+
+    # ------------------------------------------------------------------
+    # step-1(192): cancellation — search_nodes failure cancels blocking search()
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_search_nodes_failure_cancels_blocking_sibling(self, service):
+        """When search_nodes raises, a forever-blocking search() is cancelled promptly.
+
+        With asyncio.gather(return_exceptions=True) the sibling is NOT cancelled — it
+        runs to completion (or blocks forever), causing asyncio.wait_for to time out
+        with TimeoutError instead of the expected RuntimeError.
+
+        With asyncio.TaskGroup the sibling is cancelled immediately when search_nodes
+        raises, so RuntimeError propagates well within the 2.0s timeout.
+        """
+        import asyncio
+
+        # Event that is never set — simulates a connection that hangs indefinitely.
+        never_resolves = asyncio.Event()
+
+        async def blocking_search(*args, **kwargs):
+            # Will block until cancelled (asyncio.CancelledError raised here).
+            await never_resolves.wait()
+            return []  # pragma: no cover
+
+        service.graphiti.search_nodes = AsyncMock(
+            side_effect=RuntimeError('search_nodes failed')
+        )
+        service.graphiti.search = AsyncMock(side_effect=blocking_search)
+
+        # With gather(return_exceptions=True): search() blocks forever → TimeoutError.
+        # With TaskGroup: search() cancelled immediately → RuntimeError propagates fast.
+        with pytest.raises(RuntimeError, match='search_nodes failed'):
+            await asyncio.wait_for(
+                service.get_entity('entity', project_id='test'),
+                timeout=2.0,
+            )
