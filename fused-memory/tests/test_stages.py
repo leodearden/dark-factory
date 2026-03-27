@@ -112,10 +112,11 @@ class TestModuleLevelHelpers:
         from fused_memory.models.reconciliation import StageId
         stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         with patch_stage(stage):
-            # Inside context: assemble_payload is patched
-            assert stage.assemble_payload is not MemoryConsolidator.assemble_payload or \
-                hasattr(stage.assemble_payload, '_mock_name') or \
-                True  # patching via patch.object; verify it doesn't raise
+            # Inside context: assemble_payload is replaced with an AsyncMock
+            assert hasattr(stage.assemble_payload, 'assert_awaited')
+            mock_ref = stage.assemble_payload
+        # After context: teardown restores the original (mock is gone)
+        assert stage.assemble_payload is not mock_ref
 
     def test_patch_stage_accepts_cli_side_effect(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId
