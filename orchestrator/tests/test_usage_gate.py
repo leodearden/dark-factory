@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, patch
 
 import pytest
 from shared.config_models import AccountConfig, UsageCapConfig
@@ -22,7 +21,6 @@ from shared.usage_gate import (
 def _make_gate(
     num_accounts: int = 2,
     wait_for_reset: bool = False,
-    probe_interval_secs: int = 300,
     session_budget_usd: float | None = None,
 ) -> UsageGate:
     """Create a UsageGate with mock accounts (tokens pre-injected)."""
@@ -33,7 +31,6 @@ def _make_gate(
     ][:num_accounts]
     config = UsageCapConfig(
         wait_for_reset=wait_for_reset,
-        probe_interval_secs=probe_interval_secs,
         session_budget_usd=session_budget_usd,
         accounts=acct_cfgs,
     )
@@ -209,30 +206,25 @@ class TestGateLifecycle:
     async def test_before_invoke_blocks_when_all_capped(self):
         gate = _make_gate(num_accounts=1)
         gate._accounts[0].capped = True
+        # resets_at in future — refresh won't uncap
+        gate._accounts[0].resets_at = datetime.now(UTC) + timedelta(hours=1)
 
-        async def api_capped(token=None):
-            return {'five_hour': {'utilization': 0.99}}
-
-        with patch.object(gate, '_query_usage_api', side_effect=api_capped), \
-                pytest.raises(asyncio.TimeoutError):
+        with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(gate.before_invoke(), timeout=0.1)
 
     @pytest.mark.asyncio
     async def test_before_invoke_unblocks_on_uncap(self):
         gate = _make_gate(num_accounts=1)
         gate._accounts[0].capped = True
+        gate._accounts[0].resets_at = datetime.now(UTC) + timedelta(hours=1)
 
         async def uncap_after_delay():
             await asyncio.sleep(0.05)
             gate._accounts[0].capped = False
             gate._open.set()
 
-        async def api_capped(token=None):
-            return {'five_hour': {'utilization': 0.99}}
-
-        with patch.object(gate, '_query_usage_api', side_effect=api_capped):
-            asyncio.create_task(uncap_after_delay())
-            token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
+        asyncio.create_task(uncap_after_delay())
+        token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
         assert token == 'token-a'
 
     @pytest.mark.asyncio
@@ -264,68 +256,13 @@ class TestGateLifecycle:
 
 class TestStartupCheck:
     @pytest.mark.asyncio
-    async def test_pauses_when_over_threshold(self):
-        gate = _make_gate(num_accounts=1)
-        mock_usage = {
-            'five_hour': {
-                'utilization': 0.98,
-                'resets_at': (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-            }
-        }
-        with patch.object(gate, '_query_usage_api', new_callable=AsyncMock,
-                          return_value=mock_usage):
-            await gate.check_at_startup()
-            assert gate.is_paused
-            assert gate._accounts[0].capped is True
-
-    @pytest.mark.asyncio
-    async def test_stays_open_when_under_threshold(self):
-        gate = _make_gate(num_accounts=1)
-        mock_usage = {
-            'five_hour': {'utilization': 0.5, 'resets_at': None}
-        }
-        with patch.object(gate, '_query_usage_api', new_callable=AsyncMock,
-                          return_value=mock_usage):
-            await gate.check_at_startup()
-            assert not gate.is_paused
-
-    @pytest.mark.asyncio
-    async def test_stays_open_when_api_unavailable(self):
-        gate = _make_gate(num_accounts=1)
-        with patch.object(gate, '_query_usage_api', new_callable=AsyncMock,
-                          return_value=None):
-            await gate.check_at_startup()
-            assert not gate.is_paused
-
-    @pytest.mark.asyncio
-    async def test_marks_capped_account_at_startup(self):
+    async def test_startup_is_noop(self):
+        """Startup check no longer queries any API — all accounts remain open."""
         gate = _make_gate(num_accounts=2)
-
-        async def mock_query(token=None):
-            if token == 'token-a':
-                return {'five_hour': {'utilization': 0.99, 'resets_at': None}}
-            return {'five_hour': {'utilization': 0.3}}
-
-        with patch.object(gate, '_query_usage_api', side_effect=mock_query):
-            await gate.check_at_startup()
-
-        assert gate._accounts[0].capped is True
+        await gate.check_at_startup()
+        assert not gate.is_paused
+        assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
-        assert not gate.is_paused  # account B still available
-
-    @pytest.mark.asyncio
-    async def test_pauses_when_all_capped_at_startup(self):
-        gate = _make_gate(num_accounts=2)
-
-        async def mock_query(token=None):
-            return {'five_hour': {'utilization': 0.99, 'resets_at': None}}
-
-        with patch.object(gate, '_query_usage_api', side_effect=mock_query):
-            await gate.check_at_startup()
-
-        assert gate._accounts[0].capped is True
-        assert gate._accounts[1].capped is True
-        assert gate.is_paused
 
 
 # --- Multi-account before_invoke ---
@@ -349,37 +286,31 @@ class TestBeforeInvoke:
     async def test_blocks_when_all_capped_then_resumes(self):
         gate = _make_gate()
         gate._accounts[0].capped = True
+        gate._accounts[0].resets_at = datetime.now(UTC) + timedelta(hours=1)
         gate._accounts[1].capped = True
-
-        async def mock_query(token=None):
-            return {'five_hour': {'utilization': 0.99}}
+        gate._accounts[1].resets_at = datetime.now(UTC) + timedelta(hours=1)
 
         async def uncap_after_delay():
             await asyncio.sleep(0.05)
             gate._accounts[1].capped = False
             gate._open.set()
 
-        with patch.object(gate, '_query_usage_api', side_effect=mock_query):
-            asyncio.create_task(uncap_after_delay())
-            token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
+        asyncio.create_task(uncap_after_delay())
+        token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
         assert token == 'token-b'
 
     @pytest.mark.asyncio
     async def test_refresh_uncaps_account_before_blocking(self):
-        """When all accounts are flagged as capped but one has actually reset,
-        before_invoke should detect the reset via a fresh API check."""
+        """When all accounts are flagged as capped but one's reset time has
+        passed, before_invoke should uncap it via the time-based refresh."""
         gate = _make_gate()
         gate._accounts[0].capped = True
         gate._accounts[0].pause_started_at = datetime.now(UTC)
+        gate._accounts[0].resets_at = datetime.now(UTC) - timedelta(hours=1)  # past
         gate._accounts[1].capped = True
+        gate._accounts[1].resets_at = datetime.now(UTC) + timedelta(hours=1)  # future
 
-        async def mock_query(token=None):
-            if token == 'token-a':
-                return {'five_hour': {'utilization': 0.3}}  # A has reset
-            return {'five_hour': {'utilization': 0.99}}     # B still capped
-
-        with patch.object(gate, '_query_usage_api', side_effect=mock_query):
-            token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
+        token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
 
         assert token == 'token-a'
         assert gate._accounts[0].capped is False
@@ -513,253 +444,202 @@ class TestThreeAccountFailover:
         assert token == 'token-c'
 
 
-# --- Refresh on API failure ---
+# --- Refresh (time-based) ---
 
 
-class TestRefreshOnApiFailure:
+class TestRefreshCappedAccounts:
     @pytest.mark.asyncio
-    async def test_api_failure_keeps_accounts_capped_without_resets_at(self):
-        """When resets_at is None, API failure should keep accounts capped."""
-        gate = _make_gate(num_accounts=3)
-        for acct in gate._accounts:
-            acct.capped = True
-
-        async def api_down(token=None):
-            return None
-
-        with patch.object(gate, '_query_usage_api', side_effect=api_down):
-            any_uncapped = await gate._refresh_capped_accounts()
-
-        assert any_uncapped is False
-        assert all(a.capped for a in gate._accounts)
-
-    @pytest.mark.asyncio
-    async def test_tentative_uncap_after_resets_at_passed(self):
-        """After resets_at has passed and 2+ API failures, tentatively uncap."""
-        gate = _make_gate(num_accounts=2)
-        for acct in gate._accounts:
-            acct.capped = True
-            acct.resets_at = datetime.now(UTC) - timedelta(hours=1)  # past
-            acct.api_fail_count = 1  # one prior failure
-
-        async def api_down(token=None):
-            return None
-
-        with patch.object(gate, '_query_usage_api', side_effect=api_down):
-            any_uncapped = await gate._refresh_capped_accounts()
-
-        assert any_uncapped is True
-        # Both should be tentatively uncapped (both past reset + >=2 failures)
-        assert not gate._accounts[0].capped
-        assert not gate._accounts[1].capped
-
-    @pytest.mark.asyncio
-    async def test_no_tentative_uncap_before_resets_at(self):
-        """Before resets_at, API failure should not tentatively uncap."""
-        gate = _make_gate(num_accounts=1)
-        acct = gate._accounts[0]
-        acct.capped = True
-        acct.resets_at = datetime.now(UTC) + timedelta(hours=1)  # future
-        acct.api_fail_count = 10  # many failures
-
-        async def api_down(token=None):
-            return None
-
-        with patch.object(gate, '_query_usage_api', side_effect=api_down):
-            any_uncapped = await gate._refresh_capped_accounts()
-
-        assert any_uncapped is False
-        assert acct.capped is True
-
-    @pytest.mark.asyncio
-    async def test_no_tentative_uncap_on_first_failure(self):
-        """First API failure after resets_at should not uncap (needs >=2)."""
+    async def test_uncaps_account_when_resets_at_passed(self):
         gate = _make_gate(num_accounts=1)
         acct = gate._accounts[0]
         acct.capped = True
         acct.resets_at = datetime.now(UTC) - timedelta(hours=1)
-        acct.api_fail_count = 0  # first failure
+        acct.pause_started_at = datetime.now(UTC) - timedelta(hours=2)
 
-        async def api_down(token=None):
-            return None
+        any_uncapped = await gate._refresh_capped_accounts()
 
-        with patch.object(gate, '_query_usage_api', side_effect=api_down):
-            any_uncapped = await gate._refresh_capped_accounts()
+        assert any_uncapped is True
+        assert acct.capped is False
+
+    @pytest.mark.asyncio
+    async def test_keeps_account_capped_when_resets_at_in_future(self):
+        gate = _make_gate(num_accounts=1)
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.resets_at = datetime.now(UTC) + timedelta(hours=1)
+
+        any_uncapped = await gate._refresh_capped_accounts()
 
         assert any_uncapped is False
         assert acct.capped is True
-        assert acct.api_fail_count == 1
 
     @pytest.mark.asyncio
-    async def test_api_failure_for_some_accounts(self):
-        """API returns None for A (down) but valid data for B (reset)."""
+    async def test_keeps_account_capped_when_resets_at_is_none(self):
+        gate = _make_gate(num_accounts=1)
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.resets_at = None
+
+        any_uncapped = await gate._refresh_capped_accounts()
+
+        assert any_uncapped is False
+        assert acct.capped is True
+
+    @pytest.mark.asyncio
+    async def test_uncaps_multiple_past_reset_accounts(self):
+        gate = _make_gate(num_accounts=2)
+        for acct in gate._accounts:
+            acct.capped = True
+            acct.resets_at = datetime.now(UTC) - timedelta(hours=1)
+            acct.pause_started_at = datetime.now(UTC) - timedelta(hours=2)
+
+        any_uncapped = await gate._refresh_capped_accounts()
+
+        assert any_uncapped is True
+        assert not gate._accounts[0].capped
+        assert not gate._accounts[1].capped
+
+    @pytest.mark.asyncio
+    async def test_mixed_reset_times(self):
+        """One account past reset, one still in future."""
         gate = _make_gate(num_accounts=3)
         for acct in gate._accounts:
             acct.capped = True
             acct.pause_started_at = datetime.now(UTC)
+        gate._accounts[0].resets_at = datetime.now(UTC) + timedelta(hours=1)  # future
+        gate._accounts[1].resets_at = datetime.now(UTC) - timedelta(hours=1)  # past
+        gate._accounts[2].resets_at = datetime.now(UTC) + timedelta(hours=2)  # future
 
-        async def mixed_api(token=None):
-            if token == 'token-a':
-                return None  # API failure
-            if token == 'token-b':
-                return {'five_hour': {'utilization': 0.3}}  # reset
-            return {'five_hour': {'utilization': 0.99}}  # still capped
-
-        with patch.object(gate, '_query_usage_api', side_effect=mixed_api):
-            any_uncapped = await gate._refresh_capped_accounts()
+        any_uncapped = await gate._refresh_capped_accounts()
 
         assert any_uncapped is True
-        assert gate._accounts[0].capped is True   # A: API failed, stays capped
-        assert gate._accounts[1].capped is False   # B: confirmed reset
-        assert gate._accounts[2].capped is True    # C: still over threshold
+        assert gate._accounts[0].capped is True
+        assert gate._accounts[1].capped is False
+        assert gate._accounts[2].capped is True
 
     @pytest.mark.asyncio
-    async def test_api_success_resets_fail_count(self):
-        """Successful API call should reset api_fail_count."""
+    async def test_gate_reopens_when_any_uncapped(self):
+        gate = _make_gate(num_accounts=2)
+        gate._accounts[0].capped = True
+        gate._accounts[0].resets_at = datetime.now(UTC) + timedelta(hours=1)
+        gate._accounts[1].capped = True
+        gate._accounts[1].resets_at = datetime.now(UTC) - timedelta(hours=1)
+        gate._accounts[1].pause_started_at = datetime.now(UTC)
+        gate._open.clear()
+
+        await gate._refresh_capped_accounts()
+
+        assert gate._open.is_set()
+
+    @pytest.mark.asyncio
+    async def test_tracks_pause_duration_on_uncap(self):
         gate = _make_gate(num_accounts=1)
         acct = gate._accounts[0]
         acct.capped = True
-        acct.api_fail_count = 5
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
+        acct.pause_started_at = datetime.now(UTC) - timedelta(seconds=10)
 
-        async def api_capped(token=None):
-            return {'five_hour': {'utilization': 0.99}}
+        await gate._refresh_capped_accounts()
 
-        with patch.object(gate, '_query_usage_api', side_effect=api_capped):
-            await gate._refresh_capped_accounts()
-
-        assert acct.api_fail_count == 0
+        assert gate._total_pause_secs > 9.0
 
     @pytest.mark.asyncio
-    async def test_before_invoke_blocks_when_all_api_fail(self):
-        """When all capped and API returns 403 with resets_at in future,
-        before_invoke should block."""
+    async def test_before_invoke_blocks_when_resets_at_in_future(self):
+        """When all capped with resets_at in future, before_invoke should block."""
         gate = _make_gate(num_accounts=2)
         for acct in gate._accounts:
             acct.capped = True
             acct.resets_at = datetime.now(UTC) + timedelta(hours=1)
 
-        async def api_down(token=None):
-            return None
-
-        with patch.object(gate, '_query_usage_api', side_effect=api_down), \
-                pytest.raises(asyncio.TimeoutError):
+        with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(gate.before_invoke(), timeout=0.2)
 
     @pytest.mark.asyncio
     async def test_before_invoke_finds_reset_via_refresh(self):
-        """All flagged capped, but B has actually reset — should pick B."""
+        """All flagged capped, but B's reset time has passed — should pick B."""
         gate = _make_gate(num_accounts=3)
         for acct in gate._accounts:
             acct.capped = True
             acct.pause_started_at = datetime.now(UTC)
+            acct.resets_at = datetime.now(UTC) + timedelta(hours=1)
+        # B has already reset
+        gate._accounts[1].resets_at = datetime.now(UTC) - timedelta(hours=1)
 
-        async def mock_query(token=None):
-            if token == 'token-b':
-                return {'five_hour': {'utilization': 0.3}}
-            return {'five_hour': {'utilization': 0.99}}
-
-        with patch.object(gate, '_query_usage_api', side_effect=mock_query):
-            token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
+        token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
 
         assert token == 'token-b'
         assert gate._accounts[1].capped is False
 
 
-# --- Account probe ---
+# --- Resume probe (timer-based) ---
 
 
-class TestAccountProbe:
+class TestResumeProbe:
     @pytest.mark.asyncio
-    async def test_resume_reopens_gate(self):
+    async def test_sleeps_until_resets_at_then_uncaps(self):
         gate = _make_gate()
         acct = gate._accounts[0]
         acct.capped = True
         acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) + timedelta(milliseconds=50)
 
-        async def mock_query(token=None):
-            return {'five_hour': {'utilization': 0.3}}
-
-        with patch.object(gate, '_query_usage_api', side_effect=mock_query):
-            await gate._account_resume_probe_loop(acct)
+        await asyncio.wait_for(
+            gate._account_resume_probe_loop(acct), timeout=1.0,
+        )
 
         assert acct.capped is False
         assert gate._open.is_set()
 
     @pytest.mark.asyncio
-    async def test_stays_capped_on_api_failure_then_succeeds(self):
-        """API failure must NOT uncap — probe retries until API succeeds."""
-        gate = _make_gate(probe_interval_secs=1)
+    async def test_reopens_global_gate(self):
+        gate = _make_gate()
         acct = gate._accounts[0]
         acct.capped = True
         acct.pause_started_at = datetime.now(UTC)
-        acct.resets_at = None  # no reset time → skips initial sleep
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)  # already past
+        gate._open.clear()
 
-        call_count = 0
+        await gate._account_resume_probe_loop(acct)
 
-        async def mock_query(token=None):
-            nonlocal call_count
-            call_count += 1
-            if call_count < 3:
-                return None  # API failure
-            return {'five_hour': {'utilization': 0.3}}
-
-        with patch.object(gate, '_query_usage_api', side_effect=mock_query):
-            await gate._account_resume_probe_loop(acct)
-
-        assert acct.capped is False
-        assert call_count == 3
-
-    @pytest.mark.asyncio
-    async def test_tentative_uncap_after_resets_at_in_probe(self):
-        """Probe tentatively uncaps after resets_at + 2 API failures."""
-        gate = _make_gate(probe_interval_secs=1)
-        acct = gate._accounts[0]
-        acct.capped = True
-        acct.pause_started_at = datetime.now(UTC)
-        acct.resets_at = datetime.now(UTC) - timedelta(hours=1)  # past
-
-        call_count = 0
-
-        async def always_fail(token=None):
-            nonlocal call_count
-            call_count += 1
-            return None
-
-        with patch.object(gate, '_query_usage_api', side_effect=always_fail):
-            await gate._account_resume_probe_loop(acct)
-
-        # Should tentatively uncap after 2 failures (since past reset)
-        assert acct.capped is False
-        assert call_count == 2
         assert gate._open.is_set()
 
     @pytest.mark.asyncio
-    async def test_no_tentative_uncap_without_resets_at_in_probe(self):
-        """Probe should NOT tentatively uncap when resets_at is None."""
-        gate = _make_gate(probe_interval_secs=1)
+    async def test_noop_if_already_uncapped(self):
+        """If _refresh_capped_accounts already uncapped the account, probe skips."""
+        gate = _make_gate()
+        acct = gate._accounts[0]
+        acct.capped = False  # already uncapped
+        acct.pause_started_at = None
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
+
+        old_pause_secs = gate._total_pause_secs
+        await gate._account_resume_probe_loop(acct)
+
+        # No double-counting of pause duration
+        assert gate._total_pause_secs == old_pause_secs
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_1h_when_no_resets_at(self):
+        """When resets_at is None, probe defaults to 1h — verify it doesn't crash."""
+        gate = _make_gate()
         acct = gate._accounts[0]
         acct.capped = True
-        acct.resets_at = None  # no reset time known
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = None
 
-        call_count = 0
-
-        async def fail_then_succeed(token=None):
-            nonlocal call_count
-            call_count += 1
-            if call_count <= 3:
-                return None
-            return {'five_hour': {'utilization': 0.3}}
-
-        with patch.object(gate, '_query_usage_api', side_effect=fail_then_succeed):
-            await gate._account_resume_probe_loop(acct)
-
-        assert acct.capped is False
-        assert call_count == 4  # 3 failures, then success
+        # Start probe, then cancel after a short delay (don't wait 1h)
+        task = asyncio.create_task(gate._account_resume_probe_loop(acct))
+        await asyncio.sleep(0.05)
+        # Probe should still be sleeping (1h default)
+        assert not task.done()
+        assert acct.capped is True
+        task.cancel()
+        await asyncio.wait_for(task, timeout=1.0)
 
     @pytest.mark.asyncio
     async def test_probe_cancellation(self):
         """Probe should be cancellable while sleeping and leave account capped."""
-        gate = _make_gate(probe_interval_secs=3600)
+        gate = _make_gate()
         acct = gate._accounts[0]
         acct.capped = True
         acct.resets_at = datetime.now(UTC) + timedelta(hours=1)
@@ -772,52 +652,23 @@ class TestAccountProbe:
         assert acct.capped is True
 
     @pytest.mark.asyncio
-    async def test_api_success_resets_fail_count_in_probe(self):
-        """Successful API call in probe should reset api_fail_count."""
-        gate = _make_gate(probe_interval_secs=1)
+    async def test_tracks_pause_duration(self):
+        gate = _make_gate()
         acct = gate._accounts[0]
         acct.capped = True
-        acct.pause_started_at = datetime.now(UTC)
-        acct.api_fail_count = 5
+        acct.pause_started_at = datetime.now(UTC) - timedelta(seconds=10)
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
 
-        async def api_low(token=None):
-            return {'five_hour': {'utilization': 0.3}}
+        await gate._account_resume_probe_loop(acct)
 
-        with patch.object(gate, '_query_usage_api', side_effect=api_low):
-            await gate._account_resume_probe_loop(acct)
-
-        assert acct.api_fail_count == 0
+        assert gate._total_pause_secs > 9.0
+        assert acct.pause_started_at is None
 
 
-# --- Reproduce original bug ---
+# --- Cap retry rotation ---
 
 
-class TestReproduceOptimisticUncapBug:
-    """Verify the original bug is fixed: API 403 no longer causes a
-    tight loop on the first account.
-    """
-
-    @pytest.mark.asyncio
-    async def test_api_403_does_not_immediately_uncap(self):
-        """All capped, API returns 403 — no resets_at so no tentative uncap."""
-        gate = _make_gate(num_accounts=3)
-        for acct in gate._accounts:
-            acct.capped = True
-            # No resets_at set → tentative uncap not eligible
-
-        refresh_calls = []
-
-        async def api_403(token=None):
-            refresh_calls.append(token)
-            return None
-
-        with patch.object(gate, '_query_usage_api', side_effect=api_403):
-            any_uncapped = await gate._refresh_capped_accounts()
-
-        assert any_uncapped is False
-        assert set(refresh_calls) == {'token-a', 'token-b', 'token-c'}
-        assert all(a.capped for a in gate._accounts)
-
+class TestCapRetryRotation:
     @pytest.mark.asyncio
     async def test_cap_retry_rotation_order(self):
         """Cap A → pick B → cap B → pick C."""
@@ -843,11 +694,12 @@ class TestReproduceOptimisticUncapBug:
         assert token3 == 'token-c'
 
     @pytest.mark.asyncio
-    async def test_all_capped_then_one_resets_via_probe(self):
-        """All three capped, then B resets via its background probe."""
+    async def test_all_capped_then_one_resets_via_timer(self):
+        """All three capped, then B's reset time arrives."""
         gate = _make_gate(num_accounts=3)
         for acct in gate._accounts:
             acct.capped = True
+            acct.resets_at = datetime.now(UTC) + timedelta(hours=1)
         gate._open.clear()
 
         async def uncap_b_after_delay():
@@ -856,12 +708,8 @@ class TestReproduceOptimisticUncapBug:
             gate._accounts[1].pause_started_at = None
             gate._open.set()
 
-        async def api_capped(token=None):
-            return {'five_hour': {'utilization': 0.99}}
-
-        with patch.object(gate, '_query_usage_api', side_effect=api_capped):
-            asyncio.create_task(uncap_b_after_delay())
-            token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
+        asyncio.create_task(uncap_b_after_delay())
+        token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
 
         assert token == 'token-b'
 
@@ -884,12 +732,9 @@ class TestSingleAccountUnifiedPath:
     async def test_blocks_when_single_account_capped(self):
         gate = _make_gate(num_accounts=1)
         gate._accounts[0].capped = True
+        gate._accounts[0].resets_at = datetime.now(UTC) + timedelta(hours=1)
 
-        async def api_capped(token=None):
-            return {'five_hour': {'utilization': 0.99}}
-
-        with patch.object(gate, '_query_usage_api', side_effect=api_capped), \
-                pytest.raises(asyncio.TimeoutError):
+        with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(gate.before_invoke(), timeout=0.1)
 
     @pytest.mark.asyncio
@@ -902,29 +747,25 @@ class TestSingleAccountUnifiedPath:
 
     @pytest.mark.asyncio
     async def test_probe_uncaps_single_account(self):
-        gate = _make_gate(num_accounts=1, probe_interval_secs=1)
+        gate = _make_gate(num_accounts=1)
         acct = gate._accounts[0]
         acct.capped = True
         acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) + timedelta(milliseconds=50)
 
-        async def api_low(token=None):
-            return {'five_hour': {'utilization': 0.3}}
-
-        with patch.object(gate, '_query_usage_api', side_effect=api_low):
-            await gate._account_resume_probe_loop(acct)
+        await asyncio.wait_for(
+            gate._account_resume_probe_loop(acct), timeout=1.0,
+        )
 
         assert acct.capped is False
         assert gate._open.is_set()
 
     @pytest.mark.asyncio
-    async def test_startup_check_single_account(self):
+    async def test_startup_check_is_noop(self):
         gate = _make_gate(num_accounts=1)
-        mock_usage = {'five_hour': {'utilization': 0.99, 'resets_at': None}}
-        with patch.object(gate, '_query_usage_api', new_callable=AsyncMock,
-                          return_value=mock_usage):
-            await gate.check_at_startup()
-        assert gate._accounts[0].capped is True
-        assert gate.is_paused
+        await gate.check_at_startup()
+        assert gate._accounts[0].capped is False
+        assert not gate.is_paused
 
 
 # --- Refresh vs probe interaction ---
@@ -933,18 +774,17 @@ class TestSingleAccountUnifiedPath:
 class TestRefreshVsProbeInteraction:
     @pytest.mark.asyncio
     async def test_refresh_detects_reset_even_if_probe_sleeping(self):
+        """Refresh should uncap an account whose reset time has passed,
+        even though its probe task is still sleeping."""
         gate = _make_gate(num_accounts=3)
         for acct in gate._accounts:
             acct.capped = True
             acct.pause_started_at = datetime.now(UTC)
+            acct.resets_at = datetime.now(UTC) + timedelta(hours=1)
+        # B has already reset
+        gate._accounts[1].resets_at = datetime.now(UTC) - timedelta(hours=1)
 
-        async def api_b_reset(token=None):
-            if token == 'token-b':
-                return {'five_hour': {'utilization': 0.2}}
-            return {'five_hour': {'utilization': 0.99}}
-
-        with patch.object(gate, '_query_usage_api', side_effect=api_b_reset):
-            refreshed = await gate._refresh_capped_accounts()
+        refreshed = await gate._refresh_capped_accounts()
 
         assert refreshed is True
         assert gate._accounts[0].capped is True
@@ -955,16 +795,12 @@ class TestRefreshVsProbeInteraction:
     async def test_gate_reopens_when_refresh_finds_uncapped(self):
         gate = _make_gate(num_accounts=2)
         gate._accounts[0].capped = True
+        gate._accounts[0].resets_at = datetime.now(UTC) + timedelta(hours=1)
         gate._accounts[1].capped = True
         gate._accounts[1].pause_started_at = datetime.now(UTC)
+        gate._accounts[1].resets_at = datetime.now(UTC) - timedelta(hours=1)
         gate._open.clear()
 
-        async def api_b_reset(token=None):
-            if token == 'token-b':
-                return {'five_hour': {'utilization': 0.2}}
-            return {'five_hour': {'utilization': 0.99}}
-
-        with patch.object(gate, '_query_usage_api', side_effect=api_b_reset):
-            await gate._refresh_capped_accounts()
+        await gate._refresh_capped_accounts()
 
         assert gate._open.is_set()

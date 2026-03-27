@@ -118,7 +118,6 @@ class TestPackageMetadata:
 
         requires = m.get_all('Requires-Dist') or []
         dist_names = {r.split('>=')[0].split('[')[0].strip() for r in requires}
-        assert 'httpx' in dist_names, f'httpx missing from Requires-Dist: {requires}'
         assert 'pydantic' in dist_names, f'pydantic missing from Requires-Dist: {requires}'
 
     def test_shared_version_attribute(self):

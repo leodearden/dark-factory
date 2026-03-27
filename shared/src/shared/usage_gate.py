@@ -4,6 +4,11 @@ Supports multiple Claude Max accounts for failover: when one account hits its
 usage cap, the gate returns the next available account's token. Only blocks
 when *all* accounts are capped.
 
+Cap detection is reactive (stderr pattern matching). Resume is timer-based:
+when an account is capped, we sleep until the parsed ``resets_at`` time, then
+uncap. If the uncap is premature, the retry loop in ``invoke_with_cap_retry``
+re-detects the cap on the next invocation.
+
 Works with 1 or N accounts — there is no separate "single-account" path.
 """
 
@@ -18,9 +23,6 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
-
-import httpx
 
 from shared.config_models import UsageCapConfig
 
@@ -56,10 +58,6 @@ GEMINI_CAP_PATTERNS = ['quota exceeded', 'rate limit', 'resource exhausted',
                        'RESOURCE_EXHAUSTED', 'quota_exceeded']
 
 CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
-USAGE_API_URL = 'https://claude.ai/api/oauth/usage'
-
-# Consecutive API failures required before tentative uncap (after resets_at)
-_TENTATIVE_UNCAP_THRESHOLD = 2
 
 
 @dataclass
@@ -72,7 +70,6 @@ class AccountState:
     resets_at: datetime | None = None
     pause_started_at: datetime | None = None
     resume_task: asyncio.Task | None = field(default=None, repr=False)
-    api_fail_count: int = 0    # consecutive _query_usage_api failures
 
 
 class SessionBudgetExhausted(Exception):
@@ -136,38 +133,17 @@ class UsageGate:
         return accounts
 
     async def check_at_startup(self) -> None:
-        """Query /api/oauth/usage for each account. Pause if all are over threshold."""
-        for acct in self._accounts:
-            usage = await self._query_usage_api(token=acct.token)
-            if usage is None:
-                logger.info(f'Account {acct.name}: usage API unavailable — assuming OK')
-                continue
+        """No-op: pre-existing caps are detected reactively on first invocation.
 
-            for tier_name, tier_data in usage.items():
-                if not isinstance(tier_data, dict):
-                    continue
-                utilization = tier_data.get('utilization', 0)
-                resets_at_str = tier_data.get('resets_at')
-
-                logger.info(
-                    f'Account {acct.name} tier {tier_name}: {utilization:.0%} utilized'
-                    + (f', resets at {resets_at_str}' if resets_at_str else '')
-                )
-
-                if utilization >= self._config.pause_threshold:
-                    acct.capped = True
-                    acct.resets_at = _parse_iso_timestamp(resets_at_str) if resets_at_str else None
-                    acct.pause_started_at = datetime.now(UTC)
-                    logger.warning(f'Account {acct.name}: capped at startup ({utilization:.0%})')
-                    self._start_account_resume_probe(acct)
-                    break  # one capped tier is enough
-
-        # If ALL accounts are capped, close the global gate
-        if self._accounts and all(a.capped for a in self._accounts):
-            self._open.clear()
-            self._paused_reason = f'All {len(self._accounts)} account(s) capped at startup'
-            self._pause_started_at = datetime.now(UTC)
-            logger.warning(f'Usage gate PAUSED: {self._paused_reason}')
+        The usage API (claude.ai/api/oauth/usage) is no longer available.
+        If an account is already capped, the first invocation attempt will
+        detect it via stderr pattern matching in ``detect_cap_hit()``.
+        """
+        logger.info(
+            'Usage gate startup: %d account(s) configured — '
+            'caps will be detected reactively',
+            len(self._accounts),
+        )
 
     async def before_invoke(self) -> str | None:
         """Block until at least one account is available. Return its OAuth token.
@@ -191,9 +167,7 @@ class UsageGate:
                     logger.debug(f'Using account {acct.name}')
                     return acct.token
 
-            # All capped — do a fresh API check before blocking.
-            # Background probes may be sleeping through exponential backoff,
-            # but one account may have already reset.
+            # All capped — check if any reset times have passed before blocking.
             refreshed = await self._refresh_capped_accounts()
             if refreshed:
                 continue  # re-check accounts with updated flags
@@ -298,52 +272,17 @@ class UsageGate:
             pass
 
     async def _refresh_capped_accounts(self) -> bool:
-        """Query the usage API for all capped accounts. Return True if any uncapped."""
+        """Check reset times for all capped accounts. Return True if any uncapped."""
+        now = datetime.now(UTC)
         any_uncapped = False
         for acct in self._accounts:
             if not acct.capped:
                 continue
-            usage = await self._query_usage_api(token=acct.token)
-            if usage is None:
-                acct.api_fail_count += 1
-                past_reset = (
-                    acct.resets_at is not None
-                    and datetime.now(UTC) > acct.resets_at
-                )
-                if past_reset and acct.api_fail_count >= _TENTATIVE_UNCAP_THRESHOLD:
-                    logger.warning(
-                        f'Account {acct.name}: usage API unavailable after '
-                        f'expected reset — tentatively uncapping'
-                    )
-                    acct.capped = False
-                    acct.pause_started_at = None
-                    acct.api_fail_count = 0
-                    any_uncapped = True
-                else:
-                    logger.warning(
-                        f'Account {acct.name}: usage API unavailable during '
-                        f'refresh — keeping capped (will retry via probe)'
-                    )
-                continue
-
-            acct.api_fail_count = 0
-            still_capped = False
-            for _tier_name, tier_data in usage.items():
-                if not isinstance(tier_data, dict):
-                    continue
-                utilization = tier_data.get('utilization', 0)
-                if utilization >= self._config.pause_threshold:
-                    still_capped = True
-                    break
-
-            if not still_capped:
-                logger.info(f'Account {acct.name}: cap cleared on fresh check')
+            if acct.resets_at is not None and now >= acct.resets_at:
+                logger.info(f'Account {acct.name}: reset time passed — uncapping')
                 acct.capped = False
                 if acct.pause_started_at:
-                    pause_duration = (
-                        datetime.now(UTC) - acct.pause_started_at
-                    ).total_seconds()
-                    self._total_pause_secs += pause_duration
+                    self._total_pause_secs += (now - acct.pause_started_at).total_seconds()
                 acct.pause_started_at = None
                 any_uncapped = True
 
@@ -356,97 +295,36 @@ class UsageGate:
         self._cumulative_cost += cost
 
     async def _account_resume_probe_loop(self, acct: AccountState) -> None:
-        """Per-account resume probe. When the account reopens, mark it available."""
-        interval = self._config.probe_interval_secs
+        """Sleep until the account's reset time, then mark it available.
 
-        if acct.resets_at:
-            wait_secs = max(0, (acct.resets_at - datetime.now(UTC)).total_seconds())
-            if wait_secs > 0:
-                logger.info(f'Account {acct.name}: sleeping {wait_secs:.0f}s until expected reset')
-                try:
-                    await asyncio.sleep(wait_secs)
-                except asyncio.CancelledError:
-                    return
+        If the uncap is premature, ``invoke_with_cap_retry`` will re-detect
+        the cap on the next invocation and start a new probe.
+        """
+        target = acct.resets_at
+        if target is None:
+            target = datetime.now(UTC) + timedelta(hours=1)
+            logger.warning(f'Account {acct.name}: no resets_at — defaulting to 1h')
 
-        while True:
-            usage = await self._query_usage_api(token=acct.token)
-            if usage is not None:
-                acct.api_fail_count = 0
-                still_capped = False
-                for tier_name, tier_data in usage.items():
-                    if not isinstance(tier_data, dict):
-                        continue
-                    utilization = tier_data.get('utilization', 0)
-                    if utilization >= self._config.pause_threshold:
-                        still_capped = True
-                        resets_at_str = tier_data.get('resets_at')
-                        if resets_at_str:
-                            acct.resets_at = _parse_iso_timestamp(resets_at_str)
-                        logger.info(
-                            f'Account {acct.name} probe: {tier_name} still at {utilization:.0%}'
-                        )
-                        break
-
-                if not still_capped:
-                    acct.capped = False
-                    if acct.pause_started_at:
-                        pause_duration = (datetime.now(UTC) - acct.pause_started_at).total_seconds()
-                        self._total_pause_secs += pause_duration
-                    acct.pause_started_at = None
-                    logger.info(f'Account {acct.name} RESUMED')
-                    # Reopen global gate so blocked before_invoke() callers wake up
-                    self._open.set()
-                    return
-            else:
-                acct.api_fail_count += 1
-                past_reset = (
-                    acct.resets_at is not None
-                    and datetime.now(UTC) > acct.resets_at
-                )
-                if past_reset and acct.api_fail_count >= _TENTATIVE_UNCAP_THRESHOLD:
-                    logger.warning(
-                        f'Account {acct.name}: usage API unavailable after '
-                        f'expected reset — tentatively uncapping'
-                    )
-                    acct.capped = False
-                    acct.pause_started_at = None
-                    acct.api_fail_count = 0
-                    self._open.set()
-                    return
-                logger.warning(
-                    f'Account {acct.name}: usage API unavailable — '
-                    f'keeping capped (will retry in {interval}s)'
-                )
-
+        wait_secs = max(0, (target - datetime.now(UTC)).total_seconds())
+        if wait_secs > 0:
+            logger.info(f'Account {acct.name}: sleeping {wait_secs:.0f}s until reset')
             try:
-                logger.info(f'Account {acct.name}: still capped, retrying in {interval}s')
-                await asyncio.sleep(interval)
+                await asyncio.sleep(wait_secs)
             except asyncio.CancelledError:
                 return
-            interval = min(interval * 2, self._config.max_probe_interval_secs)
 
-    async def _query_usage_api(self, token: str | None = None) -> dict[str, Any] | None:
-        """GET /api/oauth/usage with the given OAuth token."""
-        if not token:
-            logger.debug('No OAuth token found — cannot query usage API')
-            return None
+        # _refresh_capped_accounts may have already uncapped this account
+        if not acct.capped:
+            return
 
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(
-                    USAGE_API_URL,
-                    headers={
-                        'Authorization': f'Bearer {token}',
-                        'Content-Type': 'application/json',
-                    },
-                )
-                if resp.status_code == 200:
-                    return resp.json()
-                logger.warning(f'Usage API returned {resp.status_code}: {resp.text[:200]}')
-                return None
-        except Exception as e:
-            logger.warning(f'Usage API request failed: {e}')
-            return None
+        acct.capped = False
+        if acct.pause_started_at:
+            self._total_pause_secs += (
+                datetime.now(UTC) - acct.pause_started_at
+            ).total_seconds()
+        acct.pause_started_at = None
+        logger.info(f'Account {acct.name} RESUMED (timer expired)')
+        self._open.set()
 
     async def shutdown(self) -> None:
         """Cancel all resume probe tasks."""
@@ -571,17 +449,6 @@ def _parse_resets_at(text: str) -> datetime:
 
     # Fallback: 1 hour from now
     return datetime.now(UTC) + timedelta(hours=1)
-
-
-def _parse_iso_timestamp(ts: str) -> datetime | None:
-    """Parse an ISO 8601 timestamp string."""
-    try:
-        dt = datetime.fromisoformat(ts)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=UTC)
-        return dt
-    except (ValueError, TypeError):
-        return None
 
 
 def _extract_cap_message(text: str, prefix: str) -> str:
