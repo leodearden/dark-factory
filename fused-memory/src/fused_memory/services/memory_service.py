@@ -798,17 +798,42 @@ class MemoryService:
         name: str,
         project_id: str = 'main',
     ) -> dict:
-        """Entity lookup in Graphiti — returns nodes + edges."""
-        nodes = await self.graphiti.search_nodes(
-            query=name,
-            group_ids=[project_id],
-            max_nodes=5,
+        """Entity lookup in Graphiti — returns nodes + edges.
+
+        Both Graphiti calls run concurrently via asyncio.gather(return_exceptions=True).
+        This ensures neither call becomes an orphaned background task in the error path:
+        gather() awaits both coroutines to settlement before returning, even when one
+        (or both) raise an exception.  If any call fails the first exception is re-raised.
+        """
+        results = await asyncio.gather(
+            self.graphiti.search_nodes(
+                query=name,
+                group_ids=[project_id],
+                max_nodes=5,
+            ),
+            self.graphiti.search(
+                query=name,
+                group_ids=[project_id],
+                num_results=10,
+            ),
+            return_exceptions=True,
         )
-        edges = await self.graphiti.search(
-            query=name,
-            group_ids=[project_id],
-            num_results=10,
-        )
+
+        # Inspect results — log all failures then re-raise the first exception.
+        # Both coroutines have already settled at this point (no orphans).
+        exceptions = [r for r in results if isinstance(r, BaseException)]
+        if exceptions:
+            for exc in exceptions:
+                logger.warning(
+                    'get_entity: Graphiti call failed: %s: %s',
+                    type(exc).__name__,
+                    exc,
+                )
+            raise exceptions[0]
+
+        nodes, edges = results
+        assert isinstance(nodes, list)
+        assert isinstance(edges, list)
 
         node_data = []
         for n in nodes:
