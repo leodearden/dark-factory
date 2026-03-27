@@ -296,6 +296,50 @@ class GitOps:
         )
         return branch
 
+    async def get_main_sha(self) -> str:
+        """Return current main branch SHA."""
+        _, sha, _ = await _run(
+            ['git', 'rev-parse', self.config.main_branch],
+            cwd=self.project_root,
+        )
+        return sha.strip()
+
+    async def rebase_onto_main(self, worktree: Path) -> bool:
+        """Rebase the task branch in *worktree* onto current main.
+
+        Returns True on success.  On failure, aborts the rebase so the
+        worktree is left in a clean state, and returns False.
+
+        Caller must NOT hold ``_merge_lock`` — this is designed to run
+        outside the lock so multiple tasks can rebase concurrently in
+        their own worktrees.
+        """
+        rc, _, err = await _run(
+            ['git', 'rebase', self.config.main_branch],
+            cwd=worktree,
+        )
+        if rc != 0:
+            await _run(['git', 'rebase', '--abort'], cwd=worktree)
+            logger.info(f'Pre-merge rebase failed in {worktree}: {err}')
+            return False
+        return True
+
+    async def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        """Return True if *ancestor* is an ancestor of *descendant*."""
+        rc, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor', ancestor, descendant],
+            cwd=self.project_root,
+        )
+        return rc == 0
+
+    async def get_changed_files(self, from_sha: str, to_sha: str) -> list[str]:
+        """Return list of files changed between two commits."""
+        _, output, _ = await _run(
+            ['git', 'diff', '--name-only', from_sha, to_sha],
+            cwd=self.project_root,
+        )
+        return [f for f in output.strip().splitlines() if f.strip()]
+
     async def merge_to_main(self, worktree: Path, branch: str) -> MergeResult:
         """Merge a task branch into main using a temporary merge worktree.
 
@@ -439,40 +483,61 @@ class GitOps:
         )
         return sha
 
-    async def advance_main(self, merge_sha: str, merge_worktree: Path | None = None) -> bool:
+    async def advance_main(
+        self,
+        merge_sha: str,
+        merge_worktree: Path | None = None,
+        branch: str | None = None,
+        max_attempts: int = 3,
+    ) -> bool:
         """Advance main branch ref to *merge_sha* atomically.
 
         Uses ``update-ref`` so the project_root working tree is never touched.
-        Returns False if main has moved past the merge base (caller should
-        mark the task as blocked).
+        Returns False if main has moved past the merge base and all retry
+        attempts are exhausted (caller should mark the task as blocked).
+
+        When *branch* is provided and a rebase fails, the method will abort
+        the rebase, reset to current main, and re-merge *branch* before
+        retrying.  Up to *max_attempts* rounds are attempted.
 
         IMPORTANT: This method is the LAST checkpoint before code reaches
         main.  update-ref bypasses ALL git hooks (including pre-commit),
         so the .task/ contamination gate here is the final defense.
         """
-        # ── .task/ contamination gate (FINAL DEFENSE) ─────────────────
-        # update-ref bypasses pre-commit hooks entirely.  This is the
-        # absolute last chance to prevent .task/ from reaching main.
-        # If this gate fires, something upstream failed to scrub — we
-        # refuse to advance and log an error so the root cause can be
-        # traced.  DO NOT remove this check or catch the exception.
-        try:
-            await _assert_no_task_dir(merge_sha, self.project_root, 'advance_main')
-        except RuntimeError as e:
-            logger.error(str(e))
-            return False
+        full_branch = f'{self.config.branch_prefix}{branch}' if branch else None
 
-        rc, _, _ = await _run(
-            ['git', 'merge-base', '--is-ancestor',
-             self.config.main_branch, merge_sha],
-            cwd=self.project_root,
-        )
-        if rc != 0 and merge_worktree is not None:
-            # Main advanced (e.g. from taskmaster auto-commits).
-            # Rebase the merge commit onto current main and retry.
-            logger.info(
-                f'Main advanced past {merge_sha[:8]} — rebasing merge commit'
+        for attempt in range(max_attempts):
+            # ── .task/ contamination gate (FINAL DEFENSE) ─────────────
+            try:
+                await _assert_no_task_dir(
+                    merge_sha, self.project_root,
+                    f'advance_main(attempt={attempt + 1})',
+                )
+            except RuntimeError as e:
+                logger.error(str(e))
+                return False
+
+            rc, _, _ = await _run(
+                ['git', 'merge-base', '--is-ancestor',
+                 self.config.main_branch, merge_sha],
+                cwd=self.project_root,
             )
+            if rc == 0:
+                break  # merge_sha is a descendant of main — safe to advance
+
+            if merge_worktree is None:
+                logger.warning(
+                    f'Cannot fast-forward: {merge_sha[:8]} is not a descendant '
+                    f'of {self.config.main_branch} (no merge worktree for retry)'
+                )
+                return False
+
+            logger.info(
+                f'advance_main attempt {attempt + 1}/{max_attempts}: '
+                f'main advanced past {merge_sha[:8]}'
+            )
+
+            # Try rebasing the merge commit onto current main
             rebase_rc, _, rebase_err = await _run(
                 ['git', 'rebase', self.config.main_branch],
                 cwd=merge_worktree,
@@ -482,27 +547,54 @@ class GitOps:
                     ['git', 'rev-parse', 'HEAD'], cwd=merge_worktree,
                 )
                 merge_sha = new_sha.strip()
-                try:
-                    await _assert_no_task_dir(
-                        merge_sha, self.project_root, 'advance_main(rebased)',
-                    )
-                except RuntimeError as e:
-                    logger.error(str(e))
-                    return False
-                rc, _, _ = await _run(
-                    ['git', 'merge-base', '--is-ancestor',
-                     self.config.main_branch, merge_sha],
-                    cwd=self.project_root,
-                )
-            else:
-                logger.warning(f'Rebase failed: {rebase_err}')
-        if rc != 0:
+                continue  # re-check is_ancestor at top of loop
+
+            # Rebase failed — abort and try a fresh re-merge if we have
+            # the branch name
             logger.warning(
-                f'Cannot fast-forward: {merge_sha[:8]} is not a descendant '
-                f'of {self.config.main_branch}'
+                f'Rebase failed (attempt {attempt + 1}): {rebase_err}'
+            )
+            await _run(['git', 'rebase', '--abort'], cwd=merge_worktree)
+
+            if full_branch is None:
+                # No branch to re-merge from — cannot recover
+                continue
+
+            # Reset merge worktree to current main and re-merge
+            await _run(
+                ['git', 'reset', '--hard', self.config.main_branch],
+                cwd=merge_worktree,
+            )
+            merge_rc, merge_out, merge_err = await _run(
+                ['git', 'merge', '--no-ff', full_branch,
+                 '-m', f'Merge {full_branch} into {self.config.main_branch}'],
+                cwd=merge_worktree,
+            )
+            if merge_rc != 0:
+                # True conflict with current main — stop retrying
+                logger.warning(
+                    f'Re-merge failed (true conflict): {merge_out}\n{merge_err}'
+                )
+                return False
+
+            await _scrub_task_dir_from_tree(
+                merge_worktree, f'advance_main-retry({attempt + 1})',
+            )
+            _, new_sha, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'], cwd=merge_worktree,
+            )
+            merge_sha = new_sha.strip()
+            continue  # re-check is_ancestor at top of loop
+        else:
+            # Exhausted all attempts
+            logger.warning(
+                f'Cannot fast-forward after {max_attempts} attempts: '
+                f'{merge_sha[:8]} is not a descendant of '
+                f'{self.config.main_branch}'
             )
             return False
 
+        # All checks passed — advance the ref
         rc, _, err = await _run(
             ['git', 'update-ref',
              f'refs/heads/{self.config.main_branch}', merge_sha],

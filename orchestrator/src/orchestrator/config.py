@@ -262,6 +262,11 @@ class OrchestratorConfig(BaseSettings):
     max_verify_attempts: int = Field(default=5)
     max_review_cycles: int = Field(default=2)
 
+    # Merge conflict reduction
+    max_advance_attempts: int = Field(default=3)
+    max_pre_merge_retries: int = Field(default=2)
+    inter_iteration_rebase: bool = Field(default=True)
+
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)
     steward_max_retries: int = Field(default=3)

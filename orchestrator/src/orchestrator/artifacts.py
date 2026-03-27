@@ -102,6 +102,15 @@ class TaskArtifacts:
         metadata = json.loads(meta_path.read_text())
         return metadata.get('base_commit')
 
+    def update_base_commit(self, new_base: str) -> None:
+        """Update the base_commit in metadata.json after a rebase."""
+        meta_path = self.root / 'metadata.json'
+        if not meta_path.exists():
+            return
+        metadata = json.loads(meta_path.read_text())
+        metadata['base_commit'] = new_base
+        self._write_json(meta_path, metadata)
+
     def write_plan(self, plan: dict) -> None:
         """Write .task/plan.json — the structured plan."""
         plan['_schema_version'] = PLAN_SCHEMA_VERSION

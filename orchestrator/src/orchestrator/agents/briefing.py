@@ -60,7 +60,11 @@ class BriefingAssembler:
 """
 
     async def build_implementer_prompt(
-        self, plan: dict, iteration_log: list[dict], context: str | None = None
+        self,
+        plan: dict,
+        iteration_log: list[dict],
+        context: str | None = None,
+        rebase_notice: dict | None = None,
     ) -> str:
         """Build prompt for the implementer agent."""
         if context is None:
@@ -85,6 +89,25 @@ class BriefingAssembler:
                 )
             log_summary = "## Recent Iterations\n\n" + '\n'.join(log_lines)
 
+        rebase_section = ''
+        if rebase_notice:
+            files_list = '\n'.join(
+                f'- `{f}`' for f in rebase_notice['changed_files'][:30]
+            )
+            rebase_section = f"""
+## Rebase Notice
+
+Your worktree was rebased onto the latest main branch.
+
+- **Previous base:** `{rebase_notice['old_base'][:12]}`
+- **New base:** `{rebase_notice['new_base'][:12]}`
+- **Files changed on main since last base:**
+
+{files_list}
+
+Review any overlap with your plan steps before continuing — file contents may have changed.
+"""
+
         return f"""\
 {context}
 
@@ -101,7 +124,7 @@ class BriefingAssembler:
 - Steps: {len(completed)} done, {len(pending)} pending
 
 {log_summary}
-
+{rebase_section}
 # Session Startup Protocol
 
 1. Read `.task/plan.json` to see the full plan with current status.

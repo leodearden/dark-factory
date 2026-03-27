@@ -69,7 +69,8 @@ class _BriefingLike(Protocol):
         worktree: Path | None = ...,
     ) -> str: ...
     async def build_implementer_prompt(
-        self, plan: dict, iteration_log: list, context: str | None = ...
+        self, plan: dict, iteration_log: list, context: str | None = ...,
+        rebase_notice: dict | None = ...,
     ) -> str: ...
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = ...
@@ -110,6 +111,10 @@ class WorkflowMetrics:
     execute_iterations: int = 0
     verify_attempts: int = 0
     review_cycles: int = 0
+    pre_merge_rebase_attempts: int = 0
+    pre_merge_rebase_ok: int = 0
+    advance_main_retries: int = 0
+    inter_iteration_rebases: int = 0
 
 
 class TaskWorkflow:
@@ -274,8 +279,41 @@ class TaskWorkflow:
             # MERGE (skip for eval mode — no merge into main)
             if not self._worktree_external:
                 self.state = WorkflowState.MERGE
+
+                # Phase 1: pre-merge rebase (NO lock held)
+                # Rebase the task branch onto current main and re-verify
+                # so the locked merge phase is fast/trivial.
+                pre_rebased = False
+                for _attempt in range(self.config.max_pre_merge_retries):
+                    main_before = await self.git_ops.get_main_sha()
+                    if not await self.git_ops.rebase_onto_main(self.worktree):
+                        break  # true conflict — fall through to locked merge
+                    verify = await run_scoped_verification(
+                        self.worktree, self.config, self._module_configs,
+                        task_files=self._task_files,
+                    )
+                    if not verify.passed:
+                        logger.warning(
+                            f'Task {self.task_id}: post-rebase verification '
+                            f'failed: {verify.summary}'
+                        )
+                        break
+                    main_after = await self.git_ops.get_main_sha()
+                    if main_before == main_after:
+                        pre_rebased = True
+                        self.metrics.pre_merge_rebase_ok += 1
+                        break
+                    self.metrics.pre_merge_rebase_attempts += 1
+                    logger.info(
+                        f'Task {self.task_id}: main moved during pre-merge '
+                        f'rebase, retrying'
+                    )
+
+                # Phase 2: merge (lock held — should be fast after rebase)
                 async with self.git_ops._merge_lock:
-                    merge_outcome = await self._merge(branch_name)
+                    merge_outcome = await self._merge(
+                        branch_name, pre_rebased=pre_rebased,
+                    )
                     if merge_outcome != WorkflowOutcome.DONE:
                         return merge_outcome
 
@@ -501,6 +539,16 @@ class TaskWorkflow:
             if self.metrics.execute_iterations >= self.config.max_execute_iterations:
                 return WorkflowOutcome.BLOCKED
 
+            # Inter-iteration rebase: keep the task branch close to main
+            # so the eventual merge is less likely to conflict.  Skip on
+            # the first iteration (nothing has changed yet).
+            rebase_notice = None
+            if (
+                self.metrics.execute_iterations > 0
+                and self.config.inter_iteration_rebase
+            ):
+                rebase_notice = await self._inter_iteration_rebase()
+
             # Validate plan ownership before each implementer invocation
             if not self.artifacts.validate_plan_owner(self.session_id):
                 logger.error(
@@ -523,7 +571,9 @@ class TaskWorkflow:
                 if s.get('status') == 'done'
             }
 
-            prompt = await self.briefing.build_implementer_prompt(self.plan, iteration_log)
+            prompt = await self.briefing.build_implementer_prompt(
+                self.plan, iteration_log, rebase_notice=rebase_notice,
+            )
             result = await self._invoke(IMPLEMENTER, prompt, self.worktree)
 
             self.metrics.execute_iterations += 1
@@ -583,6 +633,72 @@ class TaskWorkflow:
                 )
 
         return WorkflowOutcome.DONE
+
+    async def _inter_iteration_rebase(self) -> dict | None:
+        """Check if main advanced past our base; if so, rebase.
+
+        Returns a dict ``{old_base, new_base, changed_files}`` when a
+        rebase was performed, or ``None`` if no rebase was needed or the
+        rebase failed (failure is non-blocking — the merge phase will
+        handle conflicts).
+        """
+        assert self.worktree is not None and self.artifacts is not None
+
+        old_base = self.artifacts.read_base_commit()
+        if not old_base:
+            return None
+
+        current_main = await self.git_ops.get_main_sha()
+        if current_main == old_base:
+            return None
+
+        if not await self.git_ops.is_ancestor(old_base, current_main):
+            return None  # unexpected topology — skip
+
+        changed_files = await self.git_ops.get_changed_files(
+            old_base, current_main,
+        )
+
+        # Commit any uncommitted work before rebasing
+        await self.git_ops.commit(
+            self.worktree, 'chore: save WIP before inter-iteration rebase',
+        )
+
+        if not await self.git_ops.rebase_onto_main(self.worktree):
+            logger.warning(
+                f'Task {self.task_id}: inter-iteration rebase failed, '
+                f'continuing on old base'
+            )
+            return None
+
+        self.artifacts.update_base_commit(current_main)
+        self.metrics.inter_iteration_rebases += 1
+
+        self.artifacts.append_iteration_log({
+            'iteration': self.metrics.execute_iterations,
+            'agent': 'orchestrator',
+            'event': 'rebase',
+            'old_base': old_base,
+            'new_base': current_main,
+            'files_changed_on_main': changed_files[:50],
+            'source': 'orchestrator',
+            'summary': (
+                f'Rebased onto main ({old_base[:8]} -> {current_main[:8]}), '
+                f'{len(changed_files)} files changed'
+            ),
+        })
+
+        logger.info(
+            f'Task {self.task_id}: rebased onto main '
+            f'({old_base[:8]} -> {current_main[:8]}), '
+            f'{len(changed_files)} files changed on main'
+        )
+
+        return {
+            'old_base': old_base,
+            'new_base': current_main,
+            'changed_files': changed_files,
+        }
 
     async def _verify_debugfix_loop(self) -> WorkflowOutcome:
         """Run verification, invoke debugger on failures."""
@@ -729,13 +845,19 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         await self._invoke(ARCHITECT, prompt, self.worktree)
         self.plan = self.artifacts.read_plan()
 
-    async def _merge(self, branch_name: str) -> WorkflowOutcome:
+    async def _merge(
+        self, branch_name: str, pre_rebased: bool = False,
+    ) -> WorkflowOutcome:
         """Merge task branch into main via a temporary worktree.
 
         The merge and all verification run in an isolated worktree so
         ``project_root``'s working tree is never touched.  Main is
         advanced via ``update-ref`` only after verification passes.
         Caller must hold ``git_ops._merge_lock``.
+
+        When *pre_rebased* is True the task branch was already rebased
+        onto main and verified outside the lock, so the merge should be
+        trivial and re-verification can be skipped if main hasn't moved.
         """
         assert self.worktree is not None
         merge_result = await self.git_ops.merge_to_main(self.worktree, branch_name)
@@ -743,20 +865,41 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         if merge_result.success:
             assert merge_wt is not None
-            # Verify in the merge worktree — main hasn't been touched yet
-            verify = await run_scoped_verification(
-                merge_wt, self.config, self._module_configs,
-                task_files=self._task_files,
+            # Skip re-verification when the branch was pre-rebased and
+            # main hasn't moved since — the code was already verified
+            # outside the lock.
+            skip_verify = (
+                pre_rebased
+                and merge_result.pre_merge_sha is not None
+                and merge_result.pre_merge_sha
+                == (await self.git_ops.get_main_sha())
             )
-            if not verify.passed:
+            if skip_verify:
+                logger.info(
+                    f'Task {self.task_id}: skipping re-verification '
+                    f'(pre-rebased, main unchanged)'
+                )
+            verify_passed = skip_verify
+            verify_summary = ''
+            if not skip_verify:
+                verify = await run_scoped_verification(
+                    merge_wt, self.config, self._module_configs,
+                    task_files=self._task_files,
+                )
+                verify_passed = verify.passed
+                verify_summary = verify.summary
+            if not verify_passed:
                 await self.git_ops.cleanup_merge_worktree(merge_wt)
-                reason = f'Post-merge verification failed: {verify.summary}'
+                reason = f'Post-merge verification failed: {verify_summary}'
                 self._write_merge_failure_review('post_merge_verify', reason)
                 return await self._mark_blocked(reason)
 
             # Advance main ref atomically
             assert merge_result.merge_commit is not None
-            if not await self.git_ops.advance_main(merge_result.merge_commit, merge_wt):
+            if not await self.git_ops.advance_main(
+                merge_result.merge_commit, merge_wt, branch=branch_name,
+                max_attempts=self.config.max_advance_attempts,
+            ):
                 await self.git_ops.cleanup_merge_worktree(merge_wt)
                 reason = 'Main branch advanced during merge; retry needed'
                 self._write_merge_failure_review('merge_ff_failed', reason)
@@ -789,7 +932,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 _, merge_sha, _ = await _run(
                     ['git', 'rev-parse', 'HEAD'], cwd=merge_wt,
                 )
-                if not await self.git_ops.advance_main(merge_sha, merge_wt):
+                if not await self.git_ops.advance_main(
+                    merge_sha, merge_wt, branch=branch_name,
+                    max_attempts=self.config.max_advance_attempts,
+                ):
                     await self.git_ops.cleanup_merge_worktree(merge_wt)
                     reason = 'Main advanced during conflict resolution'
                     self._write_merge_failure_review('merge_ff_failed', reason)
