@@ -157,3 +157,44 @@ class TestValidateProjectRoot:
         result = validate_project_root(bad_value)
         assert result is not None
         assert bad_value in result.get('error', '')
+
+
+class TestReturnContractCompatibility:
+    """Integration tests confirming both validators share the same return contract.
+
+    tools.py callers use the pattern ``if err := _validate_...: return err``.
+    Both canonical validators must return the exact same dict shape so that
+    tools.py handlers can pass the result directly to the MCP client.
+    """
+
+    def test_validate_project_id_error_dict_shape(self):
+        """validate_project_id must return {'error': str, 'error_type': 'ValidationError'}."""
+        result = validate_project_id('bad project id!')
+        assert isinstance(result, dict)
+        assert set(result.keys()) == {'error', 'error_type'}
+        assert result['error_type'] == 'ValidationError'
+        assert isinstance(result['error'], str)
+        assert len(result['error']) > 0
+
+    def test_validate_project_root_error_dict_shape(self):
+        """validate_project_root must return {'error': str, 'error_type': 'ValidationError'}."""
+        result = validate_project_root('relative/path')
+        assert isinstance(result, dict)
+        assert set(result.keys()) == {'error', 'error_type'}
+        assert result['error_type'] == 'ValidationError'
+        assert isinstance(result['error'], str)
+        assert len(result['error']) > 0
+
+    def test_both_return_none_for_valid_inputs(self):
+        """Both validators return None (not empty dict or False) for valid inputs."""
+        assert validate_project_id('dark_factory') is None
+        assert validate_project_root('/home/user/project') is None
+
+    def test_error_type_value_is_exactly_validation_error(self):
+        """error_type must be exactly 'ValidationError' — tools.py callers check this key."""
+        pid_err = validate_project_id('bad id')
+        root_err = validate_project_root('relative')
+        assert pid_err is not None
+        assert root_err is not None
+        assert pid_err['error_type'] == 'ValidationError'
+        assert root_err['error_type'] == 'ValidationError'
