@@ -424,6 +424,15 @@ class TestReconRoute:
             html = client.get('/partials/recon').text
         # Idle agent is in the DOM (hidden via Alpine x-show)
         assert 'agent-2' in html
+        # Verify agent-2 row carries x-show="showIdle" (Alpine.js visibility contract)
+        agent2_pos = html.find('agent-2')
+        assert agent2_pos != -1
+        # Find the enclosing <tr> by searching backward from agent-2's position
+        tr_start = html.rfind('<tr', 0, agent2_pos)
+        tr_end = html.find('</tr>', agent2_pos)
+        assert tr_start != -1 and tr_end != -1
+        tr_fragment = html[tr_start:tr_end]
+        assert 'x-show="showIdle"' in tr_fragment
 
     def test_burst_state_badges(self, client):
         with _patch_recon_data():
