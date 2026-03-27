@@ -412,6 +412,81 @@ class TestMainModule:
             )
 
 
+class TestCdnVersionPinning:
+    """Tests that all CDN dependencies use exact semver versions."""
+
+    def test_alpinejs_exact_version(self, client):
+        html = client.get('/').text
+        assert 'alpinejs@3.15.8' in html
+
+    def test_chartjs_exact_version(self, client):
+        html = client.get('/').text
+        assert 'chart.js@4.5.1' in html
+
+    def test_no_wildcard_versions(self, client):
+        import re
+        html = client.get('/').text
+        # Should not contain @N.x or @N/ patterns in script src attributes
+        assert not re.search(r'@\d+\.x', html)
+        assert not re.search(r'@\d+/', html)
+
+
+class TestCustomStyles:
+    """Tests for custom CSS rules merged into tailwind.css and no separate style.css."""
+
+    def test_tailwind_css_has_xcloak(self, client):
+        css = client.get('/static/tailwind.css').text
+        assert '[x-cloak]' in css
+
+    def test_tailwind_css_has_htmx_settling(self, client):
+        css = client.get('/static/tailwind.css').text
+        assert '.htmx-settling' in css
+
+    def test_tailwind_css_has_htmx_swapping(self, client):
+        css = client.get('/static/tailwind.css').text
+        assert '.htmx-swapping' in css
+
+    def test_no_separate_style_css_link(self, client):
+        html = client.get('/').text
+        assert 'style.css' not in html
+
+
+class TestTailwindBuild:
+    """Tests for local Tailwind CSS build replacing CDN."""
+
+    def test_no_cdn_tailwind(self, client):
+        html = client.get('/').text
+        assert 'cdn.tailwindcss.com' not in html
+
+    def test_local_tailwind_css_linked(self, client):
+        html = client.get('/').text
+        assert 'href="/static/tailwind.css"' in html
+
+    def test_tailwind_css_served(self, client):
+        resp = client.get('/static/tailwind.css')
+        assert resp.status_code == 200
+        assert 'text/css' in resp.headers['content-type']
+
+    def test_tailwind_css_has_utilities(self, client):
+        css = client.get('/static/tailwind.css').text
+        assert 'bg-gray-900' in css
+        assert 'text-gray-100' in css
+
+
+class TestFavicon:
+    """Tests for SVG favicon in base.html and static serving."""
+
+    def test_favicon_link_in_html(self, client):
+        html = client.get('/').text
+        assert '/static/favicon.svg' in html
+        assert 'rel="icon"' in html
+
+    def test_favicon_svg_served(self, client):
+        resp = client.get('/static/favicon.svg')
+        assert resp.status_code == 200
+        assert 'image/svg+xml' in resp.headers['content-type']
+
+
 class TestAriaLivePollingsections:
     """Tests that all three auto-polling sections have aria-live='polite'."""
 

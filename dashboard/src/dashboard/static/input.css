@@ -1,4 +1,5 @@
-/* Dark Factory dashboard — custom styles beyond Tailwind utilities */
+@import "tailwindcss";
+@source "../templates";
 
 /* Hide Alpine-cloaked elements before Alpine initializes */
 [x-cloak] { display: none !important; }
