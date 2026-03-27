@@ -34,6 +34,7 @@ from dashboard.data.reconciliation import (
     get_recent_runs,
     get_watermarks,
 )
+from dashboard.data.chart_utils import group_top_n
 from dashboard.data.write_journal import (
     get_agent_breakdown,
     get_memory_timeseries,
@@ -301,8 +302,8 @@ async def memory_graphs_partial(request: Request):
         request, 'partials/memory_graphs.html',
         context={
             'timeseries': timeseries,
-            'operations': operations,
-            'agents': agents,
+            'operations': group_top_n(operations),
+            'agents': group_top_n(agents),
         },
     )
 
