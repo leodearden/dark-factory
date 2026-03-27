@@ -13,35 +13,48 @@ _TIMESERIES = {
 }
 _OPERATIONS = {'labels': ['search', 'add_memory'], 'values': [100, 50]}
 _AGENTS = {'labels': ['claude-interactive', 'recon-consolidator'], 'values': [80, 70]}
+_MANY_AGENTS = {
+    'labels': ['agent-a', 'agent-b', 'agent-c', 'agent-d', 'agent-e', 'agent-f'],
+    'values': [60, 50, 40, 30, 20, 10],
+}
+_MANY_OPS = {
+    'labels': ['search', 'add_memory', 'get_entity', 'add_episode', 'delete_memory', 'replay'],
+    'values': [90, 80, 70, 60, 50, 40],
+}
 
 
-def _patch_journal():
+def _patch_journal_app():
+    """Patch write_journal functions at the app module level (where they are bound).
+
+    app.py uses 'from dashboard.data.write_journal import ...' which binds the names
+    locally. Patching must be done at dashboard.app.* (the bound location), not at
+    dashboard.data.write_journal.* (the source module), to intercept the calls.
+    """
     return (
-        patch(
-            'dashboard.data.write_journal.get_memory_timeseries',
-            new_callable=AsyncMock, return_value=_TIMESERIES,
-        ),
-        patch(
-            'dashboard.data.write_journal.get_operations_breakdown',
-            new_callable=AsyncMock, return_value=_OPERATIONS,
-        ),
-        patch(
-            'dashboard.data.write_journal.get_agent_breakdown',
-            new_callable=AsyncMock, return_value=_AGENTS,
-        ),
+        patch('dashboard.app.get_memory_timeseries', new_callable=AsyncMock, return_value=_TIMESERIES),
+        patch('dashboard.app.get_operations_breakdown', new_callable=AsyncMock, return_value=_OPERATIONS),
+        patch('dashboard.app.get_agent_breakdown', new_callable=AsyncMock, return_value=_AGENTS),
     )
+
+
+def _extract_js_var(html: str, var_name: str) -> dict:
+    """Extract a JSON-assigned JS variable from rendered HTML."""
+    pattern = rf'var {var_name}\s*=\s*(\{{.*?\}});'
+    match = re.search(pattern, html, re.DOTALL)
+    assert match is not None, f'Variable {var_name!r} not found in HTML'
+    return json.loads(match.group(1))
 
 
 class TestMemoryGraphsPartial:
     def test_returns_200(self, client):
-        p1, p2, p3 = _patch_journal()
+        p1, p2, p3 = _patch_journal_app()
         with p1, p2, p3:
             resp = client.get('/partials/memory-graphs')
             assert resp.status_code == 200
             assert 'text/html' in resp.headers['content-type']
 
     def test_contains_chart_canvases(self, client):
-        p1, p2, p3 = _patch_journal()
+        p1, p2, p3 = _patch_journal_app()
         with p1, p2, p3:
             html = client.get('/partials/memory-graphs').text
             assert 'memoryTimeseriesChart' in html
@@ -49,7 +62,7 @@ class TestMemoryGraphsPartial:
             assert 'memoryAgentChart' in html
 
     def test_contains_inline_data(self, client):
-        p1, p2, p3 = _patch_journal()
+        p1, p2, p3 = _patch_journal_app()
         with p1, p2, p3:
             html = client.get('/partials/memory-graphs').text
             assert 'tsData' in html
@@ -57,13 +70,13 @@ class TestMemoryGraphsPartial:
             assert 'agentData' in html
 
     def test_contains_section_heading(self, client):
-        p1, p2, p3 = _patch_journal()
+        p1, p2, p3 = _patch_journal_app()
         with p1, p2, p3:
             html = client.get('/partials/memory-graphs').text
             assert 'last 24' in html
 
     def test_contains_pie_labels(self, client):
-        p1, p2, p3 = _patch_journal()
+        p1, p2, p3 = _patch_journal_app()
         with p1, p2, p3:
             html = client.get('/partials/memory-graphs').text
             assert 'By operation' in html
@@ -85,35 +98,6 @@ class TestMemoryGraphsPartial:
         # These exact labels come from _OPERATIONS and _AGENTS mocks — not the real DB
         assert ops_data['labels'] == ['search', 'add_memory']
         assert agent_data['labels'] == ['claude-interactive', 'recon-consolidator']
-
-
-# --- Helper to extract JS variable value from rendered HTML ---
-
-def _extract_js_var(html: str, var_name: str) -> dict:
-    """Extract a JSON-assigned JS variable from rendered HTML."""
-    pattern = rf'var {var_name}\s*=\s*(\{{.*?\}});'
-    match = re.search(pattern, html, re.DOTALL)
-    assert match is not None, f'Variable {var_name!r} not found in HTML'
-    return json.loads(match.group(1))
-
-
-_MANY_AGENTS = {
-    'labels': ['agent-a', 'agent-b', 'agent-c', 'agent-d', 'agent-e', 'agent-f'],
-    'values': [60, 50, 40, 30, 20, 10],
-}
-_MANY_OPS = {
-    'labels': ['search', 'add_memory', 'get_entity', 'add_episode', 'delete_memory', 'replay'],
-    'values': [90, 80, 70, 60, 50, 40],
-}
-
-
-def _patch_journal_app():
-    """Patch write_journal functions at the app module level (where they are bound)."""
-    return (
-        patch('dashboard.app.get_memory_timeseries', new_callable=AsyncMock, return_value=_TIMESERIES),
-        patch('dashboard.app.get_operations_breakdown', new_callable=AsyncMock, return_value=_OPERATIONS),
-        patch('dashboard.app.get_agent_breakdown', new_callable=AsyncMock, return_value=_AGENTS),
-    )
 
 
 class TestTopNGrouping:
