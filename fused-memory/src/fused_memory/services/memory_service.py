@@ -835,7 +835,7 @@ class MemoryService:
                     type(exc).__name__,
                     exc,
                 )
-            raise eg.exceptions[0]
+            raise eg.exceptions[0] from eg
 
         nodes = nodes_task.result()
         edges = edges_task.result()
