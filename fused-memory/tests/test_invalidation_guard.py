@@ -532,3 +532,96 @@ class TestInvalidationGuardOrchestration:
 
         mock_backend.bulk_restore_edge_validity.assert_called_once_with(['edge-spurious'])
         assert restored == ['edge-spurious']
+
+
+# ---------------------------------------------------------------------------
+# Step-17 through Step-20: Integration with GraphitiBackend.add_episode()
+# ---------------------------------------------------------------------------
+
+
+class TestGuardIntegration:
+    """Guard integration with GraphitiBackend.add_episode()."""
+
+    @pytest.mark.asyncio
+    async def test_add_episode_calls_guard_on_result(self, mock_config):
+        """GraphitiBackend.add_episode() invokes InvalidationGuard.guard() on the result."""
+        backend = GraphitiBackend(mock_config)
+        fake_result = FakeAddEpisodeResults(nodes=[], edges=[])
+        mock_client = MagicMock()
+        mock_client.add_episode = AsyncMock(return_value=fake_result)
+        backend.client = mock_client
+
+        with patch(
+            'fused_memory.backends.graphiti_client.InvalidationGuard',
+        ) as MockGuardClass:
+            mock_guard_instance = MagicMock()
+            mock_guard_instance.guard = AsyncMock(return_value=[])
+            MockGuardClass.return_value = mock_guard_instance
+
+            await backend.add_episode(name='ep', content='content')
+
+            mock_guard_instance.guard.assert_called_once_with(fake_result)
+
+    @pytest.mark.asyncio
+    async def test_add_episode_guard_disabled_skips_guard(self, mock_config):
+        """When invalidation_guard_enabled=False, guard is NOT called."""
+        # Disable the guard in config
+        mock_config.graphiti.invalidation_guard_enabled = False
+
+        backend = GraphitiBackend(mock_config)
+        fake_result = FakeAddEpisodeResults(nodes=[], edges=[])
+        mock_client = MagicMock()
+        mock_client.add_episode = AsyncMock(return_value=fake_result)
+        backend.client = mock_client
+
+        with patch(
+            'fused_memory.backends.graphiti_client.InvalidationGuard',
+        ) as MockGuardClass:
+            mock_guard_instance = MagicMock()
+            mock_guard_instance.guard = AsyncMock(return_value=[])
+            MockGuardClass.return_value = mock_guard_instance
+
+            await backend.add_episode(name='ep', content='content')
+
+            mock_guard_instance.guard.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_add_episode_guard_enabled_default(self, mock_config):
+        """With default config (guard enabled), guard IS called."""
+        # Default config has invalidation_guard_enabled=True
+        backend = GraphitiBackend(mock_config)
+        fake_result = FakeAddEpisodeResults(nodes=[], edges=[])
+        mock_client = MagicMock()
+        mock_client.add_episode = AsyncMock(return_value=fake_result)
+        backend.client = mock_client
+
+        with patch(
+            'fused_memory.backends.graphiti_client.InvalidationGuard',
+        ) as MockGuardClass:
+            mock_guard_instance = MagicMock()
+            mock_guard_instance.guard = AsyncMock(return_value=[])
+            MockGuardClass.return_value = mock_guard_instance
+
+            await backend.add_episode(name='ep', content='content')
+
+            mock_guard_instance.guard.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_add_episode_returns_result_after_guard(self, mock_config):
+        """add_episode() returns the original AddEpisodeResults after guard runs."""
+        backend = GraphitiBackend(mock_config)
+        fake_result = FakeAddEpisodeResults(nodes=[], edges=[])
+        mock_client = MagicMock()
+        mock_client.add_episode = AsyncMock(return_value=fake_result)
+        backend.client = mock_client
+
+        with patch(
+            'fused_memory.backends.graphiti_client.InvalidationGuard',
+        ) as MockGuardClass:
+            mock_guard_instance = MagicMock()
+            mock_guard_instance.guard = AsyncMock(return_value=[])
+            MockGuardClass.return_value = mock_guard_instance
+
+            result = await backend.add_episode(name='ep', content='content')
+
+            assert result is fake_result
