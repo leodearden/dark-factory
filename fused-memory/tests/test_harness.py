@@ -867,23 +867,27 @@ async def test_sonnet_tier_selection_sets_consolidator_limits(journal, event_buf
     captured_consolidator_limits: dict = {}
 
     for stage in harness.stages:
-        original_stage = stage
+        if isinstance(stage, MemoryConsolidator):
+            _consolidator = stage
 
-        async def mock_run(events, watermark, prior_reports, run_id, model=None, _s=original_stage):
-            if isinstance(_s, MemoryConsolidator):
+            async def _consolidator_mock_run(
+                events, watermark, prior_reports, run_id, model=None, _s=_consolidator
+            ):
                 captured_consolidator_limits['episode_limit'] = _s.episode_limit
                 captured_consolidator_limits['memory_limit'] = _s.memory_limit
-            return StageReport(
-                stage=_s.stage_id,
-                started_at=datetime.now(UTC),
-                completed_at=datetime.now(UTC),
-                items_flagged=[],
-                stats={},
-                llm_calls=0,
-                tokens_used=0,
-            )
+                return StageReport(
+                    stage=_s.stage_id,
+                    started_at=datetime.now(UTC),
+                    completed_at=datetime.now(UTC),
+                    items_flagged=[],
+                    stats={},
+                    llm_calls=0,
+                    tokens_used=0,
+                )
 
-        stage.run = mock_run
+            stage.run = _consolidator_mock_run
+        else:
+            _mock_stage_run(stage)
 
     # Part 3: run full cycle with the sonnet tier
     run = await harness.run_full_cycle('test-project', 'buffer_size:2', tier=tier)
