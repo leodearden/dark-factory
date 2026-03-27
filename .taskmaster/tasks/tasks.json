@@ -2989,15 +2989,16 @@
         "description": "No test verifies that a MemoryConsolidator constructed with a sonnet-tier ReconciliationConfig and processed through the harness's _select_tier() ends up with episode_limit=125 and memory_limit=250. Add a test (in test_harness.py or test_stages.py) that exercises the full path from a sonnet-tier ReconciliationConfig through _select_tier(), asserting the correct limits are applied. memory_hints: search for \"_select_tier\" and \"TierConfig\" in reconciliation harness code.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-27T06:03:25.305Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T06:03:25.048Z",
+      "lastModified": "2026-03-27T06:03:25.305Z",
       "taskCount": 179,
       "completedCount": 136,
       "tags": [
