@@ -573,6 +573,24 @@ class TestProjectIdValidation:
             )
         assert 'dark_factory' in captured_kwargs.get('payload', '')
 
+    @pytest.mark.asyncio
+    async def test_run_allows_whitespace_watermark_project_id(self, mock_deps):
+        from fused_memory.models.reconciliation import StageId, Watermark
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        with self._patch_stage(stage):
+            result = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='   '),
+                prior_reports=[],
+                run_id='test-run-whitespace-wm',
+            )
+        assert result is not None
+        assert result.stage == StageId.memory_consolidator
+
 
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
