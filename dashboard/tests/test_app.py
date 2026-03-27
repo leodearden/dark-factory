@@ -909,6 +909,17 @@ class TestPollingJitter:
         section_html = html[idx - 200:idx + 500]
         assert 'hx-trigger="load, poll"' in section_html
 
+    def test_no_fixed_polling_intervals(self, client):
+        """Anti-regression: no hx-trigger attribute should use 'every Xs' fixed intervals."""
+        import re
+        html = client.get('/').text
+        # Match 'every ' followed by one or more digits and 's' within hx-trigger values
+        fixed_poll_pattern = re.compile(r'hx-trigger=["\'][^"\']*every\s+\d+s[^"\']*["\']')
+        assert not fixed_poll_pattern.search(html), (
+            "Found fixed polling interval (every Xs) in hx-trigger — "
+            "all sections must use jitter-based polling via data-poll-base."
+        )
+
 
 class TestPollingJitterScript:
     """Tests that base.html contains the jitter polling script with required markers."""
