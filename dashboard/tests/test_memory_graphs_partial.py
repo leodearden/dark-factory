@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-
 from unittest.mock import AsyncMock, patch
 
 _TIMESERIES = {

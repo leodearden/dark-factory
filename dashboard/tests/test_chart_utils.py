@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from dashboard.data.chart_utils import group_top_n
 
 
