@@ -529,6 +529,10 @@ class TestProjectIdValidation:
         assert result is not None
         assert result.stage == StageId.memory_consolidator
         assert result.completed_at is not None
+        assert result.items_flagged == []
+        assert result.stats == {}
+        assert result.started_at is not None
+        assert result.started_at <= result.completed_at
 
     @pytest.mark.asyncio
     async def test_run_allows_empty_watermark_project_id(self, mock_deps):
