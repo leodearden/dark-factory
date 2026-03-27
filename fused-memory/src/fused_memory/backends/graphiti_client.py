@@ -17,6 +17,7 @@ from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
+from fused_memory.backends.invalidation_guard import InvalidationGuard
 from fused_memory.config.schema import FusedMemoryConfig
 
 logger = logging.getLogger(__name__)
@@ -130,7 +131,7 @@ class GraphitiBackend:
         ref_time = reference_time or datetime.now(UTC)
         if temporal_context is not None:
             source_description = f'[temporal:{temporal_context}] {source_description}'
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             client.add_episode(
                 name=name,
                 episode_body=content,
@@ -143,6 +144,11 @@ class GraphitiBackend:
             ),
             timeout=self._write_timeout,
         )
+        # Post-write invalidation guard: detect and reverse spurious invalidations
+        if self.config.graphiti.invalidation_guard_enabled and result is not None:
+            guard = InvalidationGuard(self)
+            await guard.guard(result)
+        return result
 
     async def search(
         self,
