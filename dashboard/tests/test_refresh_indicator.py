@@ -98,3 +98,49 @@ class TestRefreshPulseCSS:
     def test_section_refreshed_class_present(self):
         css = self._read_css()
         assert '.section-refreshed' in css
+
+
+class TestExistingBehaviorPreserved:
+    """Tests that new wrapper divs don't break existing dashboard structure."""
+
+    def test_orchestrators_still_has_hx_get(self, client):
+        html = client.get('/').text
+        assert 'hx-get="/partials/orchestrators"' in html
+
+    def test_performance_still_has_hx_get(self, client):
+        html = client.get('/').text
+        assert 'hx-get="/partials/performance"' in html
+
+    def test_memory_still_has_hx_get(self, client):
+        html = client.get('/').text
+        assert 'hx-get="/partials/memory"' in html
+
+    def test_memory_graphs_still_has_hx_get(self, client):
+        html = client.get('/').text
+        assert 'hx-get="/partials/memory-graphs"' in html
+
+    def test_recon_still_has_hx_get(self, client):
+        html = client.get('/').text
+        assert 'hx-get="/partials/recon"' in html
+
+    def test_all_sections_use_morph_innerHTML(self, client):
+        html = client.get('/').text
+        assert 'hx-swap="morph:innerHTML"' in html
+
+    def test_no_plain_innerHTML_swap(self, client):
+        html = client.get('/').text
+        assert 'hx-swap="innerHTML"' not in html
+
+    def test_aria_live_polite_present(self, client):
+        html = client.get('/').text
+        assert 'aria-live="polite"' in html
+
+    def test_loading_skeletons_present(self, client):
+        html = client.get('/').text
+        assert 'animate-pulse' in html
+
+    def test_error_handler_js_present(self, client):
+        html = client.get('/').text
+        assert 'htmx:responseError' in html
+        assert 'htmx:timeout' in html
+        assert 'htmx:sendError' in html
