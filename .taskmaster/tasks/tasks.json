@@ -3583,7 +3583,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_recon_panel.py",
+            "dashboard/src/dashboard/app.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard",
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 214,
