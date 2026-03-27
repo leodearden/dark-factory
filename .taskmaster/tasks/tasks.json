@@ -2513,7 +2513,22 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-27T06:34:47.333Z"
+        "updatedAt": "2026-03-27T06:34:47.333Z",
+        "metadata": {
+          "files": [
+            "fused-memory/src/fused_memory/services/queue_service.py",
+            "fused-memory/src/fused_memory/services/__init__.py",
+            "fused-memory/src/fused_memory/reconciliation/stages/integrity_check.py",
+            "fused-memory/src/fused_memory/backends/__init__.py",
+            "orchestrator/src/orchestrator/protocols.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/services",
+            "fused-memory/src/fused_memory/reconciliation/stages",
+            "fused-memory/src/fused_memory/backends",
+            "orchestrator/src/orchestrator"
+          ]
+        }
       },
       {
         "id": 158,
@@ -2525,7 +2540,23 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T23:27:41.833Z"
+        "updatedAt": "2026-03-26T23:27:41.833Z",
+        "metadata": {
+          "files": [
+            "fused-memory/src/fused_memory/backends/graphiti_client.py",
+            "fused-memory/src/fused_memory/services/memory_service.py",
+            "fused-memory/src/fused_memory/server/tools.py",
+            "fused-memory/src/fused_memory/maintenance/rebuild_entity_summaries.py",
+            "fused-memory/tests/test_memory_service.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/src/fused_memory/services",
+            "fused-memory/src/fused_memory/server",
+            "fused-memory/src/fused_memory/maintenance",
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 159,
