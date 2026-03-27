@@ -417,3 +417,164 @@ class TestVerificationResultCoercion:
     def test_invalid_verdict_raises(self):
         with pytest.raises(ValidationError):
             self._make_result(verdict='maybe')
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Watermark.project_id field_validator (tests written before impl)
+# ---------------------------------------------------------------------------
+
+
+class TestWatermarkProjectIdValidator:
+    """Watermark.project_id is stripped and whitespace-only becomes '' sentinel."""
+
+    def _make_watermark(self, project_id: str):
+        from fused_memory.models.reconciliation import Watermark
+
+        return Watermark(project_id=project_id)
+
+    def test_valid_project_id_passes_through_unchanged(self):
+        """A normal project_id with no surrounding whitespace is left as-is."""
+        wm = self._make_watermark('dark_factory')
+        assert wm.project_id == 'dark_factory'
+
+    def test_whitespace_only_normalizes_to_empty_string(self):
+        """Whitespace-only project_id is the bootstrap sentinel — normalizes to ''."""
+        wm = self._make_watermark('   ')
+        assert wm.project_id == ''
+
+    def test_leading_trailing_whitespace_is_stripped(self):
+        """Leading/trailing whitespace is stripped from project_id."""
+        wm = self._make_watermark('  dark_factory  ')
+        assert wm.project_id == 'dark_factory'
+
+    def test_empty_string_passes_through_as_valid_sentinel(self):
+        """Empty string is the valid 'no project' bootstrap sentinel."""
+        wm = self._make_watermark('')
+        assert wm.project_id == ''
+
+    def test_tabs_and_newlines_normalize_to_empty(self):
+        """Tab/newline-only project_id normalizes to empty string sentinel."""
+        wm = self._make_watermark('\t\n')
+        assert wm.project_id == ''
+
+
+# ---------------------------------------------------------------------------
+# Step 3: base.py guard contract tests (pass before and after simplification)
+# ---------------------------------------------------------------------------
+
+
+class TestBaseStageGuardContract:
+    """BaseStage.run() guard handles the three expected cases correctly.
+
+    These are contract tests — they must pass both before and after step 4
+    simplifies the guard logic.  They document the intended behaviour rather
+    than the implementation detail.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        from unittest.mock import AsyncMock
+
+        from fused_memory.config.schema import ReconciliationConfig
+
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @staticmethod
+    def _patch_stage(stage):
+        """Patch away the expensive I/O so only the guard logic is exercised."""
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        async def _fake_assemble(events, watermark, prior_reports):
+            return 'payload'
+
+        async def _fake_cli(**kwargs):
+            return StageResult(success=True, report={'summary': 'ok'})
+
+        @contextmanager
+        def _ctx():
+            with (
+                patch.object(stage, 'assemble_payload', side_effect=_fake_assemble),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    side_effect=_fake_cli,
+                ),
+            ):
+                yield
+
+        return _ctx()
+
+    @pytest.mark.asyncio
+    async def test_matching_watermark_project_id_proceeds(self, mock_deps):
+        """When watermark.project_id matches stage.project_id, run() completes."""
+        from fused_memory.models.reconciliation import StageId, Watermark
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        with self._patch_stage(stage):
+            result = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[],
+                run_id='guard-test-match',
+            )
+        assert result is not None
+        assert result.stage == StageId.memory_consolidator
+
+    @pytest.mark.asyncio
+    async def test_empty_watermark_project_id_proceeds_with_debug_log(self, mock_deps, caplog):
+        """When watermark.project_id is '', run() proceeds and emits a DEBUG log."""
+        import logging
+
+        from fused_memory.models.reconciliation import StageId, Watermark
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        with (
+            self._patch_stage(stage),
+            caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.stages.base'),
+        ):
+            result = await stage.run(
+                events=[],
+                watermark=Watermark(project_id=''),
+                prior_reports=[],
+                run_id='guard-test-empty',
+            )
+        assert result is not None
+        # Guard must emit a debug message mentioning the skip/mismatch check
+        assert any(
+            'no project_id' in msg.lower() or 'skipping' in msg.lower()
+            for msg in caplog.messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_mismatching_watermark_project_id_raises_value_error(self, mock_deps):
+        """When watermark.project_id is set but differs from stage.project_id, ValueError is raised."""
+        from fused_memory.models.reconciliation import StageId, Watermark
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'project_a'
+
+        with self._patch_stage(stage), pytest.raises(ValueError) as exc_info:
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='project_b'),
+                prior_reports=[],
+                run_id='guard-test-mismatch',
+            )
+        error_msg = str(exc_info.value)
+        assert 'project_a' in error_msg
+        assert 'project_b' in error_msg
