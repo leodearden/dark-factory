@@ -2816,7 +2816,17 @@
           ],
           "modules": [
             "dashboard/src/dashboard/templates"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "reconciliation.py"
+            ],
+            "queries": [
+              "reconciliation detail HTMX Idiomorph morphing x-show polling dashboard",
+              "dashboard stability concerns HTMX Alpine state preservation across morphs"
+            ]
+          },
+          "_causation_id": "0a2dc790-e788-44ff-bece-7e734501facb"
         }
       },
       {
