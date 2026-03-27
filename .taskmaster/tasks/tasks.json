@@ -3604,7 +3604,18 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "fused-memory/src/fused_memory/reconciliation/targeted.py",
+            "fused-memory/tests/test_validation.py",
+            "fused-memory/tests/test_targeted.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests"
+          ]
+        }
       }
     ],
     "metadata": {
