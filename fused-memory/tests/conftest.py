@@ -21,6 +21,7 @@ class MockNode:
     """Simulates a Graphiti entity node (source/target of an edge)."""
 
     name: str
+    uuid: str = ''
 
 
 @dataclass
