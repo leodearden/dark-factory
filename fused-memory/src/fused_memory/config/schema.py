@@ -132,6 +132,7 @@ class GraphitiBackendConfig(BaseModel):
 
     provider: Literal['falkordb'] = Field(default='falkordb')
     falkordb: FalkorDBProviderConfig = Field(default_factory=FalkorDBProviderConfig)
+    invalidation_guard_enabled: bool = Field(default=True)
 
 
 # --- Mem0 backend ---
