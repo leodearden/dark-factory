@@ -1,0 +1,79 @@
+{
+  "task_id": "200",
+  "title": "Add end-to-end tier selection test for MemoryConsolidator",
+  "files": [
+    "fused-memory/tests/test_harness.py"
+  ],
+  "modules": [
+    "fused-memory/tests"
+  ],
+  "analysis": "The task requires a single integration test that exercises the full path: ReconciliationConfig (sonnet defaults) \u2192 _select_tier() \u2192 run_full_cycle() \u2192 MemoryConsolidator gets episode_limit=125 and memory_limit=250.\n\nKey code paths:\n1. ReconciliationConfig (config/schema.py) has sonnet_episode_limit=125, sonnet_memory_limit=250 as defaults.\n2. _select_tier() (harness.py:224-239) reads buffer stats; when buffer_count <= buffer_size_threshold * opus_threshold_ratio (10 * 1.5 = 15), it returns a TierConfig with sonnet values.\n3. run_full_cycle() (harness.py:352) accepts a tier param (or defaults to TierConfig()).\n4. At harness.py:417-421, when iterating stages, if isinstance(stage, MemoryConsolidator), it sets stage.episode_limit = tier.episode_limit and stage.memory_limit = tier.memory_limit.\n\nExisting test_stages.py::TestTierConfig tests are unit-level \u2014 they only verify class defaults and mutability but never exercise _select_tier() or run_full_cycle() integration. Existing test_harness.py tests use run_full_cycle but never assert tier limit propagation to MemoryConsolidator.\n\nThe new test belongs in test_harness.py because it requires a full ReconciliationHarness with journal/buffer fixtures, matching the existing pattern of harness integration tests. The test will:\n1. Mock buffer.get_buffer_stats to return {'size': 0} (well below opus threshold, ensuring sonnet tier).\n2. Call harness._select_tier() and assert the returned TierConfig has correct sonnet values.\n3. Mock all stage.run() methods with a capture function (pattern from test_full_cycle_extracts_project_root_from_events).\n4. Call run_full_cycle() with the returned tier.\n5. Assert that the captured MemoryConsolidator state has episode_limit=125 and memory_limit=250.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing test test_sonnet_tier_selection_sets_consolidator_limits in test_harness.py. The test: (1) constructs ReconciliationHarness with default ReconciliationConfig, (2) mocks event_buffer.get_buffer_stats to return {'size': 0}, (3) calls _select_tier('test-project') and asserts TierConfig has model='sonnet', episode_limit=125, memory_limit=250, (4) mocks each stage.run with a capture callback (using the existing pattern from test_full_cycle_extracts_project_root_from_events), (5) calls run_full_cycle('test-project', 'buffer_size:2', tier=tier), (6) asserts the captured MemoryConsolidator (stage 0) had episode_limit=125 and memory_limit=250 at call time. Push events to buffer before drain. Import TierConfig from fused_memory.reconciliation.harness.",
+      "status": "done",
+      "commit": "21ed3b3"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "No implementation code changes needed \u2014 this test validates existing behavior. Run pytest on test_harness.py to confirm the test passes. If it fails, debug and fix the test (not the implementation) since sonnet-tier propagation is already implemented in harness.py:417-421.",
+      "status": "done",
+      "commit": "21ed3b3"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Place test in test_harness.py rather than test_stages.py",
+      "rationale": "The test exercises _select_tier() and run_full_cycle() which are harness methods requiring journal/event_buffer fixtures. test_stages.py tests are unit-level stage construction tests without these fixtures. The existing test_harness.py pattern (inline harness construction with mocked stages) is the exact pattern needed."
+    },
+    {
+      "decision": "Mock buffer stats to return {'size': 0} for sonnet tier selection",
+      "rationale": "Default opus_threshold_ratio=1.5 and buffer_size_threshold=10 means opus triggers at count > 15. A size of 0 guarantees sonnet tier selection deterministically without depending on threshold arithmetic."
+    },
+    {
+      "decision": "Use capture-callback pattern from test_full_cycle_extracts_project_root_from_events",
+      "rationale": "This existing test at line 208 demonstrates the exact pattern for capturing stage state at call time within mocked stage.run(). Reusing this pattern maintains test consistency and avoids inventing a new approach."
+    },
+    {
+      "decision": "Assert both _select_tier() return value AND MemoryConsolidator attributes",
+      "rationale": "The task asks for end-to-end verification. Asserting only the TierConfig wouldn't prove it's applied to MemoryConsolidator. Asserting only stage attributes wouldn't prove _select_tier() produced the right config. Both assertions together prove the full path."
+    },
+    {
+      "decision": "Single test function covers the full e2e path",
+      "rationale": "The task explicitly asks for a test that 'exercises the full path from a sonnet-tier ReconciliationConfig through _select_tier()'. Splitting into multiple tests would lose the end-to-end property. One test with clear sections (select tier \u2192 run cycle \u2192 assert limits) is the right granularity."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "journal and event_buffer pytest_asyncio fixtures",
+      "where": "test_harness.py lines 24-37",
+      "how": "Reuse existing fixtures for ReconciliationJournal and EventBuffer setup/teardown"
+    },
+    {
+      "what": "mock_memory_service fixture",
+      "where": "test_harness.py lines 40-49",
+      "how": "Reuse existing AsyncMock-based memory service with pre-configured method returns"
+    },
+    {
+      "what": "_make_event() helper",
+      "where": "test_harness.py lines 52-60",
+      "how": "Reuse to create test events to push into the buffer before running the cycle"
+    },
+    {
+      "what": "Stage run mock-and-capture pattern",
+      "where": "test_harness.py lines 208-228 (test_full_cycle_extracts_project_root_from_events)",
+      "how": "Adapt the capture callback pattern to also capture episode_limit and memory_limit from the MemoryConsolidator stage"
+    },
+    {
+      "what": "Inline harness construction pattern",
+      "where": "test_harness.py lines 128-146 (test_run_full_cycle_restores_events_on_failure)",
+      "how": "Follow the same pattern: create FusedMemoryConfig with ReconciliationConfig, construct ReconciliationHarness inline"
+    }
+  ],
+  "_session_id": "200-856be26d",
+  "_created_at": "2026-03-27T06:06:04.637797+00:00"
+}
