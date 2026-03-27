@@ -906,6 +906,7 @@ async def test_sonnet_tier_selection_sets_consolidator_limits(journal, event_buf
     assert run.status == 'completed'
 
     # Part 4: assert MemoryConsolidator received sonnet limits
+    assert captured_consolidator_limits, 'No MemoryConsolidator stage found — guard failed'
     assert captured_consolidator_limits.get('episode_limit') == 125, (
         f"Expected MemoryConsolidator.episode_limit=125 (sonnet tier), "
         f"got {captured_consolidator_limits.get('episode_limit')}. "
