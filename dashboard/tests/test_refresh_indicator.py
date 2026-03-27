@@ -57,3 +57,23 @@ class TestTimestampElements:
     def test_timestamp_elements_are_aria_hidden(self, client):
         html = client.get('/').text
         assert 'aria-hidden="true"' in html
+
+
+class TestRefreshTrackingJS:
+    """Tests that the rendered page contains the refresh-tracking JavaScript."""
+
+    def test_after_swap_listener_present(self, client):
+        html = client.get('/').text
+        assert 'htmx:afterSwap' in html
+
+    def test_set_interval_present(self, client):
+        html = client.get('/').text
+        assert 'setInterval' in html
+
+    def test_data_updated_at_present(self, client):
+        html = client.get('/').text
+        assert 'data-updated-at' in html
+
+    def test_updated_text_present(self, client):
+        html = client.get('/').text
+        assert 'Updated' in html
