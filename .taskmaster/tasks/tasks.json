@@ -3002,10 +3002,11 @@
         "description": "Clean up test_sonnet_tier_selection_sets_consolidator_limits in test_harness.py:\n\n1. Replace inline harness construction (lines 850-865) with `_make_harness_with_mocked_stages()` helper (line 271)\n2. Use `_mock_stage_run(stage)` for non-MemoryConsolidator stages instead of duplicating StageReport boilerplate\n3. Add guard assertion before value checks: `assert captured_consolidator_limits, 'No MemoryConsolidator stage found'`\n4. Move `isinstance(tier, TierConfig)` assertion before attribute assertions (line 880 → before 878)\n5. Remove misleading `agent_llm_model='claude-sonnet-4-20250514'` from ReconciliationConfig (doesn't affect tier selection)\n6. Add inline comment explaining the discrepancy between pushed events and mocked buffer stats\n\nOrigin: review suggestions on task 200 (suggestions #3, #4, #5, #6, #8, #11).\nmemory_hints: search for \"_make_harness_with_mocked_stages\" and \"_mock_stage_run\" in test_harness.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-27T06:20:13.430Z"
       },
       {
         "id": "202",
@@ -3021,7 +3022,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T06:20:13.376Z",
+      "lastModified": "2026-03-27T06:20:13.430Z",
       "taskCount": 181,
       "completedCount": 137,
       "tags": [
