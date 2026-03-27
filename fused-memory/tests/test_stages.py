@@ -23,6 +23,115 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 )
 
 
+@pytest.fixture
+def stage_mock_deps():
+    """Shared module-level fixture providing standard stage dependencies."""
+    return {
+        'memory_service': AsyncMock(),
+        'taskmaster': AsyncMock(),
+        'journal': AsyncMock(),
+        'config': ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
+    }
+
+
+async def fake_assemble_payload(events, watermark, prior_reports) -> str:
+    """Module-level fake for BaseStage.assemble_payload."""
+    return 'fake payload'
+
+
+async def fake_run_stage_via_cli(**kwargs):
+    """Module-level fake for run_stage_via_cli."""
+    from fused_memory.reconciliation.cli_stage_runner import StageResult
+    return StageResult(success=True, report={'summary': 'ok'})
+
+
+def patch_stage(stage, cli_side_effect=None):
+    """Return a context manager that patches assemble_payload and run_stage_via_cli.
+
+    Args:
+        stage: The stage instance to patch.
+        cli_side_effect: Optional async callable for run_stage_via_cli side_effect.
+            Defaults to fake_run_stage_via_cli.
+    """
+    from contextlib import contextmanager
+    from unittest.mock import patch
+
+    effective_cli_side_effect = cli_side_effect if cli_side_effect is not None else fake_run_stage_via_cli
+
+    @contextmanager
+    def _ctx():
+        with (
+            patch.object(stage, 'assemble_payload', side_effect=fake_assemble_payload),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                side_effect=effective_cli_side_effect,
+            ),
+        ):
+            yield
+
+    return _ctx()
+
+
+class TestSharedFixtures:
+    """Regression guard: validate the shape of the module-level stage_mock_deps fixture."""
+
+    def test_stage_mock_deps_has_required_keys(self, stage_mock_deps):
+        assert set(stage_mock_deps.keys()) == {'memory_service', 'taskmaster', 'journal', 'config'}
+
+    def test_stage_mock_deps_services_are_async_mocks(self, stage_mock_deps):
+        assert isinstance(stage_mock_deps['memory_service'], AsyncMock)
+        assert isinstance(stage_mock_deps['taskmaster'], AsyncMock)
+        assert isinstance(stage_mock_deps['journal'], AsyncMock)
+
+    def test_stage_mock_deps_config_is_reconciliation_config(self, stage_mock_deps):
+        assert isinstance(stage_mock_deps['config'], ReconciliationConfig)
+
+    def test_stage_mock_deps_config_has_correct_values(self, stage_mock_deps):
+        config = stage_mock_deps['config']
+        assert config.enabled is True
+        assert config.explore_codebase_root == '/tmp/test'
+
+
+class TestModuleLevelHelpers:
+    """Validate module-level stage helpers: fake_assemble_payload, fake_run_stage_via_cli, patch_stage."""
+
+    @pytest.mark.asyncio
+    async def test_fake_assemble_payload_is_async_returning_string(self):
+        result = await fake_assemble_payload(events=[], watermark=None, prior_reports=[])
+        assert result == 'fake payload'
+
+    @pytest.mark.asyncio
+    async def test_fake_run_stage_via_cli_returns_stage_result(self):
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+        result = await fake_run_stage_via_cli()
+        assert isinstance(result, StageResult)
+        assert result.success is True
+        assert result.report == {'summary': 'ok'}
+
+    def test_patch_stage_patches_assemble_payload_and_run_stage(self, stage_mock_deps):
+        from fused_memory.models.reconciliation import StageId
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
+        with patch_stage(stage):
+            # Inside context: assemble_payload is replaced with an AsyncMock
+            assert hasattr(stage.assemble_payload, 'assert_awaited')
+            mock_ref = stage.assemble_payload
+        # After context: teardown restores the original (mock is gone)
+        assert stage.assemble_payload is not mock_ref
+
+    def test_patch_stage_accepts_cli_side_effect(self, stage_mock_deps):
+        from fused_memory.models.reconciliation import StageId
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
+
+        async def custom_cli(**kwargs):
+            from fused_memory.reconciliation.cli_stage_runner import StageResult
+            return StageResult(success=False, report={'summary': 'custom'})
+
+        # Should not raise — verifies the function accepts cli_side_effect parameter
+        ctx = patch_stage(stage, cli_side_effect=custom_cli)
+        assert ctx is not None
+
+
 class TestDisallowedToolLists:
     """Verify per-stage disallowed tool lists are correct."""
 
@@ -56,35 +165,19 @@ class TestDisallowedToolLists:
 class TestStageSubclasses:
     """Each stage subclass returns the correct disallowed list."""
 
-    @pytest.fixture
-    def config(self):
-        return ReconciliationConfig(
-            enabled=True,
-            explore_codebase_root='/tmp/test',
-        )
-
-    @pytest.fixture
-    def mock_deps(self, config):
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-        }
-
-    def test_memory_consolidator_disallowed(self, mock_deps):
+    def test_memory_consolidator_disallowed(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         assert stage.get_disallowed_tools() == STAGE1_DISALLOWED
 
-    def test_task_knowledge_sync_disallowed(self, mock_deps):
+    def test_task_knowledge_sync_disallowed(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage_mock_deps)
         assert stage.get_disallowed_tools() == STAGE2_DISALLOWED
 
-    def test_integrity_check_disallowed(self, mock_deps):
+    def test_integrity_check_disallowed(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId
-        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage = IntegrityCheck(StageId.integrity_check, **stage_mock_deps)
         assert stage.get_disallowed_tools() == STAGE3_DISALLOWED
 
 
@@ -248,30 +341,19 @@ class TestNormalizePlaceholderFiltering:
 class TestPerStageReportSchema:
     """Each stage returns the correct report schema via get_report_schema()."""
 
-    @pytest.fixture
-    def mock_deps(self):
-        from fused_memory.config.schema import ReconciliationConfig
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-        }
-
-    def test_integrity_check_returns_stage3_schema(self, mock_deps):
+    def test_integrity_check_returns_stage3_schema(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId
-        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage = IntegrityCheck(StageId.integrity_check, **stage_mock_deps)
         assert stage.get_report_schema() is STAGE3_REPORT_SCHEMA
 
-    def test_memory_consolidator_returns_base_schema(self, mock_deps):
+    def test_memory_consolidator_returns_base_schema(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         assert stage.get_report_schema() is STAGE_REPORT_SCHEMA
 
-    def test_task_knowledge_sync_returns_base_schema(self, mock_deps):
+    def test_task_knowledge_sync_returns_base_schema(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage_mock_deps)
         assert stage.get_report_schema() is STAGE_REPORT_SCHEMA
 
 
@@ -323,44 +405,33 @@ class TestTaskKnowledgeSyncPayload:
     """TaskKnowledgeSync.assemble_payload() uses correct project attributes."""
 
     @pytest.fixture
-    def mock_deps(self):
-        from fused_memory.config.schema import ReconciliationConfig
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-        }
-
-    @pytest.fixture
     def watermark(self):
         from fused_memory.models.reconciliation import Watermark
         return Watermark(project_id='reify')
 
     @pytest.mark.asyncio
-    async def test_get_tasks_uses_project_root_not_project_id(self, mock_deps, watermark):
+    async def test_get_tasks_uses_project_root_not_project_id(self, stage_mock_deps, watermark):
         """assemble_payload() must pass self.project_root (not self.project_id) to get_tasks."""
         from fused_memory.models.reconciliation import StageId
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage_mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
-        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        stage_mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         await stage.assemble_payload([], watermark, [])
 
-        mock_deps['taskmaster'].get_tasks.assert_called_once_with(
+        stage_mock_deps['taskmaster'].get_tasks.assert_called_once_with(
             project_root='/home/leo/src/reify'
         )
 
     @pytest.mark.asyncio
-    async def test_payload_uses_dynamic_project_root_in_instructions(self, mock_deps, watermark):
+    async def test_payload_uses_dynamic_project_root_in_instructions(self, stage_mock_deps, watermark):
         """assemble_payload() instruction text must use self.project_root, not hardcoded path."""
         from fused_memory.models.reconciliation import StageId
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage_mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
-        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        stage_mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         payload = await stage.assemble_payload([], watermark, [])
 
@@ -368,13 +439,13 @@ class TestTaskKnowledgeSyncPayload:
         assert 'project_root="/home/leo/src/dark-factory"' not in payload
 
     @pytest.mark.asyncio
-    async def test_payload_dark_factory_project_still_works(self, mock_deps, watermark):
+    async def test_payload_dark_factory_project_still_works(self, stage_mock_deps, watermark):
         """When project_root IS dark-factory, payload still contains the correct path."""
         from fused_memory.models.reconciliation import StageId, Watermark
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage_mock_deps)
         stage.project_id = 'dark_factory'
         stage.project_root = '/home/leo/src/dark-factory'
-        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        stage_mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         wm = Watermark(project_id='dark_factory')
 
         payload = await stage.assemble_payload([], wm, [])
@@ -382,13 +453,13 @@ class TestTaskKnowledgeSyncPayload:
         assert 'project_root="/home/leo/src/dark-factory"' in payload
 
     @pytest.mark.asyncio
-    async def test_payload_contains_project_id_for_memory_tools(self, mock_deps, watermark):
+    async def test_payload_contains_project_id_for_memory_tools(self, stage_mock_deps, watermark):
         """assemble_payload() instruction text still uses self.project_id for fused-memory calls."""
         from fused_memory.models.reconciliation import StageId
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage_mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
-        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        stage_mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         payload = await stage.assemble_payload([], watermark, [])
 
@@ -399,68 +470,15 @@ class TestTaskKnowledgeSyncPayload:
 class TestProjectIdValidation:
     """BaseStage.run() validates project_id and watermark.project_id."""
 
-    @staticmethod
-    async def _fake_assemble_payload(
-        events,
-        watermark,
-        prior_reports,
-    ) -> str:
-        return 'fake payload'
-
-    @staticmethod
-    async def _fake_run_stage_via_cli(**kwargs):
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
-        return StageResult(
-            success=True,
-            report={'summary': 'ok'},
-        )
-
-    @pytest.fixture
-    def mock_deps(self):
-        from fused_memory.config.schema import ReconciliationConfig
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-        }
-
-    def _patch_stage(self, stage, cli_side_effect=None):
-        """Return a context manager that patches assemble_payload and run_stage_via_cli.
-
-        Args:
-            stage: The stage instance to patch.
-            cli_side_effect: Optional async callable for run_stage_via_cli side_effect.
-                Defaults to self._fake_run_stage_via_cli.
-        """
-        from contextlib import contextmanager
-        from unittest.mock import patch
-
-        effective_cli_side_effect = cli_side_effect if cli_side_effect is not None else self._fake_run_stage_via_cli
-
-        @contextmanager
-        def _ctx():
-            with (
-                patch.object(stage, 'assemble_payload', side_effect=self._fake_assemble_payload),
-                patch(
-                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                    side_effect=effective_cli_side_effect,
-                ),
-            ):
-                yield
-
-        return _ctx()
-
     @pytest.mark.asyncio
-    async def test_run_raises_on_empty_project_id(self, mock_deps):
+    async def test_run_raises_on_empty_project_id(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = ''
 
-        with self._patch_stage(stage), pytest.raises(ValueError, match='project_id'):
+        with patch_stage(stage), pytest.raises(ValueError, match='project_id'):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id=''),
@@ -469,14 +487,14 @@ class TestProjectIdValidation:
             )
 
     @pytest.mark.asyncio
-    async def test_run_raises_on_whitespace_project_id(self, mock_deps):
+    async def test_run_raises_on_whitespace_project_id(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = '   '
 
-        with self._patch_stage(stage), pytest.raises(ValueError, match='project_id'):
+        with patch_stage(stage), pytest.raises(ValueError, match='project_id'):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id='some_project'),
@@ -485,14 +503,14 @@ class TestProjectIdValidation:
             )
 
     @pytest.mark.asyncio
-    async def test_run_raises_on_watermark_project_id_mismatch(self, mock_deps):
+    async def test_run_raises_on_watermark_project_id_mismatch(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'project_a'
 
-        with self._patch_stage(stage), pytest.raises(ValueError) as exc_info:
+        with patch_stage(stage), pytest.raises(ValueError) as exc_info:
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id='project_b'),
@@ -504,14 +522,14 @@ class TestProjectIdValidation:
         assert 'project_b' in error_msg
 
     @pytest.mark.asyncio
-    async def test_run_allows_matching_watermark_project_id(self, mock_deps):
+    async def test_run_allows_matching_watermark_project_id(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
-        with self._patch_stage(stage):
+        with patch_stage(stage):
             result = await stage.run(
                 events=[],
                 watermark=Watermark(project_id='dark_factory'),
@@ -527,14 +545,14 @@ class TestProjectIdValidation:
         assert result.started_at <= result.completed_at
 
     @pytest.mark.asyncio
-    async def test_run_allows_empty_watermark_project_id(self, mock_deps):
+    async def test_run_allows_empty_watermark_project_id(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
-        with self._patch_stage(stage):
+        with patch_stage(stage):
             result = await stage.run(
                 events=[],
                 watermark=Watermark(project_id=''),
@@ -550,12 +568,12 @@ class TestProjectIdValidation:
         assert result.started_at <= result.completed_at
 
     @pytest.mark.asyncio
-    async def test_recon_context_includes_project_id(self, mock_deps):
+    async def test_recon_context_includes_project_id(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.cli_stage_runner import StageResult
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
         captured_kwargs = {}
@@ -564,7 +582,7 @@ class TestProjectIdValidation:
             captured_kwargs.update(kwargs)
             return StageResult(success=True, report={'summary': 'ok'})
 
-        with self._patch_stage(stage, cli_side_effect=capture_run_stage_via_cli):
+        with patch_stage(stage, cli_side_effect=capture_run_stage_via_cli):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id='dark_factory'),
@@ -575,14 +593,14 @@ class TestProjectIdValidation:
         assert 'project_id: dark_factory\n' in payload
 
     @pytest.mark.asyncio
-    async def test_run_allows_whitespace_watermark_project_id(self, mock_deps):
+    async def test_run_allows_whitespace_watermark_project_id(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
-        with self._patch_stage(stage):
+        with patch_stage(stage):
             result = await stage.run(
                 events=[],
                 watermark=Watermark(project_id='   '),
@@ -593,16 +611,16 @@ class TestProjectIdValidation:
         assert result.stage == StageId.memory_consolidator
 
     @pytest.mark.asyncio
-    async def test_run_logs_warning_when_watermark_project_id_falsy(self, mock_deps, caplog):
+    async def test_run_logs_warning_when_watermark_project_id_falsy(self, stage_mock_deps, caplog):
         import logging
 
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
-        with self._patch_stage(stage), caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.stages.base'):
+        with patch_stage(stage), caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.stages.base'):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id=''),
@@ -612,16 +630,16 @@ class TestProjectIdValidation:
         assert any('no project_id' in msg.lower() or 'skipping' in msg.lower() for msg in caplog.messages)
 
     @pytest.mark.asyncio
-    async def test_run_logs_warning_when_watermark_project_id_whitespace(self, mock_deps, caplog):
+    async def test_run_logs_warning_when_watermark_project_id_whitespace(self, stage_mock_deps, caplog):
         import logging
 
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
-        with self._patch_stage(stage), caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.stages.base'):
+        with patch_stage(stage), caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.stages.base'):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id='   '),
@@ -631,15 +649,15 @@ class TestProjectIdValidation:
         assert any('no project_id' in msg.lower() or 'skipping' in msg.lower() for msg in caplog.messages)
 
     @pytest.mark.asyncio
-    async def test_run_raises_on_special_chars_project_id(self, mock_deps):
+    async def test_run_raises_on_special_chars_project_id(self, stage_mock_deps):
         """stage.run() raises ValueError when project_id contains special characters."""
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'bad\nproject'
 
-        with self._patch_stage(stage), pytest.raises(ValueError, match='project_id'):
+        with patch_stage(stage), pytest.raises(ValueError, match='project_id'):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id=''),
