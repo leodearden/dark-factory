@@ -434,10 +434,18 @@ class TestProjectIdValidation:
             'config': config,
         }
 
-    def _patch_stage(self, stage):
-        """Return a context manager that patches assemble_payload and run_stage_via_cli."""
+    def _patch_stage(self, stage, cli_side_effect=None):
+        """Return a context manager that patches assemble_payload and run_stage_via_cli.
+
+        Args:
+            stage: The stage instance to patch.
+            cli_side_effect: Optional async callable for run_stage_via_cli side_effect.
+                Defaults to self._fake_run_stage_via_cli.
+        """
         from contextlib import contextmanager
         from unittest.mock import patch
+
+        effective_cli_side_effect = cli_side_effect if cli_side_effect is not None else self._fake_run_stage_via_cli
 
         @contextmanager
         def _ctx():
@@ -445,7 +453,7 @@ class TestProjectIdValidation:
                 patch.object(stage, 'assemble_payload', side_effect=self._fake_assemble_payload),
                 patch(
                     'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                    side_effect=self._fake_run_stage_via_cli,
+                    side_effect=effective_cli_side_effect,
                 ),
             ):
                 yield
