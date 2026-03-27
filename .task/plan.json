@@ -1,0 +1,98 @@
+{
+  "task_id": "167",
+  "title": "Clean up test_stages.py: redundant import, misleading test names, meta-tests",
+  "files": [
+    "fused-memory/tests/test_stages.py"
+  ],
+  "modules": [
+    "fused-memory/tests"
+  ],
+  "analysis": "The task addresses four review findings from task 142 on fused-memory/tests/test_stages.py:\n\n1. **Redundant AsyncMock imports**: There are 7 local `from unittest.mock import AsyncMock` scattered across test classes/methods (lines 67, 253, 285, 331, 426, 589, 601). No module-level import exists currently \u2014 the task description references a module-level import on 'line 4' that must have existed in an earlier version. Fix: add a single module-level `from unittest.mock import AsyncMock` and remove all 7 local copies.\n\n2. **TestSharedFixtureContract removal**: This class no longer exists in the file \u2014 likely removed in commit e2fce78 ('simplify: remove dead code, premature abstractions, and over-engineering'). No action needed.\n\n3. **test_default_limits misleading name**: Creates MemoryConsolidator with ReconciliationConfig() defaults and asserts episode_limit==500 and memory_limit==1000. These are CLASS-level defaults on MemoryConsolidator, which happen to match the opus tier (500/1000), NOT the framework config defaults (sonnet: 125/250). Rename to test_tier_limits_with_default_class_values.\n\n4. **test_sonnet_tier_limits misleading name**: Despite its name, this test only verifies that episode_limit and memory_limit attributes are mutable (sets 125/250 then asserts). It does not exercise _select_tier() or verify actual sonnet tier selection. Rename to test_limits_are_mutable.\n\nThis is a pure refactoring task on test code \u2014 no production code changes. The TDD pattern is: verify green baseline \u2192 make atomic refactoring change \u2192 verify green after each change.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Run existing test_stages.py to establish green baseline \u2014 all tests must pass before refactoring begins",
+      "status": "done",
+      "commit": "8e978e5",
+      "tests": [
+        "pytest fused-memory/tests/test_stages.py -v"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "impl",
+      "description": "Consolidate AsyncMock imports: add `from unittest.mock import AsyncMock` at module level (after the pytest import, line 5), then remove all 7 local `from unittest.mock import AsyncMock` at lines 67, 253, 285, 331, 426, 589, 601. Keep the `from unittest.mock import patch` on line 446 as-is since it is a separate import used only once (out of task scope).",
+      "status": "done",
+      "commit": "6d59033"
+    },
+    {
+      "id": "step-2",
+      "type": "test",
+      "description": "Run full test_stages.py suite to verify import consolidation did not break anything. All tests must pass identically to the baseline.",
+      "status": "done",
+      "commit": "6d59033"
+    },
+    {
+      "id": "step-3",
+      "type": "impl",
+      "description": "Rename TestTierConfig.test_default_limits \u2192 test_tier_limits_with_default_class_values. Add docstring: 'MemoryConsolidator class defaults (500/1000) match opus tier, not ReconciliationConfig sonnet defaults (125/250).'",
+      "status": "done",
+      "commit": "6c8ebe0"
+    },
+    {
+      "id": "step-4",
+      "type": "test",
+      "description": "Run TestTierConfig::test_tier_limits_with_default_class_values to verify the renamed test passes. Confirm the old name test_default_limits no longer exists.",
+      "status": "done",
+      "commit": "6c8ebe0"
+    },
+    {
+      "id": "step-5",
+      "type": "impl",
+      "description": "Rename TestTierConfig.test_sonnet_tier_limits \u2192 test_limits_are_mutable. Add docstring: 'episode_limit and memory_limit are mutable \u2014 the harness sets them from TierConfig before each run.'",
+      "status": "done",
+      "commit": "6c8ebe0"
+    },
+    {
+      "id": "step-6",
+      "type": "test",
+      "description": "Run full test_stages.py suite as final verification. All tests must pass. Confirm both old test names (test_default_limits, test_sonnet_tier_limits) are gone and replaced by the new names.",
+      "status": "done",
+      "commit": "6c8ebe0"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Rename test_sonnet_tier_limits \u2192 test_limits_are_mutable (not replace with _select_tier test)",
+      "rationale": "_select_tier() lives on ReconciliationHarness, not on stage classes. Adding a _select_tier() test to test_stages.py would be a scope violation \u2014 it belongs in test_harness.py. The current test body (set attribute, assert value) genuinely tests mutability, so the rename accurately describes what it does."
+    },
+    {
+      "decision": "Keep `from unittest.mock import patch` as a local import on line 446",
+      "rationale": "The task specifically calls out AsyncMock redundancy. The `patch` import is used in only one location (TestProjectIdValidation._patch_stage) and was not flagged in the review. Touching it would exceed task scope."
+    },
+    {
+      "decision": "No action for TestSharedFixtureContract (item 2)",
+      "rationale": "This class no longer exists in the file \u2014 it was removed in a prior commit (likely e2fce78). The review finding is already resolved."
+    },
+    {
+      "decision": "Add docstrings to renamed tests rather than inline comments",
+      "rationale": "Docstrings appear in pytest verbose output and IDE tooltips, making the intent visible where it matters. An inline comment only helps when reading the source."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Existing module-level import block pattern",
+      "where": "fused-memory/tests/test_stages.py lines 1-22",
+      "how": "Add AsyncMock import in the same style \u2014 stdlib imports grouped together (json, unittest.mock), then pytest, then project imports."
+    },
+    {
+      "what": "TestTierConfig class structure",
+      "where": "fused-memory/tests/test_stages.py lines 585-612",
+      "how": "Rename methods in-place, preserving the existing test body and assertions. Only add docstrings and change method names."
+    }
+  ],
+  "_session_id": "167-2c5969ba",
+  "_created_at": "2026-03-27T05:56:40.623572+00:00"
+}
