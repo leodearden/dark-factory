@@ -2716,7 +2716,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T23:41:48.249Z"
+        "updatedAt": "2026-03-26T23:41:48.249Z",
+        "metadata": {
+          "files": [
+            "fused-memory/tests/test_maintenance_utils.py",
+            "fused-memory/src/fused_memory/maintenance/_utils.py"
+          ],
+          "modules": [
+            "fused-memory/tests",
+            "fused-memory/src/fused_memory/maintenance"
+          ]
+        }
       },
       {
         "id": 171,
@@ -2764,7 +2774,16 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-26T23:27:41.598Z"
+        "updatedAt": "2026-03-26T23:27:41.598Z",
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/partials/orchestrators.html",
+            "dashboard/src/dashboard/templates/index.html"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates"
+          ]
+        }
       },
       {
         "id": 175,
