@@ -11,11 +11,7 @@ class TestConfigDefaults:
         assert cfg.host == '127.0.0.1'
         assert cfg.port == 8080
         assert cfg.project_root == Path('/home/leo/src/dark-factory')
-        assert cfg.fused_memory_urls == [
-            'http://localhost:8002',
-            'http://localhost:8000',
-            'http://localhost:8001',
-        ]
+        assert cfg.fused_memory_urls == ['http://localhost:8002']
 
     def test_config_derived_paths(self):
         from dashboard.config import DashboardConfig
@@ -48,7 +44,7 @@ class TestConfigEnvOverrides:
         assert cfg.port == 9090
         assert cfg.project_root == Path('/tmp/test')
         # Non-overridden fields keep defaults
-        assert len(cfg.fused_memory_urls) == 3
+        assert len(cfg.fused_memory_urls) == 1
 
     def test_env_derived_paths_update(self, monkeypatch):
         from dashboard.config import DashboardConfig

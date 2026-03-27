@@ -52,8 +52,8 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
             return [self._expand_env_vars(item) for item in value]
         return value
 
-    def get_field_value(self, field_name: str, field_info: Any) -> Any:
-        return None
+    def get_field_value(self, field: Any, field_name: str) -> tuple[Any, str, bool]:
+        return None, field_name, False
 
     def __call__(self) -> dict[str, Any]:
         if not self.config_path.exists():
@@ -70,7 +70,7 @@ class ServerConfig(BaseModel):
 
     transport: Literal['http', 'stdio', 'sse'] = Field(default='http', description='Transport: http, stdio, or sse')
     host: str = Field(default='0.0.0.0', description='Server host')
-    port: int = Field(default=8000, description='Server port')
+    port: int = Field(default=8002, description='Server port (canonical: 8002)')
     stateless_http: bool = Field(default=False, description='Stateless HTTP mode (no sessions)')
     json_response: bool = Field(default=False, description='JSON responses instead of SSE')
     keepalive_timeout: int = Field(default=30, description='HTTP keep-alive timeout in seconds')
