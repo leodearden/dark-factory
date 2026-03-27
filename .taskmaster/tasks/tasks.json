@@ -2615,13 +2615,13 @@
         "description": "Improve code quality in _graceful_shutdown (fused-memory/src/fused_memory/server/main.py).\n\nThree changes:\n1. Add parameter type annotations to _graceful_shutdown (currently untyped despite codebase convention of explicit types on all async functions). Use TYPE_CHECKING-guarded imports to avoid circular imports.\n2. Remove the `journal = recon_journal` alias on line 129. Either propagate the rename to all downstream uses (lines 152, 162) or revert to using `journal` throughout.\n3. Split the `except (asyncio.CancelledError, Exception): pass` in the harness cancellation block (lines 261-262) into two clauses: catch CancelledError silently (expected), but log unexpected exceptions via `logger.exception()` — consistent with every other step in the function.\n\nSource: Task 154 review, suggestions 1, 2, 3, 6, 8, 10, 17.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [
           "154"
         ],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-27T11:16:58.686Z",
+        "updatedAt": "2026-03-27T11:25:43.434Z",
         "metadata": {
           "files": [
             "fused-memory/src/fused_memory/server/main.py"
@@ -3519,9 +3519,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T11:25:31.814Z",
+      "lastModified": "2026-03-27T11:25:43.434Z",
       "taskCount": 189,
-      "completedCount": 141,
+      "completedCount": 142,
       "tags": [
         "master"
       ]
