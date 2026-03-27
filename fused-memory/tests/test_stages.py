@@ -87,35 +87,19 @@ class TestDisallowedToolLists:
 class TestStageSubclasses:
     """Each stage subclass returns the correct disallowed list."""
 
-    @pytest.fixture
-    def config(self):
-        return ReconciliationConfig(
-            enabled=True,
-            explore_codebase_root='/tmp/test',
-        )
-
-    @pytest.fixture
-    def mock_deps(self, config):
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-        }
-
-    def test_memory_consolidator_disallowed(self, mock_deps):
+    def test_memory_consolidator_disallowed(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         assert stage.get_disallowed_tools() == STAGE1_DISALLOWED
 
-    def test_task_knowledge_sync_disallowed(self, mock_deps):
+    def test_task_knowledge_sync_disallowed(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage_mock_deps)
         assert stage.get_disallowed_tools() == STAGE2_DISALLOWED
 
-    def test_integrity_check_disallowed(self, mock_deps):
+    def test_integrity_check_disallowed(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId
-        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage = IntegrityCheck(StageId.integrity_check, **stage_mock_deps)
         assert stage.get_disallowed_tools() == STAGE3_DISALLOWED
 
 
