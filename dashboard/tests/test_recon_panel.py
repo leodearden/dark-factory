@@ -223,6 +223,16 @@ class TestPartitionBurstState:
         assert len(active) == 0
         assert len(idle) == 1
 
+    def test_none_last_write_at_treated_as_idle(self):
+        from dashboard.app import partition_burst_state
+
+        # Idle agent with last_write_at=None — datetime.fromisoformat(None)
+        # raises TypeError which is caught; agent falls through to idle.
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': None}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
 
 class TestFormatDuration:
     """Tests for the format_duration Jinja2 filter (accepts seconds)."""
