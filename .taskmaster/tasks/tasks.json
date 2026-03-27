@@ -2824,11 +2824,11 @@
         "description": "Burst State table lists ~70 agents, most idle for hours/days, flooding the reconciliation left column. Default should show only bursting/active agents with a \"Show N idle agents\" expandable toggle.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 22-48). Partition agents into active (state != 'idle' or last_write < 1h) and stale. Show active by default, hide stale behind Alpine toggle. Consider also adding a max-height with overflow-y-auto as a fallback.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-27T11:04:10.900Z",
+        "updatedAt": "2026-03-27T11:04:11.630Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/recon.html",
@@ -3314,7 +3314,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T11:04:11.581Z",
+      "lastModified": "2026-03-27T11:04:11.630Z",
       "taskCount": 182,
       "completedCount": 138,
       "tags": [
