@@ -364,6 +364,59 @@ class GraphitiBackend:
         await graph.query(delete_cypher, {'uuids': uuids})
         return found
 
+    async def restore_edge_validity(self, uuid: str) -> None:
+        """Clear invalid_at and expired_at for a single RELATES_TO edge.
+
+        Used by the post-write invalidation guard to reverse spurious temporal
+        invalidations. Idempotent — safe to call on already-valid edges.
+
+        Args:
+            uuid: UUID of the RELATES_TO edge to restore.
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
+            'SET e.invalid_at = null, e.expired_at = null'
+        )
+        await graph.query(cypher, {'uuid': uuid})
+
+    async def bulk_restore_edge_validity(self, uuids: list[str]) -> int:
+        """Clear invalid_at and expired_at for multiple RELATES_TO edges.
+
+        Uses a pre-count pattern (matching bulk_remove_edges) to return the
+        number of edges actually found and updated.
+
+        Args:
+            uuids: List of edge UUIDs to restore.
+
+        Returns:
+            Number of edges that matched (and were restored). 0 for empty list.
+        """
+        if not uuids:
+            return 0
+        client = self._require_client()
+        logger.info('Restoring validity for %d edge(s)', len(uuids))
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        # Pre-count: how many of the requested UUIDs actually exist as edges
+        count_cypher = (
+            'MATCH ()-[e:RELATES_TO]->() '
+            'WHERE e.uuid IN $uuids '
+            'RETURN count(e) AS found'
+        )
+        count_result = await graph.query(count_cypher, {'uuids': uuids})
+        found = int(count_result.result_set[0][0]) if count_result.result_set else 0
+        # Restore the edges
+        restore_cypher = (
+            'MATCH ()-[e:RELATES_TO]->() '
+            'WHERE e.uuid IN $uuids '
+            'SET e.invalid_at = null, e.expired_at = null'
+        )
+        await graph.query(restore_cypher, {'uuids': uuids})
+        return found
+
     async def get_node_text(self, uuid: str) -> tuple[str, str]:
         """Return (name, summary) for the Entity node with the given UUID.
 
