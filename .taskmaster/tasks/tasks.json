@@ -2871,11 +2871,11 @@
         "description": "Post-review cleanup for get_entity tests in test_memory_service.py. Four items:\n\n1. **Move inline imports to module level**: `from tests.conftest import MockEdge` (line 624) and `import asyncio` (line 689) are inside test method bodies. Move both to top-level imports for consistency with the rest of the file.\n\n2. **Add test for default project_id='main'**: No test calls `get_entity(name='Foo')` without explicit project_id. Add a test asserting both search_nodes and search receive `group_ids=['main']`.\n\n3. **Add test for getattr fallback paths**: Production code uses `getattr(e, 'fact', str(e))` and `getattr(n, 'uuid', None)`. Add a test passing node/edge objects missing expected attributes, asserting fallback values (uuid=None, fact=str(edge)).\n\n4. **Fix incorrect docstring in test_error_propagation_search_nodes_raises** (line 722-726): Claims \"asyncio.gather cancels remaining tasks\" — this is wrong. gather() propagates the exception but does NOT cancel sibling tasks. Correct to: \"propagates the first raised exception; remaining tasks continue as orphaned background tasks.\"\n\n5. **Extend MockNode in conftest.py**: Add uuid, summary, labels fields (with defaults) so test_returns_correct_structure can use MockNode instead of ad-hoc MagicMock. Improves type safety and consistency with MockEdge pattern.\n\n## memory_hints\n- search: \"MockNode MockEdge conftest test fixtures\"\n- search: \"get_entity test coverage test_memory_service\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-27T05:52:23.458Z"
+        "updatedAt": "2026-03-27T05:52:50.763Z"
       },
       {
         "id": "191",
@@ -2975,9 +2975,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T05:52:23.458Z",
+      "lastModified": "2026-03-27T05:52:50.763Z",
       "taskCount": 177,
-      "completedCount": 134,
+      "completedCount": 135,
       "tags": [
         "master"
       ]
