@@ -111,6 +111,20 @@
       "description": "In memory_graphs.html, add position:relative to the timeseries chart container div's inline style (alongside existing height:180px). This allows Chart.js responsive mode to properly fill container width",
       "status": "done",
       "commit": "6aa991e"
+    },
+    {
+      "id": "step-13",
+      "type": "test",
+      "description": "Add a data-verification test to TestMemoryGraphsPartial that extracts JS variable values from rendered HTML via _extract_js_var() and asserts they match the mock data (e.g., opsData labels contain 'search' and 'add_memory', agentData labels contain 'claude-interactive' and 'recon-consolidator'). This test MUST use _patch_journal_app() (patching at dashboard.app.*) to prove the mock actually intercepts the bound imports. This test exposes the bug: if _patch_journal() were used, the extracted data would come from the real DB, not the mock.",
+      "status": "done",
+      "commit": "831c3e5"
+    },
+    {
+      "id": "step-14",
+      "type": "impl",
+      "description": "Migrate all 5 existing TestMemoryGraphsPartial tests to use _patch_journal_app() instead of _patch_journal(). Remove the dead _patch_journal() helper function entirely so it cannot be reused by mistake. This ensures all tests in the class correctly mock at the bound-import location (dashboard.app.*) rather than the source module (dashboard.data.write_journal.*).",
+      "status": "done",
+      "commit": "7e7b98a"
     }
   ],
   "design_decisions": [
@@ -133,6 +147,10 @@
     {
       "decision": "Default top-N grouping to 5 items",
       "rationale": "Five legend items is the practical maximum for a small (200px tall) doughnut chart with a right-positioned legend. This prevents truncation while showing meaningful granularity. The function accepts a configurable N parameter for future flexibility."
+    },
+    {
+      "decision": "Remove _patch_journal() entirely rather than deprecating it",
+      "rationale": "The helper patches at dashboard.data.write_journal.* which is the source module, not the bound import location in dashboard.app.*. Since app.py uses 'from X import Y' style imports, the names are bound locally and must be patched at dashboard.app.*. Leaving the broken helper in place (even deprecated) risks future tests copying the wrong pattern. _patch_journal_app() is the single correct helper."
     }
   ],
   "reuse": [
@@ -142,9 +160,14 @@
       "how": "Already defined identically in both templates. The pattern of destroying existing Chart.js instances before recreating (for HTMX morph compatibility) is already in place and should be preserved."
     },
     {
-      "what": "Existing test pattern: _patch_perf_data() / _patch_journal()",
+      "what": "Existing test pattern: _patch_perf_data() / _patch_journal_app()",
       "where": "test_performance_panel.py and test_memory_graphs_partial.py",
-      "how": "New tests follow the existing mock-and-render pattern: patch data functions, render via TestClient, assert on HTML content strings. No new test infrastructure needed."
+      "how": "All tests use the mock-and-render pattern: patch data functions at the bound import location (dashboard.app.*), render via TestClient, assert on HTML content. _patch_journal_app() is the correct helper for memory_graphs tests."
+    },
+    {
+      "what": "_extract_js_var() helper for data-dependent assertions",
+      "where": "test_memory_graphs_partial.py (already defined at line 75)",
+      "how": "Existing helper extracts JSON-assigned JS variables from rendered HTML using regex. Used by TestTopNGrouping, and now also by the new data-verification test in TestMemoryGraphsPartial to prove mocks are correctly applied."
     },
     {
       "what": "Color palette constants",
@@ -162,6 +185,7 @@
       "how": "The top-N grouped data flows through the same tojson serialization path. No changes to data serialization needed \u2014 group_top_n() returns the same {labels, values} dict shape."
     }
   ],
-  "_session_id": "181-cd6d040c",
-  "_created_at": "2026-03-27T05:08:56.010872+00:00"
+  "_session_id": "181-933be037",
+  "_created_at": "2026-03-27T23:43:28.568231+00:00",
+  "_schema_version": 1
 }
