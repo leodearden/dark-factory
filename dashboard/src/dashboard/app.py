@@ -17,6 +17,7 @@ from fastapi.templating import Jinja2Templates
 
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
+from dashboard.data.chart_utils import group_top_n
 from dashboard.data.db import DbPool
 from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.performance import (
@@ -301,8 +302,8 @@ async def memory_graphs_partial(request: Request):
         request, 'partials/memory_graphs.html',
         context={
             'timeseries': timeseries,
-            'operations': operations,
-            'agents': agents,
+            'operations': group_top_n(operations),
+            'agents': group_top_n(agents),
         },
     )
 

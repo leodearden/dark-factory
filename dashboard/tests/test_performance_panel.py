@@ -178,6 +178,42 @@ class TestPerformanceRouteEmpty:
         assert 'new Chart' not in html
 
 
+class TestHistogramUniformColor:
+    """Tests for histogram uniform bar color (not per-bar multi-color)."""
+
+    def test_histogram_does_not_use_per_bar_palette_coloring(self, client):
+        """Histogram bars must NOT use histPalette[i] per-bar coloring pattern."""
+        with _patch_perf_data():
+            html = client.get('/partials/performance').text
+        # The old per-bar coloring pattern should be absent
+        assert 'histPalette[i % histPalette.length]' not in html
+        assert 'histPalette[i]' not in html
+
+    def test_histogram_uses_uniform_color(self, client):
+        """Histogram bar backgroundColor should be a single uniform color string."""
+        with _patch_perf_data():
+            html = client.get('/partials/performance').text
+        # A single color like '#60a5fa' should be used for all histogram bars
+        assert '#60a5fa' in html
+
+
+class TestCompletionPathsDatalabels:
+    """Tests for datalabels plugin config on completion-paths doughnut chart."""
+
+    def test_completion_paths_doughnut_has_datalabels(self, client):
+        """Completion-paths doughnut chart script must contain datalabels configuration."""
+        with _patch_perf_data():
+            html = client.get('/partials/performance').text
+        assert 'datalabels' in html
+
+    def test_completion_paths_doughnut_has_percentage_formatter(self, client):
+        """Completion-paths doughnut chart datalabels must include a percentage formatter."""
+        with _patch_perf_data():
+            html = client.get('/partials/performance').text
+        assert 'formatter' in html
+        assert '%' in html or 'toFixed' in html
+
+
 class TestFormatDurationMs:
     """Tests for the format_duration_ms Jinja2 filter."""
 
