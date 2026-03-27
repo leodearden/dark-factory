@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from fused_memory.utils.validation import validate_project_id
 
 
