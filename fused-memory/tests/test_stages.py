@@ -23,6 +23,26 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 )
 
 
+class TestSharedFixtures:
+    """Regression guard: validate the shape of the module-level stage_mock_deps fixture."""
+
+    def test_stage_mock_deps_has_required_keys(self, stage_mock_deps):
+        assert set(stage_mock_deps.keys()) == {'memory_service', 'taskmaster', 'journal', 'config'}
+
+    def test_stage_mock_deps_services_are_async_mocks(self, stage_mock_deps):
+        assert isinstance(stage_mock_deps['memory_service'], AsyncMock)
+        assert isinstance(stage_mock_deps['taskmaster'], AsyncMock)
+        assert isinstance(stage_mock_deps['journal'], AsyncMock)
+
+    def test_stage_mock_deps_config_is_reconciliation_config(self, stage_mock_deps):
+        assert isinstance(stage_mock_deps['config'], ReconciliationConfig)
+
+    def test_stage_mock_deps_config_has_correct_values(self, stage_mock_deps):
+        config = stage_mock_deps['config']
+        assert config.enabled is True
+        assert config.explore_codebase_root == '/tmp/test'
+
+
 class TestDisallowedToolLists:
     """Verify per-stage disallowed tool lists are correct."""
 
