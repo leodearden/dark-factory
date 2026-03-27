@@ -65,12 +65,14 @@ class BriefingAssembler:
         iteration_log: list[dict],
         context: str | None = None,
         rebase_notice: dict | None = None,
+        task_id: str | None = None,
     ) -> str:
         """Build prompt for the implementer agent."""
+        effective_tid = task_id or plan.get('task_id')
         if context is None:
-            context = await self._get_memory_context(plan.get('task_id'))
+            context = await self._get_memory_context(effective_tid)
 
-        identity = self._agent_identity(plan.get('task_id'), 'implementer')
+        identity = self._agent_identity(effective_tid, 'implementer')
 
         completed = [s for s in plan.get('steps', []) if s.get('status') == 'done']
         pending = [s for s in plan.get('steps', []) if s.get('status') == 'pending']
@@ -138,13 +140,15 @@ Execute the next pending steps in TDD order. Commit after each step. Update plan
 """
 
     async def build_debugger_prompt(
-        self, failures: str, plan: dict, context: str | None = None
+        self, failures: str, plan: dict, context: str | None = None,
+        task_id: str | None = None,
     ) -> str:
         """Build prompt for the debugger agent."""
+        effective_tid = task_id or plan.get('task_id')
         if context is None:
-            context = await self._get_memory_context(plan.get('task_id'))
+            context = await self._get_memory_context(effective_tid)
 
-        identity = self._agent_identity(plan.get('task_id'), 'debugger')
+        identity = self._agent_identity(effective_tid, 'debugger')
 
         return f"""\
 {context}

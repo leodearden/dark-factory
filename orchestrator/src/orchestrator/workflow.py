@@ -70,10 +70,11 @@ class _BriefingLike(Protocol):
     ) -> str: ...
     async def build_implementer_prompt(
         self, plan: dict, iteration_log: list, context: str | None = ...,
-        rebase_notice: dict | None = ...,
+        rebase_notice: dict | None = ..., task_id: str | None = ...,
     ) -> str: ...
     async def build_debugger_prompt(
-        self, failures: str, plan: dict, context: str | None = ...
+        self, failures: str, plan: dict, context: str | None = ...,
+        task_id: str | None = ...,
     ) -> str: ...
     async def build_reviewer_prompt(
         self, reviewer_type: str, diff: str, context: str | None = ...
@@ -232,6 +233,14 @@ class TaskWorkflow:
                 # the first real commit the agent makes.
 
             # PLAN (skip if initial_plan was provided — eval mode)
+            if self.initial_plan:
+                plan_tid = self.initial_plan.get('task_id')
+                if plan_tid and plan_tid != self.task_id:
+                    logger.error(
+                        f'Task {self.task_id}: initial_plan has mismatched '
+                        f'task_id {plan_tid} — discarding, will re-plan'
+                    )
+                    self.initial_plan = None
             if self.initial_plan:
                 self.artifacts.write_plan(self.initial_plan)
                 self.artifacts.stamp_plan_provenance(self.session_id)
@@ -573,6 +582,7 @@ class TaskWorkflow:
 
             prompt = await self.briefing.build_implementer_prompt(
                 self.plan, iteration_log, rebase_notice=rebase_notice,
+                task_id=self.task_id,
             )
             result = await self._invoke(IMPLEMENTER, prompt, self.worktree)
 
@@ -722,7 +732,7 @@ class TaskWorkflow:
             # Invoke debugger
             self.plan = self.artifacts.read_plan()
             prompt = await self.briefing.build_debugger_prompt(
-                result.failure_report(), self.plan
+                result.failure_report(), self.plan, task_id=self.task_id,
             )
             debug_result = await self._invoke(DEBUGGER, prompt, self.worktree)
 

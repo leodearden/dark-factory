@@ -549,6 +549,17 @@ Output JSON matching the schema. Every task must appear in the output.
                 cleaned += 1
                 continue
 
+            # Validate plan belongs to this task
+            plan_task_id = plan.get('task_id')
+            if plan_task_id and plan_task_id != task_id:
+                logger.warning(
+                    f'Recovery: worktree {task_id} has plan for task '
+                    f'{plan_task_id} — task_id mismatch, cleaning up'
+                )
+                await self.git_ops.cleanup_worktree(entry, task_id)
+                cleaned += 1
+                continue
+
             # Check if plan has any completed steps
             completed = [
                 s for col in ('prerequisites', 'steps')

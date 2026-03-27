@@ -41,6 +41,7 @@ class BriefingProtocol(Protocol):
         plan: dict,
         iteration_log: list,
         context: str | None = None,
+        task_id: str | None = None,
     ) -> str: ...
 
     async def build_debugger_prompt(
@@ -48,6 +49,7 @@ class BriefingProtocol(Protocol):
         failures: str,
         plan: dict,
         context: str | None = None,
+        task_id: str | None = None,
     ) -> str: ...
 
     async def build_reviewer_prompt(

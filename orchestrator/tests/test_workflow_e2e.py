@@ -329,12 +329,13 @@ class FakeBriefing:
 
     async def build_implementer_prompt(
         self, plan: dict, iteration_log: list, context: str | None = None,
-        rebase_notice: dict | None = None,
+        rebase_notice: dict | None = None, task_id: str | None = None,
     ) -> str:
         return 'Implement the plan'
 
     async def build_debugger_prompt(
-        self, failures: str, plan: dict, context: str | None = None
+        self, failures: str, plan: dict, context: str | None = None,
+        task_id: str | None = None,
     ) -> str:
         return f'Fix: {failures[:100]}'
 

@@ -45,7 +45,7 @@ def harness(tmp_path: Path, git_config: GitConfig):
     return h
 
 
-def _make_plan(steps_done: int, steps_total: int) -> dict:
+def _make_plan(steps_done: int, steps_total: int, task_id: str = 'test') -> dict:
     """Build a plan dict with the given step completion counts."""
     steps = []
     for i in range(steps_total):
@@ -56,7 +56,7 @@ def _make_plan(steps_done: int, steps_total: int) -> dict:
             'commit': f'abc{i}' if i < steps_done else None,
         })
     return {
-        'task_id': 'test',
+        'task_id': task_id,
         'title': 'Test Task',
         'steps': steps,
     }
@@ -77,7 +77,7 @@ def _setup_worktree(base: Path, task_id: str, plan: dict | None = None):
 class TestRecoverCrashedTasks:
     async def test_recover_worktree_with_completed_steps(self, harness: Harness):
         """Worktree with plan (3/5 steps done) -> plan stored in _recovered_plans."""
-        plan = _make_plan(steps_done=3, steps_total=5)
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='35')
         _setup_worktree(harness.git_ops.worktree_base, '35', plan)
 
         await harness._recover_crashed_tasks()
@@ -205,12 +205,22 @@ class TestRecoverCrashedTasks:
             call_kwargs = MockWorkflow.call_args.kwargs
             assert call_kwargs['initial_plan'] is None
 
+    async def test_recover_plan_task_id_mismatch_cleaned_up(self, harness: Harness):
+        """Plan whose task_id doesn't match the worktree dir -> cleaned up."""
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='216')
+        wt = _setup_worktree(harness.git_ops.worktree_base, '369', plan)
+
+        await harness._recover_crashed_tasks()
+
+        assert '369' not in harness._recovered_plans
+        harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '369')  # type: ignore[attr-defined]
+
     async def test_multiple_worktrees_mixed(self, harness: Harness):
         """Multiple worktrees: one recovered, one cleaned, one no-progress."""
         base = harness.git_ops.worktree_base
 
         # Task with progress — should be recovered
-        plan_good = _make_plan(steps_done=2, steps_total=4)
+        plan_good = _make_plan(steps_done=2, steps_total=4, task_id='50')
         _setup_worktree(base, '50', plan_good)
 
         # Task with no plan — should be cleaned
