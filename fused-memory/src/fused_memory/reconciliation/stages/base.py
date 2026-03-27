@@ -99,6 +99,12 @@ class BaseStage:
                 f'project_id mismatch: stage has {self.project_id!r} but '
                 f'watermark has {watermark.project_id!r}'
             )
+        elif not (watermark.project_id and watermark.project_id.strip()):
+            logger.debug(
+                'Watermark has no project_id — skipping mismatch check '
+                '(stage project_id=%r)',
+                self.project_id,
+            )
 
         payload = await self.assemble_payload(events, watermark, prior_reports)
 
