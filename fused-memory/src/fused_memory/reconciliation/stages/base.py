@@ -94,7 +94,7 @@ class BaseStage:
             raise ValueError(err['error'])
 
         # Validate watermark.project_id consistency (skip if watermark has no project_id)
-        if watermark.project_id and watermark.project_id != self.project_id:
+        if watermark.project_id and watermark.project_id.strip() and watermark.project_id != self.project_id:
             raise ValueError(
                 f'project_id mismatch: stage has {self.project_id!r} but '
                 f'watermark has {watermark.project_id!r}'
