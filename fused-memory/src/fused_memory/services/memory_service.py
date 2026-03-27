@@ -800,38 +800,45 @@ class MemoryService:
     ) -> dict:
         """Entity lookup in Graphiti — returns nodes + edges.
 
-        Both Graphiti calls run concurrently via asyncio.gather(return_exceptions=True).
-        This ensures neither call becomes an orphaned background task in the error path:
-        gather() awaits both coroutines to settlement before returning, even when one
-        (or both) raise an exception.  If any call fails the first exception is re-raised.
-        """
-        results = await asyncio.gather(
-            self.graphiti.search_nodes(
-                query=name,
-                group_ids=[project_id],
-                max_nodes=5,
-            ),
-            self.graphiti.search(
-                query=name,
-                group_ids=[project_id],
-                num_results=10,
-            ),
-            return_exceptions=True,
-        )
+        Both Graphiti calls run concurrently via asyncio.TaskGroup (Python 3.11+
+        structured concurrency).  When either call raises, TaskGroup immediately
+        cancels the sibling task — preventing it from holding connections or
+        resources while waiting for a result that is no longer needed.
 
-        # Inspect results — log all failures then re-raise the first exception.
-        # Both coroutines have already settled at this point (no orphans).
-        exceptions = [r for r in results if isinstance(r, BaseException)]
-        if exceptions:
-            for exc in exceptions:
+        The ExceptionGroup raised by TaskGroup is unwrapped to re-raise
+        eg.exceptions[0], preserving the original exception type for callers.
+        """
+        nodes: list | None = None
+        edges: list | None = None
+
+        try:
+            async with asyncio.TaskGroup() as tg:
+                nodes_task = tg.create_task(
+                    self.graphiti.search_nodes(
+                        query=name,
+                        group_ids=[project_id],
+                        max_nodes=5,
+                    )
+                )
+                edges_task = tg.create_task(
+                    self.graphiti.search(
+                        query=name,
+                        group_ids=[project_id],
+                        num_results=10,
+                    )
+                )
+        except BaseExceptionGroup as eg:
+            # Log all failures before re-raising the first exception.
+            for exc in eg.exceptions:
                 logger.warning(
                     'get_entity: Graphiti call failed: %s: %s',
                     type(exc).__name__,
                     exc,
                 )
-            raise exceptions[0]
+            raise eg.exceptions[0]
 
-        nodes, edges = results
+        nodes = nodes_task.result()
+        edges = edges_task.result()
         assert isinstance(nodes, list)
         assert isinstance(edges, list)
 
