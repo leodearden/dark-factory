@@ -759,7 +759,6 @@ class TestGetEntity:
     async def test_failure_emits_warning_log(self, service):
         """When one call fails, logger.warning is called with a message mentioning
         the failed operation, before the exception is re-raised."""
-        import logging
         from unittest.mock import patch
 
         service.graphiti.search_nodes = AsyncMock(
@@ -769,9 +768,8 @@ class TestGetEntity:
 
         with patch(
             'fused_memory.services.memory_service.logger'
-        ) as mock_logger:
-            with pytest.raises(RuntimeError, match='node lookup error'):
-                await service.get_entity('entity', project_id='test')
+        ) as mock_logger, pytest.raises(RuntimeError, match='node lookup error'):
+            await service.get_entity('entity', project_id='test')
 
         mock_logger.warning.assert_called_once()
         warning_args = mock_logger.warning.call_args[0]

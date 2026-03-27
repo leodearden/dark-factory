@@ -832,6 +832,8 @@ class MemoryService:
             raise exceptions[0]
 
         nodes, edges = results
+        assert isinstance(nodes, list)
+        assert isinstance(edges, list)
 
         node_data = []
         for n in nodes:
