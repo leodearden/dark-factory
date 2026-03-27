@@ -77,3 +77,24 @@ class TestRefreshTrackingJS:
     def test_updated_text_present(self, client):
         html = client.get('/').text
         assert 'Updated' in html
+
+
+class TestRefreshPulseCSS:
+    """Tests that style.css contains the refresh-pulse animation."""
+
+    def _read_css(self):
+        import os
+        css_path = os.path.join(
+            os.path.dirname(__file__),
+            '..', 'src', 'dashboard', 'static', 'style.css'
+        )
+        with open(css_path) as f:
+            return f.read()
+
+    def test_keyframes_animation_present(self):
+        css = self._read_css()
+        assert '@keyframes section-refresh-pulse' in css
+
+    def test_section_refreshed_class_present(self):
+        css = self._read_css()
+        assert '.section-refreshed' in css
