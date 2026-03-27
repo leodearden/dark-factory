@@ -99,3 +99,18 @@ class TestStaticFiles:
         resp = client.get('/static/tailwind.css')
         assert resp.status_code == 200
         assert 'text/css' in resp.headers['content-type']
+
+
+class TestMakefileCurlSafety:
+    def test_curl_uses_fail_flag(self):
+        """Every curl invocation in the Makefile must use --fail or -f to ensure
+        failed HTTP downloads (404, 403, rate-limit) exit non-zero rather than
+        silently writing error HTML to the binary path."""
+        makefile_path = Path(__file__).parent.parent / 'Makefile'
+        content = makefile_path.read_text()
+        curl_lines = [line for line in content.splitlines() if 'curl' in line]
+        assert curl_lines, 'No curl lines found in Makefile'
+        for line in curl_lines:
+            assert '--fail' in line or '-f' in line.split(), (
+                f'curl line missing --fail/-f flag: {line!r}'
+            )
