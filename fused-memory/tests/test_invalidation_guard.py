@@ -367,3 +367,168 @@ class TestBulkRestoreEdgeValidity:
         # First call is the count query — check it uses $uuids param
         count_call = mock_graph.query.call_args_list[0]
         assert count_call[0][1].get('uuids') == uuids
+
+
+# ---------------------------------------------------------------------------
+# Step-11 through Step-16: InvalidationGuard.guard() orchestration
+# ---------------------------------------------------------------------------
+
+
+class TestInvalidationGuardOrchestration:
+    """InvalidationGuard.guard() orchestrates detection and restoration."""
+
+    @pytest.mark.asyncio
+    async def test_guard_detects_and_restores_spurious_edges(self):
+        """guard() calls bulk_restore_edge_validity with spurious edge UUIDs."""
+        mock_backend = MagicMock()
+        mock_backend.bulk_restore_edge_validity = AsyncMock(return_value=1)
+
+        guard = InvalidationGuard(mock_backend)
+
+        nodes = [FakeNode(uuid='node-A')]
+        edges = [
+            FakeEdge(
+                uuid='edge-spurious',
+                fact='Unrelated fact',
+                source_node_uuid='node-X',
+                target_node_uuid='node-Y',
+                expired_at=_now(),
+            )
+        ]
+        results = FakeAddEpisodeResults(nodes=nodes, edges=edges)
+        restored = await guard.guard(results)
+
+        mock_backend.bulk_restore_edge_validity.assert_called_once_with(['edge-spurious'])
+        assert restored == ['edge-spurious']
+
+    @pytest.mark.asyncio
+    async def test_guard_returns_list_of_restored_uuids(self):
+        """guard() returns the list of UUIDs that were spuriously invalidated."""
+        mock_backend = MagicMock()
+        mock_backend.bulk_restore_edge_validity = AsyncMock(return_value=2)
+
+        guard = InvalidationGuard(mock_backend)
+
+        nodes = [FakeNode(uuid='node-task')]
+        edges = [
+            FakeEdge(
+                uuid='edge-1',
+                fact='Fact 1',
+                source_node_uuid='node-other-1',
+                target_node_uuid='node-other-2',
+                expired_at=_now(),
+            ),
+            FakeEdge(
+                uuid='edge-2',
+                fact='Fact 2',
+                source_node_uuid='node-other-3',
+                target_node_uuid='node-other-4',
+                expired_at=_now(),
+            ),
+        ]
+        results = FakeAddEpisodeResults(nodes=nodes, edges=edges)
+        restored = await guard.guard(results)
+
+        assert set(restored) == {'edge-1', 'edge-2'}
+
+    @pytest.mark.asyncio
+    async def test_guard_noop_when_all_invalidations_legitimate(self):
+        """guard() returns [] and does NOT call bulk_restore when all edges share entity."""
+        mock_backend = MagicMock()
+        mock_backend.bulk_restore_edge_validity = AsyncMock(return_value=0)
+
+        guard = InvalidationGuard(mock_backend)
+
+        nodes = [FakeNode(uuid='node-task')]
+        edges = [
+            FakeEdge(
+                uuid='edge-old-status',
+                fact='Task had old status',
+                source_node_uuid='node-task',  # SAME entity as episode
+                target_node_uuid='node-status',
+                expired_at=_now(),
+            )
+        ]
+        results = FakeAddEpisodeResults(nodes=nodes, edges=edges)
+        restored = await guard.guard(results)
+
+        mock_backend.bulk_restore_edge_validity.assert_not_called()
+        assert restored == []
+
+    @pytest.mark.asyncio
+    async def test_guard_noop_when_no_invalidated_edges(self):
+        """guard() returns [] early when no edges have expired_at set."""
+        mock_backend = MagicMock()
+        mock_backend.bulk_restore_edge_validity = AsyncMock(return_value=0)
+
+        guard = InvalidationGuard(mock_backend)
+
+        nodes = [FakeNode(uuid='node-A')]
+        edges = [
+            FakeEdge(
+                uuid='edge-active',
+                fact='Active fact',
+                source_node_uuid='node-X',
+                target_node_uuid='node-Y',
+                expired_at=None,  # NOT invalidated
+            )
+        ]
+        results = FakeAddEpisodeResults(nodes=nodes, edges=edges)
+        restored = await guard.guard(results)
+
+        mock_backend.bulk_restore_edge_validity.assert_not_called()
+        assert restored == []
+
+    @pytest.mark.asyncio
+    async def test_guard_noop_on_empty_results(self):
+        """guard() returns [] when results have no edges at all."""
+        mock_backend = MagicMock()
+        mock_backend.bulk_restore_edge_validity = AsyncMock(return_value=0)
+
+        guard = InvalidationGuard(mock_backend)
+        results = FakeAddEpisodeResults(nodes=[], edges=[])
+        restored = await guard.guard(results)
+
+        mock_backend.bulk_restore_edge_validity.assert_not_called()
+        assert restored == []
+
+    @pytest.mark.asyncio
+    async def test_guard_mixed_edges_only_restores_spurious(self):
+        """guard() with mixed edges only restores the spurious ones, not legitimate ones."""
+        mock_backend = MagicMock()
+        mock_backend.bulk_restore_edge_validity = AsyncMock(return_value=1)
+
+        guard = InvalidationGuard(mock_backend)
+
+        nodes = [FakeNode(uuid='node-task')]
+        edges = [
+            # Legitimate: shares entity with episode
+            FakeEdge(
+                uuid='edge-legit',
+                fact='Old task status',
+                source_node_uuid='node-task',
+                target_node_uuid='node-status',
+                expired_at=_now(),
+            ),
+            # Spurious: no entity overlap
+            FakeEdge(
+                uuid='edge-spurious',
+                fact='Unrelated task status',
+                source_node_uuid='node-other-1',
+                target_node_uuid='node-other-2',
+                expired_at=_now(),
+            ),
+            # Active: not invalidated
+            FakeEdge(
+                uuid='edge-active',
+                fact='Current fact',
+                source_node_uuid='node-X',
+                target_node_uuid='node-Y',
+                expired_at=None,
+            ),
+        ]
+        results = FakeAddEpisodeResults(nodes=nodes, edges=edges)
+        restored = await guard.guard(results)
+
+        mock_backend.bulk_restore_edge_validity.assert_called_once_with(['edge-spurious'])
+        assert restored == ['edge-spurious']
