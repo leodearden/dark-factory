@@ -34,6 +34,44 @@ def stage_mock_deps():
     }
 
 
+async def fake_assemble_payload(events, watermark, prior_reports) -> str:
+    """Module-level fake for BaseStage.assemble_payload."""
+    return 'fake payload'
+
+
+async def fake_run_stage_via_cli(**kwargs):
+    """Module-level fake for run_stage_via_cli."""
+    from fused_memory.reconciliation.cli_stage_runner import StageResult
+    return StageResult(success=True, report={'summary': 'ok'})
+
+
+def patch_stage(stage, cli_side_effect=None):
+    """Return a context manager that patches assemble_payload and run_stage_via_cli.
+
+    Args:
+        stage: The stage instance to patch.
+        cli_side_effect: Optional async callable for run_stage_via_cli side_effect.
+            Defaults to fake_run_stage_via_cli.
+    """
+    from contextlib import contextmanager
+    from unittest.mock import patch
+
+    effective_cli_side_effect = cli_side_effect if cli_side_effect is not None else fake_run_stage_via_cli
+
+    @contextmanager
+    def _ctx():
+        with (
+            patch.object(stage, 'assemble_payload', side_effect=fake_assemble_payload),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                side_effect=effective_cli_side_effect,
+            ),
+        ):
+            yield
+
+    return _ctx()
+
+
 class TestSharedFixtures:
     """Regression guard: validate the shape of the module-level stage_mock_deps fixture."""
 
@@ -431,48 +469,6 @@ class TestTaskKnowledgeSyncPayload:
 class TestProjectIdValidation:
     """BaseStage.run() validates project_id and watermark.project_id."""
 
-    @staticmethod
-    async def _fake_assemble_payload(
-        events,
-        watermark,
-        prior_reports,
-    ) -> str:
-        return 'fake payload'
-
-    @staticmethod
-    async def _fake_run_stage_via_cli(**kwargs):
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
-        return StageResult(
-            success=True,
-            report={'summary': 'ok'},
-        )
-
-    def _patch_stage(self, stage, cli_side_effect=None):
-        """Return a context manager that patches assemble_payload and run_stage_via_cli.
-
-        Args:
-            stage: The stage instance to patch.
-            cli_side_effect: Optional async callable for run_stage_via_cli side_effect.
-                Defaults to self._fake_run_stage_via_cli.
-        """
-        from contextlib import contextmanager
-        from unittest.mock import patch
-
-        effective_cli_side_effect = cli_side_effect if cli_side_effect is not None else self._fake_run_stage_via_cli
-
-        @contextmanager
-        def _ctx():
-            with (
-                patch.object(stage, 'assemble_payload', side_effect=self._fake_assemble_payload),
-                patch(
-                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                    side_effect=effective_cli_side_effect,
-                ),
-            ):
-                yield
-
-        return _ctx()
-
     @pytest.mark.asyncio
     async def test_run_raises_on_empty_project_id(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
@@ -481,7 +477,7 @@ class TestProjectIdValidation:
         stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = ''
 
-        with self._patch_stage(stage), pytest.raises(ValueError, match='project_id'):
+        with patch_stage(stage), pytest.raises(ValueError, match='project_id'):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id=''),
@@ -497,7 +493,7 @@ class TestProjectIdValidation:
         stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = '   '
 
-        with self._patch_stage(stage), pytest.raises(ValueError, match='project_id'):
+        with patch_stage(stage), pytest.raises(ValueError, match='project_id'):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id='some_project'),
@@ -513,7 +509,7 @@ class TestProjectIdValidation:
         stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'project_a'
 
-        with self._patch_stage(stage), pytest.raises(ValueError) as exc_info:
+        with patch_stage(stage), pytest.raises(ValueError) as exc_info:
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id='project_b'),
@@ -532,7 +528,7 @@ class TestProjectIdValidation:
         stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
-        with self._patch_stage(stage):
+        with patch_stage(stage):
             result = await stage.run(
                 events=[],
                 watermark=Watermark(project_id='dark_factory'),
@@ -555,7 +551,7 @@ class TestProjectIdValidation:
         stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
-        with self._patch_stage(stage):
+        with patch_stage(stage):
             result = await stage.run(
                 events=[],
                 watermark=Watermark(project_id=''),
@@ -585,7 +581,7 @@ class TestProjectIdValidation:
             captured_kwargs.update(kwargs)
             return StageResult(success=True, report={'summary': 'ok'})
 
-        with self._patch_stage(stage, cli_side_effect=capture_run_stage_via_cli):
+        with patch_stage(stage, cli_side_effect=capture_run_stage_via_cli):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id='dark_factory'),
@@ -603,7 +599,7 @@ class TestProjectIdValidation:
         stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
-        with self._patch_stage(stage):
+        with patch_stage(stage):
             result = await stage.run(
                 events=[],
                 watermark=Watermark(project_id='   '),
@@ -623,7 +619,7 @@ class TestProjectIdValidation:
         stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
-        with self._patch_stage(stage), caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.stages.base'):
+        with patch_stage(stage), caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.stages.base'):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id=''),
@@ -642,7 +638,7 @@ class TestProjectIdValidation:
         stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
-        with self._patch_stage(stage), caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.stages.base'):
+        with patch_stage(stage), caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.stages.base'):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id='   '),
@@ -660,7 +656,7 @@ class TestProjectIdValidation:
         stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'bad\nproject'
 
-        with self._patch_stage(stage), pytest.raises(ValueError, match='project_id'):
+        with patch_stage(stage), pytest.raises(ValueError, match='project_id'):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id=''),
