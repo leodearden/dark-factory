@@ -2991,7 +2991,15 @@
             "dashboard/src/dashboard/templates",
             "dashboard/src/dashboard",
             "dashboard"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "Tailwind CDN production build dashboard base.html",
+              "dashboard static assets CDN vendor pinned versions",
+              "dashboard stability concerns CDN dependencies"
+            ]
+          }
         }
       },
       {
