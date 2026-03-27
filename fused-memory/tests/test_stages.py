@@ -727,6 +727,47 @@ class TestProjectIdGuideline:
         assert 'search, get_entity' in result
 
 
+class TestStage2ProjectIdGuideline:
+    """STAGE2_SYSTEM_PROMPT embeds the project_id guideline with ALL tools (memory + task mutation)."""
+
+    _STAGE2_ALL_TOOLS = [
+        'search',
+        'add_memory',
+        'delete_memory',
+        'get_entity',
+        'get_episodes',
+        'get_status',
+        'get_tasks',
+        'get_task',
+        'set_task_status',
+        'add_task',
+        'update_task',
+        'add_subtask',
+        'remove_task',
+        'add_dependency',
+        'remove_dependency',
+    ]
+
+    def test_stage2_prompt_contains_project_id_guideline(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+        assert 'project_id' in STAGE2_SYSTEM_PROMPT
+        assert 'Reconciliation Context block' in STAGE2_SYSTEM_PROMPT
+
+    def test_stage2_prompt_guideline_lists_all_tools(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+        # Find the guideline line
+        guideline_line = next(
+            (line for line in STAGE2_SYSTEM_PROMPT.splitlines()
+             if 'Reconciliation Context block' in line),
+            None,
+        )
+        assert guideline_line is not None, 'Guideline line not found in STAGE2_SYSTEM_PROMPT'
+        for tool in self._STAGE2_ALL_TOOLS:
+            assert tool in guideline_line, (
+                f"STAGE2 guideline missing tool: {tool}"
+            )
+
+
 class TestStage1ProjectIdGuideline:
     """STAGE1_SYSTEM_PROMPT embeds the project_id guideline with memory-only tools."""
 
