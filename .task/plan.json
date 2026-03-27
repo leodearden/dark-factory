@@ -1,0 +1,167 @@
+{
+  "task_id": "181",
+  "title": "Improve chart readability \u2014 add legends, data labels, and fix truncated labels",
+  "files": [
+    "dashboard/src/dashboard/data/chart_utils.py",
+    "dashboard/src/dashboard/app.py",
+    "dashboard/src/dashboard/templates/base.html",
+    "dashboard/src/dashboard/templates/partials/performance.html",
+    "dashboard/src/dashboard/templates/partials/memory_graphs.html",
+    "dashboard/tests/test_chart_utils.py",
+    "dashboard/tests/test_performance_panel.py",
+    "dashboard/tests/test_memory_graphs_partial.py"
+  ],
+  "modules": [
+    "dashboard/src/dashboard/data",
+    "dashboard/src/dashboard/templates",
+    "dashboard/src/dashboard/templates/partials",
+    "dashboard/tests"
+  ],
+  "analysis": "Five chart UX issues need fixing across two template partials, one app route, and one new utility module.\n\n(1) Histogram bars in performance.html use decorative multi-coloring (different color per bar via histPalette[i]) but disable the legend (line 192). Since bars already have x-axis category labels ('0','1','2','3+'), the multiple colors encode no information and create confusion. Fix: use a single uniform bar color and keep legend disabled \u2014 this removes the 'what do the colors mean?' question entirely.\n\n(2) Memory doughnut charts (ops + agents) in memory_graphs.html have right-positioned legends that truncate when there are many labels. The container is only 200px tall in a 2-column grid. Fix: implement 'top N + other' grouping as a Python utility, applied in the route handler before template rendering. This bounds the number of legend items.\n\n(3) The 'By agent' pie is dominated by 'unknown' (91%) because most write_ops rows lack agent_id. The top-N grouping from (2) will also help here, but additionally the grouping threshold should be configurable. With top-5 + other, 'unknown' remains visible but small-slice agents get aggregated.\n\n(4) Timeseries chart container lacks position:relative which Chart.js requires for responsive mode to properly fill the container width. Adding this CSS property and ensuring the canvas fills the container should fix the ~40% width issue.\n\n(5) Doughnut charts have no data labels on slices. Adding the chartjs-plugin-datalabels CDN script to base.html enables percentage labels. The plugin auto-registers globally, so we must set global default display:false and selectively enable on doughnut charts only. Tooltips are already default-enabled in Chart.js 4 \u2014 verify they work and enhance with percentage formatting.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Add chartjs-plugin-datalabels v2 CDN script to base.html (after chart.js script), plus a global default disable script block so labels only appear on charts that opt in",
+      "status": "done",
+      "commit": "e05d568",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write tests for group_top_n() utility in test_chart_utils.py: (a) passthrough when <= N items, (b) groups tail into 'Other' when > N items, (c) handles empty input, (d) preserves descending sort order, (e) custom N parameter, (f) 'Other' sums correctly",
+      "status": "done",
+      "commit": "c86e193"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Create dashboard/src/dashboard/data/chart_utils.py with group_top_n(data: dict, n: int = 5) -> dict function. Takes {labels: [], values: []} and returns grouped dict with top N entries plus 'Other' aggregation",
+      "status": "done",
+      "commit": "b5a2b46"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write tests in test_memory_graphs_partial.py: (a) when agent data has >5 entries, rendered template data contains 'Other' label, (b) when operations data has >5 entries, rendered template data contains 'Other' label, (c) when data has <=5 entries, no 'Other' label appears",
+      "status": "done",
+      "commit": "4342ca6"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "In app.py memory_graphs_partial(), import and apply group_top_n() to both operations and agents data after the asyncio.gather() call, before passing to template context",
+      "status": "done",
+      "commit": "1d618d7"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write test in test_performance_panel.py: verify histogram script block does NOT contain 'histPalette[i % histPalette.length]' (the per-bar coloring pattern) \u2014 instead uses a uniform color",
+      "status": "done",
+      "commit": "7ac8575"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "In performance.html, change histogram bar backgroundColor from histPalette[i] mapping to a single uniform color '#60a5fa' for all bars. Remove the histPalette array since it is no longer used for histograms",
+      "status": "done",
+      "commit": "530c1a9"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write test in test_memory_graphs_partial.py: verify doughnut chart script block contains 'datalabels' configuration key with formatter function for percentage display",
+      "status": "done",
+      "commit": "1d618d7"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "In memory_graphs.html doughnut chart options, add datalabels plugin config: display true, color white, formatter showing percentage, anchor 'center'. Also add tooltip callbacks with label showing 'name: value (pct%)'",
+      "status": "done",
+      "commit": "3e5f438"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write test in test_performance_panel.py: verify completion-paths doughnut chart script contains 'datalabels' configuration for percentage labels on slices",
+      "status": "done",
+      "commit": "7ac8575"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "In performance.html completion-paths doughnut chart options, add datalabels plugin config matching the pattern from step-8. Add tooltip callbacks with percentage display",
+      "status": "done",
+      "commit": "2e78749"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write test in test_memory_graphs_partial.py: verify timeseries chart container div has 'position:relative' in its style attribute (required by Chart.js for responsive width filling)",
+      "status": "done",
+      "commit": "1d618d7"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "In memory_graphs.html, add position:relative to the timeseries chart container div's inline style (alongside existing height:180px). This allows Chart.js responsive mode to properly fill container width",
+      "status": "done",
+      "commit": "6aa991e"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use single uniform color for histogram bars instead of adding a legend",
+      "rationale": "The histogram bars each represent a single category already labeled on the x-axis. Multi-coloring encodes no information \u2014 it creates visual noise and the false impression that colors are meaningful. A uniform color with clear x-axis labels is the standard histogram pattern. Adding a legend for decorative colors would be misleading."
+    },
+    {
+      "decision": "Implement top-N grouping as a Python utility applied in the route handler, not in SQL or JavaScript",
+      "rationale": "SQL-level grouping would complicate the data queries and tie presentation logic to the data layer. JavaScript grouping would mean sending excess data to the client. A Python utility in the route handler is cleanly testable, reusable across chart types, and keeps the template simple. The data layer remains a faithful representation of what's in the DB."
+    },
+    {
+      "decision": "Use chartjs-plugin-datalabels CDN with global disable + per-chart opt-in",
+      "rationale": "The official datalabels plugin is the standard Chart.js approach for showing values/percentages on chart elements. Using CDN matches the existing pattern (Chart.js itself is loaded via CDN). Global disable prevents the plugin from adding labels to histograms and line charts where they'd clutter. Only doughnut charts opt in with display:true."
+    },
+    {
+      "decision": "Fix timeseries width via position:relative on container, not width:100%",
+      "rationale": "Chart.js documentation explicitly states that the canvas wrapper needs position:relative for responsive mode to work. The container already has the correct display context (block-level div). The width issue is that Chart.js cannot determine the container's dimensions without this CSS property."
+    },
+    {
+      "decision": "Default top-N grouping to 5 items",
+      "rationale": "Five legend items is the practical maximum for a small (200px tall) doughnut chart with a right-positioned legend. This prevents truncation while showing meaningful granularity. The function accepts a configurable N parameter for future flexibility."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "getOrDestroyChart() helper function",
+      "where": "Both performance.html and memory_graphs.html",
+      "how": "Already defined identically in both templates. The pattern of destroying existing Chart.js instances before recreating (for HTMX morph compatibility) is already in place and should be preserved."
+    },
+    {
+      "what": "Existing test pattern: _patch_perf_data() / _patch_journal()",
+      "where": "test_performance_panel.py and test_memory_graphs_partial.py",
+      "how": "New tests follow the existing mock-and-render pattern: patch data functions, render via TestClient, assert on HTML content strings. No new test infrastructure needed."
+    },
+    {
+      "what": "Color palette constants",
+      "where": "performance.html (pathColors, histPalette) and memory_graphs.html (palette)",
+      "how": "The existing 10-color palette in memory_graphs.html is already well-suited for doughnut charts. Performance.html pathColors map is semantic (path name -> color) and stays as-is. histPalette can be simplified to a single color constant."
+    },
+    {
+      "what": "CDN script loading pattern in base.html",
+      "where": "base.html <head> section",
+      "how": "Follow the existing pattern of loading Chart.js UMD from jsdelivr CDN. The datalabels plugin uses the same CDN host and must be loaded after the Chart.js script."
+    },
+    {
+      "what": "Jinja2 tojson filter for data serialization",
+      "where": "Both template partials use {{ data | tojson }} to pass Python dicts to JavaScript",
+      "how": "The top-N grouped data flows through the same tojson serialization path. No changes to data serialization needed \u2014 group_top_n() returns the same {labels, values} dict shape."
+    }
+  ],
+  "_session_id": "181-cd6d040c",
+  "_created_at": "2026-03-27T05:08:56.010872+00:00"
+}
