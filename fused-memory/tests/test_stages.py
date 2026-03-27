@@ -263,30 +263,19 @@ class TestNormalizePlaceholderFiltering:
 class TestPerStageReportSchema:
     """Each stage returns the correct report schema via get_report_schema()."""
 
-    @pytest.fixture
-    def mock_deps(self):
-        from fused_memory.config.schema import ReconciliationConfig
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-        }
-
-    def test_integrity_check_returns_stage3_schema(self, mock_deps):
+    def test_integrity_check_returns_stage3_schema(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId
-        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage = IntegrityCheck(StageId.integrity_check, **stage_mock_deps)
         assert stage.get_report_schema() is STAGE3_REPORT_SCHEMA
 
-    def test_memory_consolidator_returns_base_schema(self, mock_deps):
+    def test_memory_consolidator_returns_base_schema(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         assert stage.get_report_schema() is STAGE_REPORT_SCHEMA
 
-    def test_task_knowledge_sync_returns_base_schema(self, mock_deps):
+    def test_task_knowledge_sync_returns_base_schema(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage_mock_deps)
         assert stage.get_report_schema() is STAGE_REPORT_SCHEMA
 
 
