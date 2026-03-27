@@ -848,12 +848,13 @@ async def test_sonnet_tier_selection_sets_consolidator_limits(journal, event_buf
 
     harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
 
-    # Push events before mocking, so drain() has real events to return
+    # Push events so drain() returns real events for stage processing.
+    # The pushed count (2) deliberately differs from the mocked stats (size=0):
+    # drain() reads the buffer directly, while _select_tier() calls get_buffer_stats().
+    # Mocking stats to size=0 forces sonnet tier selection (opus requires count > 15),
+    # independent of how many events are actually in the buffer.
     await event_buffer.push(_make_event())
     await event_buffer.push(_make_event())
-
-    # Mock buffer stats to return size=0, ensuring sonnet tier
-    # (opus requires count > buffer_size_threshold * opus_threshold_ratio = 10 * 1.5 = 15)
     event_buffer.get_buffer_stats = AsyncMock(return_value={'size': 0})
 
     # Part 1: verify _select_tier() returns correct sonnet TierConfig
