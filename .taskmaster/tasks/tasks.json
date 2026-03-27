@@ -2327,13 +2327,13 @@
         "description": "Post-merge cleanup from Task 136 review. test_stages.py has accumulated significant duplication:\n\n1. **mock_deps fixture** — Identical fixture defined in 4+ test classes (TestStageSubclasses, TestProjectIdValidation, TestPaddedStageProjectId, TestPerStageReportSchema). Extract to module level or conftest.py.\n\n2. **fake_assemble_payload / fake_run_stage_via_cli** — Defined inline ~6-7 times across test classes. Every copy is functionally identical. Extract as shared module-level async functions or fixtures.\n\nCentralizing prevents silent divergence when ReconciliationConfig or StageResult signatures change.\n\nFiles: fused-memory/tests/test_stages.py (possibly fused-memory/tests/conftest.py)\n\nmemory_hints:\n- search: \"test_stages.py mock_deps fixture deduplication\"\n- search: \"fake_assemble_payload fake_run_stage_via_cli test helper\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "136"
         ],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-27T11:04:10.688Z",
+        "updatedAt": "2026-03-27T12:00:20.458Z",
         "metadata": {
           "files": [
             "fused-memory/tests/test_stages.py",
@@ -3620,7 +3620,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T12:00:20.329Z",
+      "lastModified": "2026-03-27T12:00:20.458Z",
       "taskCount": 193,
       "completedCount": 148,
       "tags": [
