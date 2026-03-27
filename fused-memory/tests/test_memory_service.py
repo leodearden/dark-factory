@@ -653,16 +653,17 @@ class TestGetEntity:
         assert result['edges'][0]['uuid'] == 'edge-uuid-1'
 
     # ------------------------------------------------------------------
-    # step-2: search_nodes failure — sibling search() must still settle
+    # step-2: search_nodes failure — sibling search() task was invoked
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
     async def test_search_nodes_failure_raises_and_search_settles(self, service):
         """When search_nodes raises, exception propagates AND search() was still called.
 
-        In a concurrent gather() implementation both coroutines are started together,
-        so search() is awaited even when search_nodes fails.  With the current
-        sequential implementation search() is never called — this test fails.
+        With asyncio.TaskGroup both coroutines are started concurrently, so search()
+        is invoked (AsyncMock called) even when search_nodes fails.  The sibling task
+        may be cancelled before it returns, but assert_called_once() is satisfied
+        because the coroutine was created and started.
         """
         service.graphiti.search_nodes = AsyncMock(
             side_effect=RuntimeError('search_nodes failed')
@@ -672,16 +673,21 @@ class TestGetEntity:
         with pytest.raises(RuntimeError, match='search_nodes failed'):
             await service.get_entity('entity', project_id='test')
 
-        # Both calls must have settled — search() called even when search_nodes fails
+        # search() was invoked (task started) even though search_nodes failed
         service.graphiti.search.assert_called_once()
 
     # ------------------------------------------------------------------
-    # step-3: search failure — sibling search_nodes() must still settle
+    # step-3: search failure — sibling search_nodes() task was invoked
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
     async def test_search_failure_raises_and_search_nodes_settles(self, service):
-        """When search raises, exception propagates AND search_nodes() was still called."""
+        """When search() raises, exception propagates AND search_nodes() was still called.
+
+        With asyncio.TaskGroup search_nodes() is invoked (AsyncMock called) even when
+        search() fails.  The sibling task may be cancelled before it returns, but
+        assert_called_once() is satisfied because the coroutine was started.
+        """
         service.graphiti.search_nodes = AsyncMock(return_value=[])
         service.graphiti.search = AsyncMock(
             side_effect=RuntimeError('search failed')
@@ -690,7 +696,7 @@ class TestGetEntity:
         with pytest.raises(RuntimeError, match='search failed'):
             await service.get_entity('entity', project_id='test')
 
-        # search_nodes() must have been called (settled before or alongside the exception)
+        # search_nodes() was invoked (task started) even though search() failed
         service.graphiti.search_nodes.assert_called_once()
 
     # ------------------------------------------------------------------
