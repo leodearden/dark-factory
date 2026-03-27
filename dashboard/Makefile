@@ -10,7 +10,7 @@ OUTPUT_CSS := src/dashboard/static/tailwind.css
 
 $(TAILWIND_BIN):
 	mkdir -p $(TAILWIND_BIN_DIR)
-	curl -sL $(TAILWIND_URL) -o $(TAILWIND_BIN)
+	curl -fsSL $(TAILWIND_URL) -o $(TAILWIND_BIN) || (rm -f $(TAILWIND_BIN); exit 1)
 	chmod +x $(TAILWIND_BIN)
 
 css: $(TAILWIND_BIN)
