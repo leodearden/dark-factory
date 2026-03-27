@@ -2873,7 +2873,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-27T04:47:34.946Z"
+        "updatedAt": "2026-03-27T04:47:34.946Z",
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/partials/recon.html",
+            "dashboard/src/dashboard/data/reconciliation.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates",
+            "dashboard/src/dashboard/data"
+          ]
+        }
       },
       {
         "id": 180,
@@ -2885,7 +2895,21 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-27T05:04:00.781Z"
+        "updatedAt": "2026-03-27T05:04:00.781Z",
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/base.html",
+            "dashboard/src/dashboard/app.py",
+            "dashboard/src/dashboard/static/styles.css",
+            "dashboard/package.json",
+            "dashboard/tailwind.config.js"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates",
+            "dashboard/src/dashboard",
+            "dashboard"
+          ]
+        }
       },
       {
         "id": 181,
