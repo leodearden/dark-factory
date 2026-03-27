@@ -571,7 +571,8 @@ class TestProjectIdValidation:
                 prior_reports=[],
                 run_id='test-run-6',
             )
-        assert 'dark_factory' in captured_kwargs.get('payload', '')
+        payload = captured_kwargs.get('payload', '')
+        assert 'project_id: dark_factory\n' in payload
 
     @pytest.mark.asyncio
     async def test_run_allows_whitespace_watermark_project_id(self, mock_deps):
