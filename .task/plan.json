@@ -1,0 +1,244 @@
+{
+  "task_id": "189",
+  "title": "Investigate: Graphiti semantic invalidation too aggressive for task-status edges",
+  "files": [
+    "fused-memory/src/fused_memory/backends/invalidation_guard.py",
+    "fused-memory/src/fused_memory/backends/graphiti_client.py",
+    "fused-memory/src/fused_memory/config/schema.py",
+    "fused-memory/tests/test_invalidation_guard.py",
+    "fused-memory/tests/conftest.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/backends",
+    "fused-memory/src/fused_memory/config",
+    "fused-memory/tests"
+  ],
+  "analysis": "## Root Cause\n\nGraphiti's `resolve_extracted_edges()` in `graphiti_core/utils/maintenance/edge_operations.py` (lines 298-309) gathers invalidation candidates via a **broad semantic search** with an empty `SearchFilters()` — no entity-node filtering. When an episode about Task 481 is written, edge extraction produces facts like 'Task 481 has status in-progress'. The semantic search retrieves ALL similar edges including 'Task 208 has status in-progress' because they share 'task status' semantics.\n\nThe `related_edges` (duplicate candidates) ARE properly scoped via `EntityEdge.get_between_nodes()` — they only include edges between the same source/target entity nodes. But the `edge_invalidation_candidates` use EDGE_HYBRID_SEARCH_RRF with no entity filtering.\n\nThese unfiltered candidates go to the LLM via `dedupe_edges.resolve_edge()` which only sees fact text (no entity information). The small model (gpt-4o-mini) may judge 'Task 481 is in-progress' and 'Task 208 is in-progress' as contradictory, then `resolve_edge_contradictions()` temporally invalidates the older edge.\n\n## Solution: Post-Write Invalidation Guard\n\nSince `graphiti_core` is a third-party library, we cannot modify the invalidation candidate search directly. Instead, we add a **post-write validation layer** in fused-memory that detects and reverses spurious invalidations.\n\nThe guard inspects `AddEpisodeResults` after each `add_episode()` call:\n- `results.nodes` = entity nodes extracted from the episode\n- `results.edges` = `resolved_edges + invalidated_edges`\n- Invalidated edges have `expired_at` set to ~now\n- For each invalidated edge, check if its source/target entity UUIDs overlap with the episode's entity UUIDs\n- If NO overlap → spurious invalidation → restore by clearing `invalid_at`/`expired_at` via Cypher\n\n## Key Insight\n\nNew edges (resolved from episode extraction) always connect entities in `results.nodes`. Invalidated edges may connect entities NOT in `results.nodes`. If an invalidated edge shares NO entity endpoint with the episode's entities, the invalidation was driven purely by surface-level semantic similarity, not by actual factual contradiction about the same entities.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Add invalidation_guard_enabled field to GraphitiBackendConfig in config/schema.py (default True)",
+      "status": "done",
+      "commit": "84b8d08e9e2dab7ca74cf23f14e7c1bf7a226c69",
+      "tests": []
+    },
+    {
+      "id": "pre-2",
+      "description": "Add MockNode.uuid field to conftest.py MockNode dataclass (needed for entity-overlap checks in tests)",
+      "status": "done",
+      "commit": "84b8d08e9e2dab7ca74cf23f14e7c1bf7a226c69",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing test: detect_spurious_invalidations() identifies invalidated edges with no entity overlap — an edge with expired_at set whose source/target UUIDs are NOT in the episode's entity set should be flagged as spurious",
+      "status": "done",
+      "commit": "fb99810"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Implement detect_spurious_invalidations() in invalidation_guard.py — iterate results.edges, collect those with expired_at set and neither source_node_uuid nor target_node_uuid in the set of episode entity node UUIDs",
+      "status": "done",
+      "commit": "b1be27d"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing test: detect_spurious_invalidations() does NOT flag edges that share at least one entity endpoint with the episode (legitimate invalidation)",
+      "status": "done",
+      "commit": "fb99810"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Verify step-3 passes with existing implementation (the entity-overlap check should naturally handle this)",
+      "status": "done",
+      "commit": "b1be27d"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing test: detect_spurious_invalidations() ignores edges without expired_at set (non-invalidated edges pass through)",
+      "status": "done",
+      "commit": "fb99810"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Verify step-5 passes (the expired_at check should already filter these out)",
+      "status": "done",
+      "commit": "b1be27d"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing test: GraphitiBackend.restore_edge_validity() executes correct Cypher to clear invalid_at and expired_at for a given edge UUID",
+      "status": "done",
+      "commit": "9e3b72e"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Add restore_edge_validity(uuid) method to GraphitiBackend — Cypher: MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() SET e.invalid_at = NULL, e.expired_at = NULL",
+      "status": "done",
+      "commit": "cebeea2"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write failing test: GraphitiBackend.bulk_restore_edge_validity() handles multiple UUIDs and returns count of restored edges",
+      "status": "done",
+      "commit": "9e3b72e"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Add bulk_restore_edge_validity(uuids) method — batch Cypher update with pre-count pattern (matching existing bulk_remove_edges style)",
+      "status": "done",
+      "commit": "cebeea2"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write failing test: InvalidationGuard.guard() detects spurious invalidations and calls bulk_restore_edge_validity() to reverse them, returning list of restored UUIDs",
+      "status": "done",
+      "commit": "055ec24"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Implement InvalidationGuard.guard() — orchestrate detect_spurious_invalidations() + bulk_restore_edge_validity(), log all restorations with edge UUID and fact text",
+      "status": "done",
+      "commit": "b1be27d"
+    },
+    {
+      "id": "step-13",
+      "type": "test",
+      "description": "Write failing test: InvalidationGuard.guard() is a no-op when all invalidations are legitimate (all invalidated edges share entity overlap)",
+      "status": "done",
+      "commit": "055ec24"
+    },
+    {
+      "id": "step-14",
+      "type": "impl",
+      "description": "Verify step-13 passes — guard should return empty list when no spurious invalidations found",
+      "status": "done",
+      "commit": "055ec24"
+    },
+    {
+      "id": "step-15",
+      "type": "test",
+      "description": "Write failing test: InvalidationGuard.guard() is a no-op when results have no edges with expired_at set (clean episode with no invalidations)",
+      "status": "done",
+      "commit": "055ec24"
+    },
+    {
+      "id": "step-16",
+      "type": "impl",
+      "description": "Verify step-15 passes — early return when no invalidated edges detected",
+      "status": "done",
+      "commit": "055ec24"
+    },
+    {
+      "id": "step-17",
+      "type": "test",
+      "description": "Write failing test: GraphitiBackend.add_episode() calls InvalidationGuard.guard() on the result and logs any restorations",
+      "status": "done",
+      "commit": "9803257"
+    },
+    {
+      "id": "step-18",
+      "type": "impl",
+      "description": "Integrate InvalidationGuard into GraphitiBackend.add_episode() — construct guard from backend, call guard() on AddEpisodeResults, log restorations",
+      "status": "done",
+      "commit": "59936db"
+    },
+    {
+      "id": "step-19",
+      "type": "test",
+      "description": "Write failing test: InvalidationGuard is skipped when invalidation_guard_enabled=False in config",
+      "status": "done",
+      "commit": "9803257"
+    },
+    {
+      "id": "step-20",
+      "type": "impl",
+      "description": "Add config check in GraphitiBackend.add_episode() — skip guard when config.graphiti.invalidation_guard_enabled is False",
+      "status": "done",
+      "commit": "59936db"
+    },
+    {
+      "id": "step-21",
+      "type": "test",
+      "description": "Write failing test: InvalidationGuard.guard() handles mixed results — some edges spurious, some legitimate — only restores spurious ones",
+      "status": "done",
+      "commit": "055ec24"
+    },
+    {
+      "id": "step-22",
+      "type": "impl",
+      "description": "Verify step-21 passes with existing implementation (detection and restoration are independent per edge)",
+      "status": "done",
+      "commit": "055ec24"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Post-write guard rather than upstream patch",
+      "rationale": "graphiti_core is a third-party library installed via pip. Modifying it would create maintenance burden on every upgrade. A post-write guard in our wrapper layer is decoupled from upstream changes and can be toggled via config."
+    },
+    {
+      "decision": "Entity-overlap heuristic for spurious detection",
+      "rationale": "An invalidated edge is spurious if it shares NO entity endpoints with the episode's extracted entities. This is a strong signal: legitimate invalidations require at least one shared entity (e.g., same Task entity with different status). The heuristic avoids false positives because new edges always connect entities from the current episode."
+    },
+    {
+      "decision": "Guard runs inside GraphitiBackend.add_episode(), not in MemoryService",
+      "rationale": "The guard needs the full AddEpisodeResults (nodes + edges) and direct graph driver access for restoration. GraphitiBackend owns the Graphiti client and driver, making it the natural home. The guard runs before the result propagates to the dual-write callback."
+    },
+    {
+      "decision": "Bulk restore follows existing bulk_remove_edges pattern (pre-count + batch Cypher)",
+      "rationale": "Consistency with existing codebase patterns. The pre-count validation ensures accurate restoration counts for logging. The Cypher UPDATE clears invalid_at and expired_at fields to reverse spurious temporal invalidation."
+    },
+    {
+      "decision": "Guard is configurable and enabled by default",
+      "rationale": "This is a bug fix, so it should be on by default. But having a config toggle (invalidation_guard_enabled) allows disabling for debugging or if upstream Graphiti improves its invalidation candidate scoping in a future release."
+    },
+    {
+      "decision": "Detection uses expired_at presence, not timestamp comparison",
+      "rationale": "Checking `expired_at is not None` is simpler and more robust than comparing timestamps. In the AddEpisodeResults, invalidated edges always have expired_at set. New edges only have expired_at if immediately expired by more recent data, but those always share entity endpoints — so the overlap check correctly skips them."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "MockNode, MockEdge, MockAddEpisodeResult from conftest.py",
+      "where": "fused-memory/tests/conftest.py",
+      "how": "Extend MockNode with uuid field. Use MockEdge's existing valid_at/invalid_at fields. Add expired_at and source_node_uuid/target_node_uuid. Create mock AddEpisodeResults for guard tests."
+    },
+    {
+      "what": "bulk_remove_edges pattern (pre-count + batch Cypher)",
+      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py lines 330-365",
+      "how": "Mirror the pre-count + batch update pattern for bulk_restore_edge_validity(). Use the same driver._get_graph(None) access and return actual count."
+    },
+    {
+      "what": "GraphitiBackend test fixture pattern",
+      "where": "fused-memory/tests/test_temporal_context.py lines 26-32",
+      "how": "Reuse the mock_config + backend fixture pattern with mocked graphiti_core client for testing restore_edge_validity and guard integration."
+    },
+    {
+      "what": "Idempotent edge operation pattern",
+      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py remove_edge()",
+      "how": "Apply same idempotent pattern to restore_edge_validity — catch EdgeNotFoundError, log and return gracefully."
+    },
+    {
+      "what": "GraphitiBackendConfig in config/schema.py",
+      "where": "fused-memory/src/fused_memory/config/schema.py lines 130-134",
+      "how": "Add invalidation_guard_enabled: bool = Field(default=True) to existing GraphitiBackendConfig class."
+    }
+  ],
+  "_session_id": "189-c2427221",
+  "_created_at": "2026-03-27T04:14:01.437159+00:00"
+}
