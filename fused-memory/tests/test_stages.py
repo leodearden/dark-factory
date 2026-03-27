@@ -571,7 +571,8 @@ class TestProjectIdValidation:
                 prior_reports=[],
                 run_id='test-run-6',
             )
-        assert 'dark_factory' in captured_kwargs.get('payload', '')
+        payload = captured_kwargs.get('payload', '')
+        assert 'project_id: dark_factory\n' in payload
 
     @pytest.mark.asyncio
     async def test_run_allows_whitespace_watermark_project_id(self, mock_deps):
@@ -628,6 +629,23 @@ class TestProjectIdValidation:
                 run_id='test-run-log-whitespace',
             )
         assert any('no project_id' in msg.lower() or 'skipping' in msg.lower() for msg in caplog.messages)
+
+    @pytest.mark.asyncio
+    async def test_run_raises_on_special_chars_project_id(self, mock_deps):
+        """stage.run() raises ValueError when project_id contains special characters."""
+        from fused_memory.models.reconciliation import StageId, Watermark
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'bad\nproject'
+
+        with self._patch_stage(stage), pytest.raises(ValueError, match='project_id'):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id=''),
+                prior_reports=[],
+                run_id='test-run-special-chars',
+            )
 
 
 class TestTierConfig:
