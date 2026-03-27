@@ -184,7 +184,7 @@ class TaskmasterConfig(BaseModel):
     cwd: str = Field(default='')
     http_url: str = Field(default='')
     project_root: str = Field(default='.')
-    tool_mode: str = Field(default='standard')
+    tool_mode: str = Field(default='all')
 
 
 # --- Reconciliation ---
