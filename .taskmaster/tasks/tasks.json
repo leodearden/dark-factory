@@ -2982,6 +2982,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 200,
+        "title": "Add end-to-end tier selection test for MemoryConsolidator",
+        "description": "No test verifies that a MemoryConsolidator constructed with a sonnet-tier ReconciliationConfig and processed through the harness's _select_tier() ends up with episode_limit=125 and memory_limit=250. Add a test (in test_harness.py or test_stages.py) that exercises the full path from a sonnet-tier ReconciliationConfig through _select_tier(), asserting the correct limits are applied. memory_hints: search for \"_select_tier\" and \"TierConfig\" in reconciliation harness code.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -2994,7 +3005,7 @@
       ],
       "created": "2026-03-27T06:03:11.314Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-27T06:03:11.316Z"
+      "updated": "2026-03-27T06:03:14.937Z"
     }
   }
 }
