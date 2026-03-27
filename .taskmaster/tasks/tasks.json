@@ -2978,10 +2978,11 @@
         "description": "test_limits_are_mutable (fused-memory/tests/test_stages.py:591) only asserts post-mutation values. Add assertions before the mutations to verify the initial state differs (e.g. assert stage.episode_limit == 500 and stage.memory_limit == 1000 before setting 125/250). This makes the test self-contained and proves the mutation actually changes something.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-27T06:15:37.846Z"
       },
       {
         "id": "200",
@@ -3020,7 +3021,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T06:15:37.781Z",
+      "lastModified": "2026-03-27T06:15:37.846Z",
       "taskCount": 181,
       "completedCount": 137,
       "tags": [
