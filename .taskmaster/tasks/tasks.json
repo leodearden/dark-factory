@@ -3662,7 +3662,16 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "fused-memory/tests/test_enum_models.py",
+            "fused-memory/tests/test_stages.py"
+          ],
+          "modules": [
+            "fused-memory/tests"
+          ]
+        }
       }
     ],
     "metadata": {
