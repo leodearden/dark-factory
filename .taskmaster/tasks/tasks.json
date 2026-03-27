@@ -2966,15 +2966,16 @@
         "description": "Follow-up polish for task 192 (structured concurrency in get_entity). Three small fixes in memory_service.py and test_memory_service.py:\n\n1. **Fix exception chaining** (memory_service.py:838): Change `raise eg.exceptions[0] from eg` to bare `raise eg.exceptions[0]`. The `from eg` sets __cause__ to the ExceptionGroup, creating a circular reference (the EG contains the same exception) and doubling traceback length for no diagnostic value. Bare raise preserves the EG in __context__ for debugging while keeping tracebacks clean. Three reviewers converged on this.\n\n2. **Move `import asyncio` to module level** (test_memory_service.py): The import appears inline inside three test methods (lines ~732, 803, 843) instead of at the top with other stdlib imports. Move to module-level import block.\n\n3. **Rename stale test names** (test_memory_service.py:660,684): `test_search_nodes_failure_raises_and_search_settles` and `test_search_failure_raises_and_search_nodes_settles` still contain 'settles', which described the old gather() behavior. With TaskGroup the sibling may be cancelled, not settled. Rename to `..._and_search_invoked` / `..._and_search_nodes_invoked`.\n\n## memory_hints\n- search: \"get_entity TaskGroup exception chaining structured concurrency\"\n- search: \"raise eg.exceptions from eg ExceptionGroup unwrap convention\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-27T05:31:06.036Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T05:31:05.605Z",
+      "lastModified": "2026-03-27T05:31:06.036Z",
       "taskCount": 177,
       "completedCount": 134,
       "tags": [
