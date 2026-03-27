@@ -23,6 +23,17 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 )
 
 
+@pytest.fixture
+def stage_mock_deps():
+    """Shared module-level fixture providing standard stage dependencies."""
+    return {
+        'memory_service': AsyncMock(),
+        'taskmaster': AsyncMock(),
+        'journal': AsyncMock(),
+        'config': ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
+    }
+
+
 class TestSharedFixtures:
     """Regression guard: validate the shape of the module-level stage_mock_deps fixture."""
 
