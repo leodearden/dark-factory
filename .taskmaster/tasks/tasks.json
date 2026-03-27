@@ -2813,11 +2813,11 @@
         "description": "Regression: The orchestrator card renders the task table visible on load but the toggle button says \"Show tasks\". Clicking toggles to \"Hide tasks\" (still visible), then a second click hides the table correctly. On HTMX refresh (every 10s), state resets to the broken initial state. The Alpine x-data state is lost on morph.",
         "details": "Files: dashboard/src/dashboard/templates/partials/orchestrators.html.\n\nTwo issues: (1) Initial Alpine state should default to table hidden (x-show with open:false, but the table HTML is not wrapped in x-show or the logic is inverted). (2) Alpine state resets on every HTMX morph because Idiomorph replaces the x-data element, losing the toggled state. Fix: use Alpine.store('panels') which persists across morphs, or use hx-swap=\"morph:outerHTML\" which Idiomorph handles better for preserving Alpine state.\n\nmemory_hint: search \"Alpine state HTMX morph\" for prior patterns.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-27T11:04:11.330Z",
+        "updatedAt": "2026-03-27T11:16:26.911Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/orchestrators.html",
@@ -2834,11 +2834,11 @@
         "description": "The reconciliation Recent Runs table shows \"Loading...\" text between every run row. Detail rows use x-show=\"open\" with x-cloak and hx-trigger=\"revealed\", but Idiomorph morphing every 15s briefly makes hidden rows visible, triggering unnecessary HTMX fetches. The \"Loading...\" text from in-flight fetches remains visible.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 159-164).\n\nFix approach: (1) Change hx-trigger from \"revealed\" to a manual trigger fired by the Alpine @click handler (e.g. hx-trigger=\"load-detail\" and dispatch the event on click). This prevents morph-triggered fetches. (2) Use Alpine.store or id-based state preservation to maintain open/closed state across morphs.\n\nmemory_hint: search \"reconciliation detail HTMX\" for prior discussion.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-27T11:04:11.445Z",
+        "updatedAt": "2026-03-27T11:16:26.989Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/recon.html",
@@ -3494,7 +3494,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T11:16:26.845Z",
+      "lastModified": "2026-03-27T11:16:26.991Z",
       "taskCount": 188,
       "completedCount": 140,
       "tags": [
