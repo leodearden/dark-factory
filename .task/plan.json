@@ -1,0 +1,100 @@
+{
+  "task_id": "185",
+  "title": "Add HTMX polling jitter to prevent thundering herd",
+  "files": [
+    "dashboard/src/dashboard/templates/index.html",
+    "dashboard/src/dashboard/templates/base.html",
+    "dashboard/tests/test_app.py"
+  ],
+  "modules": [
+    "dashboard/src/dashboard/templates",
+    "dashboard/tests"
+  ],
+  "analysis": "All 5 dashboard sections in index.html poll at fixed intervals (10s, 10s, 15s, 30s, 60s) via hx-trigger='load, every Xs'. Multiple browser tabs or instances will synchronize their polls, creating a thundering herd effect on the backend. HTMX has no native jitter support, so the fix uses a JS-based approach: replace fixed 'every Xs' triggers with a custom 'poll' event, add 'data-poll-base' attributes declaring each section's base interval, and add a small script in base.html that listens to htmx:afterSettle and schedules the next poll with \u00b120% random jitter via setTimeout + htmx.trigger(). This is event-driven (not setInterval), so jitter accumulates naturally across cycles, preventing re-synchronization. Existing tests (TestMorphSwap, TestHtmxTimeout, TestAriaLivePollingsections, TestIndex) don't reference 'every Xs' patterns and will continue to pass unchanged.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write TestPollingJitter class in test_app.py: assert each of the 5 sections (orchestrators, performance, memory, memory-graphs, recon) has a data-poll-base attribute with the correct interval (10, 30, 10, 60, 15), and hx-trigger contains 'poll' instead of 'every'",
+      "status": "done",
+      "commit": "c0252ab"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Update index.html: change all 5 sections from hx-trigger='load, every Xs' to hx-trigger='load, poll' and add data-poll-base='X' attribute to each section element",
+      "status": "done",
+      "commit": "88dd9b1"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write TestPollingJitterScript class in test_app.py: assert the rendered HTML contains the jitter script with key markers \u2014 htmx:afterSettle listener, data-poll-base reference, htmx.trigger call, setTimeout usage, and Math.random for randomization",
+      "status": "done",
+      "commit": "5fdefc9"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Add jitter polling script to base.html (alongside existing error handler): IIFE that listens to htmx:afterSettle, reads data-poll-base from the settled element, computes a jittered delay (base \u00b1 20%), and uses setTimeout + htmx.trigger(el, 'poll') to schedule the next fetch",
+      "status": "done",
+      "commit": "a9d5f70"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write test_no_fixed_polling_intervals in TestPollingJitter: assert the rendered index page HTML contains zero occurrences of 'every ' followed by digits and 's' in any hx-trigger attribute \u2014 anti-regression guard against reintroducing fixed polling",
+      "status": "done",
+      "commit": "6b9aaa3"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Verify all tests pass (step-5 test should already pass given step-2 implementation). Run full dashboard test suite to confirm no regressions in existing TestMorphSwap, TestHtmxTimeout, TestAriaLivePollingsections, or TestIndex tests",
+      "status": "pending",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use event-driven polling (htmx:afterSettle \u2192 setTimeout \u2192 htmx.trigger) instead of setInterval with jitter",
+      "rationale": "Event-driven approach naturally prevents timer overlap \u2014 the next poll is only scheduled after the current response settles. setInterval would fire regardless of whether the previous request completed, and could pile up requests during slow responses."
+    },
+    {
+      "decision": "Use \u00b120% jitter ratio (JITTER_RATIO = 0.2)",
+      "rationale": "20% provides enough randomization to desynchronize multiple tabs (e.g., a 10s base yields 8-12s actual intervals) without making the polling feel unpredictable to users. This is a standard jitter ratio used in distributed systems."
+    },
+    {
+      "decision": "Use data-poll-base custom attribute instead of embedding intervals in JS",
+      "rationale": "Declarative approach keeps interval configuration in the template alongside other HTMX attributes. Adding a new polling section only requires HTML attributes, no JS changes. Also easily testable via HTML assertions."
+    },
+    {
+      "decision": "Place jitter script in base.html, not index.html",
+      "rationale": "Follows existing pattern \u2014 the HTMX error handler script is already in base.html. The jitter script is generic and would apply to any page with data-poll-base sections. Keeps index.html clean (template structure only)."
+    },
+    {
+      "decision": "Use custom 'poll' event in hx-trigger instead of re-implementing hx-trigger programmatically",
+      "rationale": "hx-trigger='load, poll' is clean HTMX \u2014 'load' handles initial fetch, 'poll' is triggered by our JS. No need to manipulate HTMX internals or use hx-trigger attributes dynamically."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Existing client fixture in conftest.py",
+      "where": "dashboard/tests/conftest.py",
+      "how": "All new tests use the client fixture to GET '/' and inspect rendered HTML, same pattern as TestMorphSwap, TestHtmxTimeout, etc."
+    },
+    {
+      "what": "Section-locating test pattern from TestHtmxTimeout",
+      "where": "dashboard/tests/test_app.py lines 366-385",
+      "how": "Use html.index('hx-get=\"/partials/...\"') to locate a section, then assert on attributes within a slice \u2014 same technique for checking data-poll-base values per section."
+    },
+    {
+      "what": "IIFE pattern from existing error handler script",
+      "where": "dashboard/src/dashboard/templates/base.html lines 26-37",
+      "how": "Wrap jitter script in an IIFE to avoid global scope pollution, add event listener to document.body, same pattern as error handler."
+    }
+  ],
+  "_session_id": "185-4c5189cc",
+  "_created_at": "2026-03-27T06:19:34.838341+00:00"
+}
