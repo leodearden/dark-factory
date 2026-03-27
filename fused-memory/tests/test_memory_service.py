@@ -816,3 +816,43 @@ class TestGetEntity:
                 service.get_entity('entity', project_id='test'),
                 timeout=2.0,
             )
+
+    # ------------------------------------------------------------------
+    # step-3(192): cancellation — search() failure cancels blocking search_nodes()
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_search_failure_cancels_blocking_sibling(self, service):
+        """When search() raises, a forever-blocking search_nodes() is cancelled promptly.
+
+        Mirror of test_search_nodes_failure_cancels_blocking_sibling — validates
+        that TaskGroup cancels in both directions, not just when the first task fails.
+
+        With asyncio.gather(return_exceptions=True) search_nodes() blocks forever,
+        causing wait_for to raise TimeoutError instead of the expected RuntimeError.
+
+        With asyncio.TaskGroup, search_nodes() is cancelled immediately and
+        RuntimeError propagates well within the 2.0s timeout.
+        """
+        import asyncio
+
+        # Event that is never set — simulates a connection that hangs indefinitely.
+        never_resolves = asyncio.Event()
+
+        async def blocking_search_nodes(*args, **kwargs):
+            # Will block until cancelled (asyncio.CancelledError raised here).
+            await never_resolves.wait()
+            return []  # pragma: no cover
+
+        service.graphiti.search_nodes = AsyncMock(side_effect=blocking_search_nodes)
+        service.graphiti.search = AsyncMock(
+            side_effect=RuntimeError('search failed')
+        )
+
+        # With gather(return_exceptions=True): search_nodes() blocks forever → TimeoutError.
+        # With TaskGroup: search_nodes() cancelled immediately → RuntimeError propagates fast.
+        with pytest.raises(RuntimeError, match='search failed'):
+            await asyncio.wait_for(
+                service.get_entity('entity', project_id='test'),
+                timeout=2.0,
+            )
