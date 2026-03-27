@@ -2222,7 +2222,17 @@
           "modules": [
             "fused-memory/src/fused_memory/reconciliation/prompts",
             "fused-memory/tests"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "BaseStage"
+            ],
+            "queries": [
+              "reconciliation prompt project_id stage prompts DRY extract constant",
+              "Stage 2 task-mutation tools project_id guideline incomplete tool list",
+              "reconciliation context block label base.py injection project_id phrasing"
+            ]
+          }
         }
       },
       {
