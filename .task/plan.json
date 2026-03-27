@@ -46,8 +46,8 @@
       "id": "step-5",
       "type": "test",
       "description": "Run full test suite (test_enum_models.py + test_stages.py + test_journal.py) to verify no regressions. Existing tests that create Watermark(project_id='   ') still pass because the validator normalizes to '' which triggers the same code path.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "bb9281d"
     }
   ],
   "design_decisions": [
