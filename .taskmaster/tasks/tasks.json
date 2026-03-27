@@ -3371,7 +3371,16 @@
           "modules": [
             "dashboard/src/dashboard/app.py",
             "dashboard/tests/test_recon_panel.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "partition_burst_state burst state dashboard robustness KeyError missing keys",
+              "dashboard stability concerns burst state agent dict",
+              "dashboard code quality stability fixes"
+            ]
+          },
+          "_causation_id": "0a2dc790-e788-44ff-bece-7e734501facb"
         }
       },
       {
