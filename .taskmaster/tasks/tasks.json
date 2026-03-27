@@ -2209,7 +2209,21 @@
         ],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-27T11:11:29.873Z"
+        "updatedAt": "2026-03-27T11:11:29.873Z",
+        "metadata": {
+          "files": [
+            "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py",
+            "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py",
+            "fused-memory/src/fused_memory/reconciliation/prompts/stage3.py",
+            "fused-memory/src/fused_memory/reconciliation/prompts/_shared.py",
+            "fused-memory/src/fused_memory/reconciliation/prompts/__init__.py",
+            "fused-memory/tests/test_stages.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation/prompts",
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 135,
