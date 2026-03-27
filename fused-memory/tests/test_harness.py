@@ -843,69 +843,59 @@ async def test_sonnet_tier_selection_sets_consolidator_limits(journal, event_buf
     memory_limit=250, and that run_full_cycle() propagates those limits to the
     MemoryConsolidator stage before calling stage.run().
     """
-    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
-    from fused_memory.reconciliation.harness import ReconciliationHarness, TierConfig
+    from fused_memory.reconciliation.harness import TierConfig
     from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-    config = FusedMemoryConfig(
-        reconciliation=ReconciliationConfig(
-            enabled=True,
-            explore_codebase_root='/tmp/test',
-            agent_llm_provider='anthropic',
-            agent_llm_model='claude-sonnet-4-20250514',
-        )
-    )
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
 
-    harness = ReconciliationHarness(
-        memory_service=mock_memory_service,
-        taskmaster=AsyncMock(),
-        journal=journal,
-        event_buffer=event_buffer,
-        config=config,
-    )
-
-    # Push events before mocking, so drain() has real events to return
+    # Push events so drain() returns real events for stage processing.
+    # The pushed count (2) deliberately differs from the mocked stats (size=0):
+    # drain() reads the buffer directly, while _select_tier() calls get_buffer_stats().
+    # Mocking stats to size=0 forces sonnet tier selection (opus requires count > 15),
+    # independent of how many events are actually in the buffer.
     await event_buffer.push(_make_event())
     await event_buffer.push(_make_event())
-
-    # Mock buffer stats to return size=0, ensuring sonnet tier
-    # (opus requires count > buffer_size_threshold * opus_threshold_ratio = 10 * 1.5 = 15)
     event_buffer.get_buffer_stats = AsyncMock(return_value={'size': 0})
 
     # Part 1: verify _select_tier() returns correct sonnet TierConfig
     tier = await harness._select_tier('test-project')
+    assert isinstance(tier, TierConfig)
     assert tier.model == 'sonnet', f"Expected model='sonnet', got '{tier.model}'"
     assert tier.episode_limit == 125, f"Expected episode_limit=125, got {tier.episode_limit}"
     assert tier.memory_limit == 250, f"Expected memory_limit=250, got {tier.memory_limit}"
-    assert isinstance(tier, TierConfig)
 
     # Part 2: mock stage.run() to capture MemoryConsolidator limits at call time
     captured_consolidator_limits: dict = {}
 
     for stage in harness.stages:
-        original_stage = stage
+        if isinstance(stage, MemoryConsolidator):
+            _consolidator = stage
 
-        async def mock_run(events, watermark, prior_reports, run_id, model=None, _s=original_stage):
-            if isinstance(_s, MemoryConsolidator):
+            async def _consolidator_mock_run(
+                events, watermark, prior_reports, run_id, model=None, _s=_consolidator
+            ):
                 captured_consolidator_limits['episode_limit'] = _s.episode_limit
                 captured_consolidator_limits['memory_limit'] = _s.memory_limit
-            return StageReport(
-                stage=_s.stage_id,
-                started_at=datetime.now(UTC),
-                completed_at=datetime.now(UTC),
-                items_flagged=[],
-                stats={},
-                llm_calls=0,
-                tokens_used=0,
-            )
+                return StageReport(
+                    stage=_s.stage_id,
+                    started_at=datetime.now(UTC),
+                    completed_at=datetime.now(UTC),
+                    items_flagged=[],
+                    stats={},
+                    llm_calls=0,
+                    tokens_used=0,
+                )
 
-        stage.run = mock_run
+            stage.run = _consolidator_mock_run
+        else:
+            _mock_stage_run(stage)
 
     # Part 3: run full cycle with the sonnet tier
     run = await harness.run_full_cycle('test-project', 'buffer_size:2', tier=tier)
     assert run.status == 'completed'
 
     # Part 4: assert MemoryConsolidator received sonnet limits
+    assert captured_consolidator_limits, 'No MemoryConsolidator stage found — guard failed'
     assert captured_consolidator_limits.get('episode_limit') == 125, (
         f"Expected MemoryConsolidator.episode_limit=125 (sonnet tier), "
         f"got {captured_consolidator_limits.get('episode_limit')}. "
