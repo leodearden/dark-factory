@@ -13,7 +13,7 @@
     "fused-memory/src/fused_memory/config",
     "fused-memory/tests"
   ],
-  "analysis": "## Root Cause\n\nGraphiti's `resolve_extracted_edges()` in `graphiti_core/utils/maintenance/edge_operations.py` (lines 298-309) gathers invalidation candidates via a **broad semantic search** with an empty `SearchFilters()` — no entity-node filtering. When an episode about Task 481 is written, edge extraction produces facts like 'Task 481 has status in-progress'. The semantic search retrieves ALL similar edges including 'Task 208 has status in-progress' because they share 'task status' semantics.\n\nThe `related_edges` (duplicate candidates) ARE properly scoped via `EntityEdge.get_between_nodes()` — they only include edges between the same source/target entity nodes. But the `edge_invalidation_candidates` use EDGE_HYBRID_SEARCH_RRF with no entity filtering.\n\nThese unfiltered candidates go to the LLM via `dedupe_edges.resolve_edge()` which only sees fact text (no entity information). The small model (gpt-4o-mini) may judge 'Task 481 is in-progress' and 'Task 208 is in-progress' as contradictory, then `resolve_edge_contradictions()` temporally invalidates the older edge.\n\n## Solution: Post-Write Invalidation Guard\n\nSince `graphiti_core` is a third-party library, we cannot modify the invalidation candidate search directly. Instead, we add a **post-write validation layer** in fused-memory that detects and reverses spurious invalidations.\n\nThe guard inspects `AddEpisodeResults` after each `add_episode()` call:\n- `results.nodes` = entity nodes extracted from the episode\n- `results.edges` = `resolved_edges + invalidated_edges`\n- Invalidated edges have `expired_at` set to ~now\n- For each invalidated edge, check if its source/target entity UUIDs overlap with the episode's entity UUIDs\n- If NO overlap → spurious invalidation → restore by clearing `invalid_at`/`expired_at` via Cypher\n\n## Key Insight\n\nNew edges (resolved from episode extraction) always connect entities in `results.nodes`. Invalidated edges may connect entities NOT in `results.nodes`. If an invalidated edge shares NO entity endpoint with the episode's entities, the invalidation was driven purely by surface-level semantic similarity, not by actual factual contradiction about the same entities.\n\n## Review Fix: Guard Boundary Robustness (steps 23-26)\n\nTwo blocking issues identified in review:\n1. Guard exceptions propagate to caller after episode is already committed, risking duplicate retries.\n2. Guard runs without timeout — `bulk_restore_edge_validity()` graph queries can hang indefinitely.\n\nFix: wrap guard invocation in try/except (non-fatal logging) and asyncio.wait_for (configurable timeout). The guard is best-effort post-write correction; its failures must never poison a successful write.",
+  "analysis": "## Root Cause\n\nGraphiti's `resolve_extracted_edges()` in `graphiti_core/utils/maintenance/edge_operations.py` (lines 298-309) gathers invalidation candidates via a **broad semantic search** with an empty `SearchFilters()` — no entity-node filtering. When an episode about Task 481 is written, edge extraction produces facts like 'Task 481 has status in-progress'. The semantic search retrieves ALL similar edges including 'Task 208 has status in-progress' because they share 'task status' semantics.\n\nThe `related_edges` (duplicate candidates) ARE properly scoped via `EntityEdge.get_between_nodes()` — they only include edges between the same source/target entity nodes. But the `edge_invalidation_candidates` use EDGE_HYBRID_SEARCH_RRF with no entity filtering.\n\nThese unfiltered candidates go to the LLM via `dedupe_edges.resolve_edge()` which only sees fact text (no entity information). The small model (gpt-4o-mini) may judge 'Task 481 is in-progress' and 'Task 208 is in-progress' as contradictory, then `resolve_edge_contradictions()` temporally invalidates the older edge.\n\n## Solution: Post-Write Invalidation Guard\n\nSince `graphiti_core` is a third-party library, we cannot modify the invalidation candidate search directly. Instead, we add a **post-write validation layer** in fused-memory that detects and reverses spurious invalidations.\n\nThe guard inspects `AddEpisodeResults` after each `add_episode()` call:\n- `results.nodes` = entity nodes extracted from the episode\n- `results.edges` = `resolved_edges + invalidated_edges`\n- Invalidated edges have `expired_at` set to ~now\n- For each invalidated edge, check if its source/target entity UUIDs overlap with the episode's entity UUIDs\n- If NO overlap → spurious invalidation → restore by clearing `invalid_at`/`expired_at` via Cypher\n\n## Key Insight\n\nNew edges (resolved from episode extraction) always connect entities in `results.nodes`. Invalidated edges may connect entities NOT in `results.nodes`. If an invalidated edge shares NO entity endpoint with the episode's entities, the invalidation was driven purely by surface-level semantic similarity, not by actual factual contradiction about the same entities.\n\n## Review Fix: Guard Boundary Robustness (steps 23-26)\n\nTwo blocking issues identified in review:\n1. Guard exceptions propagate to caller after episode is already committed, risking duplicate retries.\n2. Guard runs without timeout — `bulk_restore_edge_validity()` graph queries can hang indefinitely.\n\nFix: wrap guard invocation in try/except (non-fatal logging) and asyncio.wait_for (configurable timeout). The guard is best-effort post-write correction; its failures must never poison a successful write.\n\n## Review Fix: Trivially-true test assertions (steps 27-28)\n\nThree tests — `test_guard_runtime_error_is_caught_and_result_returned`, `test_guard_exception_does_not_affect_return_value`, `test_guard_timeout_error_is_caught_and_result_returned` — assert `result is fake_result` without yielding to the event loop. Because the guard runs as a detached background task via `asyncio.ensure_future()`, `add_episode()` returns before the guard task executes at all. The `result is fake_result` assertion passes trivially regardless of whether exception handling exists. These tests would pass even if the `try/except` in `_run_guard()` were deleted.\n\nFix: add `await asyncio.sleep(0)` to yield to the background task, patch the logger, and assert the guard actually ran and caught the exception (via `mock_logger.error.called`). This converts them from trivially-true to genuinely exercising the non-fatal exception path.",
   "prerequisites": [
     {
       "id": "pre-1",
@@ -219,6 +219,20 @@
       "description": "Wrap guard.guard(result) in asyncio.wait_for(guard.guard(result), timeout=self._guard_timeout) inside the existing try/except. Read _guard_timeout from config.graphiti.invalidation_guard_timeout_seconds in __init__. The TimeoutError is already caught by the Exception handler from step-24.",
       "status": "done",
       "commit": "475b499"
+    },
+    {
+      "id": "step-27",
+      "type": "test",
+      "description": "Fix three trivially-true test methods that assert `result is fake_result` without yielding to the event loop. Because the guard runs as a detached background task (`asyncio.ensure_future`), the assertion passes trivially — the guard never executes. Fix each test: (1) `test_guard_runtime_error_is_caught_and_result_returned` — wrap in `patch('fused_memory.backends.graphiti_client.logger')`, add `await asyncio.sleep(0)` after `add_episode()`, assert `mock_logger.error.called` and 'non-fatal' in the error message, in addition to `result is fake_result`. (2) `test_guard_exception_does_not_affect_return_value` — same pattern: patch logger, yield, assert `mock_logger.error.called` with 'non-fatal'. (3) `test_guard_timeout_error_is_caught_and_result_returned` — same pattern: patch logger, yield, assert `mock_logger.error.called` with 'non-fatal'. Without these changes, the tests provide zero coverage of the non-fatal exception path they claim to verify.",
+      "status": "done",
+      "commit": "PENDING"
+    },
+    {
+      "id": "step-28",
+      "type": "impl",
+      "description": "Verify all three fixed tests pass with the existing production code. No production code changes needed — the try/except in `_run_guard()` already handles these exceptions correctly. The fix is purely test-side: the tests now actually exercise the background task exception path instead of passing trivially before the guard runs.",
+      "status": "done",
+      "commit": "PENDING"
     }
   ],
   "design_decisions": [
@@ -253,6 +267,10 @@
     {
       "decision": "Separate guard timeout (30s) rather than reusing _write_timeout (120s)",
       "rationale": "The guard issues at most two graph queries (count + restore) — much lighter than a full add_episode() which involves LLM calls, embedding, and graph mutations. 30s matches backend_read_timeout_seconds which covers similar graph-query workloads. A 120s hang from the guard would be unacceptable for a best-effort correction. The timeout is configurable via invalidation_guard_timeout_seconds for tuning."
+    },
+    {
+      "decision": "Fix trivially-true tests by adding yields and logger assertions rather than consolidating into companion tests",
+      "rationale": "The three tests have distinct exception types (RuntimeError, AttributeError, TimeoutError) and verify both the return-value contract AND the logging contract in a single test. Consolidating them into the existing logging-only companion tests would lose the explicit return-value assertion per exception type. Instead, we enrich each test with the missing yield and logger check, making them self-contained and truly exercising the code path they claim to cover."
     }
   ],
   "reuse": [
@@ -290,8 +308,13 @@
       "what": "backend_read_timeout_seconds as precedent for guard timeout default",
       "where": "fused-memory/src/fused_memory/config/schema.py line 169",
       "how": "Guard timeout default (30.0s) matches backend_read_timeout because the guard's graph queries are read-class operations, not write-class."
+    },
+    {
+      "what": "Existing correct test pattern from test_guard_cancelled_error_is_caught_and_does_not_propagate",
+      "where": "fused-memory/tests/test_invalidation_guard.py lines 782-808",
+      "how": "This companion test already correctly yields to the event loop and asserts logger.warning.called. Apply the same pattern (patch logger, await asyncio.sleep(0), assert logger call) to the three trivially-true tests."
     }
   ],
   "_session_id": "189-c2427221",
-  "_created_at": "2026-03-27T04:29:02.784215+00:00"
+  "_created_at": "2026-03-27T04:50:31.455430+00:00"
 }

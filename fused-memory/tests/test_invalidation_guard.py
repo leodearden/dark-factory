@@ -654,10 +654,17 @@ class TestGuardExceptionHandling:
             )
             MockGuardClass.return_value = mock_guard_instance
 
-            result = await backend.add_episode(name='ep', content='content')
+            with patch('fused_memory.backends.graphiti_client.logger') as mock_logger:
+                result = await backend.add_episode(name='ep', content='content')
+                # yield to let the detached background guard task run and catch the exception
+                await asyncio.sleep(0)
 
-            # Episode was committed — result must be returned despite guard failure
-            assert result is fake_result
+                # Episode was committed — result must be returned despite guard failure
+                assert result is fake_result
+                # Guard actually ran and caught the exception non-fatally
+                assert mock_logger.error.called
+                error_msg = mock_logger.error.call_args[0][0]
+                assert 'non-fatal' in error_msg.lower()
 
     @pytest.mark.asyncio
     async def test_guard_runtime_error_logs_nonfatal_error(self, mock_config):
@@ -704,8 +711,16 @@ class TestGuardExceptionHandling:
             )
             MockGuardClass.return_value = mock_guard_instance
 
-            result = await backend.add_episode(name='ep', content='content')
-            assert result is fake_result
+            with patch('fused_memory.backends.graphiti_client.logger') as mock_logger:
+                result = await backend.add_episode(name='ep', content='content')
+                # yield to let the detached background guard task run and catch the exception
+                await asyncio.sleep(0)
+
+                assert result is fake_result
+                # Guard actually ran and caught the exception non-fatally
+                assert mock_logger.error.called
+                error_msg = mock_logger.error.call_args[0][0]
+                assert 'non-fatal' in error_msg.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -734,8 +749,16 @@ class TestGuardTimeout:
             )
             MockGuardClass.return_value = mock_guard_instance
 
-            result = await backend.add_episode(name='ep', content='content')
-            assert result is fake_result
+            with patch('fused_memory.backends.graphiti_client.logger') as mock_logger:
+                result = await backend.add_episode(name='ep', content='content')
+                # yield to let the detached background guard task run and catch the exception
+                await asyncio.sleep(0)
+
+                assert result is fake_result
+                # Guard actually ran and caught the exception non-fatally
+                assert mock_logger.error.called
+                error_msg = mock_logger.error.call_args[0][0]
+                assert 'non-fatal' in error_msg.lower()
 
     @pytest.mark.asyncio
     async def test_guard_invoked_via_wait_for_with_guard_timeout(self, mock_config):
