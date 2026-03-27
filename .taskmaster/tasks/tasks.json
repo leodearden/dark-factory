@@ -3528,10 +3528,11 @@
         "description": "Replace the local `_validate_project_id` and `_validate_project_root` in `fused-memory/src/fused_memory/server/tools.py` with imports of the canonical `validate_project_id` and `validate_project_root` from `fused_memory.utils.validation`.\n\nCurrently tools.py has a weaker `_validate_project_id` (only checks emptiness, not charset) and a duplicate `_validate_project_root`. The canonical validators in validation.py enforce the full `[a-zA-Z0-9_-]+` charset for project_id and the same absolute-path check for project_root.\n\nThis is defense-in-depth: bad project_id values (newlines, backticks, spaces) should be rejected at the MCP API boundary, not only deep inside BaseStage.run().\n\nAlso add test coverage for `validate_project_root` in test_validation.py (currently only `validate_project_id` is tested there).\n\nmemory_hint: search \"prompt injection fix routing layer\" and \"project_root validation helper extracted from tools.py\" for prior context.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-27T11:38:48.274Z"
       },
       {
         "id": "212",
@@ -3547,7 +3548,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T11:38:47.921Z",
+      "lastModified": "2026-03-27T11:38:48.274Z",
       "taskCount": 191,
       "completedCount": 145,
       "tags": [
