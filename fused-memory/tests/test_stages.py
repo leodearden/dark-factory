@@ -408,17 +408,6 @@ class TestProjectIdValidation:
             report={'summary': 'ok'},
         )
 
-    @pytest.fixture
-    def mock_deps(self):
-        from fused_memory.config.schema import ReconciliationConfig
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-        }
-
     def _patch_stage(self, stage, cli_side_effect=None):
         """Return a context manager that patches assemble_payload and run_stage_via_cli.
 
@@ -446,11 +435,11 @@ class TestProjectIdValidation:
         return _ctx()
 
     @pytest.mark.asyncio
-    async def test_run_raises_on_empty_project_id(self, mock_deps):
+    async def test_run_raises_on_empty_project_id(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = ''
 
         with self._patch_stage(stage), pytest.raises(ValueError, match='project_id'):
@@ -462,11 +451,11 @@ class TestProjectIdValidation:
             )
 
     @pytest.mark.asyncio
-    async def test_run_raises_on_whitespace_project_id(self, mock_deps):
+    async def test_run_raises_on_whitespace_project_id(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = '   '
 
         with self._patch_stage(stage), pytest.raises(ValueError, match='project_id'):
@@ -478,11 +467,11 @@ class TestProjectIdValidation:
             )
 
     @pytest.mark.asyncio
-    async def test_run_raises_on_watermark_project_id_mismatch(self, mock_deps):
+    async def test_run_raises_on_watermark_project_id_mismatch(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'project_a'
 
         with self._patch_stage(stage), pytest.raises(ValueError) as exc_info:
@@ -497,11 +486,11 @@ class TestProjectIdValidation:
         assert 'project_b' in error_msg
 
     @pytest.mark.asyncio
-    async def test_run_allows_matching_watermark_project_id(self, mock_deps):
+    async def test_run_allows_matching_watermark_project_id(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
         with self._patch_stage(stage):
@@ -520,11 +509,11 @@ class TestProjectIdValidation:
         assert result.started_at <= result.completed_at
 
     @pytest.mark.asyncio
-    async def test_run_allows_empty_watermark_project_id(self, mock_deps):
+    async def test_run_allows_empty_watermark_project_id(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
         with self._patch_stage(stage):
@@ -543,12 +532,12 @@ class TestProjectIdValidation:
         assert result.started_at <= result.completed_at
 
     @pytest.mark.asyncio
-    async def test_recon_context_includes_project_id(self, mock_deps):
+    async def test_recon_context_includes_project_id(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.cli_stage_runner import StageResult
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
         captured_kwargs = {}
@@ -568,11 +557,11 @@ class TestProjectIdValidation:
         assert 'project_id: dark_factory\n' in payload
 
     @pytest.mark.asyncio
-    async def test_run_allows_whitespace_watermark_project_id(self, mock_deps):
+    async def test_run_allows_whitespace_watermark_project_id(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
         with self._patch_stage(stage):
@@ -586,13 +575,13 @@ class TestProjectIdValidation:
         assert result.stage == StageId.memory_consolidator
 
     @pytest.mark.asyncio
-    async def test_run_logs_warning_when_watermark_project_id_falsy(self, mock_deps, caplog):
+    async def test_run_logs_warning_when_watermark_project_id_falsy(self, stage_mock_deps, caplog):
         import logging
 
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
         with self._patch_stage(stage), caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.stages.base'):
@@ -605,13 +594,13 @@ class TestProjectIdValidation:
         assert any('no project_id' in msg.lower() or 'skipping' in msg.lower() for msg in caplog.messages)
 
     @pytest.mark.asyncio
-    async def test_run_logs_warning_when_watermark_project_id_whitespace(self, mock_deps, caplog):
+    async def test_run_logs_warning_when_watermark_project_id_whitespace(self, stage_mock_deps, caplog):
         import logging
 
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'dark_factory'
 
         with self._patch_stage(stage), caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.stages.base'):
@@ -624,12 +613,12 @@ class TestProjectIdValidation:
         assert any('no project_id' in msg.lower() or 'skipping' in msg.lower() for msg in caplog.messages)
 
     @pytest.mark.asyncio
-    async def test_run_raises_on_special_chars_project_id(self, mock_deps):
+    async def test_run_raises_on_special_chars_project_id(self, stage_mock_deps):
         """stage.run() raises ValueError when project_id contains special characters."""
         from fused_memory.models.reconciliation import StageId, Watermark
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
         stage.project_id = 'bad\nproject'
 
         with self._patch_stage(stage), pytest.raises(ValueError, match='project_id'):
