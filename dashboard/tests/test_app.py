@@ -846,6 +846,70 @@ class TestMainModule:
             )
 
 
+class TestPollingJitter:
+    """Tests that all 5 polling sections use jitter-based polling via data-poll-base."""
+
+    def test_orchestrators_has_poll_base_10(self, client):
+        html = client.get('/').text
+        idx = html.index('hx-get="/partials/orchestrators"')
+        section_html = html[idx - 200:idx + 500]
+        assert 'data-poll-base="10"' in section_html
+
+    def test_performance_has_poll_base_30(self, client):
+        html = client.get('/').text
+        idx = html.index('hx-get="/partials/performance"')
+        section_html = html[idx - 200:idx + 500]
+        assert 'data-poll-base="30"' in section_html
+
+    def test_memory_has_poll_base_10(self, client):
+        html = client.get('/').text
+        idx = html.index('hx-get="/partials/memory"')
+        section_html = html[idx - 200:idx + 500]
+        assert 'data-poll-base="10"' in section_html
+
+    def test_memory_graphs_has_poll_base_60(self, client):
+        html = client.get('/').text
+        idx = html.index('hx-get="/partials/memory-graphs"')
+        section_html = html[idx - 200:idx + 500]
+        assert 'data-poll-base="60"' in section_html
+
+    def test_recon_has_poll_base_15(self, client):
+        html = client.get('/').text
+        idx = html.index('hx-get="/partials/recon"')
+        section_html = html[idx - 200:idx + 500]
+        assert 'data-poll-base="15"' in section_html
+
+    def test_orchestrators_trigger_contains_poll(self, client):
+        html = client.get('/').text
+        idx = html.index('hx-get="/partials/orchestrators"')
+        section_html = html[idx - 200:idx + 500]
+        assert 'hx-trigger="load, poll"' in section_html
+
+    def test_performance_trigger_contains_poll(self, client):
+        html = client.get('/').text
+        idx = html.index('hx-get="/partials/performance"')
+        section_html = html[idx - 200:idx + 500]
+        assert 'hx-trigger="load, poll"' in section_html
+
+    def test_memory_trigger_contains_poll(self, client):
+        html = client.get('/').text
+        idx = html.index('hx-get="/partials/memory"')
+        section_html = html[idx - 200:idx + 500]
+        assert 'hx-trigger="load, poll"' in section_html
+
+    def test_memory_graphs_trigger_contains_poll(self, client):
+        html = client.get('/').text
+        idx = html.index('hx-get="/partials/memory-graphs"')
+        section_html = html[idx - 200:idx + 500]
+        assert 'hx-trigger="load, poll"' in section_html
+
+    def test_recon_trigger_contains_poll(self, client):
+        html = client.get('/').text
+        idx = html.index('hx-get="/partials/recon"')
+        section_html = html[idx - 200:idx + 500]
+        assert 'hx-trigger="load, poll"' in section_html
+
+
 class TestAriaLivePollingsections:
     """Tests that all five auto-polling sections have aria-live='polite'."""
 
