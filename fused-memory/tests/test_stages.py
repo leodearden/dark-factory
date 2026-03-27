@@ -577,7 +577,8 @@ class TestProjectIdValidation:
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
-    def test_default_limits(self):
+    def test_tier_limits_with_default_class_values(self):
+        """MemoryConsolidator class defaults (500/1000) match opus tier, not ReconciliationConfig sonnet defaults (125/250)."""
         from fused_memory.models.reconciliation import StageId
         config = ReconciliationConfig()
         stage = MemoryConsolidator(
@@ -587,7 +588,8 @@ class TestTierConfig:
         assert stage.episode_limit == 500
         assert stage.memory_limit == 1000
 
-    def test_sonnet_tier_limits(self):
+    def test_limits_are_mutable(self):
+        """episode_limit and memory_limit are mutable — the harness sets them from TierConfig before each run."""
         from fused_memory.models.reconciliation import StageId
         config = ReconciliationConfig()
         stage = MemoryConsolidator(
