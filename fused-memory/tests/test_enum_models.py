@@ -417,3 +417,42 @@ class TestVerificationResultCoercion:
     def test_invalid_verdict_raises(self):
         with pytest.raises(ValidationError):
             self._make_result(verdict='maybe')
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Watermark.project_id field_validator (tests written before impl)
+# ---------------------------------------------------------------------------
+
+
+class TestWatermarkProjectIdValidator:
+    """Watermark.project_id is stripped and whitespace-only becomes '' sentinel."""
+
+    def _make_watermark(self, project_id: str):
+        from fused_memory.models.reconciliation import Watermark
+
+        return Watermark(project_id=project_id)
+
+    def test_valid_project_id_passes_through_unchanged(self):
+        """A normal project_id with no surrounding whitespace is left as-is."""
+        wm = self._make_watermark('dark_factory')
+        assert wm.project_id == 'dark_factory'
+
+    def test_whitespace_only_normalizes_to_empty_string(self):
+        """Whitespace-only project_id is the bootstrap sentinel — normalizes to ''."""
+        wm = self._make_watermark('   ')
+        assert wm.project_id == ''
+
+    def test_leading_trailing_whitespace_is_stripped(self):
+        """Leading/trailing whitespace is stripped from project_id."""
+        wm = self._make_watermark('  dark_factory  ')
+        assert wm.project_id == 'dark_factory'
+
+    def test_empty_string_passes_through_as_valid_sentinel(self):
+        """Empty string is the valid 'no project' bootstrap sentinel."""
+        wm = self._make_watermark('')
+        assert wm.project_id == ''
+
+    def test_tabs_and_newlines_normalize_to_empty(self):
+        """Tab/newline-only project_id normalizes to empty string sentinel."""
+        wm = self._make_watermark('\t\n')
+        assert wm.project_id == ''
