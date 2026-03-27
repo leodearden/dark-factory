@@ -2899,11 +2899,11 @@
         "description": "Event buffer shows \"Oldest: 1045m 36s\" which is unreadable. Should display as \"17h 25m\" for values over 60 minutes. Use the existing timeago filter or add a duration formatter.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (line 16). The template computes age // 60 for minutes and age % 60 for seconds. For large values, convert to hours+minutes instead. Could reuse the format_duration_ms Jinja filter from app.py (adapted for seconds input).",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-27T11:25:44.046Z",
+        "updatedAt": "2026-03-27T11:38:23.177Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/recon.html",
@@ -2941,7 +2941,13 @@
           "modules": [
             "dashboard/src/dashboard/templates",
             "dashboard/src/dashboard/data"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Show project names instead of raw filesystem paths in watermarks section"
+            ]
+          }
         }
       },
       {
@@ -3541,9 +3547,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-27T11:35:32.143Z",
+      "lastModified": "2026-03-27T11:38:23.177Z",
       "taskCount": 191,
-      "completedCount": 144,
+      "completedCount": 145,
       "tags": [
         "master"
       ]
