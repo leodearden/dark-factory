@@ -134,7 +134,7 @@ def partition_burst_state(
     active: list[dict] = []
     idle: list[dict] = []
     for agent in burst_state:
-        if agent['state'] != 'idle':
+        if agent.get('state', 'idle') != 'idle':
             active.append(agent)
             continue
         # Idle agents with recent writes are still "active" for display
@@ -145,7 +145,7 @@ def partition_burst_state(
             if (now - last_write).total_seconds() < active_threshold_seconds:
                 active.append(agent)
                 continue
-        except (ValueError, TypeError):
+        except (KeyError, ValueError, TypeError):
             pass
         idle.append(agent)
     return active, idle
