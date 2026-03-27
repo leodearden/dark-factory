@@ -119,7 +119,7 @@ class TestModuleLevelHelpers:
 
     def test_patch_stage_accepts_cli_side_effect(self, stage_mock_deps):
         from fused_memory.models.reconciliation import StageId
-        from unittest.mock import patch as mock_patch
+
         stage = MemoryConsolidator(StageId.memory_consolidator, **stage_mock_deps)
 
         async def custom_cli(**kwargs):
