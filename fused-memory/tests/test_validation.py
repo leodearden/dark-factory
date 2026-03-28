@@ -3,6 +3,7 @@
 import pytest
 
 from fused_memory.utils.validation import (
+    require_project_id,
     require_project_root,
     validate_project_id,
     validate_project_root,
@@ -153,6 +154,29 @@ class TestRequireProjectRoot:
         assert err_dict is not None
         with pytest.raises(ValueError) as exc_info:
             require_project_root(invalid)
+        assert str(exc_info.value) == err_dict['error']
+
+
+class TestRequireProjectId:
+    """require_project_id raises ValueError for invalid ids, returns None for valid ones."""
+
+    def test_valid_id_raises_nothing(self):
+        require_project_id('dark_factory')  # must not raise
+
+    def test_empty_string_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            require_project_id('')
+
+    def test_whitespace_only_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            require_project_id('   ')
+
+    def test_error_message_matches_validate_error_field(self):
+        invalid = ''
+        err_dict = validate_project_id(invalid)
+        assert err_dict is not None
+        with pytest.raises(ValueError) as exc_info:
+            require_project_id(invalid)
         assert str(exc_info.value) == err_dict['error']
 
 
