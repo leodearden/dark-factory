@@ -4317,10 +4317,11 @@
         "description": "Neither TestPerformancePartialIntegration nor TestMemoryGraphsPartialIntegration tests what happens when a backend async data function raises an exception. The route handlers use `asyncio.gather()` for these calls — unhandled exceptions would result in a 500 response, but this failure mode is completely untested.\n\nGiven the project's stability focus, it's important to verify the contract: does a broken DB connection result in a 500, graceful degradation, or a swallowed error?\n\nSteps:\n1. Add a test per class that patches one backend function to raise (e.g. `side_effect=RuntimeError('db unavailable')`) and asserts the endpoint returns a 500 status code (or a graceful error message, depending on actual behavior).\n2. Optionally consider whether the route handlers should catch exceptions from gather and render a degraded view instead of 500.\n\nmemory_hints: search \"dashboard error handling pattern\", review dashboard/src/dashboard/app.py route handlers for /partials/performance and /partials/memory-graphs",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T05:12:39.575Z"
       },
       {
         "id": "262",
@@ -4336,7 +4337,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T05:12:37.926Z",
+      "lastModified": "2026-03-28T05:12:39.576Z",
       "taskCount": 241,
       "completedCount": 189,
       "tags": [
