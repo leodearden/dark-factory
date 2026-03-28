@@ -3669,7 +3669,7 @@
         "description": "Follow-up from task 211 review. Four items:\n\n1. **Migrate targeted.py inline validators** (review suggestion #4): Replace the two inline `if not project_root or not os.path.isabs(project_root): raise ValueError(...)` blocks at targeted.py:86 and :355 with `require_project_root(project_root)` from `fused_memory.utils.validation`. These are the last two inline duplicates.\n\n2. **Add require_project_root tests** (review suggestion #6): `require_project_root` is a public API with zero tests. Add TestRequireProjectRoot with: valid path raises nothing, invalid path raises ValueError, ValueError message matches validate_project_root's error field.\n\n3. **Add whitespace-only tests for validate_project_root** (review suggestion #5): Add test_rejects_whitespace_only and test_rejects_tab_only to TestValidateProjectRoot, mirroring TestValidateProjectId coverage.\n\n4. **Rename TestReturnContractCompatibility** (review suggestion #2): Rename to TestValidatorErrorDictShape — the current name implies backward compat with old inline validators but actually tests the shared error dict shape.\n\nmemory_hint: search \"require_project_root extracted from tools.py\" and \"validation.py consolidation task 211\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -3683,7 +3683,8 @@
             "fused-memory/src/fused_memory/reconciliation",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-28T04:33:57.075Z"
       },
       {
         "id": "215",
@@ -4119,7 +4120,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:33:56.707Z",
+      "lastModified": "2026-03-28T04:33:57.075Z",
       "taskCount": 225,
       "completedCount": 176,
       "tags": [
