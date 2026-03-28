@@ -4480,6 +4480,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 273,
+        "title": "Improve exception-safety meta-test robustness in test_stages.py",
+        "description": "In `fused-memory/tests/test_stages.py`, `test_patch_stage_restores_on_exception` (line ~625) has two robustness gaps:\n\n1. **No exception propagation assertion**: The test uses `try/except RuntimeError: pass` but never verifies the exception actually propagated. If a future regression caused `_patch_stage` to swallow exceptions, the test would still pass (false green). Fix: use `pytest.raises(RuntimeError, match='boom')` as the outer context manager, OR add `else: pytest.fail('RuntimeError should have propagated')`.\n\n2. **Postconditions skip on unexpected exceptions**: If `_patch_stage.__exit__` raises a different exception type during teardown, the `except RuntimeError` won't catch it and postcondition assertions are skipped entirely. Fix: move postcondition assertions into a `finally` block so they always run regardless of exception type.\n\nRecommended fix:\n```python\ndef test_patch_stage_restores_on_exception(self, mock_deps):\n    stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)\n    original_run_stage_via_cli = base_module.run_stage_via_cli\n    original_assemble_payload = stage.assemble_payload\n\n    with pytest.raises(RuntimeError, match='boom'):\n        with self._patch_stage(stage):\n            raise RuntimeError('boom')\n\n    # Postconditions always checked after pytest.raises succeeds\n    assert base_module.run_stage_via_cli is original_run_stage_via_cli\n    assert not isinstance(stage.assemble_payload, _MOCK_TYPES)\n    assert stage.assemble_payload == original_assemble_payload\n```\n\nmemory_hints:\n- search: \"context manager test postcondition restoration exception safety\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -4492,7 +4503,7 @@
       ],
       "created": "2026-03-28T05:41:38.118Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T05:41:38.121Z"
+      "updated": "2026-03-28T05:41:46.228Z"
     }
   }
 }
