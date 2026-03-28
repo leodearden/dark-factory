@@ -1,5 +1,6 @@
 """Tests for dashboard scaffold: config, app, and fixtures."""
 
+import re
 from pathlib import Path
 
 from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
@@ -143,6 +144,21 @@ class TestMakefile:
     def test_makefile_has_checksum_verification(self):
         content = (DASHBOARD_ROOT / 'Makefile').read_text()
         assert 'sha256' in content
+
+    def test_makefile_checksums_are_valid_sha256(self):
+        """All CHECKSUM_ variables must be exactly 64 hex characters (SHA-256)."""
+        content = (DASHBOARD_ROOT / 'Makefile').read_text()
+        checksums = re.findall(r'CHECKSUM_[\w-]+\s*:=\s*([0-9a-f]+)', content)
+        assert len(checksums) == 4, f'Expected 4 CHECKSUM_ entries, found {len(checksums)}'
+        for checksum in checksums:
+            assert len(checksum) == 64, (
+                f'Checksum {checksum!r} is {len(checksum)} chars, expected 64'
+            )
+
+    def test_makefile_has_delete_on_error(self):
+        """Makefile must include .DELETE_ON_ERROR to clean up stale binaries on failure."""
+        content = (DASHBOARD_ROOT / 'Makefile').read_text()
+        assert '.DELETE_ON_ERROR' in content
 
 
 class TestInputCSS:
