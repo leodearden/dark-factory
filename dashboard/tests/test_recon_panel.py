@@ -854,3 +854,16 @@ class TestVerdictCardExplanation:
         with _patch_recon_data(verdict=None):
             html = client.get('/partials/recon').text
         assert 'data-testid="verdict-explanation"' not in html
+
+
+class TestPartitionBurstStateNoneGuard:
+    """Direct classification test for partition_burst_state with None last_write_at."""
+
+    def test_none_last_write_at_classified_as_idle(self):
+        """Agent with last_write_at=None should be classified as idle, not active."""
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agent = {'agent_id': 'a1', 'state': 'idle', 'last_write_at': None}
+        active, idle = partition_burst_state([agent])
+        assert idle == [agent]
+        assert active == []

@@ -648,57 +648,7 @@ class TestGetJournalEntries:
         assert entries == []
 
 
-class TestParseUtc:
-    """Tests for the parse_utc shared utility in dashboard.data.utils."""
-
-    def test_naive_iso_string_gets_utc(self):
-        """Naive ISO string (no tzinfo) should be returned with UTC attached."""
-        from datetime import UTC as _UTC
-
-        from dashboard.data.utils import parse_utc
-
-        result = parse_utc('2026-03-28T10:00:00')
-        assert result.tzinfo is not None
-        assert result.tzinfo == _UTC
-
-    def test_aware_iso_string_preserved(self):
-        """Aware ISO string (with tzinfo) should be returned unchanged."""
-        from dashboard.data.utils import parse_utc
-
-        ts = '2026-03-28T10:00:00+00:00'
-        result = parse_utc(ts)
-        assert result.tzinfo is not None
-        # Value is preserved: tzinfo stays, offset is the same
-        assert result.year == 2026
-        assert result.hour == 10
-
-    def test_aware_iso_string_with_non_utc_offset_preserved(self):
-        """Aware ISO string with non-UTC offset should be returned unchanged (tzinfo preserved)."""
-        from datetime import timedelta
-
-        from dashboard.data.utils import parse_utc
-
-        result = parse_utc('2026-03-28T10:00:00+05:30')
-        assert result.utcoffset() == timedelta(hours=5, minutes=30)
-        assert result.hour == 10
-
-    def test_invalid_string_raises_value_error(self):
-        """Invalid ISO string should raise ValueError."""
-        import pytest
-
-        from dashboard.data.utils import parse_utc
-
-        with pytest.raises(ValueError):
-            parse_utc('not-a-timestamp')
-
-    def test_none_raises_type_error(self):
-        """None input should raise TypeError."""
-        import pytest
-
-        from dashboard.data.utils import parse_utc
-
-        with pytest.raises(TypeError):
-            parse_utc(None)  # type: ignore[arg-type]
+# parse_utc tests live in tests/test_data_utils.py::TestParseUtc
 
 
 class TestPartitionBurstState:
