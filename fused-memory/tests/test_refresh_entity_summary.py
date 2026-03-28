@@ -150,3 +150,80 @@ class TestUpdateNodeSummary:
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.update_node_summary('node-uuid-1', 'summary text')
+
+
+# ---------------------------------------------------------------------------
+# step-5: GraphitiBackend.refresh_entity_summary
+# ---------------------------------------------------------------------------
+
+class TestRefreshEntitySummary:
+    """GraphitiBackend.refresh_entity_summary(node_uuid) regenerates entity summary."""
+
+    @pytest.mark.asyncio
+    async def test_returns_result_dict(self, mock_config, make_backend):
+        """Returns dict with uuid, name, old_summary, new_summary, edge_count keys."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(return_value=('Alice', 'old summary'))
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e1', 'fact': 'Alice knows Bob', 'name': 'knows'},
+        ])
+        backend.update_node_summary = AsyncMock()
+        result = await backend.refresh_entity_summary('node-uuid-1')
+        assert result['uuid'] == 'node-uuid-1'
+        assert result['name'] == 'Alice'
+        assert result['old_summary'] == 'old summary'
+        assert result['edge_count'] == 1
+        assert isinstance(result['new_summary'], str)
+
+    @pytest.mark.asyncio
+    async def test_deduplicates_facts(self, mock_config, make_backend):
+        """Duplicate facts appear only once in the new summary."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(return_value=('Alice', ''))
+        # Two edges with the same fact
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e1', 'fact': 'Alice knows Bob', 'name': 'knows'},
+            {'uuid': 'e2', 'fact': 'Alice knows Bob', 'name': 'knows'},
+            {'uuid': 'e3', 'fact': 'Alice works at Acme', 'name': 'works_at'},
+        ])
+        backend.update_node_summary = AsyncMock()
+        result = await backend.refresh_entity_summary('node-uuid-1')
+        # 'Alice knows Bob' should appear exactly once
+        assert result['new_summary'].count('Alice knows Bob') == 1
+        assert 'Alice works at Acme' in result['new_summary']
+
+    @pytest.mark.asyncio
+    async def test_calls_update_node_summary_with_new_summary(self, mock_config, make_backend):
+        """Calls update_node_summary with the new deduped summary."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(return_value=('Alice', 'old'))
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e1', 'fact': 'Alice knows Bob', 'name': 'knows'},
+        ])
+        backend.update_node_summary = AsyncMock()
+        result = await backend.refresh_entity_summary('node-uuid-1')
+        backend.update_node_summary.assert_awaited_once_with('node-uuid-1', result['new_summary'])
+
+    @pytest.mark.asyncio
+    async def test_empty_edges_produces_empty_summary(self, mock_config, make_backend):
+        """When zero valid edges remain, new_summary is empty string and update is called."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(return_value=('Alice', 'old summary'))
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[])
+        backend.update_node_summary = AsyncMock()
+        result = await backend.refresh_entity_summary('node-uuid-1')
+        assert result['new_summary'] == ''
+        assert result['edge_count'] == 0
+        backend.update_node_summary.assert_awaited_once_with('node-uuid-1', '')
+
+    @pytest.mark.asyncio
+    async def test_old_summary_returned_in_result(self, mock_config, make_backend):
+        """The old summary from get_node_text is preserved in result for auditing."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(return_value=('Bob', 'prior summary text'))
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e1', 'fact': 'Bob lives in London', 'name': 'lives_in'},
+        ])
+        backend.update_node_summary = AsyncMock()
+        result = await backend.refresh_entity_summary('node-uuid-2')
+        assert result['old_summary'] == 'prior summary text'
