@@ -291,9 +291,19 @@ def _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
     )
 
 
-def _mock_stage_run(stage, items_flagged=None):
-    """Replace stage.run with a mock that returns a StageReport."""
+def _mock_stage_run(stage, items_flagged=None, before_return=None):
+    """Replace stage.run with a mock that returns a StageReport.
+
+    Args:
+        stage: The stage whose .run method will be replaced.
+        items_flagged: Optional list of findings to include in the StageReport.
+        before_return: Optional async callable invoked with the stage object just
+            before the StageReport is returned.  Use this to capture mutable stage
+            state (e.g. episode_limit, memory_limit) at the moment .run() fires.
+    """
     async def mock_run(events, watermark, prior_reports, run_id, model=None, _s=stage):
+        if before_return is not None:
+            await before_return(_s)
         return StageReport(
             stage=_s.stage_id,
             started_at=datetime.now(UTC),
