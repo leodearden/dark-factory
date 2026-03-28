@@ -5,6 +5,7 @@ import pytest
 from fused_memory.utils.validation import (
     require_project_id,
     require_project_root,
+    require_run_id,
     validate_project_id,
     validate_project_root,
     validate_run_id,
@@ -177,6 +178,33 @@ class TestRequireProjectId:
         assert err_dict is not None
         with pytest.raises(ValueError) as exc_info:
             require_project_id(invalid)
+        assert str(exc_info.value) == err_dict['error']
+
+
+class TestRequireRunId:
+    """require_run_id raises ValueError for invalid run ids, returns None for valid ones."""
+
+    def test_valid_uuid_raises_nothing(self):
+        require_run_id('550e8400-e29b-41d4-a716-446655440000')  # must not raise
+
+    def test_empty_string_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            require_run_id('')
+
+    def test_whitespace_only_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            require_run_id('   ')
+
+    def test_injection_vector_newline_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            require_run_id('run\nid')
+
+    def test_error_message_matches_validate_error_field(self):
+        invalid = ''
+        err_dict = validate_run_id(invalid)
+        assert err_dict is not None
+        with pytest.raises(ValueError) as exc_info:
+            require_run_id(invalid)
         assert str(exc_info.value) == err_dict['error']
 
 
