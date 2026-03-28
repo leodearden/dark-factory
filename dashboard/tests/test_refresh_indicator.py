@@ -99,21 +99,12 @@ class TestRefreshTrackingJS:
 class TestRefreshPulseCSS:
     """Tests that style.css contains the refresh-pulse animation."""
 
-    def _read_css(self):
-        import os
-        css_path = os.path.join(
-            os.path.dirname(__file__),
-            '..', 'src', 'dashboard', 'static', 'style.css'
-        )
-        with open(css_path) as f:
-            return f.read()
-
-    def test_keyframes_animation_present(self):
-        css = self._read_css()
+    def test_keyframes_animation_present(self, client):
+        css = client.get('/static/style.css').text
         assert '@keyframes section-refresh-pulse' in css
 
-    def test_section_refreshed_class_present(self):
-        css = self._read_css()
+    def test_section_refreshed_class_present(self, client):
+        css = client.get('/static/style.css').text
         assert '.section-refreshed' in css
 
 
