@@ -754,6 +754,17 @@ class TestProactiveSampling:
 
         assert '### Proactive Task Sample' not in payload
 
+    # --- Step 8: system prompt includes proactive spot-check guideline ---
+
+    def test_system_prompt_includes_proactive_spot_check_guideline(self):
+        """STAGE2_SYSTEM_PROMPT contains instruction about reviewing the proactive task sample."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        # The prompt should mention proactive sample review
+        assert 'Proactive Task Sample' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must contain a guideline about reviewing the Proactive Task Sample"
+        )
+
 
 class TestRunIdValidation(BaseStageValidationTest):
     """BaseStage.run() validates run_id before prompt interpolation."""
