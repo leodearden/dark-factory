@@ -369,8 +369,8 @@ class TestGetQueueStats:
         async with httpx.AsyncClient(transport=transport) as client:
             result = await get_queue_stats(client, dashboard_config)
 
-        # 3 servers × 3 pending = 9 (all share same transport/handler)
-        assert result['counts']['pending'] == 9
+        # 1 server × 3 pending = 3 (all share same transport/handler)
+        assert result['counts']['pending'] == 3
         assert result['oldest_pending_age_seconds'] == 5.5
 
     async def test_all_down_returns_offline(self, dashboard_config):
@@ -388,7 +388,7 @@ class TestGetQueueStats:
         """If some servers are down, aggregate from those that are up.
 
         Uses two_url_config [9000, 9001]: port 9000 fails, port 9001 succeeds.
-        Multi-server aggregation (3 servers × 3 = 9) is already covered by
+        Multi-server aggregation (1 server × 3 = 3) is already covered by
         test_successful_stats; this test focuses on the partial-failure path.
         """
         from dashboard.data.memory import get_queue_stats
