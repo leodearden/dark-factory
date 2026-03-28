@@ -1,4 +1,4 @@
-"""Tests for verify_zombie_edges maintenance: run_verify_zombie_edges() edge cases."""
+"""Tests for verify_zombie_edges maintenance: run_verify_zombie_edges() delegation tests."""
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -6,109 +6,46 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 # ---------------------------------------------------------------------------
-# step-7: run_verify_zombie_edges() env-var / close() edge cases
+# step-5: run_verify_zombie_edges delegates to maintenance_service
 # ---------------------------------------------------------------------------
 
-class TestRunVerifyZombieEdgesEdgeCases:
-    """run_verify_zombie_edges() correctly saves/restores CONFIG_PATH and handles close() edge cases.
-
-    All tests pass uuids=['dummy-uuid'] to bypass the ValueError guard that
-    rejects empty uuid lists.
-    """
+class TestRunVerifyZombieEdgesDelegation:
+    """run_verify_zombie_edges() delegates service lifecycle to maintenance_service()."""
 
     @pytest.mark.asyncio
-    async def test_restores_preexisting_env_var_when_constructor_fails(self):
-        """When CONFIG_PATH already set and FusedMemoryConfig raises, old value is restored."""
-        import os
+    async def test_delegates_to_maintenance_service(self):
+        """run_verify_zombie_edges() calls maintenance_service(config_path) and uses yielded service.graphiti."""
+        from contextlib import asynccontextmanager
 
-        from fused_memory.maintenance.verify_zombie_edges import run_verify_zombie_edges
-
-        old = os.environ.get('CONFIG_PATH')
-        os.environ['CONFIG_PATH'] = 'preexisting.yaml'
-        try:
-            with patch(
-                'fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig',
-                side_effect=RuntimeError('config load failed'),
-            ), pytest.raises(RuntimeError, match='config load failed'):
-                await run_verify_zombie_edges(
-                    uuids=['dummy-uuid'], config_path='test.yaml'
-                )
-
-            assert os.environ.get('CONFIG_PATH') == 'preexisting.yaml'
-        finally:
-            if old is None:
-                os.environ.pop('CONFIG_PATH', None)
-            else:
-                os.environ['CONFIG_PATH'] = old
-
-    @pytest.mark.asyncio
-    async def test_does_not_touch_env_var_when_config_path_is_none(self):
-        """When config_path is None, CONFIG_PATH env var is left completely untouched."""
-        import os
-
-        from fused_memory.maintenance.verify_zombie_edges import run_verify_zombie_edges
-
-        old = os.environ.get('CONFIG_PATH')
-        os.environ['CONFIG_PATH'] = 'existing.yaml'
-        try:
-            with patch(
-                'fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig',
-                side_effect=RuntimeError('config load failed'),
-            ), pytest.raises(RuntimeError, match='config load failed'):
-                await run_verify_zombie_edges(uuids=['dummy-uuid'])  # no config_path
-
-            assert os.environ.get('CONFIG_PATH') == 'existing.yaml'
-        finally:
-            if old is None:
-                os.environ.pop('CONFIG_PATH', None)
-            else:
-                os.environ['CONFIG_PATH'] = old
-
-    @pytest.mark.asyncio
-    async def test_close_exception_does_not_mask_original_error(self):
-        """When both verifier.cleanup and close() raise, the original error propagates."""
-        from fused_memory.maintenance.verify_zombie_edges import run_verify_zombie_edges
+        from fused_memory.maintenance.verify_zombie_edges import (
+            VerifyResult,
+            run_verify_zombie_edges,
+        )
 
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
-        mock_service.close = AsyncMock(side_effect=RuntimeError('close error'))
+        mock_service.graphiti = MagicMock()
+        mock_result = VerifyResult(found=['u1'], missing=[], deleted=0)
+
+        @asynccontextmanager
+        async def fake_maintenance_service(config_path):
+            yield mock_cfg, mock_service
 
         with (
             patch(
-                'fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig',
-                return_value=mock_cfg,
+                'fused_memory.maintenance.verify_zombie_edges.maintenance_service',
+                side_effect=fake_maintenance_service,
             ),
-            patch(
-                'fused_memory.maintenance.verify_zombie_edges.MemoryService',
-                return_value=mock_service,
-            ),
-            patch(
-                'fused_memory.maintenance.verify_zombie_edges.ZombieEdgeVerifier'
-            ) as mock_verifier_cls,
+            patch('fused_memory.maintenance.verify_zombie_edges.ZombieEdgeVerifier') as mock_verifier_cls,
         ):
             mock_verifier = MagicMock()
-            mock_verifier.cleanup = AsyncMock(side_effect=RuntimeError('original'))
+            mock_verifier.cleanup = AsyncMock(return_value=mock_result)
             mock_verifier_cls.return_value = mock_verifier
 
-            with pytest.raises(RuntimeError, match='original'):
-                await run_verify_zombie_edges(uuids=['dummy-uuid'])
+            result = await run_verify_zombie_edges(
+                uuids=['u1'],
+                config_path='/tmp/config.yaml',
+            )
 
-    @pytest.mark.asyncio
-    async def test_skips_close_when_service_never_created(self):
-        """When FusedMemoryConfig raises, service is None and close() is never called."""
-        from fused_memory.maintenance.verify_zombie_edges import run_verify_zombie_edges
-
-        with (
-            patch(
-                'fused_memory.maintenance.verify_zombie_edges.FusedMemoryConfig',
-                side_effect=RuntimeError('config failed'),
-            ),
-            patch(
-                'fused_memory.maintenance.verify_zombie_edges.MemoryService'
-            ) as mock_svc_cls,
-            pytest.raises(RuntimeError, match='config failed'),
-        ):
-            await run_verify_zombie_edges(uuids=['dummy-uuid'])
-
-        mock_svc_cls.assert_not_called()  # MemoryService never instantiated
-        mock_svc_cls.return_value.close.assert_not_called()
+        mock_verifier_cls.assert_called_once_with(backend=mock_service.graphiti)
+        assert result is mock_result

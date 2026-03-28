@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
+
+from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.services.memory_service import MemoryService
+
+logger = logging.getLogger(__name__)
 
 
 @contextlib.contextmanager
@@ -39,3 +45,44 @@ def override_config_path(config_path: str | None) -> Generator[None, None, None]
             os.environ.pop('CONFIG_PATH', None)
         else:
             os.environ['CONFIG_PATH'] = old_value
+
+
+@contextlib.asynccontextmanager
+async def maintenance_service(
+    config_path: str | None,
+) -> AsyncGenerator[tuple[FusedMemoryConfig, MemoryService], None]:
+    """Async context manager that manages the full maintenance service lifecycle.
+
+    Sets up CONFIG_PATH, loads FusedMemoryConfig, creates and initialises
+    a MemoryService, yields ``(config, service)``, then closes the service on
+    exit — suppressing any close() errors so that caller exceptions propagate
+    cleanly.
+
+    Args:
+        config_path: Optional path to the YAML config file.  When given it is
+                     set as CONFIG_PATH before constructing FusedMemoryConfig.
+                     When ``None`` the environment is left untouched.
+
+    Yields:
+        Tuple of (FusedMemoryConfig, MemoryService) — service is already
+        initialized when yielded.
+
+    Example::
+
+        async with maintenance_service(config_path) as (config, service):
+            manager = MyManager(backend=service.graphiti)
+            result = await manager.run()
+    """
+    service: MemoryService | None = None
+    with override_config_path(config_path):
+        try:
+            config = FusedMemoryConfig()
+            service = MemoryService(config)
+            await service.initialize()
+            yield config, service
+        finally:
+            if service is not None:
+                try:
+                    await service.close()
+                except Exception:
+                    logger.warning('Error closing service in maintenance_service', exc_info=True)
