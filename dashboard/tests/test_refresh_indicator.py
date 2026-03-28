@@ -144,8 +144,8 @@ class TestTimestampErrorState:
     def test_after_swap_clears_failure_flag(self, client):
         """The htmx:afterSwap handler must clear data-update-failed on recovery."""
         html = client.get('/').text
-        # The afterSwap handler should remove or clear data-update-failed
-        assert 'removeAttribute' in html or "data-update-failed" in html
+        # The afterSwap handler must call removeAttribute('data-update-failed') specifically
+        assert "removeAttribute('data-update-failed')" in html
 
     def test_interval_skips_failed_elements(self, client):
         """The setInterval must skip updating elements that have data-update-failed set."""
