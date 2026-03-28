@@ -1,9 +1,9 @@
 """Tests for fused_memory.maintenance._utils: override_config_path and maintenance_service."""
 
 import os
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 
 from fused_memory.maintenance._utils import override_config_path
 
@@ -139,10 +139,10 @@ class TestMaintenanceService:
         with (
             patch('fused_memory.maintenance._utils.FusedMemoryConfig', return_value=mock_cfg),
             patch('fused_memory.maintenance._utils.MemoryService', return_value=mock_service),
+            pytest.raises(RuntimeError, match='body error'),
         ):
-            with pytest.raises(RuntimeError, match='body error'):
-                async with maintenance_service(None):
-                    raise RuntimeError('body error')
+            async with maintenance_service(None):
+                raise RuntimeError('body error')
 
         mock_service.close.assert_awaited_once()
 
@@ -158,10 +158,10 @@ class TestMaintenanceService:
         with (
             patch('fused_memory.maintenance._utils.FusedMemoryConfig', return_value=mock_cfg),
             patch('fused_memory.maintenance._utils.MemoryService', return_value=mock_service),
+            pytest.raises(RuntimeError, match='original'),
         ):
-            with pytest.raises(RuntimeError, match='original'):
-                async with maintenance_service(None):
-                    raise RuntimeError('original')
+            async with maintenance_service(None):
+                raise RuntimeError('original')
 
     @pytest.mark.asyncio
     async def test_skips_close_when_config_fails(self):
@@ -174,10 +174,10 @@ class TestMaintenanceService:
                 side_effect=RuntimeError('config failed'),
             ),
             patch('fused_memory.maintenance._utils.MemoryService') as mock_svc_cls,
+            pytest.raises(RuntimeError, match='config failed'),
         ):
-            with pytest.raises(RuntimeError, match='config failed'):
-                async with maintenance_service(None):
-                    pass  # pragma: no cover
+            async with maintenance_service(None):
+                pass  # pragma: no cover
 
         mock_svc_cls.assert_not_called()
 

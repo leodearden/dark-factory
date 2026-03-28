@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # step-5: run_verify_zombie_edges delegates to maintenance_service
 # ---------------------------------------------------------------------------
@@ -18,7 +17,10 @@ class TestRunVerifyZombieEdgesDelegation:
         """run_verify_zombie_edges() calls maintenance_service(config_path) and uses yielded service.graphiti."""
         from contextlib import asynccontextmanager
 
-        from fused_memory.maintenance.verify_zombie_edges import VerifyResult, run_verify_zombie_edges
+        from fused_memory.maintenance.verify_zombie_edges import (
+            VerifyResult,
+            run_verify_zombie_edges,
+        )
 
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
