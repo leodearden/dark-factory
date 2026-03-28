@@ -304,3 +304,85 @@ class TestMemoryServiceRefreshEntitySummary:
         assert 'old_summary' in result
         assert 'new_summary' in result
         assert 'edge_count' in result
+
+
+# ---------------------------------------------------------------------------
+# step-9: MCP tool refresh_entity_summary
+# ---------------------------------------------------------------------------
+
+class TestRefreshEntitySummaryMcpTool:
+    """MCP tool refresh_entity_summary is registered and delegates correctly."""
+
+    @pytest.fixture
+    def mock_service(self):
+        """Mock MemoryService for tool registration."""
+        svc = AsyncMock()
+        svc.refresh_entity_summary = AsyncMock(return_value={
+            'uuid': 'node-1',
+            'name': 'Alice',
+            'old_summary': 'old text',
+            'new_summary': 'Alice knows Bob',
+            'edge_count': 1,
+        })
+        return svc
+
+    @pytest.fixture
+    def mcp_server(self, mock_service):
+        """MCP server with mock memory service."""
+        from fused_memory.server.tools import create_mcp_server
+        return create_mcp_server(mock_service)
+
+    @pytest.mark.asyncio
+    async def test_tool_is_registered(self, mcp_server):
+        """refresh_entity_summary is registered as an MCP tool."""
+        tool_names = [t.name for t in await mcp_server.list_tools()]
+        assert 'refresh_entity_summary' in tool_names
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_memory_service(self, mcp_server, mock_service):
+        """Tool calls memory_service.refresh_entity_summary with correct entity_uuid."""
+        result = await mcp_server._tool_manager.call_tool(
+            'refresh_entity_summary',
+            {'entity_uuid': 'node-1', 'project_id': 'dark_factory'},
+        )
+        mock_service.refresh_entity_summary.assert_awaited_once()
+        call_kwargs = mock_service.refresh_entity_summary.call_args[1]
+        assert call_kwargs.get('entity_uuid') == 'node-1'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_empty_project_id_returns_error(self, mcp_server, mock_service):
+        """Empty project_id returns validation error dict."""
+        result = await mcp_server._tool_manager.call_tool(
+            'refresh_entity_summary',
+            {'entity_uuid': 'node-1', 'project_id': ''},
+        )
+        # Should be a list of TextContent from FastMCP; parse to get result
+        import json
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            parsed = json.loads(content)
+        else:
+            parsed = result
+        assert 'error' in parsed
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.refresh_entity_summary.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exception_returns_error_dict(self, mcp_server, mock_service):
+        """Exception from memory_service returns error dict (not raised)."""
+        mock_service.refresh_entity_summary = AsyncMock(
+            side_effect=RuntimeError('FalkorDB connection failed')
+        )
+        result = await mcp_server._tool_manager.call_tool(
+            'refresh_entity_summary',
+            {'entity_uuid': 'node-1', 'project_id': 'dark_factory'},
+        )
+        import json
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            parsed = json.loads(content)
+        else:
+            parsed = result
+        assert 'error' in parsed
+        assert 'FalkorDB connection failed' in parsed['error']
