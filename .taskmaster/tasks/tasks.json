@@ -2454,7 +2454,18 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T15:06:00.496Z"
+        "updatedAt": "2026-03-28T15:06:00.496Z",
+        "metadata": {
+          "files": [
+            "fused-memory/tests/test_reindex.py",
+            "fused-memory/tests/test_cleanup_stale_edges.py",
+            "fused-memory/tests/test_verify_zombie_edges.py",
+            "fused-memory/tests/conftest.py"
+          ],
+          "modules": [
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 148,
@@ -2733,7 +2744,21 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T14:43:11.626Z"
+        "updatedAt": "2026-03-28T14:43:11.626Z",
+        "metadata": {
+          "files": [
+            "fused-memory/src/fused_memory/reconciliation/targeted.py",
+            "fused-memory/src/fused_memory/server/tools.py",
+            "fused-memory/src/fused_memory/utils/validation.py",
+            "fused-memory/tests/test_targeted.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/src/fused_memory/server",
+            "fused-memory/src/fused_memory/utils",
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 165,
