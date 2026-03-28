@@ -6,27 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
-
-# ---------------------------------------------------------------------------
-# Helpers (mirrored from test_reindex.py)
-# ---------------------------------------------------------------------------
-
-def _make_backend(config) -> GraphitiBackend:
-    """Build a GraphitiBackend with a mock client attached."""
-    backend = GraphitiBackend(config)
-    mock_client = MagicMock()
-    backend.client = mock_client
-    return backend
-
-
-def _make_graph_mock(rows: list[list]) -> MagicMock:
-    """Return a mock whose .query() is an AsyncMock returning rows."""
-    result = MagicMock()
-    result.result_set = rows
-    graph_mock = MagicMock()
-    graph_mock.query = AsyncMock(return_value=result)
-    return graph_mock
-
+from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult, run_cleanup
 
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.query_edges_by_time_range
@@ -36,13 +16,13 @@ class TestQueryEdgesByTimeRange:
     """GraphitiBackend.query_edges_by_time_range(start, end) returns matching edges."""
 
     @pytest.mark.asyncio
-    async def test_returns_matching_edges(self, mock_config):
-        backend = _make_backend(mock_config)
+    async def test_returns_matching_edges(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
         rows = [
             ['uuid-1', 'Alice is related to Bob', 'is_related', '2026-03-22T17:51:00', '2026-03-22T18:00:00'],
             ['uuid-2', 'Bob knows Carol', 'knows', '2026-03-22T18:00:00', None],
         ]
-        graph = _make_graph_mock(rows)
+        graph = make_graph_mock(rows)
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -59,9 +39,9 @@ class TestQueryEdgesByTimeRange:
         assert result[1]['uuid'] == 'uuid-2'
 
     @pytest.mark.asyncio
-    async def test_returns_empty_when_no_matches(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_returns_empty_when_no_matches(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -81,9 +61,9 @@ class TestQueryEdgesByTimeRange:
             )
 
     @pytest.mark.asyncio
-    async def test_passes_time_params_to_query(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_passes_time_params_to_query(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         start = '2026-03-22T17:50:00'
@@ -106,8 +86,8 @@ class TestBulkRemoveEdges:
     """GraphitiBackend.bulk_remove_edges(uuids) deletes edges and returns count."""
 
     @pytest.mark.asyncio
-    async def test_deletes_matching_edges(self, mock_config):
-        backend = _make_backend(mock_config)
+    async def test_deletes_matching_edges(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
         # Two calls: pre-count returns [[3]], DELETE returns empty
         pre_count_result = MagicMock()
         pre_count_result.result_set = [[3]]
@@ -124,9 +104,9 @@ class TestBulkRemoveEdges:
         assert graph_mock.query.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_handles_empty_uuid_list(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_handles_empty_uuid_list(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -142,8 +122,8 @@ class TestBulkRemoveEdges:
             await backend.bulk_remove_edges(['uuid-1'])
 
     @pytest.mark.asyncio
-    async def test_passes_uuid_list_to_query(self, mock_config):
-        backend = _make_backend(mock_config)
+    async def test_passes_uuid_list_to_query(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
         # Two calls: pre-count then DELETE
         pre_count_result = MagicMock()
         pre_count_result.result_set = [[2]]
@@ -165,13 +145,13 @@ class TestBulkRemoveEdges:
         assert cypher_params.get('uuids') == uuids
 
     @pytest.mark.asyncio
-    async def test_returns_actual_deletion_count_not_input_length(self, mock_config):
+    async def test_returns_actual_deletion_count_not_input_length(self, mock_config, make_backend):
         """bulk_remove_edges returns the actual count of matched edges, not len(uuids).
 
         Pass 3 UUIDs but simulate only 2 existing in FalkorDB via pre-count query.
         The return value must be 2, not 3.
         """
-        backend = _make_backend(mock_config)
+        backend = make_backend(mock_config)
         cast_target = MagicMock()
 
         # Pre-count result: 2 of 3 UUIDs exist as edges
@@ -203,10 +183,9 @@ class TestCleanupManager:
     """CleanupManager orchestrates find_stale_edges + bulk_remove_edges."""
 
     @pytest.mark.asyncio
-    async def test_find_stale_edges_delegates_to_backend(self, mock_config):
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupManager
+    async def test_find_stale_edges_delegates_to_backend(self, mock_config, make_backend):
 
-        backend = _make_backend(mock_config)
+        backend = make_backend(mock_config)
         backend.query_edges_by_time_range = AsyncMock(return_value=[
             {'uuid': 'u1', 'fact': 'f1', 'name': 'n1', 'valid_at': '2026-03-22T17:51:00', 'invalid_at': None},
         ])
@@ -221,14 +200,13 @@ class TestCleanupManager:
         assert result[0]['uuid'] == 'u1'
 
     @pytest.mark.asyncio
-    async def test_cleanup_queries_and_deletes(self, mock_config):
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult
+    async def test_cleanup_queries_and_deletes(self, mock_config, make_backend):
 
         edge_details = [
             {'uuid': 'u1', 'fact': 'f1', 'name': 'n1', 'valid_at': '2026-03-22T17:51:00', 'invalid_at': None},
             {'uuid': 'u2', 'fact': 'f2', 'name': 'n2', 'valid_at': '2026-03-22T18:00:00', 'invalid_at': None},
         ]
-        backend = _make_backend(mock_config)
+        backend = make_backend(mock_config)
         backend.query_edges_by_time_range = AsyncMock(return_value=edge_details)
         backend.bulk_remove_edges = AsyncMock(return_value=2)
         manager = CleanupManager(backend)
@@ -241,13 +219,12 @@ class TestCleanupManager:
         backend.bulk_remove_edges.assert_awaited_once_with(['u1', 'u2'])
 
     @pytest.mark.asyncio
-    async def test_dry_run_queries_but_does_not_delete(self, mock_config):
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult
+    async def test_dry_run_queries_but_does_not_delete(self, mock_config, make_backend):
 
         edge_details = [
             {'uuid': 'u1', 'fact': 'f1', 'name': 'n1', 'valid_at': '2026-03-22T17:51:00', 'invalid_at': None},
         ]
-        backend = _make_backend(mock_config)
+        backend = make_backend(mock_config)
         backend.query_edges_by_time_range = AsyncMock(return_value=edge_details)
         backend.bulk_remove_edges = AsyncMock(return_value=0)
         manager = CleanupManager(backend)
@@ -260,10 +237,9 @@ class TestCleanupManager:
         backend.bulk_remove_edges.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_cleanup_empty_result(self, mock_config):
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult
+    async def test_cleanup_empty_result(self, mock_config, make_backend):
 
-        backend = _make_backend(mock_config)
+        backend = make_backend(mock_config)
         backend.query_edges_by_time_range = AsyncMock(return_value=[])
         backend.bulk_remove_edges = AsyncMock(return_value=0)
         manager = CleanupManager(backend)
@@ -280,17 +256,6 @@ class TestCleanupManager:
 # step-7: run_cleanup async entrypoint
 # ---------------------------------------------------------------------------
 
-def _make_fake_maintenance_service(mock_cfg, mock_service):
-    """Return a fake maintenance_service async context manager for testing."""
-    from contextlib import asynccontextmanager
-
-    @asynccontextmanager
-    async def fake(config_path):
-        yield mock_cfg, mock_service
-
-    return fake
-
-
 class TestRunCleanup:
     """run_cleanup() delegates service lifecycle to maintenance_service(), runs cleanup.
 
@@ -299,10 +264,8 @@ class TestRunCleanup:
     """
 
     @pytest.mark.asyncio
-    async def test_calls_cleanup_with_correct_args(self):
+    async def test_calls_cleanup_with_correct_args(self, make_fake_maintenance_service):
         """run_cleanup() constructs CleanupManager and calls cleanup with correct args."""
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
-
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
@@ -311,7 +274,7 @@ class TestRunCleanup:
         with (
             patch(
                 'fused_memory.maintenance.cleanup_stale_edges.maintenance_service',
-                side_effect=_make_fake_maintenance_service(mock_cfg, mock_service),
+                side_effect=make_fake_maintenance_service(mock_cfg, mock_service),
             ),
             patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
         ):
@@ -333,10 +296,8 @@ class TestRunCleanup:
         assert result == mock_result
 
     @pytest.mark.asyncio
-    async def test_passes_dry_run_flag(self):
+    async def test_passes_dry_run_flag(self, make_fake_maintenance_service):
         """run_cleanup(dry_run=True) passes dry_run=True to CleanupManager.cleanup()."""
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
-
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
@@ -345,7 +306,7 @@ class TestRunCleanup:
         with (
             patch(
                 'fused_memory.maintenance.cleanup_stale_edges.maintenance_service',
-                side_effect=_make_fake_maintenance_service(mock_cfg, mock_service),
+                side_effect=make_fake_maintenance_service(mock_cfg, mock_service),
             ),
             patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
         ):
@@ -375,25 +336,17 @@ class TestRunCleanupDelegation:
     """
 
     @pytest.mark.asyncio
-    async def test_delegates_to_maintenance_service(self):
+    async def test_delegates_to_maintenance_service(self, make_fake_maintenance_service):
         """run_cleanup() calls maintenance_service(config_path) and uses yielded service.graphiti."""
-        from contextlib import asynccontextmanager
-
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
-
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
         mock_result = CleanupResult(edges_found=1, edges_deleted=1)
 
-        @asynccontextmanager
-        async def fake_maintenance_service(config_path):
-            yield mock_cfg, mock_service
-
         with (
             patch(
                 'fused_memory.maintenance.cleanup_stale_edges.maintenance_service',
-                side_effect=fake_maintenance_service,
+                side_effect=make_fake_maintenance_service(mock_cfg, mock_service),
             ),
             patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
         ):

@@ -10,29 +10,7 @@ from fused_memory.backends.graphiti_client import (
     GraphitiBackend,
     NodeNotFoundError,
 )
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _make_backend(config) -> GraphitiBackend:
-    """Build a GraphitiBackend with a mock client attached."""
-    backend = GraphitiBackend(config)
-    # inject a mock Graphiti client
-    mock_client = MagicMock()
-    backend.client = mock_client
-    return backend
-
-
-def _make_graph_mock(rows: list[list]) -> MagicMock:
-    """Return a mock whose .query() is an AsyncMock returning rows."""
-    result = MagicMock()
-    result.result_set = rows
-    graph_mock = MagicMock()
-    graph_mock.query = AsyncMock(return_value=result)
-    graph_mock.ro_query = AsyncMock(return_value=result)
-    return graph_mock
-
+from fused_memory.maintenance.reindex import ReindexManager, ReindexResult, run_reindex
 
 # ---------------------------------------------------------------------------
 # step-1: query_stale_node_embeddings / query_stale_edge_embeddings
@@ -42,15 +20,15 @@ class TestQueryStaleNodeEmbeddings:
     """GraphitiBackend.query_stale_node_embeddings(expected_dim) returns stale nodes."""
 
     @pytest.mark.asyncio
-    async def test_returns_stale_nodes(self, mock_config):
-        backend = _make_backend(mock_config)
+    async def test_returns_stale_nodes(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
         vec_3 = '<' + ', '.join(['0.1'] * 3) + '>'
         vec_5 = '<' + ', '.join(['0.1'] * 5) + '>'
         rows = [
             ['uuid-1', 'Node A', vec_3],
             ['uuid-2', 'Node B', vec_5],
         ]
-        graph = _make_graph_mock(rows)
+        graph = make_graph_mock(rows)
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -60,9 +38,9 @@ class TestQueryStaleNodeEmbeddings:
         assert result[1] == ('uuid-2', 'Node B', 5)
 
     @pytest.mark.asyncio
-    async def test_returns_empty_when_all_match(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_returns_empty_when_all_match(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -76,9 +54,9 @@ class TestQueryStaleNodeEmbeddings:
             await backend.query_stale_node_embeddings(expected_dim=1536)
 
     @pytest.mark.asyncio
-    async def test_calls_ro_query(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_calls_ro_query(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -93,13 +71,13 @@ class TestQueryStaleEdgeEmbeddings:
     """GraphitiBackend.query_stale_edge_embeddings(expected_dim) returns stale edges."""
 
     @pytest.mark.asyncio
-    async def test_returns_stale_edges(self, mock_config):
-        backend = _make_backend(mock_config)
+    async def test_returns_stale_edges(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
         vec_4 = '<' + ', '.join(['0.1'] * 4) + '>'
         rows = [
             ['edge-uuid-1', 'edge name', vec_4],
         ]
-        graph = _make_graph_mock(rows)
+        graph = make_graph_mock(rows)
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -108,9 +86,9 @@ class TestQueryStaleEdgeEmbeddings:
         assert result[0] == ('edge-uuid-1', 'edge name', 4)
 
     @pytest.mark.asyncio
-    async def test_returns_empty_when_all_match(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_returns_empty_when_all_match(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -124,9 +102,9 @@ class TestQueryStaleEdgeEmbeddings:
             await backend.query_stale_edge_embeddings(expected_dim=1536)
 
     @pytest.mark.asyncio
-    async def test_calls_ro_query(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_calls_ro_query(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -145,9 +123,9 @@ class TestGetNodeText:
     """GraphitiBackend.get_node_text(uuid) returns (name, summary) tuple."""
 
     @pytest.mark.asyncio
-    async def test_returns_name_and_summary(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([['Alice', 'Alice is a person']])
+    async def test_returns_name_and_summary(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([['Alice', 'Alice is a person']])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -156,9 +134,9 @@ class TestGetNodeText:
         assert summary == 'Alice is a person'
 
     @pytest.mark.asyncio
-    async def test_raises_node_not_found(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])  # empty result
+    async def test_raises_node_not_found(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])  # empty result
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with (
@@ -174,9 +152,9 @@ class TestGetNodeText:
             await backend.get_node_text('uuid-1')
 
     @pytest.mark.asyncio
-    async def test_passes_uuid_to_query(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([['Node', 'Summary']])
+    async def test_passes_uuid_to_query(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([['Node', 'Summary']])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -191,9 +169,9 @@ class TestGetEdgeText:
     """GraphitiBackend.get_edge_text(uuid) returns (name, fact) tuple."""
 
     @pytest.mark.asyncio
-    async def test_returns_name_and_fact(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([['edge-name', 'Some fact about the edge']])
+    async def test_returns_name_and_fact(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([['edge-name', 'Some fact about the edge']])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -202,9 +180,9 @@ class TestGetEdgeText:
         assert fact == 'Some fact about the edge'
 
     @pytest.mark.asyncio
-    async def test_raises_edge_not_found(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_raises_edge_not_found(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with (
@@ -220,9 +198,9 @@ class TestGetEdgeText:
             await backend.get_edge_text('edge-uuid-1')
 
     @pytest.mark.asyncio
-    async def test_passes_uuid_to_query(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([['name', 'fact']])
+    async def test_passes_uuid_to_query(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([['name', 'fact']])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -241,9 +219,9 @@ class TestUpdateNodeEmbedding:
     """GraphitiBackend.update_node_embedding(uuid, embedding) stores new vector."""
 
     @pytest.mark.asyncio
-    async def test_calls_set_with_embedding(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_calls_set_with_embedding(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         embedding = [0.1] * 1536
@@ -252,9 +230,9 @@ class TestUpdateNodeEmbedding:
         assert graph.query.called
 
     @pytest.mark.asyncio
-    async def test_passes_uuid_and_embedding_to_query(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_passes_uuid_and_embedding_to_query(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         embedding = [0.5] * 128
@@ -277,9 +255,9 @@ class TestUpdateEdgeEmbedding:
     """GraphitiBackend.update_edge_embedding(uuid, embedding) stores new vector."""
 
     @pytest.mark.asyncio
-    async def test_calls_set_with_embedding(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_calls_set_with_embedding(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         embedding = [0.2] * 1536
@@ -288,9 +266,9 @@ class TestUpdateEdgeEmbedding:
         assert graph.query.called
 
     @pytest.mark.asyncio
-    async def test_passes_uuid_and_embedding_to_query(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_passes_uuid_and_embedding_to_query(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         embedding = [0.7] * 64
@@ -317,14 +295,14 @@ class TestListIndices:
     """GraphitiBackend.list_indices() returns parsed index records."""
 
     @pytest.mark.asyncio
-    async def test_returns_index_list(self, mock_config):
-        backend = _make_backend(mock_config)
+    async def test_returns_index_list(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
         # FalkorDB index records: [label, property, type, entity_type]
         rows = [
             ['Entity', 'name_embedding', 'VECTOR', 'NODE'],
             ['Entity', 'name', 'FULLTEXT', 'NODE'],
         ]
-        graph = _make_graph_mock(rows)
+        graph = make_graph_mock(rows)
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -336,9 +314,9 @@ class TestListIndices:
         assert result[0]['entity_type'] == 'NODE'
 
     @pytest.mark.asyncio
-    async def test_returns_empty_when_no_indices(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_returns_empty_when_no_indices(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -356,9 +334,9 @@ class TestDropIndex:
     """GraphitiBackend.drop_index(label, field) generates correct DROP Cypher."""
 
     @pytest.mark.asyncio
-    async def test_drop_index_calls_query(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_drop_index_calls_query(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -366,9 +344,9 @@ class TestDropIndex:
         assert graph.query.called
 
     @pytest.mark.asyncio
-    async def test_drop_index_cypher_contains_label_and_field(self, mock_config):
-        backend = _make_backend(mock_config)
-        graph = _make_graph_mock([])
+    async def test_drop_index_cypher_contains_label_and_field(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
@@ -393,9 +371,9 @@ class TestDropVectorIndices:
     """GraphitiBackend.drop_vector_indices() drops only VECTOR-type indices."""
 
     @pytest.mark.asyncio
-    async def test_drops_only_vector_type_indices(self, mock_config):
+    async def test_drops_only_vector_type_indices(self, mock_config, make_backend):
         """Calls drop_index for VECTOR indices only, not FULLTEXT/RANGE."""
-        backend = _make_backend(mock_config)
+        backend = make_backend(mock_config)
 
         indices = [
             {'label': 'Entity', 'field': 'name_embedding', 'type': 'VECTOR', 'entity_type': 'NODE'},
@@ -414,9 +392,9 @@ class TestDropVectorIndices:
         assert ('RELATES_TO', 'fact_embedding') in called_pairs
 
     @pytest.mark.asyncio
-    async def test_returns_list_of_dropped_indices(self, mock_config):
+    async def test_returns_list_of_dropped_indices(self, mock_config, make_backend):
         """Returns list of dicts with 'label' and 'field' for each dropped index."""
-        backend = _make_backend(mock_config)
+        backend = make_backend(mock_config)
 
         indices = [
             {'label': 'Entity', 'field': 'name_embedding', 'type': 'VECTOR', 'entity_type': 'NODE'},
@@ -431,9 +409,9 @@ class TestDropVectorIndices:
         assert result[0] == {'label': 'Entity', 'field': 'name_embedding'}
 
     @pytest.mark.asyncio
-    async def test_no_op_when_no_vector_indices(self, mock_config):
+    async def test_no_op_when_no_vector_indices(self, mock_config, make_backend):
         """When no VECTOR indices exist, drop_index not called and returns []."""
-        backend = _make_backend(mock_config)
+        backend = make_backend(mock_config)
 
         indices = [
             {'label': 'Entity', 'field': 'name', 'type': 'FULLTEXT', 'entity_type': 'NODE'},
@@ -456,13 +434,11 @@ class TestReindexManager:
     """ReindexManager.reindex() orchestrates stale-embedding detection and re-embedding."""
 
     def _make_manager(self, backend, embedder, expected_dim=1536):
-        from fused_memory.maintenance.reindex import ReindexManager
         return ReindexManager(backend=backend, embedder=embedder, expected_dim=expected_dim)
 
     @pytest.mark.asyncio
     async def test_reindex_processes_stale_nodes_and_edges(self):
         """Finds 2 stale nodes and 1 stale edge, re-embeds each, updates embeddings."""
-        from fused_memory.maintenance.reindex import ReindexManager
 
         backend = MagicMock()
         backend.query_stale_node_embeddings = AsyncMock(return_value=[
@@ -499,7 +475,6 @@ class TestReindexManager:
     @pytest.mark.asyncio
     async def test_reindex_with_no_stale_items_returns_zeros(self):
         """reindex() with no stale items returns ReindexResult(0, 0, 0) immediately."""
-        from fused_memory.maintenance.reindex import ReindexManager
 
         backend = MagicMock()
         backend.query_stale_node_embeddings = AsyncMock(return_value=[])
@@ -517,7 +492,6 @@ class TestReindexManager:
     @pytest.mark.asyncio
     async def test_reindex_passes_expected_dim_to_queries(self):
         """query_stale_node/edge_embeddings receive the expected_dim from config."""
-        from fused_memory.maintenance.reindex import ReindexManager
 
         backend = MagicMock()
         backend.query_stale_node_embeddings = AsyncMock(return_value=[])
@@ -533,7 +507,6 @@ class TestReindexManager:
     @pytest.mark.asyncio
     async def test_reindex_node_text_combined_for_embedding(self):
         """Embedder receives name + space + summary as text."""
-        from fused_memory.maintenance.reindex import ReindexManager
 
         backend = MagicMock()
         backend.query_stale_node_embeddings = AsyncMock(return_value=[
@@ -556,7 +529,6 @@ class TestReindexManager:
     @pytest.mark.asyncio
     async def test_reindex_edge_text_combined_for_embedding(self):
         """Embedder receives name + space + fact as text for edges."""
-        from fused_memory.maintenance.reindex import ReindexManager
 
         backend = MagicMock()
         backend.query_stale_node_embeddings = AsyncMock(return_value=[])
@@ -587,7 +559,6 @@ class TestReindexAndReplay:
     @pytest.mark.asyncio
     async def test_reindex_called_before_replay(self):
         """reindex() is called before replay_dead()."""
-        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
 
         call_order: list[str] = []
 
@@ -616,7 +587,6 @@ class TestReindexAndReplay:
     @pytest.mark.asyncio
     async def test_returns_combined_result(self):
         """Returns dict with reindex_result and replay_count."""
-        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
 
         backend = MagicMock()
         embedder = MagicMock()
@@ -636,7 +606,6 @@ class TestReindexAndReplay:
     @pytest.mark.asyncio
     async def test_passes_group_id_to_replay(self):
         """group_id parameter is forwarded to durable_queue.replay_dead()."""
-        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
 
         backend = MagicMock()
         embedder = MagicMock()
@@ -654,7 +623,6 @@ class TestReindexAndReplay:
     @pytest.mark.asyncio
     async def test_default_group_id_is_none(self):
         """Default group_id=None replays all dead-letter items."""
-        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
 
         backend = MagicMock()
         embedder = MagicMock()
@@ -672,7 +640,6 @@ class TestReindexAndReplay:
     @pytest.mark.asyncio
     async def test_drops_indices_before_reindex_when_requested(self):
         """drop_vector_indices() called before reindex() when drop_indices=True."""
-        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
 
         call_order: list[str] = []
 
@@ -706,7 +673,6 @@ class TestReindexAndReplay:
     @pytest.mark.asyncio
     async def test_skips_drop_when_drop_indices_false(self):
         """drop_vector_indices() NOT called when drop_indices=False."""
-        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
 
         backend = MagicMock()
         backend.drop_vector_indices = AsyncMock(return_value=[])
@@ -725,7 +691,6 @@ class TestReindexAndReplay:
     @pytest.mark.asyncio
     async def test_default_drop_indices_is_false(self):
         """drop_indices defaults to False (backward compatible)."""
-        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
 
         backend = MagicMock()
         backend.drop_vector_indices = AsyncMock(return_value=[])
@@ -744,7 +709,6 @@ class TestReindexAndReplay:
     @pytest.mark.asyncio
     async def test_result_includes_indices_dropped(self):
         """Return dict includes 'indices_dropped' list from drop_vector_indices."""
-        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
 
         dropped = [
             {'label': 'Entity', 'field': 'name_embedding'},
@@ -767,7 +731,6 @@ class TestReindexAndReplay:
     @pytest.mark.asyncio
     async def test_result_indices_dropped_empty_when_skipped(self):
         """Return dict has 'indices_dropped': [] when drop_indices=False."""
-        from fused_memory.maintenance.reindex import ReindexManager, ReindexResult
 
         backend = MagicMock()
         backend.drop_vector_indices = AsyncMock(return_value=[])
@@ -788,17 +751,6 @@ class TestReindexAndReplay:
 # step-13: run_reindex() CLI entrypoint
 # ---------------------------------------------------------------------------
 
-def _make_fake_maintenance_service_reindex(mock_cfg, mock_service):
-    """Return a fake maintenance_service async context manager for reindex testing."""
-    from contextlib import asynccontextmanager
-
-    @asynccontextmanager
-    async def fake(config_path):
-        yield mock_cfg, mock_service
-
-    return fake
-
-
 class TestRunReindex:
     """run_reindex() delegates service lifecycle to maintenance_service(), runs reindex_and_replay.
 
@@ -807,15 +759,8 @@ class TestRunReindex:
     """
 
     @pytest.mark.asyncio
-    async def test_calls_reindex_and_replay_with_correct_args(self):
+    async def test_calls_reindex_and_replay_with_correct_args(self, standard_mock_config, make_fake_maintenance_service):
         """run_reindex() constructs ReindexManager and calls reindex_and_replay."""
-        from fused_memory.maintenance.reindex import ReindexResult, run_reindex
-
-        mock_config = MagicMock()
-        mock_config.embedder.dimensions = 1536
-        mock_config.embedder.providers.openai = None
-        mock_config.embedder.model = 'text-embedding-3-small'
-
         mock_service = AsyncMock()
         mock_service.durable_queue = MagicMock()
         mock_service.graphiti = MagicMock()
@@ -825,7 +770,7 @@ class TestRunReindex:
         with (
             patch(
                 'fused_memory.maintenance.reindex.maintenance_service',
-                side_effect=_make_fake_maintenance_service_reindex(mock_config, mock_service),
+                side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
             patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
             patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
@@ -842,15 +787,8 @@ class TestRunReindex:
         assert result == mock_result
 
     @pytest.mark.asyncio
-    async def test_passes_drop_indices_true(self):
+    async def test_passes_drop_indices_true(self, standard_mock_config, make_fake_maintenance_service):
         """run_reindex(drop_indices=True) passes drop_indices=True to reindex_and_replay."""
-        from fused_memory.maintenance.reindex import ReindexResult, run_reindex
-
-        mock_config = MagicMock()
-        mock_config.embedder.dimensions = 1536
-        mock_config.embedder.providers.openai = None
-        mock_config.embedder.model = 'text-embedding-3-small'
-
         mock_service = AsyncMock()
         mock_service.durable_queue = MagicMock()
         mock_service.graphiti = MagicMock()
@@ -860,7 +798,7 @@ class TestRunReindex:
         with (
             patch(
                 'fused_memory.maintenance.reindex.maintenance_service',
-                side_effect=_make_fake_maintenance_service_reindex(mock_config, mock_service),
+                side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
             patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
             patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
@@ -876,15 +814,8 @@ class TestRunReindex:
         assert call_kwargs.get('drop_indices') is True
 
     @pytest.mark.asyncio
-    async def test_default_drop_indices_false(self):
+    async def test_default_drop_indices_false(self, standard_mock_config, make_fake_maintenance_service):
         """run_reindex() with no drop_indices arg passes drop_indices=False."""
-        from fused_memory.maintenance.reindex import ReindexResult, run_reindex
-
-        mock_config = MagicMock()
-        mock_config.embedder.dimensions = 1536
-        mock_config.embedder.providers.openai = None
-        mock_config.embedder.model = 'text-embedding-3-small'
-
         mock_service = AsyncMock()
         mock_service.durable_queue = MagicMock()
         mock_service.graphiti = MagicMock()
@@ -894,7 +825,7 @@ class TestRunReindex:
         with (
             patch(
                 'fused_memory.maintenance.reindex.maintenance_service',
-                side_effect=_make_fake_maintenance_service_reindex(mock_config, mock_service),
+                side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
             patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
             patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
@@ -910,14 +841,10 @@ class TestRunReindex:
         assert call_kwargs.get('drop_indices') is False
 
     @pytest.mark.asyncio
-    async def test_creates_embedder_with_config_dimensions(self):
+    async def test_creates_embedder_with_config_dimensions(self, standard_mock_config, make_fake_maintenance_service):
         """run_reindex() passes config.embedder.dimensions to OpenAIEmbedderConfig."""
-        from fused_memory.maintenance.reindex import ReindexResult, run_reindex
-
-        mock_config = MagicMock()
-        mock_config.embedder.dimensions = 768
-        mock_config.embedder.providers.openai = None
-        mock_config.embedder.model = 'text-embedding-ada-002'
+        standard_mock_config.embedder.dimensions = 768
+        standard_mock_config.embedder.model = 'text-embedding-ada-002'
 
         mock_service = AsyncMock()
         mock_service.durable_queue = MagicMock()
@@ -928,7 +855,7 @@ class TestRunReindex:
         with (
             patch(
                 'fused_memory.maintenance.reindex.maintenance_service',
-                side_effect=_make_fake_maintenance_service_reindex(mock_config, mock_service),
+                side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
             patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig') as mock_cfg_cls,
             patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
@@ -945,19 +872,15 @@ class TestRunReindex:
         assert call_kwargs.get('embedding_dim') == 768
 
     @pytest.mark.asyncio
-    async def test_embedder_constructor_failure_propagates(self):
+    async def test_embedder_constructor_failure_propagates(self, standard_mock_config, make_fake_maintenance_service):
         """When OpenAIEmbedderConfig raises inside the context, the exception propagates."""
-        from fused_memory.maintenance.reindex import run_reindex
-
-        mock_config = MagicMock()
-        mock_config.embedder.providers.openai = None
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
 
         with (
             patch(
                 'fused_memory.maintenance.reindex.maintenance_service',
-                side_effect=_make_fake_maintenance_service_reindex(mock_config, mock_service),
+                side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
             patch(
                 'fused_memory.maintenance.reindex.OpenAIEmbedderConfig',
@@ -968,19 +891,15 @@ class TestRunReindex:
             await run_reindex()
 
     @pytest.mark.asyncio
-    async def test_manager_constructor_failure_propagates(self):
+    async def test_manager_constructor_failure_propagates(self, standard_mock_config, make_fake_maintenance_service):
         """When ReindexManager raises inside the context, the exception propagates."""
-        from fused_memory.maintenance.reindex import run_reindex
-
-        mock_config = MagicMock()
-        mock_config.embedder.providers.openai = None
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
 
         with (
             patch(
                 'fused_memory.maintenance.reindex.maintenance_service',
-                side_effect=_make_fake_maintenance_service_reindex(mock_config, mock_service),
+                side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
             patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig'),
             patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
@@ -1001,16 +920,8 @@ class TestRunReindexDelegation:
     """run_reindex() delegates service lifecycle to maintenance_service()."""
 
     @pytest.mark.asyncio
-    async def test_delegates_to_maintenance_service(self):
+    async def test_delegates_to_maintenance_service(self, standard_mock_config, make_fake_maintenance_service):
         """run_reindex() calls maintenance_service(config_path) and uses yielded (config, service)."""
-        from contextlib import asynccontextmanager
-
-        from fused_memory.maintenance.reindex import ReindexResult, run_reindex
-
-        mock_cfg = MagicMock()
-        mock_cfg.embedder.providers.openai = None
-        mock_cfg.embedder.model = 'text-embedding-3-small'
-        mock_cfg.embedder.dimensions = 1536
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
         mock_service.durable_queue = MagicMock()
@@ -1021,14 +932,10 @@ class TestRunReindexDelegation:
             'indices_dropped': [],
         }
 
-        @asynccontextmanager
-        async def fake_maintenance_service(config_path):
-            yield mock_cfg, mock_service
-
         with (
             patch(
                 'fused_memory.maintenance.reindex.maintenance_service',
-                side_effect=fake_maintenance_service,
+                side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
             patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig'),
             patch('fused_memory.maintenance.reindex.OpenAIEmbedder') as mock_embedder_cls,
