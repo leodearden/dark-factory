@@ -4550,6 +4550,17 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 279,
+        "title": "Fix regression: restore _PROJECT_ID_GUIDELINE extraction for reconciliation prompts",
+        "description": "Commit 0ea23cb5 (stash pop merge conflict) reverted task 134's shared project_id guideline extraction. The copy-pasted project_id guidelines are back in each stage prompt instead of being derived from a shared template.\n\nFix: Re-extract _PROJECT_ID_GUIDELINE to fused-memory/src/fused_memory/reconciliation/prompts/__init__.py with a {tools} placeholder. Create per-stage constants (use clear names like _STAGE1_PROJECT_ID_GUIDELINE, not _S1_PID). Interpolate with each stage's allowed tool list. Stage 2's tool list should include expand_task and parse_prd (it has access but the guideline omits them). Collapse the three duplicate test_stageN_prompt_contains_project_id_guideline tests into one parametrized test. Hoist inline imports in test methods to module-level.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -4562,7 +4573,7 @@
       ],
       "created": "2026-03-28T07:37:31.561Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T07:37:31.564Z"
+      "updated": "2026-03-28T07:37:38.398Z"
     }
   }
 }
