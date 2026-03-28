@@ -12,6 +12,7 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
+from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
 
@@ -145,7 +146,7 @@ Review the above data and perform memory consolidation:
 4. Flag any items that are relevant to task planning for Stage 2.
 5. When you have completed your work, produce your final structured report as your response.
 
-Always pass project_id="{self.project_id}" when calling fused-memory MCP tools.
+{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
 """
 
     def _assemble_remediation_payload(self) -> str:
@@ -164,7 +165,7 @@ This is a focused remediation run. Address ONLY the specific findings listed abo
 3. Do NOT perform general consolidation — only fix the listed findings.
 4. Report each finding's resolution status in your structured report.
 
-Always pass project_id="{self.project_id}" when calling fused-memory MCP tools.
+{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
 """
 
 
