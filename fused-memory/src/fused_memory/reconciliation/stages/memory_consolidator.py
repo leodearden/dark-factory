@@ -22,9 +22,9 @@ if TYPE_CHECKING:
 class MemoryConsolidator(BaseStage):
     """Stage 1: Review and consolidate memories across Graphiti and Mem0."""
 
-    # Tier limits — set by harness before run()
-    episode_limit: int = 500
-    memory_limit: int = 1000
+    # Tier limits — set by harness before run(); None until explicitly assigned
+    episode_limit: int | None = None
+    memory_limit: int | None = None
 
     # Remediation support — set by harness for second pass
     remediation_findings: list[dict] | None = None
@@ -45,6 +45,13 @@ class MemoryConsolidator(BaseStage):
         watermark: Watermark,
         prior_reports: list[StageReport],
     ) -> str:
+        # Validate that limits were explicitly set by the harness
+        if self.episode_limit is None or self.memory_limit is None:
+            raise ValueError(
+                f'episode_limit and memory_limit must be explicitly set by the harness before run(); '
+                f'got episode_limit={self.episode_limit}, memory_limit={self.memory_limit}'
+            )
+
         # Remediation mode: return focused payload with findings only
         if self.remediation_findings is not None:
             return self._assemble_remediation_payload()

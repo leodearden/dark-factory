@@ -773,8 +773,8 @@ class TestTierConfig:
             StageId.memory_consolidator,
             AsyncMock(), AsyncMock(), AsyncMock(), config,
         )
-        assert stage.episode_limit == 500
-        assert stage.memory_limit == 1000
+        assert stage.episode_limit is None
+        assert stage.memory_limit is None
 
     def test_limits_are_writable(self):
         config = ReconciliationConfig()
@@ -782,9 +782,57 @@ class TestTierConfig:
             StageId.memory_consolidator,
             AsyncMock(), AsyncMock(), AsyncMock(), config,
         )
-        assert stage.episode_limit == 500
-        assert stage.memory_limit == 1000
+        assert stage.episode_limit is None
+        assert stage.memory_limit is None
         stage.episode_limit = 125
         stage.memory_limit = 250
         assert stage.episode_limit == 125
         assert stage.memory_limit == 250
+
+    @pytest.mark.asyncio
+    async def test_assemble_payload_raises_without_limits(self):
+        config = ReconciliationConfig()
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator,
+            AsyncMock(), AsyncMock(), AsyncMock(), config,
+        )
+        stage.project_id = 'test_project'
+        watermark = Watermark(project_id='test_project')
+        with pytest.raises(ValueError, match='episode_limit and memory_limit must be explicitly set'):
+            await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+    @pytest.mark.asyncio
+    async def test_assemble_payload_succeeds_with_limits_set(self):
+        config = ReconciliationConfig()
+        memory_mock = AsyncMock()
+        memory_mock.get_episodes = AsyncMock(return_value=[])
+        memory_mock.mem0 = AsyncMock()
+        memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
+        memory_mock.get_status = AsyncMock(return_value={})
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator,
+            memory_mock, AsyncMock(), AsyncMock(), config,
+        )
+        stage.project_id = 'test_project'
+        stage.episode_limit = 125
+        stage.memory_limit = 250
+        watermark = Watermark(project_id='test_project')
+        # Should not raise
+        result = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+        assert isinstance(result, str)
+        assert 'Stage 1' in result
+
+    @pytest.mark.asyncio
+    async def test_remediation_path_also_validates_limits(self):
+        config = ReconciliationConfig()
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator,
+            AsyncMock(), AsyncMock(), AsyncMock(), config,
+        )
+        stage.project_id = 'test_project'
+        # Set remediation findings but leave limits as None
+        stage.remediation_findings = [{'description': 'test finding'}]
+        watermark = Watermark(project_id='test_project')
+        with pytest.raises(ValueError, match='episode_limit and memory_limit must be explicitly set'):
+            await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+

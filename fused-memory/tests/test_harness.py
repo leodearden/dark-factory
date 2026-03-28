@@ -387,6 +387,8 @@ async def test_normal_payload_includes_prior_s3_findings(mock_memory_service):
         AsyncMock(),
     )
     stage.project_id = 'test-project'
+    stage.episode_limit = 500
+    stage.memory_limit = 1000
     stage.prior_s3_findings = [_make_s3_findings()[0]]
 
     watermark = Watermark(project_id='test-project')
