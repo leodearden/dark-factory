@@ -21,6 +21,51 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BURST_COOLDOWN = 150
 
 
+def _parse_utc(ts: str | None) -> datetime:
+    """Parse an ISO timestamp string and ensure it has UTC timezone.
+
+    Naive datetimes (no tzinfo) get UTC attached.  Aware datetimes are
+    returned unchanged.  Invalid input propagates ValueError or TypeError
+    from :func:`datetime.fromisoformat`.
+    """
+    dt = datetime.fromisoformat(ts)  # type: ignore[arg-type]
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+_ACTIVE_THRESHOLD_SECONDS = 3600  # 1 hour
+
+
+def partition_burst_state(
+    burst_state: list[dict],
+    *,
+    active_threshold_seconds: int = _ACTIVE_THRESHOLD_SECONDS,
+) -> tuple[list[dict], list[dict]]:
+    """Split burst agents into active and idle lists.
+
+    Active means ``state != 'idle'`` **or** ``last_write_at`` within
+    *active_threshold_seconds*.  Everything else is idle/stale.
+    """
+    now = datetime.now(UTC)
+    active: list[dict] = []
+    idle: list[dict] = []
+    for agent in burst_state:
+        if agent['state'] != 'idle':
+            active.append(agent)
+            continue
+        # Idle agents with recent writes are still "active" for display
+        try:
+            last_write = _parse_utc(agent['last_write_at'])
+            if (now - last_write).total_seconds() < active_threshold_seconds:
+                active.append(agent)
+                continue
+        except (ValueError, TypeError):
+            pass
+        idle.append(agent)
+    return active, idle
+
+
 async def get_recent_runs(db: aiosqlite.Connection | None, *, limit: int = 50) -> list[dict]:
     """Return recent reconciliation runs ordered by started_at DESC.
 
@@ -194,9 +239,7 @@ async def get_buffer_stats(db: aiosqlite.Connection | None) -> dict:
 
         age = None
         if oldest_ts is not None:
-            oldest_dt = datetime.fromisoformat(oldest_ts)
-            if oldest_dt.tzinfo is None:
-                oldest_dt = oldest_dt.replace(tzinfo=UTC)
+            oldest_dt = _parse_utc(oldest_ts)
             age = (datetime.now(UTC) - oldest_dt).total_seconds()
 
         return {'buffered_count': count, 'oldest_event_age_seconds': age}
@@ -233,9 +276,7 @@ async def get_burst_state(
             # Apply cooldown: if last write is older than cooldown, agent is idle
             if state == 'bursting':
                 try:
-                    last_write = datetime.fromisoformat(row['last_write_at'])
-                    if last_write.tzinfo is None:
-                        last_write = last_write.replace(tzinfo=UTC)
+                    last_write = _parse_utc(row['last_write_at'])
                     if (now - last_write).total_seconds() > burst_cooldown_seconds:
                         state = 'idle'
                         burst_started = None

@@ -505,6 +505,60 @@ class TestGetJournalEntries:
         assert entries == []
 
 
+class TestParseUtc:
+    """Tests for the _parse_utc private helper."""
+
+    def test_naive_iso_string_gets_utc(self):
+        """Naive ISO string (no tzinfo) should be returned with UTC attached."""
+        from datetime import UTC as _UTC
+
+        from dashboard.data.reconciliation import _parse_utc
+
+        result = _parse_utc('2026-03-28T10:00:00')
+        assert result.tzinfo is not None
+        assert result.tzinfo == _UTC
+
+    def test_aware_iso_string_preserved(self):
+        """Aware ISO string (with tzinfo) should be returned unchanged."""
+        from dashboard.data.reconciliation import _parse_utc
+
+        ts = '2026-03-28T10:00:00+00:00'
+        result = _parse_utc(ts)
+        assert result.tzinfo is not None
+        # Value is preserved: tzinfo stays, offset is the same
+        assert result.year == 2026
+        assert result.hour == 10
+
+    def test_invalid_string_raises_value_error(self):
+        """Invalid ISO string should raise ValueError."""
+        import pytest
+
+        from dashboard.data.reconciliation import _parse_utc
+        with pytest.raises(ValueError):
+            _parse_utc('not-a-timestamp')
+
+    def test_none_raises_type_error(self):
+        """None input should raise TypeError."""
+        import pytest
+
+        from dashboard.data.reconciliation import _parse_utc
+        with pytest.raises(TypeError):
+            _parse_utc(None)
+
+
+class TestPartitionBurstStateLocation:
+    """Verify partition_burst_state and _ACTIVE_THRESHOLD_SECONDS live in reconciliation."""
+
+    def test_importable_from_reconciliation(self):
+        """partition_burst_state and _ACTIVE_THRESHOLD_SECONDS importable from data layer."""
+        from dashboard.data.reconciliation import (  # noqa: F401
+            _ACTIVE_THRESHOLD_SECONDS,
+            partition_burst_state,
+        )
+        assert callable(partition_burst_state)
+        assert _ACTIVE_THRESHOLD_SECONDS == 3600
+
+
 class TestWithDb:
     """Unit tests for the with_db helper function."""
 

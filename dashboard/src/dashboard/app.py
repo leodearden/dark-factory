@@ -118,40 +118,6 @@ def format_duration_ms(value: int | float | None) -> str:
 templates.env.filters['format_duration_ms'] = format_duration_ms
 
 
-_ACTIVE_THRESHOLD_SECONDS = 3600  # 1 hour
-
-
-def partition_burst_state(
-    burst_state: list[dict],
-    *,
-    active_threshold_seconds: int = _ACTIVE_THRESHOLD_SECONDS,
-) -> tuple[list[dict], list[dict]]:
-    """Split burst agents into active and idle lists.
-
-    Active means ``state != 'idle'`` **or** ``last_write_at`` within
-    *active_threshold_seconds*.  Everything else is idle/stale.
-    """
-    now = datetime.now(UTC)
-    active: list[dict] = []
-    idle: list[dict] = []
-    for agent in burst_state:
-        if agent['state'] != 'idle':
-            active.append(agent)
-            continue
-        # Idle agents with recent writes are still "active" for display
-        try:
-            last_write = datetime.fromisoformat(agent['last_write_at'])
-            if last_write.tzinfo is None:
-                last_write = last_write.replace(tzinfo=UTC)
-            if (now - last_write).total_seconds() < active_threshold_seconds:
-                active.append(agent)
-                continue
-        except (ValueError, TypeError):
-            pass
-        idle.append(agent)
-    return active, idle
-
-
 def format_duration(value: int | float | None) -> str:
     """Format a duration in seconds to a human-readable compound string.
 
