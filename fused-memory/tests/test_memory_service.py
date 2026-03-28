@@ -1058,8 +1058,9 @@ class TestDedupEpisodeEdges:
     @pytest.mark.asyncio
     async def test_three_duplicate_edges_removes_two(self, service):
         """step-1: 3 edges with same (source, target, fact) → 2 removed."""
-        from tests.conftest import MockAddEpisodeResult, MockEdge
         from unittest.mock import AsyncMock
+
+        from tests.conftest import MockAddEpisodeResult, MockEdge
 
         service.graphiti.bulk_remove_edges = AsyncMock(return_value=2)
 
@@ -1097,8 +1098,9 @@ class TestDedupEpisodeEdges:
     @pytest.mark.asyncio
     async def test_no_duplicates_returns_zero_no_backend_call(self, service):
         """step-3: all edges distinct → 0 removed, bulk_remove_edges NOT called."""
-        from tests.conftest import MockAddEpisodeResult, MockEdge
         from unittest.mock import AsyncMock
+
+        from tests.conftest import MockAddEpisodeResult, MockEdge
 
         service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
 
@@ -1145,8 +1147,9 @@ class TestDedupEpisodeEdges:
     @pytest.mark.asyncio
     async def test_empty_edges_list_returns_zero(self, service):
         """step-5b: result with empty edges list → 0, no backend calls."""
-        from tests.conftest import MockAddEpisodeResult
         from unittest.mock import AsyncMock
+
+        from tests.conftest import MockAddEpisodeResult
 
         service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
 
@@ -1161,8 +1164,9 @@ class TestDedupEpisodeEdges:
     @pytest.mark.asyncio
     async def test_normalization_treats_case_whitespace_variants_as_duplicate(self, service):
         """step-6: case + whitespace normalization catches near-duplicate facts."""
-        from tests.conftest import MockAddEpisodeResult, MockEdge
         from unittest.mock import AsyncMock
+
+        from tests.conftest import MockAddEpisodeResult, MockEdge
 
         service.graphiti.bulk_remove_edges = AsyncMock(return_value=1)
 
@@ -1193,8 +1197,9 @@ class TestDedupEpisodeEdges:
     @pytest.mark.asyncio
     async def test_same_fact_different_node_pairs_not_duplicates(self, service):
         """step-7: same fact text but different source/target pairs → distinct edges."""
-        from tests.conftest import MockAddEpisodeResult, MockEdge
         from unittest.mock import AsyncMock
+
+        from tests.conftest import MockAddEpisodeResult, MockEdge
 
         service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
 
@@ -1244,8 +1249,9 @@ class TestExecuteGraphitiWriteWithDedup:
     @pytest.mark.asyncio
     async def test_execute_graphiti_write_calls_dedup_and_removes_duplicates(self, service):
         """step-8: dedup is called after add_episode; duplicates are removed."""
+        from unittest.mock import AsyncMock
+
         from tests.conftest import MockAddEpisodeResult, MockEdge
-        from unittest.mock import AsyncMock, patch
 
         dup_edges = [
             MockEdge(fact='X depends on Y', uuid='u1', source_node_uuid='s1', target_node_uuid='t1'),
@@ -1306,7 +1312,6 @@ class TestDualWriteCallbackEdgesField:
     async def test_callback_reads_real_edges_field(self, service):
         """result.edges (not result.entity_edges) drives dual-write enqueue."""
         from tests.conftest import MockAddEpisodeResult, MockEdge
-        from unittest.mock import AsyncMock
 
         # Build a mock where entity_edges is empty but edges has content.
         # After our pre-1 fix, MockAddEpisodeResult mirrors entity_edges→edges,
