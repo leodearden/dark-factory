@@ -12,8 +12,12 @@ Each test group is expected to FAIL before the corresponding deletion and PASS a
 
 import importlib
 import importlib.util
+from pathlib import Path
 
 import pytest
+
+# Root of the repository (two levels up from fused-memory/tests/)
+_REPO_ROOT = Path(__file__).parent.parent.parent
 
 
 class TestQueueServiceRemoved:
@@ -47,13 +51,19 @@ class TestQueueServiceRemoved:
 
 
 class TestOrchestratorProtocolsRemoved:
-    """Assert orchestrator.protocols module has been deleted."""
+    """Assert orchestrator.protocols module has been deleted.
 
-    def test_protocols_module_not_importable(self):
-        """orchestrator.protocols should not be importable after deletion."""
-        spec = importlib.util.find_spec("orchestrator.protocols")
-        assert spec is None, (
-            "orchestrator.protocols still exists — delete protocols.py"
+    Note: orchestrator is a separate package not installed in the fused-memory
+    venv, so we use a direct file-system check rather than importlib.util.find_spec.
+    """
+
+    def test_protocols_file_does_not_exist(self):
+        """orchestrator/src/orchestrator/protocols.py should not exist on disk."""
+        protocols_path = (
+            _REPO_ROOT / "orchestrator" / "src" / "orchestrator" / "protocols.py"
+        )
+        assert not protocols_path.exists(), (
+            f"orchestrator/protocols.py still exists at {protocols_path} — delete it"
         )
 
 
