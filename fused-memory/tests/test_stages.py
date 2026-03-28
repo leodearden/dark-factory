@@ -975,6 +975,26 @@ class TestBaseStageValidationContract:
         assert MagicMock in _self_module._MOCK_TYPES, "_MOCK_TYPES must contain MagicMock"
 
 
+class TestParametrizeFixSanity:
+    """Temporary sanity check: test_run_raises_on_injection_run_id should use ids= not vector_name."""
+
+    def test_injection_test_has_no_vector_name_param(self):
+        import inspect  # noqa: PLC0415
+
+        fn = TestRunIdValidation.test_run_raises_on_injection_run_id
+        sig = inspect.signature(fn)
+        assert 'vector_name' not in sig.parameters, (
+            "vector_name should not appear in function signature after parametrize refactor"
+        )
+
+    def test_injection_test_has_exactly_3_cases(self):
+        markers = getattr(TestRunIdValidation.test_run_raises_on_injection_run_id, 'pytestmark', [])
+        parametrize_markers = [m for m in markers if m.name == 'parametrize']
+        assert len(parametrize_markers) == 1, "Expected exactly one parametrize marker"
+        argvalues = parametrize_markers[0].args[1]
+        assert len(argvalues) == 3, f"Expected 3 parametrize cases, got {len(argvalues)}"
+
+
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
