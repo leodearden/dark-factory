@@ -2,6 +2,8 @@
 
 import re
 
+from .test_helpers import _get_opening_tag
+
 _SECTIONS = ('orchestrators', 'performance', 'memory', 'memory-graphs', 'recon')
 
 
@@ -56,20 +58,14 @@ class TestTimestampElements:
         html = client.get('/').text
         for section in _SECTIONS:
             marker = f'data-updated-for="{section}"'
-            idx = html.index(marker)
-            tag_start = html.rfind('<', 0, idx)
-            tag_end = html.index('>', idx)
-            tag = html[tag_start:tag_end + 1]
+            tag = _get_opening_tag(html, marker)
             assert 'text-gray-500' in tag, f'Expected text-gray-500 on data-updated-for="{section}" element'
 
     def test_timestamp_elements_are_aria_hidden(self, client):
         html = client.get('/').text
         for section in _SECTIONS:
             marker = f'data-updated-for="{section}"'
-            idx = html.index(marker)
-            tag_start = html.rfind('<', 0, idx)
-            tag_end = html.index('>', idx)
-            tag = html[tag_start:tag_end + 1]
+            tag = _get_opening_tag(html, marker)
             assert 'aria-hidden="true"' in tag, f'Expected aria-hidden="true" on data-updated-for="{section}" element'
 
 
