@@ -645,40 +645,6 @@ class TestHtmxTimeout:
             or f'"timeout":{timeout_ms}' in section_html
         ), f'timeout {timeout_ms} not found near {partial_url}'
 
-    def test_memory_section_has_timeout_8000(self, client):
-        html = client.get('/').text
-        # memory section uses 10s poll interval → 8s timeout
-        memory_idx = html.index('hx-get="/partials/memory"')
-        section_html = html[memory_idx - 200:memory_idx + 500]
-        assert '"timeout": 8000' in section_html or '"timeout":8000' in section_html
-
-    def test_recon_section_has_timeout_12000(self, client):
-        html = client.get('/').text
-        # recon section uses 15s poll interval → 12s timeout
-        recon_idx = html.index('hx-get="/partials/recon"')
-        section_html = html[recon_idx - 200:recon_idx + 500]
-        assert '"timeout": 12000' in section_html or '"timeout":12000' in section_html
-
-    def test_orchestrators_section_has_timeout_8000(self, client):
-        html = client.get('/').text
-        # orchestrators section uses 10s poll interval → 8s timeout
-        orch_idx = html.index('hx-get="/partials/orchestrators"')
-        section_html = html[orch_idx - 200:orch_idx + 500]
-        assert '"timeout": 8000' in section_html or '"timeout":8000' in section_html
-
-    def test_performance_section_has_timeout_12000(self, client):
-        html = client.get('/').text
-        # performance section uses 30s poll interval → 12s timeout
-        perf_idx = html.index('hx-get="/partials/performance"')
-        section_html = html[perf_idx - 200:perf_idx + 500]
-        assert '"timeout": 12000' in section_html or '"timeout":12000' in section_html
-
-    def test_memory_graphs_section_has_timeout_10000(self, client):
-        html = client.get('/').text
-        # memory-graphs section uses 60s poll interval → 10s timeout
-        mg_idx = html.index('hx-get="/partials/memory-graphs"')
-        section_html = html[mg_idx - 200:mg_idx + 500]
-        assert '"timeout": 10000' in section_html or '"timeout":10000' in section_html
 
 
 class TestTailwindBuild:
