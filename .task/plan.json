@@ -1,0 +1,68 @@
+{
+  "task_id": "231",
+  "title": "Add hx-get test coverage for performance and memory-graphs partials",
+  "files": [
+    "dashboard/tests/test_app.py"
+  ],
+  "modules": [
+    "dashboard/tests"
+  ],
+  "analysis": "The dashboard index.html template has five polling sections (orchestrators, performance, memory, memory-graphs, recon), each with hx-get attributes pointing to their respective partial endpoints. The test_app.py file has two relevant test classes: TestIndex (verifies hx-get attributes exist in root page) and TestMorphSwap (verifies sections use morph:innerHTML swap + hx-get). Both classes cover memory, recon, and orchestrators but are missing coverage for performance and memory-graphs. The fix is straightforward: add two tests to TestIndex and two tests to TestMorphSwap following the exact existing patterns. No new fixtures, files, or imports are needed — just four new test methods in one file.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Add test_get_root_htmx_performance to TestIndex — asserts 'hx-get=\"/partials/performance\"' is present in GET / response. Also add test_get_root_htmx_memory_graphs asserting 'hx-get=\"/partials/memory-graphs\"'. Both tests follow the exact pattern of the existing test_get_root_htmx_memory/recon/orchestrators methods. These will pass immediately since the template already has the attributes — this is a coverage gap fill, not new behavior.",
+      "status": "done",
+      "commit": "5edf2b6"
+    },
+    {
+      "id": "step-2",
+      "type": "test",
+      "description": "Add test_performance_section_uses_morph to TestMorphSwap — asserts both 'hx-swap=\"morph:innerHTML\"' and 'hx-get=\"/partials/performance\"' are in the HTML. Also add test_memory_graphs_section_uses_morph with the same pattern for memory-graphs. Follows the exact pattern of existing test_memory_section_uses_morph/test_recon_section_uses_morph/test_orchestrators_section_uses_morph.",
+      "status": "done",
+      "commit": "c2d712b"
+    },
+    {
+      "id": "step-3",
+      "type": "impl",
+      "description": "Run the full test_app.py test suite to verify all new and existing tests pass. No implementation code changes are needed — only tests are added since the template already has the hx-get attributes. This step validates the tests are correct and not false-positives.",
+      "status": "done",
+      "commit": "c2d712b"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Add tests to both TestIndex AND TestMorphSwap rather than choosing one",
+      "rationale": "The two classes test different concerns: TestIndex verifies the hx-get attribute exists, TestMorphSwap verifies the morph swap strategy is paired with the endpoint. The existing three sections (memory, recon, orchestrators) have coverage in both classes, so the two missing sections should match this pattern for consistency."
+    },
+    {
+      "decision": "Steps 1 and 2 are both 'test' type with no intervening 'impl' step",
+      "rationale": "This is a pure test-gap-fill task — the feature (hx-get attributes in index.html) already exists and works. There is no production code to write. The TDD cycle here is: write tests that verify existing behavior, then run them to confirm they pass. Splitting into two test steps keeps the atomic commit granularity (TestIndex changes vs TestMorphSwap changes) while acknowledging no impl is needed."
+    },
+    {
+      "decision": "Do not extend TestHtmxTimeout or TestAriaLivePollingsections in this task",
+      "rationale": "The task description specifically calls out hx-get assertions missing from TestIndex/TestMorphSwap. Timeout and aria-live coverage gaps for the two new sections are a separate concern and out of scope. Note: memory-graphs section lacks aria-live='polite' in the template, so adding an aria-live test for it would fail — that's a template issue, not a test issue."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Existing TestIndex test pattern (client.get('/').text + string assertion)",
+      "where": "dashboard/tests/test_app.py lines 74-84",
+      "how": "Copy the pattern from test_get_root_htmx_memory/recon/orchestrators — single-line methods that get HTML text and assert an hx-get string is present"
+    },
+    {
+      "what": "Existing TestMorphSwap test pattern (dual assertion on hx-swap + hx-get)",
+      "where": "dashboard/tests/test_app.py lines 26-38",
+      "how": "Copy the pattern from test_memory/recon/orchestrators_section_uses_morph — get HTML, assert both morph:innerHTML swap and hx-get endpoint string"
+    },
+    {
+      "what": "Existing client fixture",
+      "where": "dashboard/tests/conftest.py lines 136-141",
+      "how": "All new tests use the existing 'client' fixture parameter — no new fixtures needed"
+    }
+  ],
+  "_session_id": "231-afbcb2f6",
+  "_created_at": "2026-03-28T04:30:05.936269+00:00"
+}
