@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid as uuid_mod
 from typing import TYPE_CHECKING, Any
 
@@ -11,7 +12,6 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.services.memory_service import MemoryService
-from fused_memory.utils.validation import validate_project_id, validate_project_root
 
 if TYPE_CHECKING:
     from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -211,6 +211,24 @@ def create_mcp_server(
     _VALID_STORES = frozenset(v.value for v in SourceStore)
     _VALID_CATEGORIES = frozenset(v.value for v in MemoryCategory)
 
+    def _validate_project_id(project_id: str) -> dict[str, str] | None:
+        """Return an error dict if project_id is empty, else None."""
+        if not project_id:
+            return {
+                'error': 'project_id is required and must be non-empty',
+                'error_type': 'ValidationError',
+            }
+        return None
+
+    def _validate_project_root(project_root: str) -> dict[str, str] | None:
+        """Return an error dict if project_root is not an absolute path, else None."""
+        if not project_root or not os.path.isabs(project_root):
+            return {
+                'error': f'project_root must be a non-empty absolute path, got: {project_root!r}',
+                'error_type': 'ValidationError',
+            }
+        return None
+
     @mcp.tool()
     async def add_episode(
         content: str,
@@ -241,7 +259,7 @@ def create_mcp_server(
                 infer the time-frame of the episode without parsing content.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
-        if err := validate_project_id(project_id):
+        if err := _validate_project_id(project_id):
             return err
         if temporal_context is not None and temporal_context not in _VALID_TEMPORAL_CONTEXTS:
             return {
@@ -295,7 +313,7 @@ def create_mcp_server(
             dual_write: Force write to both stores (default: false)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
-        if err := validate_project_id(project_id):
+        if err := _validate_project_id(project_id):
             return err
         if category is not None and category not in _VALID_CATEGORIES:
             return {
@@ -360,7 +378,7 @@ def create_mcp_server(
             session_id: Filter by session (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
-        if err := validate_project_id(project_id):
+        if err := _validate_project_id(project_id):
             return err
         if limit <= 0:
             return {
@@ -423,7 +441,7 @@ def create_mcp_server(
             session_id: Session context (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
-        if err := validate_project_id(project_id):
+        if err := _validate_project_id(project_id):
             return err
         try:
             result = await memory_service.get_entity(name=name, project_id=project_id)
@@ -472,7 +490,7 @@ def create_mcp_server(
             session_id: Session context (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
-        if err := validate_project_id(project_id):
+        if err := _validate_project_id(project_id):
             return err
         if last_n <= 0:
             return {
@@ -540,7 +558,7 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
-        if err := validate_project_id(project_id):
+        if err := _validate_project_id(project_id):
             return err
         if store not in _VALID_STORES:
             return {
@@ -586,7 +604,7 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
-        if err := validate_project_id(project_id):
+        if err := _validate_project_id(project_id):
             return err
         try:
             causation_id, source, _ = _extract_causation(metadata, agent_id)
@@ -639,7 +657,7 @@ def create_mcp_server(
             source_store: Source store to replay from (currently only "mem0")
             limit: Max memories to replay (None = all)
         """
-        if err := validate_project_id(project_id):
+        if err := _validate_project_id(project_id):
             return err
         try:
             count = await memory_service.replay_from_store(
@@ -700,7 +718,7 @@ def create_mcp_server(
         Args:
             project_id: Project to trigger reconciliation for
         """
-        if err := validate_project_id(project_id):
+        if err := _validate_project_id(project_id):
             return err
         if not _taskmaster_configured:
             return {
@@ -742,7 +760,7 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        if err := _validate_project_root(project_root):
             return err
         try:
             return await task_interceptor.get_tasks(project_root=project_root, tag=tag)
@@ -763,7 +781,7 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        if err := _validate_project_root(project_root):
             return err
         try:
             return await task_interceptor.get_task(
@@ -792,7 +810,7 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        if err := _validate_project_root(project_root):
             return err
         if status not in _VALID_TASK_STATUSES:
             return {
@@ -840,7 +858,7 @@ def create_mcp_server(
                 Persisted via a follow-up update_task call after creation.
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        if err := _validate_project_root(project_root):
             return err
         try:
             return await task_interceptor.add_task(
@@ -877,7 +895,7 @@ def create_mcp_server(
             append: Append instead of full update
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        if err := _validate_project_root(project_root):
             return err
         try:
             if isinstance(metadata, dict):
@@ -913,7 +931,7 @@ def create_mcp_server(
             details: Subtask details
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        if err := _validate_project_root(project_root):
             return err
         try:
             return await task_interceptor.add_subtask(
@@ -941,7 +959,7 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        if err := _validate_project_root(project_root):
             return err
         try:
             return await task_interceptor.remove_task(
@@ -966,7 +984,7 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        if err := _validate_project_root(project_root):
             return err
         try:
             return await task_interceptor.add_dependency(
@@ -994,7 +1012,7 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        if err := _validate_project_root(project_root):
             return err
         try:
             return await task_interceptor.remove_dependency(
@@ -1026,7 +1044,7 @@ def create_mcp_server(
             force: Force expansion even if subtasks exist
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        if err := _validate_project_root(project_root):
             return err
         try:
             return await task_interceptor.expand_task(
@@ -1056,7 +1074,7 @@ def create_mcp_server(
             num_tasks: Approximate number of tasks to generate
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        if err := _validate_project_root(project_root):
             return err
         try:
             return await task_interceptor.parse_prd(

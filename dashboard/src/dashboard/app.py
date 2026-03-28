@@ -135,7 +135,7 @@ def partition_burst_state(
     active: list[dict] = []
     idle: list[dict] = []
     for agent in burst_state:
-        if agent.get('state', 'idle') != 'idle':
+        if agent['state'] != 'idle':
             active.append(agent)
             continue
         # Idle agents with recent writes are still "active" for display
@@ -146,7 +146,7 @@ def partition_burst_state(
             if (now - last_write).total_seconds() < active_threshold_seconds:
                 active.append(agent)
                 continue
-        except (KeyError, ValueError, TypeError):
+        except (ValueError, TypeError):
             pass
         idle.append(agent)
     return active, idle
@@ -342,14 +342,11 @@ async def partials_recon(request: Request):
     # Determine if runs span multiple project_ids (for column display)
     run_project_ids = {r['project_id'] for r in runs}
 
-    active_agents, idle_agents = partition_burst_state(burst_state)
-
     return templates.TemplateResponse(
         request, 'partials/recon.html',
         context={
             'buffer_stats': buffer_stats,
-            'active_agents': active_agents,
-            'idle_agents': idle_agents,
+            'burst_state': burst_state,
             'projects': projects,
             'verdict': verdict,
             'runs': runs,

@@ -3,7 +3,7 @@
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 
 class EventType(StrEnum):
@@ -141,14 +141,6 @@ class Watermark(BaseModel):
     last_episode_timestamp: datetime | None = None
     last_memory_timestamp: datetime | None = None
     last_task_change_timestamp: datetime | None = None
-
-    @field_validator('project_id', mode='before')
-    @classmethod
-    def strip_project_id(cls, v: object) -> object:
-        """Strip whitespace; whitespace-only becomes '' (valid bootstrap sentinel)."""
-        if isinstance(v, str):
-            return v.strip()
-        return v
 
 
 class VerdictSeverity(StrEnum):

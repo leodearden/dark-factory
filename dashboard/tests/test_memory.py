@@ -307,21 +307,19 @@ class TestGetMemoryStatus:
         assert result['offline'] is True
         assert 'error' in result
 
-    async def test_first_server_down_falls_through(self, tmp_path):
+    async def test_first_server_down_falls_through(self, dashboard_config):
         """If first URL fails, tries subsequent URLs."""
-        from dashboard.config import DashboardConfig
         from dashboard.data.memory import get_memory_status
 
-        # Explicit 2-URL config so one can fail and the other succeeds
-        cfg = DashboardConfig(
-            project_root=tmp_path,
-            fused_memory_urls=['http://localhost:9000', 'http://localhost:9001'],
-        )
+        call_count = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
             port = request.url.port
-            # First server (port 9000) always fails
-            if port == 9000:
+
+            # First server (port 8000) always fails
+            if port == 8000:
                 raise httpx.ConnectError('refused')
 
             body = json.loads(request.content)
@@ -335,7 +333,7 @@ class TestGetMemoryStatus:
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            result = await get_memory_status(client, cfg)
+            result = await get_memory_status(client, dashboard_config)
 
         assert result == _STATUS_PAYLOAD
         assert 'offline' not in result
@@ -362,8 +360,8 @@ class TestGetQueueStats:
         async with httpx.AsyncClient(transport=transport) as client:
             result = await get_queue_stats(client, dashboard_config)
 
-        # 1 server × 3 pending = 3 (default config has single canonical URL)
-        assert result['counts']['pending'] == 3
+        # 3 servers × 3 pending = 9 (all share same transport/handler)
+        assert result['counts']['pending'] == 9
         assert result['oldest_pending_age_seconds'] == 5.5
 
     async def test_all_down_returns_offline(self, dashboard_config):
@@ -377,20 +375,13 @@ class TestGetQueueStats:
 
         assert result['offline'] is True
 
-    async def test_partial_failure_aggregates_available(self, tmp_path):
+    async def test_partial_failure_aggregates_available(self, dashboard_config):
         """If some servers are down, aggregate from those that are up."""
-        from dashboard.config import DashboardConfig
         from dashboard.data.memory import get_queue_stats
-
-        # Explicit 2-URL config so one can fail and the other succeeds
-        cfg = DashboardConfig(
-            project_root=tmp_path,
-            fused_memory_urls=['http://localhost:9000', 'http://localhost:9001'],
-        )
 
         def handler(request: httpx.Request) -> httpx.Response:
             port = request.url.port
-            if port == 9000:
+            if port == 8000:
                 raise httpx.ConnectError('refused')
             body = json.loads(request.content)
             method = body.get('method', '')
@@ -403,10 +394,10 @@ class TestGetQueueStats:
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            result = await get_queue_stats(client, cfg)
+            result = await get_queue_stats(client, dashboard_config)
 
-        # 1 successful server × 3 pending = 3
-        assert result['counts']['pending'] == 3
+        # 2 servers × 3 pending = 6
+        assert result['counts']['pending'] == 6
         assert 'offline' not in result
 
 

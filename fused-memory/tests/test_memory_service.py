@@ -456,46 +456,57 @@ class TestSearch:
 
     @pytest.mark.asyncio
     async def test_search_graphiti_temporal_valid_at_only(self, service):
-        """When an edge has only valid_at set, temporal dict has valid_at ISO string and null invalid_at."""
-        from tests.conftest import MockEdge
+        """Graphiti search results with only valid_at set get temporal dict with null invalid_at."""
+        from tests.conftest import MockEdge, MockNode
 
-        dt = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
+        dt_valid = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
         service.graphiti.search = AsyncMock(return_value=[
-            MockEdge(fact='edge with valid_at only', valid_at=dt, invalid_at=None),
+            MockEdge(
+                fact='Service A started',
+                uuid='edge-temporal-1',
+                source_node=MockNode(name='Service A'),
+                valid_at=dt_valid,
+                invalid_at=None,
+            ),
         ])
         service.mem0.search = AsyncMock(return_value={'results': []})
 
-        results = await service.search(query='edge', project_id='test')
-
+        results = await service.search(
+            query='Service A',
+            project_id='test',
+            categories=['entities_and_relations'],
+        )
         assert len(results) == 1
-        temporal = results[0].temporal
-        assert temporal is not None
-        assert temporal['valid_at'] == '2024-01-15T12:00:00+00:00'
-        assert temporal['invalid_at'] is None
+        assert results[0].temporal is not None
+        assert results[0].temporal['valid_at'] == '2024-03-01T10:00:00+00:00'
+        assert results[0].temporal['invalid_at'] is None
 
     @pytest.mark.asyncio
     async def test_search_graphiti_only_invalid_at_returns_temporal(self, service):
-        """When only invalid_at is set (valid_at is None/falsy), temporal is still returned.
+        """Graphiti search results with only invalid_at set get temporal dict with null valid_at."""
+        from tests.conftest import MockEdge, MockNode
 
-        This tests the outer guard truthiness bug fix: the old code used
-        `if valid_at or invalid_at` which is correct for truthiness, but the helper
-        must handle the case where valid_at is falsy while invalid_at is truthy.
-        """
-        from tests.conftest import MockEdge
-
-        dt = datetime(2024, 6, 1, 0, 0, 0, tzinfo=UTC)
+        dt_invalid = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
         service.graphiti.search = AsyncMock(return_value=[
-            MockEdge(fact='expired edge', valid_at=None, invalid_at=dt),
+            MockEdge(
+                fact='Service B deprecated',
+                uuid='edge-temporal-2',
+                source_node=MockNode(name='Service B'),
+                valid_at=None,
+                invalid_at=dt_invalid,
+            ),
         ])
         service.mem0.search = AsyncMock(return_value={'results': []})
 
-        results = await service.search(query='expired', project_id='test')
-
+        results = await service.search(
+            query='Service B',
+            project_id='test',
+            categories=['entities_and_relations'],
+        )
         assert len(results) == 1
-        temporal = results[0].temporal
-        assert temporal is not None, 'temporal should be set when only invalid_at is present'
-        assert temporal['valid_at'] is None
-        assert temporal['invalid_at'] == '2024-06-01T00:00:00+00:00'
+        assert results[0].temporal is not None
+        assert results[0].temporal['valid_at'] is None
+        assert results[0].temporal['invalid_at'] == '2024-09-01T10:00:00+00:00'
 
 
 class TestDeleteMemory:
@@ -689,7 +700,7 @@ class TestGetEpisodes:
 
 class TestGetEntity:
     # ------------------------------------------------------------------
-    # step-1: baseline success regression test
+    # baseline success regression test
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
@@ -716,17 +727,15 @@ class TestGetEntity:
         assert result['edges'][0]['uuid'] == 'edge-uuid-1'
 
     # ------------------------------------------------------------------
-    # step-2: search_nodes failure — sibling search() task was invoked
+    # search_nodes failure — error propagates (sequential execution)
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_search_nodes_failure_raises_and_search_settles(self, service):
-        """When search_nodes raises, exception propagates AND search() was still called.
+    async def test_search_nodes_failure_raises(self, service):
+        """When search_nodes raises, exception propagates.
 
-        With asyncio.TaskGroup both coroutines are started concurrently, so search()
-        is invoked (AsyncMock called) even when search_nodes fails.  The sibling task
-        may be cancelled before it returns, but assert_called_once() is satisfied
-        because the coroutine was created and started.
+        With sequential execution, search() is not called because search_nodes
+        fails first.
         """
         service.graphiti.search_nodes = AsyncMock(
             side_effect=RuntimeError('search_nodes failed')
@@ -736,20 +745,16 @@ class TestGetEntity:
         with pytest.raises(RuntimeError, match='search_nodes failed'):
             await service.get_entity('entity', project_id='test')
 
-        # search() was invoked (task started) even though search_nodes failed
-        service.graphiti.search.assert_called_once()
-
     # ------------------------------------------------------------------
-    # step-3: search failure — sibling search_nodes() task was invoked
+    # search failure — search_nodes succeeds, search raises
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
     async def test_search_failure_raises_and_search_nodes_settles(self, service):
-        """When search() raises, exception propagates AND search_nodes() was still called.
+        """When search() raises, exception propagates AND search_nodes() was called.
 
-        With asyncio.TaskGroup search_nodes() is invoked (AsyncMock called) even when
-        search() fails.  The sibling task may be cancelled before it returns, but
-        assert_called_once() is satisfied because the coroutine was started.
+        With sequential execution, search_nodes() completes first, then search()
+        is called and raises.
         """
         service.graphiti.search_nodes = AsyncMock(return_value=[])
         service.graphiti.search = AsyncMock(
@@ -759,16 +764,16 @@ class TestGetEntity:
         with pytest.raises(RuntimeError, match='search failed'):
             await service.get_entity('entity', project_id='test')
 
-        # search_nodes() was invoked (task started) even though search() failed
+        # search_nodes() was called first (sequential)
         service.graphiti.search_nodes.assert_called_once()
 
     # ------------------------------------------------------------------
-    # step-4: both calls fail — first exception is re-raised
+    # both calls fail — first exception is re-raised
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
     async def test_both_failures_raises_first_exception(self, service):
-        """When both calls fail, get_entity raises (the first exception found)."""
+        """When search_nodes fails, get_entity raises (search is never called)."""
         service.graphiti.search_nodes = AsyncMock(
             side_effect=RuntimeError('search_nodes failed')
         )
@@ -780,154 +785,7 @@ class TestGetEntity:
             await service.get_entity('entity', project_id='test')
 
     # ------------------------------------------------------------------
-    # step-5: concurrency test using asyncio.Event gates
-    # ------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_concurrent_execution(self, service):
-        """Both calls must run concurrently, not sequentially.
-
-        Each side_effect sets its own event then waits on the other's.
-        If calls are sequential the first waiter never unblocks (inner
-        asyncio.wait_for times out with TimeoutError).
-        If calls are concurrent both events fire and both calls proceed.
-        """
-        import asyncio
-
-        nodes_started = asyncio.Event()
-        search_started = asyncio.Event()
-
-        async def search_nodes_gate(*args, **kwargs):
-            nodes_started.set()
-            await asyncio.wait_for(search_started.wait(), timeout=0.5)
-            return []
-
-        async def search_gate(*args, **kwargs):
-            search_started.set()
-            await asyncio.wait_for(nodes_started.wait(), timeout=0.5)
-            return []
-
-        service.graphiti.search_nodes = AsyncMock(side_effect=search_nodes_gate)
-        service.graphiti.search = AsyncMock(side_effect=search_gate)
-
-        # With sequential execution the first gate times out → TimeoutError.
-        # With concurrent execution both gates fire → result returned normally.
-        result = await asyncio.wait_for(
-            service.get_entity('entity', project_id='test'),
-            timeout=2.0,
-        )
-
-        assert result['nodes'] == []
-        assert result['edges'] == []
-
-    # ------------------------------------------------------------------
-    # step-7: error logging — warning emitted on failure
-    # ------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_failure_emits_warning_log(self, service):
-        """When one call fails, logger.warning is called with a message mentioning
-        the failed operation, before the exception is re-raised."""
-        from unittest.mock import patch
-
-        service.graphiti.search_nodes = AsyncMock(
-            side_effect=RuntimeError('node lookup error')
-        )
-        service.graphiti.search = AsyncMock(return_value=[])
-
-        with patch(
-            'fused_memory.services.memory_service.logger'
-        ) as mock_logger, pytest.raises(RuntimeError, match='node lookup error'):
-            await service.get_entity('entity', project_id='test')
-
-        mock_logger.warning.assert_called_once()
-        warning_args = mock_logger.warning.call_args[0]
-        # The warning message must mention RuntimeError or the exception message
-        full_message = ' '.join(str(a) for a in warning_args)
-        assert 'RuntimeError' in full_message or 'node lookup error' in full_message, (
-            f'Expected warning to mention the error, got: {full_message!r}'
-        )
-
-    # ------------------------------------------------------------------
-    # step-1(192): cancellation — search_nodes failure cancels blocking search()
-    # ------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_search_nodes_failure_cancels_blocking_sibling(self, service):
-        """When search_nodes raises, a forever-blocking search() is cancelled promptly.
-
-        With asyncio.gather(return_exceptions=True) the sibling is NOT cancelled — it
-        runs to completion (or blocks forever), causing asyncio.wait_for to time out
-        with TimeoutError instead of the expected RuntimeError.
-
-        With asyncio.TaskGroup the sibling is cancelled immediately when search_nodes
-        raises, so RuntimeError propagates well within the 2.0s timeout.
-        """
-        import asyncio
-
-        # Event that is never set — simulates a connection that hangs indefinitely.
-        never_resolves = asyncio.Event()
-
-        async def blocking_search(*args, **kwargs):
-            # Will block until cancelled (asyncio.CancelledError raised here).
-            await never_resolves.wait()
-            return []  # pragma: no cover
-
-        service.graphiti.search_nodes = AsyncMock(
-            side_effect=RuntimeError('search_nodes failed')
-        )
-        service.graphiti.search = AsyncMock(side_effect=blocking_search)
-
-        # With gather(return_exceptions=True): search() blocks forever → TimeoutError.
-        # With TaskGroup: search() cancelled immediately → RuntimeError propagates fast.
-        with pytest.raises(RuntimeError, match='search_nodes failed'):
-            await asyncio.wait_for(
-                service.get_entity('entity', project_id='test'),
-                timeout=2.0,
-            )
-
-    # ------------------------------------------------------------------
-    # step-3(192): cancellation — search() failure cancels blocking search_nodes()
-    # ------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_search_failure_cancels_blocking_sibling(self, service):
-        """When search() raises, a forever-blocking search_nodes() is cancelled promptly.
-
-        Mirror of test_search_nodes_failure_cancels_blocking_sibling — validates
-        that TaskGroup cancels in both directions, not just when the first task fails.
-
-        With asyncio.gather(return_exceptions=True) search_nodes() blocks forever,
-        causing wait_for to raise TimeoutError instead of the expected RuntimeError.
-
-        With asyncio.TaskGroup, search_nodes() is cancelled immediately and
-        RuntimeError propagates well within the 2.0s timeout.
-        """
-        import asyncio
-
-        # Event that is never set — simulates a connection that hangs indefinitely.
-        never_resolves = asyncio.Event()
-
-        async def blocking_search_nodes(*args, **kwargs):
-            # Will block until cancelled (asyncio.CancelledError raised here).
-            await never_resolves.wait()
-            return []  # pragma: no cover
-
-        service.graphiti.search_nodes = AsyncMock(side_effect=blocking_search_nodes)
-        service.graphiti.search = AsyncMock(
-            side_effect=RuntimeError('search failed')
-        )
-
-        # With gather(return_exceptions=True): search_nodes() blocks forever → TimeoutError.
-        # With TaskGroup: search_nodes() cancelled immediately → RuntimeError propagates fast.
-        with pytest.raises(RuntimeError, match='search failed'):
-            await asyncio.wait_for(
-                service.get_entity('entity', project_id='test'),
-                timeout=2.0,
-            )
-
-    # ------------------------------------------------------------------
-    # task-168: temporal serialization in edge_data
+    # temporal serialization in edge_data
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
@@ -1008,9 +866,9 @@ class TestSerializeTemporal:
     def test_only_invalid_at(self):
         """When only invalid_at is set, returns dict with valid_at=None and invalid_at string.
 
-        This covers the old truthiness bug: the original code used `if valid_at or invalid_at`
-        as the outer guard — which IS correct for truthiness. The fix ensures isoformat() is
-        used instead of str() for proper ISO 8601 format.
+        This covers the old truthiness bug: the original code used `if not valid_at and
+        not invalid_at` as the outer guard — which would return None for falsy-but-not-None
+        values. The fix uses identity checks (`is None`) for correctness.
         """
         dt = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
         result = _serialize_temporal(None, dt)

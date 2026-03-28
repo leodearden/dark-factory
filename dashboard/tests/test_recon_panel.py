@@ -204,35 +204,6 @@ class TestPartitionBurstState:
         assert len(active) == 1
         assert len(idle) == 0
 
-    def test_missing_state_key_defaults_to_idle(self):
-        from dashboard.app import partition_burst_state
-
-        # Agent dict has no 'state' key — should not raise KeyError; treated as idle
-        agents = [{'agent_id': 'a1', 'last_write_at': '2020-01-01T00:00:00+00:00'}]
-        active, idle = partition_burst_state(agents)
-        assert len(active) == 0
-        assert len(idle) == 1
-
-    def test_missing_last_write_at_key_treated_as_idle(self):
-        from dashboard.app import partition_burst_state
-
-        # Idle agent with no 'last_write_at' key — should not raise KeyError;
-        # treated as idle (except block falls through to idle.append)
-        agents = [{'agent_id': 'a1', 'state': 'idle'}]
-        active, idle = partition_burst_state(agents)
-        assert len(active) == 0
-        assert len(idle) == 1
-
-    def test_none_last_write_at_treated_as_idle(self):
-        from dashboard.app import partition_burst_state
-
-        # Idle agent with last_write_at=None — datetime.fromisoformat(None)
-        # raises TypeError which is caught; agent falls through to idle.
-        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': None}]
-        active, idle = partition_burst_state(agents)
-        assert len(active) == 0
-        assert len(idle) == 1
-
 
 class TestFormatDuration:
     """Tests for the format_duration Jinja2 filter (accepts seconds)."""
@@ -293,6 +264,7 @@ class TestFormatDuration:
 
         assert 'format_duration' in templates.env.filters
         assert templates.env.filters['format_duration'] is format_duration
+
 
 
 # --- Mock data for route tests ---
@@ -414,60 +386,17 @@ class TestReconRoute:
             html = client.get('/partials/recon').text
         assert '3 events buffered' in html
 
-    def test_burst_active_agents_displayed(self, client):
+    def test_burst_agents_displayed(self, client):
         with _patch_recon_data():
             html = client.get('/partials/recon').text
-        assert 'agent-1' in html  # bursting → active, always visible
-
-    def test_burst_idle_agents_in_html(self, client):
-        with _patch_recon_data():
-            html = client.get('/partials/recon').text
-        # Idle agent is in the DOM (hidden via Alpine x-show)
+        assert 'agent-1' in html
         assert 'agent-2' in html
-        # Verify agent-2 row carries x-show="showIdle" (Alpine.js visibility contract)
-        agent2_pos = html.find('agent-2')
-        assert agent2_pos != -1
-        # Find the enclosing <tr> by searching backward from agent-2's position
-        tr_start = html.rfind('<tr', 0, agent2_pos)
-        tr_end = html.find('</tr>', agent2_pos)
-        assert tr_start != -1 and tr_end != -1
-        tr_fragment = html[tr_start:tr_end]
-        assert 'x-show="showIdle"' in tr_fragment
 
     def test_burst_state_badges(self, client):
         with _patch_recon_data():
             html = client.get('/partials/recon').text
         assert 'bursting' in html
         assert 'idle' in html
-
-    def test_idle_toggle_shown(self, client):
-        with _patch_recon_data():
-            html = client.get('/partials/recon').text
-        assert 'data-testid="idle-toggle"' in html
-        assert '1 idle agent' in html
-
-    def test_idle_toggle_hidden_when_no_idle(self, client):
-        only_active = [MOCK_BURST_STATE[0]]  # just the bursting agent
-        with _patch_recon_data(burst_state=only_active):
-            html = client.get('/partials/recon').text
-        assert 'data-testid="idle-toggle"' not in html
-
-    def test_idle_toggle_plural(self, client):
-        """Multiple idle agents should show plural label."""
-        agents = [
-            MOCK_BURST_STATE[0],
-            {**MOCK_BURST_STATE[1], 'agent_id': 'agent-2'},
-            {**MOCK_BURST_STATE[1], 'agent_id': 'agent-3'},
-        ]
-        with _patch_recon_data(burst_state=agents):
-            html = client.get('/partials/recon').text
-        assert '2 idle agents' in html
-
-    def test_burst_table_has_max_height(self, client):
-        with _patch_recon_data():
-            html = client.get('/partials/recon').text
-        assert 'max-h-64' in html
-        assert 'overflow-y-auto' in html
 
     def test_watermark_labels(self, client):
         with _patch_recon_data():

@@ -1,16 +1,6 @@
 """System prompt for Stage 2: Task-Knowledge Sync."""
 
-from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
-
-_S2_PID = _PROJECT_ID_GUIDELINE.format(
-    tools=(
-        'search, add_memory, delete_memory, get_entity, get_episodes, get_status,'
-        ' get_tasks, get_task, set_task_status, add_task, update_task, add_subtask,'
-        ' remove_task, add_dependency, remove_dependency'
-    )
-)
-
-STAGE2_SYSTEM_PROMPT = f"""\
+STAGE2_SYSTEM_PROMPT = """\
 You are a Task-Knowledge Sync agent operating in sleep mode. Your role is to reconcile \
 task state against memory state, ensuring tasks and knowledge are mutually consistent.
 
@@ -50,6 +40,5 @@ Note: update Mem0 procedure AFTER task completes, not now.
 - Use search to understand the knowledge landscape around each task.
 - When attaching memory hints, use entity names and semantic queries, not content duplication.
 - Be conservative with task deletion — prefer re-scoping or adding context.
-{_S2_PID}
 - When you have completed your work, produce your final structured report as your response.
 """

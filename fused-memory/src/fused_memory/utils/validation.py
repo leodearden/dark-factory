@@ -10,9 +10,6 @@ Two styles:
 from __future__ import annotations
 
 import os
-import re
-
-_PROJECT_ID_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
 
 
 def validate_project_root(project_root: str) -> dict[str, str] | None:
@@ -26,24 +23,10 @@ def validate_project_root(project_root: str) -> dict[str, str] | None:
 
 
 def validate_project_id(project_id: str) -> dict[str, str] | None:
-    """Return an error dict if project_id is invalid, else None.
-
-    A valid project_id must be non-empty and contain only alphanumeric
-    characters, underscores, or hyphens (``^[a-zA-Z0-9_-]+$``).  This
-    prevents newlines, backticks, spaces, and other characters that could
-    inject content into reconciliation context prompts.
-    """
+    """Return an error dict if project_id is empty, else None."""
     if not project_id or not project_id.strip():
         return {
             'error': 'project_id is required and must be non-empty',
-            'error_type': 'ValidationError',
-        }
-    if not _PROJECT_ID_RE.fullmatch(project_id):
-        return {
-            'error': (
-                f'project_id contains invalid characters: {project_id!r}. '
-                'Only alphanumeric characters, underscores, and hyphens are allowed.'
-            ),
             'error_type': 'ValidationError',
         }
     return None

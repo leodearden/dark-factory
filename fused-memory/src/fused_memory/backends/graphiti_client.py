@@ -17,7 +17,6 @@ from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
-from fused_memory.backends.invalidation_guard import InvalidationGuard
 from fused_memory.config.schema import FusedMemoryConfig
 
 logger = logging.getLogger(__name__)
@@ -36,8 +35,6 @@ class GraphitiBackend:
         self._driver: FalkorDriver | None = None
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
-        self._guard_timeout: float = config.graphiti.invalidation_guard_timeout_seconds
-        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     async def initialize(self) -> None:
         """Create FalkorDriver + Graphiti client from unified config."""
@@ -133,7 +130,7 @@ class GraphitiBackend:
         ref_time = reference_time or datetime.now(UTC)
         if temporal_context is not None:
             source_description = f'[temporal:{temporal_context}] {source_description}'
-        result = await asyncio.wait_for(
+        return await asyncio.wait_for(
             client.add_episode(
                 name=name,
                 episode_body=content,
@@ -146,26 +143,6 @@ class GraphitiBackend:
             ),
             timeout=self._write_timeout,
         )
-        # Post-write invalidation guard: detect and reverse spurious invalidations.
-        # The guard is best-effort: failures must never poison a successful write.
-        # Fired as a detached background task so that outer cancellation (e.g. from
-        # the durable queue's asyncio.wait_for timeout) cannot propagate into the
-        # guard and leave queue items stuck in 'in_flight' state.
-        if self.config.graphiti.invalidation_guard_enabled and result is not None:
-            guard = InvalidationGuard(self)
-
-            async def _run_guard() -> None:
-                try:
-                    await asyncio.wait_for(guard.guard(result), timeout=self._guard_timeout)
-                except asyncio.CancelledError:
-                    logger.warning('InvalidationGuard cancelled (non-fatal)')
-                except Exception as exc:
-                    logger.error('InvalidationGuard failed (non-fatal): %s', exc)
-
-            task = asyncio.ensure_future(_run_guard())
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-        return result
 
     async def search(
         self,
@@ -387,59 +364,6 @@ class GraphitiBackend:
         await graph.query(delete_cypher, {'uuids': uuids})
         return found
 
-    async def restore_edge_validity(self, uuid: str) -> None:
-        """Clear invalid_at and expired_at for a single RELATES_TO edge.
-
-        Used by the post-write invalidation guard to reverse spurious temporal
-        invalidations. Idempotent — safe to call on already-valid edges.
-
-        Args:
-            uuid: UUID of the RELATES_TO edge to restore.
-        """
-        client = self._require_client()
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
-        cypher = (
-            'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
-            'SET e.invalid_at = null, e.expired_at = null'
-        )
-        await graph.query(cypher, {'uuid': uuid})
-
-    async def bulk_restore_edge_validity(self, uuids: list[str]) -> int:
-        """Clear invalid_at and expired_at for multiple RELATES_TO edges.
-
-        Uses a pre-count pattern (matching bulk_remove_edges) to return the
-        number of edges actually found and updated.
-
-        Args:
-            uuids: List of edge UUIDs to restore.
-
-        Returns:
-            Number of edges that matched (and were restored). 0 for empty list.
-        """
-        if not uuids:
-            return 0
-        client = self._require_client()
-        logger.info('Restoring validity for %d edge(s)', len(uuids))
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
-        # Pre-count: how many of the requested UUIDs actually exist as edges
-        count_cypher = (
-            'MATCH ()-[e:RELATES_TO]->() '
-            'WHERE e.uuid IN $uuids '
-            'RETURN count(e) AS found'
-        )
-        count_result = await graph.query(count_cypher, {'uuids': uuids})
-        found = int(count_result.result_set[0][0]) if count_result.result_set else 0
-        # Restore the edges
-        restore_cypher = (
-            'MATCH ()-[e:RELATES_TO]->() '
-            'WHERE e.uuid IN $uuids '
-            'SET e.invalid_at = null, e.expired_at = null'
-        )
-        await graph.query(restore_cypher, {'uuids': uuids})
-        return found
-
     async def get_node_text(self, uuid: str) -> tuple[str, str]:
         """Return (name, summary) for the Entity node with the given UUID.
 
@@ -557,11 +481,7 @@ class GraphitiBackend:
         return result.result_set[0][0] if result.result_set else 0
 
     async def close(self) -> None:
-        """Shut down the driver and cancel pending background tasks."""
-        # Cancel any pending guard tasks
-        for task in list(self._background_tasks):
-            task.cancel()
-        self._background_tasks.clear()
+        """Shut down the driver."""
         if self._driver is not None:
             with contextlib.suppress(Exception):
                 await self._driver.close()

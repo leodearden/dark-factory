@@ -8,6 +8,8 @@ from pathlib import Path
 
 _DEFAULT_FUSED_MEMORY_URLS = [
     'http://localhost:8002',
+    'http://localhost:8000',
+    'http://localhost:8001',
 ]
 
 

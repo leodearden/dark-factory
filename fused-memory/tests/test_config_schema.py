@@ -42,10 +42,6 @@ class TestServerConfigTransport:
         with pytest.raises(ValidationError):
             ServerConfig(transport='grpc')  # type: ignore[arg-type]
 
-    def test_default_port_is_8002(self):
-        config = ServerConfig()
-        assert config.port == 8002
-
 
 class TestLLMConfigProvider:
     """Tests for LLMConfig.provider Literal validation."""

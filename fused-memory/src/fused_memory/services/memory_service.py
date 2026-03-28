@@ -50,15 +50,15 @@ def _serialize_temporal(
 ) -> dict[str, str | None] | None:
     """Serialize valid_at/invalid_at to an ISO 8601 dict or None.
 
-    Returns None when both values are falsy (common case — no temporal context).
-    Uses .isoformat() instead of str() to guarantee the standard
-    'YYYY-MM-DDTHH:MM:SS+00:00' format for datetime objects.
+    Returns None when both values are None (common case — no temporal context).
+    Uses .isoformat() when available, falls back to str() for pre-serialized strings
+    or other types.
     """
-    if not valid_at and not invalid_at:
+    if valid_at is None and invalid_at is None:
         return None
     return {
-        'valid_at': valid_at.isoformat() if hasattr(valid_at, 'isoformat') else str(valid_at) if valid_at else None,
-        'invalid_at': invalid_at.isoformat() if hasattr(invalid_at, 'isoformat') else str(invalid_at) if invalid_at else None,
+        'valid_at': valid_at.isoformat() if hasattr(valid_at, 'isoformat') else str(valid_at) if valid_at is not None else None,
+        'invalid_at': invalid_at.isoformat() if hasattr(invalid_at, 'isoformat') else str(invalid_at) if invalid_at is not None else None,
     }
 
 
@@ -811,49 +811,17 @@ class MemoryService:
         name: str,
         project_id: str = 'main',
     ) -> dict:
-        """Entity lookup in Graphiti — returns nodes + edges.
-
-        Both Graphiti calls run concurrently via asyncio.TaskGroup (Python 3.11+
-        structured concurrency).  When either call raises, TaskGroup immediately
-        cancels the sibling task — preventing it from holding connections or
-        resources while waiting for a result that is no longer needed.
-
-        The ExceptionGroup raised by TaskGroup is unwrapped to re-raise
-        eg.exceptions[0], preserving the original exception type for callers.
-        """
-        nodes: list | None = None
-        edges: list | None = None
-
-        try:
-            async with asyncio.TaskGroup() as tg:
-                nodes_task = tg.create_task(
-                    self.graphiti.search_nodes(
-                        query=name,
-                        group_ids=[project_id],
-                        max_nodes=5,
-                    )
-                )
-                edges_task = tg.create_task(
-                    self.graphiti.search(
-                        query=name,
-                        group_ids=[project_id],
-                        num_results=10,
-                    )
-                )
-        except BaseExceptionGroup as eg:
-            # Log all failures before re-raising the first exception.
-            for exc in eg.exceptions:
-                logger.warning(
-                    'get_entity: Graphiti call failed: %s: %s',
-                    type(exc).__name__,
-                    exc,
-                )
-            raise eg.exceptions[0] from eg
-
-        nodes = nodes_task.result()
-        edges = edges_task.result()
-        assert isinstance(nodes, list)
-        assert isinstance(edges, list)
+        """Entity lookup in Graphiti — returns nodes + edges."""
+        nodes = await self.graphiti.search_nodes(
+            query=name,
+            group_ids=[project_id],
+            max_nodes=5,
+        )
+        edges = await self.graphiti.search(
+            query=name,
+            group_ids=[project_id],
+            num_results=10,
+        )
 
         node_data = []
         for n in nodes:

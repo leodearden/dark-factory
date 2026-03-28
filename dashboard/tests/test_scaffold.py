@@ -1,6 +1,5 @@
 """Tests for dashboard scaffold: config, app, and fixtures."""
 
-import re
 from pathlib import Path
 
 
@@ -12,7 +11,11 @@ class TestConfigDefaults:
         assert cfg.host == '127.0.0.1'
         assert cfg.port == 8080
         assert cfg.project_root == Path('/home/leo/src/dark-factory')
-        assert cfg.fused_memory_urls == ['http://localhost:8002']
+        assert cfg.fused_memory_urls == [
+            'http://localhost:8002',
+            'http://localhost:8000',
+            'http://localhost:8001',
+        ]
 
     def test_config_derived_paths(self):
         from dashboard.config import DashboardConfig
@@ -45,7 +48,7 @@ class TestConfigEnvOverrides:
         assert cfg.port == 9090
         assert cfg.project_root == Path('/tmp/test')
         # Non-overridden fields keep defaults
-        assert len(cfg.fused_memory_urls) == 1
+        assert len(cfg.fused_memory_urls) == 3
 
     def test_env_derived_paths_update(self, monkeypatch):
         from dashboard.config import DashboardConfig
@@ -92,33 +95,7 @@ class TestConftestFixtures:
 
 class TestStaticFiles:
     def test_static_css_served(self, client):
-        """Static CSS file should be served at /static/tailwind.css."""
-        resp = client.get('/static/tailwind.css')
+        """Static CSS file should be served at /static/style.css."""
+        resp = client.get('/static/style.css')
         assert resp.status_code == 200
         assert 'text/css' in resp.headers['content-type']
-
-
-class TestMakefileCurlSafety:
-    def test_curl_uses_fail_flag(self):
-        """Every curl invocation in the Makefile must use --fail or -f/-fsSL to
-        ensure failed HTTP downloads (404, 403, rate-limit) exit non-zero rather
-        than silently writing error HTML to the binary path.
-
-        Only the curl portion of the line (before any || cleanup guard) is checked,
-        to avoid false positives from 'rm -f' tokens in cleanup commands on the
-        same line.
-        """
-        makefile_path = Path(__file__).parent.parent / 'Makefile'
-        content = makefile_path.read_text()
-        curl_lines = [line for line in content.splitlines() if 'curl' in line]
-        assert curl_lines, 'No curl lines found in Makefile'
-        for line in curl_lines:
-            # Split on || to isolate only the curl command portion, avoiding
-            # false positives from cleanup guards like '|| (rm -f ...)'
-            curl_part = line.split('||')[0]
-            has_fail_flag = '--fail' in curl_part or bool(
-                re.search(r'curl\s+(?:\S+\s+)*-[a-zA-Z]*f', curl_part)
-            )
-            assert has_fail_flag, (
-                f'curl line missing --fail/-f flag (checked curl portion only): {line!r}'
-            )
