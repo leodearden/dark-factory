@@ -53,6 +53,7 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
         return value
 
     def get_field_value(self, field_name: str, field_info: Any) -> Any:
+        # Resolution handled in __call__; satisfy abstract interface with no-op.
         return None
 
     def __call__(self) -> dict[str, Any]:
