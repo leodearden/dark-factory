@@ -307,19 +307,23 @@ class TestGetMemoryStatus:
         assert result['offline'] is True
         assert 'error' in result
 
-    async def test_first_server_down_falls_through(self, dashboard_config):
-        """If first URL fails, tries subsequent URLs."""
+    async def test_first_server_down_falls_through(self, two_url_config):
+        """If first URL fails, tries subsequent URLs.
+
+        Uses a two-URL config [9000, 9001] so port 9000 is attempted first and
+        fails, proving the fallback to 9001 is actually exercised (not a trivial
+        pass where the first server already succeeds).
+        """
         from dashboard.data.memory import get_memory_status
 
-        call_count = 0
+        ports_seen: set[int] = set()
 
         def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal call_count
-            call_count += 1
             port = request.url.port
+            ports_seen.add(port)
 
-            # First server (port 8000) always fails
-            if port == 8000:
+            # First server (port 9000) always fails
+            if port == 9000:
                 raise httpx.ConnectError('refused')
 
             body = json.loads(request.content)
@@ -333,10 +337,12 @@ class TestGetMemoryStatus:
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            result = await get_memory_status(client, dashboard_config)
+            result = await get_memory_status(client, two_url_config)
 
         assert result == _STATUS_PAYLOAD
         assert 'offline' not in result
+        # Prove port 9000 was actually attempted before falling through to 9001
+        assert 9000 in ports_seen
 
 
 # ── get_queue_stats (aggregation) ──────────────────────────────
