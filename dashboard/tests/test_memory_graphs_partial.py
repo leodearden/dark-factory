@@ -150,6 +150,31 @@ class TestTimeseriesContainer:
         assert 'position:relative' in html or 'position: relative' in html
 
 
+class TestChartInitTiming:
+    """Tests for chart initialization timing fix (htmx:afterSettle instead of double-rAF)."""
+
+    def test_no_request_animation_frame(self, client):
+        """Double requestAnimationFrame pattern must be absent from rendered HTML."""
+        p1, p2, p3 = _patch_journal_app()
+        with p1, p2, p3:
+            html = client.get('/partials/memory-graphs').text
+        assert 'requestAnimationFrame' not in html
+
+    def test_htmx_after_settle_listener(self, client):
+        """htmx:afterSettle one-shot event listener must be present in rendered HTML."""
+        p1, p2, p3 = _patch_journal_app()
+        with p1, p2, p3:
+            html = client.get('/partials/memory-graphs').text
+        assert 'htmx:afterSettle' in html
+
+    def test_render_all_function_present(self, client):
+        """renderAll function must still be present after the timing fix."""
+        p1, p2, p3 = _patch_journal_app()
+        with p1, p2, p3:
+            html = client.get('/partials/memory-graphs').text
+        assert 'renderAll' in html
+
+
 class TestDoughnutDatalabels:
     """Tests for datalabels plugin configuration on doughnut charts."""
 
