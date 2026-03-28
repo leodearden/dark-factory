@@ -4182,10 +4182,11 @@
         "description": "DEFAULT_FUSED_MEMORY_URLS in dashboard/src/dashboard/config.py:9 is a mutable list constant. If any code accidentally calls .append()/.remove() on it directly, the mutation bleeds into all subsequent callers in the same process. Callers already defensively do `list(DEFAULT_FUSED_MEMORY_URLS)`, so changing to a tuple is safe.\n\nChange to: `DEFAULT_FUSED_MEMORY_URLS: Final = ('http://localhost:8002', 'http://localhost:8000', 'http://localhost:8001')`\n\nUpdate the pinned test assertion in test_scaffold.py to compare against a tuple (or use `list(DEFAULT_FUSED_MEMORY_URLS)` in the assertion).\n\nmemory_hints:\n- search: \"DEFAULT_FUSED_MEMORY_URLS mutable constant\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T05:17:19.354Z"
       },
       {
         "id": "250",
@@ -4360,7 +4361,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T05:17:17.033Z",
+      "lastModified": "2026-03-28T05:17:19.361Z",
       "taskCount": 243,
       "completedCount": 191,
       "tags": [
