@@ -581,6 +581,37 @@ class TestProjectIdValidation:
             )
         assert 'dark_factory' in captured_kwargs.get('payload', '')
 
+    @pytest.mark.asyncio
+    async def test_whitespace_watermark_project_id_treated_as_empty(self, mock_deps, caplog):
+        """Whitespace-only watermark project_id is stripped to '' by field_validator,
+        guard skips mismatch check, and emits a DEBUG log about skipping."""
+        import logging
+
+        from fused_memory.models.reconciliation import StageId, Watermark
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        with self._patch_stage(stage), caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.stages.base'):
+            result = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='   '),
+                prior_reports=[],
+                run_id='test-run-7',
+            )
+
+        # (a) run succeeds — whitespace stripped to '', guard treats as empty watermark
+        assert result is not None
+        # (b) result.stage is correct
+        assert result.stage == StageId.memory_consolidator
+        # (c) DEBUG log emitted about skipping mismatch check
+        assert any(
+            ('no project_id' in rec.message.lower() or 'skipping' in rec.message.lower())
+            for rec in caplog.records
+            if rec.levelno == logging.DEBUG
+        )
+
 
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""

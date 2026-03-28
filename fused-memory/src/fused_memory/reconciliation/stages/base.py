@@ -94,10 +94,17 @@ class BaseStage:
             raise ValueError(err['error'])
 
         # Validate watermark.project_id consistency (skip if watermark has no project_id)
-        if watermark.project_id and watermark.project_id != self.project_id:
-            raise ValueError(
-                f'project_id mismatch: stage has {self.project_id!r} but '
-                f'watermark has {watermark.project_id!r}'
+        wm_pid = watermark.project_id
+        if wm_pid:
+            if wm_pid != self.project_id:
+                raise ValueError(
+                    f'project_id mismatch: stage has {self.project_id!r} but '
+                    f'watermark has {wm_pid!r}'
+                )
+        else:
+            logger.debug(
+                'Watermark has no project_id — skipping mismatch check (stage project_id=%r)',
+                self.project_id,
             )
 
         payload = await self.assemble_payload(events, watermark, prior_reports)
