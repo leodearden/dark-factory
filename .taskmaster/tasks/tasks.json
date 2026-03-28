@@ -3919,11 +3919,11 @@
         "description": "test_refresh_indicator.py and test_recon_panel.py both use an identical fragile pattern to extract HTML opening tags via rfind('<')/index('>') string slicing. This pattern:\n1. Is duplicated 3 times across 2 files (test_refresh_indicator.py lines 58-62, 68-72; test_recon_panel.py ~line 749-777)\n2. Breaks on multi-line tags (rfind/index assumes single-line)\n3. Returns wrong content when rfind returns -1 (no '<' found)\n\nFix: Create a robust `_get_opening_tag(html, marker)` helper in conftest.py (or a test_helpers module) using regex: `re.search(r'<[^>]+' + re.escape(marker) + r'[^>]*>', html)`. Replace all 3 call sites.\n\nmemory_hints: search for \"dashboard test tag extraction helper\", get_entity \"test_refresh_indicator.py\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T04:29:04.886Z",
+        "updatedAt": "2026-03-28T04:32:08.735Z",
         "metadata": {
           "modules": [
             "dashboard/tests/test_helpers.py",
@@ -4118,7 +4118,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:32:07.342Z",
+      "lastModified": "2026-03-28T04:32:08.735Z",
       "taskCount": 225,
       "completedCount": 176,
       "tags": [
