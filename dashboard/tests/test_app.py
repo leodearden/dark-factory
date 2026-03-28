@@ -445,7 +445,7 @@ class TestMainModule:
 
 
 class TestAriaLivePollingsections:
-    """Tests that all three auto-polling sections have aria-live='polite'."""
+    """Tests that all five auto-polling sections have aria-live='polite'."""
 
     def test_memory_section_has_aria_live_polite(self, client):
         html = client.get('/').text
