@@ -156,6 +156,46 @@ class TestRequireProjectRoot:
         assert str(exc_info.value) == err_dict['error']
 
 
+class TestValidateProjectId:
+    """validate_project_id returns None for valid ids, error dict for empty/whitespace."""
+
+    def test_empty_string_returns_error(self):
+        result = validate_project_id('')
+        assert result is not None
+        assert 'error' in result
+        assert 'error_type' in result
+        assert result['error_type'] == 'ValidationError'
+
+    def test_whitespace_only_returns_error(self):
+        """Whitespace-only project_id must be rejected — the canonical contract includes .strip()."""
+        result = validate_project_id('   ')
+        assert result is not None
+        assert 'error' in result
+        assert result['error_type'] == 'ValidationError'
+
+    def test_tab_only_returns_error(self):
+        result = validate_project_id('\t')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_newline_only_returns_error(self):
+        result = validate_project_id('\n')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_valid_id_returns_none(self):
+        result = validate_project_id('dark_factory')
+        assert result is None
+
+    def test_valid_id_with_hyphens_returns_none(self):
+        result = validate_project_id('my-project-1')
+        assert result is None
+
+    def test_single_character_returns_none(self):
+        result = validate_project_id('x')
+        assert result is None
+
+
 class TestValidatorErrorDictShape:
     """All validate_* functions return dicts with exactly 'error' and 'error_type' keys."""
 
