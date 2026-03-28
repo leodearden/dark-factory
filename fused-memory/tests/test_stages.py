@@ -597,6 +597,8 @@ class TestProjectIdValidation:
         with self._patch_stage(stage, cli_side_effect=custom_cli):
             # The patched run_stage_via_cli should have custom_cli as its side_effect
             assert base_module.run_stage_via_cli.side_effect is custom_cli  # type: ignore[reportFunctionMemberAccess]
+            # Cross-assert: assemble_payload is also patched regardless of which parameter path is taken
+            assert isinstance(stage.assemble_payload, (AsyncMock, MagicMock))
 
 
 class TestRunIdValidation:
