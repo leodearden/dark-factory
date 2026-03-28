@@ -391,3 +391,65 @@ class TestReviews:
         assert 'missing_test' in text
         assert 'No test for empty input' in text
         assert 'c.py:10' in text
+
+    def test_aggregate_reviews_error_filtered(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer1', {
+            'reviewer': 'reviewer1',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'OK',
+        })
+        artifacts.write_review('reviewer2', {
+            'reviewer': 'reviewer2',
+            'verdict': 'ERROR',
+            'issues': [],
+            'summary': 'Reviewer error: 401 Unauthorized',
+        })
+
+        agg = artifacts.aggregate_reviews()
+        assert not agg.has_blocking_issues
+        assert agg.reviewer_errors == ['reviewer2']
+        assert 'reviewer1' in agg.reviews
+        assert 'reviewer2' not in agg.reviews
+        assert not agg.all_reviewers_errored
+
+    def test_aggregate_reviews_all_errors(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer1', {
+            'reviewer': 'reviewer1',
+            'verdict': 'ERROR',
+            'issues': [],
+            'summary': 'Reviewer error: 401',
+        })
+        artifacts.write_review('reviewer2', {
+            'reviewer': 'reviewer2',
+            'verdict': 'ERROR',
+            'issues': [],
+            'summary': 'Reviewer error: timeout',
+        })
+
+        agg = artifacts.aggregate_reviews()
+        assert agg.all_reviewers_errored
+        assert len(agg.reviewer_errors) == 2
+        assert not agg.reviews
+
+    def test_aggregate_reviews_error_plus_blocking(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer1', {
+            'reviewer': 'reviewer1',
+            'verdict': 'ERROR',
+            'issues': [],
+            'summary': 'Reviewer error: 401',
+        })
+        artifacts.write_review('reviewer2', {
+            'reviewer': 'reviewer2',
+            'verdict': 'ISSUES_FOUND',
+            'issues': [
+                {'severity': 'blocking', 'location': 'd.py:1',
+                 'category': 'bug', 'description': 'Null deref'},
+            ],
+            'summary': 'Bug found',
+        })
+
+        agg = artifacts.aggregate_reviews()
+        assert agg.has_blocking_issues
+        assert agg.reviewer_errors == ['reviewer1']
+        assert len(agg.blocking_issues) == 1

@@ -1446,3 +1446,139 @@ class TestDoneIsTerminal:
         escalations = queue.get_by_task(task_assignment.task_id)
         assert len(escalations) == 1
         assert escalations[0].category == 'task_failure'
+
+
+# ---------------------------------------------------------------------------
+# Tests: Reviewer Error Handling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReviewerErrors:
+    """Reviewer failures are detected, retried, and escalated."""
+
+    async def test_reviewer_error_blocks_task(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """A reviewer that persistently fails blocks the task."""
+        config.max_reviewer_retries = 1
+        config.reviewer_stagger_secs = 0.0  # no delay in tests
+
+        class ErrorReviewerStub(AgentStub):
+            def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+                if role == 'reviewer_test_analyst':
+                    # Simulate 401 — unparseable output, no structured_output
+                    return AgentResult(
+                        success=False,
+                        output='Failed to authenticate. API Error: 401',
+                        structured_output=None,
+                        cost_usd=0.0,
+                    )
+                review = _make_review(role)
+                return AgentResult(
+                    success=True, output=json.dumps(review),
+                    structured_output=review, cost_usd=0.10,
+                )
+
+        stub = ErrorReviewerStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert 'blocked' in scheduler.statuses.get(task_assignment.task_id, [])
+
+    async def test_all_reviewers_error_blocks_task(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """When every reviewer errors, the task is blocked."""
+        config.max_reviewer_retries = 0
+        config.reviewer_stagger_secs = 0.0
+
+        class AllErrorStub(AgentStub):
+            def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+                return AgentResult(
+                    success=False,
+                    output='Failed to authenticate. API Error: 401',
+                    structured_output=None,
+                    cost_usd=0.0,
+                )
+
+        stub = AllErrorStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        # Verify the review artifacts have ERROR verdicts
+        assert workflow.artifacts is not None
+        reviews = workflow.artifacts.read_reviews()
+        for review in reviews.values():
+            assert review['verdict'] == 'ERROR'
+
+    async def test_reviewer_retry_heals(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """A reviewer that fails then succeeds on retry lets the task pass."""
+        config.max_reviewer_retries = 2
+        config.reviewer_stagger_secs = 0.0
+
+        call_counts: dict[str, int] = {}
+
+        class RetryHealStub(AgentStub):
+            def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+                call_counts[role] = call_counts.get(role, 0) + 1
+                if role == 'reviewer_robustness' and call_counts[role] <= 1:
+                    # First call fails
+                    return AgentResult(
+                        success=False,
+                        output='Connection refused',
+                        structured_output=None,
+                        cost_usd=0.0,
+                    )
+                # All others (and retry) pass
+                review = _make_review(role)
+                return AgentResult(
+                    success=True, output=json.dumps(review),
+                    structured_output=review, cost_usd=0.10,
+                )
+
+        stub = RetryHealStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        # robustness was called twice (initial fail + retry success)
+        assert call_counts['reviewer_robustness'] == 2

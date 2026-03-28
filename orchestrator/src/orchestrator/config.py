@@ -261,6 +261,8 @@ class OrchestratorConfig(BaseSettings):
     max_execute_iterations: int = Field(default=10)
     max_verify_attempts: int = Field(default=5)
     max_review_cycles: int = Field(default=2)
+    reviewer_stagger_secs: float = Field(default=2.0)
+    max_reviewer_retries: int = Field(default=4)
 
     # Merge conflict reduction
     max_advance_attempts: int = Field(default=3)

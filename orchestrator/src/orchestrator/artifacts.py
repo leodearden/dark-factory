@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -22,6 +22,12 @@ class ReviewAggregation:
     blocking_issues: list[dict]
     suggestions: list[dict]
     reviews: dict[str, dict]
+    reviewer_errors: list[str] = field(default_factory=list)
+
+    @property
+    def all_reviewers_errored(self) -> bool:
+        """True when every reviewer returned ERROR (no usable reviews)."""
+        return bool(self.reviewer_errors) and not self.reviews
 
     def format_for_replan(self) -> str:
         """Format blocking issues for the architect to address."""
@@ -205,12 +211,20 @@ class TaskArtifacts:
         return reviews
 
     def aggregate_reviews(self) -> ReviewAggregation:
-        """Parse all reviews, separate blocking from suggestions."""
+        """Parse all reviews, separate blocking from suggestions.
+
+        Reviews with verdict ``ERROR`` are filtered into a separate list
+        so the workflow can detect incomplete reviewer coverage.
+        """
         reviews = self.read_reviews()
         blocking = []
         suggestions = []
+        errors = []
 
         for reviewer_name, review in reviews.items():
+            if review.get('verdict') == 'ERROR':
+                errors.append(reviewer_name)
+                continue
             for issue in review.get('issues', []):
                 enriched = {**issue, 'reviewer': reviewer_name}
                 if issue.get('severity') == 'blocking':
@@ -218,11 +232,13 @@ class TaskArtifacts:
                 else:
                     suggestions.append(enriched)
 
+        clean = {k: v for k, v in reviews.items() if k not in errors}
         return ReviewAggregation(
             has_blocking_issues=len(blocking) > 0,
             blocking_issues=blocking,
             suggestions=suggestions,
-            reviews=reviews,
+            reviews=clean,
+            reviewer_errors=errors,
         )
 
     def stamp_plan_provenance(self, session_id: str) -> None:

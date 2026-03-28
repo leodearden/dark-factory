@@ -36,6 +36,8 @@ class TestDefaults:
         assert config.max_execute_iterations == defaults['max_execute_iterations']
         assert config.max_verify_attempts == defaults['max_verify_attempts']
         assert config.max_review_cycles == defaults['max_review_cycles']
+        assert config.reviewer_stagger_secs == defaults['reviewer_stagger_secs']
+        assert config.max_reviewer_retries == defaults['max_reviewer_retries']
         assert config.models.architect == defaults['models']['architect']
         assert config.models.reviewer == defaults['models']['reviewer']
         assert config.budgets.implementer == defaults['budgets']['implementer']

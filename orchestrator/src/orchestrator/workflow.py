@@ -517,6 +517,12 @@ class TaskWorkflow:
             # REVIEW
             self.state = WorkflowState.REVIEW
             reviews = await self._review()
+            if reviews.reviewer_errors:
+                names = ', '.join(reviews.reviewer_errors)
+                return await self._mark_blocked(
+                    f'{len(reviews.reviewer_errors)} reviewer(s) failed with '
+                    f'infrastructure errors after retries: {names}'
+                )
             if not reviews.has_blocking_issues:
                 if self.escalation_queue and reviews.suggestions:
                     self._escalate_suggestions(reviews)
@@ -757,7 +763,7 @@ class TaskWorkflow:
                 logger.warning(f'Task {self.task_id}: debugger failed')
 
     async def _review(self):
-        """Run all 5 reviewers in parallel, aggregate results."""
+        """Run all 5 reviewers with stagger, retry errors."""
         assert self.worktree is not None and self.artifacts is not None
         base_commit = self.artifacts.read_base_commit()
         if base_commit:
@@ -765,18 +771,47 @@ class TaskWorkflow:
         else:
             diff = await self.git_ops.get_diff_from_main(self.worktree)
 
-        # Launch all reviewers concurrently
-        review_tasks = []
-        for reviewer_role in ALL_REVIEWERS:
-            review_tasks.append(self._run_reviewer(reviewer_role, diff))
+        stagger = self.config.reviewer_stagger_secs
 
-        results = await asyncio.gather(*review_tasks, return_exceptions=True)
+        # Staggered launch — spread OAuth session creation
+        async def _staggered(idx: int, role: AgentRole):
+            if idx > 0:
+                await asyncio.sleep(idx * stagger)
+            return await self._run_reviewer(role, diff)
 
-        # Collect successful reviews
+        tasks = [_staggered(i, r) for i, r in enumerate(ALL_REVIEWERS)]
+        results = list(await asyncio.gather(*tasks, return_exceptions=True))
+
+        # Retry ERROR verdicts and exceptions
+        for attempt in range(self.config.max_reviewer_retries):
+            error_indices = [
+                i for i, r in enumerate(results)
+                if isinstance(r, Exception)
+                or (isinstance(r, dict) and r.get('verdict') == 'ERROR')
+            ]
+            if not error_indices:
+                break
+            logger.info(
+                f'Task {self.task_id}: retrying {len(error_indices)} failed '
+                f'reviewer(s) (attempt {attempt + 1}/{self.config.max_reviewer_retries})'
+            )
+            for i in error_indices:
+                await asyncio.sleep(stagger)
+                try:
+                    results[i] = await self._run_reviewer(ALL_REVIEWERS[i], diff)
+                except Exception as exc:
+                    results[i] = exc
+
+        # Write results — synthesize ERROR for persistent exceptions
         for role, result in zip(ALL_REVIEWERS, results, strict=True):
             if isinstance(result, Exception):
-                logger.error(f'Reviewer {role.name} failed: {result}')
-                continue
+                logger.error(f'Reviewer {role.name} failed after retries: {result}')
+                result = {
+                    'reviewer': role.name,
+                    'verdict': 'ERROR',
+                    'issues': [],
+                    'summary': f'Reviewer exception: {result}',
+                }
             if isinstance(result, dict):
                 self.artifacts.write_review(role.name, result)
 
@@ -823,12 +858,15 @@ class TaskWorkflow:
         try:
             return json.loads(result.output)
         except (json.JSONDecodeError, TypeError):
-            logger.warning(f'Reviewer {role.name} did not produce valid JSON')
+            logger.warning(
+                f'Reviewer {role.name} produced unparseable output '
+                f'(success={result.success}): {result.output[:200]}'
+            )
             return {
                 'reviewer': role.name,
-                'verdict': 'PASS',
+                'verdict': 'ERROR',
                 'issues': [],
-                'summary': f'Reviewer output could not be parsed: {result.output[:200]}',
+                'summary': f'Reviewer error: {result.output[:200]}',
             }
 
     async def _replan(self, reviews) -> None:
