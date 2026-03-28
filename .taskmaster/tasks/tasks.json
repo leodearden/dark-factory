@@ -3221,7 +3221,18 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-28T14:56:39.779Z"
+        "updatedAt": "2026-03-28T14:56:39.779Z",
+        "metadata": {
+          "files": [
+            "fused-memory/src/fused_memory/memory_service.py",
+            "fused-memory/src/fused_memory/graphiti_client.py",
+            "fused-memory/tests/test_memory_service.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory",
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 189,
@@ -4138,7 +4149,17 @@
           "185"
         ],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/base.html",
+            "dashboard/tests/test_app.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates",
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 241,
