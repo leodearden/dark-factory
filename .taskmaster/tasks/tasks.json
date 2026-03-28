@@ -4146,10 +4146,11 @@
         "description": "TestRunIdValidation duplicates ~40 lines of infrastructure verbatim from TestProjectIdValidation: _fake_assemble_payload, _fake_run_stage_via_cli, mock_deps fixture, and _patch_stage. Additionally, several test assertions are weak:\n\n1. Extract shared helpers into a base class (e.g. BaseStageValidationTest) or module-level fixtures. Both test classes inherit/use these without loss of isolation.\n2. Add `match='run_id'` to `test_run_raises_on_injection_run_id` (currently bare `pytest.raises(ValueError)`).\n3. In `test_recon_context_includes_run_id`, assert the key exists (`assert 'payload' in captured_kwargs`) before containment check, and assert specific structured locations (`f'run_id: {run_id_value}'`) rather than bare `in`.\n4. Parameterize the injection test with distinct vectors (lone newline, lone backtick, semicolon) instead of one combined string.\n\nmemory_hint: search \"test infrastructure duplication validation helpers\" for context.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T05:07:14.194Z"
       },
       {
         "id": "247",
@@ -4301,7 +4302,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T05:07:13.401Z",
+      "lastModified": "2026-03-28T05:07:14.194Z",
       "taskCount": 238,
       "completedCount": 187,
       "tags": [
