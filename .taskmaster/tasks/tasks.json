@@ -3824,11 +3824,11 @@
         "description": "MemoryConsolidator class-level defaults (episode_limit=500, memory_limit=1000) silently encode opus-tier values. The harness always overrides them (harness.py:418-419) before run(), but if that assignment is ever skipped or reordered, the stage silently runs with opus limits even in sonnet-tier cycles.\n\nChanges needed:\n1. Change MemoryConsolidator defaults to sentinel values (None or 0) in memory_consolidator.py:26-27\n2. Add validation in assemble_payload (or run()) that raises if limits haven't been explicitly set by the harness\n3. Update test_default_limits to expect the new sentinel values\n4. Ensure harness tests cover the assignment path (may overlap with tier selection integration tests)\n\nThis aligns with the project's stability focus — making implicit contracts explicit prevents silent misconfiguration.\n\nMemory hints: search \"MemoryConsolidator default limits\" and get_entity \"MemoryConsolidator\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-28T01:04:45.114Z",
+        "updatedAt": "2026-03-28T15:25:36.070Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
@@ -3879,11 +3879,11 @@
         "description": "Three test additions for fused-memory config loading in test_config_schema.py:\n\n1. **End-to-end env var expansion test**: Write a YAML file with a `${VAR}` placeholder (e.g. `server: {port: '${MY_PORT}'}`), set the env var with monkeypatch, construct `FusedMemoryConfig()`, and assert the expanded value propagates correctly. This exercises `_expand_env_vars` through the full settings machinery, not just in isolation.\n\n2. **Env-over-YAML priority test**: Write a YAML file with `server.port: 9999`, set `SERVER__PORT=7777` (pydantic-settings `__` delimiter), construct `FusedMemoryConfig()`, and assert `config.server.port == 7777`. This validates the `settings_customise_sources` priority chain (init > env > yaml).\n\n3. **Default retention assertions**: In `test_yaml_file_values_loaded`, add assertions that unmentioned config sections retain defaults (e.g. `assert config.embedder.provider == 'openai'`, `assert config.server.host == '0.0.0.0'`). Guards against YAML loading silently clobbering defaults with null/empty.\n\nSource: review-cycle task 205 suggestions from reviewer_test_analyst.\n\nmemory_hints:\n- search: \"fused-memory config schema test coverage\"\n- search: \"YamlSettingsSource pydantic settings config loading\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T04:19:19.363Z",
+        "updatedAt": "2026-03-28T15:25:36.094Z",
         "metadata": {
           "modules": [
             "fused-memory/tests/test_config_schema.py"
@@ -5032,7 +5032,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T15:25:36.048Z",
+      "lastModified": "2026-03-28T15:25:36.095Z",
       "taskCount": 268,
       "completedCount": 207,
       "tags": [
