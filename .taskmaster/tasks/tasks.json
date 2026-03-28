@@ -4206,10 +4206,11 @@
         "description": "Several test classes in test_app.py have copy-paste test methods that differ only in the URL string. Additionally, TestMorphSwap's hx-swap assertion is page-wide (always passes trivially since multiple sections have it), and TestIndex duplicates hx-get presence checks already done in TestMorphSwap.\n\nSteps:\n1. Parameterize TestMorphSwap: collapse 5 near-identical tests into @pytest.mark.parametrize over the 5 partial URLs. Use proximity-based slicing (find hx-get index, slice window, assert hx-swap within window) instead of page-wide assertion.\n2. Parameterize TestIndex hx-get tests: collapse 5 test_get_root_htmx_* methods into a single parameterized test. Consider whether these are now redundant with the strengthened TestMorphSwap and can be removed.\n3. Remove the redundant page-wide hx-swap assertion from individual tests — it's already covered by TestIdiomorphExtension and test_no_plain_innerhtml_on_polling_sections.\n\nmemory_hints: search for \"dashboard test parameterization pattern\", get_entity \"TestMorphSwap\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T05:27:42.904Z"
       },
       {
         "id": "252",
@@ -4373,7 +4374,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T05:27:41.731Z",
+      "lastModified": "2026-03-28T05:27:42.906Z",
       "taskCount": 244,
       "completedCount": 193,
       "tags": [
