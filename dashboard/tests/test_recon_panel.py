@@ -255,6 +255,21 @@ class TestPartitionBurstState:
         assert len(active) == 0
         assert len(idle) == 1
 
+    def test_explicit_idle_missing_last_write_at(self):
+        # Agent with explicit state='idle' and NO 'last_write_at' key should land
+        # in idle list without raising KeyError.
+        # Same root cause as test_bare_agent_dict_no_state_no_last_write_at:
+        # agent['last_write_at'] on line 59 raises KeyError for any agent that
+        # reaches the timestamp check with no 'last_write_at' in the dict.
+        # Fix: agent.get('last_write_at') returns None → _parse_utc(None) raises
+        # TypeError (already caught) → falls through to idle.append(agent).
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'x', 'state': 'idle'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
 
 class TestFormatDuration:
     """Tests for the format_duration Jinja2 filter (accepts seconds)."""
