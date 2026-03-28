@@ -238,3 +238,65 @@ class TestPollingSectionStructure:
         )
         assert '<section' in html
         assert '</section>' in html
+
+
+class TestIndexHtmlUsesMacro:
+    """Structural tests verifying index.html imports and uses polling_section."""
+
+    _tmpl_dir = (
+        Path(__file__).parent.parent / 'src' / 'dashboard' / 'templates'
+    )
+
+    def _index_content(self) -> str:
+        return (self._tmpl_dir / 'index.html').read_text()
+
+    def test_index_imports_polling_section(self):
+        content = self._index_content()
+        assert "from 'macros/polling_section.html' import polling_section" in content
+
+    def test_index_has_call_block_for_orchestrators(self):
+        content = self._index_content()
+        assert "polling_section('orchestrators'" in content or 'polling_section("orchestrators"' in content
+
+    def test_index_has_call_block_for_performance(self):
+        content = self._index_content()
+        assert "polling_section('performance'" in content or 'polling_section("performance"' in content
+
+    def test_index_has_call_block_for_memory(self):
+        content = self._index_content()
+        # 'memory' appears in both 'memory' and 'memory-graphs'; check for standalone
+        assert "polling_section('memory'" in content or 'polling_section("memory"' in content
+
+    def test_index_has_call_block_for_memory_graphs(self):
+        content = self._index_content()
+        assert "polling_section('memory-graphs'" in content or 'polling_section("memory-graphs"' in content
+
+    def test_index_has_call_block_for_recon(self):
+        content = self._index_content()
+        assert "polling_section('recon'" in content or 'polling_section("recon"' in content
+
+    def test_index_has_five_call_blocks_total(self):
+        content = self._index_content()
+        # Count occurrences of the macro call pattern
+        count = content.count('polling_section(')
+        assert count >= 5, f'Expected at least 5 polling_section calls, got {count}'
+
+    def test_orchestrators_call_passes_correct_hx_get(self):
+        content = self._index_content()
+        assert '/partials/orchestrators' in content
+
+    def test_orchestrators_call_passes_correct_trigger(self):
+        content = self._index_content()
+        assert 'every 10s' in content
+
+    def test_performance_call_passes_correct_timeout(self):
+        content = self._index_content()
+        assert '12000' in content
+
+    def test_memory_graphs_call_passes_correct_trigger(self):
+        content = self._index_content()
+        assert 'every 60s' in content
+
+    def test_recon_call_passes_correct_trigger(self):
+        content = self._index_content()
+        assert 'every 15s' in content
