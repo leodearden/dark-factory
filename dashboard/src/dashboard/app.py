@@ -36,6 +36,7 @@ from dashboard.data.reconciliation import (
     get_recent_runs,
     get_watermarks,
 )
+from dashboard.data.utils import parse_utc
 from dashboard.data.write_journal import (
     get_agent_breakdown,
     get_memory_timeseries,
@@ -52,11 +53,9 @@ def timeago(value: str | None) -> str:
     if value is None:
         return 'never'
     try:
-        parsed = datetime.fromisoformat(value)
+        parsed = parse_utc(value)
     except (ValueError, TypeError):
         return 'never'
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
     delta = datetime.now(UTC) - parsed
     total_seconds = max(delta.total_seconds(), 0)
     total_minutes = int(total_seconds // 60)
