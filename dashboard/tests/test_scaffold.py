@@ -127,7 +127,7 @@ class TestConftestFixtures:
 
 class TestStaticFiles:
     def test_static_css_served(self, client):
-        """Static CSS file should be served at /static/style.css."""
-        resp = client.get('/static/style.css')
+        """Static CSS file should be served at /static/tailwind.css."""
+        resp = client.get('/static/tailwind.css')
         assert resp.status_code == 200
         assert 'text/css' in resp.headers['content-type']
