@@ -2,7 +2,7 @@
 
 import json
 from contextlib import contextmanager
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from shared.cli_invoke import AgentResult
