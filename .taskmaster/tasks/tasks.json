@@ -3625,7 +3625,7 @@
         "description": "Add character-set validation for `run_id` in `BaseStage.run()` before it is interpolated into the reconciliation context prompt. Currently `project_id` is validated but `run_id` is not, creating an asymmetry.\n\nIn practice `run_id` is always `str(uuid4())` from harness.py, so there's no current exploit. But `BaseStage.run()` accepts `run_id: str` with no enforcement, leaving a latent injection point if the calling convention changes.\n\nFix: add a `validate_run_id` (or reuse `_PROJECT_ID_RE`-style check for `[a-zA-Z0-9_-]+`) and call it at the top of `BaseStage.run()`, consistent with the `project_id` guard on line 93.\n\nmemory_hint: search \"prompt injection fix routing layer\" for prior pattern; search \"run_id injected into CLI agent payload\" for context.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -3638,7 +3638,8 @@
             "fused-memory/src/fused_memory/reconciliation/stages",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-28T04:16:13.201Z"
       },
       {
         "id": "213",
@@ -4010,7 +4011,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:16:12.498Z",
+      "lastModified": "2026-03-28T04:16:13.201Z",
       "taskCount": 218,
       "completedCount": 172,
       "tags": [
