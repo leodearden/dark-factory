@@ -6,6 +6,9 @@ from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
 
 
 class TestConfigDefaults:
+    def test_default_fused_memory_urls_is_immutable(self):
+        assert isinstance(DEFAULT_FUSED_MEMORY_URLS, tuple)
+
     def test_default_fused_memory_urls_values(self):
         assert DEFAULT_FUSED_MEMORY_URLS == ['http://localhost:8002']
 
