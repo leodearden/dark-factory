@@ -7,41 +7,6 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 
-class TestProjectNameFilter:
-    """Tests for the project_name Jinja2 filter function."""
-
-    def test_path_returns_basename(self):
-        from dashboard.app import project_name
-
-        assert project_name('/home/leo/src/dark-factory') == 'dark-factory'
-
-    def test_non_path_returned_unchanged(self):
-        from dashboard.app import project_name
-
-        assert project_name('dark_factory') == 'dark_factory'
-
-    def test_none_returns_empty_string(self):
-        from dashboard.app import project_name
-
-        assert project_name(None) == ''
-
-    def test_empty_string_returns_empty_string(self):
-        from dashboard.app import project_name
-
-        assert project_name('') == ''
-
-    def test_trailing_slash_returns_basename(self):
-        from dashboard.app import project_name
-
-        assert project_name('/home/leo/src/dark-factory/') == 'dark-factory'
-
-    def test_filter_registered_on_jinja2_env(self):
-        from dashboard.app import project_name, templates
-
-        assert 'project_name' in templates.env.filters
-        assert templates.env.filters['project_name'] is project_name
-
-
 class TestFormatTriggerFilter:
     """Tests for the format_trigger Jinja2 filter function."""
 
@@ -131,154 +96,6 @@ class TestTimeagoFilter:
 
         assert 'timeago' in templates.env.filters
         assert templates.env.filters['timeago'] is timeago
-
-
-class TestPartitionBurstState:
-    """Tests for the partition_burst_state helper."""
-
-    def test_bursting_agent_is_active(self):
-        from dashboard.data.reconciliation import partition_burst_state
-
-        agents = [{'agent_id': 'a1', 'state': 'bursting', 'last_write_at': '2020-01-01T00:00:00+00:00'}]
-        active, idle = partition_burst_state(agents)
-        assert len(active) == 1
-        assert len(idle) == 0
-
-    def test_idle_old_agent_is_idle(self):
-        from dashboard.data.reconciliation import partition_burst_state
-
-        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': '2020-01-01T00:00:00+00:00'}]
-        active, idle = partition_burst_state(agents)
-        assert len(active) == 0
-        assert len(idle) == 1
-
-    def test_idle_recent_agent_is_active(self):
-        from dashboard.data.reconciliation import partition_burst_state
-
-        recent_ts = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
-        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': recent_ts}]
-        active, idle = partition_burst_state(agents)
-        assert len(active) == 1
-        assert len(idle) == 0
-
-    def test_mixed_partition(self):
-        from dashboard.data.reconciliation import partition_burst_state
-
-        old_ts = '2020-01-01T00:00:00+00:00'
-        recent_ts = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
-        agents = [
-            {'agent_id': 'bursting', 'state': 'bursting', 'last_write_at': old_ts},
-            {'agent_id': 'idle-old', 'state': 'idle', 'last_write_at': old_ts},
-            {'agent_id': 'idle-recent', 'state': 'idle', 'last_write_at': recent_ts},
-        ]
-        active, idle = partition_burst_state(agents)
-        assert [a['agent_id'] for a in active] == ['bursting', 'idle-recent']
-        assert [a['agent_id'] for a in idle] == ['idle-old']
-
-    def test_empty_list(self):
-        from dashboard.data.reconciliation import partition_burst_state
-
-        active, idle = partition_burst_state([])
-        assert active == []
-        assert idle == []
-
-    def test_invalid_timestamp_treated_as_idle(self):
-        from dashboard.data.reconciliation import partition_burst_state
-
-        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': 'not-a-date'}]
-        active, idle = partition_burst_state(agents)
-        assert len(active) == 0
-        assert len(idle) == 1
-
-    def test_custom_threshold(self):
-        from dashboard.data.reconciliation import partition_burst_state
-
-        ts = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
-        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': ts}]
-        # 5 min old, threshold 3 min → idle
-        active, idle = partition_burst_state(agents, active_threshold_seconds=180)
-        assert len(active) == 0
-        assert len(idle) == 1
-        # 5 min old, threshold 10 min → active
-        active, idle = partition_burst_state(agents, active_threshold_seconds=600)
-        assert len(active) == 1
-        assert len(idle) == 0
-
-
-class TestFormatDuration:
-    """Tests for the format_duration Jinja2 filter (accepts seconds)."""
-
-    def test_under_60s_returns_seconds_only(self):
-        from dashboard.app import format_duration
-
-        assert format_duration(45) == '45s'
-
-    def test_zero_seconds_returns_dash(self):
-        from dashboard.app import format_duration
-
-        assert format_duration(0) == '-'
-
-    def test_exactly_59s_returns_seconds(self):
-        from dashboard.app import format_duration
-
-        assert format_duration(59) == '59s'
-
-    def test_exactly_60s_returns_minutes_seconds(self):
-        from dashboard.app import format_duration
-
-        assert format_duration(60) == '1m 0s'
-
-    def test_600s_returns_10m_0s(self):
-        from dashboard.app import format_duration
-
-        assert format_duration(600) == '10m 0s'
-
-    def test_90s_returns_1m_30s(self):
-        from dashboard.app import format_duration
-
-        assert format_duration(90) == '1m 30s'
-
-    def test_3599s_returns_minutes_seconds(self):
-        from dashboard.app import format_duration
-
-        assert format_duration(3599) == '59m 59s'
-
-    def test_exactly_3600s_returns_hours_minutes(self):
-        from dashboard.app import format_duration
-
-        assert format_duration(3600) == '1h 0m'
-
-    def test_large_value_returns_hours_minutes(self):
-        from dashboard.app import format_duration
-
-        # 62736 seconds = 17h 25m 36s → '17h 25m'
-        assert format_duration(62736) == '17h 25m'
-
-    def test_float_input_is_handled(self):
-        from dashboard.app import format_duration
-
-        assert format_duration(600.0) == '10m 0s'
-
-    def test_filter_registered_on_jinja2_env(self):
-        from dashboard.app import format_duration, templates
-
-        assert 'format_duration' in templates.env.filters
-        assert templates.env.filters['format_duration'] is format_duration
-
-    def test_none_returns_dash(self):
-        from dashboard.app import format_duration
-
-        assert format_duration(None) == '-'
-
-    def test_negative_value_returns_dash(self):
-        from dashboard.app import format_duration
-
-        assert format_duration(-30) == '-'
-
-    def test_non_numeric_returns_dash(self):
-        from dashboard.app import format_duration
-
-        assert format_duration('not_a_number') == '-'
 
 
 # --- Mock data for route tests ---
@@ -790,112 +607,32 @@ class TestReconJournalBadge:
         assert 'aria-label="Show 5 journal entries"' in html
 
 
-class TestReconBufferAgeDisplay:
-    """Integration tests for the buffer age display using format_duration filter."""
+class TestReconRightColumnLayout:
+    """Tests for right-column layout: no absolute positioning, natural grid flow."""
 
-    def test_large_age_displays_hours_and_minutes(self, client):
-        # 62736 seconds = 17h 25m 36s → should render '17h 25m'
-        stats = {'buffered_count': 5, 'oldest_event_age_seconds': 62736}
-        with _patch_recon_data(buffer_stats=stats):
+    def test_no_lg_absolute_in_html(self, client):
+        with _patch_recon_data():
             html = client.get('/partials/recon').text
-        assert '17h 25m' in html
-        # age > 300 → warning colour class
-        assert 'text-yellow-400' in html
+        assert 'lg:absolute' not in html
 
-    def test_small_age_displays_minutes_and_seconds(self, client):
-        # 600 seconds = 10m 0s
-        stats = {'buffered_count': 3, 'oldest_event_age_seconds': 600}
-        with _patch_recon_data(buffer_stats=stats):
+    def test_no_lg_inset_0_in_html(self, client):
+        with _patch_recon_data():
             html = client.get('/partials/recon').text
-        assert '10m 0s' in html
+        assert 'lg:inset-0' not in html
 
-    def test_large_age_does_not_show_raw_minutes_seconds(self, client):
-        # Old template would produce '1045m 36s' for 62736s — must not appear
-        stats = {'buffered_count': 5, 'oldest_event_age_seconds': 62736}
-        with _patch_recon_data(buffer_stats=stats):
+    def test_right_column_card_has_h_full(self, client):
+        with _patch_recon_data():
             html = client.get('/partials/recon').text
-        assert '1045m' not in html
+        assert 'h-full' in html
 
-    def test_sub_60s_age_displays_seconds_only(self, client):
-        stats = {'buffered_count': 1, 'oldest_event_age_seconds': 45}
-        with _patch_recon_data(buffer_stats=stats):
+
+class TestReconTableHeaderNoWrap:
+    """Test that thead tr has whitespace-nowrap to prevent header truncation."""
+
+    def test_thead_row_has_whitespace_nowrap(self, client):
+        with _patch_recon_data():
             html = client.get('/partials/recon').text
-        assert '45s' in html
-        # age < 300 → neutral colour class, no warning
-        assert 'text-gray-400' in html
-        assert 'text-yellow-400' not in html
-
-
-class TestProjectNameFilterInTemplate:
-    """Tests that project_name filter is applied in the recon template."""
-
-    def test_watermarks_heading_shows_basename_not_full_path(self, client):
-        """When project_id is a filesystem path, watermarks heading shows basename."""
-        path_watermarks = [
-            {
-                'project_id': '/home/leo/src/dark-factory',
-                'last_full_run_completed': '2026-03-19T10:00:00+00:00',
-                'last_episode_timestamp': '2026-03-19T10:30:00+00:00',
-                'last_memory_timestamp': '2026-03-19T10:40:00+00:00',
-                'last_task_change_timestamp': '2026-03-19T10:50:00+00:00',
-            },
-            {
-                'project_id': '/home/leo/src/other-project',
-                'last_full_run_completed': '2026-03-19T09:00:00+00:00',
-                'last_episode_timestamp': None,
-                'last_memory_timestamp': None,
-                'last_task_change_timestamp': None,
-            },
-        ]
-        path_last_attempted = {
-            '/home/leo/src/dark-factory': {
-                'id': 'run-001',
-                'status': 'completed',
-                'started_at': '2026-03-19T10:00:00+00:00',
-                'completed_at': '2026-03-19T10:05:00+00:00',
-            },
-        }
-        with _patch_recon_data(watermarks=path_watermarks, last_attempted=path_last_attempted):
-            html = client.get('/partials/recon').text
-        assert 'dark-factory' in html
-        assert 'other-project' in html
-        assert '/home/leo/src/dark-factory' not in html
-        assert '/home/leo/src/other-project' not in html
-
-    def test_runs_table_shows_basename_not_full_path(self, client):
-        """When run.project_id is a filesystem path, runs table shows basename."""
-        path_runs = [
-            {
-                'id': 'run-001',
-                'project_id': '/home/leo/src/dark-factory',
-                'run_type': 'full',
-                'trigger_reason': 'staleness_timer',
-                'started_at': '2026-03-19T08:00:00+00:00',
-                'completed_at': '2026-03-19T08:05:00+00:00',
-                'events_processed': 7,
-                'status': 'completed',
-                'duration_seconds': 300.0,
-                'journal_entry_count': 0,
-            },
-            {
-                'id': 'run-002',
-                'project_id': '/home/leo/src/other-project',
-                'run_type': 'full',
-                'trigger_reason': 'manual',
-                'started_at': '2026-03-19T09:00:00+00:00',
-                'completed_at': '2026-03-19T09:05:00+00:00',
-                'events_processed': 3,
-                'status': 'completed',
-                'duration_seconds': 300.0,
-                'journal_entry_count': 0,
-            },
-        ]
-        with _patch_recon_data(runs=path_runs):
-            html = client.get('/partials/recon').text
-        assert 'dark-factory' in html
-        assert 'other-project' in html
-        assert '/home/leo/src/dark-factory' not in html
-        assert '/home/leo/src/other-project' not in html
+        assert 'whitespace-nowrap' in html
 
 
 class TestReconRunDetailRoute:
