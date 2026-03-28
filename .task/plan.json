@@ -67,6 +67,20 @@
       "description": "Store setInterval reference in base.html. Change bare 'setInterval(function...' to 'var refreshTimer = setInterval(function...' to store the interval ID for potential future cleanup.",
       "status": "done",
       "commit": "6c1080bc"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Fix tautological assertion in test_after_swap_clears_failure_flag (line 148): replace `assert 'removeAttribute' in html or \"data-update-failed\" in html` with `assert \"removeAttribute('data-update-failed')\" in html` to assert the exact recovery call. The 'or' branch was always true because 'data-update-failed' appears unconditionally in markStampFailed and the interval check. The fix ties the assertion to the specific removeAttribute call in the afterSwap handler (base.html line 64).",
+      "status": "done",
+      "commit": "8136e07f"
+    },
+    {
+      "id": "step-10",
+      "type": "test",
+      "description": "Fix false-positive in test_error_events_registered_in_timestamp_iife (lines 136-142): replace assertions on 'htmx:responseError', 'htmx:timeout', 'htmx:sendError' with `assert 'markStampFailed' in html`. The event name strings also appear in the pre-existing error-card IIFE (base.html lines 41-43), so the old assertions pass even if the timestamp IIFE registrations are deleted. The function name 'markStampFailed' is unique to the timestamp IIFE and would correctly fail if those registrations were absent.",
+      "status": "done",
+      "commit": "a50ef4b2"
     }
   ],
   "design_decisions": [
@@ -85,6 +99,10 @@
     {
       "decision": "Follow existing HTML string-inspection test pattern rather than adding a JS test runner",
       "rationale": "The project tests JS behavior by inspecting rendered HTML for characteristic strings. Adding a proper JS testing framework (jsdom, playwright) would be a scope expansion beyond this task. The string-inspection tests verify the fix's code is present in the rendered page."
+    },
+    {
+      "decision": "Assert exact call signatures and unique function names instead of generic string presence",
+      "rationale": "Reviewer found two test weakness patterns: (1) tautological 'or' conditions where one branch is always true, and (2) assertions on strings that exist in multiple locations (both IIFEs). Fixing by asserting `removeAttribute('data-update-failed')` (the exact call) and `markStampFailed` (the unique function name) ensures tests are tied to the specific code they guard and cannot pass by coincidence."
     }
   ],
   "reuse": [
@@ -110,5 +128,5 @@
     }
   ],
   "_session_id": "228-35447299",
-  "_created_at": "2026-03-28T19:12:27.212505+00:00"
+  "_created_at": "2026-03-28T19:20:22.419407+00:00"
 }
