@@ -4130,11 +4130,11 @@
         "description": "DEFAULT_FUSED_MEMORY_URLS in dashboard/src/dashboard/config.py includes http://localhost:8000 and http://localhost:8001 as fallback URLs. Per project decisions (project_stale_mcp_ports), these ports host stale Claude Code MCP instances running old code — the systemd instance on port 8002 is the single canonical server.\n\nEvaluate whether these stale-port fallbacks should be removed from the default list, or if they serve a legitimate purpose (e.g., graceful degradation). If removed, update DEFAULT_FUSED_MEMORY_URLS and the pinned test in test_scaffold.py accordingly. If retained, add a comment in config.py explaining the rationale.\n\nmemory_hints:\n- search: \"stale ports 8000 8001 fused memory canonical server\"\n- search: \"singleton lock fused-memory instances\"\n- entity: \"fused-memory.service\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-28T04:36:25.842Z"
+        "updatedAt": "2026-03-28T04:46:01.486Z"
       },
       {
         "id": "248",
@@ -4218,9 +4218,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:45:21.075Z",
+      "lastModified": "2026-03-28T04:46:01.487Z",
       "taskCount": 233,
-      "completedCount": 179,
+      "completedCount": 180,
       "tags": [
         "master"
       ]
