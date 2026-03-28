@@ -4898,7 +4898,7 @@
         "description": "test_harness.py TestSelectTier tests have several gaps:\n\n1. No test asserts get_buffer_stats was called with the correct project_id — add assert_called_once_with('test-project')\n2. Threshold boundary values (15, 16) are hardcoded from defaults — compute from config at runtime instead\n3. No test with non-default config values (e.g. buffer_size_threshold=20, opus_threshold_ratio=2.0) to verify multiplication actually works\n4. test_run_full_cycle_propagates_tier_to_consolidator doesn't capture/assert the model kwarg passed to run()\n5. No assertion that Stage 2 and Stage 3 do NOT receive episode_limit/memory_limit mutations (the isinstance guard is untested)\n6. Missing guard: assert captured != {} should be 'assert captured, \"stages[0].run was never invoked\"'",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -4910,7 +4910,7 @@
             "fused-memory/tests"
           ]
         },
-        "updatedAt": "2026-03-28T15:55:07.216Z"
+        "updatedAt": "2026-03-28T16:18:35.213Z"
       },
       {
         "id": "284",
@@ -5037,9 +5037,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T16:14:50.763Z",
+      "lastModified": "2026-03-28T16:18:35.214Z",
       "taskCount": 268,
-      "completedCount": 215,
+      "completedCount": 216,
       "tags": [
         "master"
       ]
