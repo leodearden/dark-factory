@@ -1,0 +1,149 @@
+{
+  "task_id": "283",
+  "title": "TestSelectTier: add call assertions, config-derived thresholds, and model propagation",
+  "files": [
+    "fused-memory/tests/test_harness.py"
+  ],
+  "modules": [
+    "fused-memory/tests"
+  ],
+  "analysis": "TestSelectTier in test_harness.py (lines 877-1033) has 4 tests covering _select_tier() and run_full_cycle tier propagation. Six gaps identified:\n\n1. get_buffer_stats mock is never asserted with correct project_id \u2014 easy fix, add assert_called_once_with to each _select_tier test.\n\n2. Threshold boundary values (15) are hardcoded from default config (buffer_size_threshold=10 * opus_threshold_ratio=1.5). Should compute from config object so tests survive default changes.\n\n3. No test exercises non-default config. Need a test with e.g. buffer_size_threshold=20, opus_threshold_ratio=2.0 (threshold=40) to prove the multiplication path.\n\n4. test_run_full_cycle_propagates_tier_to_consolidator captures episode_limit/memory_limit via before_return callback but ignores the model kwarg passed to stage.run(). The _mock_stage_run helper accepts model=None in mock_run but discards it. Need to capture and assert model propagation.\n\n5. The isinstance guard (harness.py:417) ensures only MemoryConsolidator gets episode_limit/memory_limit. No test verifies Stage 2 (TaskKnowledgeSync) and Stage 3 (IntegrityCheck) are NOT mutated. These stages don't define episode_limit/memory_limit attrs, so without the guard Python would dynamically add them \u2014 a real bug scenario.\n\n6. The guard assertion (line 1023) checks for specific dict keys rather than asserting the dict is truthy. Should be 'assert captured' with a clear failure message.\n\nAll changes are test-only. The harness implementation is correct; we're strengthening test coverage. The _mock_stage_run helper needs a capture_call_args parameter to support model kwarg capture (gap 4).",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Add assert_called_once_with('test-project') to test_select_tier_sonnet, test_select_tier_opus, and test_select_tier_boundary. Each test already mocks harness.buffer.get_buffer_stats as an AsyncMock \u2014 add the assertion after the await _select_tier call. This validates gap 1: the implementation passes project_id correctly to get_buffer_stats.",
+      "status": "done",
+      "commit": "c4688316"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Run pytest on TestSelectTier to verify the get_buffer_stats assertions pass. No implementation change needed \u2014 the harness already calls get_buffer_stats(project_id) correctly at line 226.",
+      "status": "done",
+      "commit": "c4688316"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Refactor hardcoded threshold values in test_select_tier_sonnet, test_select_tier_opus, and test_select_tier_boundary. After creating the config, compute `opus_threshold = config.reconciliation.buffer_size_threshold * config.reconciliation.opus_threshold_ratio` and derive buffer size values from it: sonnet test uses opus_threshold - 10 (well below), opus test uses opus_threshold + 5 (above), boundary test uses int(opus_threshold) (exactly at). Update comments to reference the computed threshold instead of hardcoded 15.",
+      "status": "done",
+      "commit": "24ef3aa7"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Run pytest on TestSelectTier to verify config-derived thresholds produce identical results to the old hardcoded values. No implementation change needed.",
+      "status": "done",
+      "commit": "24ef3aa7"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Add test_select_tier_custom_config: create ReconciliationConfig with buffer_size_threshold=20 and opus_threshold_ratio=2.0 (opus threshold = 40). Test two sub-cases: (a) buffer size 30 returns sonnet (below 40), (b) buffer size 50 returns opus (above 40). Assert returned TierConfig has correct model, episode_limit, and memory_limit. Also assert get_buffer_stats called with correct project_id. This validates gap 3.",
+      "status": "done",
+      "commit": "2883263f"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Run pytest to verify test_select_tier_custom_config passes. The implementation multiplies buffer_size_threshold * opus_threshold_ratio at line 227, so non-default values should work correctly.",
+      "status": "done",
+      "commit": "2883263f"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Enhance _mock_stage_run helper: add optional capture_call_args: dict | None = None parameter. In mock_run, if capture_call_args is not None, store capture_call_args['model'] = model. This is a minimal, backward-compatible addition that enables model kwarg capture without changing existing call sites.",
+      "status": "done",
+      "commit": "967445b7"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Run test_mock_stage_run_before_return_callback (line 322) and any other existing tests using _mock_stage_run to verify the helper change doesn't break anything.",
+      "status": "done",
+      "commit": "967445b7"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Enhance test_run_full_cycle_propagates_tier_to_consolidator: (a) Replace the 'captured' dict assertion from 'assert episode_limit in captured and memory_limit in captured' to 'assert captured, \"stages[0].run was never invoked\"' (gap 6). (b) Pass capture_call_args=captured to _mock_stage_run for the MemoryConsolidator stage. (c) Add assertion: assert captured['model'] == 'sonnet', verifying the TierConfig.model is forwarded as the model kwarg to stage.run() (gap 4).",
+      "status": "done",
+      "commit": "4556545d"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Run pytest on the enhanced propagation test. The harness passes model=tier.model at line 424, so the assertion should pass.",
+      "status": "done",
+      "commit": "4556545d"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Add test_run_full_cycle_does_not_mutate_non_consolidator_stages: Run run_full_cycle with a known tier, then verify that Stage 2 (TaskKnowledgeSync) and Stage 3 (IntegrityCheck) do NOT have episode_limit or memory_limit attributes. Use before_return callbacks on all stages to capture hasattr checks at invocation time (not just after). Assert not hasattr(stage, 'episode_limit') and not hasattr(stage, 'memory_limit') for stages 2 and 3. This validates gap 5: the isinstance guard at line 417 is working correctly.",
+      "status": "done",
+      "commit": "61ad4b55"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Run pytest on the new isinstance guard test. The guard at harness.py:417 only sets episode_limit/memory_limit on MemoryConsolidator instances, so Stage 2 and Stage 3 should not have these attributes.",
+      "status": "done",
+      "commit": "61ad4b55"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Enhance _mock_stage_run with capture_call_args parameter instead of replacing stage.run with a raw AsyncMock",
+      "rationale": "The existing _mock_stage_run helper returns a proper StageReport and supports before_return callbacks. Adding capture_call_args preserves this behavior while enabling kwarg capture. Using AsyncMock directly would lose the StageReport construction and before_return pattern."
+    },
+    {
+      "decision": "Compute threshold from config object in tests rather than from ReconciliationConfig class defaults",
+      "rationale": "Reading from the instantiated config object (config.reconciliation.buffer_size_threshold * config.reconciliation.opus_threshold_ratio) ensures tests stay correct if the config is constructed with overrides. Reading class defaults would re-introduce the hardcoding problem."
+    },
+    {
+      "decision": "Use hasattr checks in before_return callbacks for isinstance guard test (gap 5)",
+      "rationale": "Checking hasattr at stage.run() invocation time (via before_return) is more precise than checking after run_full_cycle completes. It proves the attributes were never set, not just that they were cleaned up afterward."
+    },
+    {
+      "decision": "Test custom config with a single test method using two _select_tier calls rather than two separate test methods",
+      "rationale": "A single test with two calls (one below threshold, one above) validates the multiplication logic end-to-end with one config setup. Two tests would duplicate the config boilerplate for minimal additional isolation benefit."
+    },
+    {
+      "decision": "Keep all changes in test_harness.py only \u2014 no implementation changes",
+      "rationale": "All six gaps are test coverage issues. The harness implementation is correct (get_buffer_stats receives project_id, multiplication works, isinstance guard exists, model kwarg is passed). We are strengthening assertions, not fixing bugs."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "_make_test_harness() helper (line 271)",
+      "where": "fused-memory/tests/test_harness.py",
+      "how": "Reuse for new tests that need a harness with default config. Already builds config, creates harness with all fixtures."
+    },
+    {
+      "what": "_mock_stage_run() helper (line 297)",
+      "where": "fused-memory/tests/test_harness.py",
+      "how": "Enhance with capture_call_args parameter and reuse for all stage mocking. Existing callers are unaffected (new param is optional with default None)."
+    },
+    {
+      "what": "_make_event() helper (line 51)",
+      "where": "fused-memory/tests/test_harness.py",
+      "how": "Reuse for creating test events in run_full_cycle tests. Already used by the propagation test."
+    },
+    {
+      "what": "FusedMemoryConfig + ReconciliationConfig pattern",
+      "where": "fused-memory/src/fused_memory/config/schema.py",
+      "how": "Follow existing test pattern of constructing FusedMemoryConfig(reconciliation=ReconciliationConfig(...)) with explicit overrides. Use for both default and custom config tests."
+    },
+    {
+      "what": "Existing TestSelectTier test structure",
+      "where": "fused-memory/tests/test_harness.py lines 877-1033",
+      "how": "Follow the same import pattern, fixture usage, and assertion style when adding new tests to the class."
+    }
+  ],
+  "_session_id": "283-dceea67c",
+  "_created_at": "2026-03-28T15:59:32.922669+00:00"
+}
