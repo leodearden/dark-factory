@@ -430,3 +430,91 @@ class TestStage1PromptMentionsRefreshEntitySummary:
         # The prompt should mention refreshing summary after deleting edges
         prompt_lower = STAGE1_SYSTEM_PROMPT.lower()
         assert 'after delet' in prompt_lower or 'after you delet' in prompt_lower
+
+
+# ---------------------------------------------------------------------------
+# step-15: partial_failure_misreported fix in MemoryService.refresh_entity_summary
+# ---------------------------------------------------------------------------
+
+class TestMemoryServiceRefreshEntitySummaryJournalFix:
+    """Verify try/finally journal pattern: journal failure cannot mask success,
+    and backend failure is always journaled."""
+
+    @pytest.fixture
+    def service_with_journal(self, mock_config):
+        """MemoryService with mocked backends and a write journal."""
+        from fused_memory.services.memory_service import MemoryService
+        svc = MemoryService(mock_config)
+        svc.graphiti = MagicMock()
+        svc.mem0 = MagicMock()
+        svc.durable_queue = MagicMock()
+        svc.durable_queue.enqueue = AsyncMock(return_value=1)
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        svc.set_write_journal(mock_journal)
+        return svc, mock_journal
+
+    @pytest.mark.asyncio
+    async def test_journal_failure_does_not_mask_successful_refresh(
+        self, service_with_journal
+    ):
+        """When graphiti succeeds but journal.log_write_op raises RuntimeError,
+        the result is still returned — journal failure cannot produce a false negative."""
+        svc, mock_journal = service_with_journal
+        expected_result = {
+            'uuid': 'node-1',
+            'name': 'Alice',
+            'old_summary': 'old',
+            'new_summary': 'Alice knows Bob',
+            'edge_count': 1,
+        }
+        svc.graphiti.refresh_entity_summary = AsyncMock(return_value=expected_result)
+        mock_journal.log_write_op.side_effect = RuntimeError('journal db is full')
+
+        # Should NOT raise — journal failure must not mask the successful operation
+        result = await svc.refresh_entity_summary(
+            entity_uuid='node-1',
+            project_id='dark_factory',
+        )
+        assert result == expected_result
+
+    @pytest.mark.asyncio
+    async def test_graphiti_failure_still_logs_journal(self, service_with_journal):
+        """When graphiti.refresh_entity_summary raises ValueError, the journal is
+        still called (even on failure) and the ValueError propagates to the caller."""
+        svc, mock_journal = service_with_journal
+        svc.graphiti.refresh_entity_summary = AsyncMock(
+            side_effect=ValueError('node not found')
+        )
+
+        with pytest.raises(ValueError, match='node not found'):
+            await svc.refresh_entity_summary(
+                entity_uuid='node-1',
+                project_id='dark_factory',
+            )
+
+        # Journal must have been called even though graphiti failed
+        mock_journal.log_write_op.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_journal_logs_success_false_on_backend_error(
+        self, service_with_journal
+    ):
+        """When graphiti raises, journal is called with success=False and
+        a non-empty error string containing the exception message."""
+        svc, mock_journal = service_with_journal
+        svc.graphiti.refresh_entity_summary = AsyncMock(
+            side_effect=ValueError('FalkorDB timeout')
+        )
+
+        with pytest.raises(ValueError):
+            await svc.refresh_entity_summary(
+                entity_uuid='node-1',
+                project_id='dark_factory',
+            )
+
+        mock_journal.log_write_op.assert_awaited_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs.get('success') is False
+        assert call_kwargs.get('error') is not None
+        assert 'FalkorDB timeout' in call_kwargs['error']
