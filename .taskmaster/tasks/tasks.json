@@ -2886,7 +2886,16 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-28T14:54:13.691Z"
+        "updatedAt": "2026-03-28T14:54:13.691Z",
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/partials/performance.html",
+            "dashboard/src/dashboard/templates/partials/memory_graphs.html"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates/partials"
+          ]
+        }
       },
       {
         "id": 174,
