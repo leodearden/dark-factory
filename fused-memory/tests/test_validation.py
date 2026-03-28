@@ -332,6 +332,67 @@ class TestValidateProjectId:
         assert result is None
 
 
+class TestSymmetricValidatorBehavior:
+    """validate_project_id and validate_run_id must enforce identical character-set rules.
+
+    Both validators share the same allowlist (ASCII letters, digits, hyphens, underscores).
+    This class makes that symmetric contract explicit and guards against future divergence
+    where one pattern gets tightened or loosened independently of the other.
+    """
+
+    INJECTION_VECTORS = [
+        'bad\nvalue',        # embedded newline
+        'bad`value',         # backtick
+        'bad"value',         # double quote
+        "bad'value",         # single quote
+        'bad{value}',        # curly braces
+        'bad;value',         # semicolon
+        'bad$value',         # dollar sign
+        'bad value',         # space
+        'valid\n',           # trailing newline (fullmatch bypass)
+    ]
+
+    VALID_IDENTIFIERS = [
+        'simple',
+        'with-hyphens',
+        'with_underscores',
+        'MixedCase',
+        'num42',
+        '42num',
+        'a',
+        'UPPER',
+        'My-Project_1',
+    ]
+
+    @pytest.mark.parametrize('vector', INJECTION_VECTORS)
+    def test_both_reject_injection_vector(self, vector):
+        """Both validators must reject the same injection vectors."""
+        pid_result = validate_project_id(vector)
+        rid_result = validate_run_id(vector)
+        assert pid_result is not None, (
+            f'validate_project_id accepted injection vector {vector!r} — '
+            'character-set allowlists have diverged'
+        )
+        assert rid_result is not None, (
+            f'validate_run_id accepted injection vector {vector!r} — '
+            'character-set allowlists have diverged'
+        )
+
+    @pytest.mark.parametrize('identifier', VALID_IDENTIFIERS)
+    def test_both_accept_valid_identifier(self, identifier):
+        """Both validators must accept the same safe identifiers."""
+        pid_result = validate_project_id(identifier)
+        rid_result = validate_run_id(identifier)
+        assert pid_result is None, (
+            f'validate_project_id rejected safe identifier {identifier!r} — '
+            'character-set allowlists have diverged'
+        )
+        assert rid_result is None, (
+            f'validate_run_id rejected safe identifier {identifier!r} — '
+            'character-set allowlists have diverged'
+        )
+
+
 class TestValidatorErrorDictShape:
     """All validate_* functions return dicts with exactly 'error' and 'error_type' keys."""
 
