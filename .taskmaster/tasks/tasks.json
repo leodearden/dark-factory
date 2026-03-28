@@ -3856,6 +3856,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 229,
+        "title": "Extract Jinja macro for polling section wrappers in dashboard index.html",
+        "description": "index.html repeats an identical wrapper pattern 5 times: `<div><section data-section=\"NAME\" hx-get=\"...\" ...>…skeleton…</section><div data-updated-for=\"NAME\" ...></div></div>`. The codebase already uses Jinja macros (macros/badges.html). Extract a `polling_section(name, hx_get, hx_trigger, hx_request_timeout)` macro that accepts section name and HTMX attributes, with skeleton content via caller block. This also eliminates the implicit coupling between data-section and data-updated-for values.\n\nmemory_hints: search for \"Jinja macros dashboard\", search for \"template DRY patterns\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -3868,7 +3879,7 @@
       ],
       "created": "2026-03-28T00:56:50.151Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T00:56:50.159Z"
+      "updated": "2026-03-28T00:56:55.607Z"
     }
   }
 }
