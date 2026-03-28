@@ -276,9 +276,7 @@ async def get_burst_state(
             # Apply cooldown: if last write is older than cooldown, agent is idle
             if state == 'bursting':
                 try:
-                    last_write = datetime.fromisoformat(row['last_write_at'])
-                    if last_write.tzinfo is None:
-                        last_write = last_write.replace(tzinfo=UTC)
+                    last_write = _parse_utc(row['last_write_at'])
                     if (now - last_write).total_seconds() > burst_cooldown_seconds:
                         state = 'idle'
                         burst_started = None
