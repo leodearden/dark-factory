@@ -948,33 +948,6 @@ class TestRunIdValidation(BaseStageValidationTest):
         assert f'run_id: {run_id_value}' in captured_kwargs['payload']
 
 
-class TestBaseStageValidationContract:
-    """Verify that BaseStageValidationTest exists and provides the four shared members."""
-
-    def test_base_class_exists(self):
-        assert BaseStageValidationTest is not None, "BaseStageValidationTest must be defined in test_stages.py"
-
-    def test_base_class_has_fake_assemble_payload(self):
-        assert hasattr(BaseStageValidationTest, '_fake_assemble_payload'), "missing _fake_assemble_payload"
-
-    def test_base_class_has_fake_run_stage_via_cli(self):
-        assert hasattr(BaseStageValidationTest, '_fake_run_stage_via_cli'), "missing _fake_run_stage_via_cli"
-
-    def test_base_class_has_mock_deps_fixture(self):
-        assert hasattr(BaseStageValidationTest, 'mock_deps'), "missing mock_deps fixture"
-
-    def test_base_class_has_patch_stage_helper(self):
-        assert hasattr(BaseStageValidationTest, '_patch_stage'), "missing _patch_stage helper"
-
-    def test_mock_types_constant_defined(self):
-        """_MOCK_TYPES module-level constant must exist and contain AsyncMock and MagicMock."""
-        import tests.test_stages as _self_module  # noqa: PLC0415
-        assert hasattr(_self_module, '_MOCK_TYPES'), "_MOCK_TYPES constant must be defined at module level"
-        assert isinstance(_self_module._MOCK_TYPES, tuple), "_MOCK_TYPES must be a tuple"
-        assert AsyncMock in _self_module._MOCK_TYPES, "_MOCK_TYPES must contain AsyncMock"
-        assert MagicMock in _self_module._MOCK_TYPES, "_MOCK_TYPES must contain MagicMock"
-
-
 class TestParametrizeFixSanity:
     """Temporary sanity check: test_run_raises_on_injection_run_id should use ids= not vector_name."""
 
