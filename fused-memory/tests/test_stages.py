@@ -722,6 +722,14 @@ class TestBaseStageValidationContract:
     def test_base_class_has_patch_stage_helper(self):
         assert hasattr(BaseStageValidationTest, '_patch_stage'), "missing _patch_stage helper"
 
+    def test_mock_types_constant_defined(self):
+        """_MOCK_TYPES module-level constant must exist and contain AsyncMock and MagicMock."""
+        import tests.test_stages as _self_module  # noqa: PLC0415
+        assert hasattr(_self_module, '_MOCK_TYPES'), "_MOCK_TYPES constant must be defined at module level"
+        assert isinstance(_self_module._MOCK_TYPES, tuple), "_MOCK_TYPES must be a tuple"
+        assert AsyncMock in _self_module._MOCK_TYPES, "_MOCK_TYPES must contain AsyncMock"
+        assert MagicMock in _self_module._MOCK_TYPES, "_MOCK_TYPES must contain MagicMock"
+
 
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
