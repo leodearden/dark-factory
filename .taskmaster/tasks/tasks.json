@@ -4202,6 +4202,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 254,
+        "title": "Fill remaining validation test coverage gaps",
+        "description": "Task 214 added tests for require_project_root and whitespace cases, but several gaps remain in test_validation.py:\n\n**TestValidateProjectRoot** (currently only tests whitespace-only and tab-only rejection):\n1. Add `test_valid_absolute_path_returns_none` — assert `validate_project_root('/some/path') is None`\n2. Add `test_rejects_relative_path` — assert non-None error dict for `'relative/path'`\n3. Add `test_rejects_empty_string` — assert non-None error dict for `''`\n\n**TestRequireProjectRoot** (currently tests relative path, but not empty/whitespace):\n4. Add `test_empty_string_raises_valueerror` — `require_project_root('')` should raise ValueError\n5. Add `test_whitespace_only_raises_valueerror` — `require_project_root('   ')` should raise ValueError\n\n**TestValidateProjectId** (no test class exists yet):\n6. Consider adding a basic TestValidateProjectId class mirroring the pattern in TestValidateRunId.\n\nmemory_hint: search \"validation.py test coverage\" and \"test_validation.py structure\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -4214,7 +4225,7 @@
       ],
       "created": "2026-03-28T04:45:06.053Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T04:45:06.069Z"
+      "updated": "2026-03-28T04:45:11.000Z"
     }
   }
 }
