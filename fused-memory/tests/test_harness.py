@@ -294,7 +294,7 @@ def _make_test_harness(journal, event_buffer, mock_memory_service):
     )
 
 
-def _mock_stage_run(stage, items_flagged=None, before_return=None):
+def _mock_stage_run(stage, items_flagged=None, before_return=None, capture_call_args=None):
     """Replace stage.run with a mock that returns a StageReport.
 
     Args:
@@ -303,8 +303,13 @@ def _mock_stage_run(stage, items_flagged=None, before_return=None):
         before_return: Optional async callable invoked with the stage object just
             before the StageReport is returned.  Use this to capture mutable stage
             state (e.g. episode_limit, memory_limit) at the moment .run() fires.
+        capture_call_args: Optional dict.  If provided, the model kwarg passed to
+            .run() is stored as capture_call_args['model'] so callers can assert
+            that the correct model was forwarded by the harness.
     """
     async def mock_run(events, watermark, prior_reports, run_id, model=None, _s=stage):
+        if capture_call_args is not None:
+            capture_call_args['model'] = model
         if before_return is not None:
             await before_return(_s)
         return StageReport(
@@ -889,8 +894,12 @@ class TestSelectTier:
                 explore_codebase_root='/tmp/test',
                 agent_llm_provider='anthropic',
                 agent_llm_model='claude-sonnet-4-20250514',
-                # defaults: buffer_size_threshold=10, opus_threshold_ratio=1.5 → opus threshold = 15
             )
+        )
+        # Compute threshold from config so the test survives default changes
+        opus_threshold = (
+            config.reconciliation.buffer_size_threshold
+            * config.reconciliation.opus_threshold_ratio
         )
 
         harness = ReconciliationHarness(
@@ -900,13 +909,14 @@ class TestSelectTier:
             event_buffer=event_buffer,
             config=config,
         )
-        # Buffer size 5 is well below opus threshold (15)
+        # Buffer size well below opus_threshold
         harness.buffer.get_buffer_stats = AsyncMock(
-            return_value={'size': 5, 'oldest_event_age_seconds': None}
+            return_value={'size': int(opus_threshold) - 10, 'oldest_event_age_seconds': None}
         )
 
         tier = await harness._select_tier('test-project')
 
+        harness.buffer.get_buffer_stats.assert_called_once_with('test-project')
         assert isinstance(tier, TierConfig)
         assert tier.model == 'sonnet'
         assert tier.episode_limit == 125
@@ -924,8 +934,12 @@ class TestSelectTier:
                 explore_codebase_root='/tmp/test',
                 agent_llm_provider='anthropic',
                 agent_llm_model='claude-sonnet-4-20250514',
-                # defaults: buffer_size_threshold=10, opus_threshold_ratio=1.5 → opus threshold = 15
             )
+        )
+        # Compute threshold from config so the test survives default changes
+        opus_threshold = (
+            config.reconciliation.buffer_size_threshold
+            * config.reconciliation.opus_threshold_ratio
         )
 
         harness = ReconciliationHarness(
@@ -935,13 +949,14 @@ class TestSelectTier:
             event_buffer=event_buffer,
             config=config,
         )
-        # Buffer size 20 is clearly above opus threshold (15)
+        # Buffer size clearly above opus_threshold
         harness.buffer.get_buffer_stats = AsyncMock(
-            return_value={'size': 20, 'oldest_event_age_seconds': 60.0}
+            return_value={'size': int(opus_threshold) + 5, 'oldest_event_age_seconds': 60.0}
         )
 
         tier = await harness._select_tier('test-project')
 
+        harness.buffer.get_buffer_stats.assert_called_once_with('test-project')
         assert isinstance(tier, TierConfig)
         assert tier.model == 'opus'
         assert tier.episode_limit == 500
@@ -949,7 +964,7 @@ class TestSelectTier:
 
     @pytest.mark.asyncio
     async def test_select_tier_boundary(self, journal, event_buffer, mock_memory_service):
-        """Buffer size exactly at threshold (15) returns sonnet — condition is strictly greater-than."""
+        """Buffer size exactly at threshold returns sonnet — condition is strictly greater-than."""
         from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
         from fused_memory.reconciliation.harness import ReconciliationHarness, TierConfig
 
@@ -959,8 +974,12 @@ class TestSelectTier:
                 explore_codebase_root='/tmp/test',
                 agent_llm_provider='anthropic',
                 agent_llm_model='claude-sonnet-4-20250514',
-                # defaults: buffer_size_threshold=10, opus_threshold_ratio=1.5 → opus threshold = 15
             )
+        )
+        # Compute threshold from config so the test survives default changes
+        opus_threshold = (
+            config.reconciliation.buffer_size_threshold
+            * config.reconciliation.opus_threshold_ratio
         )
 
         harness = ReconciliationHarness(
@@ -970,20 +989,80 @@ class TestSelectTier:
             event_buffer=event_buffer,
             config=config,
         )
-        # Buffer size exactly 15 — NOT above threshold (15 > 15 is False)
+        # Buffer size exactly at opus_threshold — NOT above (strictly >, not >=)
         harness.buffer.get_buffer_stats = AsyncMock(
-            return_value={'size': 15, 'oldest_event_age_seconds': None}
+            return_value={'size': int(opus_threshold), 'oldest_event_age_seconds': None}
         )
 
         tier = await harness._select_tier('test-project')
 
+        harness.buffer.get_buffer_stats.assert_called_once_with('test-project')
         assert isinstance(tier, TierConfig)
         assert tier.model == 'sonnet', (
-            "size==threshold should return sonnet (condition is strictly >); "
-            "if this fails, the boundary condition was changed to >= "
+            f"size==opus_threshold ({int(opus_threshold)}) should return sonnet "
+            "(condition is strictly >); if this fails, the boundary condition was changed to >="
         )
         assert tier.episode_limit == 125
         assert tier.memory_limit == 250
+
+    @pytest.mark.asyncio
+    async def test_select_tier_custom_config(self, journal, event_buffer, mock_memory_service):
+        """Non-default config with buffer_size_threshold=20 and opus_threshold_ratio=2.0 (threshold=40)."""
+        from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+        from fused_memory.reconciliation.harness import ReconciliationHarness, TierConfig
+
+        config = FusedMemoryConfig(
+            reconciliation=ReconciliationConfig(
+                enabled=True,
+                explore_codebase_root='/tmp/test',
+                agent_llm_provider='anthropic',
+                agent_llm_model='claude-sonnet-4-20250514',
+                buffer_size_threshold=20,
+                opus_threshold_ratio=2.0,
+                # opus_threshold = 20 * 2.0 = 40
+            )
+        )
+        opus_threshold = (
+            config.reconciliation.buffer_size_threshold
+            * config.reconciliation.opus_threshold_ratio
+        )
+        assert opus_threshold == 40, f"Expected opus_threshold=40, got {opus_threshold}"
+
+        harness = ReconciliationHarness(
+            memory_service=mock_memory_service,
+            taskmaster=AsyncMock(),
+            journal=journal,
+            event_buffer=event_buffer,
+            config=config,
+        )
+
+        # Sub-case (a): buffer size 30 is below threshold (40) → sonnet
+        harness.buffer.get_buffer_stats = AsyncMock(
+            return_value={'size': 30, 'oldest_event_age_seconds': None}
+        )
+        tier_a = await harness._select_tier('test-project')
+
+        harness.buffer.get_buffer_stats.assert_called_once_with('test-project')
+        assert isinstance(tier_a, TierConfig)
+        assert tier_a.model == 'sonnet', (
+            f"size=30 < opus_threshold=40 should return sonnet, got {tier_a.model}"
+        )
+        assert tier_a.episode_limit == 125
+        assert tier_a.memory_limit == 250
+
+        # Sub-case (b): buffer size 50 is above threshold (40) → opus
+        harness.buffer.get_buffer_stats = AsyncMock(
+            return_value={'size': 50, 'oldest_event_age_seconds': 30.0}
+        )
+        tier_b = await harness._select_tier('test-project')
+
+        harness.buffer.get_buffer_stats.assert_called_once_with('test-project')
+        assert isinstance(tier_b, TierConfig)
+        assert tier_b.model == 'opus', (
+            f"size=50 > opus_threshold=40 should return opus, got {tier_b.model}"
+        )
+        assert tier_b.episode_limit == 500
+        assert tier_b.memory_limit == 1000
 
     @pytest.mark.asyncio
     async def test_run_full_cycle_propagates_tier_to_consolidator(
@@ -1008,7 +1087,7 @@ class TestSelectTier:
 
         for stage in harness.stages:
             if isinstance(stage, MemoryConsolidator):
-                _mock_stage_run(stage, before_return=capture_limits)
+                _mock_stage_run(stage, before_return=capture_limits, capture_call_args=captured)
             else:
                 _mock_stage_run(stage)
 
@@ -1020,8 +1099,8 @@ class TestSelectTier:
             events=[_make_event()],
         )
 
-        assert 'episode_limit' in captured and 'memory_limit' in captured, (
-            'MemoryConsolidator.run() was never called or did not capture expected keys — '
+        assert captured, (
+            'MemoryConsolidator.run() was never invoked — '
             'run_full_cycle skipped it or stage list changed'
         )
 
@@ -1031,3 +1110,55 @@ class TestSelectTier:
         assert captured.get('memory_limit') == 250, (
             f"Expected memory_limit=250 propagated to consolidator, got {captured.get('memory_limit')}"
         )
+        assert captured.get('model') == 'sonnet', (
+            f"Expected model='sonnet' forwarded as kwarg to stage.run(), got {captured.get('model')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_does_not_mutate_non_consolidator_stages(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """isinstance guard ensures episode_limit/memory_limit are NOT set on Stage 2 and 3."""
+        from fused_memory.reconciliation.harness import TierConfig
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # Capture hasattr state at the moment each non-consolidator stage.run() fires
+        non_consolidator_hasattr: dict[str, dict] = {}
+
+        for stage in harness.stages:
+            if isinstance(stage, MemoryConsolidator):
+                _mock_stage_run(stage)
+            else:
+                stage_name = type(stage).__name__
+
+                async def capture_hasattr(s, _name=stage_name):
+                    non_consolidator_hasattr[_name] = {
+                        'episode_limit': hasattr(s, 'episode_limit'),
+                        'memory_limit': hasattr(s, 'memory_limit'),
+                    }
+
+                _mock_stage_run(stage, before_return=capture_hasattr)
+
+        tier = TierConfig(model='sonnet', episode_limit=125, memory_limit=250)
+        await harness.run_full_cycle(
+            'test-project',
+            'isinstance-guard-test',
+            tier=tier,
+            events=[_make_event()],
+        )
+
+        assert non_consolidator_hasattr, (
+            'No non-MemoryConsolidator stages were invoked — stage list changed?'
+        )
+
+        for stage_name, attrs in non_consolidator_hasattr.items():
+            assert not attrs['episode_limit'], (
+                f"{stage_name}.episode_limit was set by run_full_cycle — "
+                "isinstance guard at harness.py:417 may have been removed or widened"
+            )
+            assert not attrs['memory_limit'], (
+                f"{stage_name}.memory_limit was set by run_full_cycle — "
+                "isinstance guard at harness.py:417 may have been removed or widened"
+            )
