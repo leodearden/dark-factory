@@ -327,6 +327,36 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
+    async def get_valid_edges_for_node(self, node_uuid: str) -> list[dict]:
+        """Return all currently-valid RELATES_TO edges for an Entity node.
+
+        Matches the node as either source or target (undirected) and filters
+        edges where invalid_at IS NULL (i.e. not yet invalidated).
+
+        Args:
+            node_uuid: UUID of the Entity node.
+
+        Returns:
+            List of dicts with keys: uuid, fact, name.
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() '
+            'WHERE e.invalid_at IS NULL '
+            'RETURN DISTINCT e.uuid, e.fact, e.name'
+        )
+        result = await graph.query(cypher, {'uuid': node_uuid})
+        return [
+            {
+                'uuid': row[0],
+                'fact': row[1] or '',
+                'name': row[2] or '',
+            }
+            for row in (result.result_set or [])
+        ]
+
     async def bulk_remove_edges(self, uuids: list[str]) -> int:
         """Delete RELATES_TO edges by UUID list. Returns count of actually matched edges.
 
