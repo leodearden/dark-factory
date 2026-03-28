@@ -1,0 +1,132 @@
+{
+  "task_id": "134",
+  "title": "Extract shared project_id guideline for reconciliation stage prompts",
+  "files": [
+    "fused-memory/src/fused_memory/reconciliation/prompts/__init__.py",
+    "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py",
+    "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py",
+    "fused-memory/src/fused_memory/reconciliation/prompts/stage3.py",
+    "fused-memory/tests/test_stages.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/reconciliation/prompts",
+    "fused-memory/tests"
+  ],
+  "analysis": "The project_id guideline was added to all three stage system prompts in commit 5263576 then removed in commit e2fce78 ('simplify') as 'redundant' since base.py injects a Reconciliation Context block into the payload. However, the base.py injection provides the project_id VALUE but doesn't explicitly instruct the agent to USE it in every call \u2014 that's what the system prompt guideline does. The removed lines were copy-pasted with near-identical wording, differing only in the parenthetical tool list. Stage 2's tool list was incomplete (omitted task-mutation tools). The fix: (1) create a shared template constant _PROJECT_ID_GUIDELINE in prompts/__init__.py with a {tools} placeholder, using 'Reconciliation Context block' phrasing matching base.py's section label; (2) re-add the guideline to each stage's system prompt using the shared constant with stage-specific tool lists; (3) ensure Stage 2's tool list includes ALL tools it has access to (memory + task mutation).",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write tests for _PROJECT_ID_GUIDELINE shared constant: importable from prompts package, contains {tools} placeholder, contains 'Reconciliation Context block' phrasing, .format(tools=...) produces correct string",
+      "status": "done",
+      "commit": "8356139"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Add _PROJECT_ID_GUIDELINE template constant to prompts/__init__.py: '- Always include the `project_id` from the Reconciliation Context block in every fused-memory MCP call ({tools}).'",
+      "status": "done",
+      "commit": "5a31f8a"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write test that Stage 1 system prompt contains the project_id guideline with correct memory-only tools (search, add_memory, delete_memory, get_entity, get_episodes, get_status) and 'Reconciliation Context block' phrasing",
+      "status": "done",
+      "commit": "cfd61db"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Update stage1.py to import _PROJECT_ID_GUIDELINE from prompts package and embed it in STAGE1_SYSTEM_PROMPT with Stage 1's memory tool list via .format()",
+      "status": "done",
+      "commit": "7c7c98a"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write test that Stage 2 system prompt contains the project_id guideline with ALL tools including task-mutation tools (search, add_memory, delete_memory, get_entity, get_episodes, get_status, get_tasks, get_task, set_task_status, add_task, update_task, add_subtask, remove_task, add_dependency, remove_dependency)",
+      "status": "done",
+      "commit": "c778ba4"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Update stage2.py to import _PROJECT_ID_GUIDELINE from prompts package and embed it in STAGE2_SYSTEM_PROMPT with Stage 2's complete tool list (memory + task-mutation tools)",
+      "status": "done",
+      "commit": "b3e71ea"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write test that Stage 3 system prompt contains the project_id guideline with read-only tools (search, get_entity, get_episodes, get_status, get_tasks, get_task) and does NOT contain write tools",
+      "status": "done",
+      "commit": "489ae1b"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Update stage3.py to import _PROJECT_ID_GUIDELINE from prompts package and embed it in STAGE3_SYSTEM_PROMPT with Stage 3's read-only tool list",
+      "status": "done",
+      "commit": "4d0e95a"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write consistency test: all three stage prompts share the same prefix text before the tool list parenthetical, proving they use the same shared constant rather than copy-pasted variants",
+      "status": "done",
+      "commit": "1c3b877"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use a template string constant (_PROJECT_ID_GUIDELINE) with {tools} placeholder rather than a function",
+      "rationale": "A template string is simpler and more transparent than a function. Each stage imports it and calls .format(tools=...) at module level, keeping the prompt constants as plain strings. This matches the existing pattern where prompts are simple string constants."
+    },
+    {
+      "decision": "Place the shared constant in prompts/__init__.py rather than a new _shared.py",
+      "rationale": "prompts/__init__.py already exists (with only a docstring). Using it avoids creating a new file and follows the Python convention of putting package-level shared definitions in __init__.py. The constant is small enough that a separate _shared.py is over-engineering."
+    },
+    {
+      "decision": "Use 'Reconciliation Context block' phrasing instead of 'payload context'",
+      "rationale": "The base.py injection uses the heading '## Reconciliation Context' (line 116). Referring to it as 'Reconciliation Context block' in the guideline creates an unambiguous cross-reference that the agent can follow to find the actual project_id value."
+    },
+    {
+      "decision": "Stage 2 tool list includes ALL task-mutation tools, not just read tools",
+      "rationale": "Stage 2 (TaskKnowledgeSync) has STAGE2_DISALLOWED = DISALLOW_BUILTIN only \u2014 meaning it has full access to both memory and task tools. The original implementation incorrectly used the same tool list as Stage 1 (memory-only), omitting set_task_status, add_task, update_task, add_subtask, remove_task, add_dependency, remove_dependency."
+    },
+    {
+      "decision": "Convert stage prompt strings to f-strings to embed the formatted guideline",
+      "rationale": "The cleanest way to embed _PROJECT_ID_GUIDELINE.format(tools=...) into the triple-quoted prompt constants is to make them f-strings. An alternative (string concatenation) would break the visual structure. A module-level _S1_PID = _PROJECT_ID_GUIDELINE.format(...) variable keeps the f-string substitution simple."
+    },
+    {
+      "decision": "Add tests to existing test_stages.py rather than a new test file",
+      "rationale": "test_stages.py already contains TestStage3PromptAlignment which tests prompt content, plus TestDisallowedToolLists. Adding a new TestProjectIdGuideline class to the same file follows the established pattern of keeping stage-related tests together."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "prompts/__init__.py",
+      "where": "fused-memory/src/fused_memory/reconciliation/prompts/__init__.py",
+      "how": "Already exists with a docstring \u2014 extend it with the _PROJECT_ID_GUIDELINE constant rather than creating a new file"
+    },
+    {
+      "what": "Existing test patterns in test_stages.py",
+      "where": "fused-memory/tests/test_stages.py",
+      "how": "Follow the TestStage3PromptAlignment pattern for testing prompt content. Reuse the stage_mock_deps fixture and import patterns from TestStageSubclasses."
+    },
+    {
+      "what": "DISALLOW_TASK_WRITES list from cli_stage_runner",
+      "where": "fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py",
+      "how": "Cross-reference this authoritative list of task-mutation tools when building Stage 2's tool list, ensuring the guideline's tool list matches the actual permissions"
+    },
+    {
+      "what": "base.py Reconciliation Context injection",
+      "where": "fused-memory/src/fused_memory/reconciliation/stages/base.py lines 114-124",
+      "how": "The '## Reconciliation Context' heading is the label the guideline references \u2014 no changes needed to base.py, but the guideline's phrasing ('from the Reconciliation Context block') must match"
+    }
+  ],
+  "_session_id": "134-d4e836c8",
+  "_created_at": "2026-03-27T23:55:15.603344+00:00"
+}
