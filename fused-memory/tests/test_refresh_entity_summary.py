@@ -93,3 +93,60 @@ class TestGetValidEdgesForNode:
         args, kwargs = call_args
         cypher = args[0] if args else kwargs.get('query', '')
         assert 'invalid_at IS NULL' in cypher
+
+
+# ---------------------------------------------------------------------------
+# step-3: GraphitiBackend.update_node_summary
+# ---------------------------------------------------------------------------
+
+class TestUpdateNodeSummary:
+    """GraphitiBackend.update_node_summary(uuid, summary) sets summary on Entity node."""
+
+    @pytest.mark.asyncio
+    async def test_sets_summary_on_node(self, mock_config, make_backend, make_graph_mock):
+        """Issues Cypher SET n.summary = $summary for the given Entity node UUID."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.update_node_summary('node-uuid-1', 'Alice knows Bob.\nAlice works at Acme.')
+        graph.query.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_passes_uuid_and_summary_as_params(self, mock_config, make_backend, make_graph_mock):
+        """Query receives uuid and summary as Cypher parameters."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        node_uuid = 'my-node-uuid'
+        summary = 'Alice knows Bob.'
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.update_node_summary(node_uuid, summary)
+        call_args = graph.query.call_args
+        args, kwargs = call_args
+        cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        assert cypher_params.get('uuid') == node_uuid
+        assert cypher_params.get('summary') == summary
+
+    @pytest.mark.asyncio
+    async def test_cypher_sets_summary_property(self, mock_config, make_backend, make_graph_mock):
+        """Cypher query contains SET n.summary = $summary."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.update_node_summary('node-uuid-1', 'some summary')
+        call_args = graph.query.call_args
+        args, kwargs = call_args
+        cypher = args[0] if args else kwargs.get('query', '')
+        assert 'SET n.summary' in cypher
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        """Raises RuntimeError when client is not initialized."""
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.update_node_summary('node-uuid-1', 'summary text')
