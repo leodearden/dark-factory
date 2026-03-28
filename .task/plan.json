@@ -1,0 +1,137 @@
+{
+  "task_id": "144",
+  "title": "Extract CONFIG_PATH save/restore into shared maintenance utility",
+  "files": [
+    "fused-memory/src/fused_memory/maintenance/_utils.py",
+    "fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py",
+    "fused-memory/src/fused_memory/maintenance/verify_zombie_edges.py",
+    "fused-memory/src/fused_memory/maintenance/reindex.py",
+    "fused-memory/tests/test_maintenance_utils.py",
+    "fused-memory/tests/test_cleanup_stale_edges.py",
+    "fused-memory/tests/test_verify_zombie_edges.py",
+    "fused-memory/tests/test_reindex.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/maintenance",
+    "fused-memory/tests"
+  ],
+  "analysis": "_utils.py already exists with override_config_path() synchronous context manager, and all three entrypoints (cleanup_stale_edges, verify_zombie_edges, reindex) already use it. However, the full service lifecycle pattern remains duplicated across all three run_* functions: (1) service=None sentinel, (2) with override_config_path, (3) try: FusedMemoryConfig + MemoryService + initialize, (4) finally: if service is not None: try: service.close() except: warn. This 6-line finally block plus the ~4-line setup pattern is byte-for-byte identical (except log message strings). The fix is to extract an async context manager `maintenance_service(config_path)` that encapsulates the entire lifecycle: env-var override, config loading, service creation, initialization, yield, and close-with-error-suppression. Each entrypoint then reduces to `async with maintenance_service(config_path) as (config, service): <script-specific logic>`. The behavioral change is minor: service.initialize() now runs before script-specific manager construction (previously it ran after), but this is safe because managers only store service.graphiti/durable_queue references at construction time and use them asynchronously later. All three entrypoints will remove their direct imports of FusedMemoryConfig and MemoryService. Test strategy: comprehensive lifecycle tests move to test_maintenance_utils.py; entrypoint tests mock maintenance_service to focus on script-specific logic; duplicate CONFIG_PATH and close() edge-case tests are removed from entrypoint test files.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing tests for maintenance_service async context manager in test_maintenance_utils.py. Tests: (1) yields (FusedMemoryConfig, MemoryService) tuple, (2) calls service.initialize() before yield, (3) calls service.close() on normal exit, (4) calls service.close() on exception, (5) close() exception does not mask original error, (6) skips close when FusedMemoryConfig fails (service never created), (7) CONFIG_PATH set during config construction, (8) CONFIG_PATH restored on normal exit, (9) CONFIG_PATH no-op when config_path is None. Mock FusedMemoryConfig and MemoryService at the _utils module path.",
+      "status": "done",
+      "commit": "927967a9"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Implement maintenance_service async context manager in _utils.py. Import FusedMemoryConfig and MemoryService. Use @asynccontextmanager wrapping override_config_path, with service=None sentinel, try/finally, and close-with-error-suppression. Yield (config, service) after initialize().",
+      "status": "done",
+      "commit": "e2060f70"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Add delegation test for run_cleanup in test_cleanup_stale_edges.py: verify run_cleanup calls maintenance_service(config_path) as async context manager and uses yielded service.graphiti to construct CleanupManager. This test fails because run_cleanup still uses the old inline pattern.",
+      "status": "done",
+      "commit": "e6e2a517"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Refactor run_cleanup to use maintenance_service. Remove direct FusedMemoryConfig/MemoryService imports, replace inline lifecycle with `async with maintenance_service(config_path) as (config, service):`. Update existing tests: change mock paths from cleanup_stale_edges module to _utils module for FusedMemoryConfig/MemoryService, or replace lifecycle tests (closes_service_on_success, closes_service_on_error, CONFIG_PATH edge cases) with a reference to test_maintenance_utils coverage. Keep tests for CleanupManager construction, cleanup call args, dry_run flag, and return value.",
+      "status": "done",
+      "commit": "be1488f2"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Add delegation test for run_verify_zombie_edges in test_verify_zombie_edges.py: verify it calls maintenance_service(config_path) and uses yielded service.graphiti to construct ZombieEdgeVerifier. This test fails because the function still uses inline lifecycle.",
+      "status": "done",
+      "commit": "b236cc9c"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Refactor run_verify_zombie_edges to use maintenance_service. Remove FusedMemoryConfig/MemoryService imports, replace inline lifecycle. Keep the ValueError guard for empty uuids BEFORE entering the context manager. Update/remove lifecycle edge-case tests that are now covered by test_maintenance_utils.",
+      "status": "done",
+      "commit": "fa2e5125"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Add delegation test for run_reindex in test_reindex.py: verify it calls maintenance_service(config_path) and uses yielded (config, service) to build OpenAIEmbedder from config.embedder and ReindexManager from service.graphiti. This test fails because run_reindex still uses inline lifecycle.",
+      "status": "done",
+      "commit": "e469e1ef"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Refactor run_reindex to use maintenance_service. Remove FusedMemoryConfig/MemoryService imports, replace inline lifecycle. Keep embedder construction and ReindexManager creation inside the async with block. Update tests: replace lifecycle tests (close on success/error, CONFIG_PATH propagation/restore) with reference to test_maintenance_utils. Keep tests for embedder config dimensions, drop_indices flag, reindex_and_replay call args, and embedder/manager constructor failure tests (adjusting mock paths to _utils module).",
+      "status": "done",
+      "commit": "235cc5ff"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use @asynccontextmanager rather than a callback-based helper or class",
+      "rationale": "Async context manager is the natural Python pattern for resource lifecycle in async code. It guarantees cleanup via __aexit__, integrates naturally with `async with`, and is consistent with the existing override_config_path synchronous context manager pattern already in _utils.py."
+    },
+    {
+      "decision": "Yield (config, service) tuple rather than just service",
+      "rationale": "reindex.py needs config.embedder for OpenAIEmbedder construction. All scripts need service. Yielding both avoids callers having to reconstruct config or reach into service internals to access it."
+    },
+    {
+      "decision": "Call service.initialize() before yield (i.e., callers receive an already-initialized service)",
+      "rationale": "All three entrypoints call initialize() before doing work. Moving it inside the context manager means callers can't forget it. The current code creates managers before initialize() but this is safe \u2014 managers store backend references at construction and only use them in async methods called later."
+    },
+    {
+      "decision": "Keep override_config_path as a separate, independently importable utility",
+      "rationale": "It's already tested independently (6 tests), has value outside the service lifecycle (e.g., testing config loading), and maintenance_service composes it rather than replacing it."
+    },
+    {
+      "decision": "Move FusedMemoryConfig and MemoryService imports into _utils.py, remove from entrypoints",
+      "rationale": "Since maintenance_service creates both internally, entrypoints no longer need direct access. This eliminates the import coupling and ensures all service construction goes through the shared utility."
+    },
+    {
+      "decision": "Mock maintenance_service in entrypoint tests rather than patching underlying components through _utils",
+      "rationale": "Entrypoint tests should verify script-specific logic (manager construction, operation args, return values), not re-test the lifecycle that's comprehensively covered in test_maintenance_utils.py. Patching through _utils would be fragile and duplicate coverage."
+    },
+    {
+      "decision": "Keep the ValueError guard for empty uuids OUTSIDE the context manager in verify_zombie_edges",
+      "rationale": "The empty-uuids check is a precondition that should fail fast without creating config/service. It's cheaper and clearer to validate input before entering the service lifecycle."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "override_config_path context manager",
+      "where": "fused_memory/maintenance/_utils.py",
+      "how": "maintenance_service wraps it internally \u2014 the env-var save/restore logic is fully delegated to the existing utility"
+    },
+    {
+      "what": "FusedMemoryConfig config loader",
+      "where": "fused_memory/config/schema.py",
+      "how": "maintenance_service calls FusedMemoryConfig() inside override_config_path to load config with the correct CONFIG_PATH"
+    },
+    {
+      "what": "MemoryService lifecycle",
+      "where": "fused_memory/services/memory_service.py",
+      "how": "maintenance_service creates MemoryService(config), calls initialize(), and handles close() with error suppression"
+    },
+    {
+      "what": "Existing test patterns for override_config_path",
+      "where": "fused-memory/tests/test_maintenance_utils.py",
+      "how": "New maintenance_service tests follow the same monkeypatch + assert pattern for CONFIG_PATH verification; extend the same TestOverrideConfigPath test class structure"
+    },
+    {
+      "what": "AsyncMock context manager pattern from entrypoint tests",
+      "where": "fused-memory/tests/test_cleanup_stale_edges.py, test_verify_zombie_edges.py, test_reindex.py",
+      "how": "Reuse the patch() + AsyncMock() + MagicMock() mocking approach; adapt it for mocking maintenance_service as an async context manager yielding (mock_config, mock_service)"
+    }
+  ],
+  "_session_id": "144-2e2ac571",
+  "_created_at": "2026-03-28T15:51:20.871030+00:00"
+}
