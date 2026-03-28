@@ -4179,6 +4179,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 252,
+        "title": "Add integration tests for /partials/performance and /partials/memory-graphs endpoints",
+        "description": "All three pre-existing partials have dedicated integration test classes (TestMemoryPartialIntegration, TestReconPartialIntegration, TestOrchestratorsPartialIntegration) that verify status code, content-type, and rendered content for both happy-path and empty/error states. The two newer endpoints (/partials/performance and /partials/memory-graphs) have no equivalent integration tests.\n\nSteps:\n1. Add TestPerformancePartialIntegration: patch the data functions (get_completion_paths, get_escalation_rates, get_loop_histograms, get_time_centiles) with mock data, assert 200 + expected HTML content. Add empty-data test asserting \"no data yet\" renders.\n2. Add TestMemoryGraphsPartialIntegration: patch data functions (get_memory_timeseries, get_operations_breakdown, get_agent_breakdown) with mock data, assert 200 + expected HTML content. Add empty-data test.\n3. Follow the same pattern as TestReconPartialIntegration (ExitStack patching) for consistency.\n\nmemory_hints: search for \"dashboard partial integration test pattern\", get_entity \"performance partial\", get_entity \"memory-graphs partial\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -4191,7 +4202,7 @@
       ],
       "created": "2026-03-28T04:38:02.332Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T04:38:09.496Z"
+      "updated": "2026-03-28T04:38:16.206Z"
     }
   }
 }
