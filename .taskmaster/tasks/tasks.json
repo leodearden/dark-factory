@@ -3987,11 +3987,11 @@
         "description": "index.html repeats an identical wrapper pattern 5 times: `<div><section data-section=\"NAME\" hx-get=\"...\" ...>…skeleton…</section><div data-updated-for=\"NAME\" ...></div></div>`. The codebase already uses Jinja macros (macros/badges.html). Extract a `polling_section(name, hx_get, hx_trigger, hx_request_timeout)` macro that accepts section name and HTMX attributes, with skeleton content via caller block. This also eliminates the implicit coupling between data-section and data-updated-for values.\n\nmemory_hints: search for \"Jinja macros dashboard\", search for \"template DRY patterns\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T04:47:38.949Z",
+        "updatedAt": "2026-03-28T15:25:36.207Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/templates",
@@ -4005,11 +4005,11 @@
         "description": "test_refresh_indicator.py and test_recon_panel.py both use an identical fragile pattern to extract HTML opening tags via rfind('<')/index('>') string slicing. This pattern:\n1. Is duplicated 3 times across 2 files (test_refresh_indicator.py lines 58-62, 68-72; test_recon_panel.py ~line 749-777)\n2. Breaks on multi-line tags (rfind/index assumes single-line)\n3. Returns wrong content when rfind returns -1 (no '<' found)\n\nFix: Create a robust `_get_opening_tag(html, marker)` helper in conftest.py (or a test_helpers module) using regex: `re.search(r'<[^>]+' + re.escape(marker) + r'[^>]*>', html)`. Replace all 3 call sites.\n\nmemory_hints: search for \"dashboard test tag extraction helper\", get_entity \"test_refresh_indicator.py\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T04:32:08.735Z",
+        "updatedAt": "2026-03-28T15:25:36.230Z",
         "metadata": {
           "modules": [
             "dashboard/tests/test_helpers.py",
@@ -5032,7 +5032,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T15:25:36.182Z",
+      "lastModified": "2026-03-28T15:25:36.230Z",
       "taskCount": 268,
       "completedCount": 207,
       "tags": [
