@@ -3645,7 +3645,7 @@
         "description": "partition_burst_state has two untested state/timestamp interaction paths after the Task 206 hardening. Add test coverage for these edge cases.",
         "details": "## Problem\n\nTask 206 added tests for missing keys and None values, but two interaction paths remain untested:\n\n1. **Missing state key + recent timestamp → active**: `test_missing_state_key_defaults_to_idle` uses a 2020 timestamp, so the agent lands in idle for two compounding reasons (missing state defaults to 'idle' AND old timestamp). There is no test proving that a missing-state agent with a recent `last_write_at` gets promoted to active via the timestamp check.\n\n2. **Non-idle state + missing last_write_at → active**: No test verifies that an agent with `state='bursting'` but no `last_write_at` key is still classified as active (the early-return on `state != 'idle'` fires before reaching the timestamp lookup). While implicitly covered, this combination should be explicit.\n\n## Fix\n\nAdd two tests to `TestPartitionBurstState`:\n\n1. `test_missing_state_key_recent_write_is_active`: agent with no 'state' key + recent `last_write_at` → should be in active list (timestamp promotion fires on the defaulted 'idle' state).\n\n2. `test_non_idle_state_missing_last_write_at_is_active`: agent with `state='bursting'` and no `last_write_at` → should be in active list (early return before timestamp check).\n\nAlso update the comment on `test_missing_state_key_defaults_to_idle` to clarify both conditions contribute.\n\n## Memory hints\n- search: \"partition_burst_state test edge cases task 206\"",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -3658,7 +3658,8 @@
             "dashboard/src/dashboard",
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-28T01:12:54.184Z"
       },
       {
         "id": "214",
@@ -3902,7 +3903,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T01:12:53.587Z",
+      "lastModified": "2026-03-28T01:12:54.184Z",
       "taskCount": 210,
       "completedCount": 168,
       "tags": [
