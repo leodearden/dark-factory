@@ -45,6 +45,13 @@ class MemoryConsolidator(BaseStage):
         watermark: Watermark,
         prior_reports: list[StageReport],
     ) -> str:
+        # Validate that limits were explicitly set by the harness
+        if self.episode_limit is None or self.memory_limit is None:
+            raise ValueError(
+                f'episode_limit and memory_limit must be explicitly set by the harness before run(); '
+                f'got episode_limit={self.episode_limit}, memory_limit={self.memory_limit}'
+            )
+
         # Remediation mode: return focused payload with findings only
         if self.remediation_findings is not None:
             return self._assemble_remediation_payload()
