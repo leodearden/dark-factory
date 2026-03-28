@@ -27,6 +27,16 @@ class TestParseUtc:
         assert result.year == 2026
         assert result.hour == 10
 
+    def test_aware_iso_string_with_non_utc_offset_preserved(self):
+        """Aware ISO string with non-UTC offset should be returned unchanged (tzinfo preserved)."""
+        from datetime import timedelta
+
+        from dashboard.data.utils import parse_utc
+
+        result = parse_utc('2026-03-28T10:00:00+05:30')
+        assert result.utcoffset() == timedelta(hours=5, minutes=30)
+        assert result.hour == 10
+
     def test_invalid_string_raises_value_error(self):
         """Invalid ISO string should raise ValueError."""
         import pytest
