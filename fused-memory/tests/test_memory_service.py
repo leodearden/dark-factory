@@ -1,6 +1,7 @@
 """Tests for the memory service — unit tests with mocked backends."""
 
 import asyncio
+import types
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
