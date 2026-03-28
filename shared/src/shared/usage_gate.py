@@ -70,6 +70,7 @@ class AccountState:
     resets_at: datetime | None = None
     pause_started_at: datetime | None = None
     resume_task: asyncio.Task | None = field(default=None, repr=False)
+    probe_count: int = 0
 
 
 class SessionBudgetExhausted(Exception):
@@ -295,21 +296,35 @@ class UsageGate:
         self._cumulative_cost += cost
 
     async def _account_resume_probe_loop(self, acct: AccountState) -> None:
-        """Sleep until the account's reset time, then mark it available.
+        """Sleep for a probe interval, then optimistically uncap the account.
+
+        Uses exponential backoff: ``probe_interval_secs * 2^probe_count``,
+        capped at ``max_probe_interval_secs``.  The sleep duration is also
+        bounded by the time remaining until ``resets_at``.
 
         If the uncap is premature, ``invoke_with_cap_retry`` will re-detect
-        the cap on the next invocation and start a new probe.
+        the cap on the next invocation and ``_handle_cap_detected`` will
+        start a new probe with an incremented ``probe_count``.
         """
         target = acct.resets_at
         if target is None:
             target = datetime.now(UTC) + timedelta(hours=1)
             logger.warning(f'Account {acct.name}: no resets_at — defaulting to 1h')
 
-        wait_secs = max(0, (target - datetime.now(UTC)).total_seconds())
-        if wait_secs > 0:
-            logger.info(f'Account {acct.name}: sleeping {wait_secs:.0f}s until reset')
+        base = self._config.probe_interval_secs
+        ceiling = self._config.max_probe_interval_secs
+        interval = min(base * (2 ** acct.probe_count), ceiling)
+
+        remaining = max(0, (target - datetime.now(UTC)).total_seconds())
+        sleep_for = min(interval, remaining) if remaining > 0 else 0
+
+        if sleep_for > 0:
+            logger.info(
+                f'Account {acct.name}: sleeping {sleep_for:.0f}s '
+                f'(probe #{acct.probe_count + 1}, resets in {remaining:.0f}s)',
+            )
             try:
-                await asyncio.sleep(wait_secs)
+                await asyncio.sleep(sleep_for)
             except asyncio.CancelledError:
                 return
 
@@ -317,13 +332,21 @@ class UsageGate:
         if not acct.capped:
             return
 
+        past_reset = datetime.now(UTC) >= target
+        if past_reset:
+            acct.probe_count = 0
+        else:
+            acct.probe_count += 1
+
         acct.capped = False
         if acct.pause_started_at:
             self._total_pause_secs += (
                 datetime.now(UTC) - acct.pause_started_at
             ).total_seconds()
         acct.pause_started_at = None
-        logger.info(f'Account {acct.name} RESUMED (timer expired)')
+
+        label = 'reset time passed' if past_reset else f'optimistic probe #{acct.probe_count}'
+        logger.info(f'Account {acct.name} RESUMED ({label})')
         self._open.set()
 
     async def shutdown(self) -> None:
@@ -394,11 +417,18 @@ def _read_oauth_token() -> str | None:
         return None
 
 
+_MONTH_ABBR = {
+    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+}
+
+
 def _parse_resets_at(text: str) -> datetime:
     """Parse reset time from cap-hit message text.
 
     Handles:
     - "resets in 3h" / "resets in 45m" / "resets in 2d"
+    - "resets Mar 30, 6pm (Europe/London)" (date + time + tz)
     - "resets 9pm (Europe/London)" / "resets 3:00 AM (US/Pacific)"
     - Falls back to 1 hour from now
     """
@@ -414,6 +444,45 @@ def _parse_resets_at(text: str) -> datetime:
         }.get(unit, timedelta(hours=1))
         return datetime.now(UTC) + delta
 
+    # Absolute with date: "resets Mar 30, 6pm (Europe/London)"
+    m = re.search(
+        r'resets\s+([A-Za-z]{3})\s+(\d{1,2}),?\s+'
+        r'(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)',
+        text, re.IGNORECASE,
+    )
+    if m:
+        try:
+            import zoneinfo
+            month_str = m.group(1).lower()
+            day = int(m.group(2))
+            time_str = m.group(3).strip()
+            tz_str = m.group(4).strip()
+            tz = zoneinfo.ZoneInfo(tz_str)
+            month = _MONTH_ABBR.get(month_str)
+            if month is None:
+                raise ValueError(f'Unknown month: {month_str}')
+            for fmt in ('%I:%M %p', '%I%p', '%I:%M%p', '%I %p'):
+                try:
+                    parsed_time = datetime.strptime(time_str, fmt).time()
+                    break
+                except ValueError:
+                    continue
+            else:
+                raise ValueError(f'Cannot parse time: {time_str}')
+            now_in_tz = datetime.now(tz)
+            year = now_in_tz.year
+            target = now_in_tz.replace(
+                year=year, month=month, day=day,
+                hour=parsed_time.hour, minute=parsed_time.minute,
+                second=0, microsecond=0,
+            )
+            # If target is in the past, assume next year
+            if target <= now_in_tz:
+                target = target.replace(year=year + 1)
+            return target.astimezone(UTC)
+        except Exception:
+            pass
+
     # Absolute: "resets Xpm (TZ)" or "resets X:XX AM (TZ)"
     m = re.search(
         r'resets\s+(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)',
@@ -425,7 +494,6 @@ def _parse_resets_at(text: str) -> datetime:
             time_str = m.group(1).strip()
             tz_str = m.group(2).strip()
             tz = zoneinfo.ZoneInfo(tz_str)
-            # Try parsing with different formats
             for fmt in ('%I:%M %p', '%I%p', '%I:%M%p', '%I %p'):
                 try:
                     parsed_time = datetime.strptime(time_str, fmt).time()

@@ -22,6 +22,8 @@ def _make_gate(
     num_accounts: int = 2,
     wait_for_reset: bool = False,
     session_budget_usd: float | None = None,
+    probe_interval_secs: int = 300,
+    max_probe_interval_secs: int = 1800,
 ) -> UsageGate:
     """Create a UsageGate with mock accounts (tokens pre-injected)."""
     acct_cfgs = [
@@ -32,6 +34,8 @@ def _make_gate(
     config = UsageCapConfig(
         wait_for_reset=wait_for_reset,
         session_budget_usd=session_budget_usd,
+        probe_interval_secs=probe_interval_secs,
+        max_probe_interval_secs=max_probe_interval_secs,
         accounts=acct_cfgs,
     )
     gate = UsageGate.__new__(UsageGate)
@@ -804,3 +808,130 @@ class TestRefreshVsProbeInteraction:
         await gate._refresh_capped_accounts()
 
         assert gate._open.is_set()
+
+
+# --- Probe interval / backoff ---
+
+
+class TestProbeInterval:
+    @pytest.mark.asyncio
+    async def test_probe_uncaps_after_interval_not_resets_at(self):
+        """Probe should uncap after probe_interval_secs, not wait for resets_at."""
+        gate = _make_gate(probe_interval_secs=1, max_probe_interval_secs=10)
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        # resets_at is far in the future
+        acct.resets_at = datetime.now(UTC) + timedelta(hours=5)
+
+        await asyncio.wait_for(
+            gate._account_resume_probe_loop(acct), timeout=3.0,
+        )
+
+        # Should have uncapped optimistically before resets_at
+        assert acct.capped is False
+        assert gate._open.is_set()
+        # probe_count incremented (optimistic uncap, not past reset)
+        assert acct.probe_count == 1
+
+    @pytest.mark.asyncio
+    async def test_probe_backoff(self):
+        """Higher probe_count should mean longer sleep via exponential backoff."""
+        gate = _make_gate(probe_interval_secs=1, max_probe_interval_secs=100)
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) + timedelta(hours=5)
+        acct.probe_count = 3  # 2^3 = 8 second interval
+
+        # Should NOT complete in 0.5 seconds (interval is 8s)
+        task = asyncio.create_task(gate._account_resume_probe_loop(acct))
+        await asyncio.sleep(0.5)
+        assert not task.done()
+        assert acct.capped is True
+        task.cancel()
+        await asyncio.wait_for(task, timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_probe_resets_count_after_resets_at(self):
+        """probe_count should reset to 0 when past resets_at."""
+        gate = _make_gate(probe_interval_secs=1, max_probe_interval_secs=10)
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)  # already past
+        acct.probe_count = 5
+
+        await gate._account_resume_probe_loop(acct)
+
+        assert acct.capped is False
+        assert acct.probe_count == 0
+
+    @pytest.mark.asyncio
+    async def test_probe_respects_ceiling(self):
+        """Backoff should be capped at max_probe_interval_secs."""
+        gate = _make_gate(probe_interval_secs=1, max_probe_interval_secs=2)
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) + timedelta(hours=5)
+        acct.probe_count = 10  # 2^10 = 1024, but capped at 2
+
+        # Should complete within 3 seconds (ceiling = 2s, not 1024s)
+        await asyncio.wait_for(
+            gate._account_resume_probe_loop(acct), timeout=4.0,
+        )
+        assert acct.capped is False
+
+    @pytest.mark.asyncio
+    async def test_probe_sleeps_remaining_when_close_to_reset(self):
+        """When resets_at is closer than probe interval, sleep only until resets_at."""
+        gate = _make_gate(probe_interval_secs=100, max_probe_interval_secs=1000)
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        # 50ms until reset — much less than 100s probe interval
+        acct.resets_at = datetime.now(UTC) + timedelta(milliseconds=50)
+
+        await asyncio.wait_for(
+            gate._account_resume_probe_loop(acct), timeout=1.0,
+        )
+
+        assert acct.capped is False
+        assert acct.probe_count == 0  # past reset → count reset
+
+
+# --- Parse resets_at with date ---
+
+
+class TestParseResetsAtWithDate:
+    def test_date_time_timezone(self):
+        """Parse 'resets Mar 30, 6pm (Europe/London)'."""
+        dt = _parse_resets_at('resets Mar 30, 6pm (Europe/London)')
+        assert dt is not None
+        # Should be a real datetime, not the 1h fallback
+        fallback = datetime.now(UTC) + timedelta(hours=1)
+        assert abs((dt - fallback).total_seconds()) > 60
+
+    def test_date_time_with_comma(self):
+        dt = _parse_resets_at('resets Mar 30, 6pm (UTC)')
+        assert dt is not None
+        assert dt.month == 3 or dt.month == 3  # March (possibly next year)
+        assert dt.hour == 18
+        assert dt.minute == 0
+
+    def test_date_time_no_comma(self):
+        dt = _parse_resets_at('resets Mar 30 6pm (UTC)')
+        assert dt is not None
+        assert dt.hour == 18
+
+    def test_date_time_with_minutes(self):
+        dt = _parse_resets_at('resets Mar 31, 2:30pm (Europe/London)')
+        assert dt is not None
+
+    def test_embedded_in_cap_message(self):
+        text = "You've hit your limit · resets Mar 30, 6pm (Europe/London)"
+        dt = _parse_resets_at(text)
+        assert dt is not None
+        fallback = datetime.now(UTC) + timedelta(hours=1)
+        assert abs((dt - fallback).total_seconds()) > 60
