@@ -261,6 +261,15 @@ class TestYamlSettingsSourceErrorHandling:
             source()
         assert exc_info.value.__cause__ is original
 
+    def test_expand_env_vars_error_does_not_mask_yaml_error(self, tmp_path):
+        """Corrupt YAML must still raise RuntimeError with 'Failed to load configuration' message."""
+        bad_file = tmp_path / 'bad.yaml'
+        bad_file.write_bytes(b': :\n  - \x00bad')
+        source = self._make_source(bad_file)
+        with pytest.raises(RuntimeError, match='Failed to load configuration') as exc_info:
+            source()
+        assert 'Failed to expand' not in str(exc_info.value)
+
 
 class TestYamlSettingsSourceEncoding:
     """Tests for YamlSettingsSource explicit UTF-8 encoding."""
