@@ -1,0 +1,104 @@
+{
+  "task_id": "173",
+  "title": "Fix chart rendering timing bug — charts invisible after HTMX morph",
+  "files": [
+    "dashboard/src/dashboard/templates/partials/performance.html",
+    "dashboard/src/dashboard/templates/partials/memory_graphs.html",
+    "dashboard/tests/test_performance_panel.py",
+    "dashboard/tests/test_memory_graphs_partial.py"
+  ],
+  "modules": [
+    "dashboard/src/dashboard/templates/partials",
+    "dashboard/tests"
+  ],
+  "analysis": "Root cause: Both performance.html (lines 233-235) and memory_graphs.html (lines 143-145) use a double requestAnimationFrame pattern to initialize Chart.js charts. This conflicts with Idiomorph's morph:innerHTML DOM replacement cycle used by HTMX. When HTMX morphs section innerHTML via Idiomorph, the inline <script> re-executes and the double-rAF fires at an unpredictable time relative to the morph/settle lifecycle. Canvas elements may not have their final layout dimensions when Chart.js tries to initialize, causing charts to appear blank despite having data.\n\nHTMX swap pipeline: (1) htmx:beforeSwap, (2) content morphed into DOM, (3) scripts execute, (4) htmx:afterSwap, (5) 20ms settle delay, (6) htmx:afterSettle. Scripts execute at step 3, but double-rAF (~33ms) may fire during or after the settle phase with unreliable DOM state.\n\nFix: Replace double-rAF with a one-shot htmx:afterSettle event listener. Since partials are always loaded via HTMX (hx-trigger=\"load, every Ns\"), htmx:afterSettle is guaranteed to fire after each swap. The listener fires after the DOM is fully settled, ensuring canvas elements have proper dimensions for Chart.js responsive mode.\n\nThe getOrDestroyChart() pattern already handles chart cleanup (destroy existing + recreate), so the fix is purely the initialization trigger timing. Both templates use identical double-rAF patterns and need the same fix.\n\nExisting tests are server-side Python (pytest + Starlette TestClient) that assert HTML content patterns. No browser/E2E test infrastructure exists. Tests will verify: (a) double-rAF pattern is absent (regression), (b) htmx:afterSettle listener is present, (c) renderAll function and Chart creation code are preserved.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing tests in test_performance_panel.py: TestChartInitTiming class with 3 tests — (1) assert requestAnimationFrame is NOT in rendered HTML, (2) assert htmx:afterSettle IS in rendered HTML, (3) assert renderAll function is still present. Uses existing _patch_perf_data() helper and client fixture.",
+      "status": "done",
+      "commit": "65a94f68"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Fix performance.html: Replace double-rAF block (lines 233-235) with `document.body.addEventListener('htmx:afterSettle', renderAll, { once: true });` — a one-shot event listener that calls renderAll() after HTMX settles the DOM. All chart creation and getOrDestroyChart logic remain unchanged.",
+      "status": "done",
+      "commit": "36f9c829"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing tests in test_memory_graphs_partial.py: TestChartInitTiming class with 3 tests — (1) assert requestAnimationFrame is NOT in rendered HTML, (2) assert htmx:afterSettle IS in rendered HTML, (3) assert renderAll function is still present. Uses existing _patch_journal_app() helper and client fixture.",
+      "status": "done",
+      "commit": "dfaa3945"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Fix memory_graphs.html: Replace double-rAF block (lines 143-145) with `document.body.addEventListener('htmx:afterSettle', renderAll, { once: true });` — identical one-shot pattern as performance.html.",
+      "status": "done",
+      "commit": "d62b41b3"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Run full dashboard test suite (pytest dashboard/tests/) to verify all existing tests still pass — especially TestPerformanceRoute.test_chart_js_script (asserts 'new Chart' in html), TestHistogramUniformColor, TestCompletionPathsDatalabels, TestMemoryGraphsPartial.test_contains_inline_data, TestDoughnutDatalabels, and integration tests in test_app.py that assert 'new Chart' in html.",
+      "status": "pending",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use htmx:afterSettle event instead of htmx:afterSwap",
+      "rationale": "afterSettle fires after the 20ms settle delay, guaranteeing the browser has completed layout of morphed canvas elements. afterSwap fires immediately after DOM insertion, before settle — same timing problem as rAF."
+    },
+    {
+      "decision": "One-shot listener via { once: true } on document.body",
+      "rationale": "Each morph refresh re-executes the inline script (because Jinja2 data variables change the script content, so Idiomorph replaces the script tag), which registers a fresh one-shot listener. Using { once: true } prevents listener accumulation across refreshes. document.body is used because htmx:afterSettle bubbles from the swap target."
+    },
+    {
+      "decision": "Pass renderAll directly as the listener callback instead of wrapping in anonymous function",
+      "rationale": "renderAll is already a named function defined in the same IIFE scope. Passing it directly to addEventListener is cleaner and allows { once: true } to cleanly remove it. getOrDestroyChart already handles idempotent chart destruction/recreation."
+    },
+    {
+      "decision": "No MutationObserver fallback needed",
+      "rationale": "All chart partials are loaded exclusively via HTMX (hx-trigger on the section elements in index.html), so htmx:afterSettle is guaranteed to fire. There is no code path where these partials render outside an HTMX swap cycle."
+    },
+    {
+      "decision": "Test via HTML string assertions rather than browser tests",
+      "rationale": "The project has no browser/E2E test infrastructure (no Playwright, Jest, etc.). All 531 existing tests use pytest with Starlette TestClient checking HTML output. Adding browser tests would require new infrastructure outside the task scope. HTML pattern assertions effectively verify the fix (absence of rAF, presence of afterSettle)."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "_patch_perf_data() helper function",
+      "where": "dashboard/tests/test_performance_panel.py",
+      "how": "Reuse existing mock helper that patches all 4 performance data functions for new TestChartInitTiming tests"
+    },
+    {
+      "what": "_patch_journal_app() helper function",
+      "where": "dashboard/tests/test_memory_graphs_partial.py",
+      "how": "Reuse existing mock helper that patches all 3 memory-graphs data functions for new TestChartInitTiming tests"
+    },
+    {
+      "what": "client fixture from conftest.py",
+      "where": "dashboard/tests/conftest.py",
+      "how": "Shared Starlette TestClient fixture used by all new test methods"
+    },
+    {
+      "what": "getOrDestroyChart() function in both templates",
+      "where": "dashboard/src/dashboard/templates/partials/performance.html, memory_graphs.html",
+      "how": "Existing chart cleanup logic is already idempotent (destroy existing + recreate). No changes needed — only the trigger timing changes."
+    },
+    {
+      "what": "Existing htmx:afterSwap handler pattern in base.html",
+      "where": "dashboard/src/dashboard/templates/base.html (line 46)",
+      "how": "Establishes the project convention of using HTMX lifecycle events for post-swap behavior. The fix follows this same convention, using afterSettle instead of afterSwap."
+    }
+  ],
+  "_session_id": "173-ceb81fa5",
+  "_created_at": "2026-03-28T15:30:40.883875+00:00"
+}
