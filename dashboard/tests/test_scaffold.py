@@ -10,7 +10,7 @@ class TestConfigDefaults:
         assert isinstance(DEFAULT_FUSED_MEMORY_URLS, tuple)
 
     def test_default_fused_memory_urls_values(self):
-        assert DEFAULT_FUSED_MEMORY_URLS == ['http://localhost:8002']
+        assert DEFAULT_FUSED_MEMORY_URLS == ('http://localhost:8002',)
 
     def test_config_defaults(self):
         from dashboard.config import DashboardConfig
