@@ -3711,11 +3711,11 @@
         "description": "test_sonnet_tier_limits in test_stages.py (line 600) is misnamed — it only tests that MemoryConsolidator attributes are writable, never exercising the actual _select_tier → TierConfig → harness assignment path. Additionally, no test covers the opus tier branch.\n\nChanges needed:\n1. Rename test_sonnet_tier_limits to test_limits_are_writable (it tests raw attribute mutation)\n2. Add test_select_tier_sonnet: mock buffer.get_buffer_stats to return below-threshold count, call _select_tier, assert returned TierConfig carries sonnet_episode_limit/sonnet_memory_limit from config\n3. Add test_select_tier_opus: mock buffer.get_buffer_stats to return above-threshold count (buffer_size_threshold * opus_threshold_ratio), call _select_tier, assert returned TierConfig carries opus values\n4. Optionally test that run_pipeline propagates tier limits onto the MemoryConsolidator stage (harness.py:418-419)\n\nMemory hints: search \"tier selection harness integration\" and \"MemoryConsolidator episode_limit memory_limit\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-28T00:21:45.833Z"
+        "updatedAt": "2026-03-28T00:38:28.123Z"
       },
       {
         "id": "218",
@@ -3761,9 +3761,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T00:37:46.285Z",
+      "lastModified": "2026-03-28T00:38:28.123Z",
       "taskCount": 199,
-      "completedCount": 158,
+      "completedCount": 159,
       "tags": [
         "master"
       ]
