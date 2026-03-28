@@ -115,6 +115,45 @@ class TestGetRecentRuns:
         assert len(runs) == 1
         assert runs[0]['duration_seconds'] == pytest.approx(300.0, abs=1.0)
 
+    async def test_null_started_at_with_completed_at_sets_duration_none(self, tmp_path, caplog):
+        """NULL started_at with valid completed_at yields duration_seconds=None, no exception.
+
+        SQLite enforces NOT NULL on the production schema, but NULLs can appear via
+        migrations or schema changes.  We create a relaxed schema (no NOT NULL on
+        started_at) to simulate such production data corruption.
+        """
+        import sqlite3
+
+        from dashboard.data.reconciliation import get_recent_runs
+        from tests.conftest import RECONCILIATION_SCHEMA
+
+        # Replace 'started_at TEXT NOT NULL' with 'started_at TEXT' to allow NULL
+        relaxed_schema = RECONCILIATION_SCHEMA.replace(
+            'started_at TEXT NOT NULL', 'started_at TEXT'
+        )
+
+        db_path = tmp_path / 'null_started.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(relaxed_schema)
+        conn.execute(
+            "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
+            " completed_at, events_processed, status)"
+            " VALUES ('run-ns1', 'dark_factory', 'full', 'test', NULL,"
+            " '2026-03-28T10:05:00+00:00', 0, 'completed')"
+        )
+        conn.commit()
+        conn.close()
+
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
+            async with aiosqlite.connect(str(db_path)) as db:
+                db.row_factory = aiosqlite.Row
+                runs = await get_recent_runs(db)
+
+        assert len(runs) == 1
+        assert runs[0]['id'] == 'run-ns1'
+        assert runs[0]['duration_seconds'] is None
+        assert any('bad timestamps' in record.message for record in caplog.records)
+
 
 class TestGetWatermarks:
     """Tests for get_watermarks."""
