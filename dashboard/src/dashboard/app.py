@@ -47,6 +47,18 @@ from dashboard.data.write_journal import (
 _pkg_dir = Path(__file__).parent
 logger = logging.getLogger(__name__)
 
+
+def _safe_gather_result(result: object, default: object, label: str) -> object:
+    """Return *default* if *result* is an exception, otherwise return *result*.
+
+    Used with ``asyncio.gather(return_exceptions=True)`` to inspect each result
+    independently, preserving sibling results when one coroutine fails.
+    """
+    if isinstance(result, BaseException):
+        logger.warning('Error fetching %s data: %s', label, result)
+        return default
+    return result
+
 templates = Jinja2Templates(directory=str(_pkg_dir / 'templates'))
 
 
@@ -264,17 +276,15 @@ async def memory_graphs_partial(request: Request):
     config = request.app.state.config
     pool: DbPool = request.app.state.db
     db = await pool.get(config.write_journal_db)
-    try:
-        timeseries, operations, agents = await asyncio.gather(
-            get_memory_timeseries(db),
-            get_operations_breakdown(db),
-            get_agent_breakdown(db),
-        )
-    except Exception:
-        logger.warning('Error fetching memory graphs data', exc_info=True)
-        timeseries = {'labels': [], 'reads': [], 'writes': []}
-        operations = {'labels': [], 'values': []}
-        agents = {'labels': [], 'values': []}
+    ts_r, ops_r, agents_r = await asyncio.gather(
+        get_memory_timeseries(db),
+        get_operations_breakdown(db),
+        get_agent_breakdown(db),
+        return_exceptions=True,
+    )
+    timeseries = _safe_gather_result(ts_r, {'labels': [], 'reads': [], 'writes': []}, 'timeseries')
+    operations = _safe_gather_result(ops_r, {'labels': [], 'values': []}, 'operations')
+    agents = _safe_gather_result(agents_r, {'labels': [], 'values': []}, 'agents')
     return templates.TemplateResponse(
         request, 'partials/memory_graphs.html',
         context={
