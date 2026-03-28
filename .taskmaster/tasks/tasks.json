@@ -3755,10 +3755,11 @@
         "description": "Rename `_DEFAULT_FUSED_MEMORY_URLS` → `DEFAULT_FUSED_MEMORY_URLS` in `dashboard/src/dashboard/config.py` (line 9) and update `test_scaffold.py` to import and assert against it, eliminating the hardcoded URL duplication.\n\nCurrently test_scaffold.py (lines 14-18 and 51-55) hardcodes the default URL list. If the defaults change, these tests break silently. Making the constant public lets tests assert `cfg.fused_memory_urls == list(DEFAULT_FUSED_MEMORY_URLS)`.\n\nChanges:\n1. `config.py`: rename `_DEFAULT_FUSED_MEMORY_URLS` → `DEFAULT_FUSED_MEMORY_URLS`\n2. `test_scaffold.py`: `from dashboard.config import DEFAULT_FUSED_MEMORY_URLS` and use it in both `test_config_defaults` and `test_env_overrides`\n\nSource: review-cycle task 204, suggestions from reviewer_architect_reviewer and reviewer_robustness.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T01:17:46.748Z"
       },
       {
         "id": "220",
@@ -3903,7 +3904,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T01:17:46.336Z",
+      "lastModified": "2026-03-28T01:17:46.748Z",
       "taskCount": 210,
       "completedCount": 168,
       "tags": [
