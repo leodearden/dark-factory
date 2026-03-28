@@ -862,6 +862,53 @@ class TestPartitionBurstState:
             for r in caplog.records
         ), f'Expected DEBUG log with "bad last_write_at", got: {caplog.records}'
 
+    def test_state_none_old_timestamp_is_idle(self):
+        """Agent with state=None and a stale timestamp must be classified as idle.
+
+        state=None is not a valid burst-state value; it must normalise to 'idle'
+        so the agent goes through the timestamp-recency check rather than being
+        unconditionally promoted to active (which is the current buggy behaviour
+        caused by ``agent.get('state', 'idle')`` returning None when the key
+        exists with value None, and ``None != 'idle'`` being True).
+        """
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': None, 'last_write_at': '2020-01-01T00:00:00+00:00'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0, (
+            f'Expected 0 active agents, got {len(active)}: {active}'
+        )
+        assert len(idle) == 1
+
+    def test_state_none_recent_timestamp_is_active_via_recency(self):
+        """Agent with state=None and a recent timestamp must be active via the
+        timestamp-recency path (not the ``state != 'idle'`` short-circuit).
+
+        This test verifies the threshold is actually consulted: with a 5-minute-old
+        timestamp the agent is active under a 10-minute threshold but idle under a
+        3-minute threshold.  If the buggy ``None != 'idle'`` short-circuit were in
+        effect the agent would be active under *both* thresholds regardless of the
+        timestamp, causing the second assertion to fail.
+        """
+        from dashboard.data.reconciliation import partition_burst_state
+
+        ts = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+        agents = [{'agent_id': 'a1', 'state': None, 'last_write_at': ts}]
+
+        # 5-min-old write, 10-min threshold → active (timestamp recent enough)
+        active, idle = partition_burst_state(agents, active_threshold_seconds=600)
+        assert len(active) == 1, (
+            f'Expected 1 active agent (10-min threshold), got {len(active)}'
+        )
+        assert len(idle) == 0
+
+        # 5-min-old write, 3-min threshold → idle (timestamp too stale)
+        active, idle = partition_burst_state(agents, active_threshold_seconds=180)
+        assert len(active) == 0, (
+            f'Expected 0 active agents (3-min threshold), got {len(active)}: {active}'
+        )
+        assert len(idle) == 1
+
 
 class TestWithDb:
     """Unit tests for the with_db helper function."""
