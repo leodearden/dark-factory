@@ -829,6 +829,32 @@ class TestProactiveSampling:
         )
 
 
+    # --- Step 14: non-dict elements filtered without error ---
+
+    def test_select_proactive_sample_filters_non_dict_elements(self):
+        """_select_proactive_sample with mixed non-dict elements returns only valid dict tasks
+        without raising AttributeError or TypeError."""
+        valid_task_1 = self._make_task(5, 'in-progress')
+        valid_task_2 = self._make_task(3, 'pending')
+        mixed_input = [
+            valid_task_1,
+            'a plain string',
+            42,
+            None,
+            ['nested', 'list'],
+            valid_task_2,
+        ]
+
+        # Should not raise, and should return only the dict tasks
+        result = _select_proactive_sample(mixed_input, 10)
+
+        result_ids = {t['id'] for t in result}
+        assert result_ids == {5, 3}, (
+            f'Only dict tasks should appear in result. Got ids: {result_ids}'
+        )
+        assert len(result) == 2
+
+
 class TestRunIdValidation(BaseStageValidationTest):
     """BaseStage.run() validates run_id before prompt interpolation."""
 
