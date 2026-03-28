@@ -597,7 +597,7 @@ class TestTierConfig:
         assert stage.episode_limit == 500
         assert stage.memory_limit == 1000
 
-    def test_sonnet_tier_limits(self):
+    def test_limits_are_writable(self):
         from unittest.mock import AsyncMock
 
         from fused_memory.models.reconciliation import StageId
