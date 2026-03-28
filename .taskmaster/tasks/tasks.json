@@ -4399,11 +4399,11 @@
         "description": "The error-path handling added in task 261 (try/except Exception around asyncio.gather in /partials/memory-graphs and /partials/performance) works but is architecturally inconsistent with the existing data-layer resilience pattern. The project already has `with_db()` in `data/db.py` catching `sqlite3.OperationalError` and returning typed defaults, and individual query functions in write_journal.py pre-handle `OperationalError` internally. Adding `except Exception` at the route level creates a second, overly broad resilience layer.\n\nSteps:\n1. Push exception handling down to the data layer. Either broaden `with_db()` to catch infrastructure exceptions beyond just `sqlite3.OperationalError` (e.g. `aiosqlite.OperationalError`, `OSError`), or ensure each query function returns its empty-dict default on infrastructure failure — matching how `get_memory_timeseries` already handles `OperationalError` internally.\n2. Use `return_exceptions=True` in asyncio.gather calls (or asyncio.TaskGroup) so sibling coroutines are not wasted when one fails. Inspect results individually and fall back only for failed items, enabling partial data display.\n3. Remove the route-level `except Exception` blocks from memory_graphs_partial and partials_performance — routes should stay clean.\n4. Apply the same resilience pattern to `/partials/recon` which also uses asyncio.gather over 6 functions but has no error handling.\n5. Ensure `pool.get()` failures are also handled (currently outside the try block).\n6. Update error-path tests to: (a) test at the data layer instead of/in addition to route layer, (b) parameterize which coroutine fails to verify fallback works regardless of failure position, (c) narrow exception types in assertions.\n\nmemory_hints: search \"dashboard error handling pattern\", get_entity \"with_db\", review dashboard/src/dashboard/data/db.py and dashboard/src/dashboard/app.py route handlers",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-28T05:36:22.166Z",
+        "updatedAt": "2026-03-28T05:38:07.787Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/app.py",
@@ -4472,7 +4472,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T05:38:07.688Z",
+      "lastModified": "2026-03-28T05:38:07.787Z",
       "taskCount": 250,
       "completedCount": 197,
       "tags": [
