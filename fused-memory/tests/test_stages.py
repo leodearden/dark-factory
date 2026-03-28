@@ -67,7 +67,6 @@ class TestStageSubclasses:
 
     @pytest.fixture
     def mock_deps(self, config):
-        from unittest.mock import AsyncMock
         return {
             'memory_service': AsyncMock(),
             'taskmaster': AsyncMock(),
@@ -253,9 +252,6 @@ class TestPerStageReportSchema:
 
     @pytest.fixture
     def mock_deps(self):
-        from unittest.mock import AsyncMock
-
-        from fused_memory.config.schema import ReconciliationConfig
         config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
         return {
             'memory_service': AsyncMock(),
@@ -285,8 +281,6 @@ class TestMcpConfig:
 
     @pytest.fixture
     def stage(self):
-        from unittest.mock import AsyncMock
-
         from fused_memory.models.reconciliation import StageId
         from fused_memory.reconciliation.stages.base import BaseStage
         config = ReconciliationConfig(explore_codebase_root='/tmp/test')
@@ -331,9 +325,6 @@ class TestTaskKnowledgeSyncPayload:
 
     @pytest.fixture
     def mock_deps(self):
-        from unittest.mock import AsyncMock
-
-        from fused_memory.config.schema import ReconciliationConfig
         config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
         return {
             'memory_service': AsyncMock(),
@@ -425,9 +416,6 @@ class TestProjectIdValidation:
 
     @pytest.fixture
     def mock_deps(self):
-        from unittest.mock import AsyncMock
-
-        from fused_memory.config.schema import ReconciliationConfig
         config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
         return {
             'memory_service': AsyncMock(),
@@ -636,15 +624,13 @@ class TestProjectIdValidation:
 
         with self._patch_stage(stage, cli_side_effect=custom_cli):
             # The patched run_stage_via_cli should have custom_cli as its side_effect
-            assert base_module.run_stage_via_cli.side_effect is custom_cli
+            assert base_module.run_stage_via_cli.side_effect is custom_cli  # type: ignore[reportFunctionMemberAccess]
 
 
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
     def test_default_limits(self):
-        from unittest.mock import AsyncMock
-
         from fused_memory.models.reconciliation import StageId
         config = ReconciliationConfig()
         stage = MemoryConsolidator(
@@ -655,8 +641,6 @@ class TestTierConfig:
         assert stage.memory_limit == 1000
 
     def test_limits_are_writable(self):
-        from unittest.mock import AsyncMock
-
         from fused_memory.models.reconciliation import StageId
         config = ReconciliationConfig()
         stage = MemoryConsolidator(
