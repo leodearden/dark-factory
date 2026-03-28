@@ -4259,10 +4259,11 @@
         "description": "Refactor TestHtmxTimeout and TestAriaLivePollingsections in dashboard/tests/test_app.py to reduce duplication and improve maintainability.\n\nFour improvements (all in the same file, same test classes):\n\n1. **Parametrize tests** — Both TestHtmxTimeout (5 near-identical methods) and TestAriaLivePollingsections (5 individual section tests) follow the same slice-and-assert pattern. Replace with `@pytest.mark.parametrize`:\n   - TestHtmxTimeout: parametrize over `(partial_path, expected_timeout_ms)` pairs\n   - TestAriaLivePollingsections: parametrize over `partial_path` list\n\n2. **Better error messages** — Replace bare `html.index(x)` (raises ValueError) with `html.find(x)` + explicit assertion (`assert idx != -1, 'section not found'`) so test failures produce AssertionError with meaningful messages instead of confusing ValueError tracebacks.\n\n3. **Fix misleading comments** — The \"poll interval → timeout\" comments (e.g. \"30s poll → 12s timeout\") imply a derivation rule that doesn't hold (memory-graphs: 60s poll / 10s timeout). Replace with factual comments or document the actual heuristic in the class docstring.\n\n4. **Relax count assertion** — Change `assert html.count('aria-live=\"polite\"') == 5` to `>= 5` so adding a 6th polling section doesn't break the aggregate guard before individual tests exist. Or remove the aggregate test since all 5 sections are now individually verified.\n\nmemory_hints: search for \"dashboard polling test parametrize\", get_entity \"test_app.py\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T05:31:03.792Z"
       },
       {
         "id": "256",
@@ -4414,7 +4415,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T05:31:02.808Z",
+      "lastModified": "2026-03-28T05:31:03.792Z",
       "taskCount": 247,
       "completedCount": 195,
       "tags": [
