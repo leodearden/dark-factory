@@ -188,6 +188,51 @@ class TestGetRecentRuns:
         assert runs[0]['duration_seconds'] is None
         assert any('bad timestamps' in record.message for record in caplog.records)
 
+    async def test_null_started_at_does_not_affect_other_rows(self, tmp_path):
+        """Bad row with NULL started_at does not prevent other rows from being returned correctly.
+
+        Verifies per-row isolation: a bad row yields duration_seconds=None while
+        a healthy sibling row still has its duration computed correctly.
+        """
+        import sqlite3
+
+        from dashboard.data.reconciliation import get_recent_runs
+        from tests.conftest import RECONCILIATION_SCHEMA
+
+        # Relaxed schema to allow NULL started_at
+        relaxed_schema = RECONCILIATION_SCHEMA.replace(
+            'started_at TEXT NOT NULL', 'started_at TEXT'
+        )
+
+        db_path = tmp_path / 'mixed_rows.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(relaxed_schema)
+        # Bad row: NULL started_at, valid completed_at
+        conn.execute(
+            "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
+            " completed_at, events_processed, status)"
+            " VALUES ('run-bad', 'dark_factory', 'full', 'test', NULL,"
+            " '2026-03-28T10:05:00+00:00', 0, 'completed')"
+        )
+        # Good row: valid started_at + completed_at, exactly 5 minutes apart
+        conn.execute(
+            "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
+            " completed_at, events_processed, status)"
+            " VALUES ('run-good', 'dark_factory', 'full', 'test',"
+            " '2026-03-28T09:00:00+00:00', '2026-03-28T09:05:00+00:00', 3, 'completed')"
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            runs = await get_recent_runs(db)
+
+        assert len(runs) == 2
+        by_id = {r['id']: r for r in runs}
+        assert by_id['run-bad']['duration_seconds'] is None
+        assert by_id['run-good']['duration_seconds'] == pytest.approx(300.0, abs=1.0)
+
 
 class TestGetWatermarks:
     """Tests for get_watermarks."""
