@@ -799,6 +799,8 @@ class TestReconBufferAgeDisplay:
         with _patch_recon_data(buffer_stats=stats):
             html = client.get('/partials/recon').text
         assert '17h 25m' in html
+        # age > 300 → warning colour class
+        assert 'text-yellow-400' in html
 
     def test_small_age_displays_minutes_and_seconds(self, client):
         # 600 seconds = 10m 0s
@@ -819,6 +821,9 @@ class TestReconBufferAgeDisplay:
         with _patch_recon_data(buffer_stats=stats):
             html = client.get('/partials/recon').text
         assert '45s' in html
+        # age < 300 → neutral colour class, no warning
+        assert 'text-gray-400' in html
+        assert 'text-yellow-400' not in html
 
 
 class TestProjectNameFilterInTemplate:
