@@ -115,6 +115,26 @@ class TestSessionAwareHandler:
         assert len(handler.calls) == 1
         assert handler.calls[0]['method'] == 'initialize'
 
+    def test_fail_port_raises_connect_error(self):
+        """Request to fail_port raises httpx.ConnectError."""
+        handler = _SessionAwareHandler({'ok': True}, fail_port=9000)
+        with pytest.raises(httpx.ConnectError):
+            handler(self._init_request(9000))
+
+    def test_fail_port_records_port_before_error(self):
+        """Port is recorded in ports_seen even when ConnectError is raised."""
+        handler = _SessionAwareHandler({'ok': True}, fail_port=9000)
+        with pytest.raises(httpx.ConnectError):
+            handler(self._init_request(9000))
+        assert 9000 in handler.ports_seen
+
+    def test_fail_port_does_not_affect_other_ports(self):
+        """Requests to ports other than fail_port succeed normally."""
+        handler = _SessionAwareHandler({'ok': True}, fail_port=9000)
+        response = handler(self._init_request(9001))
+        assert response.status_code == 200
+        assert 9001 in handler.ports_seen
+
 
 @pytest.fixture(autouse=True)
 def _clean_sessions():
