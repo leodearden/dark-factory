@@ -6,7 +6,6 @@ import uuid as uuid_mod
 from datetime import UTC, datetime
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
-from fused_memory.utils.validation import require_project_root
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.reconciliation import (
     MemoryHints,
@@ -18,6 +17,7 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.utils.validation import require_project_root
 
 logger = logging.getLogger(__name__)
 
