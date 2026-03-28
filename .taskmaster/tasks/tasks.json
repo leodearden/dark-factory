@@ -3964,11 +3964,11 @@
         "description": "StageId from fused_memory.models.reconciliation is imported locally inside ~20 individual test methods in test_stages.py. Similarly, `import fused_memory.reconciliation.stages.base as base_module` appears locally in 3 places. Both should be hoisted to module-level imports for consistency with the file's existing top-level imports (MemoryConsolidator, TaskKnowledgeSync, StageResult, etc.).\n\nAlso check for any other repeated local imports (Watermark, AgentResult, _extract_report, _normalize_report, STAGE3_REPORT_SCHEMA) and hoist those that are used in 3+ test methods.\n\nNote: Task 196 (done) handled mock_deps fixture dedup. Task 167 (done) handled other cleanup. This task covers the remaining import hoisting that wasn't in scope for those.\n\nmemory_hints:\n- search: \"test_stages.py local imports StageId hoist module-level\"\n- search: \"test file import conventions\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T04:34:57.476Z"
+        "updatedAt": "2026-03-28T04:47:36.620Z"
       },
       {
         "id": "234",
@@ -4231,9 +4231,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:47:15.736Z",
+      "lastModified": "2026-03-28T04:47:36.620Z",
       "taskCount": 234,
-      "completedCount": 181,
+      "completedCount": 182,
       "tags": [
         "master"
       ]
