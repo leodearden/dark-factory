@@ -11,9 +11,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 
-from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.maintenance._utils import override_config_path
-from fused_memory.services.memory_service import MemoryService
+from fused_memory.maintenance._utils import maintenance_service
 
 logger = logging.getLogger(__name__)
 
@@ -148,33 +146,17 @@ async def run_verify_zombie_edges(
             'were never confirmed. Provide them via --uuids <uuid1> <uuid2> ...'
         )
 
-    service = None
-    with override_config_path(config_path):
-        try:
-            config = FusedMemoryConfig()
-            service = MemoryService(config)
-            verifier = ZombieEdgeVerifier(backend=service.graphiti)
-
-            await service.initialize()
-            result = await verifier.cleanup(uuids=uuids, dry_run=dry_run)
-            logger.info(
-                'run_verify_zombie_edges complete: found=%d, missing=%d, deleted=%d, dry_run=%s',
-                len(result.found),
-                len(result.missing),
-                result.deleted,
-                dry_run,
-            )
-            return result
-        finally:
-            if service is not None:
-                # Catch close() errors so CONFIG_PATH restoration below always runs.
-                try:
-                    await service.close()
-                except Exception:
-                    logger.warning(
-                        'Error closing service during run_verify_zombie_edges cleanup',
-                        exc_info=True,
-                    )
+    async with maintenance_service(config_path) as (config, service):
+        verifier = ZombieEdgeVerifier(backend=service.graphiti)
+        result = await verifier.cleanup(uuids=uuids, dry_run=dry_run)
+        logger.info(
+            'run_verify_zombie_edges complete: found=%d, missing=%d, deleted=%d, dry_run=%s',
+            len(result.found),
+            len(result.missing),
+            result.deleted,
+            dry_run,
+        )
+        return result
 
 
 if __name__ == '__main__':
