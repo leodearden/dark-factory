@@ -140,6 +140,14 @@ class TestSessionAwareHandler:
         assert response.status_code == 200
         assert 9001 in handler.ports_seen
 
+    def test_portless_url_raises_assertion_error(self):
+        """Request to a URL without an explicit port raises AssertionError."""
+        handler = _SessionAwareHandler({'ok': True})
+        body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'}).encode()
+        request = httpx.Request('POST', 'http://localhost/mcp', content=body)
+        with pytest.raises(AssertionError):
+            handler(request)
+
 
 @pytest.fixture(autouse=True)
 def _clean_sessions():
