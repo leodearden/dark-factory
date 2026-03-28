@@ -180,6 +180,10 @@ class TestRequireProjectId:
             require_project_id(invalid)
         assert str(exc_info.value) == err_dict['error']
 
+    def test_injection_vector_newline_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            require_project_id('proj\nid')
+
 
 class TestRequireRunId:
     """require_run_id raises ValueError for invalid run ids, returns None for valid ones."""
@@ -245,6 +249,86 @@ class TestValidateProjectId:
 
     def test_single_character_returns_none(self):
         result = validate_project_id('x')
+        assert result is None
+
+    def test_newline_in_middle_returns_error(self):
+        result = validate_project_id('proj\nid')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_backtick_returns_error(self):
+        result = validate_project_id('proj`id')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_double_quote_returns_error(self):
+        result = validate_project_id('proj"id')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_single_quote_returns_error(self):
+        result = validate_project_id("proj'id")
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_curly_brace_returns_error(self):
+        result = validate_project_id('proj{id}')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_semicolon_returns_error(self):
+        result = validate_project_id('proj;id')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_dollar_sign_returns_error(self):
+        result = validate_project_id('proj$id')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_space_in_middle_returns_error(self):
+        result = validate_project_id('proj id')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_trailing_newline_returns_error(self):
+        """Trailing newline must be rejected — not silently accepted by $ anchor bypass.
+
+        Python's re.match(r'^[a-zA-Z0-9_-]+$', 'dark_factory\\n') returns a truthy match
+        because $ matches just before a trailing newline. This test exposes that bypass;
+        re.fullmatch() is required to catch it.
+        """
+        result = validate_project_id('dark_factory\n')
+        assert result is not None, (
+            'validate_project_id accepted trailing newline — likely using .match() instead '
+            'of .fullmatch(). Switch to re.fullmatch() to fix.'
+        )
+        assert result['error_type'] == 'ValidationError'
+
+    def test_character_rejection_error_mentions_allowed_chars(self):
+        result = validate_project_id('proj`id')
+        assert result is not None
+        assert 'invalid characters' in result['error']
+        assert 'ASCII letters' in result['error']
+
+    def test_returns_error_dict_not_raises(self):
+        """validate_project_id must not raise — it returns an error dict."""
+        try:
+            result = validate_project_id('\x00bad')
+            assert result is not None
+        except Exception as exc:
+            pytest.fail(f'validate_project_id raised unexpectedly: {exc}')
+
+    def test_numeric_only_returns_none(self):
+        result = validate_project_id('42')
+        assert result is None
+
+    def test_uppercase_returns_none(self):
+        result = validate_project_id('DARK_FACTORY')
+        assert result is None
+
+    def test_mixed_case_hyphen_underscore_returns_none(self):
+        result = validate_project_id('My-Project_1')
         assert result is None
 
 
