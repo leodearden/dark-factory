@@ -3017,7 +3017,12 @@
             "dashboard/src/dashboard/templates/partials/performance.html"
           ],
           "modules": [
-            "dashboard/src/dashboard/templates"
+            "dashboard/src/dashboard/app.py",
+            "dashboard/src/dashboard/data",
+            "dashboard/src/dashboard/templates",
+            "dashboard/tests/test_chart_utils.py",
+            "dashboard/tests/test_memory_graphs_partial.py",
+            "dashboard/tests/test_performance_panel.py"
           ],
           "memory_hints": {
             "entities": [],
