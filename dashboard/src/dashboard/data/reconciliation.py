@@ -78,9 +78,12 @@ async def get_recent_runs(db: aiosqlite.Connection | None, *, limit: int = 50) -
         for row in rows:
             duration = None
             if row['completed_at'] is not None:
-                started = parse_utc(row['started_at'])
-                completed = parse_utc(row['completed_at'])
-                duration = (completed - started).total_seconds()
+                try:
+                    started = parse_utc(row['started_at'])
+                    completed = parse_utc(row['completed_at'])
+                    duration = (completed - started).total_seconds()
+                except (ValueError, TypeError) as exc:
+                    logger.debug('run %s: bad timestamps (%s)', row['id'], exc)
 
             results.append(
                 {
