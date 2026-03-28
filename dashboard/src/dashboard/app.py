@@ -56,8 +56,14 @@ def _safe_gather_result(result: object, default: _T, label: str) -> _T:
 
     Used with ``asyncio.gather(return_exceptions=True)`` to inspect each result
     independently, preserving sibling results when one coroutine fails.
+
+    Non-Exception BaseExceptions (CancelledError, KeyboardInterrupt, SystemExit)
+    are re-raised so that asyncio cancellation and process signals propagate
+    correctly during shutdown and disconnect.
     """
-    if isinstance(result, BaseException):
+    if isinstance(result, BaseException) and not isinstance(result, Exception):
+        raise result
+    if isinstance(result, Exception):
         logger.warning('Error fetching %s data: %s', label, result)
         return default
     return cast(_T, result)
