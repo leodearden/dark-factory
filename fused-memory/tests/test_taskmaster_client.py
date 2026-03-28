@@ -128,33 +128,24 @@ async def test_base_args_with_tag(client):
     assert args['tag'] == 'my-tag'
 
 
-@pytest.mark.asyncio
-async def test_base_args_default_project_root(client):
-    c, session = client
-    args = c._base_args()
-    assert args['projectRoot'] == '/project'  # From config
-
-
 def test_base_args_rejects_dot_project_root():
-    """_base_args must reject '.' to prevent silent fallback to server CWD."""
+    """_base_args must reject '.' — not an absolute path."""
     cfg = TaskmasterConfig(
         transport='stdio', command='node', args=['server.js'], project_root='.',
     )
     c = TaskmasterBackend(cfg)
     with pytest.raises(ValueError, match='project_root is required'):
-        c._base_args(project_root=None)
-    with pytest.raises(ValueError, match='project_root is required'):
-        c._base_args(project_root='')
+        c._base_args(project_root='.')
 
 
-def test_base_args_rejects_empty_config_fallback():
-    """_base_args must reject when both caller and config are empty."""
+def test_base_args_rejects_empty_project_root():
+    """_base_args must reject empty string."""
     cfg = TaskmasterConfig(
         transport='stdio', command='node', args=['server.js'], project_root='',
     )
     c = TaskmasterBackend(cfg)
     with pytest.raises(ValueError, match='project_root is required'):
-        c._base_args(project_root=None)
+        c._base_args(project_root='')
 
 
 @pytest.mark.asyncio

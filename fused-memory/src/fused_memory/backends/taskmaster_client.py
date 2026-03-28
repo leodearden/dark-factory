@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -146,30 +147,26 @@ class TaskmasterBackend:
 
     # ── Convenience methods ────────────────────────────────────────────
 
-    def _base_args(self, project_root: str | None = None, tag: str | None = None) -> dict:
-        resolved = project_root or self.config.project_root
-        if not resolved or resolved == '.':
+    def _base_args(self, project_root: str, tag: str | None = None) -> dict:
+        if not project_root or not os.path.isabs(project_root):
             raise ValueError(
                 'project_root is required and must be an absolute path; '
-                f'got project_root={project_root!r}, config fallback={self.config.project_root!r}'
+                f'got {project_root!r}'
             )
-        logger.debug(
-            'taskmaster projectRoot=%s (caller=%s, config=%s)',
-            resolved, project_root, self.config.project_root,
-        )
-        args: dict[str, Any] = {'projectRoot': resolved}
+        logger.debug('taskmaster projectRoot=%s', project_root)
+        args: dict[str, Any] = {'projectRoot': project_root}
         if tag:
             args['tag'] = tag
         return args
 
     async def get_tasks(
-        self, project_root: str | None = None, tag: str | None = None
+        self, project_root: str, tag: str | None = None
     ) -> dict:
         args = self._base_args(project_root, tag)
         return await self.call_tool('get_tasks', args)
 
     async def get_task(
-        self, task_id: str, project_root: str | None = None, tag: str | None = None
+        self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict:
         args = self._base_args(project_root, tag)
         args['id'] = task_id
@@ -179,7 +176,7 @@ class TaskmasterBackend:
         self,
         task_id: str,
         status: str,
-        project_root: str | None = None,
+        project_root: str,
         tag: str | None = None,
     ) -> dict:
         args = self._base_args(project_root, tag)
@@ -189,13 +186,13 @@ class TaskmasterBackend:
 
     async def add_task(
         self,
+        project_root: str,
         prompt: str | None = None,
         title: str | None = None,
         description: str | None = None,
         details: str | None = None,
         dependencies: str | None = None,
         priority: str | None = None,
-        project_root: str | None = None,
         tag: str | None = None,
     ) -> dict:
         args = self._base_args(project_root, tag)
@@ -216,10 +213,10 @@ class TaskmasterBackend:
     async def update_task(
         self,
         task_id: str,
+        project_root: str,
         prompt: str | None = None,
         metadata: str | None = None,
         append: bool = False,
-        project_root: str | None = None,
         tag: str | None = None,
     ) -> dict:
         args = self._base_args(project_root, tag)
@@ -235,10 +232,10 @@ class TaskmasterBackend:
     async def add_subtask(
         self,
         parent_id: str,
+        project_root: str,
         title: str | None = None,
         description: str | None = None,
         details: str | None = None,
-        project_root: str | None = None,
         tag: str | None = None,
     ) -> dict:
         args = self._base_args(project_root, tag)
@@ -254,7 +251,7 @@ class TaskmasterBackend:
     async def remove_task(
         self,
         task_id: str,
-        project_root: str | None = None,
+        project_root: str,
         tag: str | None = None,
     ) -> dict:
         args = self._base_args(project_root, tag)
@@ -266,7 +263,7 @@ class TaskmasterBackend:
         self,
         task_id: str,
         depends_on: str,
-        project_root: str | None = None,
+        project_root: str,
         tag: str | None = None,
     ) -> dict:
         args = self._base_args(project_root, tag)
@@ -278,7 +275,7 @@ class TaskmasterBackend:
         self,
         task_id: str,
         depends_on: str,
-        project_root: str | None = None,
+        project_root: str,
         tag: str | None = None,
     ) -> dict:
         args = self._base_args(project_root, tag)
@@ -287,7 +284,7 @@ class TaskmasterBackend:
         return await self.call_tool('remove_dependency', args)
 
     async def validate_dependencies(
-        self, project_root: str | None = None, tag: str | None = None
+        self, project_root: str, tag: str | None = None
     ) -> dict:
         args = self._base_args(project_root, tag)
         return await self.call_tool('validate_dependencies', args)
@@ -295,7 +292,7 @@ class TaskmasterBackend:
     async def expand_task(
         self,
         task_id: str,
-        project_root: str | None = None,
+        project_root: str,
         num: str | None = None,
         prompt: str | None = None,
         force: bool = False,
@@ -314,7 +311,7 @@ class TaskmasterBackend:
     async def parse_prd(
         self,
         input_path: str,
-        project_root: str | None = None,
+        project_root: str,
         num_tasks: str | None = None,
         tag: str | None = None,
     ) -> dict:
