@@ -51,15 +51,15 @@
       "id": "step-6",
       "type": "impl",
       "description": "Add animation cleanup fallback in base.html. After adding the section-refreshed class and the animationend listener, add a setTimeout(700ms) that removes the class if it's still present. Use a flag variable or check classList.contains to avoid double-removal. The 700ms > 600ms animation duration provides a safe margin.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "cb3969f1"
     },
     {
       "id": "step-7",
       "type": "test",
       "description": "Write failing test for stored setInterval reference. Add TestIntervalCleanup class to test_refresh_indicator.py with a test that the JS assigns the setInterval return value to a variable (pattern: 'var <name> = setInterval' or similar). Should fail against current base.html where setInterval is called without storing the result.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "80ab4125"
     },
     {
       "id": "step-8",

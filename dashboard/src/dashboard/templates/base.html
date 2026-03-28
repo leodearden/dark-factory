@@ -72,7 +72,7 @@
                     section.classList.remove('section-refreshed');
                 }, 700);
             });
-            setInterval(function () {
+            var refreshTimer = setInterval(function () {
                 var stamps = document.querySelectorAll('[data-updated-at]');
                 stamps.forEach(function (el) {
                     if (el.getAttribute('data-update-failed')) return;
