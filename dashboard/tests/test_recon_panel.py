@@ -204,6 +204,19 @@ class TestPartitionBurstState:
         assert len(active) == 1
         assert len(idle) == 0
 
+    def test_missing_state_key_defaults_to_idle(self):
+        # Agent with no 'state' key defaults to 'idle' (via .get('state', 'idle')).
+        # Combined with a stale 2020 timestamp, the agent is classified as idle.
+        # Both conditions (defaulted 'idle' state AND old timestamp) contribute
+        # to the idle classification — see test_missing_state_key_recent_write_is_active
+        # which isolates the timestamp-promotion path.
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'last_write_at': '2020-01-01T00:00:00+00:00'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
 
 class TestFormatDuration:
     """Tests for the format_duration Jinja2 filter (accepts seconds)."""
