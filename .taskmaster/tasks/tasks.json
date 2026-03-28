@@ -4561,6 +4561,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 280,
+        "title": "Harden chart_utils: length validation, TypedDict, and separate_label bounds check",
+        "description": "dashboard/src/dashboard/data/chart_utils.py has several robustness gaps:\n\n1. group_top_n() doesn't validate len(labels) == len(values) — silent data corruption if mismatched\n2. The {labels, values} dict shape is an implicit interface used across write_journal.py, chart_utils.py, app.py, and templates — define a ChartData TypedDict\n3. separate_label() accesses values[idx] without bounds check — IndexError if values shorter than labels\n4. group_top_n() assumes sorted input but doesn't enforce — sort internally or add assertion\n\nAdd tests for mismatched-length inputs and non-empty labels pass-through.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -4573,7 +4584,7 @@
       ],
       "created": "2026-03-28T07:37:31.561Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T07:37:38.398Z"
+      "updated": "2026-03-28T07:37:43.820Z"
     }
   }
 }
