@@ -1,0 +1,105 @@
+{
+  "task_id": "204",
+  "title": "Harden dashboard test assertions: fallback verification, fixture dedup, strict equality",
+  "files": [
+    "dashboard/tests/conftest.py",
+    "dashboard/tests/test_memory.py",
+    "dashboard/tests/test_scaffold.py"
+  ],
+  "modules": [
+    "dashboard/tests"
+  ],
+  "analysis": "Three test-quality improvements in dashboard/tests/.\n\n1. FALLBACK BEHAVIORAL VERIFICATION: test_first_server_down_falls_through (test_memory.py:310-339) uses dashboard_config which has default URLs [8002, 8000, 8001]. The handler fails port 8000, but get_memory_status tries URLs in order — port 8002 succeeds first, so port 8000 is NEVER attempted. The test passes trivially without exercising the fallback path. Fix: use a two-URL config [9000, 9001] where 9000 is tried first and fails, forcing fallthrough to 9001. Add ports_seen set and assert 9000 in ports_seen to prove the failing URL was actually attempted.\n\n2. STRICT EQUALITY IN SCAFFOLD: test_scaffold.py line 51 uses `assert len(cfg.fused_memory_urls) == 3` — a weak length-only check. test_default_values already uses strict value equality. Strengthen to match.\n\n3. FIXTURE DEDUP: After fix #1, both test_first_server_down_falls_through and test_partial_failure_aggregates_available need DashboardConfig(project_root=tmp_path, fused_memory_urls=['http://localhost:9000', 'http://localhost:9001']). Extract to a shared two_url_config fixture in conftest.py.\n\nNote: For test_partial_failure_aggregates_available, switching from 3-URL to 2-URL config means only 1 server responds (instead of 2), so the pending count assertion changes from 6 to 3. Multi-server aggregation is already covered by test_successful_stats (3 servers × 3 = 9).",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Add two_url_config fixture to conftest.py: DashboardConfig(project_root=tmp_path, fused_memory_urls=['http://localhost:9000', 'http://localhost:9001']). Placed after the existing dashboard_config fixture.",
+      "status": "done",
+      "commit": "f19de86",
+      "tests": [
+        "Run existing tests to verify no regressions from adding the new fixture"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Modify test_first_server_down_falls_through to use two_url_config fixture instead of dashboard_config. Replace call_count with a ports_seen set in the handler. Change port check from 8000 to 9000. Add assertion: assert 9000 in ports_seen (proving the failing URL was attempted before fallthrough to 9001). This test verifies behavioral coverage that was previously missing — the old test passed trivially because port 8002 succeeded before port 8000 was ever tried.",
+      "status": "done",
+      "commit": "c376eb6"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Run the modified test to verify it passes. The production code (get_memory_status) already implements correct fallback — it tries URLs in order and returns the first success. With the two_url_config [9000, 9001], port 9000 fails and port 9001 succeeds, so ports_seen will contain 9000. No production code changes needed.",
+      "status": "done",
+      "commit": "c376eb6"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Modify test_partial_failure_aggregates_available to use two_url_config fixture instead of dashboard_config. Change port check from 8000 to 9000. Update aggregation assertion from result['counts']['pending'] == 6 to == 3 (1 server × 3 pending instead of 2 × 3). The multi-server aggregation case is already covered by test_successful_stats.",
+      "status": "done",
+      "commit": "1bdae61"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Run the modified queue stats test to verify it passes. No production code changes needed — get_queue_stats already aggregates correctly across available servers.",
+      "status": "done",
+      "commit": "1bdae61"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Strengthen assertion in test_scaffold.py TestConfigEnvOverrides.test_env_overrides: change line 51 from `assert len(cfg.fused_memory_urls) == 3` to `assert cfg.fused_memory_urls == ['http://localhost:8002', 'http://localhost:8000', 'http://localhost:8001']` to match the strict pattern in test_default_values.",
+      "status": "done",
+      "commit": "9a75841"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Run the full dashboard test suite (pytest dashboard/tests/) to verify all changes pass together. No production code changes in any step — this is entirely test-quality hardening.",
+      "status": "done",
+      "commit": "9a75841"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use ports 9000 and 9001 for the two_url_config fixture",
+      "rationale": "Avoids collision with the default config ports (8002, 8000, 8001). The task description specifies these ports. Using distinct ports makes test intent clear — these are not 'real' server ports but test-specific ones."
+    },
+    {
+      "decision": "Use ports_seen set instead of call_count integer for behavioral verification",
+      "rationale": "A set of ports explicitly proves which URLs were attempted. call_count only shows how many calls were made, not which ports were hit. The task description specifically requests ports_seen."
+    },
+    {
+      "decision": "Change test_partial_failure_aggregates_available assertion from pending==6 to pending==3",
+      "rationale": "With two_url_config [9000, 9001] and 9000 failing, only 1 server (9001) responds. 1 × 3 pending = 3. Multi-server aggregation (summing across servers) is already validated by test_successful_stats which uses 3 servers (3 × 3 = 9)."
+    },
+    {
+      "decision": "Fixture goes in conftest.py, not test_memory.py",
+      "rationale": "conftest.py is the standard pytest location for shared fixtures. Even though only test_memory.py currently uses it, placing it in conftest.py follows the existing pattern (dashboard_config is there) and allows future tests to reuse it."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Existing dashboard_config fixture pattern",
+      "where": "dashboard/tests/conftest.py lines 111-116",
+      "how": "two_url_config follows the same pattern — takes tmp_path, returns DashboardConfig with custom project_root. Just adds fused_memory_urls override."
+    },
+    {
+      "what": "_SessionAwareHandler and helper functions",
+      "where": "dashboard/tests/test_memory.py lines 12-83",
+      "how": "The fallback test continues to use the inline handler pattern (not _SessionAwareHandler) because it needs port-conditional behavior and ports_seen tracking. _SessionAwareHandler is for simpler single-server tests."
+    },
+    {
+      "what": "Strict equality assertion pattern from test_default_values",
+      "where": "dashboard/tests/test_scaffold.py lines 14-18",
+      "how": "The same cfg.fused_memory_urls == [...] pattern is applied to test_env_overrides for consistency."
+    }
+  ],
+  "_session_id": "204-0116f86c",
+  "_created_at": "2026-03-28T00:15:02.936267+00:00"
+}
