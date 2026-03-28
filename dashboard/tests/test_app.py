@@ -465,6 +465,12 @@ class TestAriaLivePollingsections:
         section_html = html[orch_idx - 100:orch_idx + 300]
         assert 'aria-live="polite"' in section_html
 
+    def test_performance_section_has_aria_live_polite(self, client):
+        html = client.get('/').text
+        perf_idx = html.index('hx-get="/partials/performance"')
+        section_html = html[perf_idx - 100:perf_idx + 300]
+        assert 'aria-live="polite"' in section_html
+
     def test_all_three_sections_have_aria_live(self, client):
         html = client.get('/').text
         assert html.count('aria-live="polite"') >= 3
