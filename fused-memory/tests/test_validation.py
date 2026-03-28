@@ -175,6 +175,10 @@ class TestRequireProjectRoot:
             require_project_root(invalid)
         assert str(exc_info.value) == err_dict['error']
 
+    def test_empty_string_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            require_project_root('')
+
 
 class TestRequireProjectId:
     """require_project_id raises ValueError for invalid ids, returns None for valid ones."""
