@@ -4442,11 +4442,11 @@
         "description": "The memory-graphs and performance partial integration tests (added in task 252) have several assertion gaps:\n\n1. **memory-graphs empty test lacks unique assertions**: The template has no conditional empty-state branch — it unconditionally renders all three canvas elements. `test_memory_graphs_empty` should assert that the serialized JSON contains empty arrays (e.g. `'\"labels\": []'` or `'\"reads\": []'`) to verify the template receives and embeds the empty payload correctly.\n\n2. **memory-graphs with-data test missing data value assertions**: Should assert that mock data labels ('search', 'add_memory', 'claude-interactive', 'recon-consolidator') appear in the rendered HTML (they're embedded via `{{ operations | tojson }}`). Without these, the test would pass even if template context variables were swapped.\n\n3. **All-zero timeseries fixture**: `_MG_TIMESERIES` uses `reads=[0]*24` and `writes=[0]*24` even for the positive with-data test case. Add non-zero entries (e.g. `reads[12]=5, writes[12]=3`) and assert they appear in the rendered script block.\n\n4. **Untested performance template branches**: The `{% if escalations.get(project_id) %}` else branch (renders 'No data') and the `{% if esc.interactive_count > 0 %}` false path are untested. Add test cases for: (a) escalations populated but `interactive_count=0`, (b) escalations empty for a project that has paths data.\n\nmemory_hints: search \"dashboard partial integration test pattern\", review test_app.py lines 349-498",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T05:38:08.480Z",
+        "updatedAt": "2026-03-28T15:25:36.471Z",
         "metadata": {
           "files": [
             "dashboard/tests/test_memory_graphs_partial.py",
@@ -4487,11 +4487,11 @@
         "description": "Reduce test boilerplate in dashboard/tests/test_reconciliation.py and close coverage gaps for partition_burst_state.",
         "details": "## Problem\n\n1. **Boilerplate duplication (9 sites)**: The pattern of creating a custom SQLite DB (import sqlite3, import RECONCILIATION_SCHEMA, create db_path, connect, executescript, INSERT, commit, close, open with aiosqlite + row_factory) is repeated ~9 times across test_reconciliation.py. conftest.py has `reconciliation_db` for the common case but no factory for custom-data variants.\n\n2. **Missing happy-path coverage for partition_burst_state**: TestPartitionBurstState only tests the None-last_write_at error path. Missing tests:\n   - Recent `last_write_at` → agent in `active`\n   - Stale `last_write_at` → agent in `idle` (no debug log)\n   - `state='bursting'` → agent in `active` unconditionally\n\n## Fixes\n\n1. Add a `make_recon_db(tmp_path, inserts)` factory fixture/helper to conftest.py that accepts a list of SQL INSERT strings, creates the schema, executes them, and returns an aiosqlite connection. Refactor existing tests to use it.\n\n2. Add happy-path tests to TestPartitionBurstState covering the three cases above.\n\n## Memory hints\n- search: \"reconciliation test conftest fixture\"\n- search: \"partition_burst_state active idle threshold\"",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T05:42:02.959Z",
+        "updatedAt": "2026-03-28T15:25:36.494Z",
         "metadata": {
           "files": [
             "dashboard/tests/test_reconciliation.py",
@@ -5032,7 +5032,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T15:25:36.446Z",
+      "lastModified": "2026-03-28T15:25:36.494Z",
       "taskCount": 268,
       "completedCount": 207,
       "tags": [
