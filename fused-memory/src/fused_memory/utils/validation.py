@@ -69,3 +69,9 @@ def require_project_id(project_id: str) -> None:
     """Raise ValueError if project_id is empty or whitespace-only."""
     if err := validate_project_id(project_id):
         raise ValueError(err['error'])
+
+
+def require_run_id(run_id: str) -> None:
+    """Raise ValueError if run_id is empty or contains unsafe characters."""
+    if err := validate_run_id(run_id):
+        raise ValueError(err['error'])
