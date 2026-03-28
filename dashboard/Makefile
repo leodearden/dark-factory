@@ -28,12 +28,15 @@ endif
 TAILWIND_URL := https://github.com/tailwindlabs/tailwindcss/releases/download/v$(TAILWIND_VERSION)/tailwindcss-$(PLATFORM)
 
 # SHA-256 checksums for tailwindcss v4.2.2 per platform
-CHECKSUM_linux-x64   := d5aeca34ea33dccea2a11a5b82b18f3d475b1ee33bb91765ef8d406e0c3d9d3f
-CHECKSUM_linux-arm64 := 736a31e2040d1a22b35dfdc97f8ac1a25c9ae2aea04869a35a3af6dc8c9f5ca2
-CHECKSUM_macos-x64   := ab3c9c06a0cf0c3649c6a8e6c5f6f0e3d4b4b2e15e8d8b8c3c5e3f3a1a2b3c4
-CHECKSUM_macos-arm64 := e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9
+# Verified by downloading the actual release artifacts from GitHub and computing sha256sum.
+CHECKSUM_linux-x64   := 4ab84f2b496c402d3ec4fd25e0e5559fe1184d886dadae8fb4438344ec044c22
+CHECKSUM_linux-arm64 := ad627e77b496cccada4a6e26eafff698ef0829081e575a4baf3af8524bb00747
+CHECKSUM_macos-x64   := 98e34c6abd00a75a74ea2d20acf9e284241d13023133076d220c6f3ca419d920
+CHECKSUM_macos-arm64 := 2ce66b7c8101ef1245a07d1e7abb4beb35bf512fd3beecba1cdfb327580d1252
 
 EXPECTED_CHECKSUM := $(CHECKSUM_$(PLATFORM))
+
+.DELETE_ON_ERROR:
 
 .PHONY: css css-watch clean
 
