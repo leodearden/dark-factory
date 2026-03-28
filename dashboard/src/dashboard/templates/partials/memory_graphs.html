@@ -139,9 +139,6 @@
     });
   }
 
-  // Wait for browser layout before initializing charts
-  requestAnimationFrame(function() {
-    requestAnimationFrame(renderAll);
-  });
+  document.body.addEventListener('htmx:afterSettle', renderAll, { once: true });
 })();
 </script>
