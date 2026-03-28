@@ -40,16 +40,16 @@ class DbPool:
         resolved = db_path.resolve()
         if resolved in self._conns:
             return self._conns[resolved]
-        if not resolved.exists():
-            return None
         try:
+            if not resolved.exists():
+                return None
             conn = await aiosqlite.connect(
                 f'file:{resolved}?mode=ro', uri=True,
             )
             conn.row_factory = aiosqlite.Row
             self._conns[resolved] = conn
             return conn
-        except (FileNotFoundError, sqlite3.OperationalError):
+        except (FileNotFoundError, sqlite3.OperationalError, OSError):
             logger.debug('DbPool: cannot open %s', resolved, exc_info=True)
             return None
 
