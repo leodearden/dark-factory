@@ -81,14 +81,14 @@
       "type": "impl",
       "description": "Use re.escape() in pytest.raises match arguments: add 'import re' to the import block (already imported by schema.py but not by tests). Replace 'match=str(bad_file)' with 'match=re.escape(str(bad_file))' at line 246. Replace 'match=str(locked_file)' with 'match=re.escape(str(locked_file))' at line 257. Replace 'match=str(config_file)' with 'match=re.escape(str(config_file))' at line 272. Run full test suite to verify no regressions.",
       "status": "done",
-      "commit": "placeholder-step-9"
+      "commit": "083f3fb3"
     },
     {
       "id": "step-10",
       "type": "impl",
       "description": "Add root-user skip to test_unreadable_file_raises_runtime_error: add a second @pytest.mark.skipif decorator \u2014 'pytest.mark.skipif(os.getuid() == 0, reason=\"root ignores file permissions\")'. Place it alongside the existing Windows skip. Verify test still passes on non-root, non-Windows systems.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "placeholder-step-10"
     }
   ],
   "design_decisions": [
