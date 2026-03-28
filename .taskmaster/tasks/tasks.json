@@ -3988,10 +3988,11 @@
         "description": "The two inline `handler` functions in `test_first_server_down_falls_through` and `test_partial_failure_aggregates_available` (dashboard/tests/test_memory.py) are near-duplicates that reimplement the routing logic already in `_SessionAwareHandler`. The only additions are per-port error injection and `ports_seen` tracking.\n\nExtend `_SessionAwareHandler.__init__` with:\n- `fail_port: int | None = None` — raise `ConnectError` when request port matches\n- Expose `ports_seen: set[int]` attribute — record every port contacted\n\nIn `__call__`, record the port and raise the stored error when the port matches `fail_port`. Both fallback tests can then be simplified to:\n```python\nhandler = _SessionAwareHandler(_STATUS_PAYLOAD, fail_port=9000)\n# ... use handler ...\nassert 9000 in handler.ports_seen\nassert 9001 in handler.ports_seen\n```\n\nThis eliminates ~40 lines of duplicated routing code and keeps `ports_seen` introspection consistent.\n\nSource: review suggestion from reviewer_reuse_auditor on task 220.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T04:47:41.278Z"
       },
       {
         "id": "236",
@@ -4231,7 +4232,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:47:38.949Z",
+      "lastModified": "2026-03-28T04:47:41.278Z",
       "taskCount": 234,
       "completedCount": 182,
       "tags": [
