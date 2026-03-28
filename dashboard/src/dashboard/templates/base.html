@@ -42,6 +42,35 @@
             document.body.addEventListener('htmx:timeout', showError);
             document.body.addEventListener('htmx:sendError', showError);
         })();
+        (function () {
+            document.body.addEventListener('htmx:afterSwap', function (evt) {
+                var section = evt.detail.target;
+                var name = section && section.getAttribute('data-section');
+                if (!name) return;
+                var stamp = document.querySelector('[data-updated-for="' + name + '"]');
+                if (!stamp) return;
+                stamp.setAttribute('data-updated-at', String(Date.now()));
+                stamp.textContent = 'Updated just now';
+                section.classList.add('section-refreshed');
+                section.addEventListener('animationend', function () {
+                    section.classList.remove('section-refreshed');
+                }, { once: true });
+            });
+            setInterval(function () {
+                var stamps = document.querySelectorAll('[data-updated-at]');
+                stamps.forEach(function (el) {
+                    var ts = parseInt(el.getAttribute('data-updated-at'), 10);
+                    var elapsed = Math.floor((Date.now() - ts) / 1000);
+                    if (elapsed < 5) {
+                        el.textContent = 'Updated just now';
+                    } else if (elapsed < 60) {
+                        el.textContent = 'Updated ' + elapsed + 's ago';
+                    } else {
+                        el.textContent = 'Updated ' + Math.floor(elapsed / 60) + 'm ago';
+                    }
+                });
+            }, 1000);
+        })();
     </script>
 </body>
 </html>
