@@ -5,7 +5,9 @@ from contextlib import contextmanager
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from shared.cli_invoke import AgentResult
 
+import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId, Watermark
 from fused_memory.reconciliation.cli_stage_runner import (
@@ -21,15 +23,13 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _extract_report,
     _normalize_report,
 )
-from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
-import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
 )
-from shared.cli_invoke import AgentResult
 
 
 class TestDisallowedToolLists:
