@@ -154,3 +154,22 @@ class TestRequireProjectRoot:
         with pytest.raises(ValueError) as exc_info:
             require_project_root(invalid)
         assert str(exc_info.value) == err_dict['error']
+
+
+class TestValidatorErrorDictShape:
+    """All validate_* functions return dicts with exactly 'error' and 'error_type' keys."""
+
+    def test_validate_project_root_error_has_required_keys(self):
+        result = validate_project_root('relative/path')
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
+
+    def test_validate_project_id_error_has_required_keys(self):
+        result = validate_project_id('')
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
+
+    def test_validate_run_id_error_has_required_keys(self):
+        result = validate_run_id('')
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
