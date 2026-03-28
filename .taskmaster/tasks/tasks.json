@@ -4092,6 +4092,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 245,
+        "title": "Add character-set allowlist to validate_project_id for prompt injection safety",
+        "description": "validate_project_id currently only checks non-emptiness (line 30). It is interpolated into the same reconciliation context prompt as run_id (base.py line 122: `f'- \\`project_id\\`: \"{self.project_id}\"'`), but lacks the `[a-zA-Z0-9_-]+` character-set allowlist that validate_run_id now enforces. This asymmetry leaves project_id as a remaining injection vector in the same prompt block.\n\nFix: add the same `_RUN_ID_PATTERN.fullmatch()` check (or a shared `_SAFE_IDENTIFIER_PATTERN`) to validate_project_id. In practice project_id is always 'dark_factory', but the validation should be symmetric with run_id for defense-in-depth.\n\nmemory_hint: search \"prompt injection fix routing layer\" for prior pattern; search \"run_id validate character-set allowlist\" for the run_id implementation to mirror.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -4104,7 +4115,7 @@
       ],
       "created": "2026-03-28T04:31:36.938Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T04:31:36.940Z"
+      "updated": "2026-03-28T04:31:43.602Z"
     }
   }
 }
