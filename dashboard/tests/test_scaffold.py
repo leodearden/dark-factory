@@ -47,8 +47,12 @@ class TestConfigEnvOverrides:
         assert cfg.host == '0.0.0.0'
         assert cfg.port == 9090
         assert cfg.project_root == Path('/tmp/test')
-        # Non-overridden fields keep defaults
-        assert len(cfg.fused_memory_urls) == 3
+        # Non-overridden fields keep defaults (strict equality, not just length)
+        assert cfg.fused_memory_urls == [
+            'http://localhost:8002',
+            'http://localhost:8000',
+            'http://localhost:8001',
+        ]
 
     def test_env_derived_paths_update(self, monkeypatch):
         from dashboard.config import DashboardConfig
