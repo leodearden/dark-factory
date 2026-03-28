@@ -58,8 +58,13 @@ class _SessionAwareHandler:
         self.error_on_tool = error_on_tool
         self.error_on_all = error_on_all
         self.calls: list[dict] = []
+        self.ports_seen: set[int] = set()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        port = request.url.port
+        if port is not None:
+            self.ports_seen.add(port)
+
         if self.error_on_all:
             raise self.error_on_all
 
