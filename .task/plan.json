@@ -46,14 +46,14 @@
       "type": "impl",
       "description": "Verify step-3 test passes \u2014 no implementation change needed since the same except clause chains with 'from e'. Run test suite to confirm green.",
       "status": "done",
-      "commit": "placeholder-step-4"
+      "commit": "ab8bb6f0"
     },
     {
       "id": "step-5",
       "type": "test",
       "description": "Write new test test_utf8_open_passes_encoding_kwarg in TestYamlSettingsSourceEncoding. Use unittest.mock.patch on 'builtins.open' to intercept the open() call and assert it was called with encoding='utf-8'. The mock should use a side_effect that calls the real open so the test still exercises YAML loading, then verify via mock.call_args that encoding='utf-8' was passed.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "placeholder-step-5"
     },
     {
       "id": "step-6",

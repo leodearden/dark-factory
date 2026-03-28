@@ -2,6 +2,7 @@
 
 import os
 import sys
+import unittest.mock
 
 import pytest
 import yaml
@@ -317,6 +318,17 @@ class TestYamlSettingsSourceEncoding:
         source = self._make_source(config_file)
         result = source()
         assert result.get('description') == 'Ünfcödé tëst'
+
+    def test_utf8_open_passes_encoding_kwarg(self, tmp_path):
+        """open() must be called with encoding='utf-8' when loading the YAML file."""
+        config_file = tmp_path / 'utf8.yaml'
+        config_file.write_text('key: value', encoding='utf-8')
+        source = self._make_source(config_file)
+        _real_open = open
+        with unittest.mock.patch('builtins.open', side_effect=_real_open) as mock_open:
+            source()
+        mock_open.assert_called_once()
+        assert mock_open.call_args.kwargs.get('encoding') == 'utf-8'
 
 
 class TestYamlSettingsSourceABCContract:
