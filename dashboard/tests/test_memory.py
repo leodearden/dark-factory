@@ -82,6 +82,35 @@ class _SessionAwareHandler:
         return _make_mcp_response(self.tool_response, request_id)
 
 
+class TestSessionAwareHandler:
+    """Unit tests for _SessionAwareHandler port-tracking behaviour."""
+
+    def _init_request(self, port: int = 9001) -> httpx.Request:
+        """Build a minimal JSON-RPC initialize request targeting *port*."""
+        body = json.dumps(
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'}
+        ).encode()
+        return httpx.Request('POST', f'http://localhost:{port}/mcp', content=body)
+
+    def test_ports_seen_initializes_empty(self):
+        """Handler initializes with an empty ports_seen set."""
+        handler = _SessionAwareHandler({'ok': True})
+        assert handler.ports_seen == set()
+
+    def test_ports_seen_after_request(self):
+        """After a request to port 9001, ports_seen contains 9001."""
+        handler = _SessionAwareHandler({'ok': True})
+        handler(self._init_request(9001))
+        assert 9001 in handler.ports_seen
+
+    def test_calls_populated_for_successful_request(self):
+        """handler.calls is populated after a successful request."""
+        handler = _SessionAwareHandler({'ok': True})
+        handler(self._init_request(9001))
+        assert len(handler.calls) == 1
+        assert handler.calls[0]['method'] == 'initialize'
+
+
 @pytest.fixture(autouse=True)
 def _clean_sessions():
     """Reset session cache before each test."""
