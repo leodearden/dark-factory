@@ -1,6 +1,8 @@
 """Tests for reconciliation stage configuration (CLI-native MCP execution)."""
 
 import json
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -14,6 +16,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
     STAGE_REPORT_SCHEMA,
+    StageResult,
 )
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
@@ -415,7 +418,6 @@ class TestProjectIdValidation:
 
     @staticmethod
     async def _fake_run_stage_via_cli(**kwargs):
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
         return StageResult(
             success=True,
             report={'summary': 'ok'},
@@ -442,9 +444,6 @@ class TestProjectIdValidation:
             cli_side_effect: Optional async callable for run_stage_via_cli side_effect.
                 Defaults to self._fake_run_stage_via_cli.
         """
-        from contextlib import contextmanager
-        from unittest.mock import patch
-
         effective_cli_side_effect = cli_side_effect if cli_side_effect is not None else self._fake_run_stage_via_cli
 
         @contextmanager
@@ -560,7 +559,6 @@ class TestProjectIdValidation:
     @pytest.mark.asyncio
     async def test_recon_context_includes_project_id(self, mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
