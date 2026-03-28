@@ -752,6 +752,19 @@ class TestGetEntity:
         assert edge['uuid'] is None
         assert edge['fact'] == str(bare_edge)
 
+    @pytest.mark.asyncio
+    async def test_getattr_labels_none_returns_empty_list(self, service):
+        """labels=None (attribute present but explicitly None) must return []."""
+        bare_node = types.SimpleNamespace(name='BareNode')
+        bare_node.labels = None  # attribute IS present, value is None
+
+        service.graphiti.search_nodes = AsyncMock(return_value=[bare_node])
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        result = await service.get_entity('BareNode', project_id='test')
+
+        assert result['nodes'][0]['labels'] == []
+
     # ------------------------------------------------------------------
     # concurrent execution — both coroutines run in parallel
     # ------------------------------------------------------------------
