@@ -793,8 +793,8 @@ class TestGetEntity:
     async def test_search_failure_raises_and_search_nodes_settles(self, service):
         """When search() raises, exception propagates AND search_nodes() was called.
 
-        With sequential execution, search_nodes() completes first, then search()
-        is called and raises.
+        With concurrent gather, both coroutines settle before any exception is
+        inspected — search_nodes() completes even though search() raises.
         """
         service.graphiti.search_nodes = AsyncMock(return_value=[])
         service.graphiti.search = AsyncMock(
@@ -804,7 +804,7 @@ class TestGetEntity:
         with pytest.raises(RuntimeError, match='search failed'):
             await service.get_entity('entity', project_id='test')
 
-        # search_nodes() was called first (sequential)
+        # search_nodes() settled in the concurrent gather even though search() failed
         service.graphiti.search_nodes.assert_called_once()
 
     # ------------------------------------------------------------------
@@ -813,7 +813,11 @@ class TestGetEntity:
 
     @pytest.mark.asyncio
     async def test_both_failures_raises_first_exception(self, service):
-        """When search_nodes fails, get_entity raises (search is never called)."""
+        """When both calls fail, the first exception from gather results is re-raised.
+
+        gather() returns results in positional order: search_nodes is index 0,
+        search is index 1. The first exception found in that order is re-raised.
+        """
         service.graphiti.search_nodes = AsyncMock(
             side_effect=RuntimeError('search_nodes failed')
         )
@@ -821,8 +825,34 @@ class TestGetEntity:
             side_effect=RuntimeError('search failed')
         )
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match='search_nodes failed'):
             await service.get_entity('entity', project_id='test')
+
+    # ------------------------------------------------------------------
+    # both calls fail — both warnings emitted before re-raise
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_both_failures_emits_two_warnings(self, service):
+        """When both calls fail, logger.warning is called twice — once per exception.
+
+        The exception filter iterates all gather results and logs each Exception
+        before raising the first one. Both failures must be visible in logs.
+        """
+        from unittest.mock import patch
+
+        service.graphiti.search_nodes = AsyncMock(
+            side_effect=RuntimeError('search_nodes failed')
+        )
+        service.graphiti.search = AsyncMock(
+            side_effect=RuntimeError('search failed')
+        )
+
+        with patch('fused_memory.services.memory_service.logger') as mock_logger:
+            with pytest.raises(RuntimeError, match='search_nodes failed'):
+                await service.get_entity('entity', project_id='test')
+
+        assert mock_logger.warning.call_count == 2
 
     # ------------------------------------------------------------------
     # temporal serialization in edge_data
