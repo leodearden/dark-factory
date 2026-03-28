@@ -46,6 +46,11 @@ class ReconciliationEvent(BaseModel):
     payload: dict = Field(default_factory=dict)
     agent_id: str | None = None
 
+    @field_validator('project_id', mode='before')
+    @classmethod
+    def normalize_project_id(cls, v):
+        return _normalize_project_id(v)
+
 
 class JournalEntry(BaseModel):
     """One per reconciliation operation — full audit trail."""
@@ -106,6 +111,11 @@ class ReconciliationRun(BaseModel):
     status: RunStatus = RunStatus.running
     triggered_by: str | None = None  # parent run_id for remediation runs
 
+    @field_validator('project_id', mode='before')
+    @classmethod
+    def normalize_project_id(cls, v):
+        return _normalize_project_id(v)
+
 
 class MemoryHints(BaseModel):
     """Memory retrieval hints attached to tasks."""
@@ -132,6 +142,16 @@ class VerificationResult(BaseModel):
     git_context: dict | None = None
 
 
+def _normalize_project_id(v: object, *, allow_empty: bool = False) -> object:
+    """Strip whitespace from project_id; raise if empty unless allow_empty is True."""
+    if isinstance(v, str):
+        stripped = v.strip()
+        if not stripped and not allow_empty:
+            raise ValueError('project_id is required and must be non-empty')
+        return stripped
+    return v
+
+
 class Watermark(BaseModel):
     """Tracks what's been processed per project."""
 
@@ -144,10 +164,8 @@ class Watermark(BaseModel):
 
     @field_validator('project_id', mode='before')
     @classmethod
-    def strip_project_id(cls, v):
-        if isinstance(v, str):
-            return v.strip()
-        return v
+    def normalize_project_id(cls, v):
+        return _normalize_project_id(v, allow_empty=True)
 
 
 class VerdictSeverity(StrEnum):

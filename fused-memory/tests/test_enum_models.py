@@ -425,7 +425,7 @@ class TestVerificationResultCoercion:
 
 
 class TestWatermarkProjectIdValidator:
-    """Watermark.strip_project_id validator strips whitespace from project_id."""
+    """Watermark.normalize_project_id validator strips whitespace and rejects empty project_id."""
 
     @staticmethod
     def _make_watermark(project_id: str):
@@ -445,11 +445,11 @@ class TestWatermarkProjectIdValidator:
         wm = self._make_watermark('  dark_factory  ')
         assert wm.project_id == 'dark_factory'
 
-    def test_empty_string_passes_through_as_valid_sentinel(self):
+    def test_empty_string_passes_as_sentinel(self):
         wm = self._make_watermark('')
         assert wm.project_id == ''
 
-    def test_tabs_and_newlines_normalize_to_empty(self):
+    def test_tabs_and_newlines_normalize_to_empty_string(self):
         wm = self._make_watermark('\t\n')
         assert wm.project_id == ''
 
@@ -459,3 +459,177 @@ class TestWatermarkProjectIdValidator:
 
         wm = Watermark.model_validate({'project_id': '  dark_factory  '})
         assert wm.project_id == 'dark_factory'
+
+
+# ---------------------------------------------------------------------------
+# Step 3: ReconciliationEvent project_id field_validator
+# ---------------------------------------------------------------------------
+
+
+class TestReconciliationEventProjectId:
+    """ReconciliationEvent.normalize_project_id strips whitespace and rejects empty project_id."""
+
+    _DEFAULTS = {
+        'id': 'evt-1',
+        'type': 'episode_added',
+        'source': 'agent',
+        'timestamp': '2024-01-01T00:00:00Z',
+    }
+
+    @staticmethod
+    def _make_event(project_id: str):
+        from fused_memory.models.reconciliation import ReconciliationEvent
+
+        return ReconciliationEvent.model_validate({
+            'id': 'evt-1',
+            'type': 'episode_added',
+            'source': 'agent',
+            'project_id': project_id,
+            'timestamp': '2024-01-01T00:00:00Z',
+        })
+
+    def test_valid_project_id_passes_through_unchanged(self):
+        evt = self._make_event('dark_factory')
+        assert evt.project_id == 'dark_factory'
+
+    def test_leading_trailing_whitespace_is_stripped(self):
+        evt = self._make_event('  dark_factory  ')
+        assert evt.project_id == 'dark_factory'
+
+    def test_whitespace_only_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            self._make_event('   ')
+
+    def test_empty_string_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            self._make_event('')
+
+    def test_model_validate_dict_strips_whitespace(self):
+        """mode='before' works for DB deserialization path (model_validate)."""
+        from fused_memory.models.reconciliation import ReconciliationEvent
+
+        evt = ReconciliationEvent.model_validate({
+            'id': 'evt-1',
+            'type': 'episode_added',
+            'source': 'agent',
+            'project_id': '  dark_factory  ',
+            'timestamp': '2024-01-01T00:00:00Z',
+        })
+        assert evt.project_id == 'dark_factory'
+
+
+# ---------------------------------------------------------------------------
+# Step 5: ReconciliationRun project_id field_validator
+# ---------------------------------------------------------------------------
+
+
+class TestReconciliationRunProjectId:
+    """ReconciliationRun.normalize_project_id strips whitespace and rejects empty project_id."""
+
+    @staticmethod
+    def _make_run(project_id: str):
+        from fused_memory.models.reconciliation import ReconciliationRun
+
+        return ReconciliationRun.model_validate({
+            'id': 'run-1',
+            'project_id': project_id,
+            'run_type': 'full',
+            'trigger_reason': 'test',
+            'started_at': '2024-01-01T00:00:00Z',
+        })
+
+    def test_valid_project_id_passes_through_unchanged(self):
+        run = self._make_run('dark_factory')
+        assert run.project_id == 'dark_factory'
+
+    def test_leading_trailing_whitespace_is_stripped(self):
+        run = self._make_run('  dark_factory  ')
+        assert run.project_id == 'dark_factory'
+
+    def test_whitespace_only_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            self._make_run('   ')
+
+    def test_empty_string_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            self._make_run('')
+
+    def test_model_validate_dict_strips_whitespace(self):
+        """mode='before' works for DB deserialization path (model_validate)."""
+        from fused_memory.models.reconciliation import ReconciliationRun
+
+        run = ReconciliationRun.model_validate({
+            'id': 'run-1',
+            'project_id': '  dark_factory  ',
+            'run_type': 'full',
+            'trigger_reason': 'test',
+            'started_at': '2024-01-01T00:00:00Z',
+        })
+        assert run.project_id == 'dark_factory'
+
+
+# ---------------------------------------------------------------------------
+# Step 7: Integration test — padded project_id normalizes consistently
+# ---------------------------------------------------------------------------
+
+
+class TestProjectIdNormalizationIntegration:
+    """Padded project_id normalizes to the same value across all three models."""
+
+    PADDED = '  dark_factory  '
+    EXPECTED = 'dark_factory'
+
+    def test_watermark_strips_padded_project_id(self):
+        from fused_memory.models.reconciliation import Watermark
+
+        wm = Watermark(project_id=self.PADDED)
+        assert wm.project_id == self.EXPECTED
+
+    def test_reconciliation_event_strips_padded_project_id(self):
+        from fused_memory.models.reconciliation import ReconciliationEvent
+
+        evt = ReconciliationEvent.model_validate({
+            'id': 'evt-1',
+            'type': 'episode_added',
+            'source': 'agent',
+            'project_id': self.PADDED,
+            'timestamp': '2024-01-01T00:00:00Z',
+        })
+        assert evt.project_id == self.EXPECTED
+
+    def test_reconciliation_run_strips_padded_project_id(self):
+        from fused_memory.models.reconciliation import ReconciliationRun
+
+        run = ReconciliationRun.model_validate({
+            'id': 'run-1',
+            'project_id': self.PADDED,
+            'run_type': 'full',
+            'trigger_reason': 'test',
+            'started_at': '2024-01-01T00:00:00Z',
+        })
+        assert run.project_id == self.EXPECTED
+
+    def test_all_three_models_produce_matching_project_id(self):
+        """All three normalized values are equal — a stage can compare them safely."""
+        from fused_memory.models.reconciliation import (
+            ReconciliationEvent,
+            ReconciliationRun,
+            Watermark,
+        )
+
+        wm = Watermark(project_id=self.PADDED)
+        evt = ReconciliationEvent.model_validate({
+            'id': 'evt-1',
+            'type': 'episode_added',
+            'source': 'agent',
+            'project_id': self.PADDED,
+            'timestamp': '2024-01-01T00:00:00Z',
+        })
+        run = ReconciliationRun.model_validate({
+            'id': 'run-1',
+            'project_id': self.PADDED,
+            'run_type': 'full',
+            'trigger_reason': 'test',
+            'started_at': '2024-01-01T00:00:00Z',
+        })
+        assert wm.project_id == evt.project_id == run.project_id == self.EXPECTED
