@@ -1,0 +1,204 @@
+{
+  "task_id": "126",
+  "title": "Fix: Add Graphiti entity summary refresh after bulk edge invalidation",
+  "files": [
+    "fused-memory/src/fused_memory/backends/graphiti_client.py",
+    "fused-memory/src/fused_memory/services/memory_service.py",
+    "fused-memory/src/fused_memory/server/tools.py",
+    "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py",
+    "fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py",
+    "fused-memory/tests/test_refresh_entity_summary.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/backends",
+    "fused-memory/src/fused_memory/services",
+    "fused-memory/src/fused_memory/server",
+    "fused-memory/src/fused_memory/reconciliation/prompts",
+    "fused-memory/src/fused_memory/reconciliation",
+    "fused-memory/tests"
+  ],
+  "analysis": "Stage 1 (MemoryConsolidator) runs as a Claude CLI subprocess with MCP tool access. When it calls `delete_memory(store='graphiti')`, the backend fully deletes the RELATES_TO edge from FalkorDB via `EntityEdge.delete()`. However, the entity node's `summary` field \u2014 which is a text property on the Entity node in FalkorDB \u2014 is never updated. Graphiti only regenerates summaries during episode ingestion (`add_episode`), not on edge deletion. This means entity summaries accumulate facts from all edges ever connected, even after those edges are deleted.\n\nThe fix requires four layers:\n1. **Backend (graphiti_client.py)**: Add methods to query valid edges for a node, update node summary, and orchestrate a full refresh \u2014 querying remaining valid edges, deduplicating their facts, and writing back a clean summary.\n2. **Service (memory_service.py)**: Add a `refresh_entity_summary` method that wraps the backend call with write journal logging.\n3. **MCP Tool (tools.py)**: Register `refresh_entity_summary` as an MCP tool so Stage 1 agent can call it. Add it to `DISALLOW_MEMORY_WRITES` in cli_stage_runner.py so Stage 3 (read-only) cannot use it.\n4. **Prompt (stage1.py)**: Update Stage 1 system prompt to list the new tool and instruct the agent to call it after deleting edges from an entity.\n\nThe summary regeneration is simple concatenation of valid edge facts (deduped), consistent with Graphiti's own pattern in `_extract_entity_summaries_batch` (node_operations.py lines 578-586) where short summaries are built by joining edge facts without LLM calls. This avoids adding an LLM dependency to the refresh path.\n\n**Review fix (partial_failure_misreported)**: The service-layer `refresh_entity_summary` (lines 1098-1114) has a linear flow where journal failure after a successful graphiti call propagates an exception to the caller, producing a false negative. The fix applies the same try/finally pattern used by `add_episode` (lines 445-487) plus a protective try/except around the journal call itself, so: (a) journal always runs even when graphiti fails, (b) journal failure cannot mask a successful graphiti operation.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Create test file fused-memory/tests/test_refresh_entity_summary.py with imports, fixtures, and mock helpers following existing patterns from test_cleanup_stale_edges.py and test_memory_service.py",
+      "status": "done",
+      "commit": "74867f14",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing test for GraphitiBackend.get_valid_edges_for_node(): mock FalkorDB graph query, verify correct Cypher (matches Entity node by UUID, filters invalid_at IS NULL on RELATES_TO edges), returns list of dicts with uuid/fact/name keys. Test empty result set returns empty list.",
+      "status": "done",
+      "commit": "01a62b45"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Implement GraphitiBackend.get_valid_edges_for_node(node_uuid: str) -> list[dict] in graphiti_client.py. Uses Cypher: MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL RETURN DISTINCT e.uuid, e.fact, e.name. Returns list of {uuid, fact, name} dicts.",
+      "status": "done",
+      "commit": "8b1c3be1"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing test for GraphitiBackend.update_node_summary(): mock graph query, verify Cypher sets n.summary on Entity node by UUID, passes summary string as parameter.",
+      "status": "done",
+      "commit": "b69a4f35"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Implement GraphitiBackend.update_node_summary(uuid: str, summary: str) -> None in graphiti_client.py. Uses Cypher: MATCH (n:Entity {uuid: $uuid}) SET n.summary = $summary.",
+      "status": "done",
+      "commit": "ebb840eb"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing test for GraphitiBackend.refresh_entity_summary(): mock get_node_text to return (name, old_summary), mock get_valid_edges_for_node to return edges with facts (including duplicates), mock update_node_summary. Verify: old summary returned, new summary has each fact exactly once (deduped), update_node_summary called with clean summary. Also test case with zero remaining edges produces empty summary.",
+      "status": "done",
+      "commit": "1f640950"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Implement GraphitiBackend.refresh_entity_summary(node_uuid: str) -> dict in graphiti_client.py. Calls get_node_text for old state, get_valid_edges_for_node for current edges, deduplicates facts (preserving order via dict.fromkeys), joins with newline, calls update_node_summary. Returns {uuid, name, old_summary, new_summary, edge_count}.",
+      "status": "done",
+      "commit": "8855f4bc"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing test for MemoryService.refresh_entity_summary(): mock graphiti backend's refresh_entity_summary, verify it delegates correctly, verify write journal logging when journal is present, verify it works without journal (journal=None).",
+      "status": "done",
+      "commit": "4c18810f"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Implement MemoryService.refresh_entity_summary(entity_uuid, project_id, agent_id, session_id, causation_id, _source) in memory_service.py. Delegates to self.graphiti.refresh_entity_summary(), logs via write journal if available. Returns backend result dict.",
+      "status": "done",
+      "commit": "dec77cde"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write failing test for the refresh_entity_summary MCP tool in tools.py: verify tool registration on FastMCP, verify it calls memory_service.refresh_entity_summary with correct args, verify project_id validation (empty project_id returns error), verify error handling (exception returns error dict).",
+      "status": "done",
+      "commit": "3f847b35"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Register refresh_entity_summary as @mcp.tool() in tools.py in the 'Delete tools' section (after delete_episode). Parameters: entity_uuid (str), project_id (str), agent_id/session_id/metadata/ctx (optional). Follows existing tool pattern: _resolve_identity, validate_project_id, _extract_causation, delegate to memory_service.",
+      "status": "done",
+      "commit": "6f68d243"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write failing test that DISALLOW_MEMORY_WRITES includes 'mcp__fused-memory__refresh_entity_summary' (so Stage 3 cannot call it) and that STAGE1_DISALLOWED does NOT include it (so Stage 1 can call it). Add to existing TestDisallowedToolLists pattern in test_stages.py \u2014 or verify in test_refresh_entity_summary.py by importing the lists.",
+      "status": "done",
+      "commit": "f8633821"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Add 'mcp__fused-memory__refresh_entity_summary' to DISALLOW_MEMORY_WRITES list in cli_stage_runner.py. This ensures Stage 3 (read-only integrity check) cannot use it, while Stage 1 (which only disallows task writes + builtins) can.",
+      "status": "done",
+      "commit": "4252468b"
+    },
+    {
+      "id": "step-13",
+      "type": "test",
+      "description": "Write failing test that STAGE1_SYSTEM_PROMPT mentions 'refresh_entity_summary' tool in the Available Tools section and includes guidance to call it after deleting edges.",
+      "status": "done",
+      "commit": "c2b4f538"
+    },
+    {
+      "id": "step-14",
+      "type": "impl",
+      "description": "Update STAGE1_SYSTEM_PROMPT in prompts/stage1.py: (1) Add 'mcp__fused-memory__refresh_entity_summary' to the Available Tools list with description. (2) Add a new guideline under 'Guidelines' or a new section: 'After deleting edges from a Graphiti entity, call refresh_entity_summary with the entity's UUID to regenerate its summary from the remaining valid edges. This prevents stale duplicate text from persisting in entity summaries.'",
+      "status": "done",
+      "commit": "9962191a"
+    },
+    {
+      "id": "step-15",
+      "type": "test",
+      "description": "Write failing tests for the partial_failure_misreported fix in TestMemoryServiceRefreshEntitySummary: (1) test_journal_failure_does_not_mask_successful_refresh: graphiti succeeds, journal.log_write_op raises RuntimeError \u2014 verify result is still returned (no exception propagates to caller), proving journal failure cannot produce a false negative. (2) test_graphiti_failure_still_logs_journal: graphiti.refresh_entity_summary raises ValueError \u2014 verify journal.log_write_op is still called with success=False and error containing the exception message, and that the ValueError propagates to the caller. (3) test_journal_logs_success_false_on_backend_error: graphiti raises, verify the journal call_kwargs include success=False and a non-empty error string.",
+      "status": "done",
+      "commit": "d0689fd2"
+    },
+    {
+      "id": "step-16",
+      "type": "impl",
+      "description": "Refactor MemoryService.refresh_entity_summary() (lines 1098-1114) to use the try/finally journal pattern from add_episode (lines 445-487), plus a protective try/except around the journal call: (1) Initialize success=True, error_msg=None before the try block. (2) Wrap the graphiti.refresh_entity_summary() call in try/except \u2014 on exception set success=False, error_msg=str(e), re-raise. (3) Move journal logging into a finally block, wrapped in its own try/except that logs a warning (via logger.warning) on journal failure instead of propagating. Pass success=success and error=error_msg to log_write_op. This ensures: journal failure cannot mask a successful operation (fixes false negative), and backend failure is always journaled (fixes missing audit trail).",
+      "status": "done",
+      "commit": "93aae513"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Summary regeneration uses simple fact concatenation (deduped), not LLM-based summarization",
+      "rationale": "Consistent with Graphiti's own pattern in _extract_entity_summaries_batch (node_operations.py line 584) where summaries shorter than MAX_SUMMARY_CHARS*4 are built by joining edge facts directly. Avoids adding an LLM dependency (and associated cost/latency) to what should be a fast post-cleanup operation. If summaries grow very long in the future, LLM summarization can be added as an enhancement."
+    },
+    {
+      "decision": "Expose refresh as an MCP tool rather than auto-triggering on delete_memory",
+      "rationale": "Stage 1 is an LLM agent that decides which edges to delete. It knows which entity nodes are affected and can batch refreshes after all deletions on an entity are complete. Auto-triggering on every delete_memory would cause redundant refreshes when multiple edges on the same entity are deleted sequentially. The MCP tool approach also keeps delete_memory's behavior unchanged (no regression risk)."
+    },
+    {
+      "decision": "Query valid edges using undirected Cypher match: (n:Entity)-[e:RELATES_TO]-()",
+      "rationale": "Entity nodes can be either source or target of RELATES_TO edges. The undirected match captures both directions. DISTINCT is used on the return to prevent duplicates from self-loop edges (unlikely but defensive)."
+    },
+    {
+      "decision": "Fact deduplication uses dict.fromkeys() to preserve insertion order",
+      "rationale": "The stale summary bug is caused by duplicate facts. dict.fromkeys() deduplicates while preserving the order facts were encountered, which gives deterministic and readable summaries. This is a standard Python idiom for ordered dedup."
+    },
+    {
+      "decision": "Add to DISALLOW_MEMORY_WRITES list in cli_stage_runner.py",
+      "rationale": "refresh_entity_summary is a write operation (modifies node summary). Stage 3 (IntegrityCheck) is read-only and must not modify data. Adding to DISALLOW_MEMORY_WRITES ensures Stage 3 cannot call it, while Stage 1 (which only blocks task writes + builtins) retains access."
+    },
+    {
+      "decision": "Journal failure uses try/except with logger.warning, not silent swallow",
+      "rationale": "The add_episode pattern (lines 445-487) puts journal in finally{} but does not protect against journal failure itself. For refresh_entity_summary, we add an inner try/except around log_write_op that logs a warning rather than propagating. This prevents the false-negative scenario (journal failure masking successful operation) while still making journal failures visible in logs for debugging. A pure try/finally without the inner protection would still propagate journal exceptions."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "GraphitiBackend pattern for Cypher queries",
+      "where": "graphiti_client.py \u2014 get_node_text(), update_node_embedding(), query_edges_by_time_range()",
+      "how": "Follow the same _require_client() \u2192 cast driver \u2192 _get_graph() \u2192 graph.query() pattern. Use same parameter passing style ($uuid, $summary)."
+    },
+    {
+      "what": "MCP tool registration pattern",
+      "where": "tools.py \u2014 delete_memory(), delete_episode() tools",
+      "how": "Same @mcp.tool() decorator, same parameter structure (entity_uuid, project_id, agent_id, session_id, metadata, ctx), same _resolve_identity + validate_project_id + _extract_causation + try/except pattern."
+    },
+    {
+      "what": "MemoryService write journaling pattern (try/finally)",
+      "where": "memory_service.py \u2014 add_episode() method (lines 445-487)",
+      "how": "Same success/error_msg initialization, try/except/finally structure. Extended with inner try/except around log_write_op to prevent journal failures from masking successful operations."
+    },
+    {
+      "what": "Test mock patterns for GraphitiBackend",
+      "where": "tests/test_cleanup_stale_edges.py \u2014 _make_backend(), _make_graph_mock()",
+      "how": "Same GraphitiBackend mock construction with MagicMock client, same graph.query AsyncMock with result_set return structure."
+    },
+    {
+      "what": "Test mock patterns for MemoryService",
+      "where": "tests/test_memory_service.py \u2014 service fixture",
+      "how": "Same service fixture with mock_config, mocked graphiti/mem0/durable_queue backends."
+    },
+    {
+      "what": "DISALLOW list structure",
+      "where": "cli_stage_runner.py \u2014 DISALLOW_MEMORY_WRITES list",
+      "how": "Append to existing list following 'mcp__fused-memory__<tool_name>' naming convention."
+    }
+  ],
+  "_session_id": "126-071e3f7f",
+  "_created_at": "2026-03-28T20:04:54.140111+00:00"
+}
