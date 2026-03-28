@@ -3506,7 +3506,7 @@
         "description": "The UTC-normalization pattern (fromisoformat → check tzinfo → replace UTC) is repeated in 3 places. partition_burst_state is a pure data function misplaced in app.py.",
         "details": "## Problem\n\n1. The 3-line UTC normalization pattern (`datetime.fromisoformat(ts)` → `if tzinfo is None` → `replace(tzinfo=UTC)`) is duplicated in:\n   - `reconciliation.py:197-199` (get_buffer_stats)\n   - `reconciliation.py:236-238` (get_burst_state)\n   - `app.py:142-144` (partition_burst_state)\n   No shared helper exists.\n\n2. `partition_burst_state` is a pure data-processing function with zero web-framework deps, yet lives in `app.py`. Tests import it via `from dashboard.app import partition_burst_state`, which is an awkward dependency on the web entrypoint. Natural home is `dashboard/data/reconciliation.py` alongside `get_burst_state`.\n\n3. `get_burst_state` in reconciliation.py already loops through agents, parses `last_write_at`, normalizes UTC, and compares against a threshold — structurally identical to what `partition_burst_state` does. Consider enriching `get_burst_state` to return an `is_active` flag or do single-pass classification.\n\n## Fix\n\n1. Extract `def _parse_utc(ts: str) -> datetime` helper in `dashboard/data/reconciliation.py` and call from all 3 sites.\n2. Move `partition_burst_state` (and `_ACTIVE_THRESHOLD_SECONDS`) to `reconciliation.py`.\n3. Update imports in `app.py` and test files.\n4. Consider merging the classification into `get_burst_state` to eliminate the second per-agent loop.\n\n## Memory hints\n\n- search: \"UTC parsing helper dashboard reconciliation\"\n- search: \"dashboard code quality DRY reuse\"",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -3523,7 +3523,8 @@
             "fused-memory/src/fused_memory/utils",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-28T00:37:46.237Z"
       },
       {
         "id": "208",
@@ -3760,7 +3761,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T00:37:44.657Z",
+      "lastModified": "2026-03-28T00:37:46.285Z",
       "taskCount": 199,
       "completedCount": 158,
       "tags": [
