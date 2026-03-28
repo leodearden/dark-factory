@@ -4170,11 +4170,11 @@
         "description": "The DASHBOARD_FUSED_MEMORY_URLS environment variable override in DashboardConfig.from_env() (config.py:63-64) uses `[u.strip() for u in urls.split(',') if u.strip()]` but has no test coverage. The existing test_env_overrides only checks that fused_memory_urls keeps its default when the env var is not set.\n\nAdd tests for:\n1. Comma-separated list with whitespace: 'http://a:1, http://b:2 ' → ['http://a:1', 'http://b:2']\n2. Single URL: 'http://localhost:9000' → ['http://localhost:9000']\n3. Empty string: '' → [] (empty list, not error)\n4. Trailing/leading commas: ',http://a:1,,http://b:2,' → ['http://a:1', 'http://b:2']\n\nmemory_hints:\n- search: \"DashboardConfig from_env parsing convention\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T05:09:50.833Z"
+        "updatedAt": "2026-03-28T05:16:19.144Z"
       },
       {
         "id": "249",
@@ -4337,9 +4337,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T05:12:39.576Z",
+      "lastModified": "2026-03-28T05:16:19.147Z",
       "taskCount": 241,
-      "completedCount": 189,
+      "completedCount": 190,
       "tags": [
         "master"
       ]
