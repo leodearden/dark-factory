@@ -269,6 +269,31 @@ class TestReconPartialIntegration:
             html = resp.text
             assert 'No reconciliation runs' in html
 
+    @pytest.mark.parametrize('failing_fn', [
+        'get_buffer_stats',
+        'get_burst_state',
+        'get_watermarks',
+        'get_latest_verdict',
+        'get_recent_runs',
+        'get_last_attempted_run',
+    ])
+    def test_recon_partial_failure(self, client, failing_fn):
+        """One failing recon coroutine should not cause a 500."""
+        with _patch_recon_data(), patch(
+            f'dashboard.app.{failing_fn}',
+            new_callable=AsyncMock,
+            side_effect=RuntimeError('injected error'),
+        ):
+            resp = client.get('/partials/recon')
+            assert resp.status_code == 200
+            html = resp.text
+            # When runs fails, the other data (staleness_timer) still renders
+            if failing_fn != 'get_recent_runs':
+                assert 'staleness_timer' in html
+            # When runs fails, at least the page renders without a 500
+            else:
+                assert 'No reconciliation runs' in html
+
 
 _MOCK_ORCHESTRATOR = {
     'pids': [1234],
