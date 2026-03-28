@@ -1025,6 +1025,10 @@ class TestSelectTier:
             events=[_make_event()],
         )
 
+        assert captured != {}, (
+            'MemoryConsolidator.run() was never called — run_full_cycle skipped it or stage list changed'
+        )
+
         assert captured.get('episode_limit') == 125, (
             f"Expected episode_limit=125 propagated to consolidator, got {captured.get('episode_limit')}"
         )
