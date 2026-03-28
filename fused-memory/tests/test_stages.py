@@ -572,8 +572,8 @@ class TestProjectIdValidation:
         original_run_stage_via_cli = base_module.run_stage_via_cli
 
         with self._patch_stage(stage):
-            # (a) assemble_payload is replaced with a mock (has side_effect attribute)
-            assert hasattr(stage.assemble_payload, 'side_effect')
+            # (a) assemble_payload is replaced with a mock instance
+            assert isinstance(stage.assemble_payload, (AsyncMock, MagicMock))
             # (b) run_stage_via_cli in the base module is no longer the original function
             assert base_module.run_stage_via_cli is not original_run_stage_via_cli
 
