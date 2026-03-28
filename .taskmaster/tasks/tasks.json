@@ -3951,10 +3951,11 @@
         "description": "After task 219 made DEFAULT_FUSED_MEMORY_URLS public and updated tests to use it, the assertions in test_config_defaults and test_env_overrides became tautological — they compare cfg.fused_memory_urls against list(DEFAULT_FUSED_MEMORY_URLS), which is exactly how the default_factory works. If the constant is accidentally mutated, both sides change together and the tests still pass.\n\nAdd a focused test that pins DEFAULT_FUSED_MEMORY_URLS to its expected concrete values:\n\n```python\ndef test_default_fused_memory_urls_values():\n    assert DEFAULT_FUSED_MEMORY_URLS == [\n        'http://localhost:8002',\n        'http://localhost:8000',\n        'http://localhost:8001',\n    ]\n```\n\nThis restores the regression guard that was lost when hardcoded values were replaced with the imported constant.\n\nmemory_hints:\n- search: \"DEFAULT_FUSED_MEMORY_URLS tautological test assertion\"\n- search: \"convention: test constants pinned values\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T04:29:07.591Z"
       },
       {
         "id": "233",
@@ -4084,7 +4085,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:29:05.315Z",
+      "lastModified": "2026-03-28T04:29:07.591Z",
       "taskCount": 222,
       "completedCount": 175,
       "tags": [
