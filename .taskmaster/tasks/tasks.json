@@ -3682,7 +3682,7 @@
         "description": "TestBaseStageGuardContract in test_enum_models.py duplicates 3 tests already in TestBaseStageValidation in test_stages.py, including duplicate helper infrastructure (_patch_stage, mock_deps). Additionally, there are two test gaps in the Watermark validator coverage.\n\nFix:\n1. Remove TestBaseStageGuardContract class from test_enum_models.py entirely — all 3 tests (matching, empty, mismatch) are covered by TestBaseStageValidation in test_stages.py.\n2. Add a whitespace→empty integration test to test_stages.py: create Watermark(project_id='   ') and pass through stage.run(), assert it succeeds with DEBUG log — this tests the validator→guard combined path that motivated the whole change.\n3. Add a dict-construction test to TestWatermarkProjectIdValidator in test_enum_models.py: Watermark.model_validate({'project_id': '  dark_factory  ', ...}) and assert project_id is stripped — this confirms the mode='before' path used during DB deserialization.\n\nmemory_hints:\n- search: \"TestBaseStageGuardContract TestBaseStageValidation duplicate tests\"\n- search: \"Watermark field_validator strip_project_id model_validate\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -3694,7 +3694,8 @@
           "modules": [
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-28T00:47:48.141Z"
       },
       {
         "id": "216",
@@ -3798,7 +3799,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T00:47:47.728Z",
+      "lastModified": "2026-03-28T00:47:48.141Z",
       "taskCount": 202,
       "completedCount": 161,
       "tags": [
