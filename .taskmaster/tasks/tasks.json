@@ -4572,6 +4572,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 281,
+        "title": "Guard datasets[0].data access in JS chart datalabels/tooltip callbacks",
+        "description": "Both memory_graphs.html and performance.html access ctx.chart.data.datasets[0].data.reduce(...) without checking datasets is non-empty. If a chart renders with no data (empty dashboard state, HTMX partial re-render), both the datalabels formatter and tooltip callback throw TypeError in the browser.\n\nFix: In both templates, add `var ds = ctx.chart.data.datasets[0]; if (!ds) return '';` before each .data.reduce() call in the datalabels formatter and tooltip label callback. Four call sites total (two per template).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -4584,7 +4595,7 @@
       ],
       "created": "2026-03-28T07:37:31.561Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T07:37:43.820Z"
+      "updated": "2026-03-28T07:37:53.712Z"
     }
   }
 }
