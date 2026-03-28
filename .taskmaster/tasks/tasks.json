@@ -4116,10 +4116,11 @@
         "description": "The validation.py module docstring establishes two naming conventions: `validate_*` returns error dicts (for MCP tool handlers), `require_*` raises ValueError (for internal code). BaseStage.run() is internal code but calls `validate_run_id` and `validate_project_id`, then hand-rolls `raise ValueError(err['error'])` — exactly what `require_*` encapsulates.\n\nAdd `require_run_id(run_id: str) -> None` and `require_project_id(project_id: str) -> None` following the existing `require_project_root` pattern at line 62. Update BaseStage.run() to call these directly instead of the validate_*/raise pattern.\n\nmemory_hint: search \"validate_* vs require_* naming convention validation.py\" for context; search \"prompt injection fix routing layer\" for prior pattern.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T05:04:44.659Z"
       },
       {
         "id": "245",
@@ -4300,7 +4301,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T05:04:42.517Z",
+      "lastModified": "2026-03-28T05:04:44.659Z",
       "taskCount": 238,
       "completedCount": 186,
       "tags": [
