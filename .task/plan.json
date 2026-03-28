@@ -39,14 +39,14 @@
       "type": "test",
       "description": "Add __cause__ assertion to test_unreadable_file_raises_runtime_error: capture exc_info and assert exc_info.value.__cause__ is not None (verifies chaining for OSError from permission denied). This strengthens the existing test at line 250.",
       "status": "done",
-      "commit": "placeholder-step-3"
+      "commit": "0b0bd6f2"
     },
     {
       "id": "step-4",
       "type": "impl",
       "description": "Verify step-3 test passes \u2014 no implementation change needed since the same except clause chains with 'from e'. Run test suite to confirm green.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "placeholder-step-4"
     },
     {
       "id": "step-5",
