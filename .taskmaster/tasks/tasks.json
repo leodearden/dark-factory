@@ -3828,10 +3828,11 @@
         "description": "The _parse_utc helper has a misleading type signature and the UTC normalization pattern still has one remaining duplicate in app.py's timeago filter.",
         "details": "## Problem\n\n1. `_parse_utc` in `dashboard/data/reconciliation.py:24` declares `ts: str | None` but does not handle None — it passes None to `datetime.fromisoformat()` which raises TypeError. The `# type: ignore[arg-type]` suppresses what the type checker correctly flags. All 3 call sites already guard against None externally, so the `| None` is misleading.\n\n2. The `timeago` Jinja2 filter in `dashboard/app.py:54-58` still contains the same inline UTC-normalization pattern (`fromisoformat` → `tzinfo` check → `replace(tzinfo=UTC)`) that task 207 was meant to eliminate. Moving `_parse_utc` to a shared location would allow app.py to use it too.\n\n## Fix\n\n1. Change `_parse_utc` signature from `ts: str | None` to `ts: str`. Remove the `# type: ignore[arg-type]` comment.\n2. Move `_parse_utc` to `dashboard/src/dashboard/data/utils.py` (or similar shared module).\n3. Update imports in `reconciliation.py`.\n4. Refactor `timeago` filter in `app.py` to use `_parse_utc` instead of inline pattern. The existing try/except handles the error-return-'never' path, so `_parse_utc` composes cleanly.\n\n## Memory hints\n- search: \"UTC parsing helper dashboard reconciliation\"\n- search: \"dashboard code quality DRY reuse\"",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T04:15:54.934Z"
       },
       {
         "id": "225",
@@ -3976,7 +3977,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:15:54.462Z",
+      "lastModified": "2026-03-28T04:15:54.934Z",
       "taskCount": 215,
       "completedCount": 171,
       "tags": [
