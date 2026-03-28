@@ -431,15 +431,14 @@ class TestPerformancePartialIntegration:
             assert 'No orchestrator run data yet' in html
 
     def test_performance_backend_error_degrades_gracefully(self, client):
-        with _patch_perf_integration():
-            with patch(
-                'dashboard.app.get_completion_paths',
-                new_callable=AsyncMock,
-                side_effect=RuntimeError('db unavailable'),
-            ):
-                resp = client.get('/partials/performance')
-                assert resp.status_code == 200
-                assert 'No orchestrator run data yet' in resp.text
+        with _patch_perf_integration(), patch(
+            'dashboard.app.get_completion_paths',
+            new_callable=AsyncMock,
+            side_effect=RuntimeError('db unavailable'),
+        ):
+            resp = client.get('/partials/performance')
+            assert resp.status_code == 200
+            assert 'No orchestrator run data yet' in resp.text
 
 
 _MG_TIMESERIES = {
@@ -508,15 +507,14 @@ class TestMemoryGraphsPartialIntegration:
             assert 'memoryAgentChart' in html
 
     def test_memory_graphs_backend_error_degrades_gracefully(self, client):
-        with _patch_memory_graphs_integration():
-            with patch(
-                'dashboard.app.get_memory_timeseries',
-                new_callable=AsyncMock,
-                side_effect=RuntimeError('db unavailable'),
-            ):
-                resp = client.get('/partials/memory-graphs')
-                assert resp.status_code == 200
-                assert 'memoryTimeseriesChart' in resp.text
+        with _patch_memory_graphs_integration(), patch(
+            'dashboard.app.get_memory_timeseries',
+            new_callable=AsyncMock,
+            side_effect=RuntimeError('db unavailable'),
+        ):
+            resp = client.get('/partials/memory-graphs')
+            assert resp.status_code == 200
+            assert 'memoryTimeseriesChart' in resp.text
 
 
 class TestHtmxErrorHandling:
