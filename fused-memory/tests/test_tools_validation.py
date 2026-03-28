@@ -79,3 +79,27 @@ class TestToolsValidationIntegration:
         )
         # Validation must short-circuit before reaching the service
         mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_rejects_whitespace_project_root(self):
+        """get_tasks handler rejects whitespace-only project_root before reaching the task interceptor.
+
+        Validates that the project_root consolidation bugfix propagates through the
+        MCP handler layer for task tools, mirroring the project_id test for memory tools.
+        """
+        mock_service = AsyncMock()
+        mock_task_interceptor = AsyncMock()
+        server = create_mcp_server(mock_service, task_interceptor=mock_task_interceptor)
+
+        result = await server._tool_manager.call_tool(
+            'get_tasks',
+            {'project_root': '   '},
+        )
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}: {result!r}'
+        assert 'error' in result, f'Expected error key in result: {result!r}'
+        assert result['error_type'] == 'ValidationError', (
+            f"Expected error_type='ValidationError', got: {result['error_type']!r}"
+        )
+        # Validation must short-circuit before reaching the task interceptor
+        mock_task_interceptor.get_tasks.assert_not_called()
