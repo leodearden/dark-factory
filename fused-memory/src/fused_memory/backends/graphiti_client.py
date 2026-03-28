@@ -327,6 +327,36 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
+    async def get_valid_edges_for_node(self, node_uuid: str) -> list[dict]:
+        """Return all currently-valid RELATES_TO edges for an Entity node.
+
+        Matches the node as either source or target (undirected) and filters
+        edges where invalid_at IS NULL (i.e. not yet invalidated).
+
+        Args:
+            node_uuid: UUID of the Entity node.
+
+        Returns:
+            List of dicts with keys: uuid, fact, name.
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() '
+            'WHERE e.invalid_at IS NULL '
+            'RETURN DISTINCT e.uuid, e.fact, e.name'
+        )
+        result = await graph.query(cypher, {'uuid': node_uuid})
+        return [
+            {
+                'uuid': row[0],
+                'fact': row[1] or '',
+                'name': row[2] or '',
+            }
+            for row in (result.result_set or [])
+        ]
+
     async def bulk_remove_edges(self, uuids: list[str]) -> int:
         """Delete RELATES_TO edges by UUID list. Returns count of actually matched edges.
 
@@ -382,6 +412,57 @@ class GraphitiBackend:
             raise NodeNotFoundError(f'Entity node not found: {uuid}')
         row = result.result_set[0]
         return (row[0], row[1] or '')
+
+    async def refresh_entity_summary(self, node_uuid: str) -> dict:
+        """Regenerate an Entity node's summary from its currently-valid edges.
+
+        Fetches the node's current name and summary, queries all valid
+        (non-invalidated) RELATES_TO edges, deduplicates their facts
+        (preserving order), joins them with newlines, and writes the result
+        back to the node's summary property.
+
+        Summary regeneration uses simple fact concatenation (deduped), consistent
+        with Graphiti's own _extract_entity_summaries_batch pattern — no LLM call.
+
+        Args:
+            node_uuid: UUID of the Entity node to refresh.
+
+        Returns:
+            Dict with keys: uuid, name, old_summary, new_summary, edge_count.
+        """
+        name, old_summary = await self.get_node_text(node_uuid)
+        edges = await self.get_valid_edges_for_node(node_uuid)
+        # Deduplicate facts while preserving insertion order
+        facts = list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
+        new_summary = '\n'.join(facts)
+        await self.update_node_summary(node_uuid, new_summary)
+        logger.info(
+            'refresh_entity_summary: node=%s name=%r edges=%d old_len=%d new_len=%d',
+            node_uuid, name, len(edges), len(old_summary), len(new_summary),
+        )
+        return {
+            'uuid': node_uuid,
+            'name': name,
+            'old_summary': old_summary,
+            'new_summary': new_summary,
+            'edge_count': len(edges),
+        }
+
+    async def update_node_summary(self, uuid: str, summary: str) -> None:
+        """Update the summary text property on an Entity node.
+
+        Args:
+            uuid: UUID of the Entity node to update.
+            summary: New summary text (may be empty string to clear).
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH (n:Entity {uuid: $uuid}) '
+            'SET n.summary = $summary'
+        )
+        await graph.query(cypher, {'uuid': uuid, 'summary': summary})
 
     async def get_edge_text(self, uuid: str) -> tuple[str, str]:
         """Return (name, fact) for the RELATES_TO edge with the given UUID.
