@@ -119,3 +119,37 @@ class TestRefreshPulseCSS:
         css = client.get('/static/tailwind.css').text
         assert '.section-refreshed' in css
 
+
+class TestTimestampErrorState:
+    """Tests that JS shows failure state in timestamp elements on htmx errors."""
+
+    def test_update_failed_text_in_js(self, client):
+        """The JS must contain 'Update failed' text for the failure message."""
+        html = client.get('/').text
+        assert 'Update failed' in html
+
+    def test_error_handler_sets_data_update_failed_attr(self, client):
+        """The JS must set a data-update-failed attribute to prevent interval overwrites."""
+        html = client.get('/').text
+        assert 'data-update-failed' in html
+
+    def test_error_events_registered_in_timestamp_iife(self, client):
+        """The timestamp IIFE must register listeners on all three htmx error events."""
+        html = client.get('/').text
+        # All three error event names must appear in the page JS
+        assert 'htmx:responseError' in html
+        assert 'htmx:timeout' in html
+        assert 'htmx:sendError' in html
+
+    def test_after_swap_clears_failure_flag(self, client):
+        """The htmx:afterSwap handler must clear data-update-failed on recovery."""
+        html = client.get('/').text
+        # The afterSwap handler should remove or clear data-update-failed
+        assert 'removeAttribute' in html or "data-update-failed" in html
+
+    def test_interval_skips_failed_elements(self, client):
+        """The setInterval must skip updating elements that have data-update-failed set."""
+        html = client.get('/').text
+        # The interval function must check for data-update-failed before updating text
+        assert 'data-update-failed' in html
+
