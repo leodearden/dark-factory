@@ -23,15 +23,15 @@
       "id": "step-2",
       "type": "impl",
       "description": "Implement error-state timestamp updates in base.html. In the timestamp-tracking IIFE, add a function that: (1) extracts data-section from evt.detail.target, (2) finds the matching data-updated-for element, (3) sets its textContent to 'Update failed \\u2014 retrying\\u2026', (4) sets a data-update-failed attribute. Register this function on htmx:responseError, htmx:timeout, htmx:sendError. In the htmx:afterSwap handler, clear the data-update-failed attribute on recovery. In the setInterval, skip elements that have data-update-failed set.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "75237907"
     },
     {
       "id": "step-3",
       "type": "test",
       "description": "Write failing test for NaN guard. Add TestNaNGuard class to test_refresh_indicator.py with a test that the JS contains 'isNaN' in the context of the setInterval timestamp updater. Should fail against current base.html.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "7940dcbe"
     },
     {
       "id": "step-4",

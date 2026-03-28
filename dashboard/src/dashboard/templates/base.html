@@ -74,6 +74,7 @@
                 stamps.forEach(function (el) {
                     if (el.getAttribute('data-update-failed')) return;
                     var ts = parseInt(el.getAttribute('data-updated-at'), 10);
+                    if (isNaN(ts)) return;
                     var elapsed = Math.floor((Date.now() - ts) / 1000);
                     if (elapsed < 5) {
                         el.textContent = 'Updated just now';
