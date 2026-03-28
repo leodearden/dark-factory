@@ -20,7 +20,6 @@ from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data.chart_utils import group_top_n
 from dashboard.data.db import DbPool
-from dashboard.data.utils import parse_utc
 from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.performance import (
     get_completion_paths,
@@ -37,6 +36,7 @@ from dashboard.data.reconciliation import (
     get_recent_runs,
     get_watermarks,
 )
+from dashboard.data.utils import parse_utc
 from dashboard.data.write_journal import (
     get_agent_breakdown,
     get_memory_timeseries,
