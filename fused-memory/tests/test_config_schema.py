@@ -243,8 +243,9 @@ class TestYamlSettingsSourceErrorHandling:
         bad_file = tmp_path / 'bad.yaml'
         bad_file.write_bytes(b': :\n  - \x00bad')
         source = self._make_source(bad_file)
-        with pytest.raises(RuntimeError, match=str(bad_file)):
+        with pytest.raises(RuntimeError, match=str(bad_file)) as exc_info:
             source()
+        assert exc_info.value.__cause__ is not None
 
     @pytest.mark.skipif(sys.platform == 'win32', reason='chmod not reliable on Windows')
     def test_unreadable_file_raises_runtime_error(self, tmp_path):

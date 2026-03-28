@@ -24,8 +24,8 @@
       "id": "step-1",
       "type": "test",
       "description": "Add __cause__ assertion to test_corrupt_yaml_raises_runtime_error: capture exc_info and assert exc_info.value.__cause__ is not None (verifies 'raise ... from e' chaining for YAML parse errors). This strengthens the existing test at line 241.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "placeholder-step-1"
     },
     {
       "id": "step-2",
