@@ -106,7 +106,8 @@
                 if (!Number.isFinite(baseMs) || baseMs <= 0) { return; }
                 var jitter = baseMs * JITTER_RATIO * (2 * Math.random() - 1);
                 var delay = Math.round(baseMs + jitter);
-                setTimeout(function () { htmx.trigger(el, 'poll'); }, delay);
+                clearTimeout(el._pollTimer);
+                el._pollTimer = setTimeout(function () { htmx.trigger(el, 'poll'); }, delay);
             }
             document.body.addEventListener('htmx:afterSettle', function (evt) {
                 var el = evt.detail.elt;
