@@ -60,8 +60,11 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
     def __call__(self) -> dict[str, Any]:
         if not self.config_path.exists():
             return {}
-        with open(self.config_path) as f:
-            raw_config = yaml.safe_load(f) or {}
+        try:
+            with open(self.config_path, encoding='utf-8') as f:
+                raw_config = yaml.safe_load(f) or {}
+        except (yaml.YAMLError, OSError) as e:
+            raise RuntimeError(f'Failed to load configuration from {self.config_path}: {e}') from e
         return self._expand_env_vars(raw_config)
 
 
