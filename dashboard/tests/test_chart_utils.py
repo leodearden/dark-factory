@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import typing
 
+import pytest
+
 from dashboard.data.chart_utils import ChartData, group_top_n
 
 
@@ -33,6 +35,29 @@ class TestChartDataType:
         """ChartData 'values' annotation is list[int | float]."""
         hints = typing.get_type_hints(ChartData)
         assert hints['values'] == list[int | float]
+
+
+class TestGroupTopNValidation:
+    """Tests for length validation in group_top_n."""
+
+    def test_raises_when_labels_longer_than_values(self):
+        """ValueError is raised when labels list is longer than values list."""
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [10, 20]}
+        with pytest.raises(ValueError, match="same length"):
+            group_top_n(data)
+
+    def test_raises_when_values_longer_than_labels(self):
+        """ValueError is raised when values list is longer than labels list."""
+        data: ChartData = {'labels': ['a', 'b'], 'values': [10, 20, 30]}
+        with pytest.raises(ValueError, match="same length"):
+            group_top_n(data)
+
+    def test_no_error_when_lengths_match(self):
+        """No error is raised when labels and values have the same length."""
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [30, 20, 10]}
+        result = group_top_n(data, n=5)
+        assert result['labels'] == ['a', 'b', 'c']
+        assert result['values'] == [30, 20, 10]
 
 
 class TestGroupTopN:
