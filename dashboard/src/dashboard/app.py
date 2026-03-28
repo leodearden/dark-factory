@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -44,6 +45,7 @@ from dashboard.data.write_journal import (
 )
 
 _pkg_dir = Path(__file__).parent
+logger = logging.getLogger(__name__)
 
 templates = Jinja2Templates(directory=str(_pkg_dir / 'templates'))
 
