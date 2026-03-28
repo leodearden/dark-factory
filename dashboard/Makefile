@@ -42,13 +42,13 @@ EXPECTED_CHECKSUM := $(CHECKSUM_$(PLATFORM))
 
 $(TAILWIND_BIN):
 	mkdir -p $(TAILWIND_BIN_DIR)
-	curl -sL $(TAILWIND_URL) -o $(TAILWIND_BIN)
-	if [ "$(OS)" = "Darwin" ]; then \
-		echo "$(EXPECTED_CHECKSUM)  $(TAILWIND_BIN)" | shasum -a 256 -c -; \
-	else \
-		echo "$(EXPECTED_CHECKSUM)  $(TAILWIND_BIN)" | sha256sum -c -; \
-	fi
-	chmod +x $(TAILWIND_BIN)
+	curl -sL $(TAILWIND_URL) -o $(TAILWIND_BIN) && \
+	  (if [ "$(OS)" = "Darwin" ]; then \
+	    echo "$(EXPECTED_CHECKSUM)  $(TAILWIND_BIN)" | shasum -a 256 -c -; \
+	  else \
+	    echo "$(EXPECTED_CHECKSUM)  $(TAILWIND_BIN)" | sha256sum -c -; \
+	  fi) && \
+	  chmod +x $(TAILWIND_BIN) || (rm -f $(TAILWIND_BIN); exit 1)
 
 css: $(TAILWIND_BIN)
 	$(TAILWIND_BIN) -i $(INPUT_CSS) -o $(OUTPUT_CSS) --minify
