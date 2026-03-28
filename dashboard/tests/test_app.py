@@ -7,6 +7,16 @@ import runpy
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
+PARTIAL_URLS = (
+    "/partials/memory",
+    "/partials/recon",
+    "/partials/orchestrators",
+    "/partials/performance",
+    "/partials/memory-graphs",
+)
+
 
 class TestIdiomorphExtension:
     """Tests for idiomorph extension setup in base.html."""
@@ -23,30 +33,13 @@ class TestIdiomorphExtension:
 class TestMorphSwap:
     """Tests that all polling sections use morph:innerHTML swap strategy."""
 
-    def test_memory_section_uses_morph(self, client):
+    @pytest.mark.parametrize('partial_url', PARTIAL_URLS)
+    def test_section_uses_morph_swap(self, client, partial_url):
         html = client.get('/').text
-        assert 'hx-swap="morph:innerHTML"' in html
-        assert 'hx-get="/partials/memory"' in html
-
-    def test_recon_section_uses_morph(self, client):
-        html = client.get('/').text
-        assert 'hx-swap="morph:innerHTML"' in html
-        assert 'hx-get="/partials/recon"' in html
-
-    def test_orchestrators_section_uses_morph(self, client):
-        html = client.get('/').text
-        assert 'hx-swap="morph:innerHTML"' in html
-        assert 'hx-get="/partials/orchestrators"' in html
-
-    def test_performance_section_uses_morph(self, client):
-        html = client.get('/').text
-        assert 'hx-swap="morph:innerHTML"' in html
-        assert 'hx-get="/partials/performance"' in html
-
-    def test_memory_graphs_section_uses_morph(self, client):
-        html = client.get('/').text
-        assert 'hx-swap="morph:innerHTML"' in html
-        assert 'hx-get="/partials/memory-graphs"' in html
+        hx_get = f'hx-get="{partial_url}"'
+        idx = html.index(hx_get)
+        window = html[idx - 200:idx + 200]
+        assert 'hx-swap="morph:innerHTML"' in window
 
     def test_no_plain_innerhtml_on_polling_sections(self, client):
         html = client.get('/').text
@@ -80,26 +73,6 @@ class TestIndex:
     def test_get_root_contains_dark_factory(self, client):
         html = client.get('/').text
         assert 'Dark Factory' in html
-
-    def test_get_root_htmx_memory(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/memory"' in html
-
-    def test_get_root_htmx_recon(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/recon"' in html
-
-    def test_get_root_htmx_orchestrators(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/orchestrators"' in html
-
-    def test_get_root_htmx_performance(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/performance"' in html
-
-    def test_get_root_htmx_memory_graphs(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/memory-graphs"' in html
 
     def test_loading_skeletons_present(self, client):
         html = client.get('/').text
