@@ -4437,11 +4437,11 @@
         "description": "Consistency follow-up from task 236. Two issues:\n\n1. **get_burst_state** (reconciliation.py:271-279) silently swallows `(ValueError, TypeError)` for bad `last_write_at` timestamps — no logging. `partition_burst_state` (same module) now logs at DEBUG for the same failure. Apply the same `logger.debug(...)` pattern to `get_burst_state`'s except block for consistent observability.\n\n2. **parse_utc docstring** (utils.py:9-13) still says \"Invalid input propagates ValueError or TypeError from datetime.fromisoformat\" but TypeError for None is now raised explicitly *before* fromisoformat. Update to: \"None raises TypeError explicitly. Other invalid input raises ValueError from datetime.fromisoformat.\"\n\nBoth are small, same-file changes with no architectural impact.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T15:25:36.446Z",
+        "updatedAt": "2026-03-28T20:31:10.142Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data",
@@ -5053,7 +5053,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T20:31:09.861Z",
+      "lastModified": "2026-03-28T20:31:10.142Z",
       "taskCount": 268,
       "completedCount": 235,
       "tags": [
