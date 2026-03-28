@@ -53,7 +53,7 @@
       "id": "step-4",
       "type": "impl",
       "description": "Update reconciliation.py: remove the local _parse_utc definition, add 'from dashboard.data.utils import parse_utc' at the top. Replace all 3 internal call sites (_parse_utc \u2192 parse_utc). Remove the now-unnecessary '# type: ignore[arg-type]' line. The existing reconciliation tests (get_buffer_stats, get_burst_state, partition_burst_state) and updated TestParseUtc tests should all pass.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
