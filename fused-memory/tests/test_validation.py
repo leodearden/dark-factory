@@ -305,6 +305,20 @@ class TestValidateProjectId:
         )
         assert result['error_type'] == 'ValidationError'
 
+    def test_character_rejection_error_mentions_allowed_chars(self):
+        result = validate_project_id('proj`id')
+        assert result is not None
+        assert 'invalid characters' in result['error']
+        assert 'ASCII letters' in result['error']
+
+    def test_returns_error_dict_not_raises(self):
+        """validate_project_id must not raise — it returns an error dict."""
+        try:
+            result = validate_project_id('\x00bad')
+            assert result is not None
+        except Exception as exc:
+            pytest.fail(f'validate_project_id raised unexpectedly: {exc}')
+
 
 class TestValidatorErrorDictShape:
     """All validate_* functions return dicts with exactly 'error' and 'error_type' keys."""
