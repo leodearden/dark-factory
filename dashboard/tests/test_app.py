@@ -489,6 +489,36 @@ class TestMemoryGraphsPartialIntegration:
             assert resp.status_code == 200
             assert 'memoryTimeseriesChart' in resp.text
 
+    @pytest.mark.parametrize('failing_fn', [
+        'get_memory_timeseries',
+        'get_operations_breakdown',
+        'get_agent_breakdown',
+    ])
+    def test_memory_graphs_partial_failure(self, client, failing_fn):
+        """One failing coroutine should not discard its siblings' data."""
+        with _patch_memory_graphs_integration(), patch(
+            f'dashboard.app.{failing_fn}',
+            new_callable=AsyncMock,
+            side_effect=RuntimeError('injected error'),
+        ):
+            resp = client.get('/partials/memory-graphs')
+            assert resp.status_code == 200
+            html = resp.text
+            # All chart divs always present
+            assert 'memoryTimeseriesChart' in html
+            assert 'memoryOpsChart' in html
+            assert 'memoryAgentChart' in html
+            # When timeseries fails, ops and agents still have data
+            if failing_fn == 'get_memory_timeseries':
+                assert 'search' in html
+                assert 'claude-interactive' in html
+            # When ops fails, timeseries and agents still render (non-empty data)
+            if failing_fn == 'get_operations_breakdown':
+                assert 'claude-interactive' in html
+            # When agents fails, timeseries and ops still render
+            if failing_fn == 'get_agent_breakdown':
+                assert 'search' in html
+
 
 class TestHtmxErrorHandling:
     """Tests for global HTMX error handler script in base.html."""
