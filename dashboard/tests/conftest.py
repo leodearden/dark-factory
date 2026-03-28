@@ -117,6 +117,22 @@ def dashboard_config(tmp_path):
 
 
 @pytest.fixture()
+def two_url_config(tmp_path):
+    """Create a DashboardConfig with two test URLs (ports 9000, 9001).
+
+    Port 9000 is used as the failing server in fallback tests; port 9001
+    responds successfully. Using ports distinct from the default (8002/8000/8001)
+    makes the test intent explicit.
+    """
+    from dashboard.config import DashboardConfig
+
+    return DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://localhost:9000', 'http://localhost:9001'],
+    )
+
+
+@pytest.fixture()
 def client():
     """Create a TestClient for the dashboard FastAPI app."""
     from dashboard.app import app
