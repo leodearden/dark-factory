@@ -52,11 +52,13 @@ class _SessionAwareHandler:
     """Mock handler that responds to initialize, notify, and tools/call."""
 
     def __init__(self, tool_response: dict | None = None, *, error_status: int | None = None,
-                 error_on_tool: Exception | None = None, error_on_all: Exception | None = None):
+                 error_on_tool: Exception | None = None, error_on_all: Exception | None = None,
+                 fail_port: int | None = None):
         self.tool_response = tool_response or {}
         self.error_status = error_status
         self.error_on_tool = error_on_tool
         self.error_on_all = error_on_all
+        self.fail_port = fail_port
         self.calls: list[dict] = []
         self.ports_seen: set[int] = set()
 
@@ -64,6 +66,9 @@ class _SessionAwareHandler:
         port = request.url.port
         if port is not None:
             self.ports_seen.add(port)
+
+        if self.fail_port is not None and port == self.fail_port:
+            raise httpx.ConnectError('refused')
 
         if self.error_on_all:
             raise self.error_on_all
