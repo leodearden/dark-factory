@@ -274,7 +274,8 @@ async def get_burst_state(
                     if (now - last_write).total_seconds() > burst_cooldown_seconds:
                         state = 'idle'
                         burst_started = None
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as exc:
+                    logger.debug('agent %s: bad last_write_at %r (%s)', row['agent_id'], row['last_write_at'], exc)
                     state = 'idle'
                     burst_started = None
 
