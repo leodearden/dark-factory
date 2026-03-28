@@ -727,6 +727,7 @@ class TestGetEntity:
         assert len(result['edges']) == 1
         assert result['edges'][0]['fact'] == 'Auth service depends on Redis'
         assert result['edges'][0]['uuid'] == 'edge-uuid-1'
+        assert result['nodes'][0]['labels'] == []
 
     # ------------------------------------------------------------------
     # getattr fallback — missing attributes return None / [] defaults
