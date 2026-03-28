@@ -2546,11 +2546,11 @@
         "description": "Four pieces of confirmed dead code to remove:\n\n1. fused-memory/src/fused_memory/services/queue_service.py — legacy in-memory queue, superseded by DurableWriteQueue. Zero imports.\n2. orchestrator/src/orchestrator/protocols.py — defines SchedulerProtocol, BriefingProtocol, McpProtocol but none are imported anywhere. workflow.py defines its own inline Protocol classes.\n3. fused-memory/src/fused_memory/reconciliation/stages/integrity_check.py — 9-line shim that re-exports IntegrityCheck from task_knowledge_sync.py. Nothing imports it; harness.py imports directly from task_knowledge_sync.\n4. fused-memory/src/fused_memory/services/__init__.py — stale QueueService re-export in __all__. Remove import and clean __all__.\n\nOptional: fused-memory/src/fused_memory/backends/__init__.py has unused aggregate exports (GraphitiBackend, Mem0Backend). All callers import from submodules directly. Can be cleaned but is not harmful.\n\nSource: review-cycle 2026-03-25, dead code audit.",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T04:09:18.456Z",
+        "updatedAt": "2026-03-28T04:13:09.904Z",
         "metadata": {
           "files": [
             "fused-memory/src/fused_memory/services/queue_service.py",
@@ -3957,7 +3957,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:09:18.456Z",
+      "lastModified": "2026-03-28T04:13:09.906Z",
       "taskCount": 214,
       "completedCount": 171,
       "tags": [
