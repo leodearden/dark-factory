@@ -65,7 +65,12 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
                 raw_config = yaml.safe_load(f) or {}
         except (yaml.YAMLError, OSError) as e:
             raise RuntimeError(f'Failed to load configuration from {self.config_path}: {e}') from e
-        return self._expand_env_vars(raw_config)
+        try:
+            return self._expand_env_vars(raw_config)
+        except Exception as e:
+            raise RuntimeError(
+                f'Failed to expand environment variables in {self.config_path}: {e}'
+            ) from e
 
 
 # --- Server ---
