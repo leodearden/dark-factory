@@ -430,6 +430,17 @@ class TestPerformancePartialIntegration:
             html = resp.text
             assert 'No orchestrator run data yet' in html
 
+    def test_performance_backend_error_degrades_gracefully(self, client):
+        with _patch_perf_integration():
+            with patch(
+                'dashboard.app.get_completion_paths',
+                new_callable=AsyncMock,
+                side_effect=RuntimeError('db unavailable'),
+            ):
+                resp = client.get('/partials/performance')
+                assert resp.status_code == 200
+                assert 'No orchestrator run data yet' in resp.text
+
 
 _MG_TIMESERIES = {
     'labels': [f'{h:02d}:00' for h in range(24)],
