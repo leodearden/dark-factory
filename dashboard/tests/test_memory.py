@@ -381,13 +381,18 @@ class TestGetQueueStats:
 
         assert result['offline'] is True
 
-    async def test_partial_failure_aggregates_available(self, dashboard_config):
-        """If some servers are down, aggregate from those that are up."""
+    async def test_partial_failure_aggregates_available(self, two_url_config):
+        """If some servers are down, aggregate from those that are up.
+
+        Uses two_url_config [9000, 9001]: port 9000 fails, port 9001 succeeds.
+        Multi-server aggregation (3 servers × 3 = 9) is already covered by
+        test_successful_stats; this test focuses on the partial-failure path.
+        """
         from dashboard.data.memory import get_queue_stats
 
         def handler(request: httpx.Request) -> httpx.Response:
             port = request.url.port
-            if port == 8000:
+            if port == 9000:
                 raise httpx.ConnectError('refused')
             body = json.loads(request.content)
             method = body.get('method', '')
@@ -400,10 +405,10 @@ class TestGetQueueStats:
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            result = await get_queue_stats(client, dashboard_config)
+            result = await get_queue_stats(client, two_url_config)
 
-        # 2 servers × 3 pending = 6
-        assert result['counts']['pending'] == 6
+        # 1 server (9001) × 3 pending = 3
+        assert result['counts']['pending'] == 3
         assert 'offline' not in result
 
 
