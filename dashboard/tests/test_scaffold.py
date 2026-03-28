@@ -72,6 +72,13 @@ class TestConfigEnvOverrides:
         cfg = DashboardConfig.from_env()
         assert cfg.fused_memory_urls == []
 
+    def test_fused_memory_urls_extra_commas(self, monkeypatch):
+        from dashboard.config import DashboardConfig
+
+        monkeypatch.setenv('DASHBOARD_FUSED_MEMORY_URLS', ',http://a:1,,http://b:2,')
+        cfg = DashboardConfig.from_env()
+        assert cfg.fused_memory_urls == ['http://a:1', 'http://b:2']
+
     def test_env_derived_paths_update(self, monkeypatch):
         from dashboard.config import DashboardConfig
 
