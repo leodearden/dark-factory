@@ -507,6 +507,17 @@ class TestMemoryGraphsPartialIntegration:
             assert 'memoryOpsChart' in html
             assert 'memoryAgentChart' in html
 
+    def test_memory_graphs_backend_error_degrades_gracefully(self, client):
+        with _patch_memory_graphs_integration():
+            with patch(
+                'dashboard.app.get_memory_timeseries',
+                new_callable=AsyncMock,
+                side_effect=RuntimeError('db unavailable'),
+            ):
+                resp = client.get('/partials/memory-graphs')
+                assert resp.status_code == 200
+                assert 'memoryTimeseriesChart' in resp.text
+
 
 class TestHtmxErrorHandling:
     """Tests for global HTMX error handler script in base.html."""
