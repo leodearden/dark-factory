@@ -215,3 +215,34 @@ class TestSeparateLabelBasic:
         assert value == 10
         assert remaining['labels'] == ['a', 'b']
         assert remaining['values'] == [30, 20]
+
+
+class TestSeparateLabelNotFound:
+    """Tests for separate_label when target label is not in the data."""
+
+    def test_returns_data_copy_when_label_not_found(self):
+        """Returns a copy of the data (not original) when label is not found."""
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [30, 20, 10]}
+        remaining, value = separate_label(data, 'z')
+        assert remaining['labels'] == ['a', 'b', 'c']
+        assert remaining['values'] == [30, 20, 10]
+
+    def test_returns_zero_when_label_not_found(self):
+        """Returns 0 as the extracted value when label is not found."""
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [30, 20, 10]}
+        _, value = separate_label(data, 'missing')
+        assert value == 0
+
+    def test_does_not_raise_when_label_not_found(self):
+        """No exception is raised when the label does not exist."""
+        data: ChartData = {'labels': ['a', 'b'], 'values': [10, 20]}
+        remaining, value = separate_label(data, 'nonexistent')
+        assert value == 0
+
+    def test_not_found_on_empty_data(self):
+        """Returns empty data and 0 for empty input when label not found."""
+        data: ChartData = {'labels': [], 'values': []}
+        remaining, value = separate_label(data, 'anything')
+        assert remaining['labels'] == []
+        assert remaining['values'] == []
+        assert value == 0
