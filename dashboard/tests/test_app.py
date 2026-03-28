@@ -477,6 +477,6 @@ class TestAriaLivePollingsections:
         section_html = html[mg_idx - 100:mg_idx + 300]
         assert 'aria-live="polite"' in section_html
 
-    def test_all_three_sections_have_aria_live(self, client):
+    def test_polling_sections_have_aria_live(self, client):
         html = client.get('/').text
-        assert html.count('aria-live="polite"') >= 3
+        assert html.count('aria-live="polite"') == 5
