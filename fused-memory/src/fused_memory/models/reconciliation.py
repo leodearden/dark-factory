@@ -111,6 +111,11 @@ class ReconciliationRun(BaseModel):
     status: RunStatus = RunStatus.running
     triggered_by: str | None = None  # parent run_id for remediation runs
 
+    @field_validator('project_id', mode='before')
+    @classmethod
+    def normalize_project_id(cls, v):
+        return _normalize_project_id(v)
+
 
 class MemoryHints(BaseModel):
     """Memory retrieval hints attached to tasks."""
