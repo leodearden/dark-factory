@@ -998,25 +998,24 @@ class TestSelectTier:
             'MemoryConsolidator not found in harness.stages — stage ordering changed?'
         )
 
-        # Capture the limits as seen by stage1 when its run() is invoked
+        # Capture the limits as seen by MemoryConsolidator when its run() is invoked
         captured: dict = {}
 
-        async def capturing_run(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0]):
-            captured['episode_limit'] = _s.episode_limit
-            captured['memory_limit'] = _s.memory_limit
-            return StageReport(
-                stage=_s.stage_id,
-                started_at=datetime.now(UTC),
-                completed_at=datetime.now(UTC),
-                items_flagged=[],
-                stats={},
-                llm_calls=0,
-                tokens_used=0,
-            )
+        async def capture_limits(stage):
+            captured['episode_limit'] = stage.episode_limit
+            captured['memory_limit'] = stage.memory_limit
 
-        harness.stages[0].run = capturing_run
-        _mock_stage_run(harness.stages[1])
-        _mock_stage_run(harness.stages[2])
+        found_consolidator = False
+        for stage in harness.stages:
+            if isinstance(stage, MemoryConsolidator):
+                _mock_stage_run(stage, before_return=capture_limits)
+                found_consolidator = True
+            else:
+                _mock_stage_run(stage)
+
+        assert found_consolidator, (
+            'MemoryConsolidator not found during stage mocking — stage list changed?'
+        )
 
         tier = TierConfig(model='sonnet', episode_limit=125, memory_limit=250)
         await harness.run_full_cycle(
