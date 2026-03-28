@@ -25,14 +25,14 @@
       "type": "test",
       "description": "Add __cause__ assertion to test_corrupt_yaml_raises_runtime_error: capture exc_info and assert exc_info.value.__cause__ is not None (verifies 'raise ... from e' chaining for YAML parse errors). This strengthens the existing test at line 241.",
       "status": "done",
-      "commit": "placeholder-step-1"
+      "commit": "b7d79944"
     },
     {
       "id": "step-2",
       "type": "impl",
       "description": "Verify step-1 test passes \u2014 no implementation change needed since schema.py line 67 already uses 'raise RuntimeError(...) from e'. Run test suite to confirm green.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "placeholder-step-2"
     },
     {
       "id": "step-3",
