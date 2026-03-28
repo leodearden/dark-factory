@@ -3879,11 +3879,11 @@
         "description": "Three test additions for fused-memory config loading in test_config_schema.py:\n\n1. **End-to-end env var expansion test**: Write a YAML file with a `${VAR}` placeholder (e.g. `server: {port: '${MY_PORT}'}`), set the env var with monkeypatch, construct `FusedMemoryConfig()`, and assert the expanded value propagates correctly. This exercises `_expand_env_vars` through the full settings machinery, not just in isolation.\n\n2. **Env-over-YAML priority test**: Write a YAML file with `server.port: 9999`, set `SERVER__PORT=7777` (pydantic-settings `__` delimiter), construct `FusedMemoryConfig()`, and assert `config.server.port == 7777`. This validates the `settings_customise_sources` priority chain (init > env > yaml).\n\n3. **Default retention assertions**: In `test_yaml_file_values_loaded`, add assertions that unmentioned config sections retain defaults (e.g. `assert config.embedder.provider == 'openai'`, `assert config.server.host == '0.0.0.0'`). Guards against YAML loading silently clobbering defaults with null/empty.\n\nSource: review-cycle task 205 suggestions from reviewer_test_analyst.\n\nmemory_hints:\n- search: \"fused-memory config schema test coverage\"\n- search: \"YamlSettingsSource pydantic settings config loading\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T15:25:36.094Z",
+        "updatedAt": "2026-03-28T16:45:34.453Z",
         "metadata": {
           "modules": [
             "fused-memory/tests/test_config_schema.py"
@@ -5038,7 +5038,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T16:45:34.293Z",
+      "lastModified": "2026-03-28T16:45:34.453Z",
       "taskCount": 268,
       "completedCount": 220,
       "tags": [
