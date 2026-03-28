@@ -60,7 +60,7 @@
       "id": "step-5",
       "type": "test",
       "description": "Write a test in test_data_utils.py verifying that timeago('2026-03-28T10:00:00') (naive timestamp) works correctly \u2014 this documents the expected behavior after refactoring app.py. Also write a test that app.py imports parse_utc from dashboard.data.utils (verifying the DRY consolidation). These tests fail because app.py still uses inline parsing.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
