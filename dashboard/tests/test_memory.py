@@ -433,24 +433,7 @@ class TestGetQueueStats:
         """
         from dashboard.data.memory import get_queue_stats
 
-        ports_seen: set[int] = set()
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            port = request.url.port
-            assert port is not None
-            ports_seen.add(port)
-
-            if port == 9000:
-                raise httpx.ConnectError('refused')
-            body = json.loads(request.content)
-            method = body.get('method', '')
-            rid = body.get('id', 1)
-            if method == 'initialize':
-                return _make_init_response(rid)
-            if method.startswith('notifications/'):
-                return _make_notify_response()
-            return _make_mcp_response(_QUEUE_STATS_PAYLOAD, rid)
-
+        handler = _SessionAwareHandler(_QUEUE_STATS_PAYLOAD, fail_port=9000)
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await get_queue_stats(client, two_url_config)
@@ -459,8 +442,8 @@ class TestGetQueueStats:
         assert result['counts']['pending'] == 3
         assert 'offline' not in result
         # Prove both ports were actually contacted
-        assert 9000 in ports_seen
-        assert 9001 in ports_seen
+        assert 9000 in handler.ports_seen
+        assert 9001 in handler.ports_seen
 
 
 # ── Malformed responses ─────────────────────────────────────────
