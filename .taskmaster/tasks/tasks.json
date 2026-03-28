@@ -4594,6 +4594,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 283,
+        "title": "TestSelectTier: add call assertions, config-derived thresholds, and model propagation",
+        "description": "test_harness.py TestSelectTier tests have several gaps:\n\n1. No test asserts get_buffer_stats was called with the correct project_id — add assert_called_once_with('test-project')\n2. Threshold boundary values (15, 16) are hardcoded from defaults — compute from config at runtime instead\n3. No test with non-default config values (e.g. buffer_size_threshold=20, opus_threshold_ratio=2.0) to verify multiplication actually works\n4. test_run_full_cycle_propagates_tier_to_consolidator doesn't capture/assert the model kwarg passed to run()\n5. No assertion that Stage 2 and Stage 3 do NOT receive episode_limit/memory_limit mutations (the isinstance guard is untested)\n6. Missing guard: assert captured != {} should be 'assert captured, \"stages[0].run was never invoked\"'",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -4606,7 +4617,7 @@
       ],
       "created": "2026-03-28T07:37:31.561Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T07:37:59.786Z"
+      "updated": "2026-03-28T07:38:07.658Z"
     }
   }
 }
