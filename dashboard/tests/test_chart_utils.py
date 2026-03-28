@@ -37,6 +37,46 @@ class TestChartDataType:
         assert hints['values'] == list[int | float]
 
 
+class TestGroupTopNSorting:
+    """Tests for group_top_n sorting unsorted input descending by values."""
+
+    def test_unsorted_input_produces_correct_top_n_and_other(self):
+        """Unsorted input with len > n produces correct top-N + Other after sorting."""
+        data: ChartData = {
+            'labels': ['c', 'a', 'e', 'b', 'd', 'f'],
+            'values': [30, 60, 10, 50, 20, 40],
+        }
+        result = group_top_n(data, n=3)
+        # After descending sort: a=60, b=50, f=40, c=30, d=20, e=10
+        # Top 3: a, b, f; Other = 30+20+10 = 60
+        assert result['labels'][:3] == ['a', 'b', 'f']
+        assert result['values'][:3] == [60, 50, 40]
+        assert result['labels'][-1] == 'Other'
+        assert result['values'][-1] == 60
+
+    def test_unsorted_input_within_n_returns_descending_order(self):
+        """Unsorted input with len <= n returns values in descending order."""
+        data: ChartData = {
+            'labels': ['c', 'a', 'b'],
+            'values': [30, 60, 50],
+        }
+        result = group_top_n(data, n=5)
+        assert result['labels'] == ['a', 'b', 'c']
+        assert result['values'] == [60, 50, 30]
+
+    def test_already_sorted_input_is_unchanged(self):
+        """Already-sorted descending input is returned in same order."""
+        data: ChartData = {
+            'labels': ['a', 'b', 'c', 'd', 'e', 'f'],
+            'values': [60, 50, 40, 30, 20, 10],
+        }
+        result = group_top_n(data, n=5)
+        assert result['labels'][:5] == ['a', 'b', 'c', 'd', 'e']
+        assert result['values'][:5] == [60, 50, 40, 30, 20]
+        assert result['labels'][-1] == 'Other'
+        assert result['values'][-1] == 10
+
+
 class TestGroupTopNValidation:
     """Tests for length validation in group_top_n."""
 
