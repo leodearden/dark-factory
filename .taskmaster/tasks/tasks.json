@@ -2111,7 +2111,25 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-26T22:52:01.243Z"
+        "updatedAt": "2026-03-26T22:52:01.243Z",
+        "metadata": {
+          "memory_hints": {
+            "entities": [
+              "reconciliation.py"
+            ],
+            "entity_uuids": [
+              "16ae33d1-5bbc-4df8-90bf-469a937509db"
+            ],
+            "queries": [
+              "Graphiti entity summary refresh after edge invalidation",
+              "Graphiti node summary recomputation stale cached invalidated edges",
+              "memory_consolidator Stage 1 edge invalidation pipeline"
+            ]
+          },
+          "_causation_id": "f8c7f12f-b05e-4b53-9a54-ad834208a20b",
+          "hints_added_by": "recon-stage-task_knowledge_sync",
+          "hints_run": "f8c7f12f-b05e-4b53-9a54-ad834208a20b"
+        }
       },
       {
         "id": 127,
