@@ -3006,11 +3006,11 @@
         "description": "Several chart UX issues: (1) Histogram bars have legend disabled — no way to know what colors mean. (2) Memory \"By operation\" doughnut legend text is truncated when many labels. (3) Memory \"By agent\" chart dominated by \"unknown\" (91%) making pie chart unhelpful. (4) Timeseries chart only uses ~40% of container width. (5) No data labels on doughnut slices.",
         "details": "Files: dashboard/src/dashboard/templates/partials/performance.html (line 192 legend:display:false), dashboard/src/dashboard/templates/partials/memory_graphs.html (lines 106-116 legend config).\n\nFixes: (1) Enable legend on histograms or add x-axis labels. (2) For pie charts with dominant slice, consider \"top N + other\" grouping. (3) Investigate why timeseries doesn't fill container — likely Chart.js responsive:true with maintainAspectRatio:false should work but canvas container may need explicit width. (4) Add tooltips with values for all chart types (already default in Chart.js, verify working).",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T00:00:49.508Z",
+        "updatedAt": "2026-03-28T00:05:18.706Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/memory_graphs.html",
@@ -3693,7 +3693,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T00:05:17.071Z",
+      "lastModified": "2026-03-28T00:05:18.711Z",
       "taskCount": 195,
       "completedCount": 153,
       "tags": [
