@@ -692,3 +692,250 @@ class TestTierConfig:
         stage.memory_limit = 250
         assert stage.episode_limit == 125
         assert stage.memory_limit == 250
+
+
+class TestProjectIdGuideline:
+    """_PROJECT_ID_GUIDELINE shared constant in prompts/__init__.py."""
+
+    def test_guideline_is_importable_from_prompts_package(self):
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        assert _PROJECT_ID_GUIDELINE is not None
+
+    def test_guideline_contains_tools_placeholder(self):
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        assert '{tools}' in _PROJECT_ID_GUIDELINE
+
+    def test_guideline_contains_reconciliation_context_block_phrasing(self):
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        assert 'Reconciliation Context block' in _PROJECT_ID_GUIDELINE
+
+    def test_guideline_contains_project_id_instruction(self):
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        assert 'project_id' in _PROJECT_ID_GUIDELINE
+
+    def test_guideline_format_replaces_tools_placeholder(self):
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        result = _PROJECT_ID_GUIDELINE.format(tools='search, add_memory')
+        assert '{tools}' not in result
+        assert 'search, add_memory' in result
+
+    def test_guideline_format_produces_correct_string(self):
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        result = _PROJECT_ID_GUIDELINE.format(tools='search, get_entity')
+        assert 'project_id' in result
+        assert 'Reconciliation Context block' in result
+        assert 'search, get_entity' in result
+
+
+class TestStage3ProjectIdGuideline:
+    """STAGE3_SYSTEM_PROMPT embeds the project_id guideline with read-only tools."""
+
+    _STAGE3_READ_TOOLS = [
+        'search',
+        'get_entity',
+        'get_episodes',
+        'get_status',
+        'get_tasks',
+        'get_task',
+    ]
+
+    _STAGE3_WRITE_TOOLS = [
+        'add_memory',
+        'delete_memory',
+        'set_task_status',
+        'add_task',
+        'update_task',
+        'add_subtask',
+        'remove_task',
+        'add_dependency',
+        'remove_dependency',
+    ]
+
+    def test_stage3_prompt_contains_project_id_guideline(self):
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+        assert 'project_id' in STAGE3_SYSTEM_PROMPT
+        assert 'Reconciliation Context block' in STAGE3_SYSTEM_PROMPT
+
+    def test_stage3_prompt_guideline_lists_read_only_tools(self):
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+        guideline_line = next(
+            (line for line in STAGE3_SYSTEM_PROMPT.splitlines()
+             if 'Reconciliation Context block' in line),
+            None,
+        )
+        assert guideline_line is not None, 'Guideline line not found in STAGE3_SYSTEM_PROMPT'
+        for tool in self._STAGE3_READ_TOOLS:
+            assert tool in guideline_line, (
+                f"STAGE3 guideline missing read tool: {tool}"
+            )
+
+    def test_stage3_prompt_guideline_does_not_list_write_tools(self):
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+        guideline_line = next(
+            (line for line in STAGE3_SYSTEM_PROMPT.splitlines()
+             if 'Reconciliation Context block' in line),
+            None,
+        )
+        assert guideline_line is not None, 'Guideline line not found in STAGE3_SYSTEM_PROMPT'
+        for tool in self._STAGE3_WRITE_TOOLS:
+            assert tool not in guideline_line, (
+                f"Stage 3 guideline should NOT list write tool: {tool}"
+            )
+
+
+class TestStage2ProjectIdGuideline:
+    """STAGE2_SYSTEM_PROMPT embeds the project_id guideline with ALL tools (memory + task mutation)."""
+
+    _STAGE2_ALL_TOOLS = [
+        'search',
+        'add_memory',
+        'delete_memory',
+        'get_entity',
+        'get_episodes',
+        'get_status',
+        'get_tasks',
+        'get_task',
+        'set_task_status',
+        'add_task',
+        'update_task',
+        'add_subtask',
+        'remove_task',
+        'add_dependency',
+        'remove_dependency',
+    ]
+
+    def test_stage2_prompt_contains_project_id_guideline(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+        assert 'project_id' in STAGE2_SYSTEM_PROMPT
+        assert 'Reconciliation Context block' in STAGE2_SYSTEM_PROMPT
+
+    def test_stage2_prompt_guideline_lists_all_tools(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+        # Find the guideline line
+        guideline_line = next(
+            (line for line in STAGE2_SYSTEM_PROMPT.splitlines()
+             if 'Reconciliation Context block' in line),
+            None,
+        )
+        assert guideline_line is not None, 'Guideline line not found in STAGE2_SYSTEM_PROMPT'
+        for tool in self._STAGE2_ALL_TOOLS:
+            assert tool in guideline_line, (
+                f"STAGE2 guideline missing tool: {tool}"
+            )
+
+
+class TestStage1ProjectIdGuideline:
+    """STAGE1_SYSTEM_PROMPT embeds the project_id guideline with memory-only tools."""
+
+    _STAGE1_MEMORY_TOOLS = [
+        'search',
+        'add_memory',
+        'delete_memory',
+        'get_entity',
+        'get_episodes',
+        'get_status',
+    ]
+
+    def test_stage1_prompt_contains_project_id_guideline(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        assert 'project_id' in STAGE1_SYSTEM_PROMPT
+        assert 'Reconciliation Context block' in STAGE1_SYSTEM_PROMPT
+
+    def test_stage1_prompt_guideline_lists_all_memory_tools(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        for tool in self._STAGE1_MEMORY_TOOLS:
+            assert tool in STAGE1_SYSTEM_PROMPT, (
+                f"STAGE1_SYSTEM_PROMPT guideline missing memory tool: {tool}"
+            )
+
+    def test_stage1_prompt_guideline_does_not_list_task_mutation_tools(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        # The guideline in Stage 1 should only reference memory tools, not task mutations
+        task_mutation_indicators = [
+            'set_task_status',
+            'add_task',
+            'update_task',
+            'add_subtask',
+            'remove_task',
+            'add_dependency',
+            'remove_dependency',
+        ]
+        # Find the guideline line containing 'Reconciliation Context block'
+        guideline_line = next(
+            (line for line in STAGE1_SYSTEM_PROMPT.splitlines()
+             if 'Reconciliation Context block' in line),
+            None,
+        )
+        assert guideline_line is not None, 'Guideline line not found in STAGE1_SYSTEM_PROMPT'
+        for tool in task_mutation_indicators:
+            assert tool not in guideline_line, (
+                f"Stage 1 guideline should NOT list task mutation tool: {tool}"
+            )
+
+
+class TestProjectIdGuidelineConsistency:
+    """All three stage prompts share the same guideline prefix text, proving shared constant usage."""
+
+    def _get_guideline_line(self, prompt: str) -> str | None:
+        return next(
+            (line for line in prompt.splitlines() if 'Reconciliation Context block' in line),
+            None,
+        )
+
+    def _get_prefix(self, guideline_line: str) -> str:
+        """Extract prefix up to and including the opening parenthesis of the tool list."""
+        paren_pos = guideline_line.find('(')
+        if paren_pos == -1:
+            return guideline_line
+        return guideline_line[:paren_pos + 1]
+
+    def test_all_three_stages_have_guideline_line(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+
+        for name, prompt in [
+            ('Stage 1', STAGE1_SYSTEM_PROMPT),
+            ('Stage 2', STAGE2_SYSTEM_PROMPT),
+            ('Stage 3', STAGE3_SYSTEM_PROMPT),
+        ]:
+            line = self._get_guideline_line(prompt)
+            assert line is not None, f'{name} system prompt missing guideline line'
+
+    def test_all_three_stages_share_same_guideline_prefix(self):
+        """All three stages share the same prefix text before the tool list parenthetical.
+
+        This proves they use the same _PROJECT_ID_GUIDELINE constant, not copy-pasted variants.
+        """
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+
+        prefixes = []
+        for prompt in [STAGE1_SYSTEM_PROMPT, STAGE2_SYSTEM_PROMPT, STAGE3_SYSTEM_PROMPT]:
+            line = self._get_guideline_line(prompt)
+            assert line is not None
+            prefixes.append(self._get_prefix(line))
+
+        # All prefixes must be identical
+        assert prefixes[0] == prefixes[1] == prefixes[2], (
+            f'Stage guideline prefixes differ: {prefixes!r}'
+        )
+
+    def test_guideline_prefix_matches_template_constant(self):
+        """The shared prefix matches _PROJECT_ID_GUIDELINE before the {tools} placeholder."""
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        # The template prefix is everything before {tools}
+        template_prefix = _PROJECT_ID_GUIDELINE[:_PROJECT_ID_GUIDELINE.find('{tools}')]
+
+        line = self._get_guideline_line(STAGE1_SYSTEM_PROMPT)
+        assert line is not None
+        actual_prefix = self._get_prefix(line)
+
+        assert actual_prefix == template_prefix, (
+            f'Stage guideline prefix does not match template:\n'
+            f'  template: {template_prefix!r}\n'
+            f'  actual:   {actual_prefix!r}'
+        )
