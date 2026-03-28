@@ -12,23 +12,32 @@ class ChartData(TypedDict):
     values: list[int | float]
 
 
-def group_top_n(data: dict, n: int = 5) -> dict:
+def group_top_n(data: ChartData, n: int = 5) -> ChartData:
     """Group chart data into top N entries plus an 'Other' aggregate.
 
-    Takes a dict with 'labels' and 'values' lists (already sorted descending
-    by convention) and returns a new dict. When the number of items exceeds N,
-    the tail items are summed into a single 'Other' entry appended at the end.
-    When items <= N, the data is returned unchanged.
+    Takes a ChartData dict with 'labels' and 'values' lists and returns a new
+    ChartData. When the number of items exceeds N, the tail items are summed
+    into a single 'Other' entry appended at the end. When items <= N, the data
+    is returned with values sorted descending.
 
     Args:
-        data: Dict with 'labels' (list[str]) and 'values' (list[int|float]).
+        data: ChartData with 'labels' (list[str]) and 'values' (list[int|float]).
         n: Maximum number of top items to keep before grouping. Default 5.
 
     Returns:
-        Dict with 'labels' and 'values', with at most N+1 entries.
+        ChartData with 'labels' and 'values', with at most N+1 entries.
+
+    Raises:
+        ValueError: If labels and values have different lengths.
     """
     labels: list = data.get('labels', [])
     values: list = data.get('values', [])
+
+    if len(labels) != len(values):
+        raise ValueError(
+            f"labels and values must have the same length "
+            f"(got {len(labels)} labels and {len(values)} values)"
+        )
 
     if len(labels) <= n:
         return {'labels': list(labels), 'values': list(values)}
