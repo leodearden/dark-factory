@@ -3933,11 +3933,11 @@
         "description": "Post-move test cleanup: relocate tests to match new module locations, fix brittle assertions, add missing edge cases.",
         "details": "## Problem\n\nAfter task 207 moved `partition_burst_state` to `dashboard/data/reconciliation.py`, several test quality issues remain:\n\n1. **Test colocation mismatch**: `TestPartitionBurstState` remains in `test_recon_panel.py` after the function moved to `data/reconciliation.py`. Future contributors will look in `test_reconciliation.py`, not `test_recon_panel.py`.\n\n2. **Brittle constant assertion**: `TestPartitionBurstStateLocation.test_importable_from_reconciliation` hard-codes `assert _ACTIVE_THRESHOLD_SECONDS == 3600`. This tests a private constant's value — if the threshold is tuned, this test breaks for a non-behavioral reason. The behavioral tests already exercise the threshold.\n\n3. **Incomplete offset test**: `test_aware_iso_string_preserved` only exercises UTC+00:00 input. A non-UTC offset (e.g., +05:30) should also be tested to verify tzinfo is preserved unchanged, not silently normalized.\n\n4. **Missing None timestamp edge case**: No test for `agent['last_write_at'] = None`. When last_write_at is None, `_parse_utc(None)` raises TypeError which partition_burst_state catches and routes to idle. This is real production behavior (DB rows can have NULL last_write_at) but untested.\n\n## Fix\n\n1. Move `TestPartitionBurstState` class from `test_recon_panel.py` to `test_reconciliation.py`.\n2. Remove `assert _ACTIVE_THRESHOLD_SECONDS == 3600` from `TestPartitionBurstStateLocation` (or remove the class entirely — behavioral tests cover import path).\n3. Add a non-UTC offset sub-case to `test_aware_iso_string_preserved` (e.g., `+05:30`) and assert `result.utcoffset() == timedelta(hours=5, minutes=30)`.\n4. Add `test_none_timestamp_treated_as_idle`: agents with `last_write_at: None` should end up in the idle list.\n\n## Memory hints\n- search: \"dashboard test organization colocation\"\n- search: \"partition_burst_state test coverage\"",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T19:05:25.249Z",
+        "updatedAt": "2026-03-28T19:17:07.399Z",
         "metadata": {
           "modules": [
             "dashboard/tests/test_recon_panel.py",
@@ -5046,9 +5046,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T19:09:29.317Z",
+      "lastModified": "2026-03-28T19:17:07.399Z",
       "taskCount": 268,
-      "completedCount": 224,
+      "completedCount": 225,
       "tags": [
         "master"
       ]
