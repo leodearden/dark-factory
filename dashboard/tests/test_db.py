@@ -95,3 +95,14 @@ class TestWithDb:
 
             result = await with_db(db, bad_query, [])
             assert result == []
+
+    async def test_returns_default_on_os_error(self, tmp_path):
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            async def raises_os_error(db):
+                raise OSError('disk I/O error')
+
+            result = await with_db(db, raises_os_error, 'default')
+            assert result == 'default'
