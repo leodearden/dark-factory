@@ -37,6 +37,9 @@ Note: update Mem0 procedure AFTER task completes, not now.
 
 ## Guidelines
 - Review Stage 1's flagged items first — they identify task-relevant findings.
+- Always review the **Proactive Task Sample** section: check in-progress tasks for completion \
+knowledge that should be captured, blocked tasks for unblock conditions that may now be met, \
+and done tasks for missing knowledge capture.
 - Use search to understand the knowledge landscape around each task.
 - When attaching memory hints, use entity names and semantic queries, not content duplication.
 - Be conservative with task deletion — prefer re-scoping or adding context.
