@@ -81,8 +81,8 @@ async def get_recent_runs(db: aiosqlite.Connection | None, *, limit: int = 50) -
         for row in rows:
             duration = None
             if row['completed_at'] is not None:
-                started = datetime.fromisoformat(row['started_at'])
-                completed = datetime.fromisoformat(row['completed_at'])
+                started = parse_utc(row['started_at'])
+                completed = parse_utc(row['completed_at'])
                 duration = (completed - started).total_seconds()
 
             results.append(
