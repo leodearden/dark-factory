@@ -3931,10 +3931,11 @@
         "description": "The dashboard template (index.html) has hx-get=\"/partials/performance\" and hx-get=\"/partials/memory-graphs\" polling endpoints, but no test verifies their presence. Coverage was previously in TestExistingBehaviorPreserved (removed in task 182 as duplicative), but the hx-get assertions for these two sections were NOT duplicated elsewhere.\n\ntest_app.py TestIndex verifies hx-get for /partials/memory, /partials/recon, and /partials/orchestrators — but NOT performance or memory-graphs. Add matching assertions for the two missing endpoints in TestIndex or TestMorphSwap.\n\nmemory_hints: search for \"dashboard hx-get polling tests\", get_entity \"test_app.py\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T04:28:27.114Z"
       },
       {
         "id": "232",
@@ -4075,7 +4076,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:28:26.201Z",
+      "lastModified": "2026-03-28T04:28:27.115Z",
       "taskCount": 222,
       "completedCount": 175,
       "tags": [
