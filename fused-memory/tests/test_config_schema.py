@@ -145,6 +145,32 @@ class TestFusedMemoryConfigDefaults:
         assert config.server.port == 9999
         assert config.server.transport == 'sse'
         assert config.llm.provider == 'anthropic'
+        # Verify unmentioned config sections retain their defaults (not clobbered to null/empty)
+        assert config.embedder.provider == 'openai'
+        assert config.embedder.model == 'text-embedding-3-small'
+        assert config.server.host == '0.0.0.0'
+        assert config.graphiti.provider == 'falkordb'
+        assert config.mem0.qdrant_url == 'http://localhost:6333'
+        assert config.routing.confidence_threshold == 0.7
+
+    def test_env_var_expansion_e2e(self, tmp_path, monkeypatch):
+        """End-to-end: env var placeholder in YAML is expanded through full settings machinery."""
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text("server:\n  port: '${MY_TEST_PORT}'\n")
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+        monkeypatch.setenv('MY_TEST_PORT', '4242')
+        config = FusedMemoryConfig()
+        assert config.server.port == 4242
+
+    def test_env_overrides_yaml_priority(self, tmp_path, monkeypatch):
+        """Env vars (via pydantic-settings __ delimiter) take priority over YAML values."""
+        config_data = {'server': {'port': 9999}}
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(yaml.dump(config_data))
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+        monkeypatch.setenv('SERVER__PORT', '7777')
+        config = FusedMemoryConfig()
+        assert config.server.port == 7777
 
 
 class TestYamlSettingsSourceEnvVarExpansion:
