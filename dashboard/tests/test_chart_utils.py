@@ -2,7 +2,37 @@
 
 from __future__ import annotations
 
-from dashboard.data.chart_utils import group_top_n
+import typing
+
+from dashboard.data.chart_utils import ChartData, group_top_n
+
+
+class TestChartDataType:
+    """Tests for ChartData TypedDict definition."""
+
+    def test_chartdata_importable(self):
+        """ChartData can be imported from chart_utils."""
+        assert ChartData is not None
+
+    def test_chartdata_has_labels_key(self):
+        """ChartData has a 'labels' annotation."""
+        hints = typing.get_type_hints(ChartData)
+        assert 'labels' in hints
+
+    def test_chartdata_has_values_key(self):
+        """ChartData has a 'values' annotation."""
+        hints = typing.get_type_hints(ChartData)
+        assert 'values' in hints
+
+    def test_chartdata_labels_is_list_of_str(self):
+        """ChartData 'labels' annotation is list[str]."""
+        hints = typing.get_type_hints(ChartData)
+        assert hints['labels'] == list[str]
+
+    def test_chartdata_values_is_list_of_int_or_float(self):
+        """ChartData 'values' annotation is list[int | float]."""
+        hints = typing.get_type_hints(ChartData)
+        assert hints['values'] == list[int | float]
 
 
 class TestGroupTopN:
