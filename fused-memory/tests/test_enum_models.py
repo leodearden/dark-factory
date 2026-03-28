@@ -480,13 +480,13 @@ class TestReconciliationEventProjectId:
     def _make_event(project_id: str):
         from fused_memory.models.reconciliation import ReconciliationEvent
 
-        return ReconciliationEvent(
-            id='evt-1',
-            type='episode_added',
-            source='agent',
-            project_id=project_id,
-            timestamp='2024-01-01T00:00:00Z',
-        )
+        return ReconciliationEvent.model_validate({
+            'id': 'evt-1',
+            'type': 'episode_added',
+            'source': 'agent',
+            'project_id': project_id,
+            'timestamp': '2024-01-01T00:00:00Z',
+        })
 
     def test_valid_project_id_passes_through_unchanged(self):
         evt = self._make_event('dark_factory')
@@ -530,13 +530,13 @@ class TestReconciliationRunProjectId:
     def _make_run(project_id: str):
         from fused_memory.models.reconciliation import ReconciliationRun
 
-        return ReconciliationRun(
-            id='run-1',
-            project_id=project_id,
-            run_type='full',
-            trigger_reason='test',
-            started_at='2024-01-01T00:00:00Z',
-        )
+        return ReconciliationRun.model_validate({
+            'id': 'run-1',
+            'project_id': project_id,
+            'run_type': 'full',
+            'trigger_reason': 'test',
+            'started_at': '2024-01-01T00:00:00Z',
+        })
 
     def test_valid_project_id_passes_through_unchanged(self):
         run = self._make_run('dark_factory')
@@ -588,25 +588,25 @@ class TestProjectIdNormalizationIntegration:
     def test_reconciliation_event_strips_padded_project_id(self):
         from fused_memory.models.reconciliation import ReconciliationEvent
 
-        evt = ReconciliationEvent(
-            id='evt-1',
-            type='episode_added',
-            source='agent',
-            project_id=self.PADDED,
-            timestamp='2024-01-01T00:00:00Z',
-        )
+        evt = ReconciliationEvent.model_validate({
+            'id': 'evt-1',
+            'type': 'episode_added',
+            'source': 'agent',
+            'project_id': self.PADDED,
+            'timestamp': '2024-01-01T00:00:00Z',
+        })
         assert evt.project_id == self.EXPECTED
 
     def test_reconciliation_run_strips_padded_project_id(self):
         from fused_memory.models.reconciliation import ReconciliationRun
 
-        run = ReconciliationRun(
-            id='run-1',
-            project_id=self.PADDED,
-            run_type='full',
-            trigger_reason='test',
-            started_at='2024-01-01T00:00:00Z',
-        )
+        run = ReconciliationRun.model_validate({
+            'id': 'run-1',
+            'project_id': self.PADDED,
+            'run_type': 'full',
+            'trigger_reason': 'test',
+            'started_at': '2024-01-01T00:00:00Z',
+        })
         assert run.project_id == self.EXPECTED
 
     def test_all_three_models_produce_matching_project_id(self):
@@ -618,18 +618,18 @@ class TestProjectIdNormalizationIntegration:
         )
 
         wm = Watermark(project_id=self.PADDED)
-        evt = ReconciliationEvent(
-            id='evt-1',
-            type='episode_added',
-            source='agent',
-            project_id=self.PADDED,
-            timestamp='2024-01-01T00:00:00Z',
-        )
-        run = ReconciliationRun(
-            id='run-1',
-            project_id=self.PADDED,
-            run_type='full',
-            trigger_reason='test',
-            started_at='2024-01-01T00:00:00Z',
-        )
+        evt = ReconciliationEvent.model_validate({
+            'id': 'evt-1',
+            'type': 'episode_added',
+            'source': 'agent',
+            'project_id': self.PADDED,
+            'timestamp': '2024-01-01T00:00:00Z',
+        })
+        run = ReconciliationRun.model_validate({
+            'id': 'run-1',
+            'project_id': self.PADDED,
+            'run_type': 'full',
+            'trigger_reason': 'test',
+            'started_at': '2024-01-01T00:00:00Z',
+        })
         assert wm.project_id == evt.project_id == run.project_id == self.EXPECTED
