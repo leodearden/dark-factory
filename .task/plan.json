@@ -1,0 +1,100 @@
+{
+  "task_id": "253",
+  "title": "Consolidate tools.py validators to shared validation module",
+  "files": [
+    "fused-memory/src/fused_memory/server/tools.py",
+    "fused-memory/src/fused_memory/utils/validation.py",
+    "fused-memory/tests/test_validation.py",
+    "fused-memory/tests/test_tools_validation.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/server",
+    "fused-memory/src/fused_memory/utils",
+    "fused-memory/tests"
+  ],
+  "analysis": "tools.py (lines 214-230) defines two private closures \u2014 _validate_project_id and _validate_project_root \u2014 that duplicate the shared validators in fused_memory.utils.validation. The _validate_project_id copy is behaviorally divergent: it checks `if not project_id` (truthy check only), while the shared version checks `if not project_id or not project_id.strip()`. This means whitespace-only project IDs like '   ' pass validation in tools.py but fail in the shared module. The _validate_project_root copies are functionally identical. There are 9 call sites for _validate_project_id (lines 262, 316, 381, 444, 493, 561, 607, 660, 721) and 11 for _validate_project_root (lines 763, 784, 813, 861, 898, 934, 962, 987, 1015, 1047, 1077). The `import os` at line 7 is used only in _validate_project_root and can be removed after consolidation. The shared validation module already has tests in test_validation.py but lacks a TestValidateProjectId class \u2014 only an error-dict-shape test exists. We need to: (1) add a test proving the whitespace divergence bug, (2) add a regression test for tools.py calling the shared validators, (3) swap the imports, (4) remove dead code.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Add TestValidateProjectId class to test_validation.py with tests for empty string, whitespace-only, and valid project_id \u2014 establishing the shared validator's whitespace-stripping behavior as the canonical contract",
+      "status": "done",
+      "commit": "bb95f9c"
+    },
+    {
+      "id": "step-2",
+      "type": "test",
+      "description": "Create test_tools_validation.py with a test that directly exercises the tools.py _validate_project_id with a whitespace-only input (' '), demonstrating it currently returns None (bug) where the shared validator returns an error dict. This is the failing test that proves the behavioral divergence.",
+      "status": "done",
+      "commit": "629a172"
+    },
+    {
+      "id": "step-3",
+      "type": "impl",
+      "description": "In tools.py: (a) add `from fused_memory.utils.validation import validate_project_id, validate_project_root` to the imports, (b) delete the _validate_project_id closure (lines 214-221) and the _validate_project_root closure (lines 223-230), (c) replace all 9 call sites of `_validate_project_id(...)` with `validate_project_id(...)`, (d) replace all 11 call sites of `_validate_project_root(...)` with `validate_project_root(...)`, (e) remove `import os` from line 7 since it is no longer used",
+      "status": "done",
+      "commit": "2b6065c"
+    },
+    {
+      "id": "step-4",
+      "type": "test",
+      "description": "Update test_tools_validation.py: replace the divergence-proving test with a regression test that imports tools.py (or patches it) and confirms whitespace-only project_id is now rejected \u2014 verifying the consolidation fixed the bug. Add a second test confirming _validate_project_root and _validate_project_id no longer exist as private names in the tools module.",
+      "status": "done",
+      "commit": "23cbe7d"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Run the full test suite (pytest fused-memory/tests/test_validation.py fused-memory/tests/test_tools_validation.py) to verify all tests pass \u2014 shared validators, tools integration, and no regressions",
+      "status": "done",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Replace call sites with direct function names (validate_project_id, validate_project_root) instead of aliasing to the old underscore-prefixed names",
+      "rationale": "The shared validators are the canonical public API. Using the actual names makes it clear these are the same validators used everywhere (reconciliation/stages/base.py, reconciliation/targeted.py). No aliasing means grep finds all usages consistently."
+    },
+    {
+      "decision": "Accept the behavioral change from removing the whitespace-only bug as intentional, not a breaking change",
+      "rationale": "Whitespace-only project IDs are never valid \u2014 the shared validator's .strip() guard is correct. The tools.py copy lacked it accidentally. No caller should be passing '   ' as a project_id, so this is a bugfix, not a behavior change."
+    },
+    {
+      "decision": "Remove `import os` from tools.py since it was only used by the private _validate_project_root closure",
+      "rationale": "Confirmed via grep: os is used only on line 225 (os.path.isabs in _validate_project_root). After removing that closure, no other code in tools.py references the os module."
+    },
+    {
+      "decision": "Create a separate test_tools_validation.py rather than adding to test_validation.py",
+      "rationale": "test_validation.py tests the shared validators in isolation. The new file tests that tools.py correctly delegates to those shared validators \u2014 a different concern (integration/regression). Keeping them separate matches the existing test organization pattern."
+    },
+    {
+      "decision": "Do NOT modify validation.py itself",
+      "rationale": "The shared validators are already correct and well-tested. This task only needs to make tools.py use them. validation.py is listed in files[] only because test_validation.py imports from it and step-1 adds tests for it."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "validate_project_id from fused_memory.utils.validation",
+      "where": "fused-memory/src/fused_memory/utils/validation.py:29-35",
+      "how": "Direct import to replace _validate_project_id closure in tools.py. Drop-in compatible \u2014 same signature (str -> dict|None), same error dict shape, stricter behavior (adds .strip() guard)."
+    },
+    {
+      "what": "validate_project_root from fused_memory.utils.validation",
+      "where": "fused-memory/src/fused_memory/utils/validation.py:22-27",
+      "how": "Direct import to replace _validate_project_root closure in tools.py. Identical behavior \u2014 same signature, same error dict shape, same logic."
+    },
+    {
+      "what": "Existing call-site pattern: `if err := validate_*(x): return err`",
+      "where": "All 20 call sites in tools.py",
+      "how": "The walrus-operator pattern at every call site stays unchanged \u2014 only the function name drops the underscore prefix. No refactoring of call sites beyond the name change."
+    },
+    {
+      "what": "Import pattern from other consumers",
+      "where": "reconciliation/stages/base.py:23, reconciliation/targeted.py:20",
+      "how": "Follow the same `from fused_memory.utils.validation import validate_*` pattern already used by two other modules in the codebase."
+    }
+  ],
+  "_session_id": "253-c6628d99",
+  "_created_at": "2026-03-28T04:48:24.251784+00:00"
+}
