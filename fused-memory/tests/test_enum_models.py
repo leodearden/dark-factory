@@ -459,3 +459,60 @@ class TestWatermarkProjectIdValidator:
 
         wm = Watermark.model_validate({'project_id': '  dark_factory  '})
         assert wm.project_id == 'dark_factory'
+
+
+# ---------------------------------------------------------------------------
+# Step 3: ReconciliationEvent project_id field_validator
+# ---------------------------------------------------------------------------
+
+
+class TestReconciliationEventProjectId:
+    """ReconciliationEvent.normalize_project_id strips whitespace and rejects empty project_id."""
+
+    _DEFAULTS = {
+        'id': 'evt-1',
+        'type': 'episode_added',
+        'source': 'agent',
+        'timestamp': '2024-01-01T00:00:00Z',
+    }
+
+    @staticmethod
+    def _make_event(project_id: str):
+        from fused_memory.models.reconciliation import ReconciliationEvent
+
+        return ReconciliationEvent(
+            id='evt-1',
+            type='episode_added',
+            source='agent',
+            project_id=project_id,
+            timestamp='2024-01-01T00:00:00Z',
+        )
+
+    def test_valid_project_id_passes_through_unchanged(self):
+        evt = self._make_event('dark_factory')
+        assert evt.project_id == 'dark_factory'
+
+    def test_leading_trailing_whitespace_is_stripped(self):
+        evt = self._make_event('  dark_factory  ')
+        assert evt.project_id == 'dark_factory'
+
+    def test_whitespace_only_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            self._make_event('   ')
+
+    def test_empty_string_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            self._make_event('')
+
+    def test_model_validate_dict_strips_whitespace(self):
+        """mode='before' works for DB deserialization path (model_validate)."""
+        from fused_memory.models.reconciliation import ReconciliationEvent
+
+        evt = ReconciliationEvent.model_validate({
+            'id': 'evt-1',
+            'type': 'episode_added',
+            'source': 'agent',
+            'project_id': '  dark_factory  ',
+            'timestamp': '2024-01-01T00:00:00Z',
+        })
+        assert evt.project_id == 'dark_factory'
