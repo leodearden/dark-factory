@@ -1,6 +1,7 @@
 """Tests for config schema Literal type validation."""
 
 import os
+import sys
 
 import pytest
 import yaml
@@ -198,6 +199,39 @@ class TestYamlSettingsSourceEnvVarExpansion:
     def test_non_env_string_unchanged(self):
         result = self.source._expand_env_vars('plain-string')
         assert result == 'plain-string'
+
+
+class TestYamlSettingsSourceErrorHandling:
+    """Tests for YamlSettingsSource error handling on corrupt or unreadable files."""
+
+    def _make_source(self, path):
+        from pydantic_settings import BaseSettings
+
+        class _DummySettings(BaseSettings):
+            pass
+
+        return YamlSettingsSource(_DummySettings, config_path=path)
+
+    def test_corrupt_yaml_raises_runtime_error(self, tmp_path):
+        """Corrupt YAML content must raise RuntimeError with the file path in the message."""
+        bad_file = tmp_path / 'bad.yaml'
+        bad_file.write_bytes(b': :\n  - \x00bad')
+        source = self._make_source(bad_file)
+        with pytest.raises(RuntimeError, match=str(bad_file)):
+            source()
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='chmod not reliable on Windows')
+    def test_unreadable_file_raises_runtime_error(self, tmp_path):
+        """An unreadable file must raise RuntimeError with the file path in the message."""
+        locked_file = tmp_path / 'locked.yaml'
+        locked_file.write_text('key: value')
+        locked_file.chmod(0o000)
+        try:
+            source = self._make_source(locked_file)
+            with pytest.raises(RuntimeError, match=str(locked_file)):
+                source()
+        finally:
+            locked_file.chmod(0o644)
 
 
 class TestYamlSettingsSourceABCContract:
