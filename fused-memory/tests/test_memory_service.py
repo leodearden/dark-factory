@@ -1033,3 +1033,307 @@ class TestSerializeTemporal:
         assert result is not None
         assert result['valid_at'] == str(ts)
         assert result['invalid_at'] is None
+
+
+# ---------------------------------------------------------------------------
+# Tests for _dedup_episode_edges  (steps 1, 3, 5, 6, 7)
+# ---------------------------------------------------------------------------
+
+class TestDedupEpisodeEdges:
+    """Unit tests for MemoryService._dedup_episode_edges.
+
+    step-1: 3 edges sharing same (source_node_uuid, target_node_uuid, fact)
+            → 2 duplicates removed via bulk_remove_edges, returns count=2
+
+    step-3: all edges distinct → returns 0, bulk_remove_edges NOT called
+
+    step-5: None result / empty edges list → returns 0, no backend calls
+
+    step-6: normalization (case + whitespace) → 'Auth depends on Redis' and
+            '  auth  depends  on  redis  ' treated as duplicates
+
+    step-7: same fact but different source/target pairs → NOT duplicates
+    """
+
+    @pytest.mark.asyncio
+    async def test_three_duplicate_edges_removes_two(self, service):
+        """step-1: 3 edges with same (source, target, fact) → 2 removed."""
+        from unittest.mock import AsyncMock
+
+        from tests.conftest import MockAddEpisodeResult, MockEdge
+
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=2)
+
+        edges = [
+            MockEdge(
+                fact='Auth depends on Redis',
+                uuid='uuid-1',
+                source_node_uuid='src-A',
+                target_node_uuid='tgt-B',
+            ),
+            MockEdge(
+                fact='Auth depends on Redis',
+                uuid='uuid-2',
+                source_node_uuid='src-A',
+                target_node_uuid='tgt-B',
+            ),
+            MockEdge(
+                fact='Auth depends on Redis',
+                uuid='uuid-3',
+                source_node_uuid='src-A',
+                target_node_uuid='tgt-B',
+            ),
+        ]
+        result = MockAddEpisodeResult(edges=edges)
+        # Clear the entity_edges mirror so we test the 'edges' path directly
+        result.entity_edges = []
+
+        removed = await service._dedup_episode_edges(result)
+
+        assert removed == 2
+        service.graphiti.bulk_remove_edges.assert_called_once()
+        deleted_uuids = service.graphiti.bulk_remove_edges.call_args[0][0]
+        assert sorted(deleted_uuids) == ['uuid-2', 'uuid-3']
+
+    @pytest.mark.asyncio
+    async def test_no_duplicates_returns_zero_no_backend_call(self, service):
+        """step-3: all edges distinct → 0 removed, bulk_remove_edges NOT called."""
+        from unittest.mock import AsyncMock
+
+        from tests.conftest import MockAddEpisodeResult, MockEdge
+
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
+
+        edges = [
+            MockEdge(
+                fact='Auth depends on Redis',
+                uuid='uuid-1',
+                source_node_uuid='src-A',
+                target_node_uuid='tgt-B',
+            ),
+            MockEdge(
+                fact='Redis stores sessions',
+                uuid='uuid-2',
+                source_node_uuid='src-A',
+                target_node_uuid='tgt-B',
+            ),
+            MockEdge(
+                fact='Auth depends on Redis',
+                uuid='uuid-3',
+                source_node_uuid='src-C',   # different source — different relationship
+                target_node_uuid='tgt-B',
+            ),
+        ]
+        result = MockAddEpisodeResult(edges=edges)
+        result.entity_edges = []
+
+        removed = await service._dedup_episode_edges(result)
+
+        assert removed == 0
+        service.graphiti.bulk_remove_edges.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_none_result_returns_zero(self, service):
+        """step-5a: None result → 0, no backend calls."""
+        from unittest.mock import AsyncMock
+
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
+
+        removed = await service._dedup_episode_edges(None)
+
+        assert removed == 0
+        service.graphiti.bulk_remove_edges.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_edges_list_returns_zero(self, service):
+        """step-5b: result with empty edges list → 0, no backend calls."""
+        from unittest.mock import AsyncMock
+
+        from tests.conftest import MockAddEpisodeResult
+
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
+
+        result = MockAddEpisodeResult(edges=[])
+        result.entity_edges = []
+
+        removed = await service._dedup_episode_edges(result)
+
+        assert removed == 0
+        service.graphiti.bulk_remove_edges.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_normalization_treats_case_whitespace_variants_as_duplicate(self, service):
+        """step-6: case + whitespace normalization catches near-duplicate facts."""
+        from unittest.mock import AsyncMock
+
+        from tests.conftest import MockAddEpisodeResult, MockEdge
+
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=1)
+
+        edges = [
+            MockEdge(
+                fact='Auth depends on Redis',
+                uuid='uuid-1',
+                source_node_uuid='src-A',
+                target_node_uuid='tgt-B',
+            ),
+            MockEdge(
+                fact='  auth  depends  on  redis  ',
+                uuid='uuid-2',
+                source_node_uuid='src-A',
+                target_node_uuid='tgt-B',
+            ),
+        ]
+        result = MockAddEpisodeResult(edges=edges)
+        result.entity_edges = []
+
+        removed = await service._dedup_episode_edges(result)
+
+        assert removed == 1
+        service.graphiti.bulk_remove_edges.assert_called_once()
+        deleted_uuids = service.graphiti.bulk_remove_edges.call_args[0][0]
+        assert deleted_uuids == ['uuid-2']
+
+    @pytest.mark.asyncio
+    async def test_same_fact_different_node_pairs_not_duplicates(self, service):
+        """step-7: same fact text but different source/target pairs → distinct edges."""
+        from unittest.mock import AsyncMock
+
+        from tests.conftest import MockAddEpisodeResult, MockEdge
+
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
+
+        edges = [
+            MockEdge(
+                fact='depends on Redis',
+                uuid='uuid-1',
+                source_node_uuid='src-A',
+                target_node_uuid='tgt-B',
+            ),
+            MockEdge(
+                fact='depends on Redis',
+                uuid='uuid-2',
+                source_node_uuid='src-C',   # different source
+                target_node_uuid='tgt-B',
+            ),
+            MockEdge(
+                fact='depends on Redis',
+                uuid='uuid-3',
+                source_node_uuid='src-A',
+                target_node_uuid='tgt-D',   # different target
+            ),
+        ]
+        result = MockAddEpisodeResult(edges=edges)
+        result.entity_edges = []
+
+        removed = await service._dedup_episode_edges(result)
+
+        assert removed == 0
+        service.graphiti.bulk_remove_edges.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests for _execute_graphiti_write integration with dedup  (steps 8, 10)
+# ---------------------------------------------------------------------------
+
+class TestExecuteGraphitiWriteWithDedup:
+    """Integration tests for dedup wiring in _execute_graphiti_write.
+
+    step-8: _execute_graphiti_write calls _dedup_episode_edges with result,
+            duplicate edges are removed before returning
+
+    step-10: _execute_graphiti_write returns normally when add_episode
+             returns None (no edges to dedup, no crash)
+    """
+
+    @pytest.mark.asyncio
+    async def test_execute_graphiti_write_calls_dedup_and_removes_duplicates(self, service):
+        """step-8: dedup is called after add_episode; duplicates are removed."""
+        from unittest.mock import AsyncMock
+
+        from tests.conftest import MockAddEpisodeResult, MockEdge
+
+        dup_edges = [
+            MockEdge(fact='X depends on Y', uuid='u1', source_node_uuid='s1', target_node_uuid='t1'),
+            MockEdge(fact='X depends on Y', uuid='u2', source_node_uuid='s1', target_node_uuid='t1'),
+        ]
+        mock_result = MockAddEpisodeResult(edges=dup_edges)
+        mock_result.entity_edges = []
+
+        service.graphiti.add_episode = AsyncMock(return_value=mock_result)
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=1)
+
+        payload = {
+            'name': 'ep_test',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+
+        # dedup must have removed the second edge
+        service.graphiti.bulk_remove_edges.assert_called_once()
+        deleted_uuids = service.graphiti.bulk_remove_edges.call_args[0][0]
+        assert deleted_uuids == ['u2']
+
+    @pytest.mark.asyncio
+    async def test_execute_graphiti_write_none_result_no_crash(self, service):
+        """step-10: add_episode returns None → _execute_graphiti_write does not crash."""
+        from unittest.mock import AsyncMock
+
+        service.graphiti.add_episode = AsyncMock(return_value=None)
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
+
+        payload = {
+            'name': 'ep_test',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        result = await service._execute_graphiti_write('add_episode', payload)
+
+        # Should return None without crashing
+        assert result is None
+        service.graphiti.bulk_remove_edges.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests for _dual_write_callback reading result.edges  (step 11)
+# ---------------------------------------------------------------------------
+
+class TestDualWriteCallbackEdgesField:
+    """step-11: _dual_write_callback reads edges from result.edges (the real
+    field name) not result.entity_edges.
+    """
+
+    @pytest.mark.asyncio
+    async def test_callback_reads_real_edges_field(self, service):
+        """result.edges (not result.entity_edges) drives dual-write enqueue."""
+        from tests.conftest import MockAddEpisodeResult, MockEdge
+
+        # Build a mock where entity_edges is empty but edges has content.
+        # After our pre-1 fix, MockAddEpisodeResult mirrors entity_edges→edges,
+        # but here we explicitly set them to different values to verify the
+        # callback reads from 'edges'.
+        result = MockAddEpisodeResult.__new__(MockAddEpisodeResult)
+        result.entity_edges = []
+        result.edges = [
+            MockEdge(fact='Auth depends on Redis', uuid='e1'),
+            MockEdge(fact='Redis stores sessions', uuid='e2'),
+        ]
+
+        payload = {
+            'project_id': 'test',
+            'agent_id': 'test-agent',
+            '_causation_id': 'caus-1',
+        }
+        await service._dual_write_callback('dual_write_episode', result, payload)
+
+        service.durable_queue.enqueue_batch.assert_called_once()
+        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        assert len(batch) == 2, (
+            '_dual_write_callback must read from result.edges (got 2 edges) '
+            f'but found {len(batch)} items — it may still be reading entity_edges'
+        )
