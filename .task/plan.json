@@ -2,10 +2,8 @@
   "task_id": "157",
   "title": "Cleanup: Remove dead code \u2014 queue_service.py, protocols.py, integrity_check.py shim, stale exports",
   "files": [
-    "fused-memory/src/fused_memory/services/queue_service.py",
     "fused-memory/src/fused_memory/services/__init__.py",
-    "orchestrator/src/orchestrator/protocols.py",
-    "fused-memory/src/fused_memory/reconciliation/stages/integrity_check.py",
+    "orchestrator/src/orchestrator/verify.py",
     "fused-memory/src/fused_memory/backends/__init__.py",
     "fused-memory/tests/test_dead_code_removal.py"
   ],
