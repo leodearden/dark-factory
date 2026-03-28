@@ -1,6 +1,7 @@
 """Tests for the memory service — unit tests with mocked backends."""
 
 import asyncio
+import types
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -726,6 +727,43 @@ class TestGetEntity:
         assert len(result['edges']) == 1
         assert result['edges'][0]['fact'] == 'Auth service depends on Redis'
         assert result['edges'][0]['uuid'] == 'edge-uuid-1'
+
+    # ------------------------------------------------------------------
+    # getattr fallback — missing attributes return None / [] defaults
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_getattr_fallback_missing_attributes(self, service):
+        """Bare objects without optional attrs return None/[] defaults."""
+        bare_node = types.SimpleNamespace(name='BareNode')
+        bare_edge = types.SimpleNamespace()  # no attributes at all
+
+        service.graphiti.search_nodes = AsyncMock(return_value=[bare_node])
+        service.graphiti.search = AsyncMock(return_value=[bare_edge])
+
+        result = await service.get_entity('BareNode', project_id='test')
+
+        node = result['nodes'][0]
+        assert node['uuid'] is None
+        assert node['summary'] is None
+        assert node['labels'] == []
+
+        edge = result['edges'][0]
+        assert edge['uuid'] is None
+        assert edge['fact'] == str(bare_edge)
+
+    @pytest.mark.asyncio
+    async def test_getattr_labels_none_returns_empty_list(self, service):
+        """labels=None (attribute present but explicitly None) must return []."""
+        bare_node = types.SimpleNamespace(name='BareNode')
+        bare_node.labels = None  # attribute IS present, value is None
+
+        service.graphiti.search_nodes = AsyncMock(return_value=[bare_node])
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        result = await service.get_entity('BareNode', project_id='test')
+
+        assert result['nodes'][0]['labels'] == []
 
     # ------------------------------------------------------------------
     # concurrent execution — both coroutines run in parallel
