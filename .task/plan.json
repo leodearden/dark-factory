@@ -46,7 +46,7 @@
       "id": "step-3",
       "type": "test",
       "description": "Update TestParseUtc in test_reconciliation.py to import parse_utc from dashboard.data.utils instead of _parse_utc from dashboard.data.reconciliation. Tests will fail because reconciliation.py still defines the local _parse_utc and the test expectations reference the old location.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
