@@ -7,6 +7,16 @@ import runpy
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
+PARTIAL_URLS = (
+    "/partials/memory",
+    "/partials/recon",
+    "/partials/orchestrators",
+    "/partials/performance",
+    "/partials/memory-graphs",
+)
+
 
 class TestIdiomorphExtension:
     """Tests for idiomorph extension setup in base.html."""
@@ -47,6 +57,14 @@ class TestMorphSwap:
         html = client.get('/').text
         assert 'hx-swap="morph:innerHTML"' in html
         assert 'hx-get="/partials/memory-graphs"' in html
+
+    @pytest.mark.parametrize('partial_url', PARTIAL_URLS)
+    def test_section_uses_morph_swap(self, client, partial_url):
+        html = client.get('/').text
+        hx_get = f'hx-get="{partial_url}"'
+        idx = html.index(hx_get)
+        window = html[idx - 200:idx + 200]
+        assert 'hx-swap="morph:innerHTML"' in window
 
     def test_no_plain_innerhtml_on_polling_sections(self, client):
         html = client.get('/').text
