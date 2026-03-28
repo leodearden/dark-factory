@@ -1,0 +1,81 @@
+{
+  "task_id": "239",
+  "title": "Extend YamlSettingsSource error boundary to wrap _expand_env_vars",
+  "files": [
+    "fused-memory/src/fused_memory/config/schema.py",
+    "fused-memory/tests/test_config_schema.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/config",
+    "fused-memory/tests"
+  ],
+  "analysis": "In YamlSettingsSource.__call__ (schema.py:60-68), _expand_env_vars(raw_config) on line 68 is called after the try/except block that wraps YAML loading (lines 63-67). The try/except catches yaml.YAMLError and OSError, wrapping them in RuntimeError with the config file path. However, if _expand_env_vars raises any exception (e.g. a TypeError from unexpected YAML value types, or any other runtime error during recursive expansion), it propagates as a raw exception without the config path context. The fix is to add a second try/except around _expand_env_vars that catches Exception and wraps it in RuntimeError with a descriptive message including self.config_path. A separate except block (rather than widening the existing one) preserves the distinct error messages for YAML parsing vs env-var expansion failures. Existing test infrastructure in test_config_schema.py provides the _make_source helper and TestYamlSettingsSourceErrorHandling class that we can extend.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing test: test_expand_env_vars_error_raises_runtime_error. In TestYamlSettingsSourceErrorHandling, add a test that creates a valid YAML file, monkeypatches _expand_env_vars to raise a ValueError, calls source(), and asserts RuntimeError is raised with the config path in the message. This test will fail because the current code does not wrap _expand_env_vars exceptions.",
+      "status": "done",
+      "commit": "89b2b344"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Fix the error boundary in YamlSettingsSource.__call__: add a second try/except around the _expand_env_vars call (after the YAML loading try/except) that catches Exception and raises RuntimeError(f'Failed to expand environment variables in {self.config_path}: {e}') from e. This makes step-1's test pass while preserving all existing behavior.",
+      "status": "done",
+      "commit": "9b6a81de"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write additional test: test_expand_env_vars_error_includes_original_cause. Verify that the raised RuntimeError has a __cause__ (chained exception) that is the original exception from _expand_env_vars, ensuring proper exception chaining with 'from e'.",
+      "status": "done",
+      "commit": "34656bd1"
+    },
+    {
+      "id": "step-4",
+      "type": "test",
+      "description": "Write test: test_expand_env_vars_error_does_not_mask_yaml_error. Verify that corrupt YAML still raises RuntimeError with 'Failed to load configuration' (not 'Failed to expand'), confirming the two error paths remain distinct and the YAML loading error handling is unchanged.",
+      "status": "done",
+      "commit": "c29219f3"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use a separate try/except block for _expand_env_vars rather than widening the existing one",
+      "rationale": "Keeps error messages distinct: 'Failed to load configuration from ...' for YAML/IO errors vs 'Failed to expand environment variables in ...' for expansion errors. This gives operators clear diagnostics about which phase failed. Also avoids accidentally catching non-expansion exceptions in a broadened except clause."
+    },
+    {
+      "decision": "Catch broad Exception in the env-var expansion try/except",
+      "rationale": "_expand_env_vars performs recursive dict/list traversal with regex operations. The set of possible exceptions is unbounded (TypeError, AttributeError, re.error, etc.), so catching Exception is appropriate for a boundary that exists solely to add context (the file path) before re-raising as RuntimeError."
+    },
+    {
+      "decision": "Use monkeypatch on _expand_env_vars to simulate failure rather than crafting pathological YAML input",
+      "rationale": "The current _expand_env_vars implementation handles all standard YAML types gracefully. Crafting input that actually triggers a failure would be fragile and version-dependent. Monkeypatching directly tests the error boundary contract: any exception from _expand_env_vars gets wrapped."
+    },
+    {
+      "decision": "Add tests to existing TestYamlSettingsSourceErrorHandling class",
+      "rationale": "The new tests are thematically related to error handling in __call__ and the class already has _make_source helper. Adding here keeps test organization consistent."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "TestYamlSettingsSourceErrorHandling._make_source helper",
+      "where": "fused-memory/tests/test_config_schema.py:207-213",
+      "how": "Reuse the existing _make_source method to create YamlSettingsSource instances with a dummy settings class for all new tests"
+    },
+    {
+      "what": "Existing error-handling pattern in __call__",
+      "where": "fused-memory/src/fused_memory/config/schema.py:63-67",
+      "how": "Follow the same pattern of catching exceptions and re-raising as RuntimeError with config path context, using 'from e' for exception chaining"
+    },
+    {
+      "what": "tmp_path pytest fixture for temp YAML files",
+      "where": "fused-memory/tests/test_config_schema.py:215-234",
+      "how": "Use the same pattern of creating temporary YAML files with tmp_path for test isolation"
+    }
+  ],
+  "_session_id": "239-4126f053",
+  "_created_at": "2026-03-28T05:01:43.749365+00:00"
+}
