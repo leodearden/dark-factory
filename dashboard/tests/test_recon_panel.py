@@ -213,10 +213,10 @@ class TestFormatDuration:
 
         assert format_duration(45) == '45s'
 
-    def test_zero_seconds_returns_0s(self):
+    def test_zero_seconds_returns_dash(self):
         from dashboard.app import format_duration
 
-        assert format_duration(0) == '0s'
+        assert format_duration(0) == '-'
 
     def test_exactly_59s_returns_seconds(self):
         from dashboard.app import format_duration

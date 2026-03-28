@@ -126,9 +126,12 @@ def format_duration(value: int | float | None) -> str:
         < 3600s → 'Xm Ys'   (e.g. '10m 0s')
         ≥ 3600s → 'Xh Ym'   (e.g. '17h 25m')
     """
-    if value is None:
+    try:
+        total = int(value)
+    except (TypeError, ValueError):
         return '-'
-    total = int(value)
+    if total <= 0:
+        return '-'
     if total < 60:
         return f'{total}s'
     if total < 3600:
