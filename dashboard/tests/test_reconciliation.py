@@ -572,6 +572,26 @@ class TestParseUtc:
             parse_utc(None)  # type: ignore[arg-type]
 
 
+class TestPartitionBurstState:
+    """Functional tests for partition_burst_state."""
+
+    def test_none_last_write_at_handled_consistently(self, caplog):
+        """Agent with None last_write_at lands in idle and emits a debug log."""
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': None}]
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
+            active, idle = partition_burst_state(agents)
+
+        assert len(idle) == 1
+        assert idle[0]['agent_id'] == 'a1'
+        assert len(active) == 0
+        assert any(
+            r.levelno == logging.DEBUG and 'bad last_write_at' in r.message
+            for r in caplog.records
+        ), f'Expected DEBUG log with "bad last_write_at", got: {caplog.records}'
+
+
 class TestPartitionBurstStateLocation:
     """Verify partition_burst_state and _ACTIVE_THRESHOLD_SECONDS live in reconciliation."""
 
