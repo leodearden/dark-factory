@@ -4231,11 +4231,11 @@
         "description": "validate_project_id currently only checks non-emptiness (line 30). It is interpolated into the same reconciliation context prompt as run_id (base.py line 122: `f'- \\`project_id\\`: \"{self.project_id}\"'`), but lacks the `[a-zA-Z0-9_-]+` character-set allowlist that validate_run_id now enforces. This asymmetry leaves project_id as a remaining injection vector in the same prompt block.\n\nFix: add the same `_RUN_ID_PATTERN.fullmatch()` check (or a shared `_SAFE_IDENTIFIER_PATTERN`) to validate_project_id. In practice project_id is always 'dark_factory', but the validation should be symmetric with run_id for defense-in-depth.\n\nmemory_hint: search \"prompt injection fix routing layer\" for prior pattern; search \"run_id validate character-set allowlist\" for the run_id implementation to mirror.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-28T04:46:02.990Z",
+        "updatedAt": "2026-03-28T15:25:36.333Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/utils",
@@ -4345,11 +4345,11 @@
         "description": "Task 214 added tests for require_project_root and whitespace cases, but several gaps remain in test_validation.py:\n\n**TestValidateProjectRoot** (currently only tests whitespace-only and tab-only rejection):\n1. Add `test_valid_absolute_path_returns_none` — assert `validate_project_root('/some/path') is None`\n2. Add `test_rejects_relative_path` — assert non-None error dict for `'relative/path'`\n3. Add `test_rejects_empty_string` — assert non-None error dict for `''`\n\n**TestRequireProjectRoot** (currently tests relative path, but not empty/whitespace):\n4. Add `test_empty_string_raises_valueerror` — `require_project_root('')` should raise ValueError\n5. Add `test_whitespace_only_raises_valueerror` — `require_project_root('   ')` should raise ValueError\n\n**TestValidateProjectId** (no test class exists yet):\n6. Consider adding a basic TestValidateProjectId class mirroring the pattern in TestValidateRunId.\n\nmemory_hint: search \"validation.py test coverage\" and \"test_validation.py structure\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T05:32:45.057Z",
+        "updatedAt": "2026-03-28T15:25:36.359Z",
         "metadata": {
           "modules": [
             "fused-memory/tests/test_validation.py"
@@ -5032,7 +5032,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T15:25:36.305Z",
+      "lastModified": "2026-03-28T15:25:36.359Z",
       "taskCount": 268,
       "completedCount": 207,
       "tags": [
