@@ -983,3 +983,89 @@ class TestWithDb:
             if r.levelno == logging.DEBUG and 'dashboard.data.db' in r.name
         ]
         assert debug_records, f'Expected DEBUG log, got: {caplog.records}'
+
+
+class TestMakeReconDb:
+    """Tests for the make_recon_db async context manager helper in conftest.py."""
+
+    async def test_creates_schema_and_executes_plain_sql_inserts(self, tmp_path):
+        """make_recon_db creates schema tables and executes plain SQL inserts."""
+        from tests.conftest import make_recon_db
+
+        inserts = [
+            "INSERT INTO watermarks (project_id) VALUES ('proj-a')",
+            "INSERT INTO watermarks (project_id) VALUES ('proj-b')",
+        ]
+        async with make_recon_db(tmp_path, inserts) as conn:
+            async with conn.execute(
+                'SELECT project_id FROM watermarks ORDER BY project_id'
+            ) as cur:
+                rows = await cur.fetchall()
+        assert len(rows) == 2
+        assert rows[0]['project_id'] == 'proj-a'
+        assert rows[1]['project_id'] == 'proj-b'
+
+    async def test_executes_parameterized_inserts(self, tmp_path):
+        """make_recon_db executes (sql, params) tuple inserts with bound parameters."""
+        from datetime import UTC, datetime
+        from tests.conftest import make_recon_db
+
+        now = datetime.now(UTC).isoformat()
+        inserts = [
+            (
+                "INSERT INTO burst_state (agent_id, state, last_write_at)"
+                " VALUES (?, ?, ?)",
+                ('ag-1', 'bursting', now),
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts) as conn:
+            async with conn.execute(
+                'SELECT agent_id, state FROM burst_state'
+            ) as cur:
+                rows = await cur.fetchall()
+        assert len(rows) == 1
+        assert rows[0]['agent_id'] == 'ag-1'
+        assert rows[0]['state'] == 'bursting'
+
+    async def test_row_factory_is_set(self, tmp_path):
+        """Connection yielded by make_recon_db has aiosqlite.Row as row_factory."""
+        import aiosqlite as _aiosqlite
+        from tests.conftest import make_recon_db
+
+        async with make_recon_db(tmp_path, []) as conn:
+            assert conn.row_factory is _aiosqlite.Row
+
+    async def test_custom_schema_kwarg(self, tmp_path):
+        """Optional schema= kwarg overrides the default RECONCILIATION_SCHEMA."""
+        from tests.conftest import make_recon_db
+
+        tiny_schema = 'CREATE TABLE IF NOT EXISTS foo (bar TEXT)'
+        inserts = ["INSERT INTO foo (bar) VALUES ('hello')"]
+        async with make_recon_db(tmp_path, inserts, schema=tiny_schema) as conn:
+            async with conn.execute('SELECT bar FROM foo') as cur:
+                rows = await cur.fetchall()
+        assert len(rows) == 1
+        assert rows[0]['bar'] == 'hello'
+
+    async def test_custom_name_kwarg(self, tmp_path):
+        """Optional name= kwarg controls the DB filename."""
+        import aiosqlite as _aiosqlite
+        from tests.conftest import make_recon_db
+
+        async with make_recon_db(tmp_path, [], name='custom.db') as conn:
+            # Connection should still be functional
+            await conn.execute('SELECT 1')
+        assert (tmp_path / 'custom.db').exists()
+
+    async def test_connection_closed_after_context_exit(self, tmp_path):
+        """Connection is closed after the context manager exits."""
+        import aiosqlite as _aiosqlite
+        from tests.conftest import make_recon_db
+
+        captured = []
+        async with make_recon_db(tmp_path, []) as conn:
+            captured.append(conn)
+        # After exit, executing on the connection should raise (closed)
+        import pytest as _pytest
+        with _pytest.raises(Exception):
+            await captured[0].execute('SELECT 1')
