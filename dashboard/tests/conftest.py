@@ -121,7 +121,7 @@ def two_url_config(tmp_path):
     """Create a DashboardConfig with two test URLs (ports 9000, 9001).
 
     Port 9000 is used as the failing server in fallback tests; port 9001
-    responds successfully. Using ports distinct from the default (8002/8000/8001)
+    responds successfully. Using ports distinct from the default (8002)
     makes the test intent explicit.
     """
     from dashboard.config import DashboardConfig
