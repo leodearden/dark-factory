@@ -1069,6 +1069,50 @@ class MemoryService:
 
         return {'status': 'deleted', 'episode_id': episode_id, 'cascade': cascade}
 
+    async def refresh_entity_summary(
+        self,
+        entity_uuid: str,
+        project_id: str = 'main',
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
+    ) -> dict:
+        """Regenerate a Graphiti entity node's summary from its valid edges.
+
+        Delegates to GraphitiBackend.refresh_entity_summary(), which queries
+        remaining valid edges, deduplicates their facts, and writes back a
+        clean summary. Logs the operation via write journal if available.
+
+        Args:
+            entity_uuid: UUID of the Entity node to refresh.
+            project_id: Project scope (for journal logging).
+            agent_id: Which agent is calling (optional).
+            session_id: Session context (optional).
+            causation_id: Reconciliation causation ID (optional).
+            _source: Source label for journal entry.
+
+        Returns:
+            Dict from backend: {uuid, name, old_summary, new_summary, edge_count}.
+        """
+        result = await self.graphiti.refresh_entity_summary(entity_uuid)
+
+        if self._write_journal:
+            await self._write_journal.log_write_op(
+                write_op_id=str(uuid_mod.uuid4()),
+                causation_id=causation_id,
+                source=_source,
+                operation='refresh_entity_summary',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'entity_uuid': entity_uuid},
+                result_summary=result,
+                success=True,
+            )
+
+        return result
+
     # ------------------------------------------------------------------
     # Management
     # ------------------------------------------------------------------
