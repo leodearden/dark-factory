@@ -67,14 +67,14 @@
       "type": "impl",
       "description": "Move inline imports to module level: add 'from pydantic_settings import BaseSettings' and 'from pydantic.fields import FieldInfo' to the module-level import block (after the existing pydantic imports). Remove the 5 inline import statements at lines 181, 234, 304, 324, and 333. Run full test suite to verify no regressions.",
       "status": "done",
-      "commit": "placeholder-step-7"
+      "commit": "28c8b2a5"
     },
     {
       "id": "step-8",
       "type": "impl",
       "description": "Extract _DummySettings to module level: define a single 'class _DummySettings(BaseSettings): pass' after the import block. Extract a module-level helper '_make_source(path)' that creates YamlSettingsSource(_DummySettings, config_path=path). Replace the 4 inline _DummySettings definitions and the 2 identical _make_source methods (in TestYamlSettingsSourceErrorHandling and TestYamlSettingsSourceEncoding) with calls to the module-level helper. Update the 2 setup_method methods (TestYamlSettingsSourceEnvVarExpansion and TestYamlSettingsSourceABCContract) to use the module-level _DummySettings directly. Run full test suite to verify no regressions.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "placeholder-step-8"
     },
     {
       "id": "step-9",

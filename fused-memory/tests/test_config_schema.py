@@ -20,6 +20,14 @@ from fused_memory.config.schema import (
 )
 
 
+class _DummySettings(BaseSettings):
+    pass
+
+
+def _make_source(path):
+    return YamlSettingsSource(_DummySettings, config_path=path)
+
+
 class TestServerConfigTransport:
     """Tests for ServerConfig.transport Literal validation."""
 
@@ -180,9 +188,6 @@ class TestYamlSettingsSourceEnvVarExpansion:
     """Tests for YamlSettingsSource._expand_env_vars."""
 
     def setup_method(self):
-        # Use a dummy settings class; path doesn't matter for _expand_env_vars
-        class _DummySettings(BaseSettings):
-            pass
         self.source = YamlSettingsSource(_DummySettings, config_path=None)
 
     def test_expands_env_var_with_value(self, monkeypatch):
@@ -232,17 +237,11 @@ class TestYamlSettingsSourceEnvVarExpansion:
 class TestYamlSettingsSourceErrorHandling:
     """Tests for YamlSettingsSource error handling on corrupt or unreadable files."""
 
-    def _make_source(self, path):
-        class _DummySettings(BaseSettings):
-            pass
-
-        return YamlSettingsSource(_DummySettings, config_path=path)
-
     def test_corrupt_yaml_raises_runtime_error(self, tmp_path):
         """Corrupt YAML content must raise RuntimeError with the file path in the message."""
         bad_file = tmp_path / 'bad.yaml'
         bad_file.write_bytes(b': :\n  - \x00bad')
-        source = self._make_source(bad_file)
+        source = _make_source(bad_file)
         with pytest.raises(RuntimeError, match=str(bad_file)) as exc_info:
             source()
         assert exc_info.value.__cause__ is not None
@@ -254,7 +253,7 @@ class TestYamlSettingsSourceErrorHandling:
         locked_file.write_text('key: value')
         locked_file.chmod(0o000)
         try:
-            source = self._make_source(locked_file)
+            source = _make_source(locked_file)
             with pytest.raises(RuntimeError, match=str(locked_file)) as exc_info:
                 source()
             assert exc_info.value.__cause__ is not None
@@ -265,7 +264,7 @@ class TestYamlSettingsSourceErrorHandling:
         """_expand_env_vars raising any exception must be wrapped in RuntimeError with config path."""
         config_file = tmp_path / 'valid.yaml'
         config_file.write_text('key: value')
-        source = self._make_source(config_file)
+        source = _make_source(config_file)
 
         def _raise(val):
             raise ValueError('boom')
@@ -278,7 +277,7 @@ class TestYamlSettingsSourceErrorHandling:
         """The RuntimeError raised for _expand_env_vars failure must chain the original exception."""
         config_file = tmp_path / 'valid.yaml'
         config_file.write_text('key: value')
-        source = self._make_source(config_file)
+        source = _make_source(config_file)
         original = ValueError('original cause')
 
         def _raise(val):
@@ -293,7 +292,7 @@ class TestYamlSettingsSourceErrorHandling:
         """Corrupt YAML must still raise RuntimeError with 'Failed to load configuration' message."""
         bad_file = tmp_path / 'bad.yaml'
         bad_file.write_bytes(b': :\n  - \x00bad')
-        source = self._make_source(bad_file)
+        source = _make_source(bad_file)
         with pytest.raises(RuntimeError, match='Failed to load configuration') as exc_info:
             source()
         assert 'Failed to expand' not in str(exc_info.value)
@@ -302,17 +301,11 @@ class TestYamlSettingsSourceErrorHandling:
 class TestYamlSettingsSourceEncoding:
     """Tests for YamlSettingsSource explicit UTF-8 encoding."""
 
-    def _make_source(self, path):
-        class _DummySettings(BaseSettings):
-            pass
-
-        return YamlSettingsSource(_DummySettings, config_path=path)
-
     def test_utf8_yaml_loaded_correctly(self, tmp_path):
         """YAML files with non-ASCII UTF-8 characters must load correctly."""
         config_file = tmp_path / 'utf8.yaml'
         config_file.write_text("description: 'Ünfcödé tëst'", encoding='utf-8')
-        source = self._make_source(config_file)
+        source = _make_source(config_file)
         result = source()
         assert result.get('description') == 'Ünfcödé tëst'
 
@@ -320,7 +313,7 @@ class TestYamlSettingsSourceEncoding:
         """open() must be called with encoding='utf-8' when loading the YAML file."""
         config_file = tmp_path / 'utf8.yaml'
         config_file.write_text('key: value', encoding='utf-8')
-        source = self._make_source(config_file)
+        source = _make_source(config_file)
         _real_open = open
         with unittest.mock.patch('builtins.open', side_effect=_real_open) as mock_open:
             source()
@@ -332,9 +325,6 @@ class TestYamlSettingsSourceABCContract:
     """Tests for YamlSettingsSource ABC contract compliance."""
 
     def setup_method(self):
-        class _DummySettings(BaseSettings):
-            pass
-
         self.source = YamlSettingsSource(_DummySettings, config_path=None)
 
     def test_get_field_value_returns_tuple(self):
