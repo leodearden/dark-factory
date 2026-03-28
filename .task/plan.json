@@ -1,0 +1,142 @@
+{
+  "task_id": "197",
+  "title": "Fix get_entity exception filter, remove asserts, and harden tests",
+  "files": [
+    "fused-memory/src/fused_memory/services/memory_service.py",
+    "fused-memory/tests/test_memory_service.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/services",
+    "fused-memory/tests"
+  ],
+  "analysis": "Task 191 introduced asyncio.gather(return_exceptions=True) for concurrent get_entity, but the merge conflict resolution (0ea23cb) reverted get_entity back to sequential execution. The current worktree (task/197, based on latest main 8721d26) has the sequential implementation. This task must: (a) re-introduce the asyncio.gather concurrent pattern, (b) apply all 6 review fixes. The gather pattern from task 191 used isinstance(r, BaseException) which catches CancelledError/KeyboardInterrupt/SystemExit \u2014 the fix uses isinstance(r, Exception) matching the established pattern in task_interceptor.py:112. The existing test_search_nodes_failure_raises and test_both_failures_raises_first_exception tests need updating for concurrent semantics. Three test changes: add match= to both-failures test, fix stale docstring, add double-warning test. The code also had assert isinstance(nodes, list) / assert isinstance(edges, list) which must NOT be re-introduced (stripped by python -O). The implementation uses next() instead of list comprehension for first-exception detection.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Verify test suite passes on current worktree state before making changes: cd fused-memory && python -m pytest tests/test_memory_service.py -x -q",
+      "status": "done",
+      "commit": "8721d26",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing test_concurrent_execution: use asyncio.Event gates where each side_effect sets its own event then waits on the other's. Sequential execution causes TimeoutError; concurrent execution passes. This test will fail because get_entity is currently sequential.",
+      "status": "done",
+      "commit": "3be3fa3"
+    },
+    {
+      "id": "step-2",
+      "type": "test",
+      "description": "Update test_search_nodes_failure_raises \u2192 rename to test_search_nodes_failure_raises_and_search_settles. Update docstring to describe concurrent semantics. Add assertion that search() was still called (both coroutines settle in gather). Update comment from 'sequential' to 'concurrent gather'. This test will also fail against sequential code since search() is never called when search_nodes fails first.",
+      "status": "done",
+      "commit": "3be3fa3"
+    },
+    {
+      "id": "step-3",
+      "type": "impl",
+      "description": "Refactor get_entity to use asyncio.gather(return_exceptions=True). Replace sequential await calls with: results = await asyncio.gather(search_nodes(...), search(...), return_exceptions=True). Add exception filter loop that iterates results, logs each Exception via logger.warning, then re-raises the first one found. Use isinstance(r, Exception) (NOT BaseException). Use next((r for r in results if isinstance(r, Exception)), None) for first-exception detection. Unpack nodes, edges = results after filter. Do NOT add assert isinstance lines. Ensure 'import asyncio' is present at top of file. This makes step-1 and step-2 tests pass.",
+      "status": "done",
+      "commit": "2ae20bf"
+    },
+    {
+      "id": "step-4",
+      "type": "test",
+      "description": "Add match='search_nodes failed' to pytest.raises(RuntimeError) in test_both_failures_raises_first_exception. This verifies the ordering contract: the first exception from gather results (search_nodes result at index 0) is the one raised. Update docstring to say 'When both calls fail, the first exception from gather results is re-raised'.",
+      "status": "done",
+      "commit": "7a21569"
+    },
+    {
+      "id": "step-5",
+      "type": "impl",
+      "description": "Verify step-4 passes (it should since the gather returns results in positional order and search_nodes is first). No production code change needed \u2014 this step is a green verification.",
+      "status": "done",
+      "commit": "7a21569"
+    },
+    {
+      "id": "step-6",
+      "type": "test",
+      "description": "Write test_both_failures_emits_two_warnings: patch 'fused_memory.services.memory_service.logger', set both search_nodes and search to raise RuntimeError, call get_entity (wrapped in pytest.raises), assert mock_logger.warning.call_count == 2. This tests the double-log path where the exception filter iterates all results and logs each exception.",
+      "status": "done",
+      "commit": "7a21569"
+    },
+    {
+      "id": "step-7",
+      "type": "impl",
+      "description": "Verify step-6 passes \u2014 the gather exception filter already iterates all results and logs each, so this should be green. If not, adjust the exception filter loop to log ALL exceptions before raising the first one (iterate fully, collect first_exc via next(), log all, then raise first_exc).",
+      "status": "done",
+      "commit": "7a21569"
+    },
+    {
+      "id": "step-8",
+      "type": "test",
+      "description": "Fix stale docstring in test_search_failure_raises_and_search_nodes_settles (currently at line ~753). Remove 'With sequential execution, search_nodes() completes first, then search() is called and raises.' and replace with concurrent gather description. Update section comment from 'search failure \u2014 search_nodes succeeds, search raises' to match concurrent semantics.",
+      "status": "done",
+      "commit": "7a21569"
+    },
+    {
+      "id": "step-9",
+      "type": "impl",
+      "description": "Run full test suite for TestGetEntity class to confirm all tests pass: pytest tests/test_memory_service.py::TestGetEntity -v. Final verification of all 6 task items.",
+      "status": "done",
+      "commit": "7a21569"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use asyncio.gather(return_exceptions=True) instead of asyncio.TaskGroup",
+      "rationale": "Task 192 previously replaced gather with TaskGroup, but that was lost in merge conflicts. The task description specifically references the gather pattern and return_exceptions=True. TaskGroup raises ExceptionGroup on failure which requires different handling. gather(return_exceptions=True) is simpler: exceptions appear as values in the results tuple, matching the existing pattern in task_interceptor.py:110."
+    },
+    {
+      "decision": "isinstance(r, Exception) not isinstance(r, BaseException)",
+      "rationale": "BaseException catches CancelledError, KeyboardInterrupt, and SystemExit which should propagate up the stack, not be logged as Graphiti failures. Exception is the correct base class for 'application errors'. This matches the established pattern in task_interceptor.py:112 and is consistent with Python best practices."
+    },
+    {
+      "decision": "Log ALL exceptions before raising the first one",
+      "rationale": "The exception filter iterates all gather results, logging each exception via logger.warning. Then the first exception is raised. This ensures both failures are visible in logs even though only one exception propagates. The alternative (raise on first, skip logging second) would hide information about the second failure."
+    },
+    {
+      "decision": "Use next() instead of list comprehension for first-exception detection",
+      "rationale": "next((r for r in results if isinstance(r, Exception)), None) avoids allocating a list on the success path (where there are 0 exceptions) and short-circuits on the first match. With only 2 results this is micro-optimization but it's also more idiomatic for 'find first match' semantics."
+    },
+    {
+      "decision": "No assert isinstance(nodes, list) guards",
+      "rationale": "Assertions are stripped with python -O and are redundant after the exception filter. If neither result is an Exception, they are guaranteed to be the return values from search_nodes/search (both returning lists). The filter already handles the error case."
+    },
+    {
+      "decision": "Re-introduce gather as part of this task rather than treating it as a prerequisite dependency",
+      "rationale": "Task 191's gather implementation was lost in merge conflict resolution (commit 0ea23cb). Rather than creating a separate task or blocking, we implement the gather with all 6 fixes applied from the start. The TDD steps are ordered so the concurrency test comes first (driving the gather implementation), then the fix-specific tests follow."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "isinstance(r, Exception) pattern from task_interceptor drain()",
+      "where": "fused-memory/src/fused_memory/middleware/task_interceptor.py:112",
+      "how": "Same pattern for filtering gather results: iterate results, check isinstance(result, Exception), log failures. Our version uses logger.warning + re-raise instead of logger.error."
+    },
+    {
+      "what": "asyncio.Event gate pattern from task 191 concurrency test",
+      "where": "git show 4a7c2df (task 191 test, lines 718-752)",
+      "how": "Reuse the two-Event gate pattern where each side_effect sets its own event then waits on the other. If calls are sequential, the first waiter times out. If concurrent, both events fire."
+    },
+    {
+      "what": "logger.warning patch pattern from task 191 warning test",
+      "where": "git show 4a7c2df (task 191 test, lines 758-782)",
+      "how": "Reuse unittest.mock.patch('fused_memory.services.memory_service.logger') pattern for asserting warning log calls."
+    },
+    {
+      "what": "Existing MockNode/MockEdge fixtures in conftest.py",
+      "where": "fused-memory/tests/conftest.py:21-38",
+      "how": "Use existing dataclass fixtures for test setup \u2014 already used by all TestGetEntity tests."
+    },
+    {
+      "what": "Existing service fixture with mocked backends",
+      "where": "fused-memory/tests/test_memory_service.py:13-30",
+      "how": "All tests use the existing service(mock_config) fixture which pre-mocks graphiti.search, graphiti.search_nodes, etc."
+    }
+  ],
+  "_session_id": "197-92c78e05",
+  "_created_at": "2026-03-28T00:18:00.733365+00:00"
+}
