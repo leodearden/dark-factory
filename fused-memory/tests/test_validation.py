@@ -138,6 +138,10 @@ class TestValidateProjectRoot:
         assert 'error_type' in result
         assert result['error_type'] == 'ValidationError'
 
+    def test_valid_absolute_path_returns_none(self):
+        result = validate_project_root('/some/path')
+        assert result is None
+
 
 class TestRequireProjectRoot:
     """require_project_root raises ValueError for invalid paths, returns None for valid ones."""
