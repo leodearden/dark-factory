@@ -224,7 +224,13 @@ def _select_proactive_sample(all_tasks: list[dict], n: int) -> list[dict]:
     Sorted by status priority (in-progress > blocked > review > pending > done),
     then by task ID descending (proxy for recency — higher ID = more recently created).
     Returns at most n tasks; fewer if the task list is smaller than n.
+
+    Non-dict elements in all_tasks are filtered out defensively, matching the
+    isinstance(t, dict) guard pattern used by active_tasks/done_tasks derivations.
     """
+    # Filter out non-dict elements before sorting so sort_key never crashes
+    tasks = [t for t in all_tasks if isinstance(t, dict)]
+
     def sort_key(t: dict) -> tuple[int, int]:
         status = t.get('status', 'pending')
         priority = _STATUS_PRIORITY.get(status, len(_STATUS_PRIORITY))
@@ -236,5 +242,5 @@ def _select_proactive_sample(all_tasks: list[dict], n: int) -> list[dict]:
             tid_int = 0
         return (priority, -tid_int)
 
-    sorted_tasks = sorted(all_tasks, key=sort_key)
+    sorted_tasks = sorted(tasks, key=sort_key)
     return sorted_tasks[:n]
