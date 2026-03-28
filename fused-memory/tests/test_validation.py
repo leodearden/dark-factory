@@ -287,6 +287,20 @@ class TestValidateProjectId:
         assert result is not None
         assert result['error_type'] == 'ValidationError'
 
+    def test_trailing_newline_returns_error(self):
+        """Trailing newline must be rejected — not silently accepted by $ anchor bypass.
+
+        Python's re.match(r'^[a-zA-Z0-9_-]+$', 'dark_factory\\n') returns a truthy match
+        because $ matches just before a trailing newline. This test exposes that bypass;
+        re.fullmatch() is required to catch it.
+        """
+        result = validate_project_id('dark_factory\n')
+        assert result is not None, (
+            'validate_project_id accepted trailing newline — likely using .match() instead '
+            'of .fullmatch(). Switch to re.fullmatch() to fix.'
+        )
+        assert result['error_type'] == 'ValidationError'
+
 
 class TestValidatorErrorDictShape:
     """All validate_* functions return dicts with exactly 'error' and 'error_type' keys."""
