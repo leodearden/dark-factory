@@ -4993,7 +4993,7 @@
         "description": "All three non-disabled orchestrator OAuth tokens (CLAUDE_OAUTH_TOKEN_B, CLAUDE_OAUTH_TOKEN_C, CLAUDE_OAUTH_TOKEN_D) are expired or revoked as of 2026-03-27. The orchestrator cannot process any tasks until tokens are refreshed. The orchestrator has no valid accounts available.\n\nSteps:\n1. Log into each Claude Max account (max-b, max-c, max-d) via the web UI\n2. Re-authenticate / refresh the OAuth session token\n3. Extract the updated cookie/token value\n4. Update the corresponding environment variable in the .env file or system config\n5. Restart the orchestrator and verify it can invoke agents successfully\n\nmemory_hints:\n- search: \"orchestrator OAuth token expired revoked multi-account failover\"\n- search: \"Claude Max account multi-account setup config order drain priority\"\n- entities: CLAUDE_OAUTH_TOKEN_B (Graphiti edge cd0b8224), CLAUDE_OAUTH_TOKEN_C (149c64f0), CLAUDE_OAUTH_TOKEN_D (755507cb)\n- search: \"orchestrator config.yaml usage_cap accounts oauth_token_env\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
@@ -5004,7 +5004,8 @@
           "modules": [
             "orchestrator"
           ]
-        }
+        },
+        "updatedAt": "2026-03-28T15:25:36.775Z"
       },
       {
         "id": "289",
@@ -5032,7 +5033,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T15:25:36.722Z",
+      "lastModified": "2026-03-28T15:25:36.775Z",
       "taskCount": 268,
       "completedCount": 207,
       "tags": [
