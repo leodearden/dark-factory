@@ -3856,11 +3856,11 @@
         "description": "The refresh indicator JS in base.html has several robustness gaps found during review of task 182:\n\n1. **Stale timestamp on error (UX bug)** — `htmx:afterSwap` only fires on success. When polling fails (htmx:responseError/timeout/sendError), the timestamp keeps ticking (\"Updated 5m ago\") with no indication of failure. Should listen on error events too and show \"Update failed — retrying…\" text.\n\n2. **Missing NaN guard** — `parseInt(el.getAttribute('data-updated-at'), 10)` returns NaN if the attribute is empty/malformed, causing display of \"Updated NaNm ago\". Add `if (isNaN(ts)) return;` guard.\n\n3. **animationend may not fire with prefers-reduced-motion** — if the browser skips the animation, `section-refreshed` class is never removed (keeps border-radius applied, leaks listener reference). Add a setTimeout fallback (~700ms) or check matchMedia before adding the class.\n\n4. **setInterval reference not stored** — minor but store the return value for potential cleanup.\n\nmemory_hints: search for \"dashboard refresh indicator\", search for \"htmx error handling pattern\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-28T01:04:44.568Z",
+        "updatedAt": "2026-03-28T01:23:01.421Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/templates",
@@ -3915,7 +3915,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T01:23:00.061Z",
+      "lastModified": "2026-03-28T01:23:01.422Z",
       "taskCount": 211,
       "completedCount": 169,
       "tags": [
