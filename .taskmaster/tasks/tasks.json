@@ -3845,7 +3845,13 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T04:16:14.926Z"
+        "updatedAt": "2026-03-28T04:16:14.926Z",
+        "metadata": {
+          "modules": [
+            "dashboard/tests/test_recon_panel.py",
+            "dashboard/tests/test_reconciliation.py"
+          ]
+        }
       },
       {
         "id": 226,
