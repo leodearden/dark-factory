@@ -1,0 +1,80 @@
+{
+  "task_id": "251",
+  "title": "Refactor dashboard test_app.py — parameterize and strengthen assertions",
+  "files": [
+    "dashboard/tests/test_app.py"
+  ],
+  "modules": [
+    "dashboard/tests"
+  ],
+  "analysis": "test_app.py has three problems: (1) TestMorphSwap has 5 near-identical methods that each assert `hx-swap=\"morph:innerHTML\"` page-wide — this always passes trivially since ANY section having it is enough. The hx-get URL is the only differentiator. Fix: parameterize over the 5 partial URLs and use proximity-based slicing (find hx-get index, slice window, assert hx-swap within window) — the same pattern already used by TestHtmxTimeout (lines 555-588) and TestAriaLivePollingSections (lines 621-649). (2) TestIndex has 5 `test_get_root_htmx_*` methods (lines 84-102) that assert `hx-get=\"/partials/<url>\"` presence — identical to what the strengthened TestMorphSwap parameterized test will check (it finds hx-get by index, which implicitly asserts presence). These are fully redundant and should be removed. (3) The page-wide `hx-swap` assertion is separately covered by TestIdiomorphExtension and test_no_plain_innerhtml_on_polling_sections, so removing it from individual TestMorphSwap methods loses nothing. A module-level PARTIAL_URLS tuple will be introduced for the parameterization; this also positions future refactors of TestHtmxTimeout and TestAriaLivePollingSections to reuse it (out of scope here).",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Run existing test suite to establish a passing baseline: `cd dashboard && uv run pytest tests/test_app.py -v`",
+      "status": "done",
+      "commit": "d83bb4fb",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Add PARTIAL_URLS module-level tuple (the 5 partial URL paths) and write a new parameterized test `test_section_uses_morph_swap` in TestMorphSwap. Use @pytest.mark.parametrize('partial_url', PARTIAL_URLS). Inside: find `hx-get=\"{partial_url}\"` index in full HTML, slice a [-200:+200] window, assert `hx-swap=\"morph:innerHTML\"` within the window. This provides a strictly stronger assertion than the page-wide check. Run tests — 5 new parameterized cases plus the 5 old methods should all pass (10 total in TestMorphSwap plus the no_plain_innerhtml test).",
+      "status": "done",
+      "commit": "d83bb4fb"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Remove the 5 individual test methods from TestMorphSwap: test_memory_section_uses_morph, test_recon_section_uses_morph, test_orchestrators_section_uses_morph, test_performance_section_uses_morph, test_memory_graphs_section_uses_morph. Keep test_no_plain_innerhtml_on_polling_sections. Run tests — TestMorphSwap should now have 6 tests (5 parameterized + 1 no_plain_innerhtml).",
+      "status": "done",
+      "commit": "4c7cef30"
+    },
+    {
+      "id": "step-3",
+      "type": "impl",
+      "description": "Remove the 5 redundant hx-get presence tests from TestIndex: test_get_root_htmx_memory, test_get_root_htmx_recon, test_get_root_htmx_orchestrators, test_get_root_htmx_performance, test_get_root_htmx_memory_graphs. These are now fully covered by TestMorphSwap's parameterized test (which calls html.index(hx-get=...) — implicitly asserting presence — and additionally verifies proximity of hx-swap). TestIndex retains: test_get_root_returns_200, test_get_root_content_type_html, test_get_root_contains_dark_factory, test_loading_skeletons_present. Run full test suite to verify no regressions.",
+      "status": "done",
+      "commit": "a2523a06"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use a module-level PARTIAL_URLS tuple rather than defining it inside the test class",
+      "rationale": "Multiple test classes (TestMorphSwap, and potentially TestHtmxTimeout, TestAriaLivePollingSections in a future refactor) share the same set of 5 partial URLs. A module-level constant avoids duplication and makes it a single source of truth. Tuple is used over list since these are immutable test fixtures."
+    },
+    {
+      "decision": "Window size of [-200:+200] around the hx-get index for proximity-based slicing",
+      "rationale": "TestHtmxTimeout uses [-200:+500] and TestAriaLivePollingSections uses [-100:+300]. For hx-swap proximity, the attribute is typically on the same HTML element as hx-get, so a symmetric [-200:+200] window is sufficient. This matches the closest precedent while being conservative enough to avoid false positives from adjacent sections."
+    },
+    {
+      "decision": "Remove TestIndex hx-get tests entirely rather than parameterizing them",
+      "rationale": "The strengthened TestMorphSwap test implicitly asserts hx-get presence (html.index() raises ValueError if not found) and additionally verifies hx-swap proximity. Keeping a separate parameterized TestIndex test for the same hx-get strings would be pure duplication with no added coverage."
+    },
+    {
+      "decision": "Keep test_no_plain_innerhtml_on_polling_sections as-is",
+      "rationale": "This test serves a different purpose — it's a negative assertion ensuring no section uses plain innerHTML swap (which would break morphing). It's not redundant with the positive proximity assertion and doesn't benefit from parameterization."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Proximity-based HTML slicing pattern",
+      "where": "TestHtmxTimeout (lines 555-588) and TestAriaLivePollingSections (lines 621-649) in the same file",
+      "how": "Follow the same pattern: html.index('hx-get=\"...\"') → slice window → assert attribute within window. This is the established convention for section-specific HTML assertions in this test file."
+    },
+    {
+      "what": "Existing client fixture",
+      "where": "conftest.py line 136",
+      "how": "Continue using the same `client` fixture that creates a TestClient for the FastAPI app — no new fixtures needed."
+    },
+    {
+      "what": "pytest.mark.parametrize",
+      "where": "Standard pytest API, not yet used in this file but idiomatic",
+      "how": "Import pytest (already available), use @pytest.mark.parametrize decorator with the PARTIAL_URLS tuple."
+    }
+  ],
+  "_session_id": "251-e27d7ca3",
+  "_created_at": "2026-03-28T05:30:00.075796+00:00"
+}
