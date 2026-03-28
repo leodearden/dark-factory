@@ -773,8 +773,8 @@ class TestTierConfig:
             StageId.memory_consolidator,
             AsyncMock(), AsyncMock(), AsyncMock(), config,
         )
-        assert stage.episode_limit == 500
-        assert stage.memory_limit == 1000
+        assert stage.episode_limit is None
+        assert stage.memory_limit is None
 
     def test_limits_are_writable(self):
         config = ReconciliationConfig()
