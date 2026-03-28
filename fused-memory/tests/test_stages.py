@@ -1,6 +1,7 @@
 """Tests for reconciliation stage configuration (CLI-native MCP execution)."""
 
 import json
+import logging
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -552,9 +553,6 @@ class TestProjectIdValidation(BaseStageValidationTest):
     async def test_whitespace_watermark_project_id_treated_as_empty(self, mock_deps, caplog):
         """Whitespace-only watermark project_id is stripped to '' by field_validator,
         guard skips mismatch check, and emits a DEBUG log about skipping."""
-        import logging
-
-
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
 
