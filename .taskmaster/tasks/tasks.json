@@ -4455,11 +4455,11 @@
         "description": "The memory-graphs and performance partial integration tests (added in task 252) have several assertion gaps:\n\n1. **memory-graphs empty test lacks unique assertions**: The template has no conditional empty-state branch — it unconditionally renders all three canvas elements. `test_memory_graphs_empty` should assert that the serialized JSON contains empty arrays (e.g. `'\"labels\": []'` or `'\"reads\": []'`) to verify the template receives and embeds the empty payload correctly.\n\n2. **memory-graphs with-data test missing data value assertions**: Should assert that mock data labels ('search', 'add_memory', 'claude-interactive', 'recon-consolidator') appear in the rendered HTML (they're embedded via `{{ operations | tojson }}`). Without these, the test would pass even if template context variables were swapped.\n\n3. **All-zero timeseries fixture**: `_MG_TIMESERIES` uses `reads=[0]*24` and `writes=[0]*24` even for the positive with-data test case. Add non-zero entries (e.g. `reads[12]=5, writes[12]=3`) and assert they appear in the rendered script block.\n\n4. **Untested performance template branches**: The `{% if escalations.get(project_id) %}` else branch (renders 'No data') and the `{% if esc.interactive_count > 0 %}` false path are untested. Add test cases for: (a) escalations populated but `interactive_count=0`, (b) escalations empty for a project that has paths data.\n\nmemory_hints: search \"dashboard partial integration test pattern\", review test_app.py lines 349-498",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T15:25:36.471Z",
+        "updatedAt": "2026-03-28T20:39:39.612Z",
         "metadata": {
           "files": [
             "dashboard/tests/test_memory_graphs_partial.py",
@@ -5053,7 +5053,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T20:39:39.133Z",
+      "lastModified": "2026-03-28T20:39:39.612Z",
       "taskCount": 268,
       "completedCount": 236,
       "tags": [
