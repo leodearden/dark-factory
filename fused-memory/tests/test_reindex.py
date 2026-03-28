@@ -1235,3 +1235,58 @@ class TestRunReindexServiceLifecycle:
             await run_reindex()
 
         mock_service.close.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# step-7: run_reindex delegates to maintenance_service
+# ---------------------------------------------------------------------------
+
+class TestRunReindexDelegation:
+    """run_reindex() delegates service lifecycle to maintenance_service()."""
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_maintenance_service(self):
+        """run_reindex() calls maintenance_service(config_path) and uses yielded (config, service)."""
+        from contextlib import asynccontextmanager
+
+        from fused_memory.maintenance.reindex import ReindexResult, run_reindex
+
+        mock_cfg = MagicMock()
+        mock_cfg.embedder.providers.openai = None
+        mock_cfg.embedder.model = 'text-embedding-3-small'
+        mock_cfg.embedder.dimensions = 1536
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+        mock_service.durable_queue = MagicMock()
+
+        mock_result = {
+            'reindex_result': ReindexResult(nodes_updated=1),
+            'replay_count': 0,
+            'indices_dropped': [],
+        }
+
+        @asynccontextmanager
+        async def fake_maintenance_service(config_path):
+            yield mock_cfg, mock_service
+
+        with (
+            patch(
+                'fused_memory.maintenance.reindex.maintenance_service',
+                side_effect=fake_maintenance_service,
+            ),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig'),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedder') as mock_embedder_cls,
+            patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
+
+            result = await run_reindex(config_path='/tmp/config.yaml')
+
+        mock_mgr_cls.assert_called_once_with(
+            backend=mock_service.graphiti,
+            embedder=mock_embedder_cls.return_value,
+            expected_dim=1536,
+        )
+        assert result is mock_result
