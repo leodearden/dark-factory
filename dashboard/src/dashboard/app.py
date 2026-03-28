@@ -302,16 +302,23 @@ async def partials_recon(request: Request):
     pool: DbPool = request.app.state.db
     db = await pool.get(config.reconciliation_db)
 
-    buffer_stats, burst_state, watermarks_list, verdict, runs, last_attempted_map = (
-        await asyncio.gather(
-            get_buffer_stats(db),
-            get_burst_state(db),
-            get_watermarks(db),
-            get_latest_verdict(db),
-            get_recent_runs(db),
-            get_last_attempted_run(db),
-        )
+    bs_r, burst_r, wm_r, verdict_r, runs_r, la_r = await asyncio.gather(
+        get_buffer_stats(db),
+        get_burst_state(db),
+        get_watermarks(db),
+        get_latest_verdict(db),
+        get_recent_runs(db),
+        get_last_attempted_run(db),
+        return_exceptions=True,
     )
+    buffer_stats = _safe_gather_result(
+        bs_r, {'buffered_count': 0, 'oldest_event_age_seconds': None}, 'buffer_stats',
+    )
+    burst_state = _safe_gather_result(burst_r, [], 'burst_state')
+    watermarks_list = _safe_gather_result(wm_r, [], 'watermarks')
+    verdict = _safe_gather_result(verdict_r, None, 'latest_verdict')
+    runs = _safe_gather_result(runs_r, [], 'recent_runs')
+    last_attempted_map = _safe_gather_result(la_r, {}, 'last_attempted_run')
 
     # Build per-project view: merge watermarks + last attempted run
     projects: dict[str, dict] = {}
