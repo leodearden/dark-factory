@@ -1,0 +1,139 @@
+{
+  "task_id": "185",
+  "title": "Add HTMX polling jitter to prevent thundering herd",
+  "files": [
+    "dashboard/src/dashboard/templates/index.html",
+    "dashboard/src/dashboard/templates/base.html",
+    "dashboard/tests/test_app.py"
+  ],
+  "modules": [
+    "dashboard/src/dashboard/templates",
+    "dashboard/tests"
+  ],
+  "analysis": "All 5 dashboard sections in index.html poll at fixed intervals (10s, 10s, 15s, 30s, 60s) via hx-trigger='load, every Xs'. Multiple browser tabs or instances will synchronize their polls, creating a thundering herd effect on the backend. HTMX has no native jitter support, so the fix uses a JS-based approach: replace fixed 'every Xs' triggers with a custom 'poll' event, add 'data-poll-base' attributes declaring each section's base interval, and add a small script in base.html that listens to htmx:afterSettle and schedules the next poll with \u00b120% random jitter via setTimeout + htmx.trigger(). This is event-driven (not setInterval), so jitter accumulates naturally across cycles, preventing re-synchronization. Existing tests (TestMorphSwap, TestHtmxTimeout, TestAriaLivePollingsections, TestIndex) don't reference 'every Xs' patterns and will continue to pass unchanged. Post-review fix: the afterSettle-only approach has a silent failure mode \u2014 HTMX error events (responseError, timeout, sendError) abort before the settle phase, so afterSettle never fires and polling permanently stops. Error recovery listeners must re-schedule the poll timer on these events.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write TestPollingJitter class in test_app.py: assert each of the 5 sections (orchestrators, performance, memory, memory-graphs, recon) has a data-poll-base attribute with the correct interval (10, 30, 10, 60, 15), and hx-trigger contains 'poll' instead of 'every'",
+      "status": "done",
+      "commit": "c0252ab"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Update index.html: change all 5 sections from hx-trigger='load, every Xs' to hx-trigger='load, poll' and add data-poll-base='X' attribute to each section element",
+      "status": "done",
+      "commit": "88dd9b1"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write TestPollingJitterScript class in test_app.py: assert the rendered HTML contains the jitter script with key markers \u2014 htmx:afterSettle listener, data-poll-base reference, htmx.trigger call, setTimeout usage, and Math.random for randomization",
+      "status": "done",
+      "commit": "5fdefc9"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Add jitter polling script to base.html (alongside existing error handler): IIFE that listens to htmx:afterSettle, reads data-poll-base from the settled element, computes a jittered delay (base \u00b1 20%), and uses setTimeout + htmx.trigger(el, 'poll') to schedule the next fetch",
+      "status": "done",
+      "commit": "a9d5f70"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write test_no_fixed_polling_intervals in TestPollingJitter: assert the rendered index page HTML contains zero occurrences of 'every ' followed by digits and 's' in any hx-trigger attribute \u2014 anti-regression guard against reintroducing fixed polling",
+      "status": "done",
+      "commit": "6b9aaa3"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Verify all tests pass (step-5 test should already pass given step-2 implementation). Run full dashboard test suite to confirm no regressions in existing TestMorphSwap, TestHtmxTimeout, TestAriaLivePollingsections, or TestIndex tests",
+      "status": "done",
+      "commit": "5eaac9f"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write TestPollingErrorRecovery class in test_app.py with 4 tests: (1) test_error_recovery_finds_polling_element \u2014 assert HTML contains closest('[data-poll-base]') selector, proving recovery code walks up from error target to locate the polling element; (2) test_response_error_has_recovery_listener \u2014 assert 'htmx:responseError' appears at least twice in HTML (once in error display handler, once in poll recovery); (3) test_timeout_has_recovery_listener \u2014 assert 'htmx:timeout' appears at least twice; (4) test_send_error_has_recovery_listener \u2014 assert 'htmx:sendError' appears at least twice. These tests will fail against the current base.html which only has one occurrence of each error event (in the display handler) and no closest() call.",
+      "status": "done",
+      "commit": "2705d2c"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Update the jitter IIFE in base.html to add error recovery: extract the scheduling logic into a shared scheduleNext(el) function (reads dataset.pollBase, computes jittered delay, calls setTimeout + htmx.trigger). The existing afterSettle handler calls scheduleNext(evt.detail.elt). Add new listeners for htmx:responseError, htmx:timeout, and htmx:sendError that find the polling element via evt.detail.elt or evt.detail.target.closest('[data-poll-base]') and call scheduleNext(el) to re-schedule. This ensures polling resumes after any error, using the same jitter logic as normal operation.",
+      "status": "done",
+      "commit": "c55ed5e"
+    },
+    {
+      "id": "step-9",
+      "type": "impl",
+      "description": "Run full dashboard test suite to confirm all new TestPollingErrorRecovery tests pass and no regressions in existing tests (TestPollingJitter, TestPollingJitterScript, TestHtmxErrorHandling, TestMorphSwap, TestHtmxTimeout, TestAriaLivePollingsections, TestIndex).",
+      "status": "done",
+      "commit": "c55ed5e"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use event-driven polling (htmx:afterSettle \u2192 setTimeout \u2192 htmx.trigger) instead of setInterval with jitter",
+      "rationale": "Event-driven approach naturally prevents timer overlap \u2014 the next poll is only scheduled after the current response settles. setInterval would fire regardless of whether the previous request completed, and could pile up requests during slow responses."
+    },
+    {
+      "decision": "Use \u00b120% jitter ratio (JITTER_RATIO = 0.2)",
+      "rationale": "20% provides enough randomization to desynchronize multiple tabs (e.g., a 10s base yields 8-12s actual intervals) without making the polling feel unpredictable to users. This is a standard jitter ratio used in distributed systems."
+    },
+    {
+      "decision": "Use data-poll-base custom attribute instead of embedding intervals in JS",
+      "rationale": "Declarative approach keeps interval configuration in the template alongside other HTMX attributes. Adding a new polling section only requires HTML attributes, no JS changes. Also easily testable via HTML assertions."
+    },
+    {
+      "decision": "Place jitter script in base.html, not index.html",
+      "rationale": "Follows existing pattern \u2014 the HTMX error handler script is already in base.html. The jitter script is generic and would apply to any page with data-poll-base sections. Keeps index.html clean (template structure only)."
+    },
+    {
+      "decision": "Use custom 'poll' event in hx-trigger instead of re-implementing hx-trigger programmatically",
+      "rationale": "hx-trigger='load, poll' is clean HTMX \u2014 'load' handles initial fetch, 'poll' is triggered by our JS. No need to manipulate HTMX internals or use hx-trigger attributes dynamically."
+    },
+    {
+      "decision": "Extract scheduleNext() as shared function for afterSettle and error recovery paths",
+      "rationale": "DRY \u2014 both the happy path (afterSettle) and error recovery need the same jitter+setTimeout+trigger logic. A shared function avoids duplicating the JITTER_RATIO calculation and ensures both paths use identical scheduling behavior."
+    },
+    {
+      "decision": "Use same jitter delay (not back-off) for error recovery scheduling",
+      "rationale": "The error display handler already shows a 'retrying...' message to the user. Using the same base interval with jitter keeps the retry timing consistent and predictable. Exponential back-off would add complexity without benefit here \u2014 transient errors self-resolve at the normal poll rate, and persistent outages are surfaced by the error display."
+    },
+    {
+      "decision": "Use closest('[data-poll-base]') to find polling element from error events",
+      "rationale": "HTMX error event detail provides elt or target, but these may be child elements inside the polling section. closest() walks up the DOM to find the nearest ancestor with data-poll-base, ensuring recovery works regardless of which element HTMX associates with the error."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Existing client fixture in conftest.py",
+      "where": "dashboard/tests/conftest.py",
+      "how": "All new tests use the client fixture to GET '/' and inspect rendered HTML, same pattern as TestMorphSwap, TestHtmxTimeout, etc."
+    },
+    {
+      "what": "Section-locating test pattern from TestHtmxTimeout",
+      "where": "dashboard/tests/test_app.py lines 366-385",
+      "how": "Use html.index('hx-get=\"/partials/...\"') to locate a section, then assert on attributes within a slice \u2014 same technique for checking data-poll-base values per section."
+    },
+    {
+      "what": "IIFE pattern from existing error handler script",
+      "where": "dashboard/src/dashboard/templates/base.html lines 26-37",
+      "how": "Wrap jitter script in an IIFE to avoid global scope pollution, add event listener to document.body, same pattern as error handler."
+    },
+    {
+      "what": "Existing error event listener pattern from error display handler",
+      "where": "dashboard/src/dashboard/templates/base.html lines 34-36",
+      "how": "The error display handler already listens to htmx:responseError, htmx:timeout, htmx:sendError on document.body. The recovery listeners follow the same pattern but dispatch to scheduleNext() instead of showError()."
+    }
+  ],
+  "_session_id": "185-2badeb59",
+  "_created_at": "2026-03-28T04:09:26.836612+00:00",
+  "_schema_version": 1
+}
