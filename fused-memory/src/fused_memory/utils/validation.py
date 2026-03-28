@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import re
 
-_RUN_ID_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
+_RUN_ID_PATTERN = re.compile(r'[a-zA-Z0-9_-]+')
 
 
 def validate_project_root(project_root: str) -> dict[str, str] | None:
@@ -48,7 +48,7 @@ def validate_run_id(run_id: str) -> dict[str, str] | None:
             'error': 'run_id is required and must be non-empty',
             'error_type': 'ValidationError',
         }
-    if not _RUN_ID_PATTERN.match(run_id):
+    if not _RUN_ID_PATTERN.fullmatch(run_id):
         return {
             'error': (
                 f'run_id contains invalid characters: {run_id!r}. '
