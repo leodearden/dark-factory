@@ -30,6 +30,7 @@ from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsoli
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
+    _select_proactive_sample,
 )
 
 _MOCK_TYPES = (AsyncMock, MagicMock)
@@ -639,6 +640,219 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert not isinstance(stage.assemble_payload, _MOCK_TYPES)
         # (c) assemble_payload is exactly the original method reference
         assert stage.assemble_payload == original_assemble_payload
+
+
+class TestProactiveSampling:
+    """Tests for _select_proactive_sample helper and proactive sample payload section."""
+
+    # --- Fixtures ---
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='test_project')
+
+    def _make_task(self, tid: int, status: str) -> dict:
+        return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': []}
+
+    # --- Step 1: payload contains proactive sample section ---
+
+    @pytest.mark.asyncio
+    async def test_proactive_sample_section_present_in_payload(self, mock_deps, watermark):
+        """assemble_payload with active tasks and 0 flagged items produces payload
+        containing '### Proactive Task Sample' section header."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'in-progress'),
+                self._make_task(2, 'pending'),
+                self._make_task(3, 'done'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Proactive Task Sample' in payload
+
+    # --- Step 2: in-progress and blocked tasks appear first ---
+
+    def test_proactive_sample_prioritizes_in_progress_and_blocked(self):
+        """Given tasks with mixed statuses, _select_proactive_sample returns
+        in-progress and blocked tasks before review, pending, and done tasks."""
+        tasks = [
+            self._make_task(1, 'done'),
+            self._make_task(2, 'pending'),
+            self._make_task(3, 'review'),
+            self._make_task(4, 'blocked'),
+            self._make_task(5, 'in-progress'),
+        ]
+        result = _select_proactive_sample(tasks, 5)
+        statuses = [t['status'] for t in result]
+        # in-progress and blocked must come before review, pending, done
+        high_priority = {'in-progress', 'blocked'}
+        low_priority = {'review', 'pending', 'done'}
+        last_high = max(
+            (i for i, t in enumerate(result) if t['status'] in high_priority),
+            default=-1,
+        )
+        first_low = min(
+            (i for i, t in enumerate(result) if t['status'] in low_priority),
+            default=len(result),
+        )
+        assert last_high < first_low, (
+            f'High-priority tasks should appear before low-priority tasks. Got: {statuses}'
+        )
+
+    # --- Step 3: sample capped at MIN_TASK_SAMPLE ---
+
+    def test_proactive_sample_capped_at_min_task_sample(self):
+        """Given more than 5 eligible tasks, _select_proactive_sample returns exactly 5."""
+        tasks = [self._make_task(i, 'pending') for i in range(1, 12)]
+        result = _select_proactive_sample(tasks, 5)
+        assert len(result) == 5
+
+    # --- Step 4: all tasks returned when fewer than floor ---
+
+    def test_proactive_sample_includes_all_when_fewer_than_floor(self):
+        """Given fewer than 5 total tasks, _select_proactive_sample returns all of them."""
+        tasks = [
+            self._make_task(1, 'in-progress'),
+            self._make_task(2, 'pending'),
+            self._make_task(3, 'done'),
+        ]
+        result = _select_proactive_sample(tasks, 5)
+        assert len(result) == 3
+
+    # --- Step 6: remediation mode skips proactive sample ---
+
+    @pytest.mark.asyncio
+    async def test_proactive_sample_skipped_in_remediation_mode(self, mock_deps, watermark):
+        """When stage.remediation_mode=True, payload does NOT contain '### Proactive Task Sample'."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        stage.remediation_mode = True
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'in-progress'),
+                self._make_task(2, 'pending'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Proactive Task Sample' not in payload
+
+    # --- Step 8: system prompt includes proactive spot-check guideline ---
+
+    def test_system_prompt_includes_proactive_spot_check_guideline(self):
+        """STAGE2_SYSTEM_PROMPT contains instruction about reviewing the proactive task sample."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        # The prompt should mention proactive sample review
+        assert 'Proactive Task Sample' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must contain a guideline about reviewing the Proactive Task Sample"
+        )
+
+    # --- Step 12: ID descending as recency proxy ---
+
+    def test_select_proactive_sample_uses_id_descending_as_recency_proxy(self):
+        """Given tasks with same status but different IDs, higher-ID tasks appear first."""
+        tasks = [
+            self._make_task(10, 'pending'),
+            self._make_task(3, 'pending'),
+            self._make_task(7, 'pending'),
+            self._make_task(1, 'pending'),
+            self._make_task(5, 'pending'),
+        ]
+        result = _select_proactive_sample(tasks, 5)
+        ids = [t['id'] for t in result]
+        assert ids == sorted(ids, reverse=True), (
+            f'Tasks with same status should be ordered by ID descending. Got: {ids}'
+        )
+
+    # --- Step 13: empty task tree handled gracefully ---
+
+    @pytest.mark.asyncio
+    async def test_proactive_sample_empty_task_tree(self, mock_deps, watermark):
+        """When taskmaster returns 0 tasks, proactive sample section shows 'No tasks.'."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Proactive Task Sample' in payload
+        # Section should contain 'No tasks.' for empty list
+        proactive_idx = payload.index('### Proactive Task Sample')
+        section_text = payload[proactive_idx:proactive_idx + 200]
+        assert 'No tasks.' in section_text, (
+            f'Empty task tree should show "No tasks." in proactive sample. Got: {section_text!r}'
+        )
+
+    # --- Step 10: 'Your Task' section includes proactive step ---
+
+    @pytest.mark.asyncio
+    async def test_payload_your_task_includes_proactive_step(self, mock_deps, watermark):
+        """The 'Your Task' section in the payload includes a proactive spot-check instruction."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'in-progress'),
+                self._make_task(2, 'blocked'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # The 'Your Task' section should instruct the agent to review the proactive sample
+        assert 'Proactive Task Sample' in payload
+        # Specifically in the Your Task instruction steps (not just the section header)
+        your_task_idx = payload.index('## Your Task')
+        proactive_step_count = payload[your_task_idx:].count('Proactive Task Sample')
+        assert proactive_step_count >= 1, (
+            "The 'Your Task' instruction section should reference the Proactive Task Sample"
+        )
+
+
+    # --- Step 14: non-dict elements filtered without error ---
+
+    def test_select_proactive_sample_filters_non_dict_elements(self):
+        """_select_proactive_sample with mixed non-dict elements returns only valid dict tasks
+        without raising AttributeError or TypeError."""
+        valid_task_1 = self._make_task(5, 'in-progress')
+        valid_task_2 = self._make_task(3, 'pending')
+        mixed_input = [
+            valid_task_1,
+            'a plain string',
+            42,
+            None,
+            ['nested', 'list'],
+            valid_task_2,
+        ]
+
+        # Should not raise, and should return only the dict tasks
+        result = _select_proactive_sample(mixed_input, 10)
+
+        result_ids = {t['id'] for t in result}
+        assert result_ids == {5, 3}, (
+            f'Only dict tasks should appear in result. Got ids: {result_ids}'
+        )
+        assert len(result) == 2
 
 
 class TestRunIdValidation(BaseStageValidationTest):

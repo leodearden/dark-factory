@@ -29,6 +29,9 @@ class TaskKnowledgeSync(BaseStage):
     # Remediation support — set by harness for second pass
     remediation_mode: bool = False
 
+    # Minimum number of tasks to proactively spot-check each run
+    MIN_TASK_SAMPLE: int = 5
+
     def get_system_prompt(self) -> str:
         return STAGE2_SYSTEM_PROMPT
 
@@ -71,6 +74,14 @@ class TaskKnowledgeSync(BaseStage):
                 'from Stage 1. Do not perform general task-knowledge sync.\n\n'
             )
 
+        proactive_sample_section = ''
+        if not self.remediation_mode:
+            sample = _select_proactive_sample(all_tasks, self.MIN_TASK_SAMPLE)
+            proactive_sample_section = (
+                f'\n### Proactive Task Sample ({len(sample)} tasks)\n'
+                f'{_format_tasks(sample)}\n'
+            )
+
         return f"""## Stage 2: Task-Knowledge Sync
 ## Project: {self.project_id}
 
@@ -84,7 +95,7 @@ class TaskKnowledgeSync(BaseStage):
 {_format_tasks(active_tasks[:50])}
 
 ### Recently Completed Tasks
-{_format_tasks(done_tasks[:30])}
+{_format_tasks(done_tasks[:30])}{proactive_sample_section}
 
 ## Your Task
 Reconcile task state against memory:
@@ -95,9 +106,12 @@ delete tasks. Update dependent tasks.
 3. For AI-generated tasks: cross-reference against knowledge graph for factual consistency.
 4. Attach memory_hints to tasks that would benefit from knowledge context at execution time. \
 Use entity references + semantic queries, NOT inline content.
-5. Check if any knowledge implies new tasks should be created or existing tasks unblocked.
-6. Hints on completed tasks are static — don't update them.
-7. When you have completed your work, produce your final structured report as your response.
+5. Proactively review the **Proactive Task Sample** regardless of Stage 1 findings: check \
+in-progress tasks for completion knowledge to capture, blocked tasks for unblock conditions \
+that may now be met, and done tasks for missing knowledge capture.
+6. Check if any knowledge implies new tasks should be created or existing tasks unblocked.
+7. Hints on completed tasks are static — don't update them.
+8. When you have completed your work, produce your final structured report as your response.
 
 {_STAGE2_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
 Use project_root="{self.project_root}" for all task operations.
@@ -192,3 +206,41 @@ def _format_tasks(tasks: list[dict]) -> str:
         deps = t.get('dependencies', [])
         lines.append(f'- [{tid}] ({status}) {title} deps={deps}')
     return '\n'.join(lines)
+
+
+# Status priority for proactive sampling: lower value = higher priority
+_STATUS_PRIORITY: dict[str, int] = {
+    'in-progress': 0,
+    'blocked': 1,
+    'review': 2,
+    'pending': 3,
+    'done': 4,
+}
+
+
+def _select_proactive_sample(all_tasks: list[dict], n: int) -> list[dict]:
+    """Select the top-N tasks for proactive spot-checking.
+
+    Sorted by status priority (in-progress > blocked > review > pending > done),
+    then by task ID descending (proxy for recency — higher ID = more recently created).
+    Returns at most n tasks; fewer if the task list is smaller than n.
+
+    Non-dict elements in all_tasks are filtered out defensively, matching the
+    isinstance(t, dict) guard pattern used by active_tasks/done_tasks derivations.
+    """
+    # Filter out non-dict elements before sorting so sort_key never crashes
+    tasks = [t for t in all_tasks if isinstance(t, dict)]
+
+    def sort_key(t: dict) -> tuple[int, int]:
+        status = t.get('status', 'pending')
+        priority = _STATUS_PRIORITY.get(status, len(_STATUS_PRIORITY))
+        # Negate ID so that higher IDs sort first within the same priority
+        tid = t.get('id', 0)
+        try:
+            tid_int = int(tid)
+        except (TypeError, ValueError):
+            tid_int = 0
+        return (priority, -tid_int)
+
+    sorted_tasks = sorted(tasks, key=sort_key)
+    return sorted_tasks[:n]
