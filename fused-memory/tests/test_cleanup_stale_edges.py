@@ -518,3 +518,47 @@ class TestRunCleanupEdgeCases:
 
         mock_svc_cls.assert_not_called()  # MemoryService never instantiated
         mock_svc_cls.return_value.close.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# step-3: run_cleanup delegates to maintenance_service
+# ---------------------------------------------------------------------------
+
+class TestRunCleanupDelegation:
+    """run_cleanup() delegates service lifecycle to maintenance_service()."""
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_maintenance_service(self):
+        """run_cleanup() calls maintenance_service(config_path) and uses yielded service.graphiti."""
+        from contextlib import asynccontextmanager
+
+        from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
+
+        mock_cfg = MagicMock()
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+        mock_result = CleanupResult(edges_found=1, edges_deleted=1)
+
+        @asynccontextmanager
+        async def fake_maintenance_service(config_path):
+            yield mock_cfg, mock_service
+
+        with (
+            patch(
+                'fused_memory.maintenance.cleanup_stale_edges.maintenance_service',
+                side_effect=fake_maintenance_service,
+            ),
+            patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.cleanup = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
+
+            result = await run_cleanup(
+                start='2026-03-22T17:50:00',
+                end='2026-03-22T18:15:00',
+                config_path='/tmp/config.yaml',
+            )
+
+        mock_mgr_cls.assert_called_once_with(backend=mock_service.graphiti)
+        assert result is mock_result
