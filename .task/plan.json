@@ -1,0 +1,86 @@
+{
+  "task_id": "243",
+  "title": "Fix remaining UTC consolidation gaps and None-handling inconsistency in reconciliation.py",
+  "files": [
+    "dashboard/src/dashboard/data/reconciliation.py",
+    "dashboard/tests/test_reconciliation.py"
+  ],
+  "modules": [
+    "dashboard/src/dashboard/data",
+    "dashboard/tests"
+  ],
+  "analysis": "The reconciliation.py data layer has two issues left over from the task 224 UTC consolidation:\n\n1. get_recent_runs (lines 84-85) still uses raw datetime.fromisoformat() instead of parse_utc(). If the database contains mixed naive/aware timestamps (e.g. naive started_at, aware completed_at), the delta arithmetic (completed - started) raises TypeError ('can't subtract offset-naive and offset-aware datetimes'). This TypeError is NOT caught by with_db (which only catches sqlite3.OperationalError), so it propagates to the caller. parse_utc normalizes all timestamps to UTC-aware, preventing this.\n\n2. partition_burst_state (lines 46-48) has an explicit None guard ('if last_write_at is None: idle.append(agent); continue') that short-circuits before reaching the try/except block. The other two call sites handle None differently: get_buffer_stats uses 'if oldest_ts is not None:' before calling parse_utc, and get_burst_state lets parse_utc(None) raise TypeError caught by except (ValueError, TypeError). Removing partition_burst_state's guard makes the pattern consistent: parse_utc(None) raises TypeError, caught by the existing except block, and the agent falls through to idle.append(agent) at line 59.\n\nBoth fixes are small and maintain backward compatibility. parse_utc (dashboard/data/utils.py) already handles None (raises TypeError) and naive timestamps (attaches UTC). The import on line 17 of reconciliation.py already exists. No new dependencies needed.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing test test_duration_with_mixed_naive_aware_timestamps in TestGetRecentRuns. Create a custom SQLite DB (via tmp_path + RECONCILIATION_SCHEMA pattern from TestGetLastAttemptedRun) with one completed run whose started_at is naive ('2026-03-28T10:00:00') and completed_at is aware ('2026-03-28T10:05:00+00:00'). Call get_recent_runs and assert the run has duration_seconds == pytest.approx(300.0, abs=1.0). This FAILS because datetime.fromisoformat produces one naive and one aware datetime; their subtraction raises TypeError which propagates through with_db.",
+      "status": "done",
+      "commit": "9a04f0ae"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "In get_recent_runs (reconciliation.py lines 84-85), replace 'started = datetime.fromisoformat(row[\"started_at\"])' with 'started = parse_utc(row[\"started_at\"])' and 'completed = datetime.fromisoformat(row[\"completed_at\"])' with 'completed = parse_utc(row[\"completed_at\"])'. parse_utc is already imported on line 17. This normalizes both timestamps to UTC-aware before subtraction, fixing the mixed-awareness TypeError.",
+      "status": "done",
+      "commit": "f8a671b3"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing test test_none_last_write_at_handled_consistently in a new TestPartitionBurstState class. Pass partition_burst_state a list with one agent dict: {'agent_id': 'a1', 'state': 'idle', 'last_write_at': None}. Assert: (1) the agent is in the idle list, and (2) a DEBUG-level log record containing 'bad last_write_at' is emitted (using caplog at DEBUG level for logger 'dashboard.data.reconciliation'). The idle assertion passes, but the debug-log assertion FAILS because the current explicit None guard (lines 46-48) short-circuits before the try/except block, so no debug message is logged.",
+      "status": "done",
+      "commit": "39b887c0"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "In partition_burst_state (reconciliation.py), remove the three-line explicit None guard: 'if last_write_at is None: / idle.append(agent) / continue' (lines 46-48). After removal, when last_write_at is None, execution reaches parse_utc(None) which raises TypeError, caught by except (ValueError, TypeError), which logs the debug message, then falls through to idle.append(agent) at the end of the loop body. Behavior preserved, pattern now consistent with get_burst_state.",
+      "status": "done",
+      "commit": "3a20bba0"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use mixed naive/aware timestamp scenario to prove the fromisoformat bug",
+      "rationale": "All-naive timestamps wouldn't fail (naive - naive works fine), and all-aware timestamps also work. Only the mixed case triggers TypeError, which is the exact real-world scenario parse_utc prevents by normalizing everything to UTC-aware. This directly demonstrates the defect documented in the task."
+    },
+    {
+      "decision": "Test debug-log emission as the observable behavioral difference for the None-guard removal",
+      "rationale": "The functional outcome (agent goes to idle) is identical before and after removing the guard. The debug log is the only observable change: after the fix, parse_utc(None) raises TypeError caught by the except block, which calls logger.debug(). This is correct behavior\u2014flagging data quality issues via debug logging, consistent with how get_burst_state handles parse failures."
+    },
+    {
+      "decision": "Remove None guard entirely (option a from task spec) rather than keeping it",
+      "rationale": "Consistent with get_burst_state which lets parse_utc handle None naturally via the except block. The task spec explicitly prefers option (a). The except (ValueError, TypeError) block already catches TypeError from parse_utc(None) and logs appropriately. Option (b) was the prior state and is what we're removing."
+    },
+    {
+      "decision": "No changes to parse_utc or utils.py",
+      "rationale": "parse_utc already correctly handles None (raises TypeError) and naive timestamps (attaches UTC). The utility is working as designed; only the call sites in reconciliation.py need updating."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "parse_utc utility",
+      "where": "dashboard/src/dashboard/data/utils.py (line 8)",
+      "how": "Already imported in reconciliation.py line 17. Replace fromisoformat calls with parse_utc() \u2014 no new imports needed."
+    },
+    {
+      "what": "RECONCILIATION_SCHEMA fixture constant",
+      "where": "dashboard/tests/conftest.py (line 12)",
+      "how": "Import in the new test method to create a custom SQLite DB with specific timestamp formats, following the same pattern used in TestGetLastAttemptedRun.test_failed_most_recent."
+    },
+    {
+      "what": "Custom tmp_path DB creation pattern",
+      "where": "dashboard/tests/test_reconciliation.py (e.g., lines 178-201)",
+      "how": "Follow the established pattern: create DB file in tmp_path, connect with sqlite3, executescript schema, insert custom data, close, then open with aiosqlite and set row_factory."
+    },
+    {
+      "what": "Existing except (ValueError, TypeError) block in partition_burst_state",
+      "where": "dashboard/src/dashboard/data/reconciliation.py (lines 54-58)",
+      "how": "This block already handles TypeError from parse_utc. After removing the None guard, it naturally catches the TypeError raised by parse_utc(None), logs it, and falls through to idle.append(agent)."
+    }
+  ],
+  "_session_id": "243-da8410e3",
+  "_created_at": "2026-03-28T05:09:00.607372+00:00"
+}
