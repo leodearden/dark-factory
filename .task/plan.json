@@ -43,8 +43,8 @@
       "id": "step-4",
       "type": "impl",
       "description": "Run the full TestProjectIdValidation test class (`pytest fused-memory/tests/test_stages.py::TestProjectIdValidation -v`) to verify all meta-tests pass and no existing tests regressed.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "59934a36"
     }
   ],
   "design_decisions": [
