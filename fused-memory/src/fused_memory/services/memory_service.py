@@ -860,7 +860,7 @@ class MemoryService:
                 'uuid': getattr(n, 'uuid', None),
                 'name': getattr(n, 'name', None),
                 'summary': getattr(n, 'summary', None),
-                'labels': getattr(n, 'labels', []),
+                'labels': getattr(n, 'labels', None) or [],
             })
 
         edge_data = []
