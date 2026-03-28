@@ -51,6 +51,13 @@ class TestConfigEnvOverrides:
         # Non-overridden fields keep defaults (strict equality, not just length)
         assert cfg.fused_memory_urls == list(DEFAULT_FUSED_MEMORY_URLS)
 
+    def test_fused_memory_urls_comma_separated(self, monkeypatch):
+        from dashboard.config import DashboardConfig
+
+        monkeypatch.setenv('DASHBOARD_FUSED_MEMORY_URLS', 'http://a:1, http://b:2 ')
+        cfg = DashboardConfig.from_env()
+        assert cfg.fused_memory_urls == ['http://a:1', 'http://b:2']
+
     def test_env_derived_paths_update(self, monkeypatch):
         from dashboard.config import DashboardConfig
 
