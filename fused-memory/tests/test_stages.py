@@ -734,6 +734,26 @@ class TestProactiveSampling:
         result = _select_proactive_sample(tasks, 5)
         assert len(result) == 3
 
+    # --- Step 6: remediation mode skips proactive sample ---
+
+    @pytest.mark.asyncio
+    async def test_proactive_sample_skipped_in_remediation_mode(self, mock_deps, watermark):
+        """When stage.remediation_mode=True, payload does NOT contain '### Proactive Task Sample'."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        stage.remediation_mode = True
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'in-progress'),
+                self._make_task(2, 'pending'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Proactive Task Sample' not in payload
+
 
 class TestRunIdValidation(BaseStageValidationTest):
     """BaseStage.run() validates run_id before prompt interpolation."""
