@@ -132,6 +132,7 @@ class TestSessionAwareHandler:
         with pytest.raises(httpx.ConnectError):
             handler(self._init_request(9000))
         assert 9000 in handler.ports_seen
+        assert len(handler.calls) == 0
 
     def test_fail_port_does_not_affect_other_ports(self):
         """Requests to ports other than fail_port succeed normally."""
