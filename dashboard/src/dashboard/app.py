@@ -264,11 +264,17 @@ async def memory_graphs_partial(request: Request):
     config = request.app.state.config
     pool: DbPool = request.app.state.db
     db = await pool.get(config.write_journal_db)
-    timeseries, operations, agents = await asyncio.gather(
-        get_memory_timeseries(db),
-        get_operations_breakdown(db),
-        get_agent_breakdown(db),
-    )
+    try:
+        timeseries, operations, agents = await asyncio.gather(
+            get_memory_timeseries(db),
+            get_operations_breakdown(db),
+            get_agent_breakdown(db),
+        )
+    except Exception:
+        logger.warning('Error fetching memory graphs data', exc_info=True)
+        timeseries = {'labels': [], 'reads': [], 'writes': []}
+        operations = {'labels': [], 'values': []}
+        agents = {'labels': [], 'values': []}
     return templates.TemplateResponse(
         request, 'partials/memory_graphs.html',
         context={
