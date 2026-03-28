@@ -1,5 +1,6 @@
 """Tests for the memory service — unit tests with mocked backends."""
 
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -853,6 +854,32 @@ class TestGetEntity:
             await service.get_entity('entity', project_id='test')
 
         assert mock_logger.warning.call_count == 2
+
+    # ------------------------------------------------------------------
+    # CancelledError propagation
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates(self, service):
+        """asyncio.CancelledError raised by search_nodes must propagate unchanged.
+
+        asyncio.gather(return_exceptions=True) captures ALL BaseException subclasses
+        as values in the results list — including CancelledError, which is a BaseException
+        but NOT an Exception.  The detection guard must use isinstance(r, BaseException)
+        so CancelledError is recognised as a captured error value and re-raised.
+
+        Without the fix (guard uses Exception instead of BaseException) the CancelledError
+        value slips past the guard, code falls through to cast(list, results[0]), and
+        'for n in nodes:' raises TypeError — silently converting cancellation into a
+        confusing TypeError.
+        """
+        service.graphiti.search_nodes = AsyncMock(
+            side_effect=asyncio.CancelledError()
+        )
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        with pytest.raises(asyncio.CancelledError):
+            await service.get_entity('entity', project_id='test')
 
     # ------------------------------------------------------------------
     # temporal serialization in edge_data
