@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
+from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -52,9 +53,9 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
             return [self._expand_env_vars(item) for item in value]
         return value
 
-    def get_field_value(self, field: Any, field_name: str) -> Any:
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
         # Resolution handled in __call__; satisfy abstract interface with no-op.
-        return None
+        return (None, field_name, False)
 
     def __call__(self) -> dict[str, Any]:
         if not self.config_path.exists():
