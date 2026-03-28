@@ -2,7 +2,12 @@
 
 import pytest
 
-from fused_memory.utils.validation import validate_run_id
+from fused_memory.utils.validation import (
+    require_project_root,
+    validate_project_id,
+    validate_project_root,
+    validate_run_id,
+)
 
 
 class TestValidateRunId:
@@ -112,3 +117,59 @@ class TestValidateRunId:
             'instead of .fullmatch(). Switch to re.fullmatch() to fix.'
         )
         assert result['error_type'] == 'ValidationError'
+
+
+class TestValidateProjectRoot:
+    """validate_project_root returns None for valid absolute paths, error dict otherwise."""
+
+    def test_rejects_whitespace_only(self):
+        result = validate_project_root('   ')
+        assert result is not None
+        assert 'error' in result
+        assert 'error_type' in result
+        assert result['error_type'] == 'ValidationError'
+
+    def test_rejects_tab_only(self):
+        result = validate_project_root('\t')
+        assert result is not None
+        assert 'error' in result
+        assert 'error_type' in result
+        assert result['error_type'] == 'ValidationError'
+
+
+class TestRequireProjectRoot:
+    """require_project_root raises ValueError for invalid paths, returns None for valid ones."""
+
+    def test_valid_absolute_path_raises_nothing(self):
+        require_project_root('/some/path')  # must not raise
+
+    def test_invalid_path_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            require_project_root('relative/path')
+
+    def test_error_message_matches_validate_error_field(self):
+        invalid = 'relative/path'
+        err_dict = validate_project_root(invalid)
+        assert err_dict is not None
+        with pytest.raises(ValueError) as exc_info:
+            require_project_root(invalid)
+        assert str(exc_info.value) == err_dict['error']
+
+
+class TestValidatorErrorDictShape:
+    """All validate_* functions return dicts with exactly 'error' and 'error_type' keys."""
+
+    def test_validate_project_root_error_has_required_keys(self):
+        result = validate_project_root('relative/path')
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
+
+    def test_validate_project_id_error_has_required_keys(self):
+        result = validate_project_id('')
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
+
+    def test_validate_run_id_error_has_required_keys(self):
+        result = validate_run_id('')
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
