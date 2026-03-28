@@ -357,12 +357,16 @@ async def partials_performance(request: Request):
     db = await pool.get(config.runs_db)
     esc_dir = config.escalations_dir
 
-    paths, escalations, histograms, ttc = await asyncio.gather(
-        get_completion_paths(db, esc_dir),
-        get_escalation_rates(db, esc_dir),
-        get_loop_histograms(db),
-        get_time_centiles(db),
-    )
+    try:
+        paths, escalations, histograms, ttc = await asyncio.gather(
+            get_completion_paths(db, esc_dir),
+            get_escalation_rates(db, esc_dir),
+            get_loop_histograms(db),
+            get_time_centiles(db),
+        )
+    except Exception:
+        logger.warning('Error fetching performance data', exc_info=True)
+        paths, escalations, histograms, ttc = {}, {}, {}, {}
     return templates.TemplateResponse(
         request, 'partials/performance.html',
         context={
