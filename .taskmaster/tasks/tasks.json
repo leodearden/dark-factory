@@ -4060,6 +4060,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 243,
+        "title": "Fix remaining UTC consolidation gaps and None-handling inconsistency in reconciliation.py",
+        "description": "Two inline `datetime.fromisoformat()` calls were missed during task 224's UTC consolidation, and the None-handling pattern is inconsistent across call sites.",
+        "details": "## Problem\n\n1. **Missed fromisoformat consolidation in get_recent_runs (lines 80-81)**: `datetime.fromisoformat(row['started_at'])` and `datetime.fromisoformat(row['completed_at'])` should use `parse_utc()` for consistency. If either column stores naive timestamps, the delta arithmetic could raise TypeError (can't subtract offset-naive and offset-aware datetimes).\n\n2. **Inconsistent None-handling in partition_burst_state (lines 46-48)**: The explicit `if last_write_at is None: raise TypeError(...)` guard contradicts the plan's stated intent (\"Do not add explicit None guards at reconciliation.py call sites\") and is inconsistent with the other two call sites (`get_buffer_stats` line 232, `get_burst_state` line 269) which let `parse_utc` raise naturally. The synthetic TypeError with an opaque string message is caught immediately by the enclosing `except (ValueError, TypeError)` block — an unnecessary round-trip. Replace with either: (a) remove the guard entirely and let `parse_utc(last_write_at)` raise naturally (preferred, consistent with other sites), or (b) replace with `if last_write_at is None: idle.append(agent); continue` for clearer intent.\n\n## Fixes\n\n1. In `get_recent_runs`: replace both `datetime.fromisoformat()` calls with `parse_utc()`.\n2. In `partition_burst_state`: remove the explicit None guard (lines 47-48), let `parse_utc(last_write_at)` be called directly consistent with other call sites.\n\n## Memory hints\n- search: \"parse_utc utility dashboard reconciliation\"\n- search: \"task 224 UTC consolidation\"",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -4072,7 +4083,7 @@
       ],
       "created": "2026-03-28T04:28:03.301Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T04:28:03.303Z"
+      "updated": "2026-03-28T04:28:13.189Z"
     }
   }
 }
