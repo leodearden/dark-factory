@@ -1,0 +1,134 @@
+{
+  "task_id": "282",
+  "title": "Harden Watermark.strip_project_id: reject empty, extend to other models",
+  "files": [
+    "fused-memory/src/fused_memory/models/reconciliation.py",
+    "fused-memory/tests/test_enum_models.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/models",
+    "fused-memory/tests"
+  ],
+  "analysis": "The Watermark model (reconciliation.py:135-151) has a field_validator `strip_project_id` that strips whitespace from project_id but silently allows empty strings through \u2014 including whitespace-only inputs that normalize to ''. This violates the invariant enforced by `validate_project_id` in utils/validation.py which rejects empty/whitespace-only strings. ReconciliationEvent (line 38) and ReconciliationRun (line 95) also have bare `project_id: str` fields with no normalization at all.\n\nThe fix involves: (1) Making the Watermark validator raise ValueError after stripping if result is empty, (2) Applying the same strip+reject validator to ReconciliationEvent and ReconciliationRun, (3) Renaming to normalize_project_id, (4) Updating existing tests that expected empty-string acceptance.\n\nA private helper function `_normalize_project_id` in reconciliation.py avoids both an artificial base class and code duplication. Each model calls it from its own `normalize_project_id` field_validator. The error message mirrors validation.py's wording for consistency.\n\nExisting tests in test_enum_models.py lines 440-454 explicitly test whitespace-only \u2192 '' and empty \u2192 '' \u2014 these must be updated to expect ValidationError. The ReconciliationRun coercion tests (line 284+) and test_harness.py/test_journal.py/test_judge.py all construct ReconciliationRun with valid project_ids ('dark_factory', 'test_project'), so they won't break.\n\n**Review feedback (post-step-7):** The strict rejection in Watermark breaks the intentional empty-string sentinel used by BaseStage.run() in base.py:95-107. The `if wm_pid:` guard relies on `Watermark(project_id='')` being constructible to skip the project_id mismatch check for uninitialized watermarks. Three tests in test_stages.py (lines 452, 518, 562) construct Watermark with empty/whitespace project_id and now fail with ValidationError before the test body runs. Fix: add `allow_empty` parameter to `_normalize_project_id` so Watermark uses permissive strip-only normalization while ReconciliationEvent and ReconciliationRun keep strict rejection.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Update existing Watermark tests: whitespace-only ('   '), empty string (''), and tabs/newlines ('\\t\\n') must now raise ValidationError instead of normalizing to ''. Rename test class docstring to reference normalize_project_id. Keep passing tests for valid IDs and leading/trailing whitespace stripping. This makes 3 tests fail against current code.",
+      "status": "done",
+      "commit": "c84771e3"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "In reconciliation.py: (1) Add private helper `_normalize_project_id(v)` that strips whitespace from strings and raises ValueError('project_id is required and must be non-empty') if result is empty. (2) Rename Watermark's `strip_project_id` \u2192 `normalize_project_id` and delegate to the helper. All step-1 tests now pass.",
+      "status": "done",
+      "commit": "230fe2d1"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Add TestReconciliationEventProjectId class with tests: (a) valid project_id passes through unchanged, (b) leading/trailing whitespace is stripped, (c) whitespace-only raises ValidationError, (d) empty string raises ValidationError, (e) model_validate dict path strips whitespace. These all fail because ReconciliationEvent has no validator yet.",
+      "status": "done",
+      "commit": "92b4fa93"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Add `normalize_project_id` field_validator to ReconciliationEvent, delegating to `_normalize_project_id`. All step-3 tests now pass.",
+      "status": "done",
+      "commit": "5204418b"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Add TestReconciliationRunProjectId class with tests: (a) valid project_id passes through unchanged, (b) leading/trailing whitespace is stripped, (c) whitespace-only raises ValidationError, (d) empty string raises ValidationError, (e) model_validate dict path strips whitespace. These all fail because ReconciliationRun has no validator yet.",
+      "status": "done",
+      "commit": "91f0f517"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Add `normalize_project_id` field_validator to ReconciliationRun, delegating to `_normalize_project_id`. All step-5 tests now pass.",
+      "status": "done",
+      "commit": "4d6b2d02"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Add integration test: construct Watermark(project_id='  dark_factory  '), verify watermark.project_id == 'dark_factory' (matches what a stage would use). Also verify ReconciliationEvent and ReconciliationRun with padded project_id normalize to match. This should pass immediately since normalization is already implemented.",
+      "status": "done",
+      "commit": "e6af2a4d"
+    },
+    {
+      "id": "step-8",
+      "type": "test",
+      "description": "Revert Watermark empty/whitespace tests to expect permissive behavior: (a) rename test_whitespace_only_raises_validation_error \u2192 test_whitespace_only_normalizes_to_empty_string, assert wm.project_id == ''; (b) rename test_empty_string_raises_validation_error \u2192 test_empty_string_passes_as_sentinel, assert wm.project_id == ''; (c) rename test_tabs_and_newlines_raise_validation_error \u2192 test_tabs_and_newlines_normalize_to_empty_string, assert wm.project_id == ''. These 3 tests will FAIL against current code because _normalize_project_id raises ValueError for empty strings.",
+      "status": "done",
+      "commit": "4a096bc6"
+    },
+    {
+      "id": "step-9",
+      "type": "impl",
+      "description": "In reconciliation.py: (1) Add `allow_empty: bool = False` keyword parameter to `_normalize_project_id`. When `allow_empty=True`, skip the ValueError raise for empty stripped strings and return '' instead. (2) Change Watermark's `normalize_project_id` to call `_normalize_project_id(v, allow_empty=True)`. ReconciliationEvent and ReconciliationRun validators remain unchanged (default `allow_empty=False`). All step-8 tests pass; ReconciliationEvent/Run rejection tests from steps 3/5 still pass; test_stages.py Watermark tests (lines 452, 518, 562) are no longer broken.",
+      "status": "done",
+      "commit": "37edc80f"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use a private module-level helper function `_normalize_project_id` instead of a shared base class",
+      "rationale": "Watermark, ReconciliationEvent, and ReconciliationRun share no other fields \u2014 a base class would be artificial. A helper function avoids duplication while keeping each model self-contained. Each model gets its own `normalize_project_id` classmethod that delegates to the helper."
+    },
+    {
+      "decision": "Keep the helper in reconciliation.py rather than validation.py",
+      "rationale": "The helper is a Pydantic field_validator implementation detail (strip + raise ValueError). validation.py contains MCP-boundary validators that return error dicts. Different patterns, different purposes. Putting it in reconciliation.py keeps it co-located with its only consumers."
+    },
+    {
+      "decision": "Watermark allows empty project_id as sentinel; ReconciliationEvent and ReconciliationRun reject it",
+      "rationale": "BaseStage.run() (base.py:95-107) uses `if wm_pid:` to detect uninitialized watermarks and skip the project_id mismatch check. This requires `Watermark(project_id='')` to be constructible. Three tests in test_stages.py depend on this pattern. ReconciliationEvent and ReconciliationRun have no empty-sentinel use case \u2014 empty project_id is always a bug for those models. The `allow_empty` parameter on `_normalize_project_id` expresses this distinction cleanly at the call site."
+    },
+    {
+      "decision": "Use `allow_empty` parameter on `_normalize_project_id` rather than a separate helper",
+      "rationale": "A single function with a boolean flag is simpler and more explicit than two nearly-identical functions (_normalize_project_id vs _strip_project_id). The parameter name documents the semantic difference at each call site: Watermark passes `allow_empty=True`, others use the strict default."
+    },
+    {
+      "decision": "Error message mirrors validation.py wording: 'project_id is required and must be non-empty'",
+      "rationale": "Consistent error messages across validate_project_id (returns dict) and normalize_project_id (raises ValueError) reduce confusion in logs and error reports."
+    },
+    {
+      "decision": "No regex validation in the field validator \u2014 only strip + empty check",
+      "rationale": "Full character-set validation (the _SAFE_IDENTIFIER_PATTERN check) is the responsibility of validate_project_id/require_project_id at API boundaries (MCP tools, BaseStage). The field validator's job is normalization + basic invariant enforcement, not duplicating all validation logic."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Error message text 'project_id is required and must be non-empty'",
+      "where": "fused-memory/src/fused_memory/utils/validation.py:40",
+      "how": "Use identical wording in the ValueError raised by _normalize_project_id for consistency"
+    },
+    {
+      "what": "Existing test helper pattern _make_run(**kwargs) with defaults dict",
+      "where": "fused-memory/tests/test_enum_models.py:287-300 (TestReconciliationRunCoercion._make_run)",
+      "how": "Follow the same factory pattern for new ReconciliationRun and ReconciliationEvent test helpers"
+    },
+    {
+      "what": "Existing test pattern: pytest.raises(ValidationError) for model rejection",
+      "where": "fused-memory/tests/test_enum_models.py throughout",
+      "how": "Use same import and assertion pattern for empty/whitespace rejection tests"
+    },
+    {
+      "what": "field_validator('project_id', mode='before') decorator pattern",
+      "where": "fused-memory/src/fused_memory/models/reconciliation.py:145-146",
+      "how": "Apply identical decorator signature to ReconciliationEvent and ReconciliationRun validators"
+    },
+    {
+      "what": "BaseStage.run() empty-watermark sentinel pattern (if wm_pid:)",
+      "where": "fused-memory/src/fused_memory/reconciliation/stages/base.py:95-107",
+      "how": "Preserve compatibility by making Watermark's validator use allow_empty=True, so empty string sentinel continues to work with the existing truthiness check"
+    }
+  ],
+  "_session_id": "282-b07728a4",
+  "_created_at": "2026-03-28T16:36:19.813030+00:00"
+}
