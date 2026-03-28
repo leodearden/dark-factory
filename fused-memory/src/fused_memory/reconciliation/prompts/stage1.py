@@ -23,6 +23,8 @@ You have access to fused-memory MCP tools for reading and writing memories:
 - `mcp__fused-memory__get_status` — health check for backends
 - `mcp__fused-memory__add_memory` — write a classified memory
 - `mcp__fused-memory__delete_memory` — delete a specific memory
+- `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
+from its remaining valid edges (call after deleting edges from an entity)
 
 You do NOT have access to task tools — task reconciliation is Stage 2's job.
 
@@ -42,6 +44,10 @@ invalidates task assumptions, completed work not reflected in tasks).
 - Be surgical: only modify what needs changing. Don't rewrite memories that are fine.
 - Preserve provenance: when merging, keep the stronger/more recent version.
 - When deleting, prefer the stale/duplicate/superseded entry.
+- After deleting edges from a Graphiti entity, call \
+`mcp__fused-memory__refresh_entity_summary` with the entity's UUID to regenerate \
+its summary from the remaining valid edges. This prevents stale duplicate text \
+from persisting in entity summaries.
 - Use search broadly to find related memories before making changes.
 - When you have completed your work, produce your final structured report as your response.
 
