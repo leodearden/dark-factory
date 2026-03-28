@@ -425,7 +425,7 @@ class TestVerificationResultCoercion:
 
 
 class TestWatermarkProjectIdValidator:
-    """Watermark.strip_project_id validator strips whitespace from project_id."""
+    """Watermark.normalize_project_id validator strips whitespace and rejects empty project_id."""
 
     @staticmethod
     def _make_watermark(project_id: str):
@@ -437,21 +437,21 @@ class TestWatermarkProjectIdValidator:
         wm = self._make_watermark('dark_factory')
         assert wm.project_id == 'dark_factory'
 
-    def test_whitespace_only_normalizes_to_empty_string(self):
-        wm = self._make_watermark('   ')
-        assert wm.project_id == ''
+    def test_whitespace_only_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            self._make_watermark('   ')
 
     def test_leading_trailing_whitespace_is_stripped(self):
         wm = self._make_watermark('  dark_factory  ')
         assert wm.project_id == 'dark_factory'
 
-    def test_empty_string_passes_through_as_valid_sentinel(self):
-        wm = self._make_watermark('')
-        assert wm.project_id == ''
+    def test_empty_string_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            self._make_watermark('')
 
-    def test_tabs_and_newlines_normalize_to_empty(self):
-        wm = self._make_watermark('\t\n')
-        assert wm.project_id == ''
+    def test_tabs_and_newlines_raise_validation_error(self):
+        with pytest.raises(ValidationError):
+            self._make_watermark('\t\n')
 
     def test_model_validate_dict_strips_whitespace(self):
         """mode='before' works for DB deserialization path (model_validate)."""
