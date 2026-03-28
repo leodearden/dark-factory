@@ -2,11 +2,11 @@
 
 import json
 import logging
-import os
 import uuid as uuid_mod
 from datetime import UTC, datetime
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
+from fused_memory.utils.validation import require_project_root
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.reconciliation import (
     MemoryHints,
@@ -83,10 +83,7 @@ class TargetedReconciler:
         project_root: str,
     ) -> dict:
         """Run targeted reconciliation for a single task state transition."""
-        if not project_root or not os.path.isabs(project_root):
-            raise ValueError(
-                f'project_root must be a non-empty absolute path, got: {project_root!r}'
-            )
+        require_project_root(project_root)
         run_id = str(uuid_mod.uuid4())
         start = datetime.now(UTC)
 
@@ -352,10 +349,7 @@ class TargetedReconciler:
         project_root: str,
     ) -> dict:
         """Reconcile after expand_task or parse_prd — cross-reference against knowledge."""
-        if not project_root or not os.path.isabs(project_root):
-            raise ValueError(
-                f'project_root must be a non-empty absolute path, got: {project_root!r}'
-            )
+        require_project_root(project_root)
         result: dict = {'parent_task_id': parent_task_id, 'actions': []}
 
         try:
