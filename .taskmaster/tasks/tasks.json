@@ -3859,10 +3859,11 @@
         "description": "Clean up redundant assertion logic in `test_run_full_cycle_propagates_tier_to_consolidator` (test_harness.py).\n\n1. Remove the `found_consolidator = False` flag, the `found_consolidator = True` assignment inside the mocking loop, and the `assert found_consolidator` post-loop assertion. The pre-loop `assert any(isinstance(s, MemoryConsolidator) for s in harness.stages)` already guarantees the same invariant on the same unchanged list.\n\n2. Replace `assert captured != {}` with `assert 'episode_limit' in captured and 'memory_limit' in captured` to explicitly name the expected keys and provide a more informative failure message, consistent with the follow-on assertions. This also makes the guard non-redundant — it catches the case where `run_full_cycle` silently skips the stage.\n\nNet effect: ~4 lines removed, 1 assertion strengthened. No behavioral change.\n\nOrigin: review suggestions on task 203 (7 overlapping flags from 4 different reviewers).\nmemory_hints: search for \"found_consolidator\" and \"captured != {}\" in test_harness.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T04:19:20.359Z"
       },
       {
         "id": "227",
@@ -4044,7 +4045,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:19:19.363Z",
+      "lastModified": "2026-03-28T04:19:20.359Z",
       "taskCount": 220,
       "completedCount": 173,
       "tags": [
