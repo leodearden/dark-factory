@@ -44,6 +44,7 @@ DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__delete_episode',
     'mcp__fused-memory__replay_to_graphiti',
     'mcp__fused-memory__replay_dead_letters',
+    'mcp__fused-memory__refresh_entity_summary',
 ]
 
 # Per-stage disallowed lists
