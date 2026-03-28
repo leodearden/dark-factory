@@ -319,6 +319,18 @@ class TestValidateProjectId:
         except Exception as exc:
             pytest.fail(f'validate_project_id raised unexpectedly: {exc}')
 
+    def test_numeric_only_returns_none(self):
+        result = validate_project_id('42')
+        assert result is None
+
+    def test_uppercase_returns_none(self):
+        result = validate_project_id('DARK_FACTORY')
+        assert result is None
+
+    def test_mixed_case_hyphen_underscore_returns_none(self):
+        result = validate_project_id('My-Project_1')
+        assert result is None
+
 
 class TestValidatorErrorDictShape:
     """All validate_* functions return dicts with exactly 'error' and 'error_type' keys."""
