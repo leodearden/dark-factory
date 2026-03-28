@@ -605,6 +605,19 @@ class GitOps:
             return False
 
         logger.info(f'Advanced {self.config.main_branch} to {merge_sha[:8]}')
+
+        # Refresh tasks.json in project root so Taskmaster/fused-memory
+        # don't auto-commit a stale snapshot.  update-ref deliberately
+        # leaves the working tree untouched, but TaskFileCommitter will
+        # stage and commit whatever is on disk — which is now stale.
+        # We only touch this one file to avoid interfering with other
+        # working-tree state.
+        await _run(
+            ['git', 'checkout', 'HEAD', '--',
+             '.taskmaster/tasks/tasks.json'],
+            cwd=self.project_root,
+        )
+
         return True
 
     async def get_conflict_details(self, cwd: Path) -> str:

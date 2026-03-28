@@ -1,6 +1,7 @@
 """Auto-commits .taskmaster/tasks/tasks.json after task write operations."""
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 
@@ -43,6 +44,43 @@ class TaskFileCommitter:
         if not tasks_file.exists():
             logger.debug("tasks.json does not exist at %s, skipping commit", tasks_file)
             return
+
+        # Guard: refuse to commit if on-disk tasks.json has fewer tasks
+        # than HEAD.  This catches stale working-tree snapshots after
+        # advance_main() moves the ref without updating the working tree.
+        try:
+            head_proc = await asyncio.create_subprocess_exec(
+                "git", "show", f"HEAD:{TASKS_REL_PATH}",
+                cwd=project_root,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            head_stdout, _ = await asyncio.wait_for(head_proc.communicate(), timeout=10)
+            if head_proc.returncode == 0:
+                head_data = json.loads(head_stdout)
+                disk_data = json.loads(tasks_file.read_text())
+
+                def _count(d: dict) -> int:
+                    return len(d.get("master", d).get("tasks", []))
+
+                head_count = _count(head_data)
+                disk_count = _count(disk_data)
+                if head_count > 0 and disk_count < head_count * 0.9:
+                    logger.error(
+                        "STALE SNAPSHOT GUARD: on-disk tasks.json has %d tasks "
+                        "but HEAD has %d — refusing to commit stale snapshot "
+                        "(op=%s). Working tree may be out of sync with HEAD "
+                        "after advance_main.",
+                        disk_count,
+                        head_count,
+                        operation,
+                    )
+                    return
+        except Exception:
+            logger.debug(
+                "Stale snapshot guard check failed, proceeding with commit",
+                exc_info=True,
+            )
 
         # Stage the tasks file
         add_proc = await asyncio.create_subprocess_exec(
