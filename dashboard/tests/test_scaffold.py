@@ -6,6 +6,13 @@ from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
 
 
 class TestConfigDefaults:
+    def test_default_fused_memory_urls_values(self):
+        assert DEFAULT_FUSED_MEMORY_URLS == [
+            'http://localhost:8002',
+            'http://localhost:8000',
+            'http://localhost:8001',
+        ]
+
     def test_config_defaults(self):
         from dashboard.config import DashboardConfig
 
