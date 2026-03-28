@@ -4271,10 +4271,11 @@
         "description": "Extract duplicated _patch_stage helper into a shared base class and fill meta-test coverage gaps.\n\n## What to do\n\n1. **Extract shared mixin**: `_patch_stage`, `_fake_assemble_payload`, `_fake_run_stage_via_cli`, and `mock_deps` are byte-for-byte duplicated between `TestProjectIdValidation` (lines ~408-429) and `TestRunIdValidation` (lines ~632-647). Extract into a `_PatchStageFixtureMixin` that both classes inherit.\n\n2. **Extract `_MOCK_TYPES` constant**: The tuple `(AsyncMock, MagicMock)` is repeated 3 times across meta-tests. Define a module-level constant `_MOCK_TYPES = (AsyncMock, MagicMock)` and use it everywhere.\n\n3. **Add postconditions to `test_patch_stage_accepts_cli_side_effect`**: Save `original_run_stage_via_cli` and `original_assemble_payload` before the `with` block, then assert both are restored after exit — mirroring the pattern in the sibling test.\n\n4. **Add exception-safety meta-test**: New test `test_patch_stage_restores_on_exception` that raises inside the `with` block, catches outside, then asserts both patches are undone. Confirms context manager cleanup on abnormal exit.\n\n5. **Symmetric meta-test coverage**: Since the mixin is shared, the meta-tests written once now cover both classes. If the mixin approach is rejected, add equivalent meta-tests to `TestRunIdValidation`.\n\nmemory_hints:\n- search: \"test_stages.py _patch_stage meta-test assertions\"\n- search: \"context manager test postcondition restoration\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T05:32:45.719Z"
       },
       {
         "id": "257",
@@ -4437,7 +4438,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T05:32:45.057Z",
+      "lastModified": "2026-03-28T05:32:45.719Z",
       "taskCount": 249,
       "completedCount": 196,
       "tags": [
