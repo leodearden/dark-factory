@@ -41,7 +41,7 @@ def group_top_n(data: ChartData, n: int = 5) -> ChartData:
 
     # Sort descending by value so top-N selection is deterministic regardless
     # of caller ordering. Timsort is O(n) on already-sorted input.
-    sorted_pairs = sorted(zip(labels, values), key=lambda pair: pair[1], reverse=True)
+    sorted_pairs = sorted(zip(labels, values, strict=True), key=lambda pair: pair[1], reverse=True)
     labels = [pair[0] for pair in sorted_pairs]
     values = [pair[1] for pair in sorted_pairs]
 

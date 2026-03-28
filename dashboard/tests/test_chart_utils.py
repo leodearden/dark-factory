@@ -105,7 +105,7 @@ class TestGroupTopN:
 
     def test_passthrough_when_at_n_items(self):
         """When input has exactly N items, return unchanged."""
-        data = {'labels': ['a', 'b', 'c', 'd', 'e'], 'values': [5, 4, 3, 2, 1]}
+        data: ChartData = {'labels': ['a', 'b', 'c', 'd', 'e'], 'values': [5, 4, 3, 2, 1]}
         result = group_top_n(data, n=5)
         assert result['labels'] == ['a', 'b', 'c', 'd', 'e']
         assert result['values'] == [5, 4, 3, 2, 1]
@@ -113,7 +113,7 @@ class TestGroupTopN:
 
     def test_passthrough_when_below_n_items(self):
         """When input has fewer than N items, return unchanged."""
-        data = {'labels': ['search', 'add_memory'], 'values': [100, 50]}
+        data: ChartData = {'labels': ['search', 'add_memory'], 'values': [100, 50]}
         result = group_top_n(data, n=5)
         assert result['labels'] == ['search', 'add_memory']
         assert result['values'] == [100, 50]
@@ -121,7 +121,7 @@ class TestGroupTopN:
 
     def test_groups_tail_into_other_when_exceeds_n(self):
         """When input has more than N items, tail entries become 'Other'."""
-        data = {
+        data: ChartData = {
             'labels': ['a', 'b', 'c', 'd', 'e', 'f'],
             'values': [60, 50, 40, 30, 20, 10],
         }
@@ -132,7 +132,7 @@ class TestGroupTopN:
 
     def test_other_sums_correctly(self):
         """'Other' value is the sum of all tail items."""
-        data = {
+        data: ChartData = {
             'labels': ['a', 'b', 'c', 'd', 'e', 'f', 'g'],
             'values': [70, 60, 50, 40, 30, 20, 10],
         }
@@ -142,14 +142,14 @@ class TestGroupTopN:
 
     def test_handles_empty_input(self):
         """Empty input returns empty output without error."""
-        data = {'labels': [], 'values': []}
+        data: ChartData = {'labels': [], 'values': []}
         result = group_top_n(data, n=5)
         assert result['labels'] == []
         assert result['values'] == []
 
     def test_preserves_descending_sort_order(self):
         """Top N items appear in their original order (already descending by convention)."""
-        data = {
+        data: ChartData = {
             'labels': ['a', 'b', 'c', 'd', 'e', 'f'],
             'values': [60, 50, 40, 30, 20, 10],
         }
@@ -159,7 +159,7 @@ class TestGroupTopN:
 
     def test_custom_n_parameter(self):
         """Custom N grouping threshold is respected."""
-        data = {
+        data: ChartData = {
             'labels': ['a', 'b', 'c'],
             'values': [30, 20, 10],
         }
@@ -170,7 +170,7 @@ class TestGroupTopN:
 
     def test_default_n_is_five(self):
         """Default N=5 groups items beyond 5 into 'Other'."""
-        data = {
+        data: ChartData = {
             'labels': ['a', 'b', 'c', 'd', 'e', 'f'],
             'values': [60, 50, 40, 30, 20, 10],
         }
@@ -254,20 +254,20 @@ class TestSeparateLabelBoundsCheck:
     def test_raises_when_label_index_beyond_values_length(self):
         """ValueError raised when label found but its index >= len(values)."""
         # labels=['a','b','c'], values=[10], label='c' at idx=2 but values has 1 element
-        data = {'labels': ['a', 'b', 'c'], 'values': [10]}
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [10]}
         with pytest.raises(ValueError, match="no corresponding value"):
             separate_label(data, 'c')
 
     def test_raises_for_middle_label_beyond_values(self):
         """ValueError raised when label is found at index beyond values."""
         # label='b' at idx=1, values has only 1 element (idx 0)
-        data = {'labels': ['a', 'b', 'c'], 'values': [10]}
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [10]}
         with pytest.raises(ValueError, match="no corresponding value"):
             separate_label(data, 'b')
 
     def test_error_message_includes_label_name_and_index(self):
         """ValueError message contains label name and index for debugging."""
-        data = {'labels': ['a', 'b', 'c'], 'values': [10]}
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [10]}
         with pytest.raises(ValueError, match="'c'"):
             separate_label(data, 'c')
         with pytest.raises(ValueError, match="index 2"):
@@ -280,7 +280,7 @@ class TestSeparateLabelBoundsWithinRange:
     def test_succeeds_when_label_within_values_bounds_mismatched_length(self):
         """separate_label succeeds when label idx < len(values) despite overall mismatch."""
         # labels=['a','b','c'], values=[30, 20], label='a' at idx=0 (within bounds)
-        data = {'labels': ['a', 'b', 'c'], 'values': [30, 20]}
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [30, 20]}
         remaining, value = separate_label(data, 'a')
         assert value == 30
         # remaining has labels=['b','c'] and values=[20]
@@ -290,7 +290,7 @@ class TestSeparateLabelBoundsWithinRange:
     def test_boundary_case_last_within_bounds(self):
         """separate_label succeeds when label is at the last valid index of values."""
         # labels=['a','b','c'], values=[30, 20], label='b' at idx=1 (last valid)
-        data = {'labels': ['a', 'b', 'c'], 'values': [30, 20]}
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [30, 20]}
         remaining, value = separate_label(data, 'b')
         assert value == 20
         assert remaining['labels'] == ['a', 'c']
