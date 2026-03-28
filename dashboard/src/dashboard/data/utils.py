@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 
-def parse_utc(ts: str) -> datetime:
+def parse_utc(ts: str | None) -> datetime:
     """Parse an ISO timestamp string and ensure it has UTC timezone.
 
     Naive datetimes (no tzinfo) get UTC attached.  Aware datetimes are

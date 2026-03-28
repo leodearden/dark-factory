@@ -90,6 +90,30 @@ class TestGetRecentRuns:
         runs = await get_recent_runs(None)
         assert runs == []
 
+    async def test_duration_with_mixed_naive_aware_timestamps(self, tmp_path):
+        """Duration calculated correctly when started_at is naive and completed_at is aware."""
+        import sqlite3
+
+        from dashboard.data.reconciliation import get_recent_runs
+        from tests.conftest import RECONCILIATION_SCHEMA
+
+        db_path = tmp_path / 'mixed.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(RECONCILIATION_SCHEMA)
+        conn.execute(
+            "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
+            "completed_at, events_processed, status) "
+            "VALUES ('run-m1', 'dark_factory', 'full', 'test', '2026-03-28T10:00:00', "
+            "'2026-03-28T10:05:00+00:00', 3, 'completed')"
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            runs = await get_recent_runs(db)
+        assert len(runs) == 1
+        assert runs[0]['duration_seconds'] == pytest.approx(300.0, abs=1.0)
 
 
 class TestGetWatermarks:
@@ -546,6 +570,26 @@ class TestParseUtc:
 
         with pytest.raises(TypeError):
             parse_utc(None)  # type: ignore[arg-type]
+
+
+class TestPartitionBurstState:
+    """Functional tests for partition_burst_state."""
+
+    def test_none_last_write_at_handled_consistently(self, caplog):
+        """Agent with None last_write_at lands in idle and emits a debug log."""
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': None}]
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
+            active, idle = partition_burst_state(agents)
+
+        assert len(idle) == 1
+        assert idle[0]['agent_id'] == 'a1'
+        assert len(active) == 0
+        assert any(
+            r.levelno == logging.DEBUG and 'bad last_write_at' in r.message
+            for r in caplog.records
+        ), f'Expected DEBUG log with "bad last_write_at", got: {caplog.records}'
 
 
 class TestPartitionBurstStateLocation:

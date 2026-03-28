@@ -43,9 +43,6 @@ def partition_burst_state(
             continue
         # Idle agents with recent writes are still "active" for display
         last_write_at = agent.get('last_write_at')
-        if last_write_at is None:
-            idle.append(agent)
-            continue
         try:
             last_write = parse_utc(last_write_at)
             if (now - last_write).total_seconds() < active_threshold_seconds:
@@ -81,8 +78,8 @@ async def get_recent_runs(db: aiosqlite.Connection | None, *, limit: int = 50) -
         for row in rows:
             duration = None
             if row['completed_at'] is not None:
-                started = datetime.fromisoformat(row['started_at'])
-                completed = datetime.fromisoformat(row['completed_at'])
+                started = parse_utc(row['started_at'])
+                completed = parse_utc(row['completed_at'])
                 duration = (completed - started).total_seconds()
 
             results.append(
