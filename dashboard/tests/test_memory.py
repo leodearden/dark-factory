@@ -320,6 +320,7 @@ class TestGetMemoryStatus:
 
         def handler(request: httpx.Request) -> httpx.Response:
             port = request.url.port
+            assert port is not None
             ports_seen.add(port)
 
             # First server (port 9000) always fails
