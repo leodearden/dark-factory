@@ -52,14 +52,24 @@ class _SessionAwareHandler:
     """Mock handler that responds to initialize, notify, and tools/call."""
 
     def __init__(self, tool_response: dict | None = None, *, error_status: int | None = None,
-                 error_on_tool: Exception | None = None, error_on_all: Exception | None = None):
+                 error_on_tool: Exception | None = None, error_on_all: Exception | None = None,
+                 fail_port: int | None = None):
         self.tool_response = tool_response or {}
         self.error_status = error_status
         self.error_on_tool = error_on_tool
         self.error_on_all = error_on_all
+        self.fail_port = fail_port
         self.calls: list[dict] = []
+        self.ports_seen: set[int] = set()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        port = request.url.port
+        if port is not None:
+            self.ports_seen.add(port)
+
+        if self.fail_port is not None and port == self.fail_port:
+            raise httpx.ConnectError('refused')
+
         if self.error_on_all:
             raise self.error_on_all
 
@@ -80,6 +90,55 @@ class _SessionAwareHandler:
         if self.error_status:
             return httpx.Response(self.error_status, text='Server Error')
         return _make_mcp_response(self.tool_response, request_id)
+
+
+class TestSessionAwareHandler:
+    """Unit tests for _SessionAwareHandler port-tracking behaviour."""
+
+    def _init_request(self, port: int = 9001) -> httpx.Request:
+        """Build a minimal JSON-RPC initialize request targeting *port*."""
+        body = json.dumps(
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'}
+        ).encode()
+        return httpx.Request('POST', f'http://localhost:{port}/mcp', content=body)
+
+    def test_ports_seen_initializes_empty(self):
+        """Handler initializes with an empty ports_seen set."""
+        handler = _SessionAwareHandler({'ok': True})
+        assert handler.ports_seen == set()
+
+    def test_ports_seen_after_request(self):
+        """After a request to port 9001, ports_seen contains 9001."""
+        handler = _SessionAwareHandler({'ok': True})
+        handler(self._init_request(9001))
+        assert 9001 in handler.ports_seen
+
+    def test_calls_populated_for_successful_request(self):
+        """handler.calls is populated after a successful request."""
+        handler = _SessionAwareHandler({'ok': True})
+        handler(self._init_request(9001))
+        assert len(handler.calls) == 1
+        assert handler.calls[0]['method'] == 'initialize'
+
+    def test_fail_port_raises_connect_error(self):
+        """Request to fail_port raises httpx.ConnectError."""
+        handler = _SessionAwareHandler({'ok': True}, fail_port=9000)
+        with pytest.raises(httpx.ConnectError):
+            handler(self._init_request(9000))
+
+    def test_fail_port_records_port_before_error(self):
+        """Port is recorded in ports_seen even when ConnectError is raised."""
+        handler = _SessionAwareHandler({'ok': True}, fail_port=9000)
+        with pytest.raises(httpx.ConnectError):
+            handler(self._init_request(9000))
+        assert 9000 in handler.ports_seen
+
+    def test_fail_port_does_not_affect_other_ports(self):
+        """Requests to ports other than fail_port succeed normally."""
+        handler = _SessionAwareHandler({'ok': True}, fail_port=9000)
+        response = handler(self._init_request(9001))
+        assert response.status_code == 200
+        assert 9001 in handler.ports_seen
 
 
 @pytest.fixture(autouse=True)
@@ -316,26 +375,7 @@ class TestGetMemoryStatus:
         """
         from dashboard.data.memory import get_memory_status
 
-        ports_seen: set[int] = set()
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            port = request.url.port
-            assert port is not None
-            ports_seen.add(port)
-
-            # First server (port 9000) always fails
-            if port == 9000:
-                raise httpx.ConnectError('refused')
-
-            body = json.loads(request.content)
-            method = body.get('method', '')
-            rid = body.get('id', 1)
-            if method == 'initialize':
-                return _make_init_response(rid)
-            if method.startswith('notifications/'):
-                return _make_notify_response()
-            return _make_mcp_response(_STATUS_PAYLOAD, rid)
-
+        handler = _SessionAwareHandler(_STATUS_PAYLOAD, fail_port=9000)
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await get_memory_status(client, two_url_config)
@@ -343,9 +383,9 @@ class TestGetMemoryStatus:
         assert result == _STATUS_PAYLOAD
         assert 'offline' not in result
         # Prove port 9000 was actually attempted before falling through to 9001
-        assert 9000 in ports_seen
+        assert 9000 in handler.ports_seen
         # Prove the fallback server (9001) was actually reached
-        assert 9001 in ports_seen
+        assert 9001 in handler.ports_seen
 
 
 # ── get_queue_stats (aggregation) ──────────────────────────────
@@ -393,24 +433,7 @@ class TestGetQueueStats:
         """
         from dashboard.data.memory import get_queue_stats
 
-        ports_seen: set[int] = set()
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            port = request.url.port
-            assert port is not None
-            ports_seen.add(port)
-
-            if port == 9000:
-                raise httpx.ConnectError('refused')
-            body = json.loads(request.content)
-            method = body.get('method', '')
-            rid = body.get('id', 1)
-            if method == 'initialize':
-                return _make_init_response(rid)
-            if method.startswith('notifications/'):
-                return _make_notify_response()
-            return _make_mcp_response(_QUEUE_STATS_PAYLOAD, rid)
-
+        handler = _SessionAwareHandler(_QUEUE_STATS_PAYLOAD, fail_port=9000)
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await get_queue_stats(client, two_url_config)
@@ -419,8 +442,8 @@ class TestGetQueueStats:
         assert result['counts']['pending'] == 3
         assert 'offline' not in result
         # Prove both ports were actually contacted
-        assert 9000 in ports_seen
-        assert 9001 in ports_seen
+        assert 9000 in handler.ports_seen
+        assert 9001 in handler.ports_seen
 
 
 # ── Malformed responses ─────────────────────────────────────────
