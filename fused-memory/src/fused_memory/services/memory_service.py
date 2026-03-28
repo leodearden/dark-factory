@@ -7,7 +7,7 @@ import contextlib
 import logging
 import uuid as uuid_mod
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from graphiti_core.nodes import EpisodeType
 
@@ -848,7 +848,8 @@ class MemoryService:
                     )
             raise first_exc
 
-        nodes, edges = results
+        nodes = cast(list, results[0])
+        edges = cast(list, results[1])
 
         node_data = []
         for n in nodes:

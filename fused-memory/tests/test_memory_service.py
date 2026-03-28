@@ -848,9 +848,9 @@ class TestGetEntity:
             side_effect=RuntimeError('search failed')
         )
 
-        with patch('fused_memory.services.memory_service.logger') as mock_logger:
-            with pytest.raises(RuntimeError, match='search_nodes failed'):
-                await service.get_entity('entity', project_id='test')
+        with patch('fused_memory.services.memory_service.logger') as mock_logger, \
+             pytest.raises(RuntimeError, match='search_nodes failed'):
+            await service.get_entity('entity', project_id='test')
 
         assert mock_logger.warning.call_count == 2
 
