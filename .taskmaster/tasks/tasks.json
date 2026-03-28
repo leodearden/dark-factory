@@ -4938,7 +4938,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_refresh_indicator.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 286,
@@ -4949,7 +4957,16 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "fused-memory/tests/test_memory_service.py",
+            "fused-memory/tests/conftest.py"
+          ],
+          "modules": [
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 287,
