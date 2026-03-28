@@ -413,6 +413,41 @@ class GraphitiBackend:
         row = result.result_set[0]
         return (row[0], row[1] or '')
 
+    async def refresh_entity_summary(self, node_uuid: str) -> dict:
+        """Regenerate an Entity node's summary from its currently-valid edges.
+
+        Fetches the node's current name and summary, queries all valid
+        (non-invalidated) RELATES_TO edges, deduplicates their facts
+        (preserving order), joins them with newlines, and writes the result
+        back to the node's summary property.
+
+        Summary regeneration uses simple fact concatenation (deduped), consistent
+        with Graphiti's own _extract_entity_summaries_batch pattern — no LLM call.
+
+        Args:
+            node_uuid: UUID of the Entity node to refresh.
+
+        Returns:
+            Dict with keys: uuid, name, old_summary, new_summary, edge_count.
+        """
+        name, old_summary = await self.get_node_text(node_uuid)
+        edges = await self.get_valid_edges_for_node(node_uuid)
+        # Deduplicate facts while preserving insertion order
+        facts = list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
+        new_summary = '\n'.join(facts)
+        await self.update_node_summary(node_uuid, new_summary)
+        logger.info(
+            'refresh_entity_summary: node=%s name=%r edges=%d old_len=%d new_len=%d',
+            node_uuid, name, len(edges), len(old_summary), len(new_summary),
+        )
+        return {
+            'uuid': node_uuid,
+            'name': name,
+            'old_summary': old_summary,
+            'new_summary': new_summary,
+            'edge_count': len(edges),
+        }
+
     async def update_node_summary(self, uuid: str, summary: str) -> None:
         """Update the summary text property on an Entity node.
 
