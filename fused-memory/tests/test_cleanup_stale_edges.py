@@ -280,23 +280,39 @@ class TestCleanupManager:
 # step-7: run_cleanup async entrypoint
 # ---------------------------------------------------------------------------
 
+def _make_fake_maintenance_service(mock_cfg, mock_service):
+    """Return a fake maintenance_service async context manager for testing."""
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def fake(config_path):
+        yield mock_cfg, mock_service
+
+    return fake
+
+
 class TestRunCleanup:
-    """run_cleanup() loads config, initializes MemoryService, runs cleanup, closes."""
+    """run_cleanup() delegates service lifecycle to maintenance_service(), runs cleanup.
+
+    Lifecycle behaviour (initialize, close, CONFIG_PATH management) is fully
+    covered by TestMaintenanceService in test_maintenance_utils.py.
+    """
 
     @pytest.mark.asyncio
-    async def test_loads_config_and_runs_cleanup(self):
-        """run_cleanup() initializes the MemoryService and calls cleanup with correct args."""
+    async def test_calls_cleanup_with_correct_args(self):
+        """run_cleanup() constructs CleanupManager and calls cleanup with correct args."""
         from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
 
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
-
         mock_result = CleanupResult(edges_found=2, edges_deleted=2)
 
         with (
-            patch('fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig', return_value=mock_cfg),
-            patch('fused_memory.maintenance.cleanup_stale_edges.MemoryService', return_value=mock_service),
+            patch(
+                'fused_memory.maintenance.cleanup_stale_edges.maintenance_service',
+                side_effect=_make_fake_maintenance_service(mock_cfg, mock_service),
+            ),
             patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
         ):
             mock_mgr = MagicMock()
@@ -308,7 +324,7 @@ class TestRunCleanup:
                 end='2026-03-22T18:15:00',
             )
 
-        mock_service.initialize.assert_awaited_once()
+        mock_mgr_cls.assert_called_once_with(backend=mock_service.graphiti)
         mock_mgr.cleanup.assert_awaited_once_with(
             start='2026-03-22T17:50:00',
             end='2026-03-22T18:15:00',
@@ -317,66 +333,20 @@ class TestRunCleanup:
         assert result == mock_result
 
     @pytest.mark.asyncio
-    async def test_closes_service_on_success(self):
-        """run_cleanup() calls service.close() in finally block after success."""
-        from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
-
-        mock_cfg = MagicMock()
-        mock_service = AsyncMock()
-        mock_service.graphiti = MagicMock()
-
-        mock_result = CleanupResult()
-
-        with (
-            patch('fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig', return_value=mock_cfg),
-            patch('fused_memory.maintenance.cleanup_stale_edges.MemoryService', return_value=mock_service),
-            patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
-        ):
-            mock_mgr = MagicMock()
-            mock_mgr.cleanup = AsyncMock(return_value=mock_result)
-            mock_mgr_cls.return_value = mock_mgr
-
-            await run_cleanup()
-
-        mock_service.close.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_closes_service_on_error(self):
-        """run_cleanup() calls service.close() in finally block even when cleanup raises."""
-        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
-
-        mock_cfg = MagicMock()
-        mock_service = AsyncMock()
-        mock_service.graphiti = MagicMock()
-
-        with (
-            patch('fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig', return_value=mock_cfg),
-            patch('fused_memory.maintenance.cleanup_stale_edges.MemoryService', return_value=mock_service),
-            patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
-        ):
-            mock_mgr = MagicMock()
-            mock_mgr.cleanup = AsyncMock(side_effect=RuntimeError('falkordb unavailable'))
-            mock_mgr_cls.return_value = mock_mgr
-
-            with pytest.raises(RuntimeError, match='falkordb unavailable'):
-                await run_cleanup()
-
-        mock_service.close.assert_awaited_once()
-
-    @pytest.mark.asyncio
     async def test_passes_dry_run_flag(self):
-        """run_cleanup(dry_run=True) passes dry_run=True to cleanup."""
+        """run_cleanup(dry_run=True) passes dry_run=True to CleanupManager.cleanup()."""
         from fused_memory.maintenance.cleanup_stale_edges import CleanupResult, run_cleanup
 
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
-
         mock_result = CleanupResult(edges_found=3, edges_deleted=0)
 
         with (
-            patch('fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig', return_value=mock_cfg),
-            patch('fused_memory.maintenance.cleanup_stale_edges.MemoryService', return_value=mock_service),
+            patch(
+                'fused_memory.maintenance.cleanup_stale_edges.maintenance_service',
+                side_effect=_make_fake_maintenance_service(mock_cfg, mock_service),
+            ),
             patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
         ):
             mock_mgr = MagicMock()
@@ -385,9 +355,7 @@ class TestRunCleanup:
 
             await run_cleanup(dry_run=True)
 
-        call_kwargs = mock_mgr.cleanup.call_args
-        assert call_kwargs is not None
-        _, kwargs = call_kwargs
+        _, kwargs = mock_mgr.cleanup.call_args
         assert kwargs.get('dry_run') is True
 
 
@@ -395,137 +363,16 @@ class TestRunCleanup:
 # step-5: run_cleanup() env-var / close() edge cases
 # ---------------------------------------------------------------------------
 
-class TestRunCleanupEdgeCases:
-    """run_cleanup() correctly saves/restores CONFIG_PATH and handles close() edge cases."""
-
-    @pytest.mark.asyncio
-    async def test_restores_preexisting_env_var_when_constructor_fails(self):
-        """When CONFIG_PATH already set and FusedMemoryConfig raises, old value is restored."""
-        import os
-
-        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
-
-        old = os.environ.get('CONFIG_PATH')
-        os.environ['CONFIG_PATH'] = 'preexisting.yaml'
-        try:
-            with patch(
-                'fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig',
-                side_effect=RuntimeError('config load failed'),
-            ), pytest.raises(RuntimeError, match='config load failed'):
-                await run_cleanup(config_path='test.yaml')
-
-            assert os.environ.get('CONFIG_PATH') == 'preexisting.yaml'
-        finally:
-            if old is None:
-                os.environ.pop('CONFIG_PATH', None)
-            else:
-                os.environ['CONFIG_PATH'] = old
-
-    @pytest.mark.asyncio
-    async def test_does_not_touch_env_var_when_config_path_is_none(self):
-        """When config_path is None, CONFIG_PATH env var is left completely untouched."""
-        import os
-
-        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
-
-        old = os.environ.get('CONFIG_PATH')
-        os.environ['CONFIG_PATH'] = 'existing.yaml'
-        try:
-            with patch(
-                'fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig',
-                side_effect=RuntimeError('config load failed'),
-            ), pytest.raises(RuntimeError, match='config load failed'):
-                await run_cleanup()  # no config_path → guard skips
-
-            assert os.environ.get('CONFIG_PATH') == 'existing.yaml'
-        finally:
-            if old is None:
-                os.environ.pop('CONFIG_PATH', None)
-            else:
-                os.environ['CONFIG_PATH'] = old
-
-    @pytest.mark.asyncio
-    async def test_config_path_set_during_config_construction(self):
-        """FusedMemoryConfig sees CONFIG_PATH=config_path at construction time."""
-        import os
-
-        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
-
-        captured: dict[str, str | None] = {}
-
-        def capture_config(*args, **kwargs):
-            captured['value'] = os.environ.get('CONFIG_PATH')
-            return MagicMock()
-
-        old = os.environ.get('CONFIG_PATH')
-        os.environ.pop('CONFIG_PATH', None)
-        try:
-            mock_service = AsyncMock()
-            with (
-                patch('fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig', side_effect=capture_config),
-                patch('fused_memory.maintenance.cleanup_stale_edges.MemoryService', return_value=mock_service),
-                patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
-            ):
-                mock_mgr = MagicMock()
-                mock_mgr.cleanup = AsyncMock(return_value=MagicMock(edges_found=0, edges_deleted=0))
-                mock_mgr_cls.return_value = mock_mgr
-
-                await run_cleanup(config_path='/tmp/custom.yaml')
-
-            assert captured['value'] == '/tmp/custom.yaml'
-            assert os.environ.get('CONFIG_PATH') is None
-        finally:
-            if old is None:
-                os.environ.pop('CONFIG_PATH', None)
-            else:
-                os.environ['CONFIG_PATH'] = old
-
-    @pytest.mark.asyncio
-    async def test_close_exception_does_not_mask_original_error(self):
-        """When both cleanup and close() raise, the original error propagates."""
-        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
-
-        mock_cfg = MagicMock()
-        mock_service = AsyncMock()
-        mock_service.close = AsyncMock(side_effect=RuntimeError('close error'))
-
-        with (
-            patch('fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig', return_value=mock_cfg),
-            patch('fused_memory.maintenance.cleanup_stale_edges.MemoryService', return_value=mock_service),
-            patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
-        ):
-            mock_mgr = MagicMock()
-            mock_mgr.cleanup = AsyncMock(side_effect=RuntimeError('original'))
-            mock_mgr_cls.return_value = mock_mgr
-
-            with pytest.raises(RuntimeError, match='original'):
-                await run_cleanup()
-
-    @pytest.mark.asyncio
-    async def test_skips_close_when_service_never_created(self):
-        """When FusedMemoryConfig raises, service is None and close() is never called."""
-        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
-
-        with (
-            patch(
-                'fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig',
-                side_effect=RuntimeError('config failed'),
-            ),
-            patch('fused_memory.maintenance.cleanup_stale_edges.MemoryService') as mock_svc_cls,
-            pytest.raises(RuntimeError, match='config failed'),
-        ):
-            await run_cleanup()
-
-        mock_svc_cls.assert_not_called()  # MemoryService never instantiated
-        mock_svc_cls.return_value.close.assert_not_called()
-
-
 # ---------------------------------------------------------------------------
 # step-3: run_cleanup delegates to maintenance_service
 # ---------------------------------------------------------------------------
 
 class TestRunCleanupDelegation:
-    """run_cleanup() delegates service lifecycle to maintenance_service()."""
+    """run_cleanup() delegates service lifecycle to maintenance_service().
+
+    (Replaces TestRunCleanupEdgeCases — lifecycle behaviour is fully covered
+    by TestMaintenanceService in test_maintenance_utils.py.)
+    """
 
     @pytest.mark.asyncio
     async def test_delegates_to_maintenance_service(self):
