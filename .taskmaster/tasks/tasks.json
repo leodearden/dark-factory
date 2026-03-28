@@ -4399,6 +4399,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 268,
+        "title": "Add length cap to repr() in validation error messages",
+        "description": "validate_project_id and validate_run_id embed raw user-supplied values via repr() in error messages without any length cap. An adversarial or buggy caller passing a multi-megabyte string would produce a huge error dict that propagates through logging, serialization, and MCP responses.\n\nSteps:\n1. Add a truncation helper (e.g. `_safe_repr(value: str, max_len: int = 200) -> str`) that truncates repr output\n2. Apply it in validate_project_id and validate_run_id error messages\n3. Add tests verifying that very long inputs produce truncated error messages\n4. Check if validate_project_root has the same issue and fix if so\n\nmemory_hint: search \"validation error message format\" for conventions; search \"prompt injection fix\" for related safety patterns.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -4411,7 +4422,7 @@
       ],
       "created": "2026-03-28T05:30:43.473Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T05:30:43.476Z"
+      "updated": "2026-03-28T05:30:48.160Z"
     }
   }
 }
