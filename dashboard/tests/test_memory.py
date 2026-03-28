@@ -64,8 +64,8 @@ class _SessionAwareHandler:
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         port = request.url.port
-        if port is not None:
-            self.ports_seen.add(port)
+        assert port is not None, f'Request to {request.url} has no port'
+        self.ports_seen.add(port)
 
         if self.fail_port is not None and port == self.fail_port:
             raise httpx.ConnectError('refused')
