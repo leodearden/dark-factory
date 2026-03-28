@@ -1095,21 +1095,37 @@ class MemoryService:
         Returns:
             Dict from backend: {uuid, name, old_summary, new_summary, edge_count}.
         """
-        result = await self.graphiti.refresh_entity_summary(entity_uuid)
-
-        if self._write_journal:
-            await self._write_journal.log_write_op(
-                write_op_id=str(uuid_mod.uuid4()),
-                causation_id=causation_id,
-                source=_source,
-                operation='refresh_entity_summary',
-                project_id=project_id,
-                agent_id=agent_id,
-                session_id=session_id,
-                params={'entity_uuid': entity_uuid},
-                result_summary=result,
-                success=True,
-            )
+        write_op_id = str(uuid_mod.uuid4())
+        success = True
+        error_msg = None
+        result: dict = {}
+        try:
+            result = await self.graphiti.refresh_entity_summary(entity_uuid)
+        except Exception as e:
+            success = False
+            error_msg = str(e)
+            raise
+        finally:
+            if self._write_journal:
+                try:
+                    await self._write_journal.log_write_op(
+                        write_op_id=write_op_id,
+                        causation_id=causation_id,
+                        source=_source,
+                        operation='refresh_entity_summary',
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        params={'entity_uuid': entity_uuid},
+                        result_summary=result if success else None,
+                        success=success,
+                        error=error_msg,
+                    )
+                except Exception as journal_exc:
+                    logger.warning(
+                        'refresh_entity_summary: journal log_write_op failed: %s',
+                        journal_exc,
+                    )
 
         return result
 
