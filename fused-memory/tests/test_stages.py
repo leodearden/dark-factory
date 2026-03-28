@@ -887,12 +887,12 @@ class TestRunIdValidation(BaseStageValidationTest):
             )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('bad_run_id,vector_name', [
-        ('run\nid', 'newline'),
-        ('run`id', 'backtick'),
-        ('run;id', 'semicolon'),
-    ])
-    async def test_run_raises_on_injection_run_id(self, mock_deps, bad_run_id, vector_name):
+    @pytest.mark.parametrize('bad_run_id', [
+        'run\nid',
+        'run`id',
+        'run;id',
+    ], ids=['newline', 'backtick', 'semicolon'])
+    async def test_run_raises_on_injection_run_id(self, mock_deps, bad_run_id):
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
