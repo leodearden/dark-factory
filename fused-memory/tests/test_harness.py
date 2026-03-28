@@ -1113,3 +1113,52 @@ class TestSelectTier:
         assert captured.get('model') == 'sonnet', (
             f"Expected model='sonnet' forwarded as kwarg to stage.run(), got {captured.get('model')!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_does_not_mutate_non_consolidator_stages(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """isinstance guard ensures episode_limit/memory_limit are NOT set on Stage 2 and 3."""
+        from fused_memory.reconciliation.harness import TierConfig
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # Capture hasattr state at the moment each non-consolidator stage.run() fires
+        non_consolidator_hasattr: dict[str, dict] = {}
+
+        for stage in harness.stages:
+            if isinstance(stage, MemoryConsolidator):
+                _mock_stage_run(stage)
+            else:
+                stage_name = type(stage).__name__
+
+                async def capture_hasattr(s, _name=stage_name):
+                    non_consolidator_hasattr[_name] = {
+                        'episode_limit': hasattr(s, 'episode_limit'),
+                        'memory_limit': hasattr(s, 'memory_limit'),
+                    }
+
+                _mock_stage_run(stage, before_return=capture_hasattr)
+
+        tier = TierConfig(model='sonnet', episode_limit=125, memory_limit=250)
+        await harness.run_full_cycle(
+            'test-project',
+            'isinstance-guard-test',
+            tier=tier,
+            events=[_make_event()],
+        )
+
+        assert non_consolidator_hasattr, (
+            'No non-MemoryConsolidator stages were invoked — stage list changed?'
+        )
+
+        for stage_name, attrs in non_consolidator_hasattr.items():
+            assert not attrs['episode_limit'], (
+                f"{stage_name}.episode_limit was set by run_full_cycle — "
+                "isinstance guard at harness.py:417 may have been removed or widened"
+            )
+            assert not attrs['memory_limit'], (
+                f"{stage_name}.memory_limit was set by run_full_cycle — "
+                "isinstance guard at harness.py:417 may have been removed or widened"
+            )
