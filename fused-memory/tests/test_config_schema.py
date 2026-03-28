@@ -3,6 +3,7 @@
 import os
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from fused_memory.config.schema import (
@@ -127,6 +128,21 @@ class TestFusedMemoryConfigDefaults:
             graphiti=GraphitiBackendConfig(provider='falkordb'),
         )
         assert config.server.transport == 'stdio'
+        assert config.llm.provider == 'anthropic'
+
+    def test_yaml_file_values_loaded(self, tmp_path, monkeypatch):
+        # Write a YAML file with non-default values to exercise the full
+        # YamlSettingsSource.__call__ + YAML-parsing branch (lines 61-63 of schema.py)
+        config_data = {
+            'server': {'port': 9999, 'transport': 'sse'},
+            'llm': {'provider': 'anthropic'},
+        }
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(yaml.dump(config_data))
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+        config = FusedMemoryConfig()
+        assert config.server.port == 9999
+        assert config.server.transport == 'sse'
         assert config.llm.provider == 'anthropic'
 
 
