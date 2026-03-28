@@ -4977,7 +4977,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_recon_panel.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 288,
@@ -4988,7 +4996,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "orchestrator/src/orchestrator/config.py"
+          ],
+          "modules": [
+            "orchestrator"
+          ]
+        }
       },
       {
         "id": 289,
