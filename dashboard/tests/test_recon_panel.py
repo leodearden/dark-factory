@@ -229,6 +229,17 @@ class TestPartitionBurstState:
         assert len(active) == 1
         assert len(idle) == 0
 
+    def test_non_idle_state_missing_last_write_at_is_active(self):
+        # Agent with state='bursting' and no 'last_write_at' key is classified active.
+        # The early return (state != 'idle') fires before the timestamp lookup,
+        # so the missing last_write_at key is irrelevant and does not raise KeyError.
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': 'bursting'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 1
+        assert len(idle) == 0
+
 
 class TestFormatDuration:
     """Tests for the format_duration Jinja2 filter (accepts seconds)."""
