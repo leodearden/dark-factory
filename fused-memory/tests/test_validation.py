@@ -247,6 +247,46 @@ class TestValidateProjectId:
         result = validate_project_id('x')
         assert result is None
 
+    def test_newline_in_middle_returns_error(self):
+        result = validate_project_id('proj\nid')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_backtick_returns_error(self):
+        result = validate_project_id('proj`id')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_double_quote_returns_error(self):
+        result = validate_project_id('proj"id')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_single_quote_returns_error(self):
+        result = validate_project_id("proj'id")
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_curly_brace_returns_error(self):
+        result = validate_project_id('proj{id}')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_semicolon_returns_error(self):
+        result = validate_project_id('proj;id')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_dollar_sign_returns_error(self):
+        result = validate_project_id('proj$id')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_space_in_middle_returns_error(self):
+        result = validate_project_id('proj id')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
 
 class TestValidatorErrorDictShape:
     """All validate_* functions return dicts with exactly 'error' and 'error_type' keys."""
