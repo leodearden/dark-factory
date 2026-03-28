@@ -227,3 +227,80 @@ class TestRefreshEntitySummary:
         backend.update_node_summary = AsyncMock()
         result = await backend.refresh_entity_summary('node-uuid-2')
         assert result['old_summary'] == 'prior summary text'
+
+
+# ---------------------------------------------------------------------------
+# step-7: MemoryService.refresh_entity_summary
+# ---------------------------------------------------------------------------
+
+class TestMemoryServiceRefreshEntitySummary:
+    """MemoryService.refresh_entity_summary() delegates to graphiti backend."""
+
+    @pytest.fixture
+    def service(self, mock_config):
+        """MemoryService with mocked backends (no real DB needed)."""
+        from fused_memory.services.memory_service import MemoryService
+        svc = MemoryService(mock_config)
+        svc.graphiti = MagicMock()
+        svc.graphiti.refresh_entity_summary = AsyncMock(return_value={
+            'uuid': 'node-1',
+            'name': 'Alice',
+            'old_summary': 'old',
+            'new_summary': 'Alice knows Bob',
+            'edge_count': 1,
+        })
+        svc.mem0 = MagicMock()
+        svc.durable_queue = MagicMock()
+        svc.durable_queue.enqueue = AsyncMock(return_value=1)
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_graphiti_backend(self, service):
+        """Calls graphiti.refresh_entity_summary with entity_uuid."""
+        result = await service.refresh_entity_summary(
+            entity_uuid='node-1',
+            project_id='dark_factory',
+        )
+        service.graphiti.refresh_entity_summary.assert_awaited_once_with('node-1')
+        assert result['uuid'] == 'node-1'
+        assert result['edge_count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_logs_via_write_journal_when_present(self, service):
+        """Logs write op via write journal when journal is set."""
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        service.set_write_journal(mock_journal)
+        await service.refresh_entity_summary(
+            entity_uuid='node-1',
+            project_id='dark_factory',
+            agent_id='test-agent',
+        )
+        mock_journal.log_write_op.assert_awaited_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs.get('operation') == 'refresh_entity_summary'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_works_without_journal(self, service):
+        """Works correctly when no write journal is set (journal=None)."""
+        # Ensure no journal is set
+        service._write_journal = None
+        result = await service.refresh_entity_summary(
+            entity_uuid='node-1',
+            project_id='dark_factory',
+        )
+        assert result['uuid'] == 'node-1'
+
+    @pytest.mark.asyncio
+    async def test_returns_backend_result(self, service):
+        """Returns the result dict from the backend unchanged."""
+        result = await service.refresh_entity_summary(
+            entity_uuid='node-1',
+            project_id='test_project',
+        )
+        assert 'uuid' in result
+        assert 'name' in result
+        assert 'old_summary' in result
+        assert 'new_summary' in result
+        assert 'edge_count' in result
