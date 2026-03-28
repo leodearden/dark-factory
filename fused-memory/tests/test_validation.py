@@ -2,7 +2,12 @@
 
 import pytest
 
-from fused_memory.utils.validation import validate_run_id
+from fused_memory.utils.validation import (
+    require_project_root,
+    validate_project_id,
+    validate_project_root,
+    validate_run_id,
+)
 
 
 class TestValidateRunId:
@@ -111,4 +116,22 @@ class TestValidateRunId:
             'validate_run_id accepted UUID with trailing newline — likely using .match() '
             'instead of .fullmatch(). Switch to re.fullmatch() to fix.'
         )
+        assert result['error_type'] == 'ValidationError'
+
+
+class TestValidateProjectRoot:
+    """validate_project_root returns None for valid absolute paths, error dict otherwise."""
+
+    def test_rejects_whitespace_only(self):
+        result = validate_project_root('   ')
+        assert result is not None
+        assert 'error' in result
+        assert 'error_type' in result
+        assert result['error_type'] == 'ValidationError'
+
+    def test_rejects_tab_only(self):
+        result = validate_project_root('\t')
+        assert result is not None
+        assert 'error' in result
+        assert 'error_type' in result
         assert result['error_type'] == 'ValidationError'
