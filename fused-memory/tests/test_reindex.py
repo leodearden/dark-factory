@@ -983,6 +983,55 @@ class TestRunReindex:
 # step-1: run_reindex() CONFIG_PATH env-var save/restore edge cases
 # ---------------------------------------------------------------------------
 
+class TestRunReindexConfigPathPropagation:
+    """Integration: config_path argument propagates to CONFIG_PATH for FusedMemoryConfig."""
+
+    @pytest.mark.asyncio
+    async def test_config_path_set_during_config_construction(self):
+        """FusedMemoryConfig sees CONFIG_PATH=config_path at construction time."""
+        import os
+
+        from fused_memory.maintenance.reindex import run_reindex
+
+        captured: dict[str, str | None] = {}
+
+        def capture_config(*args, **kwargs):
+            mock_cfg = MagicMock()
+            captured['value'] = os.environ.get('CONFIG_PATH')
+            mock_cfg.embedder.dimensions = 1536
+            mock_cfg.embedder.providers.openai.api_key = 'test-key'
+            mock_cfg.embedder.model = 'text-embedding-3-small'
+            return mock_cfg
+
+        old = os.environ.get('CONFIG_PATH')
+        os.environ.pop('CONFIG_PATH', None)
+        try:
+            mock_service = AsyncMock()
+            mock_service.durable_queue = MagicMock()
+            mock_result = {'reindex_result': MagicMock(), 'replay_count': 0}
+
+            with (
+                patch('fused_memory.maintenance.reindex.FusedMemoryConfig', side_effect=capture_config),
+                patch('fused_memory.maintenance.reindex.MemoryService', return_value=mock_service),
+                patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig'),
+                patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+                patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
+            ):
+                mock_mgr = MagicMock()
+                mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+                mock_mgr_cls.return_value = mock_mgr
+
+                await run_reindex(config_path='/tmp/custom.yaml')
+
+            assert captured['value'] == '/tmp/custom.yaml'
+            assert os.environ.get('CONFIG_PATH') is None
+        finally:
+            if old is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = old
+
+
 class TestRunReindexEnvVarRestore:
     """run_reindex() correctly saves and restores CONFIG_PATH in all branches."""
 
