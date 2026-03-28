@@ -75,37 +75,44 @@ async def test_update_task_metadata_none_passed_through(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('param_name,tool_args,expected_key,expected_value', [
-    ('prompt', {'prompt': 'Update desc'}, 'prompt', 'Update desc'),
-    ('append', {'prompt': 'Extra', 'append': True}, 'append', True),
-    ('tag', {'tag': 'v2'}, 'tag', 'v2'),
-])
-async def test_update_task_param_forwarded_to_interceptor(
-    param_name, tool_args, expected_key, expected_value,
-    mcp_server_with_tasks, task_interceptor,
+@pytest.mark.parametrize(
+    'tool_args, expected_overrides',
+    [
+        pytest.param(
+            {'id': '1', 'project_root': '/project', 'prompt': 'Update the description'},
+            {'prompt': 'Update the description', 'append': False, 'tag': None},
+            id='prompt-forwarded',
+        ),
+        pytest.param(
+            {'id': '1', 'project_root': '/project', 'prompt': 'Extra info', 'append': True},
+            {'prompt': 'Extra info', 'append': True, 'tag': None},
+            id='append-true',
+        ),
+        pytest.param(
+            {'id': '1', 'project_root': '/project', 'tag': 'v2'},
+            {'prompt': None, 'append': False, 'tag': 'v2'},
+            id='tag-forwarded',
+        ),
+        pytest.param(
+            {'id': '1', 'project_root': '/project'},
+            {'prompt': None, 'append': False, 'tag': None},
+            id='tag-none',
+        ),
+    ],
+)
+async def test_update_task_param_forwarding(
+    tool_args, expected_overrides, mcp_server_with_tasks, task_interceptor,
 ):
-    """When a parameter is provided, it should be forwarded to the interceptor."""
-    await mcp_server_with_tasks._tool_manager.call_tool(
-        'update_task',
-        {'id': '1', 'project_root': '/project', **tool_args},
-    )
-    task_interceptor.update_task.assert_called_once()
-    _, kwargs = task_interceptor.update_task.call_args
-    assert kwargs[expected_key] == expected_value
-
-
-@pytest.mark.asyncio
-async def test_update_task_tag_default_is_none(
-    mcp_server_with_tasks, task_interceptor,
-):
-    """When tag is omitted, it should default to None in the interceptor call."""
-    await mcp_server_with_tasks._tool_manager.call_tool(
-        'update_task',
-        {'id': '1', 'project_root': '/project'},
-    )
-    task_interceptor.update_task.assert_called_once()
-    _, kwargs = task_interceptor.update_task.call_args
-    assert kwargs['tag'] is None
+    """update_task forwards all parameters to the interceptor with exact kwargs."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool('update_task', tool_args)
+    assert result == {'success': True}
+    base_kwargs = {
+        'task_id': '1',
+        'project_root': '/project',
+        'metadata': None,
+    }
+    expected_kwargs = {**base_kwargs, **expected_overrides}
+    task_interceptor.update_task.assert_called_once_with(**expected_kwargs)
 
 
 # ------------------------------------------------------------------
