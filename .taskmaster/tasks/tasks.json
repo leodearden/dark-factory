@@ -4097,11 +4097,11 @@
         "description": "Post-merge cleanup of test_config_schema.py from task 221 (YamlSettingsSource hardening). Six improvements:\n\n1. **Extract shared _DummySettings and _make_source** — `_DummySettings(BaseSettings)` is defined identically in 4 places (TestYamlSettingsSourceEnvVarExpansion.setup_method, TestYamlSettingsSourceErrorHandling._make_source, TestYamlSettingsSourceEncoding._make_source, TestYamlSettingsSourceABCContract.setup_method). Extract to a module-level helper or pytest fixture.\n\n2. **Move inline imports to module level** — `from pydantic_settings import BaseSettings` appears inside 3 methods; `from pydantic.fields import FieldInfo` inside 1 test body. Move both to module-level import block.\n\n3. **Use re.escape in pytest.raises match** — `pytest.raises(RuntimeError, match=str(bad_file))` passes raw path strings as regex. Dots and hyphens in tmp_path are regex metacharacters. Use `re.escape(str(path))` instead.\n\n4. **Add root-user skip for chmod test** — test_unreadable_file_raises_runtime_error only skips Windows but not root, where chmod(0o000) is a no-op. Add `pytest.mark.skipif(os.getuid() == 0, reason='root ignores file permissions')`.\n\n5. **Assert exception chaining** — Implementation uses `raise ... from e` but no test verifies `exc.__cause__` is preserved. Add `assert exc_info.value.__cause__ is not None` to error handling tests.\n\n6. **Improve UTF-8 encoding test** — test_utf8_yaml_loaded_correctly passes on any UTF-8 locale system regardless of the `encoding='utf-8'` parameter. Mock `builtins.open` to assert `encoding='utf-8'` is passed, or verify via a more robust approach.\n\nmemory_hints:\n- search: \"YamlSettingsSource test helpers test_config_schema\"\n- entity: \"test_config_schema.py\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T05:07:13.401Z",
+        "updatedAt": "2026-03-28T15:25:36.256Z",
         "metadata": {
           "modules": [
             "fused-memory/tests/test_config_schema.py"
@@ -4114,11 +4114,11 @@
         "description": "agent.get('state', 'idle') returns None (not 'idle') when state is explicitly set to None. This silently classifies the agent as active without any timestamp check — likely not the intended behavior.",
         "details": "## Problem\n\n`partition_burst_state` uses `agent.get('state', 'idle')` to default missing keys to 'idle'. However, if the dict contains `{'state': None}`, `.get()` returns `None` (the default only applies to missing keys, not None values). Since `None != 'idle'` is True, the agent is classified as **active** without any timestamp check.\n\nWhile `get_burst_state` in production currently only emits 'idle' or 'bursting', `partition_burst_state` is a public utility function that could receive arbitrary dicts.\n\n## Fix\n\n1. Decide the intended contract: should `state=None` be treated as idle?\n2. If yes, change `agent.get('state', 'idle')` to `agent.get('state') or 'idle'` in reconciliation.py:54.\n3. Add a test for the `state=None` case documenting the chosen behavior.\n\n## Memory hints\n- search: \"partition_burst_state state None edge case\"\n- search: \"get_burst_state state values idle bursting\"",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T05:04:42.510Z",
+        "updatedAt": "2026-03-28T15:25:36.280Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data",
@@ -5032,7 +5032,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T15:25:36.230Z",
+      "lastModified": "2026-03-28T15:25:36.280Z",
       "taskCount": 268,
       "completedCount": 207,
       "tags": [
