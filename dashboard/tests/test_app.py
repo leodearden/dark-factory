@@ -20,6 +20,14 @@ PARTIAL_URLS = (
     "/partials/memory-graphs",
 )
 
+SECTION_TIMEOUTS = (
+    ("/partials/memory", 8000),
+    ("/partials/recon", 12000),
+    ("/partials/orchestrators", 8000),
+    ("/partials/performance", 12000),
+    ("/partials/memory-graphs", 10000),
+)
+
 
 class TestIdiomorphExtension:
     """Tests for idiomorph extension setup in base.html."""
@@ -615,7 +623,27 @@ class TestHtmxErrorHandling:
 
 
 class TestHtmxTimeout:
-    """Tests that polling sections have correct hx-request timeout attributes."""
+    """Tests that polling sections have correct hx-request timeout attributes.
+
+    Actual poll intervals and timeout values:
+    - /partials/memory: poll 10s, timeout 8000ms
+    - /partials/recon: poll 15s, timeout 12000ms
+    - /partials/orchestrators: poll 10s, timeout 8000ms
+    - /partials/performance: poll 30s, timeout 12000ms
+    - /partials/memory-graphs: poll 60s, timeout 10000ms
+    """
+
+    @pytest.mark.parametrize('partial_url,timeout_ms', SECTION_TIMEOUTS)
+    def test_section_has_correct_timeout(self, client, partial_url, timeout_ms):
+        html = client.get('/').text
+        hx_get = f'hx-get="{partial_url}"'
+        idx = html.find(hx_get)
+        assert idx != -1, f'hx-get for {partial_url} not found in HTML'
+        section_html = html[idx - 200:idx + 500]
+        assert (
+            f'"timeout": {timeout_ms}' in section_html
+            or f'"timeout":{timeout_ms}' in section_html
+        ), f'timeout {timeout_ms} not found near {partial_url}'
 
     def test_memory_section_has_timeout_8000(self, client):
         html = client.get('/').text
