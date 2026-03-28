@@ -179,6 +179,10 @@ class TestRequireProjectRoot:
         with pytest.raises(ValueError):
             require_project_root('')
 
+    def test_whitespace_only_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            require_project_root('   ')
+
 
 class TestRequireProjectId:
     """require_project_id raises ValueError for invalid ids, returns None for valid ones."""
