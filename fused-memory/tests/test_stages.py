@@ -910,3 +910,103 @@ class TestProjectIdGuidelineConstants:
         assert 'set_task_status' not in _STAGE3_PROJECT_ID_GUIDELINE
         assert 'add_task' not in _STAGE3_PROJECT_ID_GUIDELINE
 
+
+class TestStagePayloadProjectIdGuideline:
+    """All three stages include the per-stage project_id guideline in their assembled payload."""
+
+    @pytest.fixture
+    def memory_mock(self):
+        m = AsyncMock()
+        m.get_episodes = AsyncMock(return_value=[])
+        m.mem0 = AsyncMock()
+        m.mem0.get_all = AsyncMock(return_value={'results': []})
+        m.get_status = AsyncMock(return_value={})
+        return m
+
+    @pytest.fixture
+    def mock_deps_for_stage(self, memory_mock):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': memory_mock,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('stage_class,stage_id,expected_guideline_import,extra_setup', [
+        (
+            'MemoryConsolidator',
+            StageId.memory_consolidator,
+            '_STAGE1_PROJECT_ID_GUIDELINE',
+            'limits',
+        ),
+        (
+            'TaskKnowledgeSync',
+            StageId.task_knowledge_sync,
+            '_STAGE2_PROJECT_ID_GUIDELINE',
+            'taskmaster',
+        ),
+        (
+            'IntegrityCheck',
+            StageId.integrity_check,
+            '_STAGE3_PROJECT_ID_GUIDELINE',
+            None,
+        ),
+    ])
+    async def test_stage_payload_contains_project_id_guideline(
+        self,
+        mock_deps_for_stage,
+        stage_class,
+        stage_id,
+        expected_guideline_import,
+        extra_setup,
+    ):
+        """Each stage's assembled payload contains the per-stage project_id guideline
+        with the project_id correctly interpolated."""
+        from fused_memory.reconciliation import prompts as prompts_module
+
+        guideline_template = getattr(prompts_module, expected_guideline_import)
+        project_id = 'test_proj'
+        expected_guideline = guideline_template.format(project_id=project_id)
+
+        # Build stage instance
+        cls_map = {
+            'MemoryConsolidator': MemoryConsolidator,
+            'TaskKnowledgeSync': TaskKnowledgeSync,
+            'IntegrityCheck': IntegrityCheck,
+        }
+        stage = cls_map[stage_class](stage_id, **mock_deps_for_stage)
+        stage.project_id = project_id
+
+        if extra_setup == 'limits':
+            stage.episode_limit = 125
+            stage.memory_limit = 250
+        elif extra_setup == 'taskmaster':
+            stage.project_root = '/home/leo/src/test_proj'
+            mock_deps_for_stage['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        watermark = Watermark(project_id=project_id)
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert expected_guideline in payload, (
+            f'{stage_class} payload missing per-stage project_id guideline.\n'
+            f'Expected: {expected_guideline!r}\n'
+            f'Payload snippet: {payload[-500:]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stage2_payload_contains_project_root_instruction(
+        self, mock_deps_for_stage
+    ):
+        """Stage 2 payload additionally includes the project_root= instruction."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_for_stage)
+        stage.project_id = 'test_proj'
+        stage.project_root = '/home/leo/src/test_proj'
+        mock_deps_for_stage['taskmaster'].get_tasks.return_value = {'tasks': []}
+        watermark = Watermark(project_id='test_proj')
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert 'project_root="/home/leo/src/test_proj"' in payload
+
