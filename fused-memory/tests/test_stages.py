@@ -624,6 +624,20 @@ class TestProjectIdValidation:
             # (b) run_stage_via_cli in the base module is no longer the original function
             assert base_module.run_stage_via_cli is not original_run_stage_via_cli
 
+    def test_patch_stage_accepts_cli_side_effect(self, mock_deps):
+        """_patch_stage wires a custom cli_side_effect onto the run_stage_via_cli mock."""
+        import fused_memory.reconciliation.stages.base as base_module
+        from fused_memory.models.reconciliation import StageId
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+
+        async def custom_cli(**kwargs):
+            return StageResult(success=False, report={'summary': 'custom'})
+
+        with self._patch_stage(stage, cli_side_effect=custom_cli):
+            # The patched run_stage_via_cli should have custom_cli as its side_effect
+            assert base_module.run_stage_via_cli.side_effect is custom_cli
+
 
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
