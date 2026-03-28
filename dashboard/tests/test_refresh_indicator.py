@@ -183,3 +183,14 @@ class TestAnimationFallback:
         html = client.get('/').text
         assert '700' in html
 
+
+class TestIntervalCleanup:
+    """Tests that setInterval return value is stored for potential cleanup."""
+
+    def test_setinterval_assigned_to_variable(self, client):
+        """The setInterval return value must be assigned to a variable."""
+        html = client.get('/').text
+        # Matches 'var <name> = setInterval' or 'const <name> = setInterval' etc.
+        import re
+        assert re.search(r'\b(?:var|let|const)\s+\w+\s*=\s*setInterval\b', html) is not None
+
