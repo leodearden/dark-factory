@@ -413,6 +413,37 @@ class TestPerformancePartialIntegration:
             assert resp.status_code == 200
             assert 'No orchestrator run data yet' in resp.text
 
+    @pytest.mark.parametrize('failing_fn', [
+        'get_completion_paths',
+        'get_escalation_rates',
+        'get_loop_histograms',
+        'get_time_centiles',
+    ])
+    def test_performance_partial_failure(self, client, failing_fn):
+        """One failing coroutine should not discard its siblings' data."""
+        with _patch_perf_integration(), patch(
+            f'dashboard.app.{failing_fn}',
+            new_callable=AsyncMock,
+            side_effect=RuntimeError('injected error'),
+        ):
+            resp = client.get('/partials/performance')
+            assert resp.status_code == 200
+            html = resp.text
+            # When paths fails, escalations data (Steward) still renders
+            if failing_fn == 'get_completion_paths':
+                assert 'Steward' in html
+            # When escalations fail, paths data still renders
+            if failing_fn == 'get_escalation_rates':
+                assert 'one-pass' in html
+            # When histograms fail, paths and escalations still render
+            if failing_fn == 'get_loop_histograms':
+                assert 'one-pass' in html
+                assert 'Steward' in html
+            # When ttc fails, paths and escalations still render
+            if failing_fn == 'get_time_centiles':
+                assert 'one-pass' in html
+                assert 'Steward' in html
+
 
 _MG_TIMESERIES = {
     'labels': [f'{h:02d}:00' for h in range(24)],
