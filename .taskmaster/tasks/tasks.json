@@ -4404,11 +4404,11 @@
         "description": "test_tools_validation.py (added in task 253) claims to verify that tools.py delegates validation to shared validators, but every test calls the shared validators directly — none exercise a path through tools.py. The tests would pass identically even if tools.py still used the old private closures.\n\nSpecific issues:\n1. **False coverage**: test_whitespace_only_project_id_is_now_rejected and test_whitespace_only_project_root_is_rejected call shared validators directly, not through any tool handler.\n2. **Vacuous tests**: test_private_validate_project_id_does_not_exist and test_private_validate_project_root_does_not_exist use hasattr() on the module, but the closures were always inside create_mcp_server() and never module-level — these tests pass unconditionally pre- and post-fix.\n3. **Redundant tests**: test_shared_validators_are_importable_from_tools_dependencies, test_valid_project_id_passes, test_valid_project_root_passes duplicate coverage in test_validation.py.\n\nRequired changes:\n1. Replace vacuous/redundant tests with an identity check: `assert tools_module.validate_project_id is validate_project_id` (from utils.validation) — this directly proves delegation by object identity.\n2. Add at least one integration test that invokes a tools.py MCP handler (with mocked MemoryService/TaskInterceptor) passing a whitespace-only project_id and asserts the returned error dict propagates correctly.\n3. Remove tests that duplicate test_validation.py coverage.\n4. Also add test_empty_string_returns_error to TestValidateProjectRoot in test_validation.py for consistency with TestValidateProjectId.\n\nmemory_hint: search \"test_tools_validation.py delegation\" and \"validator consolidation task 253\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T15:25:36.420Z",
+        "updatedAt": "2026-03-28T20:25:05.453Z",
         "metadata": {
           "files": [
             "fused-memory/tests/test_tools_validation.py",
@@ -5053,7 +5053,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T20:25:04.660Z",
+      "lastModified": "2026-03-28T20:25:05.455Z",
       "taskCount": 268,
       "completedCount": 234,
       "tags": [
