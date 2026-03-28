@@ -375,26 +375,7 @@ class TestGetMemoryStatus:
         """
         from dashboard.data.memory import get_memory_status
 
-        ports_seen: set[int] = set()
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            port = request.url.port
-            assert port is not None
-            ports_seen.add(port)
-
-            # First server (port 9000) always fails
-            if port == 9000:
-                raise httpx.ConnectError('refused')
-
-            body = json.loads(request.content)
-            method = body.get('method', '')
-            rid = body.get('id', 1)
-            if method == 'initialize':
-                return _make_init_response(rid)
-            if method.startswith('notifications/'):
-                return _make_notify_response()
-            return _make_mcp_response(_STATUS_PAYLOAD, rid)
-
+        handler = _SessionAwareHandler(_STATUS_PAYLOAD, fail_port=9000)
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await get_memory_status(client, two_url_config)
@@ -402,9 +383,9 @@ class TestGetMemoryStatus:
         assert result == _STATUS_PAYLOAD
         assert 'offline' not in result
         # Prove port 9000 was actually attempted before falling through to 9001
-        assert 9000 in ports_seen
+        assert 9000 in handler.ports_seen
         # Prove the fallback server (9001) was actually reached
-        assert 9001 in ports_seen
+        assert 9001 in handler.ports_seen
 
 
 # ── get_queue_stats (aggregation) ──────────────────────────────
