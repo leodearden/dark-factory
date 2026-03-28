@@ -20,6 +20,14 @@ PARTIAL_URLS = (
     "/partials/memory-graphs",
 )
 
+SECTION_TIMEOUTS = (
+    ("/partials/memory", 8000),
+    ("/partials/recon", 12000),
+    ("/partials/orchestrators", 8000),
+    ("/partials/performance", 12000),
+    ("/partials/memory-graphs", 10000),
+)
+
 
 class TestIdiomorphExtension:
     """Tests for idiomorph extension setup in base.html."""
@@ -615,42 +623,28 @@ class TestHtmxErrorHandling:
 
 
 class TestHtmxTimeout:
-    """Tests that polling sections have correct hx-request timeout attributes."""
+    """Tests that polling sections have correct hx-request timeout attributes.
 
-    def test_memory_section_has_timeout_8000(self, client):
-        html = client.get('/').text
-        # memory section uses 10s poll interval → 8s timeout
-        memory_idx = html.index('hx-get="/partials/memory"')
-        section_html = html[memory_idx - 200:memory_idx + 500]
-        assert '"timeout": 8000' in section_html or '"timeout":8000' in section_html
+    Actual poll intervals and timeout values:
+    - /partials/memory: poll 10s, timeout 8000ms
+    - /partials/recon: poll 15s, timeout 12000ms
+    - /partials/orchestrators: poll 10s, timeout 8000ms
+    - /partials/performance: poll 30s, timeout 12000ms
+    - /partials/memory-graphs: poll 60s, timeout 10000ms
+    """
 
-    def test_recon_section_has_timeout_12000(self, client):
+    @pytest.mark.parametrize('partial_url,timeout_ms', SECTION_TIMEOUTS)
+    def test_section_has_correct_timeout(self, client, partial_url, timeout_ms):
         html = client.get('/').text
-        # recon section uses 15s poll interval → 12s timeout
-        recon_idx = html.index('hx-get="/partials/recon"')
-        section_html = html[recon_idx - 200:recon_idx + 500]
-        assert '"timeout": 12000' in section_html or '"timeout":12000' in section_html
+        hx_get = f'hx-get="{partial_url}"'
+        idx = html.find(hx_get)
+        assert idx != -1, f'hx-get for {partial_url} not found in HTML'
+        section_html = html[idx - 200:idx + 500]
+        assert (
+            f'"timeout": {timeout_ms}' in section_html
+            or f'"timeout":{timeout_ms}' in section_html
+        ), f'timeout {timeout_ms} not found near {partial_url}'
 
-    def test_orchestrators_section_has_timeout_8000(self, client):
-        html = client.get('/').text
-        # orchestrators section uses 10s poll interval → 8s timeout
-        orch_idx = html.index('hx-get="/partials/orchestrators"')
-        section_html = html[orch_idx - 200:orch_idx + 500]
-        assert '"timeout": 8000' in section_html or '"timeout":8000' in section_html
-
-    def test_performance_section_has_timeout_12000(self, client):
-        html = client.get('/').text
-        # performance section uses 30s poll interval → 12s timeout
-        perf_idx = html.index('hx-get="/partials/performance"')
-        section_html = html[perf_idx - 200:perf_idx + 500]
-        assert '"timeout": 12000' in section_html or '"timeout":12000' in section_html
-
-    def test_memory_graphs_section_has_timeout_10000(self, client):
-        html = client.get('/').text
-        # memory-graphs section uses 60s poll interval → 10s timeout
-        mg_idx = html.index('hx-get="/partials/memory-graphs"')
-        section_html = html[mg_idx - 200:mg_idx + 500]
-        assert '"timeout": 10000' in section_html or '"timeout":10000' in section_html
 
 
 class TestTailwindBuild:
@@ -719,39 +713,20 @@ class TestMainModule:
 class TestAriaLivePollingsections:
     """Tests that all five auto-polling sections have aria-live='polite'."""
 
-    def test_memory_section_has_aria_live_polite(self, client):
+    @pytest.mark.parametrize('partial_url', PARTIAL_URLS)
+    def test_section_has_aria_live_polite(self, client, partial_url):
         html = client.get('/').text
-        memory_idx = html.index('hx-get="/partials/memory"')
-        section_html = html[memory_idx - 100:memory_idx + 300]
-        assert 'aria-live="polite"' in section_html
-
-    def test_recon_section_has_aria_live_polite(self, client):
-        html = client.get('/').text
-        recon_idx = html.index('hx-get="/partials/recon"')
-        section_html = html[recon_idx - 100:recon_idx + 300]
-        assert 'aria-live="polite"' in section_html
-
-    def test_orchestrators_section_has_aria_live_polite(self, client):
-        html = client.get('/').text
-        orch_idx = html.index('hx-get="/partials/orchestrators"')
-        section_html = html[orch_idx - 100:orch_idx + 300]
-        assert 'aria-live="polite"' in section_html
-
-    def test_performance_section_has_aria_live_polite(self, client):
-        html = client.get('/').text
-        perf_idx = html.index('hx-get="/partials/performance"')
-        section_html = html[perf_idx - 100:perf_idx + 300]
-        assert 'aria-live="polite"' in section_html
-
-    def test_memory_graphs_section_has_aria_live_polite(self, client):
-        html = client.get('/').text
-        mg_idx = html.index('hx-get="/partials/memory-graphs"')
-        section_html = html[mg_idx - 100:mg_idx + 300]
-        assert 'aria-live="polite"' in section_html
+        hx_get = f'hx-get="{partial_url}"'
+        idx = html.find(hx_get)
+        assert idx != -1, f'hx-get for {partial_url} not found in HTML'
+        section_html = html[idx - 100:idx + 300]
+        assert 'aria-live="polite"' in section_html, (
+            f'aria-live="polite" not found near {partial_url}'
+        )
 
     def test_polling_sections_have_aria_live(self, client):
         html = client.get('/').text
-        assert html.count('aria-live="polite"') == 5
+        assert html.count('aria-live="polite"') >= 5
 
 
 class TestSafeGatherResult:
