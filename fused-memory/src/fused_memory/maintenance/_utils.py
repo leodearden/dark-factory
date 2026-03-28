@@ -19,6 +19,12 @@ def override_config_path(config_path: str | None) -> Generator[None, None, None]
     - On exit (normal **or** exceptional) the original state is restored:
       if CONFIG_PATH was absent before entry it is popped; if it had a
       value that value is reinstated.
+
+    .. warning:: **Not thread-safe.**  This context manager mutates
+       ``os.environ`` without any locking.  Concurrent calls within the
+       same process will race on the ``CONFIG_PATH`` key.  Use only from
+       a single thread (or a single ``asyncio`` event loop with no
+       concurrent tasks that also call this function).
     """
     if config_path is None:
         yield

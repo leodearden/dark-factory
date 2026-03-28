@@ -445,6 +445,42 @@ class TestRunCleanupEdgeCases:
                 os.environ['CONFIG_PATH'] = old
 
     @pytest.mark.asyncio
+    async def test_config_path_set_during_config_construction(self):
+        """FusedMemoryConfig sees CONFIG_PATH=config_path at construction time."""
+        import os
+
+        from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
+
+        captured: dict[str, str | None] = {}
+
+        def capture_config(*args, **kwargs):
+            captured['value'] = os.environ.get('CONFIG_PATH')
+            return MagicMock()
+
+        old = os.environ.get('CONFIG_PATH')
+        os.environ.pop('CONFIG_PATH', None)
+        try:
+            mock_service = AsyncMock()
+            with (
+                patch('fused_memory.maintenance.cleanup_stale_edges.FusedMemoryConfig', side_effect=capture_config),
+                patch('fused_memory.maintenance.cleanup_stale_edges.MemoryService', return_value=mock_service),
+                patch('fused_memory.maintenance.cleanup_stale_edges.CleanupManager') as mock_mgr_cls,
+            ):
+                mock_mgr = MagicMock()
+                mock_mgr.cleanup = AsyncMock(return_value=MagicMock(edges_found=0, edges_deleted=0))
+                mock_mgr_cls.return_value = mock_mgr
+
+                await run_cleanup(config_path='/tmp/custom.yaml')
+
+            assert captured['value'] == '/tmp/custom.yaml'
+            assert os.environ.get('CONFIG_PATH') is None
+        finally:
+            if old is None:
+                os.environ.pop('CONFIG_PATH', None)
+            else:
+                os.environ['CONFIG_PATH'] = old
+
+    @pytest.mark.asyncio
     async def test_close_exception_does_not_mask_original_error(self):
         """When both cleanup and close() raise, the original error propagates."""
         from fused_memory.maintenance.cleanup_stale_edges import run_cleanup
