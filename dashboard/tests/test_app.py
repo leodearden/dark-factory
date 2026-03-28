@@ -483,6 +483,19 @@ class TestMemoryGraphsPartialIntegration:
             assert 'By agent' in html
             assert 'new Chart' in html
 
+    def test_memory_graphs_empty(self, client):
+        with _patch_memory_graphs_integration(
+            timeseries={'labels': [], 'reads': [], 'writes': []},
+            operations={'labels': [], 'values': []},
+            agents={'labels': [], 'values': []},
+        ):
+            resp = client.get('/partials/memory-graphs')
+            assert resp.status_code == 200
+            html = resp.text
+            assert 'memoryTimeseriesChart' in html
+            assert 'memoryOpsChart' in html
+            assert 'memoryAgentChart' in html
+
 
 class TestHtmxErrorHandling:
     """Tests for global HTMX error handler script in base.html."""
