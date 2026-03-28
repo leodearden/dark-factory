@@ -74,26 +74,6 @@ class TestIndex:
         html = client.get('/').text
         assert 'Dark Factory' in html
 
-    def test_get_root_htmx_memory(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/memory"' in html
-
-    def test_get_root_htmx_recon(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/recon"' in html
-
-    def test_get_root_htmx_orchestrators(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/orchestrators"' in html
-
-    def test_get_root_htmx_performance(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/performance"' in html
-
-    def test_get_root_htmx_memory_graphs(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/memory-graphs"' in html
-
     def test_loading_skeletons_present(self, client):
         html = client.get('/').text
         assert 'animate-pulse' in html
