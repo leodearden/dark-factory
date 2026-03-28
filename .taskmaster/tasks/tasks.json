@@ -4605,6 +4605,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 284,
+        "title": "Fix format_duration: OverflowError, sub-second truncation, and buffer age color tests",
+        "description": "dashboard/src/dashboard/app.py format_duration has correctness issues:\n\n1. int(float('inf')) raises OverflowError not caught by except (TypeError, ValueError) — add OverflowError to the clause\n2. Sub-second positive floats (0 < value < 1) truncate to 0 then return '-' — use round() before int()\n3. Missing test: format_duration(float('inf')) should return '-'\n4. test_small_age_displays_minutes_and_seconds uses 600s (> 300 threshold) but doesn't assert text-yellow-400\n5. No boundary test at exactly 300 seconds (strict > means 300 should be gray, 301 yellow)",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -4617,7 +4628,7 @@
       ],
       "created": "2026-03-28T07:37:31.561Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T07:38:07.658Z"
+      "updated": "2026-03-28T07:38:16.811Z"
     }
   }
 }
