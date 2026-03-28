@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -44,6 +45,7 @@ from dashboard.data.write_journal import (
 )
 
 _pkg_dir = Path(__file__).parent
+logger = logging.getLogger(__name__)
 
 templates = Jinja2Templates(directory=str(_pkg_dir / 'templates'))
 
@@ -262,11 +264,17 @@ async def memory_graphs_partial(request: Request):
     config = request.app.state.config
     pool: DbPool = request.app.state.db
     db = await pool.get(config.write_journal_db)
-    timeseries, operations, agents = await asyncio.gather(
-        get_memory_timeseries(db),
-        get_operations_breakdown(db),
-        get_agent_breakdown(db),
-    )
+    try:
+        timeseries, operations, agents = await asyncio.gather(
+            get_memory_timeseries(db),
+            get_operations_breakdown(db),
+            get_agent_breakdown(db),
+        )
+    except Exception:
+        logger.warning('Error fetching memory graphs data', exc_info=True)
+        timeseries = {'labels': [], 'reads': [], 'writes': []}
+        operations = {'labels': [], 'values': []}
+        agents = {'labels': [], 'values': []}
     return templates.TemplateResponse(
         request, 'partials/memory_graphs.html',
         context={
@@ -355,12 +363,16 @@ async def partials_performance(request: Request):
     db = await pool.get(config.runs_db)
     esc_dir = config.escalations_dir
 
-    paths, escalations, histograms, ttc = await asyncio.gather(
-        get_completion_paths(db, esc_dir),
-        get_escalation_rates(db, esc_dir),
-        get_loop_histograms(db),
-        get_time_centiles(db),
-    )
+    try:
+        paths, escalations, histograms, ttc = await asyncio.gather(
+            get_completion_paths(db, esc_dir),
+            get_escalation_rates(db, esc_dir),
+            get_loop_histograms(db),
+            get_time_centiles(db),
+        )
+    except Exception:
+        logger.warning('Error fetching performance data', exc_info=True)
+        paths, escalations, histograms, ttc = {}, {}, {}, {}
     return templates.TemplateResponse(
         request, 'partials/performance.html',
         context={
