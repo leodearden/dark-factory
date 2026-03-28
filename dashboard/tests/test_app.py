@@ -38,6 +38,16 @@ class TestMorphSwap:
         assert 'hx-swap="morph:innerHTML"' in html
         assert 'hx-get="/partials/orchestrators"' in html
 
+    def test_performance_section_uses_morph(self, client):
+        html = client.get('/').text
+        assert 'hx-swap="morph:innerHTML"' in html
+        assert 'hx-get="/partials/performance"' in html
+
+    def test_memory_graphs_section_uses_morph(self, client):
+        html = client.get('/').text
+        assert 'hx-swap="morph:innerHTML"' in html
+        assert 'hx-get="/partials/memory-graphs"' in html
+
     def test_no_plain_innerhtml_on_polling_sections(self, client):
         html = client.get('/').text
         assert 'hx-swap="innerHTML"' not in html
