@@ -149,7 +149,7 @@ class TestValidateProjectRoot:
         assert 'error_type' in result
         assert result['error_type'] == 'ValidationError'
 
-    def test_rejects_empty_string(self):
+    def test_empty_string_returns_error(self):
         result = validate_project_root('')
         assert result is not None
         assert 'error' in result
