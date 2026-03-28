@@ -822,3 +822,17 @@ class TestTierConfig:
         assert isinstance(result, str)
         assert 'Stage 1' in result
 
+    @pytest.mark.asyncio
+    async def test_remediation_path_also_validates_limits(self):
+        config = ReconciliationConfig()
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator,
+            AsyncMock(), AsyncMock(), AsyncMock(), config,
+        )
+        stage.project_id = 'test_project'
+        # Set remediation findings but leave limits as None
+        stage.remediation_findings = [{'description': 'test finding'}]
+        watermark = Watermark(project_id='test_project')
+        with pytest.raises(ValueError, match='episode_limit and memory_limit must be explicitly set'):
+            await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
