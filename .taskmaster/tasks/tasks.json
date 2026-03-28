@@ -3709,12 +3709,13 @@
         "description": "Post-merge cleanup from Task 142 review. Two issues in fused-memory/tests/test_stages.py:\n\n1. **Deferred imports** — `contextmanager` and `patch` are imported inside `patch_stage()` (lines 56-57), and `StageResult` is imported inside `fake_run_stage_via_cli()` (line 44) and again inline in `test_fake_run_stage_via_cli_returns_stage_result` (line 105). These should all be top-level imports alongside the existing `from unittest.mock import AsyncMock`. The module already imports from `cli_stage_runner` at top level (lines 9-18) — add `StageResult` there.\n\n2. **Hollow/incomplete tests in TestModuleLevelHelpers:**\n   - `test_patch_stage_accepts_cli_side_effect` (line 121) creates the context manager but never enters it. The only assertion (`ctx is not None`) is trivially true. Fix: enter the context and verify the custom side_effect is wired (e.g., inspect the patched mock's `side_effect` attribute or run the stage and confirm the custom result).\n   - `test_patch_stage_patches_assemble_payload_and_run_stage` (line 111) only asserts on `assemble_payload` but not `run_stage_via_cli`. Fix: inside the `with` block, verify `fused_memory.reconciliation.stages.base.run_stage_via_cli` has been replaced with a mock.\n\nmemory_hints:\n- search: \"test_stages.py deferred imports patch_stage\"\n- search: \"test helper hollow test patch_stage_accepts_cli_side_effect\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "142"
         ],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T01:04:47.727Z"
       },
       {
         "id": "217",
@@ -3879,7 +3880,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T01:04:45.116Z",
+      "lastModified": "2026-03-28T01:04:47.728Z",
       "taskCount": 208,
       "completedCount": 166,
       "tags": [
