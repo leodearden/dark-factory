@@ -24,7 +24,6 @@ The user will be in one of these situations. Read the request and jump to the ma
 | No arguments given (bare `/orchestrate`) | [Execute Tasks](#execute-tasks) — run all pending tasks |
 | "What's the status?" / "How are the tasks going?" | [Check Status](#check-status) |
 | "Task X is blocked" / "Something failed" | [Resolve Blocks](#resolve-blocks) |
-| "An agent escalated" / escalation notification | [Handle Escalations](#handle-escalations) |
 | Tasks already exist in Taskmaster, user wants to execute them | [Execute Tasks](#execute-tasks) (skip decomposition) |
 | Docker/services aren't running, connection errors | Read `references/infrastructure.md` |
 
@@ -137,14 +136,14 @@ uv run --project orchestrator orchestrator run --prd <path-to-prd>
 - `--config <path>` — override default config (at `orchestrator/config.yaml`). Useful for adjusting concurrency, models, or budgets.
 - `--verbose` — debug-level logging.
 
-The orchestrator manages its own fused-memory HTTP server lifecycle — it starts the server before work begins and stops it when done. You don't need to start it manually.
+The fused-memory HTTP server runs as a **systemd service** and must already be running before launching the orchestrator. Do **not** start, restart, or stop fused-memory without explicit user permission. Verify it's up: `curl -sf http://localhost:8002/health`.
 
-The orchestrator also starts an **escalation MCP server** on port 8102 (configurable). Agents use this to escalate issues. The interactive session connects to the same server to resolve escalations — it's pre-configured in `.mcp.json` as the `escalation` server, so escalation tools (`mcp__escalation__resolve_issue`, etc.) are available in the interactive session during a run.
+The orchestrator also starts an **escalation MCP server** on port 8102 (configurable). Agents use this to escalate issues they can't resolve. **Escalations are handled in a separate session** — this session should ignore them entirely. Use the `/escalation-watcher` skill in a dedicated session to monitor and resolve escalations during a run.
 
 ### What happens during a run
 
 The orchestrator will:
-1. Start fused-memory HTTP server and escalation MCP server
+1. Start escalation MCP server (fused-memory must already be running as a systemd service)
 2. Check usage cap status (multi-account failover if cap hit at startup)
 3. Recover crashed tasks from surviving worktrees — if a prior run crashed mid-task, it resumes from the last completed plan step rather than starting over
 4. Call `parse_prd` (no-op if tasks already exist in Taskmaster)
@@ -152,7 +151,7 @@ The orchestrator will:
 6. Execute tasks concurrently (default 12, configurable via `max_concurrent_tasks`), each following:
    **PLAN** (architect) → **EXECUTE** (implementer, TDD) → **VERIFY** (pytest/ruff/pyright) → if verify fails: **DEBUG** (up to 5 cycles) → **REVIEW** (5 specialist reviewers) → **MERGE** (to main, with post-merge verification)
 7. If an agent encounters a problem outside its scope, it **escalates** rather than retrying.
-   Escalations are pushed to the handler session via a background watcher. See [Handle Escalations](#handle-escalations).
+   Escalations are handled in a **separate session** — do not attempt to handle them here.
 8. Print a summary report with per-task outcomes and costs
 
 Each task gets its own git worktree and branch (`task/<id>`). Merges use `--no-ff` to preserve history.
@@ -260,99 +259,6 @@ add_memory(
 ```
 
 ---
-
-## Handle Escalations
-
-During an orchestrator run, agents can escalate issues they can't solve at their scope. Unlike blocks (which are detected post-run), escalations are **pushed in real-time** — you'll be notified as they happen.
-
-### Dismissing stale escalations
-
-Escalations from prior runs persist on disk and can block tasks in new runs. Before starting a new run, check for and dismiss stale escalations:
-
-```
-get_pending_escalations()
-```
-
-If there are pending escalations from a prior session (check timestamps), dismiss them:
-
-```
-resolve_issue(escalation_id="<id>", resolution="Stale from prior run", terminate=true)
-```
-
-### Setting up the escalation watcher
-
-After launching the orchestrator, start the watcher as a background task:
-
-```bash
-uv run --project escalation python -m escalation.watcher \
-  --queue-dir /home/leo/src/dark-factory/data/escalations &
-```
-
-The watcher uses inotify to wait (zero CPU) for new escalation files. When one arrives, it prints the escalation JSON to stdout and exits — this triggers a background task completion notification in Claude Code, which is your signal to handle it. After resolving, re-arm the watcher with the same command.
-
-**Watcher options:**
-- `--task-id <id>` — filter to a specific task
-- `--ntfy-url <url>` — send push notifications via ntfy.sh (for AFK monitoring)
-
-### Reading an escalation
-
-Each escalation includes:
-- **id** — format `esc-{task_id}-{seq}` (e.g., `esc-42-1`)
-- **task_id** — which task's agent escalated
-- **severity** — `blocking` (task paused, waiting for you) or `info` (FYI, agent continued)
-- **category** — `scope_violation`, `design_concern`, `cleanup_needed`, `dependency_discovered`, `risk_identified`, `infra_issue`, or `task_failure` (auto-escalation when workflow hits iteration/verify/review limits)
-- **summary** / **detail** — what the agent found
-- **suggested_action** — what the agent thinks should happen
-- **worktree** — path to the task's worktree (useful for diagnosis)
-- **workflow_state** — what stage the agent was in when it escalated
-
-You can also fetch a specific escalation by ID:
-```
-get_escalation(escalation_id="esc-42-1")
-```
-
-### Resolving an escalation
-
-These are MCP tools on the escalation server (prefixed `mcp__escalation__` in Claude Code). The server is pre-configured in `.mcp.json`, so these tools are available in the interactive session during a run.
-
-```
-resolve_issue(
-  escalation_id="<id from the notification>",
-  resolution="<your resolution — this text is injected into the agent's briefing when the task resumes>",
-  terminate=false
-)
-```
-
-The `resolution` text should be actionable instructions for the re-invoked agent. Examples:
-- "Scope expanded: you now have write access to `crates/reify-compiler`. Update the trait impl in `src/lib.rs` to match the new type signature."
-- "This is a known limitation in M2 scope. Skip the duplicate-ID check — it will be addressed in task 14."
-- "The test infrastructure issue is fixed on main. Rebase your branch with `git rebase main`."
-
-Set `terminate=true` if the task should be abandoned rather than resumed.
-
-### Listing pending escalations
-
-To see all unresolved escalations (e.g., if you missed a notification):
-
-```
-get_pending_escalations()
-```
-
-Or filtered to a specific task:
-
-```
-get_pending_escalations(task_id="7")
-```
-
-### Common escalation patterns
-
-| Category | Typical cause | Resolution approach |
-|----------|--------------|-------------------|
-| `scope_violation` | Agent hit bwrap sandbox boundary | Evaluate if scope expansion is warranted. If yes, update the task's modules via `update_task` and resolve with expanded scope instructions. If no, guide the agent to an alternative approach. |
-| `design_concern` | Agent found a design issue outside task scope | Assess severity. Create a follow-up task if needed, resolve with "proceed, this is tracked in task N". |
-| `dependency_discovered` | Task depends on code from an unfinished task | Check if the dependency task is in progress. If so, resolve with "wait" or requeue. If not, may need to add a dependency. |
-| `infra_issue` | Test framework, build tool, or environment problem | Fix the infrastructure issue, then resolve with instructions for the agent. |
-| `task_failure` | Auto-escalation: workflow hit iteration/verify/review limits | Check the worktree artifacts to understand why. Either fix the issue and resolve, or terminate if the task needs to be redesigned. |
 
 ---
 

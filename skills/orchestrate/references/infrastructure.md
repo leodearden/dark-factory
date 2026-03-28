@@ -17,7 +17,7 @@ This starts:
 - **FalkorDB** on port 6379 (Redis-compatible graph database)
 - **Qdrant** on port 6333/6334 (vector search engine)
 
-The docker-compose also defines a `fused-mcp` service, but the orchestrator manages its own fused-memory server process — you typically only need the two backing stores from docker-compose.
+The docker-compose also defines a `fused-mcp` service, but fused-memory runs as a systemd user service (port 8002) — you typically only need the two backing stores from docker-compose.
 
 ### Verify backing stores
 
@@ -38,7 +38,7 @@ curl -sf http://localhost:6333/readyz
 |---------|-------|-----|
 | `Connection refused :6379` | FalkorDB not running | `cd fused-memory/docker && docker compose up -d falkordb` |
 | `Connection refused :6333` | Qdrant not running | `cd fused-memory/docker && docker compose up -d qdrant` |
-| `Connection refused :8000` | fused-memory server not running | The orchestrator starts this automatically. If running tools manually: `cd /home/leo/src/dark-factory && uv run --project fused-memory python -m fused_memory.server.main --transport http` |
+| `Connection refused :8002` | fused-memory server not running | fused-memory runs as a systemd user service on port 8002. Check: `systemctl --user status fused-memory`. Do **not** start/restart/stop without explicit user permission. |
 | `OPENAI_API_KEY not set` | Missing env var | Export it: `export OPENAI_API_KEY=sk-...` (needed for embeddings) |
 | `ANTHROPIC_API_KEY not set` | Stale check — no longer required | Orchestrator agents use OAuth (Max subscription). If fused-memory's Graphiti extraction needs Anthropic models, set it in `fused-memory/config/config.yaml`, but this is not required for orchestrator runs. |
 | Docker containers exit immediately | Port conflict or stale volume | `docker compose down -v && docker compose up -d` |
@@ -55,16 +55,17 @@ uv sync
 
 This installs dependencies into a local `.venv`. The `uv run --project orchestrator` prefix handles this automatically.
 
-## Fused-Memory Server (manual)
+## Fused-Memory Server
 
-The orchestrator starts and stops fused-memory automatically. If you need to run it manually (e.g., for interactive MCP tool usage):
+fused-memory runs as a **systemd user service** on port 8002. It must be running before launching the orchestrator. Do **not** start, restart, or stop it without explicit user permission.
 
 ```bash
-cd /home/leo/src/dark-factory
-uv run --project fused-memory python -m fused_memory.server.main --transport http --config fused-memory/config/config.yaml
-```
+# Check status
+systemctl --user status fused-memory
 
-This starts the HTTP server on port 8000. Health check: `curl http://localhost:8000/health`
+# Health check
+curl -sf http://localhost:8002/health
+```
 
 ## Bubblewrap (bwrap) Sandbox
 
