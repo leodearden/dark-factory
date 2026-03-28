@@ -4788,7 +4788,7 @@
         "description": "Commit 0ea23cb5 (stash pop merge conflict) reverted task 180's Tailwind CDN replacement. base.html line 7 currently has `<script src=\"https://cdn.tailwindcss.com\"></script>` instead of the built CSS link and favicon. The built files (tailwind.css, favicon.svg) still exist in static/ but aren't linked.\n\nFix: In dashboard/src/dashboard/templates/base.html, replace the CDN script with `<link rel=\"stylesheet\" href=\"/static/tailwind.css\">` and add `<link rel=\"icon\" type=\"image/svg+xml\" href=\"/static/favicon.svg\">`. Also add platform detection to the Makefile (currently hardcoded to linux-x64) and sha256 checksum verification for the Tailwind CLI binary download.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
@@ -4802,7 +4802,7 @@
             "dashboard"
           ]
         },
-        "updatedAt": "2026-03-28T16:11:37.032Z"
+        "updatedAt": "2026-03-28T16:45:34.293Z"
       },
       {
         "id": "279",
@@ -5038,9 +5038,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T16:43:59.381Z",
+      "lastModified": "2026-03-28T16:45:34.293Z",
       "taskCount": 268,
-      "completedCount": 219,
+      "completedCount": 220,
       "tags": [
         "master"
       ]
