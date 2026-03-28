@@ -423,6 +423,13 @@ class TestPerformancePartialIntegration:
             assert '5m' in html
             assert 'new Chart' in html
 
+    def test_performance_empty(self, client):
+        with _patch_perf_integration(paths={}, escalations={}, histograms={}, ttc={}):
+            resp = client.get('/partials/performance')
+            assert resp.status_code == 200
+            html = resp.text
+            assert 'No orchestrator run data yet' in html
+
 
 class TestHtmxErrorHandling:
     """Tests for global HTMX error handler script in base.html."""
