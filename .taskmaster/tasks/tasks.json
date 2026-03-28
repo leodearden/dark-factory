@@ -4202,11 +4202,11 @@
         "description": "tools.py still has private `_validate_project_root` and `_validate_project_id` closures that duplicate the shared validators in `fused_memory.utils.validation`. The `_validate_project_id` copy is also **behaviorally divergent** — it lacks the `.strip()` guard, so whitespace-only project IDs pass in tools.py but fail in the shared version.\n\n1. Replace `_validate_project_root` (tools.py:223-230) with an import of `validate_project_root` from `fused_memory.utils.validation`. Update all ~11 call sites (lines 763, 784, 813, 861, 898, 934, 962, 987, 1015, 1047, 1077).\n2. Replace `_validate_project_id` (tools.py:214-221) with an import of `validate_project_id` from `fused_memory.utils.validation`. Update all call sites.\n3. Remove the `import os` in tools.py if it's no longer needed after removal of the closures.\n\nThis completes the validator consolidation started in task 211 and continued in task 214 (which migrated targeted.py).\n\nmemory_hint: search \"require_project_root extracted from tools.py\" and \"validation.py consolidation task 211\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-28T04:46:06.766Z"
+        "updatedAt": "2026-03-28T04:55:40.678Z"
       },
       {
         "id": "254",
@@ -4255,9 +4255,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:55:28.395Z",
+      "lastModified": "2026-03-28T04:55:40.679Z",
       "taskCount": 236,
-      "completedCount": 183,
+      "completedCount": 184,
       "tags": [
         "master"
       ]
