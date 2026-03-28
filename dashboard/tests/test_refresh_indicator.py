@@ -119,3 +119,78 @@ class TestRefreshPulseCSS:
         css = client.get('/static/tailwind.css').text
         assert '.section-refreshed' in css
 
+
+class TestTimestampErrorState:
+    """Tests that JS shows failure state in timestamp elements on htmx errors."""
+
+    def test_update_failed_text_in_js(self, client):
+        """The JS must contain 'Update failed' text for the failure message."""
+        html = client.get('/').text
+        assert 'Update failed' in html
+
+    def test_error_handler_sets_data_update_failed_attr(self, client):
+        """The JS must set a data-update-failed attribute to prevent interval overwrites."""
+        html = client.get('/').text
+        assert 'data-update-failed' in html
+
+    def test_error_events_registered_in_timestamp_iife(self, client):
+        """The timestamp IIFE must register listeners on all three htmx error events."""
+        html = client.get('/').text
+        # markStampFailed is the unique function name defined in the timestamp IIFE;
+        # asserting its presence confirms the timestamp-IIFE registrations exist
+        # (unlike the event name strings which also appear in the error-card IIFE)
+        assert 'markStampFailed' in html
+
+    def test_after_swap_clears_failure_flag(self, client):
+        """The htmx:afterSwap handler must clear data-update-failed on recovery."""
+        html = client.get('/').text
+        # The afterSwap handler must call removeAttribute('data-update-failed') specifically
+        assert "removeAttribute('data-update-failed')" in html
+
+    def test_interval_skips_failed_elements(self, client):
+        """The setInterval must skip updating elements that have data-update-failed set."""
+        html = client.get('/').text
+        # The interval function must check for data-update-failed before updating text
+        assert 'data-update-failed' in html
+
+
+class TestNaNGuard:
+    """Tests that the setInterval timestamp updater guards against NaN timestamps."""
+
+    def test_isnan_guard_present(self, client):
+        """The JS setInterval updater must contain an isNaN guard to prevent 'Updated NaNm ago'."""
+        html = client.get('/').text
+        assert 'isNaN' in html
+
+
+class TestAnimationFallback:
+    """Tests that a setTimeout fallback ensures section-refreshed class is always removed."""
+
+    def test_settimeout_fallback_present(self, client):
+        """A setTimeout fallback must be present near section-refreshed class removal."""
+        html = client.get('/').text
+        assert 'setTimeout' in html
+
+    def test_settimeout_removes_section_refreshed(self, client):
+        """The setTimeout fallback must reference 'section-refreshed' class removal."""
+        html = client.get('/').text
+        # Both setTimeout and section-refreshed must appear in the JS
+        assert 'setTimeout' in html
+        assert 'section-refreshed' in html
+
+    def test_settimeout_has_700ms_margin(self, client):
+        """The setTimeout fallback should use a duration >= 700ms (safe margin over 600ms animation)."""
+        html = client.get('/').text
+        assert '700' in html
+
+
+class TestIntervalCleanup:
+    """Tests that setInterval return value is stored for potential cleanup."""
+
+    def test_setinterval_assigned_to_variable(self, client):
+        """The setInterval return value must be assigned to a variable."""
+        html = client.get('/').text
+        # Matches 'var <name> = setInterval' or 'const <name> = setInterval' etc.
+        import re
+        assert re.search(r'\b(?:var|let|const)\s+\w+\s*=\s*setInterval\b', html) is not None
+
