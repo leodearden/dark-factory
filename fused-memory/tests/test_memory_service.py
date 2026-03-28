@@ -729,6 +729,30 @@ class TestGetEntity:
         assert result['edges'][0]['uuid'] == 'edge-uuid-1'
 
     # ------------------------------------------------------------------
+    # getattr fallback — missing attributes return None / [] defaults
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_getattr_fallback_missing_attributes(self, service):
+        """Bare objects without optional attrs return None/[] defaults."""
+        bare_node = types.SimpleNamespace(name='BareNode')
+        bare_edge = types.SimpleNamespace()  # no attributes at all
+
+        service.graphiti.search_nodes = AsyncMock(return_value=[bare_node])
+        service.graphiti.search = AsyncMock(return_value=[bare_edge])
+
+        result = await service.get_entity('BareNode', project_id='test')
+
+        node = result['nodes'][0]
+        assert node['uuid'] is None
+        assert node['summary'] is None
+        assert node['labels'] == []
+
+        edge = result['edges'][0]
+        assert edge['uuid'] is None
+        assert edge['fact'] == str(bare_edge)
+
+    # ------------------------------------------------------------------
     # concurrent execution — both coroutines run in parallel
     # ------------------------------------------------------------------
 
