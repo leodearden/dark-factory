@@ -30,6 +30,7 @@ from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsoli
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
+    _select_proactive_sample,
 )
 
 _MOCK_TYPES = (AsyncMock, MagicMock)
@@ -639,6 +640,99 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert not isinstance(stage.assemble_payload, _MOCK_TYPES)
         # (c) assemble_payload is exactly the original method reference
         assert stage.assemble_payload == original_assemble_payload
+
+
+class TestProactiveSampling:
+    """Tests for _select_proactive_sample helper and proactive sample payload section."""
+
+    # --- Fixtures ---
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='test_project')
+
+    def _make_task(self, tid: int, status: str) -> dict:
+        return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': []}
+
+    # --- Step 1: payload contains proactive sample section ---
+
+    @pytest.mark.asyncio
+    async def test_proactive_sample_section_present_in_payload(self, mock_deps, watermark):
+        """assemble_payload with active tasks and 0 flagged items produces payload
+        containing '### Proactive Task Sample' section header."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'in-progress'),
+                self._make_task(2, 'pending'),
+                self._make_task(3, 'done'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Proactive Task Sample' in payload
+
+    # --- Step 2: in-progress and blocked tasks appear first ---
+
+    def test_proactive_sample_prioritizes_in_progress_and_blocked(self):
+        """Given tasks with mixed statuses, _select_proactive_sample returns
+        in-progress and blocked tasks before review, pending, and done tasks."""
+        tasks = [
+            self._make_task(1, 'done'),
+            self._make_task(2, 'pending'),
+            self._make_task(3, 'review'),
+            self._make_task(4, 'blocked'),
+            self._make_task(5, 'in-progress'),
+        ]
+        result = _select_proactive_sample(tasks, 5)
+        statuses = [t['status'] for t in result]
+        # in-progress and blocked must come before review, pending, done
+        high_priority = {'in-progress', 'blocked'}
+        low_priority = {'review', 'pending', 'done'}
+        last_high = max(
+            (i for i, t in enumerate(result) if t['status'] in high_priority),
+            default=-1,
+        )
+        first_low = min(
+            (i for i, t in enumerate(result) if t['status'] in low_priority),
+            default=len(result),
+        )
+        assert last_high < first_low, (
+            f'High-priority tasks should appear before low-priority tasks. Got: {statuses}'
+        )
+
+    # --- Step 3: sample capped at MIN_TASK_SAMPLE ---
+
+    def test_proactive_sample_capped_at_min_task_sample(self):
+        """Given more than 5 eligible tasks, _select_proactive_sample returns exactly 5."""
+        tasks = [self._make_task(i, 'pending') for i in range(1, 12)]
+        result = _select_proactive_sample(tasks, 5)
+        assert len(result) == 5
+
+    # --- Step 4: all tasks returned when fewer than floor ---
+
+    def test_proactive_sample_includes_all_when_fewer_than_floor(self):
+        """Given fewer than 5 total tasks, _select_proactive_sample returns all of them."""
+        tasks = [
+            self._make_task(1, 'in-progress'),
+            self._make_task(2, 'pending'),
+            self._make_task(3, 'done'),
+        ]
+        result = _select_proactive_sample(tasks, 5)
+        assert len(result) == 3
 
 
 class TestRunIdValidation(BaseStageValidationTest):
