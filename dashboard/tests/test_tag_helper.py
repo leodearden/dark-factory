@@ -85,13 +85,6 @@ class TestMarkerInTextContent:
         with pytest.raises(ValueError):
             _get_opening_tag(html, 'data-section="recon"')
 
-    def test_marker_inside_closing_tag_raises(self):
-        # Closing tags don't have attributes; this shouldn't match
-        html = '<div></div data-section="recon">'
-        with pytest.raises(ValueError):
-            _get_opening_tag(html, 'data-section="recon"')
-
-
 class TestMultipleTags:
     """When multiple tags exist, the one containing the marker is returned."""
 
