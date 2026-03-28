@@ -5025,7 +5025,7 @@
         "description": "Stage 2 (task_knowledge_sync) currently acts only on Stage 1 flagged items. When Stage 1 flags 0 items, Stage 2 reviews 0 tasks — creating a blind spot for in-progress and blocked tasks. In run 3258f7ce, Stage 2 reviewed 0 tasks despite Tasks 125 (in-progress) and 126 (blocked) being active.\n\nFix: Add a minimum sampling floor to Stage 2's reconciliation prompt/implementation. Stage 2 should always inspect N=5 most-recently-updated tasks regardless of Stage 1 flagged_items count. This ensures:\n- In-progress tasks are periodically checked for completion knowledge\n- Blocked tasks are checked for unblock conditions\n- Done tasks without knowledge capture are caught\n\nImplementation: Modify the Stage 2 reconciliation agent prompt (fused-memory/src/fused_memory/reconciliation/prompts/stage2.py or equivalent) to include a mandatory proactive sampling step.\n\nmemory_hints:\n- search: \\\"Stage 2 proactive spot-check minimum sampling floor tasks\\\"\n- search: \\\"reconciliation Stage 2 reactive systemic gap blind spot\\\"\n- graphiti_edge: 942afad3 (Stage 2 should perform proactive spot-check)",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -5040,12 +5040,13 @@
             "fused-memory/src/fused_memory/reconciliation/stages",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-28T17:17:06.521Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T17:17:06.357Z",
+      "lastModified": "2026-03-28T17:17:06.521Z",
       "taskCount": 268,
       "completedCount": 222,
       "tags": [
