@@ -377,8 +377,13 @@ class TestTaskKnowledgeSyncPayload:
         assert 'project_id="reify"' in payload
 
 
-class TestProjectIdValidation:
-    """BaseStage.run() validates project_id and watermark.project_id."""
+class BaseStageValidationTest:
+    """Shared infrastructure for stage validation test classes.
+
+    Both TestProjectIdValidation and TestRunIdValidation inherit from this base
+    to avoid duplicating _fake_assemble_payload, _fake_run_stage_via_cli,
+    mock_deps, and _patch_stage.
+    """
 
     @staticmethod
     async def _fake_assemble_payload(
@@ -427,6 +432,10 @@ class TestProjectIdValidation:
                 yield
 
         return _ctx()
+
+
+class TestProjectIdValidation(BaseStageValidationTest):
+    """BaseStage.run() validates project_id and watermark.project_id."""
 
     @pytest.mark.asyncio
     async def test_run_raises_on_empty_project_id(self, mock_deps):
@@ -601,50 +610,8 @@ class TestProjectIdValidation:
             assert isinstance(stage.assemble_payload, (AsyncMock, MagicMock))
 
 
-class TestRunIdValidation:
+class TestRunIdValidation(BaseStageValidationTest):
     """BaseStage.run() validates run_id before prompt interpolation."""
-
-    @staticmethod
-    async def _fake_assemble_payload(
-        events,
-        watermark,
-        prior_reports,
-    ) -> str:
-        return 'fake payload'
-
-    @staticmethod
-    async def _fake_run_stage_via_cli(**kwargs):
-        return StageResult(
-            success=True,
-            report={'summary': 'ok'},
-        )
-
-    @pytest.fixture
-    def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-        }
-
-    def _patch_stage(self, stage, cli_side_effect=None):
-        """Return a context manager that patches assemble_payload and run_stage_via_cli."""
-        effective_cli_side_effect = cli_side_effect if cli_side_effect is not None else self._fake_run_stage_via_cli
-
-        @contextmanager
-        def _ctx():
-            with (
-                patch.object(stage, 'assemble_payload', side_effect=self._fake_assemble_payload),
-                patch(
-                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                    side_effect=effective_cli_side_effect,
-                ),
-            ):
-                yield
-
-        return _ctx()
 
     @pytest.mark.asyncio
     async def test_run_raises_on_empty_run_id(self, mock_deps):
