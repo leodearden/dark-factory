@@ -5,8 +5,11 @@ from contextlib import contextmanager
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from shared.cli_invoke import AgentResult
 
+import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.reconciliation import StageId, Watermark
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
     DISALLOW_MEMORY_WRITES,
@@ -17,7 +20,11 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE3_REPORT_SCHEMA,
     STAGE_REPORT_SCHEMA,
     StageResult,
+    _extract_report,
+    _normalize_report,
 )
+from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
@@ -75,17 +82,14 @@ class TestStageSubclasses:
         }
 
     def test_memory_consolidator_disallowed(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         assert stage.get_disallowed_tools() == STAGE1_DISALLOWED
 
     def test_task_knowledge_sync_disallowed(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         assert stage.get_disallowed_tools() == STAGE2_DISALLOWED
 
     def test_integrity_check_disallowed(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
         assert stage.get_disallowed_tools() == STAGE3_DISALLOWED
 
@@ -108,11 +112,9 @@ class TestStage3ReportSchema:
     """STAGE3_REPORT_SCHEMA has structured finding item properties."""
 
     def test_stage3_schema_importable(self):
-        from fused_memory.reconciliation.cli_stage_runner import STAGE3_REPORT_SCHEMA
         assert STAGE3_REPORT_SCHEMA is not None
 
     def test_stage3_flagged_items_has_item_properties(self):
-        from fused_memory.reconciliation.cli_stage_runner import STAGE3_REPORT_SCHEMA
         items_schema = STAGE3_REPORT_SCHEMA['properties']['flagged_items']['items']
         assert 'properties' in items_schema
         props = items_schema['properties']
@@ -120,18 +122,15 @@ class TestStage3ReportSchema:
             assert field in props, f"Expected '{field}' in flagged_items.items.properties"
 
     def test_stage3_finding_item_required_includes_description_and_severity(self):
-        from fused_memory.reconciliation.cli_stage_runner import STAGE3_REPORT_SCHEMA
         items_schema = STAGE3_REPORT_SCHEMA['properties']['flagged_items']['items']
         assert 'required' in items_schema
         assert 'description' in items_schema['required']
         assert 'severity' in items_schema['required']
 
     def test_stage3_schema_is_json_serializable(self):
-        from fused_memory.reconciliation.cli_stage_runner import STAGE3_REPORT_SCHEMA
         json.dumps(STAGE3_REPORT_SCHEMA)
 
     def test_stage3_schema_preserves_base_structure(self):
-        from fused_memory.reconciliation.cli_stage_runner import STAGE3_REPORT_SCHEMA
         assert STAGE3_REPORT_SCHEMA['type'] == 'object'
         assert 'summary' in STAGE3_REPORT_SCHEMA['required']
         assert 'flagged_items' in STAGE3_REPORT_SCHEMA['properties']
@@ -142,7 +141,6 @@ class TestExtractReportNormalization:
     """_extract_report normalizes findings key to flagged_items."""
 
     def _make_result(self, structured_output=None, output=None):
-        from shared.cli_invoke import AgentResult
         return AgentResult(
             success=True,
             output=output or '',
@@ -150,7 +148,6 @@ class TestExtractReportNormalization:
         )
 
     def test_findings_remapped_to_flagged_items(self):
-        from fused_memory.reconciliation.cli_stage_runner import _extract_report
         result = self._make_result(structured_output={
             'findings': [{'description': 'stale edge', 'severity': 'moderate'}],
             'summary': 'done',
@@ -161,7 +158,6 @@ class TestExtractReportNormalization:
         assert 'findings' not in report
 
     def test_flagged_items_preserved_when_no_findings(self):
-        from fused_memory.reconciliation.cli_stage_runner import _extract_report
         result = self._make_result(structured_output={
             'flagged_items': [{'description': 'real finding', 'severity': 'serious'}],
             'summary': 'ok',
@@ -170,7 +166,6 @@ class TestExtractReportNormalization:
         assert report['flagged_items'] == [{'description': 'real finding', 'severity': 'serious'}]
 
     def test_flagged_items_preferred_over_findings_when_both_present(self):
-        from fused_memory.reconciliation.cli_stage_runner import _extract_report
         result = self._make_result(structured_output={
             'findings': [{'description': 'from findings'}],
             'flagged_items': [{'description': 'from flagged_items'}],
@@ -181,7 +176,6 @@ class TestExtractReportNormalization:
         assert report['flagged_items'] == [{'description': 'from flagged_items'}]
 
     def test_findings_used_when_flagged_items_is_empty(self):
-        from fused_memory.reconciliation.cli_stage_runner import _extract_report
         result = self._make_result(structured_output={
             'findings': [{'description': 'fallback finding'}],
             'flagged_items': [],
@@ -195,7 +189,6 @@ class TestNormalizePlaceholderFiltering:
     """_normalize_report filters out placeholder findings."""
 
     def _normalize(self, report):
-        from fused_memory.reconciliation.cli_stage_runner import _normalize_report
         return _normalize_report(report)
 
     def test_filters_missing_description(self):
@@ -261,17 +254,14 @@ class TestPerStageReportSchema:
         }
 
     def test_integrity_check_returns_stage3_schema(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
         assert stage.get_report_schema() is STAGE3_REPORT_SCHEMA
 
     def test_memory_consolidator_returns_base_schema(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         assert stage.get_report_schema() is STAGE_REPORT_SCHEMA
 
     def test_task_knowledge_sync_returns_base_schema(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         assert stage.get_report_schema() is STAGE_REPORT_SCHEMA
 
@@ -281,8 +271,6 @@ class TestMcpConfig:
 
     @pytest.fixture
     def stage(self):
-        from fused_memory.models.reconciliation import StageId
-        from fused_memory.reconciliation.stages.base import BaseStage
         config = ReconciliationConfig(explore_codebase_root='/tmp/test')
         return BaseStage(
             StageId.memory_consolidator,
@@ -309,13 +297,11 @@ class TestStage3PromptAlignment:
     """STAGE3_SYSTEM_PROMPT explicitly mentions flagged_items."""
 
     def test_stage3_prompt_references_flagged_items(self):
-        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
         assert 'flagged_items' in STAGE3_SYSTEM_PROMPT, (
             "STAGE3_SYSTEM_PROMPT must instruct the LLM to use 'flagged_items' key"
         )
 
     def test_stage3_prompt_has_output_format_section(self):
-        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
         # Should have an Output Format section to guide the LLM
         assert 'Output Format' in STAGE3_SYSTEM_PROMPT
 
@@ -335,13 +321,11 @@ class TestTaskKnowledgeSyncPayload:
 
     @pytest.fixture
     def watermark(self):
-        from fused_memory.models.reconciliation import Watermark
         return Watermark(project_id='reify')
 
     @pytest.mark.asyncio
     async def test_get_tasks_uses_project_root_not_project_id(self, mock_deps, watermark):
         """assemble_payload() must pass self.project_root (not self.project_id) to get_tasks."""
-        from fused_memory.models.reconciliation import StageId
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
@@ -356,7 +340,6 @@ class TestTaskKnowledgeSyncPayload:
     @pytest.mark.asyncio
     async def test_payload_uses_dynamic_project_root_in_instructions(self, mock_deps, watermark):
         """assemble_payload() instruction text must use self.project_root, not hardcoded path."""
-        from fused_memory.models.reconciliation import StageId
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
@@ -370,7 +353,6 @@ class TestTaskKnowledgeSyncPayload:
     @pytest.mark.asyncio
     async def test_payload_dark_factory_project_still_works(self, mock_deps, watermark):
         """When project_root IS dark-factory, payload still contains the correct path."""
-        from fused_memory.models.reconciliation import StageId, Watermark
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'dark_factory'
         stage.project_root = '/home/leo/src/dark-factory'
@@ -384,7 +366,6 @@ class TestTaskKnowledgeSyncPayload:
     @pytest.mark.asyncio
     async def test_payload_contains_project_id_for_memory_tools(self, mock_deps, watermark):
         """assemble_payload() instruction text still uses self.project_id for fused-memory calls."""
-        from fused_memory.models.reconciliation import StageId
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
@@ -449,8 +430,6 @@ class TestProjectIdValidation:
 
     @pytest.mark.asyncio
     async def test_run_raises_on_empty_project_id(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = ''
@@ -465,8 +444,6 @@ class TestProjectIdValidation:
 
     @pytest.mark.asyncio
     async def test_run_raises_on_whitespace_project_id(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = '   '
@@ -481,8 +458,6 @@ class TestProjectIdValidation:
 
     @pytest.mark.asyncio
     async def test_run_raises_on_watermark_project_id_mismatch(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'project_a'
@@ -500,8 +475,6 @@ class TestProjectIdValidation:
 
     @pytest.mark.asyncio
     async def test_run_allows_matching_watermark_project_id(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
@@ -523,8 +496,6 @@ class TestProjectIdValidation:
 
     @pytest.mark.asyncio
     async def test_run_allows_empty_watermark_project_id(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
@@ -546,8 +517,6 @@ class TestProjectIdValidation:
 
     @pytest.mark.asyncio
     async def test_recon_context_includes_project_id(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
@@ -573,8 +542,6 @@ class TestProjectIdValidation:
         guard skips mismatch check, and emits a DEBUG log about skipping."""
         import logging
 
-        from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
@@ -600,8 +567,6 @@ class TestProjectIdValidation:
 
     def test_patch_stage_patches_assemble_payload_and_run_stage(self, mock_deps):
         """_patch_stage replaces both assemble_payload and run_stage_via_cli with mocks."""
-        import fused_memory.reconciliation.stages.base as base_module
-        from fused_memory.models.reconciliation import StageId
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         original_run_stage_via_cli = base_module.run_stage_via_cli
@@ -614,8 +579,6 @@ class TestProjectIdValidation:
 
     def test_patch_stage_accepts_cli_side_effect(self, mock_deps):
         """_patch_stage wires a custom cli_side_effect onto the run_stage_via_cli mock."""
-        import fused_memory.reconciliation.stages.base as base_module
-        from fused_memory.models.reconciliation import StageId
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
 
@@ -674,8 +637,6 @@ class TestRunIdValidation:
 
     @pytest.mark.asyncio
     async def test_run_raises_on_empty_run_id(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
@@ -690,8 +651,6 @@ class TestRunIdValidation:
 
     @pytest.mark.asyncio
     async def test_run_raises_on_whitespace_run_id(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
@@ -706,8 +665,6 @@ class TestRunIdValidation:
 
     @pytest.mark.asyncio
     async def test_run_raises_on_injection_run_id(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
@@ -722,8 +679,6 @@ class TestRunIdValidation:
 
     @pytest.mark.asyncio
     async def test_run_allows_valid_uuid_run_id(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
@@ -743,8 +698,6 @@ class TestRunIdValidation:
 
     @pytest.mark.asyncio
     async def test_recon_context_includes_run_id(self, mock_deps):
-        from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
@@ -770,7 +723,6 @@ class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
     def test_default_limits(self):
-        from fused_memory.models.reconciliation import StageId
         config = ReconciliationConfig()
         stage = MemoryConsolidator(
             StageId.memory_consolidator,
@@ -780,7 +732,6 @@ class TestTierConfig:
         assert stage.memory_limit == 1000
 
     def test_limits_are_writable(self):
-        from fused_memory.models.reconciliation import StageId
         config = ReconciliationConfig()
         stage = MemoryConsolidator(
             StageId.memory_consolidator,
