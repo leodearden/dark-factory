@@ -1,0 +1,106 @@
+{
+  "task_id": "221",
+  "title": "Harden YamlSettingsSource: fix ABC contract, error handling, explicit encoding",
+  "files": [
+    "fused-memory/src/fused_memory/config/schema.py",
+    "fused-memory/tests/test_config_schema.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/config",
+    "fused-memory/tests"
+  ],
+  "analysis": "YamlSettingsSource in schema.py (lines 18-64) has three robustness issues: (1) get_field_value returns `None` instead of `tuple[Any, str, bool]` per PydanticBaseSettingsSource ABC, and uses `Any` for the `field` param instead of `FieldInfo`; (2) __call__ has no error handling for corrupt YAML or unreadable files — the `exists()` guard only handles missing files; (3) `open(self.config_path)` uses system-locale encoding instead of explicit UTF-8. The existing test file test_config_schema.py has 8 tests for _expand_env_vars, 3 for FusedMemoryConfig defaults, and type validation tests for sub-configs. The test file uses class-based organization, monkeypatch for env vars, tmp_path for temp files, and direct assertions. All three fixes are localized to schema.py lines 1-64. The test additions will go into new test classes in test_config_schema.py following the existing patterns.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing test: get_field_value returns tuple (None, field_name, False) matching ABC contract. Create TestYamlSettingsSourceABCContract class with test_get_field_value_returns_tuple that creates a mock FieldInfo, calls get_field_value, and asserts the return is a 3-tuple (None, field_name, False).",
+      "status": "done",
+      "commit": "2ac34bb"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Fix get_field_value ABC contract in schema.py: import FieldInfo from pydantic.fields, change signature to `def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:`, change return to `return (None, field_name, False)`.",
+      "status": "done",
+      "commit": "9feacfe"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing test: corrupt YAML raises RuntimeError. In a new TestYamlSettingsSourceErrorHandling class, write test_corrupt_yaml_raises_runtime_error that writes invalid YAML (e.g. `': :\\n  - \\x00bad'`) to tmp_path, creates YamlSettingsSource pointing at it, calls source(), and asserts RuntimeError is raised with a descriptive message mentioning the path.",
+      "status": "done",
+      "commit": "1f22c77"
+    },
+    {
+      "id": "step-4",
+      "type": "test",
+      "description": "Write failing test: unreadable file raises RuntimeError. Write test_unreadable_file_raises_runtime_error that creates a file in tmp_path, removes read permission with os.chmod(path, 0o000), creates YamlSettingsSource pointing at it, calls source(), and asserts RuntimeError is raised. Skip on Windows. Restore permissions in finally block for tmp_path cleanup.",
+      "status": "done",
+      "commit": "1f22c77"
+    },
+    {
+      "id": "step-5",
+      "type": "impl",
+      "description": "Add error handling in __call__: wrap the `with open(...)` and `yaml.safe_load()` block in try/except catching (yaml.YAMLError, OSError) and re-raise as RuntimeError with message f'Failed to load configuration from {self.config_path}: {e}'.",
+      "status": "done",
+      "commit": "4e08f8f"
+    },
+    {
+      "id": "step-6",
+      "type": "test",
+      "description": "Write failing test: UTF-8 content loads correctly. Write test_utf8_yaml_loaded_correctly that writes YAML with non-ASCII characters (e.g. `description: 'Ünïcödé tëst'`) to tmp_path, creates YamlSettingsSource pointing at it, calls source(), and asserts the value is correctly decoded.",
+      "status": "done",
+      "commit": "d3e5bd4"
+    },
+    {
+      "id": "step-7",
+      "type": "impl",
+      "description": "Add explicit UTF-8 encoding: change `open(self.config_path)` to `open(self.config_path, encoding='utf-8')` in __call__.",
+      "status": "done",
+      "commit": "4e08f8f"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Re-raise as RuntimeError rather than a custom exception",
+      "rationale": "The task description specifies RuntimeError. The config loading is a startup-time operation and RuntimeError is appropriate for 'this should not happen in a correctly deployed system' failures. Adding a custom exception class would be overengineering for this scope."
+    },
+    {
+      "decision": "Include the file path in the RuntimeError message",
+      "rationale": "When config loading fails, the operator needs to know which file is problematic. Including self.config_path in the error message makes diagnosis immediate without needing to trace through code."
+    },
+    {
+      "decision": "Catch both yaml.YAMLError and OSError in a single handler",
+      "rationale": "Both represent 'the file exists but cannot be used as config' — the user action is the same (fix or replace the file). A single except clause keeps the code simple while the chained exception preserves the original cause."
+    },
+    {
+      "decision": "Use FieldInfo import from pydantic.fields (not pydantic)",
+      "rationale": "pydantic.fields is the canonical location for FieldInfo in pydantic v2. The project already uses pydantic>=2.7 so this is safe. The ABC in pydantic-settings declares the parameter as FieldInfo."
+    },
+    {
+      "decision": "Return (None, field_name, False) from get_field_value",
+      "rationale": "The ABC contract requires tuple[Any, str, bool]. The values mean: no field value resolved (None), the field name as-is (field_name), and not a complex field (False). This is a no-op implementation since resolution happens in __call__, matching the existing comment."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "_DummySettings class pattern for isolated YamlSettingsSource testing",
+      "where": "fused-memory/tests/test_config_schema.py lines 154-156 (TestYamlSettingsSourceEnvVarExpansion.setup_method)",
+      "how": "New test classes will use the same _DummySettings(BaseSettings) pattern to create YamlSettingsSource instances without needing real config"
+    },
+    {
+      "what": "tmp_path + monkeypatch fixture pattern for YAML file tests",
+      "where": "fused-memory/tests/test_config_schema.py lines 133-146 (test_yaml_file_values_loaded)",
+      "how": "Error handling and UTF-8 tests will write YAML to tmp_path and create YamlSettingsSource pointing at the temp file, same pattern as existing tests"
+    },
+    {
+      "what": "Class-based test organization with setup_method",
+      "where": "fused-memory/tests/test_config_schema.py (all test classes)",
+      "how": "New test classes follow the same class-based pattern with descriptive docstrings"
+    }
+  ],
+  "_session_id": "221-86bb23d9",
+  "_created_at": "2026-03-28T04:04:50.883781+00:00"
+}
