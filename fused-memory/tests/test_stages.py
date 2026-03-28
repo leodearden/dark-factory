@@ -567,6 +567,13 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert 'payload' in captured_kwargs
         assert '`project_id`: "dark_factory"' in captured_kwargs['payload']
 
+    def test_watermark_rejects_none_project_id(self):
+        """Watermark(project_id=None) raises Pydantic ValidationError — None is not a valid string."""
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError, match='project_id'):
+            Watermark(project_id=None)  # type: ignore[arg-type]
+
     def test_patch_stage_patches_assemble_payload_and_run_stage(self, mock_deps):
         """_patch_stage replaces both assemble_payload and run_stage_via_cli with mocks."""
 
