@@ -3824,11 +3824,11 @@
         "description": "MemoryConsolidator class-level defaults (episode_limit=500, memory_limit=1000) silently encode opus-tier values. The harness always overrides them (harness.py:418-419) before run(), but if that assignment is ever skipped or reordered, the stage silently runs with opus limits even in sonnet-tier cycles.\n\nChanges needed:\n1. Change MemoryConsolidator defaults to sentinel values (None or 0) in memory_consolidator.py:26-27\n2. Add validation in assemble_payload (or run()) that raises if limits haven't been explicitly set by the harness\n3. Update test_default_limits to expect the new sentinel values\n4. Ensure harness tests cover the assignment path (may overlap with tier selection integration tests)\n\nThis aligns with the project's stability focus — making implicit contracts explicit prevents silent misconfiguration.\n\nMemory hints: search \"MemoryConsolidator default limits\" and get_entity \"MemoryConsolidator\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-28T15:25:36.070Z",
+        "updatedAt": "2026-03-28T15:25:37.013Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
@@ -5033,7 +5033,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T15:25:36.918Z",
+      "lastModified": "2026-03-28T15:25:37.013Z",
       "taskCount": 268,
       "completedCount": 207,
       "tags": [
