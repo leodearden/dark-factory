@@ -32,7 +32,7 @@
       "id": "step-1",
       "type": "test",
       "description": "Write failing tests for parse_utc in new dashboard/tests/test_data_utils.py: test naive ISO string gets UTC, aware ISO string preserved, invalid string raises ValueError, and type signature accepts str (None raises TypeError from fromisoformat). Import from dashboard.data.utils which does not yet exist \u2014 tests fail with ImportError.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
