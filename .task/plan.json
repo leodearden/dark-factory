@@ -1,0 +1,147 @@
+{
+  "task_id": "147",
+  "title": "DRY up maintenance test boilerplate (CONFIG_PATH fixture, mock_config factory, imports)",
+  "files": [
+    "fused-memory/tests/conftest.py",
+    "fused-memory/tests/test_reindex.py",
+    "fused-memory/tests/test_cleanup_stale_edges.py",
+    "fused-memory/tests/test_verify_zombie_edges.py"
+  ],
+  "modules": [
+    "fused-memory/tests"
+  ],
+  "analysis": "The maintenance test files (test_reindex.py, test_cleanup_stale_edges.py, test_verify_zombie_edges.py) share significant boilerplate:\n\n1. **_make_backend(config)** \u2014 duplicated identically in test_reindex.py:18-24 and test_cleanup_stale_edges.py:14-19 (the latter literally comments 'mirrored from test_reindex.py').\n\n2. **_make_graph_mock(rows)** \u2014 duplicated in test_reindex.py:27-34 (with .ro_query) and test_cleanup_stale_edges.py:22-28 (without .ro_query). The reindex version is a superset.\n\n3. **Fake maintenance_service factory** \u2014 5 instances across 3 files: _make_fake_maintenance_service_reindex() at test_reindex.py:791-799, _make_fake_maintenance_service() at test_cleanup_stale_edges.py:283-291, and 3 inline @asynccontextmanager definitions (test_reindex.py:1024-1026, test_cleanup_stale_edges.py:389-391, test_verify_zombie_edges.py:30-32). All are functionally identical: yield (mock_cfg, mock_service) from an async context manager.\n\n4. **MagicMock config with embedder attrs** \u2014 7+ repetitions in TestRunReindex/TestRunReindexDelegation: `mock_config = MagicMock(); mock_config.embedder.dimensions = 1536; mock_config.embedder.providers.openai = None; mock_config.embedder.model = 'text-embedding-3-small'`. Two variants: 1536-dim (common) and 768-dim (one test).\n\n5. **In-method imports** \u2014 fused_memory.maintenance.{reindex,cleanup_stale_edges,verify_zombie_edges} imports are repeated inside individual test method bodies instead of at module level. Also `from contextlib import asynccontextmanager` appears in-method.\n\nThe existing conftest.py (95 lines) has a `mock_config` fixture returning a real FusedMemoryConfig and MockNode/MockEdge/MockAddEpisodeResult dataclasses. We'll extend it with factory fixtures and the CONFIG_PATH safety-net fixture.\n\nApproach: Use pytest factory fixtures (functions that return callables) for make_backend, make_graph_mock, and make_fake_maintenance_service. This is idiomatic pytest and keeps dependencies explicit without requiring fragile conftest imports. The standard_mock_config fixture returns a pre-configured MagicMock for the run_* entrypoint tests. A preserve_config_path autouse fixture provides a safety net even though current tests mock maintenance_service.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Run existing maintenance tests to establish passing baseline: pytest fused-memory/tests/test_reindex.py test_cleanup_stale_edges.py test_verify_zombie_edges.py",
+      "status": "done",
+      "commit": "baseline-69-pass",
+      "tests": [
+        "fused-memory/tests/test_reindex.py",
+        "fused-memory/tests/test_cleanup_stale_edges.py",
+        "fused-memory/tests/test_verify_zombie_edges.py"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write a focused test in conftest.py or a scratch test that validates the preserve_config_path fixture restores CONFIG_PATH after yield (set, unset, and absent cases). Also write a test that standard_mock_config has expected attributes (.embedder.dimensions=1536, .embedder.providers.openai=None, .embedder.model='text-embedding-3-small'). These tests will fail because the fixtures don't exist yet.",
+      "status": "done",
+      "commit": "78c8d841"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Add shared fixtures and helpers to conftest.py: (a) preserve_config_path autouse fixture that saves/restores os.environ CONFIG_PATH around each test; (b) standard_mock_config fixture returning MagicMock with .embedder.dimensions=1536, .embedder.providers.openai=None, .embedder.model='text-embedding-3-small'; (c) make_backend factory fixture returning a callable(config)->GraphitiBackend with mock client; (d) make_graph_mock factory fixture returning a callable(rows)->MagicMock with .query and .ro_query AsyncMocks; (e) make_fake_maintenance_service factory fixture returning a callable(mock_cfg, mock_service)->async-context-manager. Add necessary imports (os, contextlib.asynccontextmanager, AsyncMock).",
+      "status": "done",
+      "commit": "1a3c12eb"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Verify the new fixtures work: run the tests from step-1 and confirm they pass. Also run all existing maintenance tests to confirm the additive conftest changes cause no regressions.",
+      "status": "done",
+      "commit": "1a3c12eb"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Migrate test_reindex.py: (a) Move in-method imports to module level: `from fused_memory.maintenance.reindex import ReindexManager, ReindexResult, run_reindex` and `from contextlib import asynccontextmanager`; (b) Remove local _make_backend() and _make_graph_mock() helpers; add make_backend and make_graph_mock fixture params to all test methods that used them (TestQueryStaleNodeEmbeddings, TestQueryStaleEdgeEmbeddings, TestGetNodeText, TestGetEdgeText, TestUpdateNodeEmbedding, TestUpdateEdgeEmbedding, TestListIndices, TestDropIndex, TestDropVectorIndices, TestReindexManager); (c) Remove local _make_fake_maintenance_service_reindex(); add make_fake_maintenance_service fixture param to TestRunReindex and TestRunReindexDelegation methods; (d) Replace inline MagicMock config setup (7 instances in TestRunReindex/TestRunReindexDelegation) with standard_mock_config fixture, overriding .embedder.dimensions=768 and .embedder.model='text-embedding-ada-002' only in test_creates_embedder_with_config_dimensions; (e) Remove inline @asynccontextmanager in TestRunReindexDelegation, use make_fake_maintenance_service instead.",
+      "status": "done",
+      "commit": "7df48c9f"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Run pytest fused-memory/tests/test_reindex.py and verify all tests pass after migration.",
+      "status": "done",
+      "commit": "7df48c9f"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Migrate test_cleanup_stale_edges.py: (a) Move in-method imports to module level: `from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult, run_cleanup` and `from contextlib import asynccontextmanager`; (b) Remove local _make_backend() and _make_graph_mock() helpers (lines 14-28) and the 'mirrored from test_reindex.py' comment; add make_backend and make_graph_mock fixture params to TestQueryEdgesByTimeRange and TestBulkRemoveEdges methods; (c) Remove local _make_fake_maintenance_service() (lines 283-291); add make_fake_maintenance_service fixture param to TestRunCleanup and TestRunCleanupDelegation methods; (d) Remove inline @asynccontextmanager in TestRunCleanupDelegation, use make_fake_maintenance_service instead.",
+      "status": "done",
+      "commit": "7df48c9f"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Run pytest fused-memory/tests/test_cleanup_stale_edges.py and verify all tests pass after migration.",
+      "status": "done",
+      "commit": "7df48c9f"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Migrate test_verify_zombie_edges.py: (a) Move in-method imports to module level: `from contextlib import asynccontextmanager` and `from fused_memory.maintenance.verify_zombie_edges import VerifyResult, run_verify_zombie_edges`; (b) Remove inline @asynccontextmanager definition; add make_fake_maintenance_service fixture param to test_delegates_to_maintenance_service; (c) Use make_fake_maintenance_service(mock_cfg, mock_service) in the patch side_effect.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Run full maintenance test suite: pytest fused-memory/tests/test_reindex.py fused-memory/tests/test_cleanup_stale_edges.py fused-memory/tests/test_verify_zombie_edges.py fused-memory/tests/test_maintenance_utils.py \u2014 verify all pass with zero failures.",
+      "status": "pending",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use pytest factory fixtures (return callables) rather than module-level helper functions in conftest.py",
+      "rationale": "conftest.py is not meant to be imported via `from conftest import X`. Factory fixtures are idiomatic pytest, keep dependencies explicit in test method signatures, and work with pytest's fixture injection. The tradeoff is slightly more parameters on test methods, but this is the standard pattern."
+    },
+    {
+      "decision": "make_graph_mock includes both .query and .ro_query AsyncMocks (superset of both current versions)",
+      "rationale": "test_reindex.py's version has .ro_query, test_cleanup_stale_edges.py's doesn't. Using the superset avoids divergence and ro_query on cleanup tests is harmless (unused mock method)."
+    },
+    {
+      "decision": "preserve_config_path is autouse even though current tests mock maintenance_service",
+      "rationale": "Safety net: if a test fails mid-execution or a new test forgets to mock maintenance_service, CONFIG_PATH pollution won't leak between tests. The fixture is a no-op for tests that don't touch CONFIG_PATH, so zero performance cost."
+    },
+    {
+      "decision": "standard_mock_config returns MagicMock (not FusedMemoryConfig) with 1536-dim defaults",
+      "rationale": "The run_* entrypoint tests use MagicMock configs to avoid needing real config schema validation. The existing mock_config fixture (real FusedMemoryConfig) serves backend-level tests. Tests needing 768-dim override standard_mock_config.embedder.dimensions in-place \u2014 MagicMock supports attribute assignment, so this is clean."
+    },
+    {
+      "decision": "Move maintenance module imports to module level in all three test files",
+      "rationale": "There are no circular import risks (maintenance modules don't import test modules). In-method imports were likely defensive habits, not necessities. Module-level imports follow PEP 8, improve readability, and let tooling (pyright, ruff) analyze types statically."
+    },
+    {
+      "decision": "Migrate one test file per step rather than all at once",
+      "rationale": "Each file migration is independently verifiable. If a test breaks, the cause is isolated to one file's changes. This matches the TDD principle of small, atomic commits."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Existing mock_config fixture (real FusedMemoryConfig)",
+      "where": "fused-memory/tests/conftest.py:63-94",
+      "how": "Continue using for backend-level tests (TestQueryStale*, TestBulkRemoveEdges, TestCleanupManager, etc.). New standard_mock_config fixture is for run_* entrypoint tests only."
+    },
+    {
+      "what": "_make_backend() helper logic from test_reindex.py",
+      "where": "fused-memory/tests/test_reindex.py:18-24",
+      "how": "Extract into make_backend factory fixture in conftest.py. Identical logic: GraphitiBackend(config) + inject MagicMock client."
+    },
+    {
+      "what": "_make_graph_mock() helper logic from test_reindex.py (superset version with ro_query)",
+      "where": "fused-memory/tests/test_reindex.py:27-34",
+      "how": "Extract into make_graph_mock factory fixture in conftest.py. Uses the reindex version (superset) which includes both .query and .ro_query AsyncMocks."
+    },
+    {
+      "what": "_make_fake_maintenance_service() / _make_fake_maintenance_service_reindex() helper logic",
+      "where": "fused-memory/tests/test_cleanup_stale_edges.py:283-291 and test_reindex.py:791-799",
+      "how": "Extract into make_fake_maintenance_service factory fixture in conftest.py. Returns an @asynccontextmanager that yields (mock_cfg, mock_service). Replaces both named helpers and 3 inline @asynccontextmanager definitions."
+    },
+    {
+      "what": "override_config_path context manager from maintenance _utils.py",
+      "where": "fused-memory/src/fused_memory/maintenance/_utils.py",
+      "how": "The preserve_config_path fixture mirrors its save/restore logic at the test level. Not importing it directly because we want the fixture to be autouse and pytest-native."
+    }
+  ],
+  "_session_id": "147-d37a08e1",
+  "_created_at": "2026-03-28T16:17:15.951451+00:00"
+}

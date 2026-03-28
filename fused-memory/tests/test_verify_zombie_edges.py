@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from fused_memory.maintenance.verify_zombie_edges import VerifyResult, run_verify_zombie_edges
+
 # ---------------------------------------------------------------------------
 # step-5: run_verify_zombie_edges delegates to maintenance_service
 # ---------------------------------------------------------------------------
@@ -13,28 +15,17 @@ class TestRunVerifyZombieEdgesDelegation:
     """run_verify_zombie_edges() delegates service lifecycle to maintenance_service()."""
 
     @pytest.mark.asyncio
-    async def test_delegates_to_maintenance_service(self):
+    async def test_delegates_to_maintenance_service(self, make_fake_maintenance_service):
         """run_verify_zombie_edges() calls maintenance_service(config_path) and uses yielded service.graphiti."""
-        from contextlib import asynccontextmanager
-
-        from fused_memory.maintenance.verify_zombie_edges import (
-            VerifyResult,
-            run_verify_zombie_edges,
-        )
-
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
         mock_result = VerifyResult(found=['u1'], missing=[], deleted=0)
 
-        @asynccontextmanager
-        async def fake_maintenance_service(config_path):
-            yield mock_cfg, mock_service
-
         with (
             patch(
                 'fused_memory.maintenance.verify_zombie_edges.maintenance_service',
-                side_effect=fake_maintenance_service,
+                side_effect=make_fake_maintenance_service(mock_cfg, mock_service),
             ),
             patch('fused_memory.maintenance.verify_zombie_edges.ZombieEdgeVerifier') as mock_verifier_cls,
         ):
