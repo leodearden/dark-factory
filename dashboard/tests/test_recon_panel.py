@@ -98,6 +98,220 @@ class TestTimeagoFilter:
         assert templates.env.filters['timeago'] is timeago
 
 
+class TestPartitionBurstState:
+    """Tests for the partition_burst_state helper."""
+
+    def test_bursting_agent_is_active(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': 'bursting', 'last_write_at': '2020-01-01T00:00:00+00:00'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 1
+        assert len(idle) == 0
+
+    def test_idle_old_agent_is_idle(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': '2020-01-01T00:00:00+00:00'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
+    def test_idle_recent_agent_is_active(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        recent_ts = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': recent_ts}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 1
+        assert len(idle) == 0
+
+    def test_mixed_partition(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        old_ts = '2020-01-01T00:00:00+00:00'
+        recent_ts = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+        agents = [
+            {'agent_id': 'bursting', 'state': 'bursting', 'last_write_at': old_ts},
+            {'agent_id': 'idle-old', 'state': 'idle', 'last_write_at': old_ts},
+            {'agent_id': 'idle-recent', 'state': 'idle', 'last_write_at': recent_ts},
+        ]
+        active, idle = partition_burst_state(agents)
+        assert [a['agent_id'] for a in active] == ['bursting', 'idle-recent']
+        assert [a['agent_id'] for a in idle] == ['idle-old']
+
+    def test_empty_list(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        active, idle = partition_burst_state([])
+        assert active == []
+        assert idle == []
+
+    def test_invalid_timestamp_treated_as_idle(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': 'not-a-date'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
+    def test_custom_threshold(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        ts = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': ts}]
+        # 5 min old, threshold 3 min → idle
+        active, idle = partition_burst_state(agents, active_threshold_seconds=180)
+        assert len(active) == 0
+        assert len(idle) == 1
+        # 5 min old, threshold 10 min → active
+        active, idle = partition_burst_state(agents, active_threshold_seconds=600)
+        assert len(active) == 1
+        assert len(idle) == 0
+
+    def test_missing_state_key_defaults_to_idle(self):
+        # Agent with no 'state' key defaults to 'idle' (via .get('state', 'idle')).
+        # Combined with a stale 2020 timestamp, the agent is classified as idle.
+        # Both conditions (defaulted 'idle' state AND old timestamp) contribute
+        # to the idle classification — see test_missing_state_key_recent_write_is_active
+        # which isolates the timestamp-promotion path.
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'last_write_at': '2020-01-01T00:00:00+00:00'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
+    def test_missing_state_key_recent_write_is_active(self):
+        # Agent with no 'state' key defaults to 'idle' (via .get('state', 'idle')),
+        # but a recent last_write_at timestamp promotes it to active.
+        # Isolates the timestamp-promotion path for the defaulted 'idle' state.
+        from dashboard.data.reconciliation import partition_burst_state
+
+        recent_ts = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+        agents = [{'agent_id': 'a1', 'last_write_at': recent_ts}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 1
+        assert len(idle) == 0
+
+    def test_non_idle_state_missing_last_write_at_is_active(self):
+        # Agent with state='bursting' and no 'last_write_at' key is classified active.
+        # The early return (state != 'idle') fires before the timestamp lookup,
+        # so the missing last_write_at key is irrelevant and does not raise KeyError.
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': 'bursting'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 1
+        assert len(idle) == 0
+
+    def test_bare_agent_dict_no_state_no_last_write_at(self):
+        # Agent dict with NEITHER 'state' NOR 'last_write_at' key should land in
+        # idle list without raising KeyError.
+        # Root cause: agent.get('state', 'idle') defaults to 'idle', then
+        # agent['last_write_at'] on line 59 raises KeyError (NOT caught by the
+        # existing except (ValueError, TypeError) block).
+        # Fix: change to agent.get('last_write_at') so _parse_utc(None) raises
+        # TypeError which IS caught, allowing the agent to fall through to idle.
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'x'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
+    def test_explicit_idle_missing_last_write_at(self):
+        # Agent with explicit state='idle' and NO 'last_write_at' key should land
+        # in idle list without raising KeyError.
+        # Same root cause as test_bare_agent_dict_no_state_no_last_write_at:
+        # agent['last_write_at'] on line 59 raises KeyError for any agent that
+        # reaches the timestamp check with no 'last_write_at' in the dict.
+        # Fix: agent.get('last_write_at') returns None → _parse_utc(None) raises
+        # TypeError (already caught) → falls through to idle.append(agent).
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'x', 'state': 'idle'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
+
+class TestFormatDuration:
+    """Tests for the format_duration Jinja2 filter (accepts seconds)."""
+
+    def test_under_60s_returns_seconds_only(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(45) == '45s'
+
+    def test_zero_seconds_returns_dash(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(0) == '-'
+
+    def test_exactly_59s_returns_seconds(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(59) == '59s'
+
+    def test_exactly_60s_returns_minutes_seconds(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(60) == '1m 0s'
+
+    def test_600s_returns_10m_0s(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(600) == '10m 0s'
+
+    def test_90s_returns_1m_30s(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(90) == '1m 30s'
+
+    def test_3599s_returns_minutes_seconds(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(3599) == '59m 59s'
+
+    def test_exactly_3600s_returns_hours_minutes(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(3600) == '1h 0m'
+
+    def test_large_value_returns_hours_minutes(self):
+        from dashboard.app import format_duration
+
+        # 62736 seconds = 17h 25m 36s → '17h 25m'
+        assert format_duration(62736) == '17h 25m'
+
+    def test_float_input_is_handled(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(600.0) == '10m 0s'
+
+    def test_filter_registered_on_jinja2_env(self):
+        from dashboard.app import format_duration, templates
+
+        assert 'format_duration' in templates.env.filters
+        assert templates.env.filters['format_duration'] is format_duration
+
+    def test_none_returns_dash(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(None) == '-'
+
+    def test_negative_value_returns_dash(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(-30) == '-'
+
+    def test_non_numeric_returns_dash(self):
+        from dashboard.app import format_duration
+
+        assert format_duration('not_a_number') == '-'
+
+
 # --- Mock data for route tests ---
 
 MOCK_BUFFER_STATS = {'buffered_count': 3, 'oldest_event_age_seconds': 600.0}
