@@ -34,6 +34,38 @@ def _parse_utc(ts: str) -> datetime:
     return dt
 
 
+_ACTIVE_THRESHOLD_SECONDS = 3600  # 1 hour
+
+
+def partition_burst_state(
+    burst_state: list[dict],
+    *,
+    active_threshold_seconds: int = _ACTIVE_THRESHOLD_SECONDS,
+) -> tuple[list[dict], list[dict]]:
+    """Split burst agents into active and idle lists.
+
+    Active means ``state != 'idle'`` **or** ``last_write_at`` within
+    *active_threshold_seconds*.  Everything else is idle/stale.
+    """
+    now = datetime.now(UTC)
+    active: list[dict] = []
+    idle: list[dict] = []
+    for agent in burst_state:
+        if agent['state'] != 'idle':
+            active.append(agent)
+            continue
+        # Idle agents with recent writes are still "active" for display
+        try:
+            last_write = _parse_utc(agent['last_write_at'])
+            if (now - last_write).total_seconds() < active_threshold_seconds:
+                active.append(agent)
+                continue
+        except (ValueError, TypeError):
+            pass
+        idle.append(agent)
+    return active, idle
+
+
 async def get_recent_runs(db: aiosqlite.Connection | None, *, limit: int = 50) -> list[dict]:
     """Return recent reconciliation runs ordered by started_at DESC.
 
