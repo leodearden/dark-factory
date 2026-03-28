@@ -3062,11 +3062,11 @@
         "description": "Two layout issues: (1) Right column uses lg:absolute lg:inset-0 which causes scroll/overlap issues when left column height differs. (2) \"When\" and \"Detail\" column headers truncated at right edge on 1440px viewport.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 110-111). Fix: Replace absolute positioning with a simpler flex or grid layout that allows both columns to scroll independently. For truncation: ensure table uses table-layout:auto or add min-width to the container with overflow-x-auto.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T04:38:30.302Z",
+        "updatedAt": "2026-03-28T07:18:45.138Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/recon.html"
@@ -4543,9 +4543,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T07:18:44.897Z",
+      "lastModified": "2026-03-28T07:18:45.138Z",
       "taskCount": 256,
-      "completedCount": 200,
+      "completedCount": 201,
       "tags": [
         "master"
       ]
