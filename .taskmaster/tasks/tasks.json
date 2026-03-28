@@ -3417,7 +3417,7 @@
         "description": "Clean up misleading test helper name and improve test robustness in test_harness.py.\n\n1. **Rename helper** (10 call sites + definition): `_make_harness_with_mocked_stages` → `_make_test_harness` (or `_make_harness`). Update docstring to: \"Build a ReconciliationHarness wired to test fixtures with minimal config. Callers must mock individual stage.run methods as needed.\" The current name implies stages are pre-mocked, but they are not — all callers mock stages separately.\n\n2. **Extend `_mock_stage_run`**: Add optional `before_return` async callback parameter. Use it in `test_sonnet_tier_selection` to capture consolidator limits instead of duplicating StageReport boilerplate inline. This eliminates the pattern inconsistency where the test uses `_mock_stage_run` for non-consolidator stages but inlines a full mock for MemoryConsolidator.\n\n3. **Add pre-loop structural guard** in `test_sonnet_tier_selection`: Before the stage-mocking loop, assert `any(isinstance(s, MemoryConsolidator) for s in harness.stages)` — fails fast with clear message instead of silently running the full cycle.\n\n4. **Split post-cycle guard into two assertions**: One after the loop confirming MemoryConsolidator was found, one after run_full_cycle confirming `.run()` was actually called (with distinct error messages).\n\nOrigin: review suggestions #1, #2, #4, #5, #6, #8 on task 201.\nmemory_hints: search for \"_make_harness_with_mocked_stages\" and \"_mock_stage_run\" usage in test_harness.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -3428,7 +3428,8 @@
           "modules": [
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-28T00:41:14.873Z"
       },
       {
         "id": "204",
@@ -3784,7 +3785,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T00:41:13.837Z",
+      "lastModified": "2026-03-28T00:41:14.919Z",
       "taskCount": 201,
       "completedCount": 160,
       "tags": [
