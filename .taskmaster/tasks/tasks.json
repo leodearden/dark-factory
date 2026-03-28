@@ -4085,10 +4085,11 @@
         "description": "Test quality and duplication issues identified in task 224 code review.",
         "details": "## Problem\n\nTask 224 moved `parse_utc` to `dashboard/data/utils.py` and added canonical tests in `test_data_utils.py`, but left identical tests in `test_reconciliation.py`. Several other test quality issues also need addressing.\n\n## Fixes\n\n1. **Remove duplicate TestParseUtc from test_reconciliation.py (lines 508-548)**. The 4 test methods are byte-for-byte identical to `test_data_utils.py::TestParseUtc`. The canonical tests live in `test_data_utils.py`. A comment referencing the new location is acceptable.\n\n2. **Replace or remove test_app_imports_parse_utc_from_utils in test_data_utils.py (lines 63-70)**. This white-box test checks `hasattr(app_module, 'parse_utc')` — it tests import structure, not behavior. The behavioral test `test_naive_timestamp_timeago_works` already provides the regression guard. Either remove entirely, or replace with a behavioral mock test that verifies `timeago` delegates to `parse_utc`.\n\n3. **Strengthen test_naive_timestamp_timeago_works in test_data_utils.py (lines 52-61)**. Use a dynamically computed timestamp (e.g. `datetime.now() - timedelta(minutes=5)`) and assert specific output (`'5m ago'`), rather than a hardcoded date with `result != 'never'`.\n\n4. **Add test for partition_burst_state with last_write_at=None in test_recon_panel.py**. The explicit None guard added in task 224 is untested. Add: `agent = {'agent_id': 'a1', 'state': 'idle', 'last_write_at': None}; active, idle = partition_burst_state([agent]); assert idle == [agent]`.\n\n## Memory hints\n- search: \"parse_utc utility dashboard test\"\n- search: \"task 224 UTC consolidation\"",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T05:02:25.225Z"
       },
       {
         "id": "243",
@@ -4280,7 +4281,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T05:02:25.104Z",
+      "lastModified": "2026-03-28T05:02:25.225Z",
       "taskCount": 237,
       "completedCount": 185,
       "tags": [
