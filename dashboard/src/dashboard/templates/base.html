@@ -68,6 +68,9 @@
                 section.addEventListener('animationend', function () {
                     section.classList.remove('section-refreshed');
                 }, { once: true });
+                setTimeout(function () {
+                    section.classList.remove('section-refreshed');
+                }, 700);
             });
             setInterval(function () {
                 var stamps = document.querySelectorAll('[data-updated-at]');

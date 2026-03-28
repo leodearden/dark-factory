@@ -37,15 +37,15 @@
       "id": "step-4",
       "type": "impl",
       "description": "Add NaN guard in base.html. After the parseInt call on line 62, add: if (isNaN(ts)) return; \u2014 this prevents 'Updated NaNm ago' when data-updated-at is empty or malformed.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "70813982"
     },
     {
       "id": "step-5",
       "type": "test",
       "description": "Write failing test for animation cleanup fallback. Add TestAnimationFallback class to test_refresh_indicator.py with a test that the JS contains a setTimeout fallback near section-refreshed class removal, ensuring the class gets removed even when animationend doesn't fire (prefers-reduced-motion). Should fail against current base.html.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "76d22543"
     },
     {
       "id": "step-6",
