@@ -31,6 +31,8 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     TaskKnowledgeSync,
 )
 
+_MOCK_TYPES = (AsyncMock, MagicMock)
+
 
 class TestDisallowedToolLists:
     """Verify per-stage disallowed tool lists are correct."""
@@ -584,7 +586,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
 
         with self._patch_stage(stage):
             # (a) assemble_payload is replaced with a mock instance
-            assert isinstance(stage.assemble_payload, (AsyncMock, MagicMock))
+            assert isinstance(stage.assemble_payload, _MOCK_TYPES)
             # (b) run_stage_via_cli in the base module is no longer the original function
             assert base_module.run_stage_via_cli is not original_run_stage_via_cli
 
@@ -592,7 +594,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
         # (a) run_stage_via_cli is the original function again
         assert base_module.run_stage_via_cli is original_run_stage_via_cli
         # (b) assemble_payload is no longer a mock
-        assert not isinstance(stage.assemble_payload, (AsyncMock, MagicMock))
+        assert not isinstance(stage.assemble_payload, _MOCK_TYPES)
         # (c) assemble_payload is exactly the original method reference
         assert stage.assemble_payload == original_assemble_payload
 
@@ -600,6 +602,8 @@ class TestProjectIdValidation(BaseStageValidationTest):
         """_patch_stage wires a custom cli_side_effect onto the run_stage_via_cli mock."""
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        original_run_stage_via_cli = base_module.run_stage_via_cli
+        original_assemble_payload = stage.assemble_payload
 
         async def custom_cli(**kwargs):
             return StageResult(success=False, report={'summary': 'custom'})
@@ -608,7 +612,36 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # The patched run_stage_via_cli should have custom_cli as its side_effect
             assert base_module.run_stage_via_cli.side_effect is custom_cli  # type: ignore[reportFunctionMemberAccess]
             # Cross-assert: assemble_payload is also patched regardless of which parameter path is taken
-            assert isinstance(stage.assemble_payload, (AsyncMock, MagicMock))
+            assert isinstance(stage.assemble_payload, _MOCK_TYPES)
+
+        # Postconditions: context manager must restore original state on exit
+        # (a) run_stage_via_cli is the original function again
+        assert base_module.run_stage_via_cli is original_run_stage_via_cli
+        # (b) assemble_payload is no longer a mock
+        assert not isinstance(stage.assemble_payload, _MOCK_TYPES)
+        # (c) assemble_payload is exactly the original method reference
+        assert stage.assemble_payload == original_assemble_payload
+
+    def test_patch_stage_restores_on_exception(self, mock_deps):
+        """_patch_stage restores originals even when an exception is raised inside the with block."""
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        original_run_stage_via_cli = base_module.run_stage_via_cli
+        original_assemble_payload = stage.assemble_payload
+
+        try:
+            with self._patch_stage(stage):
+                raise RuntimeError('boom')
+        except RuntimeError:
+            pass
+
+        # Postconditions: context manager must restore original state on abnormal exit
+        # (a) run_stage_via_cli is the original function again
+        assert base_module.run_stage_via_cli is original_run_stage_via_cli
+        # (b) assemble_payload is no longer a mock
+        assert not isinstance(stage.assemble_payload, _MOCK_TYPES)
+        # (c) assemble_payload is exactly the original method reference
+        assert stage.assemble_payload == original_assemble_payload
 
 
 class TestRunIdValidation(BaseStageValidationTest):
@@ -721,6 +754,14 @@ class TestBaseStageValidationContract:
 
     def test_base_class_has_patch_stage_helper(self):
         assert hasattr(BaseStageValidationTest, '_patch_stage'), "missing _patch_stage helper"
+
+    def test_mock_types_constant_defined(self):
+        """_MOCK_TYPES module-level constant must exist and contain AsyncMock and MagicMock."""
+        import tests.test_stages as _self_module  # noqa: PLC0415
+        assert hasattr(_self_module, '_MOCK_TYPES'), "_MOCK_TYPES constant must be defined at module level"
+        assert isinstance(_self_module._MOCK_TYPES, tuple), "_MOCK_TYPES must be a tuple"
+        assert AsyncMock in _self_module._MOCK_TYPES, "_MOCK_TYPES must contain AsyncMock"
+        assert MagicMock in _self_module._MOCK_TYPES, "_MOCK_TYPES must contain MagicMock"
 
 
 class TestTierConfig:
