@@ -3654,7 +3654,7 @@
         "description": "Ten review suggestions targeting test_stages.py TestProjectIdValidation tests added by task 194:\n\n1. **Fix misleading test names**: Four tests use \"warning\" in their name but assert DEBUG-level logs. Rename to use \"debug\" (e.g. `test_run_logs_debug_when_watermark_project_id_falsy`).\n\n2. **Parametrize duplicate tests**: `test_run_allows_whitespace_watermark_project_id` and `test_run_allows_empty_watermark_project_id` are near-identical — consolidate with `@pytest.mark.parametrize('project_id,run_id', [('', 'test-run-5'), ('   ', 'test-run-whitespace-wm')])`. Same for the two log-checking tests.\n\n3. **Strengthen weak assertions**: `test_run_allows_whitespace_watermark_project_id` drops completed_at, started_at, items_flagged, stats checks that sibling tests include. Restore full assertion set.\n\n4. **Add None edge case**: No test covers `Watermark(project_id=None)` — a realistic default-construction input. Add parametrize case or dedicated test.\n\n5. **Filter caplog by logger name**: caplog.messages assertions don't filter by logger, risking false positives. Filter by `r.name == 'fused_memory.reconciliation.stages.base'`.\n\nmemory_hints:\n- search: \"task 194 test_stages.py project_id validation tests\"",
         "details": "File: fused-memory/tests/test_stages.py (lines 507-631, TestProjectIdValidation class)\n\nSource: review suggestions from task 194 (esc-194-4), suggestions 2/6/7/9/10/11/12/13/14/16.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -3667,7 +3667,7 @@
             "fused-memory/tests/test_stages.py"
           ]
         },
-        "updatedAt": "2026-03-28T15:25:36.048Z"
+        "updatedAt": "2026-03-28T16:43:59.381Z"
       },
       {
         "id": "210",
@@ -5038,7 +5038,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T16:43:59.032Z",
+      "lastModified": "2026-03-28T16:43:59.381Z",
       "taskCount": 268,
       "completedCount": 219,
       "tags": [
