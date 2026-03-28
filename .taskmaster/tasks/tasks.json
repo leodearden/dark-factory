@@ -3976,10 +3976,11 @@
         "description": "Three improvements to the _patch_stage helper tests in TestProjectIdValidation (test_stages.py, lines ~601-628):\n\n1. **Replace hasattr with isinstance**: `assert hasattr(stage.assemble_payload, 'side_effect')` is a weak proxy for \"is a mock\". Use `from unittest.mock import MagicMock; assert isinstance(stage.assemble_payload, (AsyncMock, MagicMock))` instead.\n\n2. **Add postcondition assertions**: After the `with self._patch_stage(...)` block exits, verify that `base_module.run_stage_via_cli` is restored to the original function and `stage.assemble_payload` is no longer a mock. This validates the context manager's most important property — state restoration.\n\n3. **Cross-assert both patches in cli_side_effect test**: `test_patch_stage_accepts_cli_side_effect` verifies the CLI side effect but doesn't check that `assemble_payload` is also patched. Add an isinstance assertion for assemble_payload inside the `with` block to confirm both patches are applied regardless of which parameter path is taken.\n\nmemory_hints:\n- search: \"test_stages.py _patch_stage meta-test assertions\"\n- search: \"context manager test postcondition restoration\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T04:47:15.736Z"
       },
       {
         "id": "235",
@@ -4230,7 +4231,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:47:15.221Z",
+      "lastModified": "2026-03-28T04:47:15.736Z",
       "taskCount": 234,
       "completedCount": 181,
       "tags": [
