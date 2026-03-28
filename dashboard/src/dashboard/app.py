@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from typing import Any
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -118,7 +119,7 @@ def format_duration_ms(value: int | float | None) -> str:
 templates.env.filters['format_duration_ms'] = format_duration_ms
 
 
-def format_duration(value: int | float | None) -> str:
+def format_duration(value: Any) -> str:
     """Format a duration in seconds to a human-readable compound string.
 
     Tiers:
