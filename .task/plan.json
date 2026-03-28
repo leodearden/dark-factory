@@ -1,0 +1,171 @@
+{
+  "task_id": "188",
+  "title": "Fix: add_memory \u2192 Graphiti pathway creates duplicate edges",
+  "files": [
+    "fused-memory/src/fused_memory/services/memory_service.py",
+    "fused-memory/tests/test_memory_service.py",
+    "fused-memory/tests/conftest.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/services",
+    "fused-memory/tests"
+  ],
+  "analysis": "Root cause: When add_memory routes to Graphiti (for categories entities_and_relations, temporal_facts, decisions_and_rationale), it enqueues an 'add_memory_graphiti' operation. The durable queue worker calls _execute_graphiti_write, which delegates to graphiti_core's add_episode(). This runs the full LLM-powered extraction pipeline \u2014 extract_nodes \u2192 resolve_nodes \u2192 extract_edges \u2192 resolve_edges \u2192 save. For simple, single-fact memories, the LLM extraction can produce multiple edges expressing the same fact (observed: 6 identical edges from episode 04dd0070). Graphiti's internal dedup (resolve_extracted_edges) only catches exact matches on (source_node_uuid, target_node_uuid, _normalize_string_exact(fact)) within the same extraction batch. If the LLM produces edges with slight wording variations or different entity pairings that resolve to the same nodes, they pass through dedup. Since graphiti_core is an external library we cannot modify, the fix must be at the fused-memory layer.\n\nFix approach: Add a post-write dedup step in _execute_graphiti_write. After add_episode() returns AddEpisodeResults (with .edges list of EntityEdge objects), group edges by (source_node_uuid, target_node_uuid, normalized_fact). For each group with >1 edge, keep the first and delete extras via graphiti.bulk_remove_edges(). This is the narrowest fix \u2014 it runs in the same durable queue processing cycle, so failures trigger retry of the whole item.\n\nSecondary finding: MockAddEpisodeResult in conftest uses 'entity_edges' but the real AddEpisodeResults class has 'edges'. The _dual_write_callback accesses getattr(result, 'entity_edges', None) which would miss the real field. This needs to be fixed alongside the dedup work to ensure the mock matches reality.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Update MockAddEpisodeResult in conftest.py to include 'edges' field matching the real AddEpisodeResults schema, while keeping 'entity_edges' for backward compat",
+      "status": "done",
+      "commit": "e8bf35f0",
+      "tests": []
+    },
+    {
+      "id": "pre-2",
+      "description": "Add source_node_uuid and target_node_uuid fields to MockEdge in conftest.py to enable dedup testing with realistic edge objects",
+      "status": "done",
+      "commit": "e8bf35f0",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing test: _dedup_episode_edges with result containing 3 edges sharing same (source_node_uuid, target_node_uuid, fact) removes 2 duplicates via bulk_remove_edges and returns count=2",
+      "status": "done",
+      "commit": "59ab8551"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Implement _dedup_episode_edges method on MemoryService: extract edges from result, group by (source_node_uuid, target_node_uuid, normalized_fact), collect duplicate UUIDs, call self.graphiti.bulk_remove_edges, return removed count",
+      "status": "done",
+      "commit": "31b0d926"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing test: _dedup_episode_edges returns 0 and does NOT call bulk_remove_edges when all edges have distinct (source, target, fact) tuples",
+      "status": "done",
+      "commit": "59ab8551"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Ensure _dedup_episode_edges short-circuits without calling backend when no duplicates found (no-op path)",
+      "status": "done",
+      "commit": "31b0d926"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing test: _dedup_episode_edges handles None result and result with empty edges list gracefully (returns 0, no backend calls)",
+      "status": "done",
+      "commit": "59ab8551"
+    },
+    {
+      "id": "step-6",
+      "type": "test",
+      "description": "Write failing test: _dedup_episode_edges normalizes fact text for comparison \u2014 edges with 'Auth depends on Redis' vs '  auth  depends  on  redis  ' are treated as duplicates",
+      "status": "done",
+      "commit": "59ab8551"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing test: _dedup_episode_edges preserves edges with same fact but different source/target node pairs (different relationships are not duplicates)",
+      "status": "done",
+      "commit": "59ab8551"
+    },
+    {
+      "id": "step-8",
+      "type": "test",
+      "description": "Write failing test: _execute_graphiti_write calls _dedup_episode_edges with the result from add_episode and the duplicate edges are removed before returning",
+      "status": "done",
+      "commit": "59ab8551"
+    },
+    {
+      "id": "step-9",
+      "type": "impl",
+      "description": "Wire _dedup_episode_edges into _execute_graphiti_write: call it on the result after _journaled_backend_call returns, before returning the result",
+      "status": "done",
+      "commit": "31b0d926"
+    },
+    {
+      "id": "step-10",
+      "type": "test",
+      "description": "Write failing test: _execute_graphiti_write still returns normally when add_episode returns None (no edges to dedup, no crash)",
+      "status": "done",
+      "commit": "59ab8551"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write test: _dual_write_callback reads edges from result.edges (not result.entity_edges) to match real AddEpisodeResults schema \u2014 fix the field access",
+      "status": "done",
+      "commit": "59ab8551"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Fix _dual_write_callback to read result.edges with fallback to result.entity_edges for backward compat: edges = getattr(result, 'edges', None) or getattr(result, 'entity_edges', None) or []",
+      "status": "done",
+      "commit": "31b0d926"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Post-write dedup in _execute_graphiti_write rather than pre-write content guard",
+      "rationale": "A pre-write guard (search-before-insert) would add latency and couldn't catch duplicates created within the same add_episode call. Post-write dedup inspects the actual edges created, so it catches all duplication sources including LLM extraction producing multiple similar triples."
+    },
+    {
+      "decision": "Dedup key is (source_node_uuid, target_node_uuid, normalized_fact) matching graphiti_core's internal approach",
+      "rationale": "Using the same key format as graphiti_core's resolve_extracted_edges ensures consistency. The normalization (lowercase + collapse whitespace) catches near-duplicates from LLM extraction that differ only in capitalization or spacing."
+    },
+    {
+      "decision": "Use bulk_remove_edges for deletion rather than individual remove_edge calls",
+      "rationale": "bulk_remove_edges executes a single Cypher query for all UUIDs, which is more efficient than N individual calls for N duplicate edges. The GraphitiBackend already has this method with pre-count verification."
+    },
+    {
+      "decision": "Dedup runs inside the durable queue's _process_item cycle (within the write timeout)",
+      "rationale": "If dedup fails, the whole queue item fails and retries. This is safer than fire-and-forget dedup \u2014 duplicates won't persist if the cleanup step crashes. The write_timeout_seconds (default 120s) is generous enough for the extra query."
+    },
+    {
+      "decision": "Fix _dual_write_callback field access from entity_edges to edges with fallback",
+      "rationale": "The real AddEpisodeResults uses 'edges' not 'entity_edges'. The current code silently produces no dual-writes because getattr(result, 'entity_edges', None) returns None for the real result class. Using a fallback chain preserves backward compat with the mock while fixing the real code path."
+    },
+    {
+      "decision": "Keep dedup as a method on MemoryService rather than a standalone utility",
+      "rationale": "The method needs access to self.graphiti.bulk_remove_edges for deletion. Making it a service method keeps it co-located with the write logic and accessible from tests via the service fixture."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "GraphitiBackend.bulk_remove_edges",
+      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py",
+      "how": "Use existing method to batch-delete duplicate edge UUIDs in a single Cypher query. Already handles pre-count verification and returns actual delete count."
+    },
+    {
+      "what": "graphiti_core's normalize pattern (lowercase + collapse whitespace)",
+      "where": "graphiti_core/utils/maintenance/dedup_helpers.py",
+      "how": "Replicate the same normalization logic (re.sub(r'[\\s]+', ' ', text.lower()).strip()) for fact comparison to match graphiti_core's internal dedup key format."
+    },
+    {
+      "what": "MockEdge and MockAddEpisodeResult from conftest",
+      "where": "fused-memory/tests/conftest.py",
+      "how": "Extend existing mock dataclasses with source_node_uuid/target_node_uuid on MockEdge and edges field on MockAddEpisodeResult. Existing tests continue working unchanged."
+    },
+    {
+      "what": "MemoryService test fixture pattern",
+      "where": "fused-memory/tests/test_memory_service.py",
+      "how": "Reuse existing service fixture with mocked backends. For dedup tests, configure graphiti.add_episode to return MockAddEpisodeResult with edges containing duplicates, and mock bulk_remove_edges to verify calls."
+    },
+    {
+      "what": "WriteJournal _journaled_backend_call pattern",
+      "where": "fused-memory/src/fused_memory/services/memory_service.py line 132",
+      "how": "Dedup runs after _journaled_backend_call returns, using the same result object. No changes needed to journal tracking \u2014 dedup is an additional post-processing step."
+    }
+  ],
+  "_session_id": "188-7d51d619",
+  "_created_at": "2026-03-28T15:41:39.295987+00:00"
+}
