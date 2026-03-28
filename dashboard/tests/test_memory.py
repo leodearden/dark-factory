@@ -344,6 +344,8 @@ class TestGetMemoryStatus:
         assert 'offline' not in result
         # Prove port 9000 was actually attempted before falling through to 9001
         assert 9000 in ports_seen
+        # Prove the fallback server (9001) was actually reached
+        assert 9001 in ports_seen
 
 
 # ── get_queue_stats (aggregation) ──────────────────────────────
@@ -391,8 +393,13 @@ class TestGetQueueStats:
         """
         from dashboard.data.memory import get_queue_stats
 
+        ports_seen: set[int] = set()
+
         def handler(request: httpx.Request) -> httpx.Response:
             port = request.url.port
+            assert port is not None
+            ports_seen.add(port)
+
             if port == 9000:
                 raise httpx.ConnectError('refused')
             body = json.loads(request.content)
@@ -411,6 +418,9 @@ class TestGetQueueStats:
         # 1 server (9001) × 3 pending = 3
         assert result['counts']['pending'] == 3
         assert 'offline' not in result
+        # Prove both ports were actually contacted
+        assert 9000 in ports_seen
+        assert 9001 in ports_seen
 
 
 # ── Malformed responses ─────────────────────────────────────────
