@@ -1,6 +1,7 @@
 """Tests for config schema Literal type validation."""
 
 import os
+import sys
 
 import pytest
 import yaml
@@ -198,3 +199,80 @@ class TestYamlSettingsSourceEnvVarExpansion:
     def test_non_env_string_unchanged(self):
         result = self.source._expand_env_vars('plain-string')
         assert result == 'plain-string'
+
+
+class TestYamlSettingsSourceErrorHandling:
+    """Tests for YamlSettingsSource error handling on corrupt or unreadable files."""
+
+    def _make_source(self, path):
+        from pydantic_settings import BaseSettings
+
+        class _DummySettings(BaseSettings):
+            pass
+
+        return YamlSettingsSource(_DummySettings, config_path=path)
+
+    def test_corrupt_yaml_raises_runtime_error(self, tmp_path):
+        """Corrupt YAML content must raise RuntimeError with the file path in the message."""
+        bad_file = tmp_path / 'bad.yaml'
+        bad_file.write_bytes(b': :\n  - \x00bad')
+        source = self._make_source(bad_file)
+        with pytest.raises(RuntimeError, match=str(bad_file)):
+            source()
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='chmod not reliable on Windows')
+    def test_unreadable_file_raises_runtime_error(self, tmp_path):
+        """An unreadable file must raise RuntimeError with the file path in the message."""
+        locked_file = tmp_path / 'locked.yaml'
+        locked_file.write_text('key: value')
+        locked_file.chmod(0o000)
+        try:
+            source = self._make_source(locked_file)
+            with pytest.raises(RuntimeError, match=str(locked_file)):
+                source()
+        finally:
+            locked_file.chmod(0o644)
+
+
+class TestYamlSettingsSourceEncoding:
+    """Tests for YamlSettingsSource explicit UTF-8 encoding."""
+
+    def _make_source(self, path):
+        from pydantic_settings import BaseSettings
+
+        class _DummySettings(BaseSettings):
+            pass
+
+        return YamlSettingsSource(_DummySettings, config_path=path)
+
+    def test_utf8_yaml_loaded_correctly(self, tmp_path):
+        """YAML files with non-ASCII UTF-8 characters must load correctly."""
+        config_file = tmp_path / 'utf8.yaml'
+        config_file.write_text("description: 'Ünfcödé tëst'", encoding='utf-8')
+        source = self._make_source(config_file)
+        result = source()
+        assert result.get('description') == 'Ünfcödé tëst'
+
+
+class TestYamlSettingsSourceABCContract:
+    """Tests for YamlSettingsSource ABC contract compliance."""
+
+    def setup_method(self):
+        from pydantic_settings import BaseSettings
+
+        class _DummySettings(BaseSettings):
+            pass
+
+        self.source = YamlSettingsSource(_DummySettings, config_path=None)
+
+    def test_get_field_value_returns_tuple(self):
+        """get_field_value must return tuple[Any, str, bool] per PydanticBaseSettingsSource ABC."""
+        from pydantic.fields import FieldInfo
+
+        field = FieldInfo(annotation=str)
+        result = self.source.get_field_value(field, 'my_field')
+        assert isinstance(result, tuple), f'Expected tuple, got {type(result)}'
+        assert len(result) == 3, f'Expected 3-tuple, got {len(result)}-tuple'
+        assert result[0] is None
+        assert result[1] == 'my_field'
+        assert result[2] is False
