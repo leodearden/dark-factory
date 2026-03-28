@@ -4748,7 +4748,7 @@
         "description": "Task 180's Tailwind setup (Makefile, input.css, tailwind.css, favicon.svg) was reverted in commit 0ea23cb5 during merge conflict resolution for task 168. The dashboard is back on cdn.tailwindcss.com + style.css. Re-implement the local build correctly:\n\n1. Restore dashboard/Makefile, dashboard/.gitignore, dashboard/src/dashboard/static/input.css, dashboard/src/dashboard/static/favicon.svg\n2. Add tailwind.css to dashboard/.gitignore (do NOT commit generated CSS)\n3. Add sha256 checksum verification for the downloaded Tailwind binary\n4. Chain chmod with cleanup guard: `curl ... && chmod +x ... || (rm -f ...; exit 1)`\n5. Document linux-x64 platform assumption or add platform detection\n6. Update dashboard/src/dashboard/templates/base.html to reference /static/tailwind.css instead of cdn.tailwindcss.com\n\nmemory_hints: search for \"tailwind\" and \"task 180\" for prior context on the original implementation.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -4765,7 +4765,8 @@
             "dashboard/src/dashboard/static",
             "dashboard/src/dashboard/templates"
           ]
-        }
+        },
+        "updatedAt": "2026-03-28T16:47:36.518Z"
       },
       {
         "id": "277",
@@ -5044,7 +5045,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T16:47:36.253Z",
+      "lastModified": "2026-03-28T16:47:36.518Z",
       "taskCount": 268,
       "completedCount": 220,
       "tags": [
