@@ -566,3 +566,70 @@ class TestReconciliationRunProjectId:
             'started_at': '2024-01-01T00:00:00Z',
         })
         assert run.project_id == 'dark_factory'
+
+
+# ---------------------------------------------------------------------------
+# Step 7: Integration test — padded project_id normalizes consistently
+# ---------------------------------------------------------------------------
+
+
+class TestProjectIdNormalizationIntegration:
+    """Padded project_id normalizes to the same value across all three models."""
+
+    PADDED = '  dark_factory  '
+    EXPECTED = 'dark_factory'
+
+    def test_watermark_strips_padded_project_id(self):
+        from fused_memory.models.reconciliation import Watermark
+
+        wm = Watermark(project_id=self.PADDED)
+        assert wm.project_id == self.EXPECTED
+
+    def test_reconciliation_event_strips_padded_project_id(self):
+        from fused_memory.models.reconciliation import ReconciliationEvent
+
+        evt = ReconciliationEvent(
+            id='evt-1',
+            type='episode_added',
+            source='agent',
+            project_id=self.PADDED,
+            timestamp='2024-01-01T00:00:00Z',
+        )
+        assert evt.project_id == self.EXPECTED
+
+    def test_reconciliation_run_strips_padded_project_id(self):
+        from fused_memory.models.reconciliation import ReconciliationRun
+
+        run = ReconciliationRun(
+            id='run-1',
+            project_id=self.PADDED,
+            run_type='full',
+            trigger_reason='test',
+            started_at='2024-01-01T00:00:00Z',
+        )
+        assert run.project_id == self.EXPECTED
+
+    def test_all_three_models_produce_matching_project_id(self):
+        """All three normalized values are equal — a stage can compare them safely."""
+        from fused_memory.models.reconciliation import (
+            ReconciliationEvent,
+            ReconciliationRun,
+            Watermark,
+        )
+
+        wm = Watermark(project_id=self.PADDED)
+        evt = ReconciliationEvent(
+            id='evt-1',
+            type='episode_added',
+            source='agent',
+            project_id=self.PADDED,
+            timestamp='2024-01-01T00:00:00Z',
+        )
+        run = ReconciliationRun(
+            id='run-1',
+            project_id=self.PADDED,
+            run_type='full',
+            trigger_reason='test',
+            started_at='2024-01-01T00:00:00Z',
+        )
+        assert wm.project_id == evt.project_id == run.project_id == self.EXPECTED
