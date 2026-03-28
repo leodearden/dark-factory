@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import runpy
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
 import pytest
+
+from dashboard.app import _safe_gather_result
 
 PARTIAL_URLS = (
     "/partials/memory",
@@ -713,3 +716,17 @@ class TestAriaLivePollingsections:
     def test_polling_sections_have_aria_live(self, client):
         html = client.get('/').text
         assert html.count('aria-live="polite"') == 5
+
+
+class TestSafeGatherResult:
+    """Tests for the _safe_gather_result helper."""
+
+    def test_safe_gather_result_reraises_cancelled_error(self):
+        """CancelledError (BaseException, not Exception) must propagate, not be swallowed."""
+        with pytest.raises(asyncio.CancelledError):
+            _safe_gather_result(asyncio.CancelledError(), 'default', 'test')
+
+    def test_safe_gather_result_reraises_keyboard_interrupt(self):
+        """KeyboardInterrupt (BaseException, not Exception) must propagate, not be swallowed."""
+        with pytest.raises(KeyboardInterrupt):
+            _safe_gather_result(KeyboardInterrupt(), 'default', 'test')
