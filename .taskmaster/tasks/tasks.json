@@ -3984,6 +3984,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 238,
+        "title": "Handle state=None edge case in partition_burst_state",
+        "description": "agent.get('state', 'idle') returns None (not 'idle') when state is explicitly set to None. This silently classifies the agent as active without any timestamp check — likely not the intended behavior.",
+        "details": "## Problem\n\n`partition_burst_state` uses `agent.get('state', 'idle')` to default missing keys to 'idle'. However, if the dict contains `{'state': None}`, `.get()` returns `None` (the default only applies to missing keys, not None values). Since `None != 'idle'` is True, the agent is classified as **active** without any timestamp check.\n\nWhile `get_burst_state` in production currently only emits 'idle' or 'bursting', `partition_burst_state` is a public utility function that could receive arbitrary dicts.\n\n## Fix\n\n1. Decide the intended contract: should `state=None` be treated as idle?\n2. If yes, change `agent.get('state', 'idle')` to `agent.get('state') or 'idle'` in reconciliation.py:54.\n3. Add a test for the `state=None` case documenting the chosen behavior.\n\n## Memory hints\n- search: \"partition_burst_state state None edge case\"\n- search: \"get_burst_state state values idle bursting\"",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -3996,7 +4007,7 @@
       ],
       "created": "2026-03-28T04:15:57.638Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T04:15:57.647Z"
+      "updated": "2026-03-28T04:15:57.816Z"
     }
   }
 }
