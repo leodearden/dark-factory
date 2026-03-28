@@ -507,17 +507,29 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.started_at <= result.completed_at
 
     @pytest.mark.asyncio
-    async def test_run_allows_empty_watermark_project_id(self, mock_deps):
-
+    @pytest.mark.parametrize(
+        'watermark_pid,run_id',
+        [
+            ('', 'test-run-5'),
+            ('   ', 'test-run-whitespace-wm'),
+        ],
+    )
+    async def test_run_succeeds_and_logs_debug_when_watermark_project_id_falsy(
+        self, mock_deps, caplog, watermark_pid, run_id
+    ):
+        """Empty or whitespace-only watermark project_id: mismatch check is skipped,
+        a DEBUG log is emitted, and the run succeeds with full results."""
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
 
-        with self._patch_stage(stage):
+        with self._patch_stage(stage), caplog.at_level(
+            logging.DEBUG, logger='fused_memory.reconciliation.stages.base'
+        ):
             result = await stage.run(
                 events=[],
-                watermark=Watermark(project_id=''),
+                watermark=Watermark(project_id=watermark_pid),
                 prior_reports=[],
-                run_id='test-run-5',
+                run_id=run_id,
             )
         assert result is not None
         assert result.stage == StageId.memory_consolidator
@@ -526,6 +538,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.stats == {}
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
+        assert any(
+            ('no project_id' in rec.message.lower() or 'skipping' in rec.message.lower())
+            for rec in caplog.records
+            if rec.name == 'fused_memory.reconciliation.stages.base'
+            and rec.levelno == logging.DEBUG
+        )
 
     @pytest.mark.asyncio
     async def test_recon_context_includes_project_id(self, mock_deps):
