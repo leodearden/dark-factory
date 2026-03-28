@@ -137,7 +137,7 @@ class TestPartitionBurstState:
     """Tests for the partition_burst_state helper."""
 
     def test_bursting_agent_is_active(self):
-        from dashboard.app import partition_burst_state
+        from dashboard.data.reconciliation import partition_burst_state
 
         agents = [{'agent_id': 'a1', 'state': 'bursting', 'last_write_at': '2020-01-01T00:00:00+00:00'}]
         active, idle = partition_burst_state(agents)
@@ -145,7 +145,7 @@ class TestPartitionBurstState:
         assert len(idle) == 0
 
     def test_idle_old_agent_is_idle(self):
-        from dashboard.app import partition_burst_state
+        from dashboard.data.reconciliation import partition_burst_state
 
         agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': '2020-01-01T00:00:00+00:00'}]
         active, idle = partition_burst_state(agents)
@@ -153,7 +153,7 @@ class TestPartitionBurstState:
         assert len(idle) == 1
 
     def test_idle_recent_agent_is_active(self):
-        from dashboard.app import partition_burst_state
+        from dashboard.data.reconciliation import partition_burst_state
 
         recent_ts = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
         agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': recent_ts}]
@@ -162,7 +162,7 @@ class TestPartitionBurstState:
         assert len(idle) == 0
 
     def test_mixed_partition(self):
-        from dashboard.app import partition_burst_state
+        from dashboard.data.reconciliation import partition_burst_state
 
         old_ts = '2020-01-01T00:00:00+00:00'
         recent_ts = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
@@ -176,14 +176,14 @@ class TestPartitionBurstState:
         assert [a['agent_id'] for a in idle] == ['idle-old']
 
     def test_empty_list(self):
-        from dashboard.app import partition_burst_state
+        from dashboard.data.reconciliation import partition_burst_state
 
         active, idle = partition_burst_state([])
         assert active == []
         assert idle == []
 
     def test_invalid_timestamp_treated_as_idle(self):
-        from dashboard.app import partition_burst_state
+        from dashboard.data.reconciliation import partition_burst_state
 
         agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': 'not-a-date'}]
         active, idle = partition_burst_state(agents)
@@ -191,7 +191,7 @@ class TestPartitionBurstState:
         assert len(idle) == 1
 
     def test_custom_threshold(self):
-        from dashboard.app import partition_burst_state
+        from dashboard.data.reconciliation import partition_burst_state
 
         ts = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
         agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': ts}]
