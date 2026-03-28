@@ -268,8 +268,11 @@ def _make_s3_findings():
     ]
 
 
-def _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service):
-    """Build a harness with all stages mocked to return StageReports."""
+def _make_test_harness(journal, event_buffer, mock_memory_service):
+    """Build a ReconciliationHarness wired to test fixtures with minimal config.
+
+    Callers must mock individual stage.run methods as needed.
+    """
     from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
     from fused_memory.reconciliation.harness import ReconciliationHarness
 
@@ -319,7 +322,7 @@ def _mock_stage_run(stage, items_flagged=None, before_return=None):
 @pytest.mark.asyncio
 async def test_mock_stage_run_before_return_callback(journal, event_buffer, mock_memory_service):
     """_mock_stage_run must invoke an optional async before_return callback with the stage."""
-    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     stage = harness.stages[0]
 
     callback_args: list = []
@@ -396,7 +399,7 @@ async def test_normal_payload_includes_prior_s3_findings(mock_memory_service):
 @pytest.mark.asyncio
 async def test_run_full_cycle_triggers_remediation(journal, event_buffer, mock_memory_service):
     """Full cycle with S3 actionable findings triggers a remediation pass."""
-    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     await event_buffer.push(_make_event())
     await event_buffer.push(_make_event())
@@ -427,7 +430,7 @@ async def test_remediation_does_not_run_without_actionable_findings(
     journal, event_buffer, mock_memory_service,
 ):
     """No remediation pass when S3 has only non-actionable findings."""
-    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     await event_buffer.push(_make_event())
 
@@ -457,7 +460,7 @@ async def test_remediation_failure_does_not_fail_parent(
     journal, event_buffer, mock_memory_service,
 ):
     """If remediation pass fails, parent run remains completed."""
-    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     await event_buffer.push(_make_event())
 
@@ -548,7 +551,7 @@ async def test_timeout_marks_run_failed(journal, event_buffer, mock_memory_servi
     """
     import asyncio
 
-    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     # Make first stage sleep forever (simulating a long-running stage)
     async def slow_stage_run(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0]):
@@ -610,7 +613,7 @@ async def test_run_full_cycle_accepts_pre_drained_events(journal, event_buffer, 
     This test confirms that passing events=[...] to run_full_cycle uses those events
     without calling buffer.drain(), and that events_processed reflects the passed count.
     """
-    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     # Mock all stages to succeed
     for stage in harness.stages:
@@ -643,7 +646,7 @@ async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_ser
     import asyncio
     from unittest.mock import AsyncMock, patch
 
-    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     # Wire a real judge with the project pre-halted
     from fused_memory.config.schema import ReconciliationConfig
@@ -696,7 +699,7 @@ async def test_stage_state_reset_after_remediation(journal, event_buffer, mock_m
     from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
     from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
-    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     await event_buffer.push(_make_event())
 
@@ -732,7 +735,7 @@ async def test_cancellation_cleanup_failure_preserves_cancelled_error(
     """
     import asyncio
 
-    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     # Make first stage sleep forever (will be cancelled by wait_for timeout)
     async def slow_stage_run(
@@ -795,7 +798,7 @@ async def test_cancellation_cleanup_shielded_from_second_cancel(
     """
     import asyncio
 
-    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     # Make first stage sleep forever (cancelled by the first outer_task.cancel())
     async def slow_stage_run(
@@ -987,7 +990,7 @@ class TestSelectTier:
         """run_full_cycle applies TierConfig limits onto MemoryConsolidator before stage runs."""
         from fused_memory.reconciliation.harness import TierConfig
 
-        harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
         # Capture the limits as seen by stage1 when its run() is invoked
         captured: dict = {}
