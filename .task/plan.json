@@ -1,0 +1,116 @@
+{
+  "task_id": "224",
+  "title": "Fix _parse_utc type contract and consolidate remaining UTC duplication",
+  "files": [
+    "dashboard/src/dashboard/data/utils.py",
+    "dashboard/src/dashboard/data/reconciliation.py",
+    "dashboard/src/dashboard/app.py",
+    "dashboard/tests/test_data_utils.py",
+    "dashboard/tests/test_reconciliation.py"
+  ],
+  "modules": [
+    "dashboard/src/dashboard/data",
+    "dashboard/src/dashboard",
+    "dashboard/tests"
+  ],
+  "analysis": "The _parse_utc helper in reconciliation.py has a misleading type signature (str | None) when it doesn't actually handle None \u2014 it just lets TypeError propagate from datetime.fromisoformat(). The # type: ignore[arg-type] suppresses what the type checker correctly flags. All 3 call sites handle None externally: line 242 checks `if oldest_ts is not None`, and lines 59 and 279 wrap calls in try/except (ValueError, TypeError). Additionally, app.py's timeago filter (lines 55-59) has a duplicate inline UTC-normalization pattern (fromisoformat \u2192 tzinfo check \u2192 replace(tzinfo=UTC)) that should use the same shared helper. The fix is: (1) tighten the type signature to `ts: str`, (2) move to a shared utils module, (3) update reconciliation.py imports, (4) refactor timeago to use the shared helper. The function should be renamed from _parse_utc to parse_utc (dropping the private prefix) since it becomes a shared public utility within the data package. Existing test_reconciliation.py TestParseUtc tests import from dashboard.data.reconciliation and must be updated to import from the new location.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Verify existing tests pass before refactoring: run dashboard test suite to establish green baseline",
+      "status": "done",
+      "commit": null,
+      "tests": [
+        "dashboard/tests/test_reconciliation.py::TestParseUtc",
+        "dashboard/tests/test_recon_panel.py::TestTimeagoFilter",
+        "dashboard/tests/test_recon_panel.py::TestPartitionBurstState"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing tests for parse_utc in new dashboard/tests/test_data_utils.py: test naive ISO string gets UTC, aware ISO string preserved, invalid string raises ValueError, and type signature accepts str (None raises TypeError from fromisoformat). Import from dashboard.data.utils which does not yet exist \u2014 tests fail with ImportError.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Create dashboard/src/dashboard/data/utils.py with parse_utc(ts: str) -> datetime function. Body: call datetime.fromisoformat(ts), attach UTC if tzinfo is None, return. No type: ignore comment. All test_data_utils tests should now pass.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Update TestParseUtc in test_reconciliation.py to import parse_utc from dashboard.data.utils instead of _parse_utc from dashboard.data.reconciliation. Tests will fail because reconciliation.py still defines the local _parse_utc and the test expectations reference the old location.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Update reconciliation.py: remove the local _parse_utc definition, add 'from dashboard.data.utils import parse_utc' at the top. Replace all 3 internal call sites (_parse_utc \u2192 parse_utc). Remove the now-unnecessary '# type: ignore[arg-type]' line. The existing reconciliation tests (get_buffer_stats, get_burst_state, partition_burst_state) and updated TestParseUtc tests should all pass.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write a test in test_data_utils.py verifying that timeago('2026-03-28T10:00:00') (naive timestamp) works correctly \u2014 this documents the expected behavior after refactoring app.py. Also write a test that app.py imports parse_utc from dashboard.data.utils (verifying the DRY consolidation). These tests fail because app.py still uses inline parsing.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Refactor timeago filter in app.py: import parse_utc from dashboard.data.utils, replace the inline fromisoformat/tzinfo/replace pattern (lines 55-59) with a call to parse_utc(value). Keep the existing try/except (ValueError, TypeError) wrapper and the None early-return. Verify all timeago tests in test_recon_panel.py still pass, plus the new consolidation test.",
+      "status": "pending",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Rename _parse_utc to parse_utc (drop leading underscore) in the shared module",
+      "rationale": "The function was private (_-prefixed) when it lived in reconciliation.py. Moving it to a shared utils module means it's part of the data package's public API, consumed by both reconciliation.py and app.py. The underscore prefix would be misleading for a shared utility."
+    },
+    {
+      "decision": "Place shared utility in dashboard/src/dashboard/data/utils.py, not a top-level dashboard/utils.py",
+      "rationale": "The data/ package already contains chart_utils.py and db.py \u2014 utility modules scoped to data operations. parse_utc is a data-layer concern (parsing DB timestamp strings). Keeping it in data/ follows the existing convention and avoids creating a new top-level module."
+    },
+    {
+      "decision": "Do not add explicit None guards at reconciliation.py call sites that pass dict.get() results",
+      "rationale": "The existing try/except (ValueError, TypeError) blocks at lines 59 and 279 already handle the TypeError that arises from passing None. Adding explicit None checks would change the code structure beyond the task scope. The type annotation change to ts: str makes the contract honest \u2014 callers know None isn't handled, and their except blocks handle it. This matches the task description which says 'All 3 call sites already guard against None externally'."
+    },
+    {
+      "decision": "Move TestParseUtc tests to import from new location rather than re-exporting from reconciliation.py",
+      "rationale": "The function was private (_-prefixed), so there is no public API contract to maintain. Re-exporting would create an unnecessary alias. Clean-cut move with import updates is simpler and avoids confusion about canonical location."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Existing TestParseUtc test structure in test_reconciliation.py",
+      "where": "dashboard/tests/test_reconciliation.py lines 508-546",
+      "how": "Migrate the 4 existing test cases (naive, aware, invalid, None) to test_data_utils.py with updated imports. The test bodies remain identical \u2014 only the import path changes from dashboard.data.reconciliation._parse_utc to dashboard.data.utils.parse_utc."
+    },
+    {
+      "what": "Existing timeago test suite in test_recon_panel.py",
+      "where": "dashboard/tests/test_recon_panel.py lines 52-98",
+      "how": "These tests validate the timeago filter's full behavior including edge cases. No changes needed \u2014 they serve as regression tests to verify the refactoring doesn't break timeago."
+    },
+    {
+      "what": "Existing data/chart_utils.py module pattern",
+      "where": "dashboard/src/dashboard/data/chart_utils.py",
+      "how": "Follow the same module structure: module docstring, from __future__ import annotations, pure function(s) with docstrings. The new utils.py follows this established pattern for data-layer utility modules."
+    },
+    {
+      "what": "Existing conftest fixtures and test patterns",
+      "where": "dashboard/tests/conftest.py",
+      "how": "test_data_utils.py is pure-function unit testing (no DB fixtures needed). Uses the same import-at-call-site pattern seen throughout existing tests (e.g., 'from dashboard.data.reconciliation import _parse_utc' inside test methods)."
+    }
+  ],
+  "_session_id": "224-3852afa9",
+  "_created_at": "2026-03-28T04:18:54.982692+00:00"
+}
