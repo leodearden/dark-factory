@@ -18,6 +18,8 @@ def parse_utc(ts: str) -> datetime:
     Returns:
         A timezone-aware :class:`datetime` in UTC.
     """
+    if ts is None:
+        raise TypeError('timestamp is None')
     dt = datetime.fromisoformat(ts)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
