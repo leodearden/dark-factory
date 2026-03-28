@@ -153,3 +153,12 @@ class TestTimestampErrorState:
         # The interval function must check for data-update-failed before updating text
         assert 'data-update-failed' in html
 
+
+class TestNaNGuard:
+    """Tests that the setInterval timestamp updater guards against NaN timestamps."""
+
+    def test_isnan_guard_present(self, client):
+        """The JS setInterval updater must contain an isNaN guard to prevent 'Updated NaNm ago'."""
+        html = client.get('/').text
+        assert 'isNaN' in html
+
