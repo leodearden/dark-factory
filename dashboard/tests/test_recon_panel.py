@@ -919,3 +919,107 @@ class TestReconRunDetailRoute:
         ):
             html = client.get('/partials/recon/run/run-001').text
         assert 'No journal entries for this run.' in html
+
+
+class TestVerdictAlertBanner:
+    """Tests for the serious verdict alert banner in recon.html."""
+
+    def test_serious_verdict_shows_alert_banner(self, client):
+        verdict_serious = {
+            'run_id': 'run-001',
+            'severity': 'serious',
+            'action_taken': 'rollback',
+            'reviewed_at': '2026-03-19T10:00:00+00:00',
+        }
+        with _patch_recon_data(verdict=verdict_serious):
+            html = client.get('/partials/recon').text
+        assert 'data-testid="verdict-alert"' in html
+        assert 'bg-red-900' in html
+        assert 'serious' in html
+        assert 'rollback' in html
+
+    def test_serious_verdict_banner_contains_explanation(self, client):
+        verdict_serious = {
+            'run_id': 'run-001',
+            'severity': 'serious',
+            'action_taken': 'halt',
+            'reviewed_at': '2026-03-19T10:00:00+00:00',
+        }
+        with _patch_recon_data(verdict=verdict_serious):
+            html = client.get('/partials/recon').text
+        assert 'Reconciliation detected a serious issue requiring attention' in html
+
+    def test_ok_verdict_no_alert_banner(self, client):
+        # MOCK_VERDICT has severity='ok'
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'data-testid="verdict-alert"' not in html
+
+    def test_minor_verdict_no_alert_banner(self, client):
+        verdict_minor = {
+            'run_id': 'run-001',
+            'severity': 'minor',
+            'action_taken': 'none',
+            'reviewed_at': '2026-03-19T10:00:00+00:00',
+        }
+        with _patch_recon_data(verdict=verdict_minor):
+            html = client.get('/partials/recon').text
+        assert 'data-testid="verdict-alert"' not in html
+
+    def test_none_verdict_no_alert_banner(self, client):
+        with _patch_recon_data(verdict=None):
+            html = client.get('/partials/recon').text
+        assert 'data-testid="verdict-alert"' not in html
+
+
+class TestVerdictCardExplanation:
+    """Tests for the human-readable explanation in the Latest Verdict card."""
+
+    def test_halt_action_shows_explanation(self, client):
+        verdict_halt = {
+            'run_id': 'run-001',
+            'severity': 'serious',
+            'action_taken': 'halt',
+            'reviewed_at': '2026-03-19T10:00:00+00:00',
+        }
+        with _patch_recon_data(verdict=verdict_halt):
+            html = client.get('/partials/recon').text
+        assert 'data-testid="verdict-explanation"' in html
+        assert 'Reconciliation halted' in html
+        assert 'manual review required' in html
+
+    def test_rollback_action_shows_explanation(self, client):
+        verdict_rollback = {
+            'run_id': 'run-001',
+            'severity': 'serious',
+            'action_taken': 'rollback',
+            'reviewed_at': '2026-03-19T10:00:00+00:00',
+        }
+        with _patch_recon_data(verdict=verdict_rollback):
+            html = client.get('/partials/recon').text
+        assert 'data-testid="verdict-explanation"' in html
+        assert 'Changes were rolled back' in html
+
+    def test_repair_action_shows_explanation(self, client):
+        verdict_repair = {
+            'run_id': 'run-001',
+            'severity': 'moderate',
+            'action_taken': 'repair',
+            'reviewed_at': '2026-03-19T10:00:00+00:00',
+        }
+        with _patch_recon_data(verdict=verdict_repair):
+            html = client.get('/partials/recon').text
+        assert 'data-testid="verdict-explanation"' in html
+        assert 'Automatic repair was attempted' in html
+
+    def test_none_action_shows_explanation(self, client):
+        # MOCK_VERDICT has action_taken='none'
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'data-testid="verdict-explanation"' in html
+        assert 'No action needed' in html
+
+    def test_no_verdict_no_explanation(self, client):
+        with _patch_recon_data(verdict=None):
+            html = client.get('/partials/recon').text
+        assert 'data-testid="verdict-explanation"' not in html
