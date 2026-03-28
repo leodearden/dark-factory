@@ -3429,7 +3429,7 @@
         "description": "Three related test quality improvements in dashboard/tests/:\n\n1. **Restore behavioral verification in fallback tests** (test_memory.py:310-341):\n   `test_first_server_down_falls_through` no longer verifies that port 9000 was actually attempted before falling through to 9001. Add a `ports_seen` set in the handler and assert `9000 in ports_seen` after the result check, proving the fallback path was exercised (not just the final result).\n\n2. **Strengthen assertion in test_scaffold.py** (line 47):\n   `assert len(cfg.fused_memory_urls) == 1` should be `assert cfg.fused_memory_urls == ['http://localhost:8002']` to match the stricter pattern already used in `test_default_values`.\n\n3. **Extract shared two_url_config fixture** (test_memory.py:316-319 and :386-389):\n   Two tests construct identical `DashboardConfig(project_root=tmp_path, fused_memory_urls=['http://localhost:9000', 'http://localhost:9001'])`. Add a `two_url_config` fixture in conftest.py and use it in both.\n\nSource: review-cycle task 155, suggestions from reviewer_architect_reviewer, reviewer_reuse_auditor, reviewer_test_analyst, reviewer_robustness.\n\nmemory_hints:\n- search: \"dashboard test fallback fallthrough call_count\"\n- search: \"stale port 8000 8001 removal convention\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -3442,7 +3442,8 @@
           "modules": [
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-28T00:10:59.358Z"
       },
       {
         "id": "205",
@@ -3699,7 +3700,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T00:10:59.262Z",
+      "lastModified": "2026-03-28T00:10:59.358Z",
       "taskCount": 195,
       "completedCount": 155,
       "tags": [
