@@ -53,8 +53,8 @@
       "id": "step-6",
       "type": "test",
       "description": "Run the full test suite: pytest fused-memory/tests/test_validation.py fused-memory/tests/test_stages.py fused-memory/tests/test_tools_validation.py. All existing tests (TestProjectIdValidation, TestRunIdValidation in test_stages.py) must still pass since the observable behavior (ValueError on bad input) is unchanged. New require_* tests must pass.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "b138e486"
     }
   ],
   "design_decisions": [
