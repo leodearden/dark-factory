@@ -807,10 +807,15 @@ async def test_cancellation_cleanup_shielded_from_second_cancel(
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
+    # Event set by slow_stage_run when it starts — ensures the first cancel fires
+    # inside the try block (not during pre-try setup like _get_prior_s3_findings).
+    stage_entered = asyncio.Event()
+
     # Make first stage sleep forever (cancelled by the first outer_task.cancel())
     async def slow_stage_run(
         events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0],
     ):
+        stage_entered.set()
         await asyncio.sleep(999)
         return StageReport(
             stage=_s.stage_id,
@@ -851,8 +856,11 @@ async def test_cancellation_cleanup_shielded_from_second_cancel(
     )
     outer_task_ref[0] = outer_task
 
-    # Let the task start and reach the slow stage
-    await asyncio.sleep(0.05)
+    # Wait until slow_stage_run has actually started (deterministic — no sleep-based race).
+    # Using a fixed sleep could misfire on a loaded CI host: if _get_prior_s3_findings
+    # takes longer than the sleep, the cancel arrives before the try block and
+    # complete_run is never called, leaving the run stuck in 'running'.
+    await stage_entered.wait()
 
     # First cancellation: triggers CancelledError in slow_stage_run → cleanup starts
     outer_task.cancel()
@@ -1162,3 +1170,109 @@ class TestSelectTier:
                 f"{stage_name}.memory_limit was set by run_full_cycle — "
                 "isinstance guard at harness.py:417 may have been removed or widened"
             )
+
+
+# ── Tier selection boundary tests (parametrized) ───────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'buffer_size,expected_model,expected_episode_limit,expected_memory_limit',
+    [
+        (0, 'sonnet', 125, 250),   # well below threshold (0 is NOT > 15.0)
+        (15, 'sonnet', 125, 250),  # exact boundary (15 is NOT > 15.0, so sonnet)
+        (16, 'opus', 500, 1000),   # just above boundary (16 > 15.0, so opus)
+    ],
+)
+async def test_select_tier_boundary(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    buffer_size,
+    expected_model,
+    expected_episode_limit,
+    expected_memory_limit,
+):
+    """Parametrized boundary test for _select_tier.
+
+    ReconciliationConfig defaults: buffer_size_threshold=10, opus_threshold_ratio=1.5.
+    Threshold = 10 * 1.5 = 15.0; the condition is strictly greater-than (>).
+    size=0  → NOT > 15.0 → sonnet (well below)
+    size=15 → NOT > 15.0 → sonnet (exact boundary, must not upgrade)
+    size=16 →     > 15.0 → opus  (just above boundary)
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # Patch get_buffer_stats to return controlled buffer size
+    harness.buffer.get_buffer_stats = AsyncMock(return_value={'size': buffer_size})
+
+    tier = await harness._select_tier('test-project')
+
+    assert tier.model == expected_model
+    assert tier.episode_limit == expected_episode_limit
+    assert tier.memory_limit == expected_memory_limit
+
+
+@pytest.mark.asyncio
+async def test_opus_tier_propagates_limits_to_consolidator(
+    journal,
+    event_buffer,
+    mock_memory_service,
+):
+    """run_full_cycle propagates opus limits (500/1000) to MemoryConsolidator.
+
+    When buffer size is 16 (> threshold 15.0), _select_tier returns opus tier.
+    run_full_cycle must set stage.episode_limit=500 and stage.memory_limit=1000
+    on the MemoryConsolidator before calling stage.run().
+    """
+    from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # Mock buffer stats to trigger opus tier (16 > 15.0)
+    harness.buffer.get_buffer_stats = AsyncMock(return_value={'size': 16})
+
+    # Push an event so drain() has something to process
+    await event_buffer.push(_make_event())
+
+    # Capture limits at the moment stage.run() is called
+    captured: dict = {}
+    stage0 = harness.stages[0]
+    assert isinstance(stage0, MemoryConsolidator)
+
+    async def capturing_run(
+        events, watermark, prior_reports, run_id, model=None, _s=stage0,
+    ):
+        captured['episode_limit'] = _s.episode_limit
+        captured['memory_limit'] = _s.memory_limit
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    stage0.run = capturing_run
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    # Zero-sentinel: reset to values that differ from opus tier defaults (500/1000).
+    # MemoryConsolidator class defaults are 500/1000 — identical to opus values.
+    # Without this reset, deleting harness.py:418-419 would leave stage0 at its class
+    # defaults, and the test would still pass.  By forcing to 0 first we guarantee the
+    # test fails when propagation is absent.
+    stage0.episode_limit = 0
+    stage0.memory_limit = 0
+
+    tier = await harness._select_tier('test-project')
+    await harness.run_full_cycle('test-project', 'buffer_size:16', tier=tier)
+
+    assert captured.get('episode_limit') == 500, (
+        f"Expected episode_limit=500 for opus tier, got {captured.get('episode_limit')}"
+    )
+    assert captured.get('memory_limit') == 1000, (
+        f"Expected memory_limit=1000 for opus tier, got {captured.get('memory_limit')}"
+    )
