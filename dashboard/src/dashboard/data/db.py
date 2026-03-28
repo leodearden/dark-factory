@@ -82,6 +82,6 @@ async def with_db(
         return default
     try:
         return await fn(db)
-    except sqlite3.OperationalError:
+    except (sqlite3.OperationalError, OSError):
         logger.debug('with_db: query failed', exc_info=True)
         return default
