@@ -24,9 +24,9 @@
   {% set q_counts = queue.counts if queue.counts is defined else {} %}
   {% set q_dead = q_counts.dead|default(0) %}
   {% set q_pending = q_counts.pending|default(0) %}
-  <div class="flex items-center gap-1.5">
+  <div class="flex items-center gap-1.5" title="Write Queue: {{ q_pending }} pending / {{ q_counts.retry|default(0) }} retry / {{ q_dead }} dead letters">
     <div class="w-3 h-3 rounded-full {% if q_dead > 0 %}bg-red-500{% elif q_pending > 0 %}bg-yellow-500{% else %}bg-green-500{% endif %}" role="status" aria-label="Write Queue {% if q_dead > 0 %}dead letters{% elif q_pending > 0 %}pending{% else %}healthy{% endif %}"></div>
-    <span class="text-xs text-gray-400">Queue {{ q_pending }}p/{{ q_counts.retry|default(0) }}r/{{ q_dead }}d</span>
+    <span class="text-xs text-gray-400">Queue {{ q_pending }} pending · {{ q_counts.retry|default(0) }} retry · {{ q_dead }} dead</span>
   </div>
 </div>
 

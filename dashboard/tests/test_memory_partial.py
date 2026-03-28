@@ -295,9 +295,20 @@ class TestWriteQueueCard:
             patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
         ):
             html = client.get('/partials/memory').text
-            assert '3p/' in html
-            assert '1r/' in html
-            assert '0d' in html
+            assert '3 pending' in html
+            assert '1 retry' in html
+            assert '0 dead' in html
+            assert '3p/' not in html
+            assert '1r/' not in html
+
+    def test_queue_tooltip_title_attribute(self, client):
+        queue = {'counts': {'pending': 2, 'retry': 1, 'dead': 5}, 'oldest_pending_age_seconds': None}
+        with (
+            patch('dashboard.data.memory.get_memory_status', new_callable=AsyncMock, return_value=_ONLINE_STATUS),
+            patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=queue),
+        ):
+            html = client.get('/partials/memory').text
+            assert 'title="Write Queue: 2 pending / 1 retry / 5 dead letters"' in html
 
 
 class TestWriteQueueConditionalStyling:
@@ -379,9 +390,11 @@ class TestSplitBrainQueueOffline:
             patch('dashboard.data.memory.get_queue_stats', new_callable=AsyncMock, return_value=_SPLIT_BRAIN_QUEUE),
         ):
             html = client.get('/partials/memory').text
-            assert '0p/' in html
-            assert '0r/' in html
-            assert '0d' in html
+            assert '0 pending' in html
+            assert '0 retry' in html
+            assert '0 dead' in html
+            assert '0p/' not in html
+            assert '0r/' not in html
 
 
 class TestMemoryDotAriaLabels:

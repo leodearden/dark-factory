@@ -1,4 +1,15 @@
 {% from 'macros/badges.html' import status_badge, severity_badge %}
+{% if verdict and verdict.severity == 'serious' %}
+<div class="bg-red-900/30 border border-red-800 rounded-lg p-4 text-red-300 mb-6 flex items-start gap-3" data-testid="verdict-alert">
+  <div class="flex-1">
+    <div class="flex items-center gap-2 mb-1">
+      {{ severity_badge(verdict.severity, aria_label='Verdict severity') }}
+      <span class="font-semibold">Action: {{ verdict.action_taken }}</span>
+    </div>
+    <p class="text-sm">Reconciliation detected a serious issue requiring attention</p>
+  </div>
+</div>
+{% endif %}
 <h2 class="text-xl font-bold text-gray-100 mb-6">Reconciliation</h2>
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
   <!-- Left column: Status cards -->
@@ -99,6 +110,17 @@
           <span class="text-gray-400">Action: {{ verdict.action_taken }}</span>
         </div>
         <p class="text-sm text-gray-400 mt-2">{{ verdict.reviewed_at | timeago }}</p>
+        <p class="text-sm text-gray-400 mt-2" data-testid="verdict-explanation">
+          {%- if verdict.action_taken == 'halt' -%}
+            Reconciliation halted — manual review required
+          {%- elif verdict.action_taken == 'rollback' -%}
+            Changes were rolled back
+          {%- elif verdict.action_taken == 'repair' -%}
+            Automatic repair was attempted
+          {%- else -%}
+            No action needed
+          {%- endif -%}
+        </p>
       {% else %}
         <p class="text-gray-400">No verdicts yet</p>
       {% endif %}

@@ -3161,11 +3161,11 @@
         "description": "The add_memory pathway to Graphiti creates multiple identical edges from a single write. Observed: episode 04dd0070 (M5 completion via add_memory) produced 6 identical Graphiti edges. Stage 1 cleaned 5 duplicates but the pattern will recur on every future add_memory write that routes to Graphiti.\n\nRoot cause investigation needed in the add_memory → Graphiti write path. Either the episode extraction step is producing duplicate edges, or the edge creation step lacks deduplication.\n\nAcceptance criteria:\n1. Identify where in the add_memory → Graphiti pipeline duplicate edges are created\n2. Add deduplication logic (content hash check before insert, or post-write dedup)\n3. Verify single add_memory call produces exactly 1 edge per fact\n\nmemory_hints:\n- search: \"add_memory Graphiti edge creation pipeline\"\n- search: \"episode extraction duplicate edges\"\n- entity: \"fused-memory write queue\"\n- search: \"Graphiti dedup mechanisms\"",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-26T22:53:54.939Z"
+        "updatedAt": "2026-03-28T14:56:39.779Z"
       },
       {
         "id": "189",
@@ -4693,7 +4693,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T14:54:31.317Z",
+      "lastModified": "2026-03-28T14:56:39.779Z",
       "taskCount": 268,
       "completedCount": 205,
       "tags": [
