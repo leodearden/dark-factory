@@ -62,8 +62,8 @@
       "id": "step-6",
       "type": "impl",
       "description": "Run full test suite to confirm all existing tests still pass alongside the new parametrized test. Fix any regressions (e.g., existing test_payload_contains_project_id_for_memory_tools should still pass since the new guideline is a superset of the old inline string).",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "d54f8e84"
     }
   ],
   "design_decisions": [
