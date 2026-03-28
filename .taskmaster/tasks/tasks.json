@@ -4583,6 +4583,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 282,
+        "title": "Harden Watermark.strip_project_id: reject empty, extend to other models",
+        "description": "The strip_project_id field_validator on Watermark silently normalizes whitespace-only strings to '' which Pydantic accepts. This violates the invariant enforced by validate_project_id elsewhere. ReconciliationEvent and ReconciliationRun also have project_id: str fields with no equivalent normalization.\n\nFix:\n1. After stripping, raise ValueError if empty: consistent with validate_project_id\n2. Apply same normalization to ReconciliationEvent.project_id and ReconciliationRun.project_id (shared base class or duplicated validator)\n3. Rename strip_project_id → normalize_project_id to match validate_* convention\n4. Add integration test: Watermark(project_id='  dark_factory  ') with stage project_id='dark_factory' should pass mismatch check",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -4595,7 +4606,7 @@
       ],
       "created": "2026-03-28T07:37:31.561Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T07:37:53.712Z"
+      "updated": "2026-03-28T07:37:59.786Z"
     }
   }
 }
