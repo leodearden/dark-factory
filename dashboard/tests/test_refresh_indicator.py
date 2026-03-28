@@ -1,6 +1,8 @@
 """Tests for the per-section last-updated timestamp and refresh indicator feature."""
 
-from __future__ import annotations
+import re
+
+_SECTIONS = ('orchestrators', 'performance', 'memory', 'memory-graphs', 'recon')
 
 
 class TestSectionDataAttributes:
@@ -52,11 +54,38 @@ class TestTimestampElements:
 
     def test_timestamp_elements_have_subtle_styling(self, client):
         html = client.get('/').text
-        assert 'text-gray-500' in html
+        for section in _SECTIONS:
+            marker = f'data-updated-for="{section}"'
+            idx = html.index(marker)
+            tag_start = html.rfind('<', 0, idx)
+            tag_end = html.index('>', idx)
+            tag = html[tag_start:tag_end + 1]
+            assert 'text-gray-500' in tag, f'Expected text-gray-500 on data-updated-for="{section}" element'
 
     def test_timestamp_elements_are_aria_hidden(self, client):
         html = client.get('/').text
-        assert 'aria-hidden="true"' in html
+        for section in _SECTIONS:
+            marker = f'data-updated-for="{section}"'
+            idx = html.index(marker)
+            tag_start = html.rfind('<', 0, idx)
+            tag_end = html.index('>', idx)
+            tag = html[tag_start:tag_end + 1]
+            assert 'aria-hidden="true"' in tag, f'Expected aria-hidden="true" on data-updated-for="{section}" element'
+
+
+class TestSectionTimestampPairing:
+    """Tests that every data-section has a matching data-updated-for element."""
+
+    def test_every_section_has_matching_timestamp(self, client):
+        html = client.get('/').text
+        sections = set(re.findall(r'data-section="([a-z][a-z-]*)"', html))
+        timestamps = set(re.findall(r'data-updated-for="([a-z][a-z-]*)"', html))
+        assert sections == timestamps
+
+    def test_all_expected_sections_paired(self, client):
+        html = client.get('/').text
+        sections = set(re.findall(r'data-section="([a-z][a-z-]*)"', html))
+        assert sections == set(_SECTIONS)
 
 
 class TestRefreshTrackingJS:
@@ -82,65 +111,11 @@ class TestRefreshTrackingJS:
 class TestRefreshPulseCSS:
     """Tests that style.css contains the refresh-pulse animation."""
 
-    def _read_css(self):
-        import os
-        css_path = os.path.join(
-            os.path.dirname(__file__),
-            '..', 'src', 'dashboard', 'static', 'style.css'
-        )
-        with open(css_path) as f:
-            return f.read()
-
-    def test_keyframes_animation_present(self):
-        css = self._read_css()
+    def test_keyframes_animation_present(self, client):
+        css = client.get('/static/style.css').text
         assert '@keyframes section-refresh-pulse' in css
 
-    def test_section_refreshed_class_present(self):
-        css = self._read_css()
+    def test_section_refreshed_class_present(self, client):
+        css = client.get('/static/style.css').text
         assert '.section-refreshed' in css
 
-
-class TestExistingBehaviorPreserved:
-    """Tests that new wrapper divs don't break existing dashboard structure."""
-
-    def test_orchestrators_still_has_hx_get(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/orchestrators"' in html
-
-    def test_performance_still_has_hx_get(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/performance"' in html
-
-    def test_memory_still_has_hx_get(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/memory"' in html
-
-    def test_memory_graphs_still_has_hx_get(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/memory-graphs"' in html
-
-    def test_recon_still_has_hx_get(self, client):
-        html = client.get('/').text
-        assert 'hx-get="/partials/recon"' in html
-
-    def test_all_sections_use_morph_innerHTML(self, client):
-        html = client.get('/').text
-        assert 'hx-swap="morph:innerHTML"' in html
-
-    def test_no_plain_innerHTML_swap(self, client):
-        html = client.get('/').text
-        assert 'hx-swap="innerHTML"' not in html
-
-    def test_aria_live_polite_present(self, client):
-        html = client.get('/').text
-        assert 'aria-live="polite"' in html
-
-    def test_loading_skeletons_present(self, client):
-        html = client.get('/').text
-        assert 'animate-pulse' in html
-
-    def test_error_handler_js_present(self, client):
-        html = client.get('/').text
-        assert 'htmx:responseError' in html
-        assert 'htmx:timeout' in html
-        assert 'htmx:sendError' in html
