@@ -64,6 +64,18 @@ class TestParseUtc:
         with pytest.raises(TypeError, match='timestamp is None'):
             parse_utc(None)  # type: ignore[arg-type]
 
+    def test_docstring_describes_none_raises_type_error_explicitly(self):
+        """parse_utc docstring must document None raising TypeError explicitly."""
+        from dashboard.data.utils import parse_utc
+
+        doc = parse_utc.__doc__ or ''
+        assert 'None raises TypeError explicitly' in doc, (
+            f"Expected 'None raises TypeError explicitly' in docstring, got: {doc!r}"
+        )
+        assert 'propagates ValueError or TypeError from' not in doc, (
+            f"Stale phrase 'propagates ValueError or TypeError from' still in docstring: {doc!r}"
+        )
+
 
 class TestTimeagoUsesParseUtc:
     """Tests verifying that app.py uses parse_utc from dashboard.data.utils (DRY)."""

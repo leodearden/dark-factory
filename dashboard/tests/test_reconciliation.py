@@ -525,6 +525,45 @@ class TestGetBurstState:
         result = await get_burst_state(None)
         assert result == []
 
+    async def test_malformed_timestamp_logs_debug(self, tmp_path, caplog):
+        """A malformed last_write_at in burst_state emits a DEBUG log with agent_id."""
+        import sqlite3
+
+        from dashboard.data.reconciliation import get_burst_state
+        from tests.conftest import RECONCILIATION_SCHEMA
+
+        db_path = tmp_path / 'malformed.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(RECONCILIATION_SCHEMA)
+        conn.execute(
+            "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
+            " VALUES (?, 'bursting', ?, ?)",
+            ('bad-agent', 'not-a-date', None),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
+                result = await get_burst_state(db)
+
+        # Agent should land in idle (malformed timestamp → cooldown fallback)
+        assert len(result) == 1
+        assert result[0]['state'] == 'idle'
+        assert result[0]['burst_started_at'] is None
+
+        # A DEBUG record must be emitted containing 'bad last_write_at' and the agent_id
+        debug_records = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG
+            and r.name == 'dashboard.data.reconciliation'
+        ]
+        assert any(
+            'bad last_write_at' in r.getMessage() and 'bad-agent' in r.getMessage()
+            for r in debug_records
+        ), f"Expected debug log with 'bad last_write_at' and 'bad-agent', got: {[r.getMessage() for r in debug_records]}"
+
 
 class TestGetLatestVerdict:
     """Tests for get_latest_verdict."""
