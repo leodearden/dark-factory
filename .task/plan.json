@@ -60,14 +60,14 @@
       "type": "impl",
       "description": "Verify step-5 test passes \u2014 no implementation change needed since schema.py line 64 already uses encoding='utf-8'. Run test suite to confirm green.",
       "status": "done",
-      "commit": "placeholder-step-6"
+      "commit": "c35a94a0"
     },
     {
       "id": "step-7",
       "type": "impl",
       "description": "Move inline imports to module level: add 'from pydantic_settings import BaseSettings' and 'from pydantic.fields import FieldInfo' to the module-level import block (after the existing pydantic imports). Remove the 5 inline import statements at lines 181, 234, 304, 324, and 333. Run full test suite to verify no regressions.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "placeholder-step-7"
     },
     {
       "id": "step-8",

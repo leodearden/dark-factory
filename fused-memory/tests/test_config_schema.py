@@ -7,6 +7,8 @@ import unittest.mock
 import pytest
 import yaml
 from pydantic import ValidationError
+from pydantic.fields import FieldInfo
+from pydantic_settings import BaseSettings
 
 from fused_memory.config.schema import (
     EmbedderConfig,
@@ -179,7 +181,6 @@ class TestYamlSettingsSourceEnvVarExpansion:
 
     def setup_method(self):
         # Use a dummy settings class; path doesn't matter for _expand_env_vars
-        from pydantic_settings import BaseSettings
         class _DummySettings(BaseSettings):
             pass
         self.source = YamlSettingsSource(_DummySettings, config_path=None)
@@ -232,8 +233,6 @@ class TestYamlSettingsSourceErrorHandling:
     """Tests for YamlSettingsSource error handling on corrupt or unreadable files."""
 
     def _make_source(self, path):
-        from pydantic_settings import BaseSettings
-
         class _DummySettings(BaseSettings):
             pass
 
@@ -304,8 +303,6 @@ class TestYamlSettingsSourceEncoding:
     """Tests for YamlSettingsSource explicit UTF-8 encoding."""
 
     def _make_source(self, path):
-        from pydantic_settings import BaseSettings
-
         class _DummySettings(BaseSettings):
             pass
 
@@ -335,8 +332,6 @@ class TestYamlSettingsSourceABCContract:
     """Tests for YamlSettingsSource ABC contract compliance."""
 
     def setup_method(self):
-        from pydantic_settings import BaseSettings
-
         class _DummySettings(BaseSettings):
             pass
 
@@ -344,8 +339,6 @@ class TestYamlSettingsSourceABCContract:
 
     def test_get_field_value_returns_tuple(self):
         """get_field_value must return tuple[Any, str, bool] per PydanticBaseSettingsSource ABC."""
-        from pydantic.fields import FieldInfo
-
         field = FieldInfo(annotation=str)
         result = self.source.get_field_value(field, 'my_field')
         assert isinstance(result, tuple), f'Expected tuple, got {type(result)}'
