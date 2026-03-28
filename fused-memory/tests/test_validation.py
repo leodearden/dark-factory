@@ -89,3 +89,26 @@ class TestValidateRunId:
             assert result is not None
         except Exception as exc:
             pytest.fail(f'validate_run_id raised unexpectedly: {exc}')
+
+    def test_trailing_newline_returns_error(self):
+        """Trailing newline must be rejected — not silently accepted by $ anchor bypass.
+
+        Python's re.match(r'^[a-zA-Z0-9_-]+$', 'valid-id\\n') returns a truthy match
+        because $ matches just before a trailing newline. This test exposes that bypass;
+        re.fullmatch() is required to catch it.
+        """
+        result = validate_run_id('valid-id\n')
+        assert result is not None, (
+            'validate_run_id accepted trailing newline — likely using .match() instead '
+            'of .fullmatch(). Switch to re.fullmatch() to fix.'
+        )
+        assert result['error_type'] == 'ValidationError'
+
+    def test_trailing_newline_after_uuid_returns_error(self):
+        """A UUID followed by a trailing newline must be rejected."""
+        result = validate_run_id('550e8400-e29b-41d4-a716-446655440000\n')
+        assert result is not None, (
+            'validate_run_id accepted UUID with trailing newline — likely using .match() '
+            'instead of .fullmatch(). Switch to re.fullmatch() to fix.'
+        )
+        assert result['error_type'] == 'ValidationError'
