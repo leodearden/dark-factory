@@ -4810,7 +4810,7 @@
         "description": "Commit 0ea23cb5 (stash pop merge conflict) reverted task 134's shared project_id guideline extraction. The copy-pasted project_id guidelines are back in each stage prompt instead of being derived from a shared template.\n\nFix: Re-extract _PROJECT_ID_GUIDELINE to fused-memory/src/fused_memory/reconciliation/prompts/__init__.py with a {tools} placeholder. Create per-stage constants (use clear names like _STAGE1_PROJECT_ID_GUIDELINE, not _S1_PID). Interpolate with each stage's allowed tool list. Stage 2's tool list should include expand_task and parse_prd (it has access but the guideline omits them). Collapse the three duplicate test_stageN_prompt_contains_project_id_guideline tests into one parametrized test. Hoist inline imports in test methods to module-level.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -4827,7 +4827,7 @@
             "fused-memory/tests"
           ]
         },
-        "updatedAt": "2026-03-28T15:48:35.623Z"
+        "updatedAt": "2026-03-28T16:14:50.344Z"
       },
       {
         "id": "280",
@@ -5036,9 +5036,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T16:11:38.492Z",
+      "lastModified": "2026-03-28T16:14:50.344Z",
       "taskCount": 268,
-      "completedCount": 214,
+      "completedCount": 215,
       "tags": [
         "master"
       ]
