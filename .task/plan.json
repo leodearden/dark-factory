@@ -1,0 +1,128 @@
+{
+  "task_id": "207",
+  "title": "Extract _parse_utc helper and relocate partition_burst_state to data layer",
+  "files": [
+    "dashboard/src/dashboard/data/reconciliation.py",
+    "dashboard/src/dashboard/app.py",
+    "dashboard/tests/test_reconciliation.py",
+    "dashboard/tests/test_recon_panel.py"
+  ],
+  "modules": [
+    "dashboard/src/dashboard/data",
+    "dashboard/src/dashboard",
+    "dashboard/tests"
+  ],
+  "analysis": "The UTC-normalization pattern (datetime.fromisoformat \u2192 check tzinfo \u2192 replace UTC) is repeated at 3 call sites: reconciliation.py:197-199 (get_buffer_stats), reconciliation.py:236-238 (get_burst_state), and app.py:143-145 (partition_burst_state). A 4th occurrence exists in app.py's timeago filter (line 54,57-58) but is out of scope per the task description.\n\npartition_burst_state is a pure data-classification function defined at app.py:124-152 alongside _ACTIVE_THRESHOLD_SECONDS (line 121). It has zero web-framework dependencies \u2014 it takes a list[dict] and returns a tuple of lists. Its natural home is data/reconciliation.py, alongside get_burst_state which queries the same data.\n\nCritically, partition_burst_state is NOT called by any route handler or Jinja2 template. The partials_recon route passes raw burst_state to the template, which iterates it directly. The function's only consumers are 7 test imports in test_recon_panel.py.\n\nAfter moving partition_burst_state to reconciliation.py, all 3 _parse_utc call sites will be in the same module, making the underscore-prefixed private helper clean. The app.py import of partition_burst_state becomes unnecessary (no production caller), and test imports need updating.\n\nget_burst_state uses _DEFAULT_BURST_COOLDOWN (150s) for state-transition logic, while partition_burst_state uses _ACTIVE_THRESHOLD_SECONDS (3600s) for display-classification. These are distinct concepts and should remain separate functions, not merged.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write TestParseUtc test class in test_reconciliation.py \u2014 tests for: (a) naive ISO string gets UTC attached, (b) aware ISO string preserved as-is, (c) invalid string raises ValueError, (d) None raises TypeError. Import _parse_utc from dashboard.data.reconciliation \u2014 tests will fail because the function does not exist yet.",
+      "status": "done",
+      "commit": "661f05a"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Implement _parse_utc(ts: str) -> datetime in reconciliation.py. Three lines: parse with fromisoformat, check tzinfo is None, replace with UTC if so. Place it after the _DEFAULT_BURST_COOLDOWN constant (around line 22). All TestParseUtc tests should now pass.",
+      "status": "done",
+      "commit": "88b403f"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write TestPartitionBurstStateLocation test in test_reconciliation.py \u2014 a single test that does 'from dashboard.data.reconciliation import partition_burst_state, _ACTIVE_THRESHOLD_SECONDS' and asserts partition_burst_state is callable and _ACTIVE_THRESHOLD_SECONDS == 3600. This test will fail because the function hasn't been moved yet.",
+      "status": "done",
+      "commit": "80a7169"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Move partition_burst_state and _ACTIVE_THRESHOLD_SECONDS from app.py to reconciliation.py. Place them after _parse_utc. Refactor the moved partition_burst_state to use _parse_utc instead of inline fromisoformat+tzinfo pattern (lines 143-145 become a single _parse_utc call). The TestPartitionBurstStateLocation test should now pass.",
+      "status": "done",
+      "commit": "58f0424"
+    },
+    {
+      "id": "step-5",
+      "type": "impl",
+      "description": "Refactor get_buffer_stats in reconciliation.py to use _parse_utc \u2014 replace lines 197-199 (oldest_dt = datetime.fromisoformat... if oldest_dt.tzinfo... replace) with a single _parse_utc(oldest_ts) call. Existing TestGetBufferStats tests validate the behavior is preserved.",
+      "status": "done",
+      "commit": "77ce562"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Refactor get_burst_state in reconciliation.py to use _parse_utc \u2014 replace lines 236-238 (last_write = datetime.fromisoformat... if last_write.tzinfo... replace) with a single _parse_utc(row['last_write_at']) call. Existing TestGetBurstState tests validate the behavior is preserved.",
+      "status": "done",
+      "commit": "dc2d5a7"
+    },
+    {
+      "id": "step-7",
+      "type": "impl",
+      "description": "Update app.py: remove the partition_burst_state function definition (lines 121-152) and _ACTIVE_THRESHOLD_SECONDS constant. Do NOT add partition_burst_state to app.py's import from reconciliation \u2014 no route handler or template calls it, so no production import is needed. Verify app.py still starts cleanly.",
+      "status": "done",
+      "commit": "7c23df9"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Update test_recon_panel.py: change all 7 occurrences of 'from dashboard.app import partition_burst_state' to 'from dashboard.data.reconciliation import partition_burst_state'. The TestPartitionBurstState test class stays in test_recon_panel.py (minimal diff). All existing partition_burst_state tests must pass with the new import path.",
+      "status": "done",
+      "commit": "874af2c"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Run full test suite (pytest dashboard/tests/) to verify no regressions. All tests in test_reconciliation.py, test_recon_panel.py, and other test files must pass. This is the final validation step.",
+      "status": "done",
+      "commit": "874af2c"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Keep _parse_utc as module-private (underscore prefix) in reconciliation.py",
+      "rationale": "After moving partition_burst_state, all 3 call sites are within reconciliation.py. No external module needs to import _parse_utc. The timeago filter in app.py (a 4th occurrence) is out of task scope and uses the same pattern inline with different error-handling flow (returns 'never')."
+    },
+    {
+      "decision": "Do NOT merge partition_burst_state into get_burst_state",
+      "rationale": "They use different thresholds for different purposes: get_burst_state applies _DEFAULT_BURST_COOLDOWN (150s) for state-transition logic (is a burst expired?), while partition_burst_state applies _ACTIVE_THRESHOLD_SECONDS (3600s) for display-classification (show in active vs idle panel). Merging would conflate two distinct concerns and change get_burst_state's return contract, affecting the template that iterates raw burst_state."
+    },
+    {
+      "decision": "Do NOT add partition_burst_state to app.py's imports from reconciliation",
+      "rationale": "No route handler or Jinja2 template calls partition_burst_state. The partials_recon route passes raw burst_state to the template. Adding an unused import to app.py would be dead code. If a future task wires up the partitioning in the route, it can add the import then."
+    },
+    {
+      "decision": "Keep TestPartitionBurstState in test_recon_panel.py, only update imports",
+      "rationale": "Moving the test class to test_reconciliation.py would be a larger diff with higher merge-conflict risk. The test class works fine from its current file \u2014 only the import path changes. Minimizes churn and keeps the PR reviewable."
+    },
+    {
+      "decision": "_parse_utc raises on bad input rather than returning Optional",
+      "rationale": "All 3 call sites already have their own try/except or None-check guards. A raising helper composes cleanly with each site's error-handling strategy (get_buffer_stats guards with 'if oldest_ts is not None', get_burst_state and partition_burst_state use try/except ValueError/TypeError)."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "_parse_utc helper (new)",
+      "where": "dashboard/data/reconciliation.py",
+      "how": "Replaces the 3-line UTC normalization pattern at 3 call sites within reconciliation.py. Each caller wraps with its own error handling."
+    },
+    {
+      "what": "Existing TestGetBufferStats and TestGetBurstState tests",
+      "where": "dashboard/tests/test_reconciliation.py",
+      "how": "These existing tests validate behavior of get_buffer_stats and get_burst_state after refactoring their internals to use _parse_utc. No new tests needed for these refactoring steps."
+    },
+    {
+      "what": "Existing TestPartitionBurstState tests (7 tests)",
+      "where": "dashboard/tests/test_recon_panel.py",
+      "how": "After updating the import path from dashboard.app to dashboard.data.reconciliation, all 7 existing tests validate the moved function works identically."
+    },
+    {
+      "what": "with_db helper pattern",
+      "where": "dashboard/data/db.py",
+      "how": "The moved partition_burst_state is a pure function (no DB access), so it does NOT use with_db. But the pattern of module-private helpers in data/ is consistent with the existing architecture."
+    }
+  ],
+  "_session_id": "207-ff26eb78",
+  "_created_at": "2026-03-28T00:42:39.994892+00:00"
+}
