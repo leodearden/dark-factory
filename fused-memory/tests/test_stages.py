@@ -782,8 +782,8 @@ class TestTierConfig:
             StageId.memory_consolidator,
             AsyncMock(), AsyncMock(), AsyncMock(), config,
         )
-        assert stage.episode_limit == 500
-        assert stage.memory_limit == 1000
+        assert stage.episode_limit is None
+        assert stage.memory_limit is None
         stage.episode_limit = 125
         stage.memory_limit = 250
         assert stage.episode_limit == 125
