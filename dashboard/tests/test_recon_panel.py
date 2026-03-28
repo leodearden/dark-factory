@@ -217,6 +217,18 @@ class TestPartitionBurstState:
         assert len(active) == 0
         assert len(idle) == 1
 
+    def test_missing_state_key_recent_write_is_active(self):
+        # Agent with no 'state' key defaults to 'idle' (via .get('state', 'idle')),
+        # but a recent last_write_at timestamp promotes it to active.
+        # Isolates the timestamp-promotion path for the defaulted 'idle' state.
+        from dashboard.data.reconciliation import partition_burst_state
+
+        recent_ts = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+        agents = [{'agent_id': 'a1', 'last_write_at': recent_ts}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 1
+        assert len(idle) == 0
+
 
 class TestFormatDuration:
     """Tests for the format_duration Jinja2 filter (accepts seconds)."""
