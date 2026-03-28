@@ -9,8 +9,8 @@ def parse_utc(ts: str | None) -> datetime:
     """Parse an ISO timestamp string and ensure it has UTC timezone.
 
     Naive datetimes (no tzinfo) get UTC attached.  Aware datetimes are
-    returned unchanged.  Invalid input propagates ValueError or TypeError
-    from :func:`datetime.fromisoformat`.
+    returned unchanged.  None raises TypeError explicitly.  Other invalid
+    input raises ValueError from :func:`datetime.fromisoformat`.
 
     Args:
         ts: ISO 8601 timestamp string.
