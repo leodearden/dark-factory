@@ -4836,7 +4836,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/data/chart_utils.py",
+            "dashboard/tests/test_chart_utils.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/data",
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 281,
