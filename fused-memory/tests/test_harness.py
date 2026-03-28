@@ -294,7 +294,7 @@ def _make_test_harness(journal, event_buffer, mock_memory_service):
     )
 
 
-def _mock_stage_run(stage, items_flagged=None, before_return=None):
+def _mock_stage_run(stage, items_flagged=None, before_return=None, capture_call_args=None):
     """Replace stage.run with a mock that returns a StageReport.
 
     Args:
@@ -303,8 +303,13 @@ def _mock_stage_run(stage, items_flagged=None, before_return=None):
         before_return: Optional async callable invoked with the stage object just
             before the StageReport is returned.  Use this to capture mutable stage
             state (e.g. episode_limit, memory_limit) at the moment .run() fires.
+        capture_call_args: Optional dict.  If provided, the model kwarg passed to
+            .run() is stored as capture_call_args['model'] so callers can assert
+            that the correct model was forwarded by the harness.
     """
     async def mock_run(events, watermark, prior_reports, run_id, model=None, _s=stage):
+        if capture_call_args is not None:
+            capture_call_args['model'] = model
         if before_return is not None:
             await before_return(_s)
         return StageReport(
