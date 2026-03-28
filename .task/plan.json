@@ -1,0 +1,160 @@
+{
+  "task_id": "266",
+  "title": "Refactor dashboard partial error handling from route layer to data layer",
+  "files": [
+    "dashboard/src/dashboard/data/db.py",
+    "dashboard/src/dashboard/data/write_journal.py",
+    "dashboard/src/dashboard/app.py",
+    "dashboard/tests/test_db.py",
+    "dashboard/tests/test_write_journal.py",
+    "dashboard/tests/test_app.py"
+  ],
+  "modules": [
+    "dashboard/src/dashboard/data",
+    "dashboard/src/dashboard",
+    "dashboard/tests"
+  ],
+  "analysis": "The dashboard has two inconsistent error-handling patterns: (1) Data layer: `with_db()` in db.py catches `sqlite3.OperationalError` and returns typed defaults; reconciliation.py and performance.py use this pattern. write_journal.py handles errors internally with its own try/except OperationalError blocks \u2014 functionally equivalent but architecturally inconsistent. (2) Route layer: app.py has broad `except Exception` blocks in memory_graphs_partial and partials_performance that catch ALL errors and return all-empty defaults, discarding successful sibling results from asyncio.gather. partials_recon uses asyncio.gather over 6 functions with NO error handling at all. The refactoring plan: (a) Broaden `with_db()` to catch `(sqlite3.OperationalError, OSError)` so infrastructure failures beyond just DB errors are handled at the data layer. (b) Broaden `DbPool.get()` similarly so pool failures return None rather than propagating. (c) Refactor write_journal.py to use the `with_db()` pattern for consistency with reconciliation.py and performance.py. (d) Use `asyncio.gather(return_exceptions=True)` in all three routes with per-result inspection via a `_safe_gather_result` helper, so one failing coroutine doesn't discard its siblings' data. (e) Remove the broad `except Exception` blocks from routes. (f) Add error handling to partials_recon. (g) Update tests: data-layer error tests for OSError, parameterized route tests for partial failure, narrower exception types.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "In test_db.py TestWithDb, add test_returns_default_on_os_error: create a real aiosqlite connection, pass a callback that raises OSError('disk I/O error'), verify with_db returns the default. This tests the broadened exception handling that doesn't exist yet.",
+      "status": "done",
+      "commit": "a2c71ddf"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "In db.py with_db(), broaden the except clause from `sqlite3.OperationalError` to `(sqlite3.OperationalError, OSError)`. The log message stays the same.",
+      "status": "done",
+      "commit": "f6451453"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "In test_db.py TestDbPool, add test_get_returns_none_on_connect_os_error: create a db file, patch aiosqlite.connect to raise OSError('disk error'), verify pool.get() returns None. Also add test_get_returns_none_on_permission_error: patch Path.exists to raise PermissionError, verify pool.get() returns None. Both currently fail because pool.get() only catches FileNotFoundError and sqlite3.OperationalError.",
+      "status": "done",
+      "commit": "9c06904b"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "In db.py DbPool.get(), move the `if not resolved.exists(): return None` check inside the existing try block, and broaden the except clause from `(FileNotFoundError, sqlite3.OperationalError)` to `(FileNotFoundError, sqlite3.OperationalError, OSError)`. This covers PermissionError (subclass of OSError) from exists() and connect().",
+      "status": "done",
+      "commit": "04c6c8f6"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "In test_write_journal.py, add a new class TestDataLayerErrorHandling with three parameterized tests: (a) test_returns_default_on_none_db \u2014 call each of the 3 functions with None, verify typed defaults (already covered but confirms post-refactor). (b) test_returns_default_on_operational_error \u2014 connect to db with no write_ops table, call each function, verify defaults. (c) test_returns_default_on_os_error \u2014 use a mock db whose execute raises OSError, call each function, verify defaults. Tests (b) and (c) will fail because write_journal.py currently handles OperationalError internally but not via with_db(), and OSError is not handled at all.",
+      "status": "done",
+      "commit": "a0ab9cfc"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Refactor write_journal.py to use with_db() from dashboard.data.db. For get_operations_breakdown and get_agent_breakdown: extract the SQL query into a nested _query(db) async function, pass it to with_db(db, _query, default). For get_memory_timeseries: keep the bucket pre-fill logic outside, extract the SQL query into _query(db) returning raw rows as list, use `rows = await with_db(db, _query, [])`, then iterate rows to fill buckets. Remove all internal `if db is None` checks and `except sqlite3.OperationalError` blocks \u2014 with_db handles both.",
+      "status": "done",
+      "commit": "86c61ff2"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "In test_app.py, replace test_memory_graphs_backend_error_degrades_gracefully with a parameterized test test_memory_graphs_partial_failure. Parametrize over ('get_memory_timeseries', 'get_operations_breakdown', 'get_agent_breakdown'). For each: patch ALL three functions with valid data via _patch_memory_graphs_integration(), then override the failing one with side_effect=RuntimeError. Verify: (1) response is 200, (2) the HTML contains chart elements (memoryTimeseriesChart etc), (3) when get_memory_timeseries is the one that fails, the other two charts still get real data (operations chart shows 'search', agent chart shows 'claude-interactive'). This test fails because the current except-Exception block discards all results on any single failure.",
+      "status": "done",
+      "commit": "4d682180"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "In app.py memory_graphs_partial: (1) Add a module-level _safe_gather_result(result, default, label) helper that checks isinstance(result, BaseException), logs a warning if so and returns default, otherwise returns result. (2) Replace the try/except block: use asyncio.gather(..., return_exceptions=True), then extract each result with _safe_gather_result using the same defaults that were in the except block. Remove the except Exception block entirely.",
+      "status": "done",
+      "commit": "ebcdbc2e"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "In test_app.py, replace test_performance_backend_error_degrades_gracefully with a parameterized test test_performance_partial_failure. Parametrize over ('get_completion_paths', 'get_escalation_rates', 'get_loop_histograms', 'get_time_centiles'). For each: patch ALL four with valid data via _patch_perf_integration(), then override the failing one with side_effect=RuntimeError. Verify: (1) response is 200, (2) when one fails, others still render (e.g. if get_completion_paths fails, the page still shows escalation data like 'Steward'). This test fails because the current except-Exception discards all results.",
+      "status": "done",
+      "commit": "f78bfa83"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "In app.py partials_performance: use asyncio.gather(..., return_exceptions=True), extract each result with _safe_gather_result using defaults (paths={}, escalations={}, histograms={}, ttc={}). Remove the except Exception block entirely.",
+      "status": "done",
+      "commit": "6eb8a8ce"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "In test_app.py, add test_recon_partial_failure in TestReconPartialIntegration, parameterized over all 6 recon functions ('get_buffer_stats', 'get_burst_state', 'get_watermarks', 'get_latest_verdict', 'get_recent_runs', 'get_last_attempted_run'). For each: patch all 6 with valid data via _patch_recon_data(), then override the failing one with side_effect=RuntimeError. Verify response is 200 and the HTML still renders (contains 'staleness_timer' from the non-failing runs data, unless runs is the one failing). This test fails because partials_recon has no error handling \u2014 an exception from any gather coroutine causes a 500.",
+      "status": "done",
+      "commit": "16636d09"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "In app.py partials_recon: change asyncio.gather to use return_exceptions=True. Extract each of the 6 results using _safe_gather_result with the appropriate defaults: buffer_stats={'buffered_count': 0, 'oldest_event_age_seconds': None}, burst_state=[], watermarks_list=[], verdict=None, runs=[], last_attempted_map={}.",
+      "status": "done",
+      "commit": "c1cd8822"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Broaden with_db() to catch (sqlite3.OperationalError, OSError) rather than catching the broader sqlite3.Error or Exception",
+      "rationale": "OperationalError covers DB-level infrastructure failures (locked, corrupt, missing table). OSError covers file-system level failures (disk full, permission denied, I/O error). Together they cover all realistic infrastructure errors for a read-only dashboard without catching programming errors (TypeError, ValueError) that should propagate as bugs."
+    },
+    {
+      "decision": "Move Path.exists() check inside DbPool.get() try block and add OSError to the catch tuple",
+      "rationale": "exists() can raise PermissionError (a subclass of OSError) on restricted paths. Currently this is outside the try block, so it would propagate. Moving it inside ensures pool.get() always returns None on infrastructure failure, matching its documented contract."
+    },
+    {
+      "decision": "Refactor write_journal.py to use with_db() instead of internal try/except",
+      "rationale": "Aligns with the pattern used by reconciliation.py and performance.py. Reduces code duplication (3 functions \u00d7 try/except/log \u2192 3 with_db calls). For get_memory_timeseries, the query returns raw rows and bucket-filling happens after with_db(), so pre-filled buckets are always returned even on error."
+    },
+    {
+      "decision": "Use asyncio.gather(return_exceptions=True) with per-result inspection instead of try/except Exception at route level",
+      "rationale": "The current except-Exception pattern discards ALL gather results when ANY coroutine fails. With return_exceptions=True, each result is inspected independently, enabling partial data display. A _safe_gather_result helper keeps the pattern DRY across the 3 routes."
+    },
+    {
+      "decision": "Place _safe_gather_result helper in app.py as a private module function rather than in data/db.py",
+      "rationale": "This helper is a route-layer concern (inspecting asyncio.gather results). The data layer (db.py, with_db) handles its own errors. Keeping the helper in app.py maintains the separation: data layer = resilient queries, route layer = resilient gather orchestration."
+    },
+    {
+      "decision": "Default values for recon _safe_gather_result calls mirror the defaults already declared in the data layer functions",
+      "rationale": "get_buffer_stats default is {'buffered_count': 0, 'oldest_event_age_seconds': None} (matches _BUFFER_STATS_DEFAULT), get_burst_state/watermarks/runs default to [], get_latest_verdict to None, get_last_attempted_run to {}. Using the same defaults at route level ensures consistent empty-state rendering whether the error is caught at data or route layer."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "with_db() helper function",
+      "where": "dashboard/src/dashboard/data/db.py",
+      "how": "Reuse in write_journal.py for get_memory_timeseries, get_operations_breakdown, get_agent_breakdown \u2014 same pattern already used by reconciliation.py and performance.py"
+    },
+    {
+      "what": "_patch_recon_data() and _patch_perf_integration() test helpers",
+      "where": "dashboard/tests/test_app.py",
+      "how": "Reuse existing ExitStack-based patch helpers to set up valid data for all functions, then override individual ones with side_effect for parameterized partial-failure tests"
+    },
+    {
+      "what": "_patch_memory_graphs_integration() test helper",
+      "where": "dashboard/tests/test_app.py",
+      "how": "Reuse to provide valid baseline data in parameterized memory-graphs error tests"
+    },
+    {
+      "what": "WRITE_OPS_SCHEMA fixture",
+      "where": "dashboard/tests/test_write_journal.py",
+      "how": "Reuse for creating test databases with and without tables to test OperationalError paths after refactoring to with_db()"
+    },
+    {
+      "what": "DbPool and with_db test patterns",
+      "where": "dashboard/tests/test_db.py",
+      "how": "Follow existing test style (tmp_path for real SQLite, aiosqlite.connect in fixtures) for new OSError tests"
+    }
+  ],
+  "_session_id": "266-a9bee1d9",
+  "_created_at": "2026-03-28T15:48:30.324424+00:00"
+}
