@@ -599,6 +599,45 @@ def create_mcp_server(
             logger.error(f'delete_episode error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
+    @mcp.tool()
+    async def refresh_entity_summary(
+        entity_uuid: str,
+        project_id: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Regenerate a Graphiti entity node's summary from its valid edges.
+
+        After deleting edges from an entity, call this tool with the entity's
+        UUID to rebuild its summary from the remaining valid edges. This prevents
+        stale duplicate text from persisting in entity summaries.
+
+        The summary is rebuilt by deduplicating the facts of all currently-valid
+        RELATES_TO edges — no LLM call is made.
+
+        Args:
+            entity_uuid: UUID of the Graphiti Entity node to refresh
+            project_id: Project scope (required)
+            agent_id: Which agent is calling (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := validate_project_id(project_id):
+            return err
+        try:
+            causation_id, source, _ = _extract_causation(metadata, agent_id)
+            return await memory_service.refresh_entity_summary(
+                entity_uuid=entity_uuid, project_id=project_id,
+                agent_id=agent_id, session_id=session_id,
+                causation_id=causation_id, _source=source,
+            )
+        except Exception as e:
+            logger.error(f'refresh_entity_summary error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
     # ------------------------------------------------------------------
     # Management tools
     # ------------------------------------------------------------------
