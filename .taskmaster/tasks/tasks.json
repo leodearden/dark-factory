@@ -3589,7 +3589,7 @@
         "description": "The format_duration Jinja2 filter (seconds → human-readable) has robustness gaps and missing test coverage identified during review of task 178.",
         "details": "Four improvements, all in dashboard/src/dashboard/app.py and dashboard/tests/test_recon_panel.py:\n\n1. **Negative value guard** (app.py:128-131): format_duration does not guard against negative values. If oldest_event_age_seconds is negative (clock skew, computation error), it renders '-30s'. Add `if value is None or value <= 0: return '-'` to mirror format_duration_ms.\n\n2. **Type guard** (app.py:130): `int(value)` raises TypeError for non-numeric inputs. Wrap in try/except: `try: total = int(value) except (TypeError, ValueError): return '-'`. Prevents TemplateError from crashing partial renders.\n\n3. **Missing None test** (test_recon_panel.py:TestFormatDuration): No test for `format_duration(None) == '-'`. Add one to mirror TestFormatDurationMs.test_none_returns_dash pattern.\n\n4. **Missing CSS class assertions** (test_recon_panel.py:TestReconBufferAgeDisplay): The template applies text-yellow-400 when age > 300 and text-gray-400 otherwise, but no integration test asserts on CSS classes. Add: in test_sub_60s_age_displays_seconds_only (age=45 < 300): assert 'text-gray-400' in html, assert 'text-yellow-400' not in html. In test_large_age_displays_hours_and_minutes (age=62736 > 300): assert 'text-yellow-400' in html.\n\nmemory_hints: search \"dashboard filter naming convention\" for sibling filter documentation norms.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -3604,7 +3604,7 @@
             "dashboard/tests"
           ]
         },
-        "updatedAt": "2026-03-28T00:56:43.644Z"
+        "updatedAt": "2026-03-28T01:06:41.016Z"
       },
       {
         "id": "211",
@@ -3880,9 +3880,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T01:04:47.728Z",
+      "lastModified": "2026-03-28T01:06:41.017Z",
       "taskCount": 208,
-      "completedCount": 166,
+      "completedCount": 167,
       "tags": [
         "master"
       ]
