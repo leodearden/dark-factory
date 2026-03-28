@@ -860,7 +860,17 @@ async def test_cancellation_cleanup_shielded_from_second_cancel(
     # Using a fixed sleep could misfire on a loaded CI host: if _get_prior_s3_findings
     # takes longer than the sleep, the cancel arrives before the try block and
     # complete_run is never called, leaving the run stuck in 'running'.
-    await stage_entered.wait()
+    # Race the event against outer_task to avoid infinite hang if run_full_cycle
+    # fails before slow_stage_run is invoked (e.g. journal/buffer setup error).
+    done, _ = await asyncio.wait(
+        [asyncio.ensure_future(stage_entered.wait()), outer_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if outer_task in done and not stage_entered.is_set():
+        pytest.fail(
+            f"outer_task completed before slow_stage_run was invoked: "
+            f"{outer_task.exception()!r}"
+        )
 
     # First cancellation: triggers CancelledError in slow_stage_run → cleanup starts
     outer_task.cancel()
