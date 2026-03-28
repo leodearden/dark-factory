@@ -989,7 +989,6 @@ class TestSelectTier:
     ):
         """run_full_cycle applies TierConfig limits onto MemoryConsolidator before stage runs."""
         from fused_memory.reconciliation.harness import TierConfig
-
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
