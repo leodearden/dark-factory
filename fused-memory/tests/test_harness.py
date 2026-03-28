@@ -867,9 +867,9 @@ async def test_cancellation_cleanup_shielded_from_second_cancel(
         return_when=asyncio.FIRST_COMPLETED,
     )
     if outer_task in done and not stage_entered.is_set():
+        exc = "task was cancelled" if outer_task.cancelled() else repr(outer_task.exception())
         pytest.fail(
-            f"outer_task completed before slow_stage_run was invoked: "
-            f"{outer_task.exception()!r}"
+            f"outer_task completed before slow_stage_run was invoked: {exc}"
         )
 
     # First cancellation: triggers CancelledError in slow_stage_run → cleanup starts
