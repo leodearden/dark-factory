@@ -8,8 +8,6 @@ import pytest
 from shared.cli_invoke import AgentResult
 
 import fused_memory.reconciliation.stages.base as base_module
-
-_MOCK_TYPES = (AsyncMock, MagicMock)
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId, Watermark
 from fused_memory.reconciliation.cli_stage_runner import (
@@ -32,6 +30,8 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
 )
+
+_MOCK_TYPES = (AsyncMock, MagicMock)
 
 
 class TestDisallowedToolLists:
