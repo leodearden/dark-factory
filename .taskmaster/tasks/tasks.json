@@ -4099,10 +4099,11 @@
         "description": "validate_project_id currently only checks non-emptiness (line 30). It is interpolated into the same reconciliation context prompt as run_id (base.py line 122: `f'- \\`project_id\\`: \"{self.project_id}\"'`), but lacks the `[a-zA-Z0-9_-]+` character-set allowlist that validate_run_id now enforces. This asymmetry leaves project_id as a remaining injection vector in the same prompt block.\n\nFix: add the same `_RUN_ID_PATTERN.fullmatch()` check (or a shared `_SAFE_IDENTIFIER_PATTERN`) to validate_project_id. In practice project_id is always 'dark_factory', but the validation should be symmetric with run_id for defense-in-depth.\n\nmemory_hint: search \"prompt injection fix routing layer\" for prior pattern; search \"run_id validate character-set allowlist\" for the run_id implementation to mirror.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T04:32:10.010Z"
       },
       {
         "id": "246",
@@ -4118,7 +4119,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:32:08.735Z",
+      "lastModified": "2026-03-28T04:32:10.010Z",
       "taskCount": 225,
       "completedCount": 176,
       "tags": [
