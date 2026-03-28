@@ -510,11 +510,13 @@ class TestParseUtc:
 
     def test_naive_iso_string_gets_utc(self):
         """Naive ISO string (no tzinfo) should be returned with UTC attached."""
+        from datetime import UTC as _UTC
+
         from dashboard.data.reconciliation import _parse_utc
 
         result = _parse_utc('2026-03-28T10:00:00')
         assert result.tzinfo is not None
-        assert result.tzinfo == UTC
+        assert result.tzinfo == _UTC
 
     def test_aware_iso_string_preserved(self):
         """Aware ISO string (with tzinfo) should be returned unchanged."""

@@ -21,6 +21,19 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BURST_COOLDOWN = 150
 
 
+def _parse_utc(ts: str) -> datetime:
+    """Parse an ISO timestamp string and ensure it has UTC timezone.
+
+    Naive datetimes (no tzinfo) get UTC attached.  Aware datetimes are
+    returned unchanged.  Invalid input propagates ValueError or TypeError
+    from :func:`datetime.fromisoformat`.
+    """
+    dt = datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
 async def get_recent_runs(db: aiosqlite.Connection | None, *, limit: int = 50) -> list[dict]:
     """Return recent reconciliation runs ordered by started_at DESC.
 
