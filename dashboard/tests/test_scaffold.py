@@ -145,6 +145,20 @@ class TestMakefile:
         assert 'sha256' in content
 
 
+class TestInputCSS:
+    """Tests that input.css contains all required CSS rules including animations."""
+
+    def test_input_css_has_refresh_pulse_keyframes(self):
+        """input.css must define the @keyframes section-refresh-pulse animation."""
+        content = (DASHBOARD_ROOT / 'src' / 'dashboard' / 'static' / 'input.css').read_text()
+        assert '@keyframes section-refresh-pulse' in content
+
+    def test_input_css_has_section_refreshed_class(self):
+        """input.css must define the .section-refreshed class."""
+        content = (DASHBOARD_ROOT / 'src' / 'dashboard' / 'static' / 'input.css').read_text()
+        assert '.section-refreshed' in content
+
+
 class TestStaticFiles:
     def test_static_css_served(self, client):
         """Static CSS file should be served at /static/tailwind.css."""
