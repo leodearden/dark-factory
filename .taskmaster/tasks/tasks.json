@@ -3275,11 +3275,11 @@
         "description": "The mock_deps fixture (AsyncMock dict with memory_service, taskmaster, journal, config) is defined identically in 4 test classes: TestStageSubclasses, TestPerStageReportSchema, TestTaskKnowledgeSyncPayload, and TestProjectIdValidation. Promote to a module-level pytest fixture to eliminate duplication.",
         "details": "File: fused-memory/tests/test_stages.py\n\nSource: review suggestions from task 137 (esc-137-8).",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "blocked",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T00:05:37.207Z",
+        "updatedAt": "2026-03-28T00:08:42.251Z",
         "metadata": {
           "files": [
             "fused-memory/tests/test_stages.py",
@@ -3693,7 +3693,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T00:05:59.105Z",
+      "lastModified": "2026-03-28T00:08:42.251Z",
       "taskCount": 195,
       "completedCount": 154,
       "tags": [
