@@ -4300,11 +4300,11 @@
         "description": "The task-235 refactor of _SessionAwareHandler in dashboard/tests/test_memory.py weakened an invariant: the original inline handlers had `assert port is not None` but the refactored class silently skips port tracking when port is None. This could mask misconfigured test URLs (portless URL would bypass both port tracking and fail_port logic, causing tests to pass vacuously).\n\nChanges needed:\n1. **Restore port assertion** (lines 67-68): Replace `if port is not None: self.ports_seen.add(port)` with `assert port is not None, f\"Request to {request.url} has no port\"` followed by unconditional `self.ports_seen.add(port)`.\n2. **Add missing assertion in test_fail_port_records_port_before_error** (line 134): Add `assert len(handler.calls) == 0` to confirm fail_port fires before body parsing.\n3. **Add negative assertion in test_fail_port_does_not_affect_other_ports** (line 141): Add `assert 9000 not in handler.ports_seen` to guard against accidental pre-insertion.\n4. **Add docstring to __call__** clarifying that `ports_seen` records every attempted port (including failures) while `calls` only records requests that pass all pre-dispatch guards.\n\nmemory_hints: search for \"_SessionAwareHandler\" in dashboard/tests/test_memory.py",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T05:35:13.990Z"
+        "updatedAt": "2026-03-28T05:49:23.462Z"
       },
       {
         "id": "259",
@@ -4496,9 +4496,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T05:42:02.959Z",
+      "lastModified": "2026-03-28T05:49:23.463Z",
       "taskCount": 252,
-      "completedCount": 198,
+      "completedCount": 199,
       "tags": [
         "master"
       ]
