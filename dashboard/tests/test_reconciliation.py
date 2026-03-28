@@ -531,17 +531,17 @@ class TestParseUtc:
 
     def test_invalid_string_raises_value_error(self):
         """Invalid ISO string should raise ValueError."""
-        from dashboard.data.reconciliation import _parse_utc
-
         import pytest
+
+        from dashboard.data.reconciliation import _parse_utc
         with pytest.raises(ValueError):
             _parse_utc('not-a-timestamp')
 
     def test_none_raises_type_error(self):
         """None input should raise TypeError."""
-        from dashboard.data.reconciliation import _parse_utc
-
         import pytest
+
+        from dashboard.data.reconciliation import _parse_utc
         with pytest.raises(TypeError):
             _parse_utc(None)
 
