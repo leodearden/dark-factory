@@ -3841,10 +3841,11 @@
         "description": "test_refresh_indicator.py has several quality issues found during review of task 182:\n\n1. **TestRefreshPulseCSS uses os.path instead of TestClient** — reads style.css via fragile relative path instead of `client.get('/static/style.css').text`, breaking the pattern used everywhere else in the test suite (test_scaffold.py already demonstrates this).\n\n2. **TestExistingBehaviorPreserved duplicates test_app.py** — all 10 tests in this class are already covered by TestMorphSwap, TestIndex, TestAriaLivePollingsections, and TestHtmxErrorHandling in test_app.py. Remove entirely.\n\n3. **Weak assertions** — `test_all_sections_use_morph_innerHTML` only checks for one occurrence (should assert count==5); `test_timestamp_elements_have_subtle_styling` checks 'text-gray-500' globally (footer also has it); `test_timestamp_elements_are_aria_hidden` checks 'aria-hidden=\"true\"' globally.\n\n4. **Missing pairing test** — no test verifies each `data-section` value has a matching `data-updated-for` value, so a typo in one attribute silently breaks the feature.\n\nmemory_hints: search for \"dashboard test patterns\", get_entity \"test_refresh_indicator.py\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T00:57:28.501Z"
       },
       {
         "id": "228",
@@ -3871,7 +3872,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T00:57:27.315Z",
+      "lastModified": "2026-03-28T00:57:28.505Z",
       "taskCount": 208,
       "completedCount": 164,
       "tags": [
