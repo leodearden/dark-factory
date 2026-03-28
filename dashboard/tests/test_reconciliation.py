@@ -154,6 +154,40 @@ class TestGetRecentRuns:
         assert runs[0]['duration_seconds'] is None
         assert any('bad timestamps' in record.message for record in caplog.records)
 
+    async def test_malformed_started_at_with_completed_at_sets_duration_none(
+        self, tmp_path, caplog
+    ):
+        """Malformed started_at (non-ISO string) with valid completed_at yields duration_seconds=None.
+
+        This exercises the ValueError branch of the try/except in get_recent_runs.
+        """
+        import sqlite3
+
+        from dashboard.data.reconciliation import get_recent_runs
+        from tests.conftest import RECONCILIATION_SCHEMA
+
+        db_path = tmp_path / 'malformed_started.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(RECONCILIATION_SCHEMA)
+        conn.execute(
+            "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
+            " completed_at, events_processed, status)"
+            " VALUES ('run-mal1', 'dark_factory', 'full', 'test', 'not-a-timestamp',"
+            " '2026-03-28T10:05:00+00:00', 0, 'completed')"
+        )
+        conn.commit()
+        conn.close()
+
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
+            async with aiosqlite.connect(str(db_path)) as db:
+                db.row_factory = aiosqlite.Row
+                runs = await get_recent_runs(db)
+
+        assert len(runs) == 1
+        assert runs[0]['id'] == 'run-mal1'
+        assert runs[0]['duration_seconds'] is None
+        assert any('bad timestamps' in record.message for record in caplog.records)
+
 
 class TestGetWatermarks:
     """Tests for get_watermarks."""
