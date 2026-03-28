@@ -78,15 +78,15 @@
       "id": "step-8",
       "type": "impl",
       "description": "Migrate test_verify_zombie_edges.py: (a) Move in-method imports to module level: `from contextlib import asynccontextmanager` and `from fused_memory.maintenance.verify_zombie_edges import VerifyResult, run_verify_zombie_edges`; (b) Remove inline @asynccontextmanager definition; add make_fake_maintenance_service fixture param to test_delegates_to_maintenance_service; (c) Use make_fake_maintenance_service(mock_cfg, mock_service) in the patch side_effect.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "427c7411"
     },
     {
       "id": "step-9",
       "type": "test",
       "description": "Run full maintenance test suite: pytest fused-memory/tests/test_reindex.py fused-memory/tests/test_cleanup_stale_edges.py fused-memory/tests/test_verify_zombie_edges.py fused-memory/tests/test_maintenance_utils.py \u2014 verify all pass with zero failures.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "427c7411"
     }
   ],
   "design_decisions": [
