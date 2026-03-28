@@ -4012,10 +4012,11 @@
         "description": "Post-merge cleanup of test_config_schema.py from task 221 (YamlSettingsSource hardening). Six improvements:\n\n1. **Extract shared _DummySettings and _make_source** — `_DummySettings(BaseSettings)` is defined identically in 4 places (TestYamlSettingsSourceEnvVarExpansion.setup_method, TestYamlSettingsSourceErrorHandling._make_source, TestYamlSettingsSourceEncoding._make_source, TestYamlSettingsSourceABCContract.setup_method). Extract to a module-level helper or pytest fixture.\n\n2. **Move inline imports to module level** — `from pydantic_settings import BaseSettings` appears inside 3 methods; `from pydantic.fields import FieldInfo` inside 1 test body. Move both to module-level import block.\n\n3. **Use re.escape in pytest.raises match** — `pytest.raises(RuntimeError, match=str(bad_file))` passes raw path strings as regex. Dots and hyphens in tmp_path are regex metacharacters. Use `re.escape(str(path))` instead.\n\n4. **Add root-user skip for chmod test** — test_unreadable_file_raises_runtime_error only skips Windows but not root, where chmod(0o000) is a no-op. Add `pytest.mark.skipif(os.getuid() == 0, reason='root ignores file permissions')`.\n\n5. **Assert exception chaining** — Implementation uses `raise ... from e` but no test verifies `exc.__cause__` is preserved. Add `assert exc_info.value.__cause__ is not None` to error handling tests.\n\n6. **Improve UTF-8 encoding test** — test_utf8_yaml_loaded_correctly passes on any UTF-8 locale system regardless of the `encoding='utf-8'` parameter. Mock `builtins.open` to assert `encoding='utf-8'` is passed, or verify via a more robust approach.\n\nmemory_hints:\n- search: \"YamlSettingsSource test helpers test_config_schema\"\n- entity: \"test_config_schema.py\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T04:55:42.051Z"
       },
       {
         "id": "238",
@@ -4255,7 +4256,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:55:40.679Z",
+      "lastModified": "2026-03-28T04:55:42.051Z",
       "taskCount": 236,
       "completedCount": 184,
       "tags": [
