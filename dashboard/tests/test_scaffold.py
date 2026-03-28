@@ -129,6 +129,20 @@ class TestConftestFixtures:
 DASHBOARD_ROOT = Path(__file__).parent.parent
 
 
+class TestGitignore:
+    """Tests that .gitignore excludes generated build artifacts."""
+
+    def test_gitignore_excludes_tailwind_css(self):
+        """tailwind.css is a generated artifact and must be gitignored."""
+        content = (DASHBOARD_ROOT / '.gitignore').read_text()
+        assert 'tailwind.css' in content
+
+    def test_gitignore_excludes_bin(self):
+        """bin/ (downloaded Tailwind binary) must remain gitignored (regression guard)."""
+        content = (DASHBOARD_ROOT / '.gitignore').read_text()
+        assert 'bin/' in content
+
+
 class TestMakefile:
     """Tests that the Makefile exists and has platform detection + checksum verification."""
 
