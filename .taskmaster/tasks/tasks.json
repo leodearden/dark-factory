@@ -3302,11 +3302,11 @@
         "description": "Post-review fixes for task 191's get_entity concurrent gather implementation. Six items in two files:\n\n**memory_service.py (lines 824-836):**\n1. Change `isinstance(r, BaseException)` to `isinstance(r, Exception)` — BaseException catches CancelledError/KeyboardInterrupt/SystemExit which should propagate, not be logged as Graphiti failures. Matches established pattern in task_interceptor.py:112 and durable_queue.py.\n2. Replace list comprehension `[r for r in results if ...]` with `next((r for r in results if ...), None)` — avoids allocating a list on the success path and short-circuits on first exception.\n3. Remove `assert isinstance(nodes, list)` and `assert isinstance(edges, list)` (lines 835-836) — assertions are stripped with `python -O`, and are redundant since the exception filter already guarantees non-exception results at that point.\n\n**test_memory_service.py:**\n4. Add `match='search_nodes failed'` to `pytest.raises(RuntimeError)` in `test_both_failures_raises_first_exception` (line 710) — verifies the ordering contract (first exception from gather results is raised).\n5. Fix stale docstring in `test_search_nodes_failure_raises_and_search_settles` (lines 664-665) — remove \"With the current sequential implementation search() is never called — this test fails\" which described the pre-refactor state.\n6. Add `test_both_failures_emits_two_warnings` — patch logger, set both search_nodes and search to raise, assert `mock_logger.warning.call_count == 2`. The production code iterates all exceptions and logs each, but this double-log path is untested.\n\n## memory_hints\n- search: \"isinstance BaseException Exception gather return_exceptions pattern\"\n- search: \"get_entity asyncio.gather concurrent search\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-28T00:13:42.363Z",
+        "updatedAt": "2026-03-28T00:37:44.657Z",
         "metadata": {
           "files": [
             "fused-memory/src/fused_memory/services/memory_service.py",
@@ -3760,9 +3760,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T00:36:35.316Z",
+      "lastModified": "2026-03-28T00:37:44.657Z",
       "taskCount": 199,
-      "completedCount": 157,
+      "completedCount": 158,
       "tags": [
         "master"
       ]
