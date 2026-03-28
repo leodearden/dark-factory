@@ -46,6 +46,11 @@ class ReconciliationEvent(BaseModel):
     payload: dict = Field(default_factory=dict)
     agent_id: str | None = None
 
+    @field_validator('project_id', mode='before')
+    @classmethod
+    def normalize_project_id(cls, v):
+        return _normalize_project_id(v)
+
 
 class JournalEntry(BaseModel):
     """One per reconciliation operation — full audit trail."""
