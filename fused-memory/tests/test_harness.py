@@ -1087,7 +1087,7 @@ class TestSelectTier:
 
         for stage in harness.stages:
             if isinstance(stage, MemoryConsolidator):
-                _mock_stage_run(stage, before_return=capture_limits)
+                _mock_stage_run(stage, before_return=capture_limits, capture_call_args=captured)
             else:
                 _mock_stage_run(stage)
 
@@ -1099,8 +1099,8 @@ class TestSelectTier:
             events=[_make_event()],
         )
 
-        assert 'episode_limit' in captured and 'memory_limit' in captured, (
-            'MemoryConsolidator.run() was never called or did not capture expected keys — '
+        assert captured, (
+            'MemoryConsolidator.run() was never invoked — '
             'run_full_cycle skipped it or stage list changed'
         )
 
@@ -1109,4 +1109,7 @@ class TestSelectTier:
         )
         assert captured.get('memory_limit') == 250, (
             f"Expected memory_limit=250 propagated to consolidator, got {captured.get('memory_limit')}"
+        )
+        assert captured.get('model') == 'sonnet', (
+            f"Expected model='sonnet' forwarded as kwarg to stage.run(), got {captured.get('model')!r}"
         )
