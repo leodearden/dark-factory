@@ -1079,3 +1079,31 @@ class TestPollingErrorRecovery:
             f"Expected 'htmx:sendError' to appear at least 2 times (got {count}) — "
             "one for error display, one for poll recovery."
         )
+
+
+class TestPollingInputValidation:
+    """Tests that scheduleNext() guards against NaN and non-positive intervals."""
+
+    def test_schedule_next_guards_nan(self, client):
+        """scheduleNext must check Number.isFinite to guard against NaN from non-numeric data-poll-base.
+
+        parseInt returns NaN for non-numeric strings, and setTimeout(fn, NaN) is spec-defined
+        to treat NaN as 0ms delay, creating a tight polling loop that hammers the server.
+        """
+        html = client.get('/').text
+        assert 'Number.isFinite' in html, (
+            "Expected 'Number.isFinite' in jitter script — "
+            "scheduleNext must guard against NaN (parseInt returns NaN for non-numeric data-poll-base)."
+        )
+
+    def test_schedule_next_guards_non_positive(self, client):
+        """scheduleNext must check that baseMs is positive to prevent zero or negative intervals.
+
+        A data-poll-base of '0' or a negative value would cause setTimeout(fn, 0) which fires
+        immediately, creating a tight polling loop.
+        """
+        html = client.get('/').text
+        assert 'baseMs <= 0' in html, (
+            "Expected 'baseMs <= 0' check in jitter script — "
+            "scheduleNext must guard against zero or negative intervals."
+        )
