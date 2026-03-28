@@ -142,6 +142,13 @@ class TestValidateProjectRoot:
         result = validate_project_root('/some/path')
         assert result is None
 
+    def test_rejects_relative_path(self):
+        result = validate_project_root('relative/path')
+        assert result is not None
+        assert 'error' in result
+        assert 'error_type' in result
+        assert result['error_type'] == 'ValidationError'
+
 
 class TestRequireProjectRoot:
     """require_project_root raises ValueError for invalid paths, returns None for valid ones."""
