@@ -727,6 +727,7 @@ class TestGetEntity:
         assert len(result['edges']) == 1
         assert result['edges'][0]['fact'] == 'Auth service depends on Redis'
         assert result['edges'][0]['uuid'] == 'edge-uuid-1'
+        assert result['nodes'][0]['labels'] == []
 
     # ------------------------------------------------------------------
     # getattr fallback — missing attributes return None / [] defaults
@@ -764,6 +765,19 @@ class TestGetEntity:
         result = await service.get_entity('BareNode', project_id='test')
 
         assert result['nodes'][0]['labels'] == []
+
+    @pytest.mark.asyncio
+    async def test_getattr_labels_nonempty_passthrough(self, service):
+        """Non-empty labels list passes through unchanged (or [] short-circuit does not fire)."""
+        node = types.SimpleNamespace(name='AuthService')
+        node.labels = ['Service', 'Auth']
+
+        service.graphiti.search_nodes = AsyncMock(return_value=[node])
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        result = await service.get_entity('AuthService', project_id='test')
+
+        assert result['nodes'][0]['labels'] == ['Service', 'Auth']
 
     # ------------------------------------------------------------------
     # concurrent execution — both coroutines run in parallel

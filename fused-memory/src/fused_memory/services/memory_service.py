@@ -821,7 +821,7 @@ class MemoryService:
                 entities.append(target_node.name)
 
             # Episode provenance
-            episodes = getattr(edge, 'episodes', []) or []
+            episodes = getattr(edge, 'episodes', None) or []
             provenance = [str(ep) for ep in episodes]
 
             # Score: rank-based (no explicit score from Graphiti search)

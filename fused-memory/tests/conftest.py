@@ -27,6 +27,7 @@ class MockNode:
 
     name: str
     uuid: str = ''
+    labels: list[str] = field(default_factory=list)
 
 
 @dataclass
