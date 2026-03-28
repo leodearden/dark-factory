@@ -1,0 +1,87 @@
+{
+  "task_id": "234",
+  "title": "Strengthen _patch_stage meta-tests: isinstance checks, postconditions, cross-assertions",
+  "files": [
+    "fused-memory/tests/test_stages.py"
+  ],
+  "modules": [
+    "fused-memory/tests"
+  ],
+  "analysis": "The _patch_stage helper in TestProjectIdValidation (test_stages.py, lines 408-429) is a context manager that patches two things: stage.assemble_payload (via patch.object) and base_module.run_stage_via_cli (via patch). Two meta-tests exist (lines 568-591) that verify the helper works. Three weaknesses need fixing:\n\n1. Line 576 uses `hasattr(stage.assemble_payload, 'side_effect')` \u2014 any object with a side_effect attr would pass. Need `isinstance(..., (AsyncMock, MagicMock))` which is the canonical mock check.\n\n2. Neither meta-test checks that the context manager restores state on exit. The `with` blocks end without postcondition assertions. After exit, base_module.run_stage_via_cli should be the original function and stage.assemble_payload should no longer be a mock.\n\n3. test_patch_stage_accepts_cli_side_effect (line 580) only checks the CLI side_effect wiring but never verifies that assemble_payload is also patched \u2014 it should cross-assert both patches are active regardless of which parameter path was taken.\n\nAll changes are confined to test_stages.py. MagicMock must be added to the import on line 5. No production code changes needed.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Add MagicMock to the unittest.mock import on line 5 of test_stages.py: `from unittest.mock import AsyncMock, MagicMock, patch`",
+      "status": "done",
+      "commit": "381a9a7",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "In test_patch_stage_patches_assemble_payload_and_run_stage: replace `assert hasattr(stage.assemble_payload, 'side_effect')` (line 576) with `assert isinstance(stage.assemble_payload, (AsyncMock, MagicMock))`. Run the test to verify it passes \u2014 the patched assemble_payload is an AsyncMock which satisfies isinstance.",
+      "status": "done",
+      "commit": "e5fd9ed"
+    },
+    {
+      "id": "step-2",
+      "type": "test",
+      "description": "In test_patch_stage_patches_assemble_payload_and_run_stage: add postcondition assertions AFTER the `with self._patch_stage(stage):` block exits. Save `original_assemble_payload = stage.assemble_payload` before the with block. After the block, assert: (a) `base_module.run_stage_via_cli is original_run_stage_via_cli` \u2014 CLI function restored, (b) `not isinstance(stage.assemble_payload, (AsyncMock, MagicMock))` \u2014 assemble_payload is no longer a mock, (c) `stage.assemble_payload is original_assemble_payload` \u2014 exact original method reference restored.",
+      "status": "done",
+      "commit": "e7fb3e6"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "In test_patch_stage_accepts_cli_side_effect: add `assert isinstance(stage.assemble_payload, (AsyncMock, MagicMock))` inside the `with` block (before or after the existing side_effect assertion). This cross-asserts that both patches are active even when the cli_side_effect parameter path is exercised.",
+      "status": "done",
+      "commit": "6525a49"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Run the full TestProjectIdValidation test class (`pytest fused-memory/tests/test_stages.py::TestProjectIdValidation -v`) to verify all meta-tests pass and no existing tests regressed.",
+      "status": "pending",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use isinstance(..., (AsyncMock, MagicMock)) tuple check rather than just AsyncMock",
+      "rationale": "patch.object with side_effect creates a MagicMock wrapping an async side_effect. Depending on the mock library version and patch mode, the resulting object may be AsyncMock or MagicMock. Checking both covers all cases and matches the task spec."
+    },
+    {
+      "decision": "Save original_assemble_payload reference before the with block for exact restoration check",
+      "rationale": "Checking `not isinstance(..., Mock)` is necessary but not sufficient \u2014 it doesn't prove the original method was restored vs some other non-mock object. Comparing identity with the saved reference gives a stronger guarantee."
+    },
+    {
+      "decision": "Only modify TestProjectIdValidation meta-tests, not TestRunIdValidation",
+      "rationale": "The task description specifically targets TestProjectIdValidation lines ~568-591. TestRunIdValidation has no equivalent meta-tests to strengthen. The _patch_stage helper implementations are identical between the two classes."
+    },
+    {
+      "decision": "Group all test changes into one commit rather than one-per-assertion",
+      "rationale": "All three improvements are tightly coupled to the same two test methods. They form a single logical change \u2014 'strengthen meta-tests' \u2014 and splitting would create noisy git history with no benefit."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Existing _patch_stage context manager",
+      "where": "fused-memory/tests/test_stages.py lines 408-429",
+      "how": "No modification needed to the helper itself \u2014 only its meta-tests are being strengthened"
+    },
+    {
+      "what": "AsyncMock already imported",
+      "where": "fused-memory/tests/test_stages.py line 5",
+      "how": "MagicMock is added to the same import line; AsyncMock is already used throughout the file"
+    },
+    {
+      "what": "base_module reference pattern",
+      "where": "fused-memory/tests/test_stages.py line 10, 572, 578",
+      "how": "The existing pattern of saving original_run_stage_via_cli before the with block and comparing identity after is reused for the postcondition check"
+    }
+  ],
+  "_session_id": "234-a6d748e8",
+  "_created_at": "2026-03-28T04:49:28.879962+00:00"
+}
