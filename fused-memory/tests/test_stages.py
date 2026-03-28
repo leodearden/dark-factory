@@ -834,3 +834,79 @@ class TestTierConfig:
         with pytest.raises(ValueError, match='episode_limit and memory_limit must be explicitly set'):
             await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
 
+
+class TestProjectIdGuidelineConstants:
+    """_PROJECT_ID_GUIDELINE template and per-stage constants in prompts/__init__.py."""
+
+    def test_template_exists(self):
+        """_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        assert isinstance(_PROJECT_ID_GUIDELINE, str)
+
+    def test_template_has_tools_placeholder(self):
+        """_PROJECT_ID_GUIDELINE contains a {tools} placeholder."""
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        assert '{tools}' in _PROJECT_ID_GUIDELINE
+
+    def test_template_has_double_brace_project_id(self):
+        """_PROJECT_ID_GUIDELINE escapes project_id as {{project_id}} so it survives .format(tools=...)."""
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        # After formatting with tools, the {project_id} placeholder must survive
+        formatted = _PROJECT_ID_GUIDELINE.format(tools='search')
+        assert '{project_id}' in formatted
+
+    def test_stage1_constant_exists(self):
+        """_STAGE1_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
+        from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+        assert isinstance(_STAGE1_PROJECT_ID_GUIDELINE, str)
+
+    def test_stage2_constant_exists(self):
+        """_STAGE2_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
+        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
+        assert isinstance(_STAGE2_PROJECT_ID_GUIDELINE, str)
+
+    def test_stage3_constant_exists(self):
+        """_STAGE3_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
+        from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
+        assert isinstance(_STAGE3_PROJECT_ID_GUIDELINE, str)
+
+    def test_stage1_constant_has_project_id_placeholder(self):
+        """_STAGE1_PROJECT_ID_GUIDELINE contains {project_id} placeholder."""
+        from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+        assert '{project_id}' in _STAGE1_PROJECT_ID_GUIDELINE
+
+    def test_stage2_constant_has_project_id_placeholder(self):
+        """_STAGE2_PROJECT_ID_GUIDELINE contains {project_id} placeholder."""
+        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
+        assert '{project_id}' in _STAGE2_PROJECT_ID_GUIDELINE
+
+    def test_stage3_constant_has_project_id_placeholder(self):
+        """_STAGE3_PROJECT_ID_GUIDELINE contains {project_id} placeholder."""
+        from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
+        assert '{project_id}' in _STAGE3_PROJECT_ID_GUIDELINE
+
+    def test_stage2_constant_includes_expand_task(self):
+        """Stage 2 guideline includes expand_task (full MCP access)."""
+        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
+        assert 'expand_task' in _STAGE2_PROJECT_ID_GUIDELINE
+
+    def test_stage2_constant_includes_parse_prd(self):
+        """Stage 2 guideline includes parse_prd (full MCP access)."""
+        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
+        assert 'parse_prd' in _STAGE2_PROJECT_ID_GUIDELINE
+
+    def test_stage1_does_not_include_task_tools(self):
+        """Stage 1 guideline does not include task write tools (Stage 1 is memory-only)."""
+        from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+        assert 'get_tasks' not in _STAGE1_PROJECT_ID_GUIDELINE
+        assert 'set_task_status' not in _STAGE1_PROJECT_ID_GUIDELINE
+        assert 'add_task' not in _STAGE1_PROJECT_ID_GUIDELINE
+
+    def test_stage3_does_not_include_write_tools(self):
+        """Stage 3 guideline does not include write tools (Stage 3 is read-only)."""
+        from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'add_memory' not in _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'delete_memory' not in _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'set_task_status' not in _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'add_task' not in _STAGE3_PROJECT_ID_GUIDELINE
+
