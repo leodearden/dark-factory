@@ -39,7 +39,7 @@
       "id": "step-2",
       "type": "impl",
       "description": "Create dashboard/src/dashboard/data/utils.py with parse_utc(ts: str) -> datetime function. Body: call datetime.fromisoformat(ts), attach UTC if tzinfo is None, return. No type: ignore comment. All test_data_utils tests should now pass.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
