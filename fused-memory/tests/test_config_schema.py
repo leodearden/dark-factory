@@ -233,6 +233,43 @@ class TestYamlSettingsSourceErrorHandling:
         finally:
             locked_file.chmod(0o644)
 
+    def test_expand_env_vars_error_raises_runtime_error(self, tmp_path, monkeypatch):
+        """_expand_env_vars raising any exception must be wrapped in RuntimeError with config path."""
+        config_file = tmp_path / 'valid.yaml'
+        config_file.write_text('key: value')
+        source = self._make_source(config_file)
+
+        def _raise(val):
+            raise ValueError('boom')
+
+        monkeypatch.setattr(source, '_expand_env_vars', _raise)
+        with pytest.raises(RuntimeError, match=str(config_file)):
+            source()
+
+    def test_expand_env_vars_error_includes_original_cause(self, tmp_path, monkeypatch):
+        """The RuntimeError raised for _expand_env_vars failure must chain the original exception."""
+        config_file = tmp_path / 'valid.yaml'
+        config_file.write_text('key: value')
+        source = self._make_source(config_file)
+        original = ValueError('original cause')
+
+        def _raise(val):
+            raise original
+
+        monkeypatch.setattr(source, '_expand_env_vars', _raise)
+        with pytest.raises(RuntimeError) as exc_info:
+            source()
+        assert exc_info.value.__cause__ is original
+
+    def test_expand_env_vars_error_does_not_mask_yaml_error(self, tmp_path):
+        """Corrupt YAML must still raise RuntimeError with 'Failed to load configuration' message."""
+        bad_file = tmp_path / 'bad.yaml'
+        bad_file.write_bytes(b': :\n  - \x00bad')
+        source = self._make_source(bad_file)
+        with pytest.raises(RuntimeError, match='Failed to load configuration') as exc_info:
+            source()
+        assert 'Failed to expand' not in str(exc_info.value)
+
 
 class TestYamlSettingsSourceEncoding:
     """Tests for YamlSettingsSource explicit UTF-8 encoding."""
