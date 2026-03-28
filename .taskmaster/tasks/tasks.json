@@ -4616,6 +4616,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 285,
+        "title": "Harden test_refresh_indicator.py: tag extraction, status assertions, regex broadening",
+        "description": "dashboard/tests/test_refresh_indicator.py has fragile patterns:\n\n1. html.index(marker) raises opaque ValueError — replace with assert + find for descriptive failures\n2. html.rfind('<', 0, idx) returns -1 on missing '<' causing silent wrap-around — add assert tag_start != -1\n3. Duplicated 5-line tag-extraction block in two test methods — extract _get_tag_for_section helper\n4. client.get() calls don't assert status 200 — a broken route silently passes absence assertions\n5. Regex r'data-section=\"([a-z][a-z-]*)\"' silently skips sections with digits — broaden to [a-z0-9][a-z0-9-]*",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -4628,7 +4639,7 @@
       ],
       "created": "2026-03-28T07:37:31.561Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T07:38:16.811Z"
+      "updated": "2026-03-28T07:38:23.545Z"
     }
   }
 }
