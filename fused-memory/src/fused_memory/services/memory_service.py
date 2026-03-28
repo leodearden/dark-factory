@@ -835,9 +835,12 @@ class MemoryService:
 
         # Log all failures then re-raise the first exception found.
         # Both coroutines have already settled at this point (no orphans).
-        # Use isinstance(r, Exception) — not BaseException — so CancelledError /
-        # KeyboardInterrupt / SystemExit propagate normally up the stack.
-        first_exc = next((r for r in results if isinstance(r, Exception)), None)
+        # Two-tier check:
+        #   Detection guard: isinstance(r, BaseException) — catches CancelledError /
+        #     KeyboardInterrupt / SystemExit that gather() captured as values.
+        #   Logging guard:   isinstance(r, Exception) — log only application errors,
+        #     not cancellation signals (CancelledError should not appear in logs).
+        first_exc = next((r for r in results if isinstance(r, BaseException)), None)
         if first_exc is not None:
             for r in results:
                 if isinstance(r, Exception):
