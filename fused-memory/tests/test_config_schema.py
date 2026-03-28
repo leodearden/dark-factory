@@ -1,6 +1,7 @@
 """Tests for config schema Literal type validation."""
 
 import os
+import re
 import sys
 import unittest.mock
 
@@ -242,7 +243,7 @@ class TestYamlSettingsSourceErrorHandling:
         bad_file = tmp_path / 'bad.yaml'
         bad_file.write_bytes(b': :\n  - \x00bad')
         source = _make_source(bad_file)
-        with pytest.raises(RuntimeError, match=str(bad_file)) as exc_info:
+        with pytest.raises(RuntimeError, match=re.escape(str(bad_file))) as exc_info:
             source()
         assert exc_info.value.__cause__ is not None
 
@@ -254,7 +255,7 @@ class TestYamlSettingsSourceErrorHandling:
         locked_file.chmod(0o000)
         try:
             source = _make_source(locked_file)
-            with pytest.raises(RuntimeError, match=str(locked_file)) as exc_info:
+            with pytest.raises(RuntimeError, match=re.escape(str(locked_file))) as exc_info:
                 source()
             assert exc_info.value.__cause__ is not None
         finally:
@@ -270,7 +271,7 @@ class TestYamlSettingsSourceErrorHandling:
             raise ValueError('boom')
 
         monkeypatch.setattr(source, '_expand_env_vars', _raise)
-        with pytest.raises(RuntimeError, match=str(config_file)):
+        with pytest.raises(RuntimeError, match=re.escape(str(config_file))):
             source()
 
     def test_expand_env_vars_error_includes_original_cause(self, tmp_path, monkeypatch):

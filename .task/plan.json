@@ -74,14 +74,14 @@
       "type": "impl",
       "description": "Extract _DummySettings to module level: define a single 'class _DummySettings(BaseSettings): pass' after the import block. Extract a module-level helper '_make_source(path)' that creates YamlSettingsSource(_DummySettings, config_path=path). Replace the 4 inline _DummySettings definitions and the 2 identical _make_source methods (in TestYamlSettingsSourceErrorHandling and TestYamlSettingsSourceEncoding) with calls to the module-level helper. Update the 2 setup_method methods (TestYamlSettingsSourceEnvVarExpansion and TestYamlSettingsSourceABCContract) to use the module-level _DummySettings directly. Run full test suite to verify no regressions.",
       "status": "done",
-      "commit": "placeholder-step-8"
+      "commit": "d7a779de"
     },
     {
       "id": "step-9",
       "type": "impl",
       "description": "Use re.escape() in pytest.raises match arguments: add 'import re' to the import block (already imported by schema.py but not by tests). Replace 'match=str(bad_file)' with 'match=re.escape(str(bad_file))' at line 246. Replace 'match=str(locked_file)' with 'match=re.escape(str(locked_file))' at line 257. Replace 'match=str(config_file)' with 'match=re.escape(str(config_file))' at line 272. Run full test suite to verify no regressions.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "placeholder-step-9"
     },
     {
       "id": "step-10",
