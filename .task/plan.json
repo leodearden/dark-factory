@@ -46,8 +46,8 @@
       "id": "step-5",
       "type": "test",
       "description": "Run full dashboard test suite (pytest dashboard/tests/) to verify all existing tests still pass — especially TestPerformanceRoute.test_chart_js_script (asserts 'new Chart' in html), TestHistogramUniformColor, TestCompletionPathsDatalabels, TestMemoryGraphsPartial.test_contains_inline_data, TestDoughnutDatalabels, and integration tests in test_app.py that assert 'new Chart' in html.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "cf63c61b"
     }
   ],
   "design_decisions": [
