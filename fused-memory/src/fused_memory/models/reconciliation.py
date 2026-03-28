@@ -132,6 +132,16 @@ class VerificationResult(BaseModel):
     git_context: dict | None = None
 
 
+def _normalize_project_id(v: object) -> object:
+    """Strip whitespace from project_id and raise if empty."""
+    if isinstance(v, str):
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError('project_id is required and must be non-empty')
+        return stripped
+    return v
+
+
 class Watermark(BaseModel):
     """Tracks what's been processed per project."""
 
@@ -144,10 +154,8 @@ class Watermark(BaseModel):
 
     @field_validator('project_id', mode='before')
     @classmethod
-    def strip_project_id(cls, v):
-        if isinstance(v, str):
-            return v.strip()
-        return v
+    def normalize_project_id(cls, v):
+        return _normalize_project_id(v)
 
 
 class VerdictSeverity(StrEnum):
