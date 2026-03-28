@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 import pytest
@@ -702,6 +703,148 @@ class TestParseUtc:
 
 class TestPartitionBurstState:
     """Functional tests for partition_burst_state."""
+
+    def test_bursting_agent_is_active(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': 'bursting', 'last_write_at': '2020-01-01T00:00:00+00:00'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 1
+        assert len(idle) == 0
+
+    def test_idle_old_agent_is_idle(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': '2020-01-01T00:00:00+00:00'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
+    def test_idle_recent_agent_is_active(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        recent_ts = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': recent_ts}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 1
+        assert len(idle) == 0
+
+    def test_mixed_partition(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        old_ts = '2020-01-01T00:00:00+00:00'
+        recent_ts = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+        agents = [
+            {'agent_id': 'bursting', 'state': 'bursting', 'last_write_at': old_ts},
+            {'agent_id': 'idle-old', 'state': 'idle', 'last_write_at': old_ts},
+            {'agent_id': 'idle-recent', 'state': 'idle', 'last_write_at': recent_ts},
+        ]
+        active, idle = partition_burst_state(agents)
+        assert [a['agent_id'] for a in active] == ['bursting', 'idle-recent']
+        assert [a['agent_id'] for a in idle] == ['idle-old']
+
+    def test_empty_list(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        active, idle = partition_burst_state([])
+        assert active == []
+        assert idle == []
+
+    def test_invalid_timestamp_treated_as_idle(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': 'not-a-date'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
+    def test_custom_threshold(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        ts = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': ts}]
+        # 5 min old, threshold 3 min → idle
+        active, idle = partition_burst_state(agents, active_threshold_seconds=180)
+        assert len(active) == 0
+        assert len(idle) == 1
+        # 5 min old, threshold 10 min → active
+        active, idle = partition_burst_state(agents, active_threshold_seconds=600)
+        assert len(active) == 1
+        assert len(idle) == 0
+
+    def test_missing_state_key_defaults_to_idle(self):
+        # Agent with no 'state' key defaults to 'idle' (via .get('state', 'idle')).
+        # Combined with a stale 2020 timestamp, the agent is classified as idle.
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'last_write_at': '2020-01-01T00:00:00+00:00'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
+    def test_missing_state_key_recent_write_is_active(self):
+        # Agent with no 'state' key defaults to 'idle' (via .get('state', 'idle')),
+        # but a recent last_write_at timestamp promotes it to active.
+        from dashboard.data.reconciliation import partition_burst_state
+
+        recent_ts = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+        agents = [{'agent_id': 'a1', 'last_write_at': recent_ts}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 1
+        assert len(idle) == 0
+
+    def test_non_idle_state_missing_last_write_at_is_active(self):
+        # Agent with state='bursting' and no 'last_write_at' key is classified active.
+        # The early return (state != 'idle') fires before the timestamp lookup.
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': 'bursting'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 1
+        assert len(idle) == 0
+
+    def test_bare_agent_dict_no_state_no_last_write_at(self):
+        # Agent dict with NEITHER 'state' NOR 'last_write_at' key should land in
+        # idle list without raising KeyError.
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'x'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
+    def test_explicit_idle_missing_last_write_at(self):
+        # Agent with explicit state='idle' and NO 'last_write_at' key should land
+        # in idle list without raising KeyError.
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'x', 'state': 'idle'}]
+        active, idle = partition_burst_state(agents)
+        assert len(active) == 0
+        assert len(idle) == 1
+
+    def test_malformed_timestamp_logs_debug(self, caplog):
+        """A malformed last_write_at timestamp should emit a DEBUG log with agent_id."""
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'bad-agent', 'state': 'idle', 'last_write_at': 'not-a-date'}]
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
+            active, idle = partition_burst_state(agents)
+
+        # Agent still lands in idle (existing behaviour unchanged)
+        assert len(active) == 0
+        assert len(idle) == 1
+
+        # A DEBUG record must be emitted containing 'bad last_write_at' and the agent_id
+        debug_records = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG
+            and r.name == 'dashboard.data.reconciliation'
+        ]
+        assert any(
+            'bad last_write_at' in r.getMessage() and 'bad-agent' in r.getMessage()
+            for r in debug_records
+        ), f"Expected debug log with 'bad last_write_at' and 'bad-agent', got: {[r.getMessage() for r in debug_records]}"
 
     def test_none_last_write_at_handled_consistently(self, caplog):
         """Agent with None last_write_at lands in idle and emits a debug log."""
