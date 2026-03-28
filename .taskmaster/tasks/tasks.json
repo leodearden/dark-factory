@@ -4164,10 +4164,11 @@
         "description": "TestHtmxTimeout covers memory (8000ms), recon (12000ms), and orchestrators (8000ms) but lacks tests for performance (12000ms) and memory-graphs (10000ms). TestAriaLivePollingsections has a stale docstring (\"three\" → \"five\"), weak count assertion (>= 3), and no per-section test for performance's aria-live.\n\nAdditionally, memory-graphs is the only polling section in index.html that omits aria-live=\"polite\" — add it for consistency.\n\nSteps:\n1. Add aria-live=\"polite\" to the memory-graphs section in index.html\n2. Add test_performance_section_has_timeout_12000 and test_memory_graphs_section_has_timeout_10000 to TestHtmxTimeout (use same proximity-slice pattern)\n3. Update TestAriaLivePollingsections: fix docstring to \"five\", update count assertion to == 5, add test_performance_section_has_aria_live_polite, add test_memory_graphs_section_has_aria_live_polite\n4. Rename test_all_three_sections_have_aria_live to test_polling_sections_have_aria_live\n\nmemory_hints: search for \"dashboard polling section attribute tests\", get_entity \"test_app.py\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T04:38:30.539Z"
       },
       {
         "id": "251",
@@ -4194,7 +4195,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:38:30.302Z",
+      "lastModified": "2026-03-28T04:38:30.539Z",
       "taskCount": 231,
       "completedCount": 178,
       "tags": [
