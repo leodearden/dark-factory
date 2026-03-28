@@ -3896,11 +3896,11 @@
         "description": "Two small test coverage improvements from review of task 193:\n\n1. **Add `labels` field to `MockNode`** in `conftest.py`: `MockNode` currently has no `labels` field, so the baseline `test_success_returns_nodes_and_edges` cannot assert on labels at all. Add `labels: list[str] = field(default_factory=list)` and assert `result['nodes'][0]['labels'] == []` in the baseline test.\n\n2. **Add positive-case labels test**: No test covers `labels = ['SomeLabel']` (non-empty list). The `getattr(n, 'labels', None) or []` fix correctly passes non-empty lists through (truthy `or []` short-circuits), but this is never asserted. Add a test that sets `bare_node.labels = ['Service', 'Auth']` and asserts `result['nodes'][0]['labels'] == ['Service', 'Auth']`.\n\nAlso align `getattr(edge, 'episodes', []) or []` at line 760 to `getattr(edge, 'episodes', None) or []` per the `None or []` convention.\n\n## memory_hints\n- search: \"getattr labels None or convention memory_service\"\n- search: \"MockNode test fixture labels\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T04:16:12.498Z",
+        "updatedAt": "2026-03-28T15:25:36.127Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/services",
@@ -5032,7 +5032,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T15:25:36.095Z",
+      "lastModified": "2026-03-28T15:25:36.127Z",
       "taskCount": 268,
       "completedCount": 207,
       "tags": [
