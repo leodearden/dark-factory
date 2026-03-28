@@ -6,7 +6,7 @@ import typing
 
 import pytest
 
-from dashboard.data.chart_utils import ChartData, group_top_n
+from dashboard.data.chart_utils import ChartData, group_top_n, separate_label
 
 
 class TestChartDataType:
@@ -177,3 +177,41 @@ class TestGroupTopN:
         result = group_top_n(data)
         assert result['labels'][-1] == 'Other'
         assert len(result['labels']) == 6
+
+
+class TestSeparateLabelBasic:
+    """Tests for separate_label basic extraction behavior."""
+
+    def test_returns_remaining_data_and_extracted_value(self):
+        """separate_label removes target label and returns (remaining, value)."""
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [30, 20, 10]}
+        remaining, value = separate_label(data, 'b')
+        assert value == 20
+        assert 'b' not in remaining['labels']
+        assert remaining['labels'] == ['a', 'c']
+        assert remaining['values'] == [30, 10]
+
+    def test_does_not_mutate_original_data(self):
+        """separate_label does not modify the original data dict."""
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [30, 20, 10]}
+        original_labels = list(data['labels'])
+        original_values = list(data['values'])
+        separate_label(data, 'b')
+        assert data['labels'] == original_labels
+        assert data['values'] == original_values
+
+    def test_extracts_first_label(self):
+        """separate_label works when target is the first label."""
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [30, 20, 10]}
+        remaining, value = separate_label(data, 'a')
+        assert value == 30
+        assert remaining['labels'] == ['b', 'c']
+        assert remaining['values'] == [20, 10]
+
+    def test_extracts_last_label(self):
+        """separate_label works when target is the last label."""
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [30, 20, 10]}
+        remaining, value = separate_label(data, 'c')
+        assert value == 10
+        assert remaining['labels'] == ['a', 'b']
+        assert remaining['values'] == [30, 20]
