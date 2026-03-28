@@ -300,3 +300,96 @@ class TestIndexHtmlUsesMacro:
     def test_recon_call_passes_correct_trigger(self):
         content = self._index_content()
         assert 'every 15s' in content
+
+
+class TestEquivalenceJsCouplingAttributes:
+    """Regression guard for JS coupling: data-section and data-updated-for
+    must match for each of the 5 sections (base.html lines 46-90).
+
+    These tests render each section via the macro and verify the critical
+    attributes that the JavaScript depends on are correctly emitted.
+    """
+
+    # The 5 sections with their expected parameters from index.html
+    _sections = [
+        {
+            'name': 'orchestrators',
+            'hx_get': '/partials/orchestrators',
+            'hx_trigger': 'load, every 10s',
+            'timeout': 8000,
+        },
+        {
+            'name': 'performance',
+            'hx_get': '/partials/performance',
+            'hx_trigger': 'load, every 30s',
+            'timeout': 12000,
+        },
+        {
+            'name': 'memory',
+            'hx_get': '/partials/memory',
+            'hx_trigger': 'load, every 10s',
+            'timeout': 8000,
+        },
+        {
+            'name': 'memory-graphs',
+            'hx_get': '/partials/memory-graphs',
+            'hx_trigger': 'load, every 60s',
+            'timeout': 10000,
+        },
+        {
+            'name': 'recon',
+            'hx_get': '/partials/recon',
+            'hx_trigger': 'load, every 15s',
+            'timeout': 12000,
+        },
+    ]
+
+    @pytest.mark.parametrize('section', _sections, ids=[s['name'] for s in _sections])
+    def test_data_section_matches_data_updated_for(self, jinja_env, section):
+        """data-section and data-updated-for must share the same name value."""
+        html = render_polling_section(
+            jinja_env,
+            name=section['name'],
+            hx_get=section['hx_get'],
+            hx_trigger=section['hx_trigger'],
+            hx_request_timeout=section['timeout'],
+        )
+        assert f'data-section="{section["name"]}"' in html
+        assert f'data-updated-for="{section["name"]}"' in html
+
+    @pytest.mark.parametrize('section', _sections, ids=[s['name'] for s in _sections])
+    def test_hx_get_path_is_correct(self, jinja_env, section):
+        """hx-get must point to the correct partial path."""
+        html = render_polling_section(
+            jinja_env,
+            name=section['name'],
+            hx_get=section['hx_get'],
+            hx_trigger=section['hx_trigger'],
+            hx_request_timeout=section['timeout'],
+        )
+        assert f'hx-get="{section["hx_get"]}"' in html
+
+    @pytest.mark.parametrize('section', _sections, ids=[s['name'] for s in _sections])
+    def test_timeout_value_is_in_hx_request(self, jinja_env, section):
+        """The timeout value must appear in the hx-request attribute."""
+        html = render_polling_section(
+            jinja_env,
+            name=section['name'],
+            hx_get=section['hx_get'],
+            hx_trigger=section['hx_trigger'],
+            hx_request_timeout=section['timeout'],
+        )
+        assert str(section['timeout']) in html
+        assert 'timeout' in html
+
+    @pytest.mark.parametrize('section', _sections, ids=[s['name'] for s in _sections])
+    def test_hx_swap_is_morph_inner_html(self, jinja_env, section):
+        """hx-swap must always be morph:innerHTML for JS-safe DOM updates."""
+        html = render_polling_section(
+            jinja_env,
+            name=section['name'],
+            hx_get=section['hx_get'],
+            hx_trigger=section['hx_trigger'],
+            hx_request_timeout=section['timeout'],
+        )
+        assert 'hx-swap="morph:innerHTML"' in html
