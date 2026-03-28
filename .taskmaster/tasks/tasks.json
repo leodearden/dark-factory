@@ -4520,11 +4520,11 @@
         "description": "Three small cleanups in fused-memory/tests/test_stages.py flagged by review of task 246:\n\n1. **Delete TestBaseStageValidationContract** (lines 707-723): All five tests are tautological — `BaseStageValidationTest is not None` can never fail, and `hasattr` checks are redundant because TestProjectIdValidation and TestRunIdValidation already exercise all shared members (missing attributes would cause AttributeError). Remove the entire class.\n\n2. **Fix unused `vector_name` parameter** in `test_run_raises_on_injection_run_id` (lines 646-662): The second parametrize tuple element `vector_name` is never used in the test body. Switch to `@pytest.mark.parametrize('bad_run_id', ['run\\nid', 'run`id', 'run;id'], ids=['newline', 'backtick', 'semicolon'])` and remove `vector_name` from the function signature.\n\n3. **Investigate assertion format inconsistency**: Line 547 asserts project_id as backtick-quoted (`'`project_id`: \"dark_factory\"'`) while line 704 asserts run_id as bare (`f'run_id: {run_id_value}'`). Check the actual payload template to confirm both assertions match the real serialization format. Align them if one is wrong.\n\nmemory_hint: search \"test_stages.py BaseStageValidationTest validation refactoring\" for context on how task 246 introduced the base class pattern.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T05:49:23.693Z",
+        "updatedAt": "2026-03-28T15:25:36.521Z",
         "metadata": {
           "files": [
             "fused-memory/tests/test_stages.py"
@@ -5032,7 +5032,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T15:25:36.494Z",
+      "lastModified": "2026-03-28T15:25:36.521Z",
       "taskCount": 268,
       "completedCount": 207,
       "tags": [
