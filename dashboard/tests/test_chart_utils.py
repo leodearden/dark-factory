@@ -272,3 +272,26 @@ class TestSeparateLabelBoundsCheck:
             separate_label(data, 'c')
         with pytest.raises(ValueError, match="index 2"):
             separate_label(data, 'c')
+
+
+class TestSeparateLabelBoundsWithinRange:
+    """Tests for separate_label succeeding when label index IS within values bounds."""
+
+    def test_succeeds_when_label_within_values_bounds_mismatched_length(self):
+        """separate_label succeeds when label idx < len(values) despite overall mismatch."""
+        # labels=['a','b','c'], values=[30, 20], label='a' at idx=0 (within bounds)
+        data = {'labels': ['a', 'b', 'c'], 'values': [30, 20]}
+        remaining, value = separate_label(data, 'a')
+        assert value == 30
+        # remaining has labels=['b','c'] and values=[20]
+        assert remaining['labels'] == ['b', 'c']
+        assert remaining['values'] == [20]
+
+    def test_boundary_case_last_within_bounds(self):
+        """separate_label succeeds when label is at the last valid index of values."""
+        # labels=['a','b','c'], values=[30, 20], label='b' at idx=1 (last valid)
+        data = {'labels': ['a', 'b', 'c'], 'values': [30, 20]}
+        remaining, value = separate_label(data, 'b')
+        assert value == 20
+        assert remaining['labels'] == ['a', 'c']
+        assert remaining['values'] == [30]
