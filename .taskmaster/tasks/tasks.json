@@ -4000,10 +4000,11 @@
         "description": "Make _parse_utc's None-handling explicit, avoid exception-as-flow-control in partition_burst_state, and add logging for corrupted timestamps.",
         "details": "## Problem\n\n`_parse_utc` relies on `datetime.fromisoformat(None)` implicitly raising `TypeError` (with a `# type: ignore` suppression). Callers must know that None raises TypeError rather than returning a sentinel. Additionally, `partition_burst_state` uses this exception path for normal flow control when `last_write_at` is missing — and silently swallows both expected None cases and unexpected corruption with no logging.\n\n## Fix\n\n1. **Explicit None guard in `_parse_utc`** (reconciliation.py:24-34): Add `if ts is None: raise TypeError('timestamp is None')` at the top. Remove the `# type: ignore[arg-type]` suppression. Makes the contract visible.\n\n2. **Explicit None guard in `partition_burst_state`** (reconciliation.py:58-64): Before calling `_parse_utc`, check `last_write_at = agent.get('last_write_at'); if last_write_at is None: idle.append(agent); continue`. This avoids exception-as-flow-control for the common missing-key case while keeping the except block for genuinely malformed timestamps.\n\n3. **Add logging in except block** (reconciliation.py:63-64): Add `logger.debug('agent %s: bad last_write_at %r (%s)', agent.get('agent_id'), agent.get('last_write_at'), exc)` so corrupted data is observable.\n\n## Memory hints\n- search: \"partition_burst_state _parse_utc None handling task 213\"\n- search: \"_parse_utc implicit contract TypeError\"",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T04:55:28.394Z"
       },
       {
         "id": "237",
@@ -4254,7 +4255,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T04:55:27.520Z",
+      "lastModified": "2026-03-28T04:55:28.395Z",
       "taskCount": 236,
       "completedCount": 183,
       "tags": [
