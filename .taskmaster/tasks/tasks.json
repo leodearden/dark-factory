@@ -4745,7 +4745,21 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/Makefile",
+            "dashboard/.gitignore",
+            "dashboard/src/dashboard/static/input.css",
+            "dashboard/src/dashboard/static/favicon.svg",
+            "dashboard/src/dashboard/templates/base.html"
+          ],
+          "modules": [
+            "dashboard",
+            "dashboard/src/dashboard/static",
+            "dashboard/src/dashboard/templates"
+          ]
+        }
       },
       {
         "id": 277,
