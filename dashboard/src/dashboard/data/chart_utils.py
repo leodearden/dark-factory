@@ -56,3 +56,46 @@ def group_top_n(data: ChartData, n: int = 5) -> ChartData:
         'labels': top_labels + ['Other'],
         'values': top_values + [other_sum],
     }
+
+
+def separate_label(
+    data: ChartData, label: str
+) -> tuple[ChartData, int | float]:
+    """Extract a single label/value pair from ChartData by label name.
+
+    Finds the first occurrence of label in data['labels'], removes it from
+    both lists, and returns the remaining data along with the extracted value.
+    The original data dict is not mutated.
+
+    Args:
+        data: ChartData with 'labels' and 'values' lists.
+        label: The label string to find and extract.
+
+    Returns:
+        A tuple of (remaining_data, extracted_value). If label is not found,
+        returns a shallow copy of data and 0. If label is found but its index
+        exceeds the length of values, raises ValueError.
+
+    Raises:
+        ValueError: If the label exists but has no corresponding value
+            (i.e., the data is structurally corrupt with mismatched lengths).
+    """
+    labels: list[str] = list(data.get('labels', []))
+    values: list[int | float] = list(data.get('values', []))
+
+    if label not in labels:
+        return {'labels': labels, 'values': values}, 0
+
+    idx = labels.index(label)
+
+    if idx >= len(values):
+        raise ValueError(
+            f"label '{label}' at index {idx} has no corresponding value "
+            f"(values length: {len(values)})"
+        )
+
+    extracted_value = values[idx]
+    remaining_labels = labels[:idx] + labels[idx + 1:]
+    remaining_values = values[:idx] + values[idx + 1:]
+
+    return {'labels': remaining_labels, 'values': remaining_values}, extracted_value
