@@ -765,6 +765,32 @@ class TestProactiveSampling:
             "STAGE2_SYSTEM_PROMPT must contain a guideline about reviewing the Proactive Task Sample"
         )
 
+    # --- Step 10: 'Your Task' section includes proactive step ---
+
+    @pytest.mark.asyncio
+    async def test_payload_your_task_includes_proactive_step(self, mock_deps, watermark):
+        """The 'Your Task' section in the payload includes a proactive spot-check instruction."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'in-progress'),
+                self._make_task(2, 'blocked'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # The 'Your Task' section should instruct the agent to review the proactive sample
+        assert 'Proactive Task Sample' in payload
+        # Specifically in the Your Task instruction steps (not just the section header)
+        your_task_idx = payload.index('## Your Task')
+        proactive_step_count = payload[your_task_idx:].count('Proactive Task Sample')
+        assert proactive_step_count >= 1, (
+            "The 'Your Task' instruction section should reference the Proactive Task Sample"
+        )
+
 
 class TestRunIdValidation(BaseStageValidationTest):
     """BaseStage.run() validates run_id before prompt interpolation."""
