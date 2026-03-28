@@ -1,6 +1,8 @@
 """Tests for reconciliation stage configuration (CLI-native MCP execution)."""
 
 import json
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -14,6 +16,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
     STAGE_REPORT_SCHEMA,
+    StageResult,
 )
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
@@ -64,7 +67,6 @@ class TestStageSubclasses:
 
     @pytest.fixture
     def mock_deps(self, config):
-        from unittest.mock import AsyncMock
         return {
             'memory_service': AsyncMock(),
             'taskmaster': AsyncMock(),
@@ -250,9 +252,6 @@ class TestPerStageReportSchema:
 
     @pytest.fixture
     def mock_deps(self):
-        from unittest.mock import AsyncMock
-
-        from fused_memory.config.schema import ReconciliationConfig
         config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
         return {
             'memory_service': AsyncMock(),
@@ -282,8 +281,6 @@ class TestMcpConfig:
 
     @pytest.fixture
     def stage(self):
-        from unittest.mock import AsyncMock
-
         from fused_memory.models.reconciliation import StageId
         from fused_memory.reconciliation.stages.base import BaseStage
         config = ReconciliationConfig(explore_codebase_root='/tmp/test')
@@ -328,9 +325,6 @@ class TestTaskKnowledgeSyncPayload:
 
     @pytest.fixture
     def mock_deps(self):
-        from unittest.mock import AsyncMock
-
-        from fused_memory.config.schema import ReconciliationConfig
         config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
         return {
             'memory_service': AsyncMock(),
@@ -415,7 +409,6 @@ class TestProjectIdValidation:
 
     @staticmethod
     async def _fake_run_stage_via_cli(**kwargs):
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
         return StageResult(
             success=True,
             report={'summary': 'ok'},
@@ -423,9 +416,6 @@ class TestProjectIdValidation:
 
     @pytest.fixture
     def mock_deps(self):
-        from unittest.mock import AsyncMock
-
-        from fused_memory.config.schema import ReconciliationConfig
         config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
         return {
             'memory_service': AsyncMock(),
@@ -442,9 +432,6 @@ class TestProjectIdValidation:
             cli_side_effect: Optional async callable for run_stage_via_cli side_effect.
                 Defaults to self._fake_run_stage_via_cli.
         """
-        from contextlib import contextmanager
-        from unittest.mock import patch
-
         effective_cli_side_effect = cli_side_effect if cli_side_effect is not None else self._fake_run_stage_via_cli
 
         @contextmanager
@@ -560,7 +547,6 @@ class TestProjectIdValidation:
     @pytest.mark.asyncio
     async def test_recon_context_includes_project_id(self, mock_deps):
         from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
@@ -612,13 +598,39 @@ class TestProjectIdValidation:
             if rec.levelno == logging.DEBUG
         )
 
+    def test_patch_stage_patches_assemble_payload_and_run_stage(self, mock_deps):
+        """_patch_stage replaces both assemble_payload and run_stage_via_cli with mocks."""
+        import fused_memory.reconciliation.stages.base as base_module
+        from fused_memory.models.reconciliation import StageId
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        original_run_stage_via_cli = base_module.run_stage_via_cli
+
+        with self._patch_stage(stage):
+            # (a) assemble_payload is replaced with a mock (has side_effect attribute)
+            assert hasattr(stage.assemble_payload, 'side_effect')
+            # (b) run_stage_via_cli in the base module is no longer the original function
+            assert base_module.run_stage_via_cli is not original_run_stage_via_cli
+
+    def test_patch_stage_accepts_cli_side_effect(self, mock_deps):
+        """_patch_stage wires a custom cli_side_effect onto the run_stage_via_cli mock."""
+        import fused_memory.reconciliation.stages.base as base_module
+        from fused_memory.models.reconciliation import StageId
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+
+        async def custom_cli(**kwargs):
+            return StageResult(success=False, report={'summary': 'custom'})
+
+        with self._patch_stage(stage, cli_side_effect=custom_cli):
+            # The patched run_stage_via_cli should have custom_cli as its side_effect
+            assert base_module.run_stage_via_cli.side_effect is custom_cli  # type: ignore[reportFunctionMemberAccess]
+
 
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
     def test_default_limits(self):
-        from unittest.mock import AsyncMock
-
         from fused_memory.models.reconciliation import StageId
         config = ReconciliationConfig()
         stage = MemoryConsolidator(
@@ -629,8 +641,6 @@ class TestTierConfig:
         assert stage.memory_limit == 1000
 
     def test_limits_are_writable(self):
-        from unittest.mock import AsyncMock
-
         from fused_memory.models.reconciliation import StageId
         config = ReconciliationConfig()
         stage = MemoryConsolidator(
