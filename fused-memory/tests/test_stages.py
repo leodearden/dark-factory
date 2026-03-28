@@ -610,6 +610,20 @@ class TestProjectIdValidation:
             if rec.levelno == logging.DEBUG
         )
 
+    def test_patch_stage_patches_assemble_payload_and_run_stage(self, mock_deps):
+        """_patch_stage replaces both assemble_payload and run_stage_via_cli with mocks."""
+        import fused_memory.reconciliation.stages.base as base_module
+        from fused_memory.models.reconciliation import StageId
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        original_run_stage_via_cli = base_module.run_stage_via_cli
+
+        with self._patch_stage(stage):
+            # (a) assemble_payload is replaced with a mock (has side_effect attribute)
+            assert hasattr(stage.assemble_payload, 'side_effect')
+            # (b) run_stage_via_cli in the base module is no longer the original function
+            assert base_module.run_stage_via_cli is not original_run_stage_via_cli
+
 
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
