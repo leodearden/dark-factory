@@ -8,6 +8,8 @@ import pytest
 from shared.cli_invoke import AgentResult
 
 import fused_memory.reconciliation.stages.base as base_module
+
+_MOCK_TYPES = (AsyncMock, MagicMock)
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId, Watermark
 from fused_memory.reconciliation.cli_stage_runner import (
@@ -584,7 +586,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
 
         with self._patch_stage(stage):
             # (a) assemble_payload is replaced with a mock instance
-            assert isinstance(stage.assemble_payload, (AsyncMock, MagicMock))
+            assert isinstance(stage.assemble_payload, _MOCK_TYPES)
             # (b) run_stage_via_cli in the base module is no longer the original function
             assert base_module.run_stage_via_cli is not original_run_stage_via_cli
 
@@ -592,7 +594,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
         # (a) run_stage_via_cli is the original function again
         assert base_module.run_stage_via_cli is original_run_stage_via_cli
         # (b) assemble_payload is no longer a mock
-        assert not isinstance(stage.assemble_payload, (AsyncMock, MagicMock))
+        assert not isinstance(stage.assemble_payload, _MOCK_TYPES)
         # (c) assemble_payload is exactly the original method reference
         assert stage.assemble_payload == original_assemble_payload
 
@@ -608,7 +610,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # The patched run_stage_via_cli should have custom_cli as its side_effect
             assert base_module.run_stage_via_cli.side_effect is custom_cli  # type: ignore[reportFunctionMemberAccess]
             # Cross-assert: assemble_payload is also patched regardless of which parameter path is taken
-            assert isinstance(stage.assemble_payload, (AsyncMock, MagicMock))
+            assert isinstance(stage.assemble_payload, _MOCK_TYPES)
 
 
 class TestRunIdValidation(BaseStageValidationTest):
