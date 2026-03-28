@@ -4835,7 +4835,7 @@
         "description": "dashboard/src/dashboard/data/chart_utils.py has several robustness gaps:\n\n1. group_top_n() doesn't validate len(labels) == len(values) — silent data corruption if mismatched\n2. The {labels, values} dict shape is an implicit interface used across write_journal.py, chart_utils.py, app.py, and templates — define a ChartData TypedDict\n3. separate_label() accesses values[idx] without bounds check — IndexError if values shorter than labels\n4. group_top_n() assumes sorted input but doesn't enforce — sort internally or add assertion\n\nAdd tests for mismatched-length inputs and non-empty labels pass-through.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -4849,7 +4849,7 @@
             "dashboard/tests"
           ]
         },
-        "updatedAt": "2026-03-28T16:14:50.763Z"
+        "updatedAt": "2026-03-28T16:43:59.032Z"
       },
       {
         "id": "281",
@@ -5038,9 +5038,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T16:43:30.456Z",
+      "lastModified": "2026-03-28T16:43:59.032Z",
       "taskCount": 268,
-      "completedCount": 218,
+      "completedCount": 219,
       "tags": [
         "master"
       ]
