@@ -386,3 +386,28 @@ class TestRefreshEntitySummaryMcpTool:
             parsed = result
         assert 'error' in parsed
         assert 'FalkorDB connection failed' in parsed['error']
+
+
+# ---------------------------------------------------------------------------
+# step-11: DISALLOW_MEMORY_WRITES list in cli_stage_runner.py
+# ---------------------------------------------------------------------------
+
+class TestDisallowListForRefreshEntitySummary:
+    """refresh_entity_summary must be in DISALLOW_MEMORY_WRITES (not in STAGE1_DISALLOWED)."""
+
+    def test_refresh_entity_summary_in_disallow_memory_writes(self):
+        """'mcp__fused-memory__refresh_entity_summary' must be in DISALLOW_MEMORY_WRITES
+        so Stage 3 (read-only) cannot call it."""
+        from fused_memory.reconciliation.cli_stage_runner import DISALLOW_MEMORY_WRITES
+        assert 'mcp__fused-memory__refresh_entity_summary' in DISALLOW_MEMORY_WRITES
+
+    def test_refresh_entity_summary_not_in_stage1_disallowed(self):
+        """Stage 1 must be able to call refresh_entity_summary (not in STAGE1_DISALLOWED)."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
+        assert 'mcp__fused-memory__refresh_entity_summary' not in STAGE1_DISALLOWED
+
+    def test_refresh_entity_summary_in_stage3_disallowed(self):
+        """Stage 3 must NOT be able to call refresh_entity_summary (in STAGE3_DISALLOWED
+        via DISALLOW_MEMORY_WRITES)."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
+        assert 'mcp__fused-memory__refresh_entity_summary' in STAGE3_DISALLOWED
