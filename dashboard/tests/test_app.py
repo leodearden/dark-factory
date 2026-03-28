@@ -653,6 +653,28 @@ class TestHtmxTimeout:
         assert '"timeout": 10000' in section_html or '"timeout":10000' in section_html
 
 
+class TestTailwindBuild:
+    """Tests that Tailwind CSS is served locally (no CDN script tag)."""
+
+    def test_no_cdn_tailwind(self, client):
+        html = client.get('/').text
+        assert 'cdn.tailwindcss.com' not in html
+
+    def test_local_tailwind_css_linked(self, client):
+        html = client.get('/').text
+        assert 'href="/static/tailwind.css"' in html
+
+    def test_tailwind_css_served(self, client):
+        resp = client.get('/static/tailwind.css')
+        assert resp.status_code == 200
+        assert 'text/css' in resp.headers['content-type']
+
+    def test_tailwind_css_has_utilities(self, client):
+        css = client.get('/static/tailwind.css').text
+        assert 'bg-gray-900' in css
+        assert 'text-gray-100' in css
+
+
 class TestMainModule:
     """Tests for python -m dashboard entry point."""
 
