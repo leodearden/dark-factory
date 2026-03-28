@@ -765,6 +765,43 @@ class TestProactiveSampling:
             "STAGE2_SYSTEM_PROMPT must contain a guideline about reviewing the Proactive Task Sample"
         )
 
+    # --- Step 12: ID descending as recency proxy ---
+
+    def test_select_proactive_sample_uses_id_descending_as_recency_proxy(self):
+        """Given tasks with same status but different IDs, higher-ID tasks appear first."""
+        tasks = [
+            self._make_task(10, 'pending'),
+            self._make_task(3, 'pending'),
+            self._make_task(7, 'pending'),
+            self._make_task(1, 'pending'),
+            self._make_task(5, 'pending'),
+        ]
+        result = _select_proactive_sample(tasks, 5)
+        ids = [t['id'] for t in result]
+        assert ids == sorted(ids, reverse=True), (
+            f'Tasks with same status should be ordered by ID descending. Got: {ids}'
+        )
+
+    # --- Step 13: empty task tree handled gracefully ---
+
+    @pytest.mark.asyncio
+    async def test_proactive_sample_empty_task_tree(self, mock_deps, watermark):
+        """When taskmaster returns 0 tasks, proactive sample section shows 'No tasks.'."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Proactive Task Sample' in payload
+        # Section should contain 'No tasks.' for empty list
+        proactive_idx = payload.index('### Proactive Task Sample')
+        section_text = payload[proactive_idx:proactive_idx + 200]
+        assert 'No tasks.' in section_text, (
+            f'Empty task tree should show "No tasks." in proactive sample. Got: {section_text!r}'
+        )
+
     # --- Step 10: 'Your Task' section includes proactive step ---
 
     @pytest.mark.asyncio
