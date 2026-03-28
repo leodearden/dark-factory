@@ -214,6 +214,28 @@ class TestCompletionPathsDatalabels:
         assert '%' in html or 'toFixed' in html
 
 
+class TestChartInitTiming:
+    """Tests for chart initialization timing fix (htmx:afterSettle instead of double-rAF)."""
+
+    def test_no_request_animation_frame(self, client):
+        """Double requestAnimationFrame pattern must be absent from rendered HTML."""
+        with _patch_perf_data():
+            html = client.get('/partials/performance').text
+        assert 'requestAnimationFrame' not in html
+
+    def test_htmx_after_settle_listener(self, client):
+        """htmx:afterSettle one-shot event listener must be present in rendered HTML."""
+        with _patch_perf_data():
+            html = client.get('/partials/performance').text
+        assert 'htmx:afterSettle' in html
+
+    def test_render_all_function_present(self, client):
+        """renderAll function must still be present after the timing fix."""
+        with _patch_perf_data():
+            html = client.get('/partials/performance').text
+        assert 'renderAll' in html
+
+
 class TestFormatDurationMs:
     """Tests for the format_duration_ms Jinja2 filter."""
 
