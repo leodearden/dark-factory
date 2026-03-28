@@ -4329,15 +4329,16 @@
         "description": "validate_project_id only checks for empty/whitespace, but project_id is interpolated directly into prompt strings in BaseStage.run() (base.py:117). A project_id containing newlines, backticks, or quotes would pass validation and could distort the prompt structure.\n\nrun_id already enforces an allowlist pattern [a-zA-Z0-9_-]+ via validate_run_id. Apply the same approach to validate_project_id so both identifiers have consistent safety guarantees.\n\nSteps:\n1. Add a _PROJECT_ID_PATTERN allowlist regex to validation.py (same as _RUN_ID_PATTERN or similar)\n2. Update validate_project_id to reject inputs that don't match the pattern\n3. Add corresponding tests for the new invalid-character rejection paths in TestValidateProjectId\n4. Verify existing callers still pass (project_id values like 'dark_factory' are already allowlist-safe)\n\nmemory_hint: search \"prompt injection fix routing layer\" for the prior pattern decision; search \"validate_* vs require_* naming convention\" for validation module conventions; get_entity \"validate_project_id\" for current usage.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T05:16:20.313Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T05:16:19.147Z",
+      "lastModified": "2026-03-28T05:16:20.313Z",
       "taskCount": 241,
       "completedCount": 190,
       "tags": [
