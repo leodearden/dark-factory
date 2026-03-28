@@ -471,6 +471,12 @@ class TestAriaLivePollingsections:
         section_html = html[perf_idx - 100:perf_idx + 300]
         assert 'aria-live="polite"' in section_html
 
+    def test_memory_graphs_section_has_aria_live_polite(self, client):
+        html = client.get('/').text
+        mg_idx = html.index('hx-get="/partials/memory-graphs"')
+        section_html = html[mg_idx - 100:mg_idx + 300]
+        assert 'aria-live="polite"' in section_html
+
     def test_all_three_sections_have_aria_live(self, client):
         html = client.get('/').text
         assert html.count('aria-live="polite"') >= 3
