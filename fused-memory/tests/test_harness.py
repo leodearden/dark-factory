@@ -1004,17 +1004,11 @@ class TestSelectTier:
             captured['episode_limit'] = stage.episode_limit
             captured['memory_limit'] = stage.memory_limit
 
-        found_consolidator = False
         for stage in harness.stages:
             if isinstance(stage, MemoryConsolidator):
                 _mock_stage_run(stage, before_return=capture_limits)
-                found_consolidator = True
             else:
                 _mock_stage_run(stage)
-
-        assert found_consolidator, (
-            'MemoryConsolidator not found during stage mocking — stage list changed?'
-        )
 
         tier = TierConfig(model='sonnet', episode_limit=125, memory_limit=250)
         await harness.run_full_cycle(
@@ -1024,8 +1018,9 @@ class TestSelectTier:
             events=[_make_event()],
         )
 
-        assert captured != {}, (
-            'MemoryConsolidator.run() was never called — run_full_cycle skipped it or stage list changed'
+        assert 'episode_limit' in captured and 'memory_limit' in captured, (
+            'MemoryConsolidator.run() was never called or did not capture expected keys — '
+            'run_full_cycle skipped it or stage list changed'
         )
 
         assert captured.get('episode_limit') == 125, (
