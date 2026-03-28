@@ -4526,6 +4526,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 277,
+        "title": "Strengthen dashboard Tailwind and static asset tests",
+        "description": "After the Tailwind local build is re-implemented, update tests in dashboard/tests/test_app.py:\n\n1. Check template-specific Tailwind utilities (e.g. border-gray-700, animate-pulse, rounded-lg) not just reset classes (bg-gray-900, text-gray-100). Also assert file size > 50KB as a coarse completeness guard.\n2. Add negative test: GET /static/style.css returns 404 after rename to input.css.\n3. Assert '<svg' and 'DF' in GET /static/favicon.svg response body (not just status code and content-type).\n\nFiles: dashboard/tests/test_app.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -4538,7 +4549,7 @@
       ],
       "created": "2026-03-28T07:13:49.099Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T07:14:00.022Z"
+      "updated": "2026-03-28T07:14:04.186Z"
     }
   }
 }
