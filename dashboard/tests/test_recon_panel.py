@@ -213,10 +213,10 @@ class TestFormatDuration:
 
         assert format_duration(45) == '45s'
 
-    def test_zero_seconds_returns_0s(self):
+    def test_zero_seconds_returns_dash(self):
         from dashboard.app import format_duration
 
-        assert format_duration(0) == '0s'
+        assert format_duration(0) == '-'
 
     def test_exactly_59s_returns_seconds(self):
         from dashboard.app import format_duration
@@ -265,6 +265,20 @@ class TestFormatDuration:
         assert 'format_duration' in templates.env.filters
         assert templates.env.filters['format_duration'] is format_duration
 
+    def test_none_returns_dash(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(None) == '-'
+
+    def test_negative_value_returns_dash(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(-30) == '-'
+
+    def test_non_numeric_returns_dash(self):
+        from dashboard.app import format_duration
+
+        assert format_duration('not_a_number') == '-'
 
 
 # --- Mock data for route tests ---
@@ -785,6 +799,8 @@ class TestReconBufferAgeDisplay:
         with _patch_recon_data(buffer_stats=stats):
             html = client.get('/partials/recon').text
         assert '17h 25m' in html
+        # age > 300 → warning colour class
+        assert 'text-yellow-400' in html
 
     def test_small_age_displays_minutes_and_seconds(self, client):
         # 600 seconds = 10m 0s
@@ -805,6 +821,9 @@ class TestReconBufferAgeDisplay:
         with _patch_recon_data(buffer_stats=stats):
             html = client.get('/partials/recon').text
         assert '45s' in html
+        # age < 300 → neutral colour class, no warning
+        assert 'text-gray-400' in html
+        assert 'text-yellow-400' not in html
 
 
 class TestProjectNameFilterInTemplate:
