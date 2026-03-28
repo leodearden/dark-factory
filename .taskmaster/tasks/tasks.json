@@ -4172,7 +4172,15 @@
           "185"
         ],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_app.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 242,
@@ -4387,7 +4395,16 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T05:33:32.421Z"
+        "updatedAt": "2026-03-28T05:33:32.421Z",
+        "metadata": {
+          "files": [
+            "fused-memory/tests/test_tools_validation.py",
+            "fused-memory/tests/test_validation.py"
+          ],
+          "modules": [
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 258,
