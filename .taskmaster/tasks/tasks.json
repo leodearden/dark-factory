@@ -2450,11 +2450,11 @@
         "description": "The CONFIG_PATH save/restore boilerplate is copy-pasted 8 times across test_reindex.py (4x), test_cleanup_stale_edges.py (2x), and test_verify_zombie_edges.py (2x). The mock_config attribute setup (dimensions, api_key, model) is duplicated 10 times in test_reindex.py alone. Module-level imports are repeated inside individual test method bodies.",
         "details": "## Steps\n\n1. Create a shared pytest fixture for CONFIG_PATH save/restore:\n   ```python\n   @pytest.fixture(autouse=True)\n   def preserve_config_path():\n       original = os.environ.get('CONFIG_PATH')\n       yield original\n       if original is None:\n           os.environ.pop('CONFIG_PATH', None)\n       else:\n           os.environ['CONFIG_PATH'] = original\n   ```\n   Place in a conftest.py or as a class-level fixture. Remove the try/finally teardown blocks from all 8 test methods.\n\n2. Create a mock_config factory fixture:\n   ```python\n   @pytest.fixture\n   def standard_mock_config():\n       m = MagicMock()\n       m.embedder.dimensions = 1536\n       m.embedder.providers.openai.api_key = 'test-key'\n       m.embedder.model = 'text-embedding-3-small'\n       return m\n   ```\n   Use in all 10+ tests that need it. The 768-dimension variant overrides `.dimensions`.\n\n3. Move `import os` and `from fused_memory.maintenance.reindex import run_reindex` to module-level imports in test_reindex.py. Do the same for equivalent imports in the other two test files.\n\n4. Verify all tests still pass.\n\n## Memory Hints\n- Search: \"test boilerplate CONFIG_PATH fixture maintenance tests DRY\"\n- Search: \"mock_config setup reindex test duplication\"\n\n## Origin\nReview suggestions from Task 143 triage (suggestions #3, #4, #5, #6).",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T15:06:00.496Z",
+        "updatedAt": "2026-03-28T16:11:38.492Z",
         "metadata": {
           "files": [
             "fused-memory/tests/test_reindex.py",
@@ -5036,7 +5036,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T16:11:38.236Z",
+      "lastModified": "2026-03-28T16:11:38.492Z",
       "taskCount": 268,
       "completedCount": 214,
       "tags": [
