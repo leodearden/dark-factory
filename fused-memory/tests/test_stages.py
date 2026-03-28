@@ -788,3 +788,16 @@ class TestTierConfig:
         stage.memory_limit = 250
         assert stage.episode_limit == 125
         assert stage.memory_limit == 250
+
+    @pytest.mark.asyncio
+    async def test_assemble_payload_raises_without_limits(self):
+        config = ReconciliationConfig()
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator,
+            AsyncMock(), AsyncMock(), AsyncMock(), config,
+        )
+        stage.project_id = 'test_project'
+        watermark = Watermark(project_id='test_project')
+        with pytest.raises(ValueError, match='episode_limit and memory_limit must be explicitly set'):
+            await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
