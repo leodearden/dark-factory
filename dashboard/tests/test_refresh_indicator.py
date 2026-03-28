@@ -1,6 +1,8 @@
 """Tests for the per-section last-updated timestamp and refresh indicator feature."""
 
-from __future__ import annotations
+import re
+
+_SECTIONS = ('orchestrators', 'performance', 'memory', 'memory-graphs', 'recon')
 
 
 class TestSectionDataAttributes:
@@ -57,6 +59,21 @@ class TestTimestampElements:
     def test_timestamp_elements_are_aria_hidden(self, client):
         html = client.get('/').text
         assert 'aria-hidden="true"' in html
+
+
+class TestSectionTimestampPairing:
+    """Tests that every data-section has a matching data-updated-for element."""
+
+    def test_every_section_has_matching_timestamp(self, client):
+        html = client.get('/').text
+        sections = set(re.findall(r'data-section="([a-z][a-z-]*)"', html))
+        timestamps = set(re.findall(r'data-updated-for="([a-z][a-z-]*)"', html))
+        assert sections == timestamps
+
+    def test_all_expected_sections_paired(self, client):
+        html = client.get('/').text
+        sections = set(re.findall(r'data-section="([a-z][a-z-]*)"', html))
+        assert sections == set(_SECTIONS)
 
 
 class TestRefreshTrackingJS:
