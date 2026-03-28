@@ -5,13 +5,14 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Final
 
 # Port 8002 is the canonical systemd-managed instance (shared across all projects).
 # Ports 8000/8001 were per-project ports retired when the architecture consolidated
 # to a single shared server. The singleton lock prevents any legitimate fused-memory
 # process from running on those ports, so listing them would only enable silent
 # fallback to stale code — a correctness bug, not graceful degradation.
-DEFAULT_FUSED_MEMORY_URLS = ['http://localhost:8002']
+DEFAULT_FUSED_MEMORY_URLS: Final = ('http://localhost:8002',)
 
 
 @dataclass
