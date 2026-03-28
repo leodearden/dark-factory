@@ -871,3 +871,71 @@ class TestStage1ProjectIdGuideline:
             assert tool not in guideline_line, (
                 f"Stage 1 guideline should NOT list task mutation tool: {tool}"
             )
+
+
+class TestProjectIdGuidelineConsistency:
+    """All three stage prompts share the same guideline prefix text, proving shared constant usage."""
+
+    def _get_guideline_line(self, prompt: str) -> str | None:
+        return next(
+            (line for line in prompt.splitlines() if 'Reconciliation Context block' in line),
+            None,
+        )
+
+    def _get_prefix(self, guideline_line: str) -> str:
+        """Extract prefix up to and including the opening parenthesis of the tool list."""
+        paren_pos = guideline_line.find('(')
+        if paren_pos == -1:
+            return guideline_line
+        return guideline_line[:paren_pos + 1]
+
+    def test_all_three_stages_have_guideline_line(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+
+        for name, prompt in [
+            ('Stage 1', STAGE1_SYSTEM_PROMPT),
+            ('Stage 2', STAGE2_SYSTEM_PROMPT),
+            ('Stage 3', STAGE3_SYSTEM_PROMPT),
+        ]:
+            line = self._get_guideline_line(prompt)
+            assert line is not None, f'{name} system prompt missing guideline line'
+
+    def test_all_three_stages_share_same_guideline_prefix(self):
+        """All three stages share the same prefix text before the tool list parenthetical.
+
+        This proves they use the same _PROJECT_ID_GUIDELINE constant, not copy-pasted variants.
+        """
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+
+        prefixes = []
+        for prompt in [STAGE1_SYSTEM_PROMPT, STAGE2_SYSTEM_PROMPT, STAGE3_SYSTEM_PROMPT]:
+            line = self._get_guideline_line(prompt)
+            assert line is not None
+            prefixes.append(self._get_prefix(line))
+
+        # All prefixes must be identical
+        assert prefixes[0] == prefixes[1] == prefixes[2], (
+            f'Stage guideline prefixes differ: {prefixes!r}'
+        )
+
+    def test_guideline_prefix_matches_template_constant(self):
+        """The shared prefix matches _PROJECT_ID_GUIDELINE before the {tools} placeholder."""
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        # The template prefix is everything before {tools}
+        template_prefix = _PROJECT_ID_GUIDELINE[:_PROJECT_ID_GUIDELINE.find('{tools}')]
+
+        line = self._get_guideline_line(STAGE1_SYSTEM_PROMPT)
+        assert line is not None
+        actual_prefix = self._get_prefix(line)
+
+        assert actual_prefix == template_prefix, (
+            f'Stage guideline prefix does not match template:\n'
+            f'  template: {template_prefix!r}\n'
+            f'  actual:   {actual_prefix!r}'
+        )
