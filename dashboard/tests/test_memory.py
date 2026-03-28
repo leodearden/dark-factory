@@ -140,6 +140,7 @@ class TestSessionAwareHandler:
         response = handler(self._init_request(9001))
         assert response.status_code == 200
         assert 9001 in handler.ports_seen
+        assert 9000 not in handler.ports_seen
 
     def test_portless_url_raises_assertion_error(self):
         """Request to a URL without an explicit port raises AssertionError."""
