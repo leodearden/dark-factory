@@ -1,0 +1,167 @@
+{
+  "task_id": "278",
+  "title": "Fix regression: restore Tailwind built CSS and favicon (reverted by merge conflict)",
+  "files": [
+    "dashboard/.gitignore",
+    "dashboard/Makefile",
+    "dashboard/src/dashboard/static/favicon.svg",
+    "dashboard/src/dashboard/static/input.css",
+    "dashboard/src/dashboard/static/tailwind.css",
+    "dashboard/src/dashboard/static/style.css",
+    "dashboard/src/dashboard/templates/base.html",
+    "dashboard/tests/test_app.py",
+    "dashboard/tests/test_scaffold.py"
+  ],
+  "modules": [
+    "dashboard",
+    "dashboard/src/dashboard/templates",
+    "dashboard/src/dashboard/static",
+    "dashboard/tests"
+  ],
+  "analysis": "Commit 0ea23cb5 ('fix(memory_service): resolve merge conflicts') accidentally reverted all of task 180's Tailwind CDN replacement work. The regression deleted: dashboard/Makefile (23 lines), dashboard/.gitignore, dashboard/src/dashboard/static/favicon.svg, dashboard/src/dashboard/static/input.css, dashboard/src/dashboard/static/tailwind.css. It also reverted base.html to use the CDN script tag and renamed input.css back to style.css. The TestTailwindBuild and TestFavicon classes were removed from test_app.py, and TestStaticFiles in test_scaffold.py was reverted to check style.css.\n\nThe fix must: (1) restore all deleted static assets and build config, (2) fix base.html template links, (3) improve the Makefile with platform detection (was hardcoded linux-x64) and sha256 checksum verification, (4) restore and update tests. The custom CSS rules in style.css are already merged into input.css (which feeds the tailwind build), so style.css should be removed as task 180 intended.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Create dashboard/.gitignore to ignore bin/ directory (Tailwind CLI binary downloaded by make css)",
+      "status": "done",
+      "commit": "7fa23cd0",
+      "tests": []
+    },
+    {
+      "id": "pre-2",
+      "description": "Restore dashboard/src/dashboard/static/favicon.svg \u2014 minimal dark-themed SVG with DF monogram on gray-900 background (exact content from commit 29b276e7)",
+      "status": "done",
+      "commit": "7fa23cd0",
+      "tests": []
+    },
+    {
+      "id": "pre-3",
+      "description": "Restore dashboard/src/dashboard/static/input.css \u2014 Tailwind v4 entry point with @import 'tailwindcss', @source '../templates', and custom rules ([x-cloak], .htmx-settling, .htmx-swapping) merged from style.css (exact content from commit 29b276e7)",
+      "status": "done",
+      "commit": "7fa23cd0",
+      "tests": []
+    },
+    {
+      "id": "pre-4",
+      "description": "Restore dashboard/src/dashboard/static/tailwind.css \u2014 the pre-built ~74KB minified CSS output. Recover from git history (commit 29b276e7) via `git show 29b276e7:dashboard/src/dashboard/static/tailwind.css > dashboard/src/dashboard/static/tailwind.css`",
+      "status": "done",
+      "commit": "7fa23cd0",
+      "tests": []
+    },
+    {
+      "id": "pre-5",
+      "description": "Create dashboard/Makefile with platform detection (uname -s/-m \u2192 linux-x64, linux-arm64, macos-x64, macos-arm64) and sha256 checksum verification after download. Targets: css, css-watch, clean. TAILWIND_VERSION=4.2.2. Include CHECKSUMS variable mapping platform\u2192hash. After curl download, verify with sha256sum/shasum.",
+      "status": "done",
+      "commit": "7fa23cd0",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Add TestTailwindBuild class to dashboard/tests/test_app.py with 4 tests: test_no_cdn_tailwind (assert 'cdn.tailwindcss.com' not in HTML), test_local_tailwind_css_linked (assert 'href=\"/static/tailwind.css\"' in HTML), test_tailwind_css_served (GET /static/tailwind.css returns 200 with text/css), test_tailwind_css_has_utilities (CSS contains bg-gray-900 and text-gray-100). Place after TestMainModule class. All 4 tests will fail because base.html still has CDN script and tailwind.css is not yet linked.",
+      "status": "done",
+      "commit": "53eeffb3"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "In dashboard/src/dashboard/templates/base.html line 7: replace `<script src=\"https://cdn.tailwindcss.com\"></script>` with `<link rel=\"stylesheet\" href=\"/static/tailwind.css\">`. This makes all 4 TestTailwindBuild tests pass.",
+      "status": "done",
+      "commit": "80ebae1d"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Add TestFavicon class to dashboard/tests/test_app.py (after TestTailwindBuild) with 2 tests: test_favicon_link_in_html (assert '/static/favicon.svg' in HTML and 'rel=\"icon\"' in HTML), test_favicon_svg_served (GET /static/favicon.svg returns 200 with image/svg+xml). test_favicon_link_in_html will fail because base.html does not have the favicon link yet.",
+      "status": "done",
+      "commit": "a95a447a"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "In dashboard/src/dashboard/templates/base.html: add `<link rel=\"icon\" type=\"image/svg+xml\" href=\"/static/favicon.svg\">` on line 7 (before the new tailwind.css link). This makes both TestFavicon tests pass.",
+      "status": "done",
+      "commit": "0b2949df"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "In dashboard/tests/test_scaffold.py, update TestStaticFiles.test_static_css_served: change URL from '/static/style.css' to '/static/tailwind.css' and update docstring. This test will fail initially because tailwind.css is served but style.css check was passing \u2014 now it validates the correct file.",
+      "status": "done",
+      "commit": "e4df407b"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Remove `<link rel=\"stylesheet\" href=\"/static/style.css\">` from base.html (currently line 19). Delete dashboard/src/dashboard/static/style.css (custom rules are already in input.css \u2192 tailwind.css). Updated TestStaticFiles now passes checking tailwind.css.",
+      "status": "done",
+      "commit": "70d065fe"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Add TestMakefile class to dashboard/tests/test_scaffold.py with 3 tests: test_makefile_exists (Path to dashboard/Makefile is_file), test_makefile_has_platform_detection (content contains 'uname' and handles both 'linux' and darwin/macos cases), test_makefile_has_checksum_verification (content contains 'sha256' for integrity check). Use pathlib with a DASHBOARD_ROOT constant pointing to the dashboard package's ancestor Makefile location. All tests should pass because Makefile was created in pre-5.",
+      "status": "done",
+      "commit": "6d4b8be9"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Verify all tests pass (TestTailwindBuild, TestFavicon, TestStaticFiles, TestMakefile). Run full test_app.py and test_scaffold.py suites. No code changes expected \u2014 this is a verification step confirming the Makefile from pre-5 satisfies step-7 tests.",
+      "status": "done",
+      "commit": "6d4b8be9"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Restore static files from git history (commit 29b276e7) rather than rebuilding from scratch",
+      "rationale": "The original task 180 committed known-good built output. Restoring from git is deterministic and doesn't require downloading the Tailwind CLI binary during the fix. The Makefile enables future rebuilds."
+    },
+    {
+      "decision": "Delete style.css and its link from base.html as part of this fix",
+      "rationale": "Task 180's final step (c547928f) consolidated custom rules into input.css \u2192 tailwind.css and deleted style.css. The regression re-created style.css. Keeping both would duplicate CSS rules. The task description's scope includes restoring task 180's intent."
+    },
+    {
+      "decision": "Platform detection via uname -s and uname -m in Makefile",
+      "rationale": "Standard POSIX approach. Maps: Linux/x86_64\u2192linux-x64, Linux/aarch64\u2192linux-arm64, Darwin/x86_64\u2192macos-x64, Darwin/arm64\u2192macos-arm64. Covers CI (Linux x64) and developer machines (macOS ARM)."
+    },
+    {
+      "decision": "sha256 checksum verification after curl download, before chmod +x",
+      "rationale": "Defense-in-depth: verifying the binary before making it executable prevents running a corrupted or tampered download. Use sha256sum on Linux, shasum -a 256 on macOS. Store expected hashes as Makefile variables per platform."
+    },
+    {
+      "decision": "TestMakefile uses file-content assertions rather than running make targets",
+      "rationale": "Running make targets would require network access (curl download) and would be slow/flaky in CI. File-content tests verify the structural correctness (platform detection logic exists, checksum verification exists) without side effects."
+    },
+    {
+      "decision": "Place TestTailwindBuild and TestFavicon in test_app.py, TestMakefile in test_scaffold.py",
+      "rationale": "Matches task 180's original placement. test_app.py tests HTTP-served content (HTML rendering, static file serving). test_scaffold.py tests project structure and configuration (config, fixtures, file existence)."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Original task 180 file content (favicon.svg, input.css, tailwind.css)",
+      "where": "Git history commits 29b276e7 and c547928f",
+      "how": "Restore exact file contents via `git show <commit>:<path>` to avoid divergence from the original implementation"
+    },
+    {
+      "what": "Existing test patterns in test_app.py (client fixture, HTML assertion style)",
+      "where": "dashboard/tests/test_app.py \u2014 TestAriaLivePollingsections, TestMainModule",
+      "how": "Follow same pattern: use client fixture, get('/').text for HTML checks, client.get('/static/...') for static file checks"
+    },
+    {
+      "what": "Existing conftest.py client fixture",
+      "where": "dashboard/tests/conftest.py",
+      "how": "All new test classes use the existing `client` pytest fixture which creates a TestClient for the FastAPI app"
+    },
+    {
+      "what": "Task 180's original test class structure (TestTailwindBuild, TestFavicon)",
+      "where": "Git history commit aa89abd4 (test_app.py diff)",
+      "how": "Reuse the exact same test methods and assertions from the original implementation"
+    }
+  ],
+  "_session_id": "278-bb0cecea",
+  "_created_at": "2026-03-28T16:16:34.627725+00:00"
+}
