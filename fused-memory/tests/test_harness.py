@@ -944,3 +944,47 @@ class TestSelectTier:
         )
         assert tier.episode_limit == 125
         assert tier.memory_limit == 250
+
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_propagates_tier_to_consolidator(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """run_full_cycle applies TierConfig limits onto MemoryConsolidator before stage runs."""
+        from fused_memory.reconciliation.harness import TierConfig
+
+        harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+
+        # Capture the limits as seen by stage1 when its run() is invoked
+        captured: dict = {}
+
+        async def capturing_run(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0]):
+            captured['episode_limit'] = _s.episode_limit
+            captured['memory_limit'] = _s.memory_limit
+            return StageReport(
+                stage=_s.stage_id,
+                started_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+                items_flagged=[],
+                stats={},
+                llm_calls=0,
+                tokens_used=0,
+            )
+
+        harness.stages[0].run = capturing_run
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        tier = TierConfig(model='sonnet', episode_limit=125, memory_limit=250)
+        await harness.run_full_cycle(
+            'test-project',
+            'tier-propagation-test',
+            tier=tier,
+            events=[_make_event()],
+        )
+
+        assert captured.get('episode_limit') == 125, (
+            f"Expected episode_limit=125 propagated to consolidator, got {captured.get('episode_limit')}"
+        )
+        assert captured.get('memory_limit') == 250, (
+            f"Expected memory_limit=250 propagated to consolidator, got {captured.get('memory_limit')}"
+        )
