@@ -307,6 +307,31 @@ def _mock_stage_run(stage, items_flagged=None):
 
 
 @pytest.mark.asyncio
+async def test_mock_stage_run_before_return_callback(journal, event_buffer, mock_memory_service):
+    """_mock_stage_run must invoke an optional async before_return callback with the stage."""
+    harness = _make_harness_with_mocked_stages(journal, event_buffer, mock_memory_service)
+    stage = harness.stages[0]
+
+    callback_args: list = []
+
+    async def capture(s):
+        callback_args.append(s)
+
+    _mock_stage_run(stage, before_return=capture)
+
+    from fused_memory.models.reconciliation import Watermark
+    watermark = Watermark(project_id='test-project')
+    await stage.run([], watermark, [], 'test-run-id')
+
+    assert len(callback_args) == 1, (
+        f"Expected before_return callback to be called once, got {len(callback_args)}"
+    )
+    assert callback_args[0] is stage, (
+        "Expected before_return callback to receive the stage object as argument"
+    )
+
+
+@pytest.mark.asyncio
 async def test_finding_partition_actionable_vs_non_actionable():
     """Partition logic: actionable findings trigger remediation, non-actionable get escalated."""
     findings = _make_s3_findings()
