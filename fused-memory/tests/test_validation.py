@@ -138,6 +138,24 @@ class TestValidateProjectRoot:
         assert 'error_type' in result
         assert result['error_type'] == 'ValidationError'
 
+    def test_valid_absolute_path_returns_none(self):
+        result = validate_project_root('/some/path')
+        assert result is None
+
+    def test_rejects_relative_path(self):
+        result = validate_project_root('relative/path')
+        assert result is not None
+        assert 'error' in result
+        assert 'error_type' in result
+        assert result['error_type'] == 'ValidationError'
+
+    def test_rejects_empty_string(self):
+        result = validate_project_root('')
+        assert result is not None
+        assert 'error' in result
+        assert 'error_type' in result
+        assert result['error_type'] == 'ValidationError'
+
 
 class TestRequireProjectRoot:
     """require_project_root raises ValueError for invalid paths, returns None for valid ones."""
@@ -156,6 +174,14 @@ class TestRequireProjectRoot:
         with pytest.raises(ValueError) as exc_info:
             require_project_root(invalid)
         assert str(exc_info.value) == err_dict['error']
+
+    def test_empty_string_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            require_project_root('')
+
+    def test_whitespace_only_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            require_project_root('   ')
 
 
 class TestRequireProjectId:
