@@ -246,3 +246,29 @@ class TestSeparateLabelNotFound:
         assert remaining['labels'] == []
         assert remaining['values'] == []
         assert value == 0
+
+
+class TestSeparateLabelBoundsCheck:
+    """Tests for separate_label bounds check when values list is shorter than labels."""
+
+    def test_raises_when_label_index_beyond_values_length(self):
+        """ValueError raised when label found but its index >= len(values)."""
+        # labels=['a','b','c'], values=[10], label='c' at idx=2 but values has 1 element
+        data = {'labels': ['a', 'b', 'c'], 'values': [10]}
+        with pytest.raises(ValueError, match="no corresponding value"):
+            separate_label(data, 'c')
+
+    def test_raises_for_middle_label_beyond_values(self):
+        """ValueError raised when label is found at index beyond values."""
+        # label='b' at idx=1, values has only 1 element (idx 0)
+        data = {'labels': ['a', 'b', 'c'], 'values': [10]}
+        with pytest.raises(ValueError, match="no corresponding value"):
+            separate_label(data, 'b')
+
+    def test_error_message_includes_label_name_and_index(self):
+        """ValueError message contains label name and index for debugging."""
+        data = {'labels': ['a', 'b', 'c'], 'values': [10]}
+        with pytest.raises(ValueError, match="'c'"):
+            separate_label(data, 'c')
+        with pytest.raises(ValueError, match="index 2"):
+            separate_label(data, 'c')
