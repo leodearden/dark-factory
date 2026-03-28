@@ -1040,3 +1040,42 @@ class TestSafeGatherResult:
         """KeyboardInterrupt (BaseException, not Exception) must propagate, not be swallowed."""
         with pytest.raises(KeyboardInterrupt):
             _safe_gather_result(KeyboardInterrupt(), 'default', 'test')
+
+
+class TestPollingErrorRecovery:
+    """Tests that the jitter script includes error recovery listeners to prevent polling stoppage."""
+
+    def test_error_recovery_finds_polling_element(self, client):
+        """Script must use closest('[data-poll-base]') to locate the polling element from error events."""
+        html = client.get('/').text
+        assert "closest('[data-poll-base]')" in html, (
+            "Expected closest('[data-poll-base]') selector in HTML — "
+            "error recovery must walk up the DOM to find the polling section."
+        )
+
+    def test_response_error_has_recovery_listener(self, client):
+        """htmx:responseError must appear at least twice: once in error display handler, once in recovery."""
+        html = client.get('/').text
+        count = html.count('htmx:responseError')
+        assert count >= 2, (
+            f"Expected 'htmx:responseError' to appear at least 2 times (got {count}) — "
+            "one for error display, one for poll recovery."
+        )
+
+    def test_timeout_has_recovery_listener(self, client):
+        """htmx:timeout must appear at least twice: once in error display handler, once in recovery."""
+        html = client.get('/').text
+        count = html.count('htmx:timeout')
+        assert count >= 2, (
+            f"Expected 'htmx:timeout' to appear at least 2 times (got {count}) — "
+            "one for error display, one for poll recovery."
+        )
+
+    def test_send_error_has_recovery_listener(self, client):
+        """htmx:sendError must appear at least twice: once in error display handler, once in recovery."""
+        html = client.get('/').text
+        count = html.count('htmx:sendError')
+        assert count >= 2, (
+            f"Expected 'htmx:sendError' to appear at least 2 times (got {count}) — "
+            "one for error display, one for poll recovery."
+        )
