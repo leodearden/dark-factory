@@ -320,8 +320,10 @@ async def run_scoped_verification(
     if module_configs:
         # Apply file-level scoping within each subproject when task_files given
         if task_files:
-            scoped = [scope_module_config(mc, task_files) for mc in module_configs]
-            n_files = len(task_files)
+            # Filter to files that still exist — tasks may delete files as part of their work
+            existing_files = [f for f in task_files if (worktree / f).exists()]
+            scoped = [scope_module_config(mc, existing_files) for mc in module_configs]
+            n_files = len(existing_files)
             n_mods = len(scoped)
             logger.info('Verification mode: file-scoped (%d files across %d subprojects)', n_files, n_mods)
         else:
@@ -334,9 +336,11 @@ async def run_scoped_verification(
 
     # No module_configs — try fallback or global
     if task_files:
-        fallback = _build_fallback_config(task_files)
+        # Filter to files that still exist — tasks may delete files as part of their work
+        existing_files = [f for f in task_files if (worktree / f).exists()]
+        fallback = _build_fallback_config(existing_files)
         if fallback is not None:
-            logger.info('Verification mode: fallback-scoped (%d files)', len(task_files))
+            logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
             return await run_verification(worktree, config, fallback)
 
     logger.info('Verification mode: global (no scope info)')

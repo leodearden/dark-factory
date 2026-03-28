@@ -14,8 +14,6 @@ import importlib
 import importlib.util
 from pathlib import Path
 
-import pytest
-
 # Root of the repository (two levels up from fused-memory/tests/)
 _REPO_ROOT = Path(__file__).parent.parent.parent
 
