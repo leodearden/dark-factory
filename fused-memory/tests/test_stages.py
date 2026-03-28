@@ -934,26 +934,35 @@ class TestStagePayloadProjectIdGuideline:
         }
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('stage_class,stage_id,expected_guideline_import,extra_setup', [
-        (
-            'MemoryConsolidator',
-            StageId.memory_consolidator,
-            '_STAGE1_PROJECT_ID_GUIDELINE',
-            'limits',
-        ),
-        (
-            'TaskKnowledgeSync',
-            StageId.task_knowledge_sync,
-            '_STAGE2_PROJECT_ID_GUIDELINE',
-            'taskmaster',
-        ),
-        (
-            'IntegrityCheck',
-            StageId.integrity_check,
-            '_STAGE3_PROJECT_ID_GUIDELINE',
-            None,
-        ),
-    ])
+    @pytest.mark.parametrize(
+        'stage_class,stage_id,expected_guideline_import,extra_setup,expected_tools,excluded_tools',
+        [
+            (
+                'MemoryConsolidator',
+                StageId.memory_consolidator,
+                '_STAGE1_PROJECT_ID_GUIDELINE',
+                'limits',
+                ['add_memory'],                          # Stage 1 has memory write access
+                ['get_tasks', 'set_task_status', 'add_task'],  # Stage 1 has no task tools
+            ),
+            (
+                'TaskKnowledgeSync',
+                StageId.task_knowledge_sync,
+                '_STAGE2_PROJECT_ID_GUIDELINE',
+                'taskmaster',
+                ['expand_task', 'parse_prd'],            # Stage 2 has full MCP access
+                [],
+            ),
+            (
+                'IntegrityCheck',
+                StageId.integrity_check,
+                '_STAGE3_PROJECT_ID_GUIDELINE',
+                None,
+                ['get_tasks'],                           # Stage 3 reads tasks
+                ['add_memory', 'delete_memory', 'set_task_status', 'add_task'],  # read-only
+            ),
+        ],
+    )
     async def test_stage_payload_contains_project_id_guideline(
         self,
         mock_deps_for_stage,
@@ -961,9 +970,11 @@ class TestStagePayloadProjectIdGuideline:
         stage_id,
         expected_guideline_import,
         extra_setup,
+        expected_tools,
+        excluded_tools,
     ):
         """Each stage's assembled payload contains the per-stage project_id guideline
-        with the project_id correctly interpolated."""
+        with the project_id correctly interpolated, and with the correct tool list."""
         from fused_memory.reconciliation import prompts as prompts_module
 
         guideline_template = getattr(prompts_module, expected_guideline_import)
@@ -994,6 +1005,22 @@ class TestStagePayloadProjectIdGuideline:
             f'Expected: {expected_guideline!r}\n'
             f'Payload snippet: {payload[-500:]!r}'
         )
+
+        # Verify stage-specific tool names appear in the guideline within the payload
+        for tool in expected_tools:
+            assert tool in payload, (
+                f'{stage_class} payload guideline missing expected tool {tool!r}. '
+                f'Payload: {payload[-300:]!r}'
+            )
+
+        # Verify excluded tools are not in the guideline portion of the payload
+        # (they may appear elsewhere in the payload's task/memory data, so we check
+        # that the guideline constant itself doesn't include them)
+        for tool in excluded_tools:
+            assert tool not in expected_guideline, (
+                f'{stage_class} guideline should NOT include {tool!r} but does: '
+                f'{expected_guideline!r}'
+            )
 
     @pytest.mark.asyncio
     async def test_stage2_payload_contains_project_root_instruction(
