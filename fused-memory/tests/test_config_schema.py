@@ -233,6 +233,19 @@ class TestYamlSettingsSourceErrorHandling:
         finally:
             locked_file.chmod(0o644)
 
+    def test_expand_env_vars_error_raises_runtime_error(self, tmp_path, monkeypatch):
+        """_expand_env_vars raising any exception must be wrapped in RuntimeError with config path."""
+        config_file = tmp_path / 'valid.yaml'
+        config_file.write_text('key: value')
+        source = self._make_source(config_file)
+
+        def _raise(val):
+            raise ValueError('boom')
+
+        monkeypatch.setattr(source, '_expand_env_vars', _raise)
+        with pytest.raises(RuntimeError, match=str(config_file)):
+            source()
+
 
 class TestYamlSettingsSourceEncoding:
     """Tests for YamlSettingsSource explicit UTF-8 encoding."""
