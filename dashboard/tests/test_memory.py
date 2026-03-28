@@ -63,9 +63,16 @@ class _SessionAwareHandler:
         self.ports_seen: set[int] = set()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        """Dispatch a mock HTTP request.
+
+        `ports_seen` records every attempted port, including those that raise
+        ConnectError via `fail_port`. `calls` only records requests that pass
+        all pre-dispatch guards (fail_port check, error_on_all check, and body
+        parsing); it is therefore empty when an early-exit path fires.
+        """
         port = request.url.port
-        if port is not None:
-            self.ports_seen.add(port)
+        assert port is not None, f'Request to {request.url} has no port'
+        self.ports_seen.add(port)
 
         if self.fail_port is not None and port == self.fail_port:
             raise httpx.ConnectError('refused')
@@ -132,6 +139,7 @@ class TestSessionAwareHandler:
         with pytest.raises(httpx.ConnectError):
             handler(self._init_request(9000))
         assert 9000 in handler.ports_seen
+        assert len(handler.calls) == 0
 
     def test_fail_port_does_not_affect_other_ports(self):
         """Requests to ports other than fail_port succeed normally."""
@@ -139,6 +147,15 @@ class TestSessionAwareHandler:
         response = handler(self._init_request(9001))
         assert response.status_code == 200
         assert 9001 in handler.ports_seen
+        assert 9000 not in handler.ports_seen
+
+    def test_portless_url_raises_assertion_error(self):
+        """Request to a URL without an explicit port raises AssertionError."""
+        handler = _SessionAwareHandler({'ok': True})
+        body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'}).encode()
+        request = httpx.Request('POST', 'http://localhost/mcp', content=body)
+        with pytest.raises(AssertionError):
+            handler(request)
 
 
 @pytest.fixture(autouse=True)
