@@ -14,3 +14,14 @@
     opacity: 0.5;
     transition: opacity 100ms ease-out;
 }
+
+/* Refresh-pulse animation for HTMX section swaps */
+@keyframes section-refresh-pulse {
+    from { background-color: rgba(96, 165, 250, 0.05); }
+    to   { background-color: transparent; }
+}
+
+.section-refreshed {
+    animation: section-refresh-pulse 600ms ease-out;
+    border-radius: 0.5rem;
+}
