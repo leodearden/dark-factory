@@ -4000,11 +4000,11 @@
         "description": "index.html repeats an identical wrapper pattern 5 times: `<div><section data-section=\"NAME\" hx-get=\"...\" ...>…skeleton…</section><div data-updated-for=\"NAME\" ...></div></div>`. The codebase already uses Jinja macros (macros/badges.html). Extract a `polling_section(name, hx_get, hx_trigger, hx_request_timeout)` macro that accepts section name and HTMX attributes, with skeleton content via caller block. This also eliminates the implicit coupling between data-section and data-updated-for values.\n\nmemory_hints: search for \"Jinja macros dashboard\", search for \"template DRY patterns\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T15:25:36.207Z",
+        "updatedAt": "2026-03-28T20:24:06.393Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/templates",
@@ -5053,7 +5053,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T20:24:06.231Z",
+      "lastModified": "2026-03-28T20:24:06.393Z",
       "taskCount": 268,
       "completedCount": 233,
       "tags": [
