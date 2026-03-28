@@ -65,8 +65,8 @@
       "id": "step-8",
       "type": "impl",
       "description": "Store setInterval reference in base.html. Change bare 'setInterval(function...' to 'var refreshTimer = setInterval(function...' to store the interval ID for potential future cleanup.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "6c1080bc"
     }
   ],
   "design_decisions": [
