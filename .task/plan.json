@@ -88,7 +88,7 @@
       "type": "impl",
       "description": "Add root-user skip to test_unreadable_file_raises_runtime_error: add a second @pytest.mark.skipif decorator \u2014 'pytest.mark.skipif(os.getuid() == 0, reason=\"root ignores file permissions\")'. Place it alongside the existing Windows skip. Verify test still passes on non-root, non-Windows systems.",
       "status": "done",
-      "commit": "placeholder-step-10"
+      "commit": "da8bae55"
     }
   ],
   "design_decisions": [
