@@ -4857,7 +4857,16 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/partials/memory_graphs.html",
+            "dashboard/src/dashboard/templates/partials/performance.html"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates/partials"
+          ]
+        }
       },
       {
         "id": 282,
@@ -4868,7 +4877,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "fused-memory/src/fused_memory/models/reconciliation.py",
+            "fused-memory/tests/test_stages.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/models",
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 283,
