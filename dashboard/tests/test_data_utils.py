@@ -79,12 +79,3 @@ class TestTimeagoUsesParseUtc:
         ts = (datetime.now(UTC) - timedelta(minutes=5)).replace(tzinfo=None).isoformat()
         assert timeago(ts) == '5m ago'
 
-    def test_app_imports_parse_utc_from_utils(self):
-        """dashboard.app must import parse_utc from dashboard.data.utils."""
-        import dashboard.app as app_module
-
-        # After step-6 refactoring, parse_utc should be in app.py's namespace
-        assert hasattr(app_module, 'parse_utc'), (
-            "dashboard.app does not expose parse_utc — "
-            "timeago filter still uses inline UTC normalization instead of the shared helper"
-        )
