@@ -33,6 +33,8 @@ class MockEdge:
     uuid: str = ''
     source_node: MockNode | None = None
     target_node: MockNode | None = None
+    source_node_uuid: str = ''
+    target_node_uuid: str = ''
     episodes: list[str] = field(default_factory=list)
     valid_at: Any = None
     invalid_at: Any = None
@@ -40,9 +42,22 @@ class MockEdge:
 
 @dataclass
 class MockAddEpisodeResult:
-    """Simulates the AddEpisodeResults returned by Graphiti's add_episode."""
+    """Simulates the AddEpisodeResults returned by Graphiti's add_episode.
+
+    The real AddEpisodeResults class uses 'edges' as the field name.
+    We keep 'entity_edges' for backward compat with existing tests that
+    construct MockAddEpisodeResult(entity_edges=[...]).
+    """
 
     entity_edges: list[MockEdge] = field(default_factory=list)
+    edges: list[MockEdge] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # If only entity_edges was provided, mirror it to edges so both fields
+        # are populated.  This preserves backward compat while ensuring the
+        # 'edges' field (used by the real AddEpisodeResults) is accessible.
+        if self.edges == [] and self.entity_edges:
+            self.edges = list(self.entity_edges)
 
 
 @pytest.fixture
