@@ -63,6 +63,13 @@ class _SessionAwareHandler:
         self.ports_seen: set[int] = set()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        """Dispatch a mock HTTP request.
+
+        `ports_seen` records every attempted port, including those that raise
+        ConnectError via `fail_port`. `calls` only records requests that pass
+        all pre-dispatch guards (fail_port check, error_on_all check, and body
+        parsing); it is therefore empty when an early-exit path fires.
+        """
         port = request.url.port
         assert port is not None, f'Request to {request.url} has no port'
         self.ports_seen.add(port)
