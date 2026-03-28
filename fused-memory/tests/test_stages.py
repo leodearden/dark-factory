@@ -543,7 +543,8 @@ class TestProjectIdValidation(BaseStageValidationTest):
                 prior_reports=[],
                 run_id='test-run-6',
             )
-        assert 'dark_factory' in captured_kwargs.get('payload', '')
+        assert 'payload' in captured_kwargs
+        assert '`project_id`: "dark_factory"' in captured_kwargs['payload']
 
     @pytest.mark.asyncio
     async def test_whitespace_watermark_project_id_treated_as_empty(self, mock_deps, caplog):
@@ -647,7 +648,7 @@ class TestRunIdValidation(BaseStageValidationTest):
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
 
-        with self._patch_stage(stage), pytest.raises(ValueError):
+        with self._patch_stage(stage), pytest.raises(ValueError, match='run_id'):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id='dark_factory'),
@@ -694,7 +695,8 @@ class TestRunIdValidation(BaseStageValidationTest):
                 prior_reports=[],
                 run_id=run_id_value,
             )
-        assert run_id_value in captured_kwargs.get('payload', '')
+        assert 'payload' in captured_kwargs
+        assert f'run_id: {run_id_value}' in captured_kwargs['payload']
 
 
 class TestBaseStageValidationContract:
