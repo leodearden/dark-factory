@@ -1,6 +1,7 @@
 """Tests for reconciliation stage configuration (CLI-native MCP execution)."""
 
 import json
+import logging
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -552,9 +553,6 @@ class TestProjectIdValidation(BaseStageValidationTest):
     async def test_whitespace_watermark_project_id_treated_as_empty(self, mock_deps, caplog):
         """Whitespace-only watermark project_id is stripped to '' by field_validator,
         guard skips mismatch check, and emits a DEBUG log about skipping."""
-        import logging
-
-
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
 
@@ -835,4 +833,207 @@ class TestTierConfig:
         watermark = Watermark(project_id='test_project')
         with pytest.raises(ValueError, match='episode_limit and memory_limit must be explicitly set'):
             await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+
+class TestProjectIdGuidelineConstants:
+    """_PROJECT_ID_GUIDELINE template and per-stage constants in prompts/__init__.py."""
+
+    def test_template_exists(self):
+        """_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        assert isinstance(_PROJECT_ID_GUIDELINE, str)
+
+    def test_template_has_tools_placeholder(self):
+        """_PROJECT_ID_GUIDELINE contains a {tools} placeholder."""
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        assert '{tools}' in _PROJECT_ID_GUIDELINE
+
+    def test_template_has_double_brace_project_id(self):
+        """_PROJECT_ID_GUIDELINE escapes project_id as {{project_id}} so it survives .format(tools=...)."""
+        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
+        # After formatting with tools, the {project_id} placeholder must survive
+        formatted = _PROJECT_ID_GUIDELINE.format(tools='search')
+        assert '{project_id}' in formatted
+
+    def test_stage1_constant_exists(self):
+        """_STAGE1_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
+        from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+        assert isinstance(_STAGE1_PROJECT_ID_GUIDELINE, str)
+
+    def test_stage2_constant_exists(self):
+        """_STAGE2_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
+        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
+        assert isinstance(_STAGE2_PROJECT_ID_GUIDELINE, str)
+
+    def test_stage3_constant_exists(self):
+        """_STAGE3_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
+        from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
+        assert isinstance(_STAGE3_PROJECT_ID_GUIDELINE, str)
+
+    def test_stage1_constant_has_project_id_placeholder(self):
+        """_STAGE1_PROJECT_ID_GUIDELINE contains {project_id} placeholder."""
+        from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+        assert '{project_id}' in _STAGE1_PROJECT_ID_GUIDELINE
+
+    def test_stage2_constant_has_project_id_placeholder(self):
+        """_STAGE2_PROJECT_ID_GUIDELINE contains {project_id} placeholder."""
+        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
+        assert '{project_id}' in _STAGE2_PROJECT_ID_GUIDELINE
+
+    def test_stage3_constant_has_project_id_placeholder(self):
+        """_STAGE3_PROJECT_ID_GUIDELINE contains {project_id} placeholder."""
+        from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
+        assert '{project_id}' in _STAGE3_PROJECT_ID_GUIDELINE
+
+    def test_stage2_constant_includes_expand_task(self):
+        """Stage 2 guideline includes expand_task (full MCP access)."""
+        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
+        assert 'expand_task' in _STAGE2_PROJECT_ID_GUIDELINE
+
+    def test_stage2_constant_includes_parse_prd(self):
+        """Stage 2 guideline includes parse_prd (full MCP access)."""
+        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
+        assert 'parse_prd' in _STAGE2_PROJECT_ID_GUIDELINE
+
+    def test_stage1_does_not_include_task_tools(self):
+        """Stage 1 guideline does not include task write tools (Stage 1 is memory-only)."""
+        from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+        assert 'get_tasks' not in _STAGE1_PROJECT_ID_GUIDELINE
+        assert 'set_task_status' not in _STAGE1_PROJECT_ID_GUIDELINE
+        assert 'add_task' not in _STAGE1_PROJECT_ID_GUIDELINE
+
+    def test_stage3_does_not_include_write_tools(self):
+        """Stage 3 guideline does not include write tools (Stage 3 is read-only)."""
+        from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'add_memory' not in _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'delete_memory' not in _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'set_task_status' not in _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'add_task' not in _STAGE3_PROJECT_ID_GUIDELINE
+
+
+class TestStagePayloadProjectIdGuideline:
+    """All three stages include the per-stage project_id guideline in their assembled payload."""
+
+    @pytest.fixture
+    def memory_mock(self):
+        m = AsyncMock()
+        m.get_episodes = AsyncMock(return_value=[])
+        m.mem0 = AsyncMock()
+        m.mem0.get_all = AsyncMock(return_value={'results': []})
+        m.get_status = AsyncMock(return_value={})
+        return m
+
+    @pytest.fixture
+    def mock_deps_for_stage(self, memory_mock):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': memory_mock,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'stage_class,stage_id,expected_guideline_import,extra_setup,expected_tools,excluded_tools',
+        [
+            (
+                'MemoryConsolidator',
+                StageId.memory_consolidator,
+                '_STAGE1_PROJECT_ID_GUIDELINE',
+                'limits',
+                ['add_memory'],                          # Stage 1 has memory write access
+                ['get_tasks', 'set_task_status', 'add_task'],  # Stage 1 has no task tools
+            ),
+            (
+                'TaskKnowledgeSync',
+                StageId.task_knowledge_sync,
+                '_STAGE2_PROJECT_ID_GUIDELINE',
+                'taskmaster',
+                ['expand_task', 'parse_prd'],            # Stage 2 has full MCP access
+                [],
+            ),
+            (
+                'IntegrityCheck',
+                StageId.integrity_check,
+                '_STAGE3_PROJECT_ID_GUIDELINE',
+                None,
+                ['get_tasks'],                           # Stage 3 reads tasks
+                ['add_memory', 'delete_memory', 'set_task_status', 'add_task'],  # read-only
+            ),
+        ],
+    )
+    async def test_stage_payload_contains_project_id_guideline(
+        self,
+        mock_deps_for_stage,
+        stage_class,
+        stage_id,
+        expected_guideline_import,
+        extra_setup,
+        expected_tools,
+        excluded_tools,
+    ):
+        """Each stage's assembled payload contains the per-stage project_id guideline
+        with the project_id correctly interpolated, and with the correct tool list."""
+        from fused_memory.reconciliation import prompts as prompts_module
+
+        guideline_template = getattr(prompts_module, expected_guideline_import)
+        project_id = 'test_proj'
+        expected_guideline = guideline_template.format(project_id=project_id)
+
+        # Build stage instance
+        cls_map = {
+            'MemoryConsolidator': MemoryConsolidator,
+            'TaskKnowledgeSync': TaskKnowledgeSync,
+            'IntegrityCheck': IntegrityCheck,
+        }
+        stage = cls_map[stage_class](stage_id, **mock_deps_for_stage)
+        stage.project_id = project_id
+
+        if extra_setup == 'limits':
+            stage.episode_limit = 125
+            stage.memory_limit = 250
+        elif extra_setup == 'taskmaster':
+            stage.project_root = '/home/leo/src/test_proj'
+            mock_deps_for_stage['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        watermark = Watermark(project_id=project_id)
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert expected_guideline in payload, (
+            f'{stage_class} payload missing per-stage project_id guideline.\n'
+            f'Expected: {expected_guideline!r}\n'
+            f'Payload snippet: {payload[-500:]!r}'
+        )
+
+        # Verify stage-specific tool names appear in the guideline within the payload
+        for tool in expected_tools:
+            assert tool in payload, (
+                f'{stage_class} payload guideline missing expected tool {tool!r}. '
+                f'Payload: {payload[-300:]!r}'
+            )
+
+        # Verify excluded tools are not in the guideline portion of the payload
+        # (they may appear elsewhere in the payload's task/memory data, so we check
+        # that the guideline constant itself doesn't include them)
+        for tool in excluded_tools:
+            assert tool not in expected_guideline, (
+                f'{stage_class} guideline should NOT include {tool!r} but does: '
+                f'{expected_guideline!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_stage2_payload_contains_project_root_instruction(
+        self, mock_deps_for_stage
+    ):
+        """Stage 2 payload additionally includes the project_root= instruction."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_for_stage)
+        stage.project_id = 'test_proj'
+        stage.project_root = '/home/leo/src/test_proj'
+        mock_deps_for_stage['taskmaster'].get_tasks.return_value = {'tasks': []}
+        watermark = Watermark(project_id='test_proj')
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert 'project_root="/home/leo/src/test_proj"' in payload
 

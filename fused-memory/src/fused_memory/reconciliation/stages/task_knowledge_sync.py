@@ -15,6 +15,10 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
 )
+from fused_memory.reconciliation.prompts import (
+    _STAGE2_PROJECT_ID_GUIDELINE,
+    _STAGE3_PROJECT_ID_GUIDELINE,
+)
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
 
@@ -95,7 +99,7 @@ Use entity references + semantic queries, NOT inline content.
 6. Hints on completed tasks are static — don't update them.
 7. When you have completed your work, produce your final structured report as your response.
 
-Always pass project_id="{self.project_id}" when calling fused-memory MCP tools.
+{_STAGE2_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
 Use project_root="{self.project_root}" for all task operations.
 """
 
@@ -149,7 +153,7 @@ Verify consistency across all three systems:
 Stage 1 and Stage 2.
 5. When you have completed your work, produce your final structured report as your response.
 
-Always pass project_id="{self.project_id}" when calling fused-memory MCP tools.
+{_STAGE3_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
 """
 
 
