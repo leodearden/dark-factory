@@ -516,3 +516,53 @@ class TestReconciliationEventProjectId:
             'timestamp': '2024-01-01T00:00:00Z',
         })
         assert evt.project_id == 'dark_factory'
+
+
+# ---------------------------------------------------------------------------
+# Step 5: ReconciliationRun project_id field_validator
+# ---------------------------------------------------------------------------
+
+
+class TestReconciliationRunProjectId:
+    """ReconciliationRun.normalize_project_id strips whitespace and rejects empty project_id."""
+
+    @staticmethod
+    def _make_run(project_id: str):
+        from fused_memory.models.reconciliation import ReconciliationRun
+
+        return ReconciliationRun(
+            id='run-1',
+            project_id=project_id,
+            run_type='full',
+            trigger_reason='test',
+            started_at='2024-01-01T00:00:00Z',
+        )
+
+    def test_valid_project_id_passes_through_unchanged(self):
+        run = self._make_run('dark_factory')
+        assert run.project_id == 'dark_factory'
+
+    def test_leading_trailing_whitespace_is_stripped(self):
+        run = self._make_run('  dark_factory  ')
+        assert run.project_id == 'dark_factory'
+
+    def test_whitespace_only_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            self._make_run('   ')
+
+    def test_empty_string_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            self._make_run('')
+
+    def test_model_validate_dict_strips_whitespace(self):
+        """mode='before' works for DB deserialization path (model_validate)."""
+        from fused_memory.models.reconciliation import ReconciliationRun
+
+        run = ReconciliationRun.model_validate({
+            'id': 'run-1',
+            'project_id': '  dark_factory  ',
+            'run_type': 'full',
+            'trigger_reason': 'test',
+            'started_at': '2024-01-01T00:00:00Z',
+        })
+        assert run.project_id == 'dark_factory'
