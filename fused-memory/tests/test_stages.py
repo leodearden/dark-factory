@@ -377,8 +377,13 @@ class TestTaskKnowledgeSyncPayload:
         assert 'project_id="reify"' in payload
 
 
-class TestProjectIdValidation:
-    """BaseStage.run() validates project_id and watermark.project_id."""
+class BaseStageValidationTest:
+    """Shared infrastructure for stage validation test classes.
+
+    Both TestProjectIdValidation and TestRunIdValidation inherit from this base
+    to avoid duplicating _fake_assemble_payload, _fake_run_stage_via_cli,
+    mock_deps, and _patch_stage.
+    """
 
     @staticmethod
     async def _fake_assemble_payload(
@@ -427,6 +432,10 @@ class TestProjectIdValidation:
                 yield
 
         return _ctx()
+
+
+class TestProjectIdValidation(BaseStageValidationTest):
+    """BaseStage.run() validates project_id and watermark.project_id."""
 
     @pytest.mark.asyncio
     async def test_run_raises_on_empty_project_id(self, mock_deps):
@@ -534,7 +543,8 @@ class TestProjectIdValidation:
                 prior_reports=[],
                 run_id='test-run-6',
             )
-        assert 'dark_factory' in captured_kwargs.get('payload', '')
+        assert 'payload' in captured_kwargs
+        assert '`project_id`: "dark_factory"' in captured_kwargs['payload']
 
     @pytest.mark.asyncio
     async def test_whitespace_watermark_project_id_treated_as_empty(self, mock_deps, caplog):
@@ -601,50 +611,8 @@ class TestProjectIdValidation:
             assert isinstance(stage.assemble_payload, (AsyncMock, MagicMock))
 
 
-class TestRunIdValidation:
+class TestRunIdValidation(BaseStageValidationTest):
     """BaseStage.run() validates run_id before prompt interpolation."""
-
-    @staticmethod
-    async def _fake_assemble_payload(
-        events,
-        watermark,
-        prior_reports,
-    ) -> str:
-        return 'fake payload'
-
-    @staticmethod
-    async def _fake_run_stage_via_cli(**kwargs):
-        return StageResult(
-            success=True,
-            report={'summary': 'ok'},
-        )
-
-    @pytest.fixture
-    def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-        }
-
-    def _patch_stage(self, stage, cli_side_effect=None):
-        """Return a context manager that patches assemble_payload and run_stage_via_cli."""
-        effective_cli_side_effect = cli_side_effect if cli_side_effect is not None else self._fake_run_stage_via_cli
-
-        @contextmanager
-        def _ctx():
-            with (
-                patch.object(stage, 'assemble_payload', side_effect=self._fake_assemble_payload),
-                patch(
-                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                    side_effect=effective_cli_side_effect,
-                ),
-            ):
-                yield
-
-        return _ctx()
 
     @pytest.mark.asyncio
     async def test_run_raises_on_empty_run_id(self, mock_deps):
@@ -675,17 +643,22 @@ class TestRunIdValidation:
             )
 
     @pytest.mark.asyncio
-    async def test_run_raises_on_injection_run_id(self, mock_deps):
+    @pytest.mark.parametrize('bad_run_id,vector_name', [
+        ('run\nid', 'newline'),
+        ('run`id', 'backtick'),
+        ('run;id', 'semicolon'),
+    ])
+    async def test_run_raises_on_injection_run_id(self, mock_deps, bad_run_id, vector_name):
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'dark_factory'
 
-        with self._patch_stage(stage), pytest.raises(ValueError):
+        with self._patch_stage(stage), pytest.raises(ValueError, match='run_id'):
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id='dark_factory'),
                 prior_reports=[],
-                run_id='run\nid`injection',
+                run_id=bad_run_id,
             )
 
     @pytest.mark.asyncio
@@ -727,7 +700,27 @@ class TestRunIdValidation:
                 prior_reports=[],
                 run_id=run_id_value,
             )
-        assert run_id_value in captured_kwargs.get('payload', '')
+        assert 'payload' in captured_kwargs
+        assert f'run_id: {run_id_value}' in captured_kwargs['payload']
+
+
+class TestBaseStageValidationContract:
+    """Verify that BaseStageValidationTest exists and provides the four shared members."""
+
+    def test_base_class_exists(self):
+        assert BaseStageValidationTest is not None, "BaseStageValidationTest must be defined in test_stages.py"
+
+    def test_base_class_has_fake_assemble_payload(self):
+        assert hasattr(BaseStageValidationTest, '_fake_assemble_payload'), "missing _fake_assemble_payload"
+
+    def test_base_class_has_fake_run_stage_via_cli(self):
+        assert hasattr(BaseStageValidationTest, '_fake_run_stage_via_cli'), "missing _fake_run_stage_via_cli"
+
+    def test_base_class_has_mock_deps_fixture(self):
+        assert hasattr(BaseStageValidationTest, 'mock_deps'), "missing mock_deps fixture"
+
+    def test_base_class_has_patch_stage_helper(self):
+        assert hasattr(BaseStageValidationTest, '_patch_stage'), "missing _patch_stage helper"
 
 
 class TestTierConfig:
