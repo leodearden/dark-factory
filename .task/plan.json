@@ -1,0 +1,119 @@
+{
+  "task_id": "218",
+  "title": "Make MemoryConsolidator tier limits explicit with sentinel defaults",
+  "files": [
+    "fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py",
+    "fused-memory/tests/test_stages.py",
+    "fused-memory/tests/test_harness.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/reconciliation/stages",
+    "fused-memory/tests"
+  ],
+  "analysis": "MemoryConsolidator (memory_consolidator.py:26-27) has class-level defaults episode_limit=500 and memory_limit=1000 \u2014 the opus-tier values. The harness always overrides them (harness.py:417-419) before calling stage.run(), but if the harness assignment is ever skipped or reordered, the stage silently runs with opus limits even in sonnet-tier cycles.\n\nThe fix: (1) change defaults to None sentinels, (2) add a validation guard in assemble_payload() that raises ValueError if limits weren't explicitly set \u2014 following the existing require_* pattern from utils/validation.py, (3) update existing tests and add a new test for the validation guard.\n\nKey observations:\n- BaseStage.run() calls assemble_payload() on line 109 \u2014 this is the natural place to validate, since it's the point where limits are consumed.\n- The remediation path (_assemble_remediation_payload) does NOT use limits, so validation should only fire on the non-remediation path.\n- The existing require_project_id/require_run_id pattern in base.py:run() uses ValueError raises \u2014 we follow the same pattern.\n- test_stages.py TestTierConfig has test_default_limits (expects 500/1000) and test_limits_are_writable (also checks 500/1000 before overwrite). Both need updating.\n- test_harness.py test_run_full_cycle_propagates_tier_to_consolidator already covers the happy path where harness sets limits \u2014 no changes needed there.\n- No new files needed \u2014 all changes are modifications to existing files.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Update test_default_limits in test_stages.py::TestTierConfig to expect sentinel None values instead of 500/1000. This test should now verify that episode_limit and memory_limit are None by default.",
+      "status": "done",
+      "commit": "78f67f64"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Change MemoryConsolidator class-level defaults from episode_limit:int=500, memory_limit:int=1000 to episode_limit:int|None=None, memory_limit:int|None=None in memory_consolidator.py:26-27. Update the comment to clarify sentinel behavior.",
+      "status": "done",
+      "commit": "d9e29919"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Update test_limits_are_writable in test_stages.py::TestTierConfig: change the 'before' assertions from 500/1000 to None. The 'after' assertions (125/250) remain the same.",
+      "status": "done",
+      "commit": "d2703556"
+    },
+    {
+      "id": "step-4",
+      "type": "test",
+      "description": "Add test_assemble_payload_raises_without_limits in test_stages.py::TestTierConfig: instantiate MemoryConsolidator without setting limits, call assemble_payload(), and assert it raises ValueError with a clear message about limits not being set. Use minimal mock events/watermark/prior_reports args.",
+      "status": "done",
+      "commit": "0454dd5e"
+    },
+    {
+      "id": "step-5",
+      "type": "impl",
+      "description": "Add validation guard at the top of assemble_payload() in memory_consolidator.py, before the remediation check. If episode_limit is None or memory_limit is None, raise ValueError('episode_limit and memory_limit must be explicitly set by the harness before run(); got episode_limit={self.episode_limit}, memory_limit={self.memory_limit}'). Place this BEFORE the remediation short-circuit so the contract is enforced universally.",
+      "status": "done",
+      "commit": "5cedf00f"
+    },
+    {
+      "id": "step-6",
+      "type": "test",
+      "description": "Add test_assemble_payload_succeeds_with_limits_set in test_stages.py::TestTierConfig: set episode_limit=125 and memory_limit=250 on the stage, then call assemble_payload() with mocked memory service and verify it does NOT raise. This confirms the validation passes when limits are properly configured.",
+      "status": "done",
+      "commit": "21d149b4"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Add test_remediation_path_also_validates_limits in test_stages.py::TestTierConfig: set remediation_findings to a non-empty list but leave limits as None. Call assemble_payload() and verify it still raises ValueError \u2014 confirming the validation is before the remediation short-circuit.",
+      "status": "done",
+      "commit": "93fdb49c"
+    },
+    {
+      "id": "step-8",
+      "type": "test",
+      "description": "Verify test_run_full_cycle_propagates_tier_to_consolidator in test_harness.py still passes as-is \u2014 the harness sets limits before run(), so the validation should not trigger. Run the test to confirm no regressions. No code changes expected.",
+      "status": "done",
+      "commit": "765e7d35"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use None sentinels instead of 0",
+      "rationale": "None clearly signals 'not set' and is unambiguous \u2014 0 could be confused with 'fetch zero items' which is a valid (if unusual) limit. None also enables clean type annotation (int | None) and idiomatic 'is None' checks."
+    },
+    {
+      "decision": "Validate in assemble_payload() rather than run()",
+      "rationale": "assemble_payload() is where limits are consumed (lines 55, 71). Validating at the consumption point follows fail-fast principles. BaseStage.run() calls assemble_payload() (base.py:109), so the error surfaces at the same call site either way, but assemble_payload() is the tighter scope."
+    },
+    {
+      "decision": "Validate BEFORE the remediation short-circuit",
+      "rationale": "Even though remediation doesn't use limits, the contract should be universal: the harness must always set limits before running any stage mode. This prevents a future code change to the remediation path from silently using None limits."
+    },
+    {
+      "decision": "Raise ValueError following existing require_* pattern",
+      "rationale": "BaseStage.run() already uses require_project_id() and require_run_id() which raise ValueError. Using the same error type for limit validation keeps the error handling consistent. The message includes both field names and values for debuggability."
+    },
+    {
+      "decision": "No changes to harness.py",
+      "rationale": "The harness already correctly sets limits on lines 417-419. The test_run_full_cycle_propagates_tier_to_consolidator test confirms this. No changes needed \u2014 the task is about making the MemoryConsolidator side defensive, not changing the harness."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "ValueError raise pattern from require_* validators",
+      "where": "fused-memory/src/fused_memory/utils/validation.py",
+      "how": "Follow the same error message style and ValueError usage. The validation is simple enough to inline rather than adding a new require_* function."
+    },
+    {
+      "what": "BaseStage.run() validation pattern",
+      "where": "fused-memory/src/fused_memory/reconciliation/stages/base.py:92-93",
+      "how": "run() already validates project_id and run_id before calling assemble_payload(). Our limit validation sits in assemble_payload(), complementing the existing guards."
+    },
+    {
+      "what": "TestTierConfig test fixtures and setup pattern",
+      "where": "fused-memory/tests/test_stages.py:767-790",
+      "how": "New tests follow the same instantiation pattern: ReconciliationConfig(), MemoryConsolidator(StageId.memory_consolidator, AsyncMock(), AsyncMock(), AsyncMock(), config). Add project_id assignment for async tests that call assemble_payload()."
+    },
+    {
+      "what": "Existing harness tier propagation test",
+      "where": "fused-memory/tests/test_harness.py:987-1031",
+      "how": "test_run_full_cycle_propagates_tier_to_consolidator already validates the harness sets limits correctly. Step 8 just verifies it still passes \u2014 no modifications needed."
+    }
+  ],
+  "_session_id": "218-11b4e0b9",
+  "_created_at": "2026-03-28T15:28:22.104337+00:00"
+}
