@@ -546,6 +546,19 @@ class TestParseUtc:
             _parse_utc(None)
 
 
+class TestPartitionBurstStateLocation:
+    """Verify partition_burst_state and _ACTIVE_THRESHOLD_SECONDS live in reconciliation."""
+
+    def test_importable_from_reconciliation(self):
+        """partition_burst_state and _ACTIVE_THRESHOLD_SECONDS importable from data layer."""
+        from dashboard.data.reconciliation import (  # noqa: F401
+            _ACTIVE_THRESHOLD_SECONDS,
+            partition_burst_state,
+        )
+        assert callable(partition_burst_state)
+        assert _ACTIVE_THRESHOLD_SECONDS == 3600
+
+
 class TestWithDb:
     """Unit tests for the with_db helper function."""
 
