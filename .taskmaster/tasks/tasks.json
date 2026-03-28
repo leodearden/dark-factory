@@ -4353,15 +4353,16 @@
         "description": "NULL started_at with non-NULL completed_at in the runs table causes unhandled TypeError from parse_utc, bypassing the declared default return.",
         "details": "## Problem\n\nIn `get_recent_runs` (dashboard/src/dashboard/data/reconciliation.py, lines 80-83), the guard `if row['completed_at'] is not None` only protects against NULL `completed_at`. If `started_at` is NULL while `completed_at` is not NULL, `parse_utc(row['started_at'])` raises TypeError that propagates through `_query` and `with_db` (which only catches `sqlite3.OperationalError`), so the caller receives an unhandled exception rather than the declared default `[]`.\n\n## Fix\n\nWrap the duration computation block in a per-row `try/except (ValueError, TypeError)` that sets `duration = None` and logs a debug warning, matching the pattern used in `partition_burst_state`:\n\n```python\nif row['completed_at'] is not None:\n    try:\n        started = parse_utc(row['started_at'])\n        completed = parse_utc(row['completed_at'])\n        duration = (completed - started).total_seconds()\n    except (ValueError, TypeError) as exc:\n        logger.debug('run %s: bad timestamps (%s)', row['id'], exc)\n```\n\nAdd a test with NULL started_at + non-NULL completed_at to verify graceful degradation.\n\n## Memory hints\n- search: \"parse_utc utility dashboard reconciliation\"\n- search: \"with_db exception handling default\"",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-28T05:23:11.897Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T05:23:10.599Z",
+      "lastModified": "2026-03-28T05:23:11.897Z",
       "taskCount": 243,
       "completedCount": 192,
       "tags": [
