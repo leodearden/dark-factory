@@ -255,8 +255,9 @@ class TestYamlSettingsSourceErrorHandling:
         locked_file.chmod(0o000)
         try:
             source = self._make_source(locked_file)
-            with pytest.raises(RuntimeError, match=str(locked_file)):
+            with pytest.raises(RuntimeError, match=str(locked_file)) as exc_info:
                 source()
+            assert exc_info.value.__cause__ is not None
         finally:
             locked_file.chmod(0o644)
 

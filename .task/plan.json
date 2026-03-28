@@ -32,14 +32,14 @@
       "type": "impl",
       "description": "Verify step-1 test passes \u2014 no implementation change needed since schema.py line 67 already uses 'raise RuntimeError(...) from e'. Run test suite to confirm green.",
       "status": "done",
-      "commit": "placeholder-step-2"
+      "commit": "882016b3"
     },
     {
       "id": "step-3",
       "type": "test",
       "description": "Add __cause__ assertion to test_unreadable_file_raises_runtime_error: capture exc_info and assert exc_info.value.__cause__ is not None (verifies chaining for OSError from permission denied). This strengthens the existing test at line 250.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "placeholder-step-3"
     },
     {
       "id": "step-4",
