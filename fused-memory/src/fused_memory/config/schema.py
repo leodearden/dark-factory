@@ -52,7 +52,7 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
             return [self._expand_env_vars(item) for item in value]
         return value
 
-    def get_field_value(self, field_name: str, field_info: Any) -> Any:
+    def get_field_value(self, field: Any, field_name: str) -> Any:
         # Resolution handled in __call__; satisfy abstract interface with no-op.
         return None
 
