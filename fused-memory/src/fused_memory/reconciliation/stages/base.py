@@ -20,7 +20,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE_REPORT_SCHEMA,
     run_stage_via_cli,
 )
-from fused_memory.utils.validation import validate_project_id
+from fused_memory.utils.validation import validate_project_id, validate_run_id
 
 if TYPE_CHECKING:
     from fused_memory.backends.taskmaster_client import TaskmasterBackend
@@ -91,6 +91,10 @@ class BaseStage:
         """Execute this stage via Claude CLI with MCP tools."""
         # Validate project_id
         if err := validate_project_id(self.project_id):
+            raise ValueError(err['error'])
+
+        # Validate run_id (must be non-empty and contain only safe characters)
+        if err := validate_run_id(run_id):
             raise ValueError(err['error'])
 
         # Validate watermark.project_id consistency (skip if watermark has no project_id)

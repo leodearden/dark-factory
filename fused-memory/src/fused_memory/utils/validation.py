@@ -10,6 +10,9 @@ Two styles:
 from __future__ import annotations
 
 import os
+import re
+
+_RUN_ID_PATTERN = re.compile(r'[a-zA-Z0-9_-]+')
 
 
 def validate_project_root(project_root: str) -> dict[str, str] | None:
@@ -27,6 +30,30 @@ def validate_project_id(project_id: str) -> dict[str, str] | None:
     if not project_id or not project_id.strip():
         return {
             'error': 'project_id is required and must be non-empty',
+            'error_type': 'ValidationError',
+        }
+    return None
+
+
+def validate_run_id(run_id: str) -> dict[str, str] | None:
+    """Return an error dict if run_id is empty or contains unsafe characters, else None.
+
+    Accepted characters: ASCII letters, digits, hyphens, underscores.
+    This allowlist blocks all prompt-injection vectors (newlines, quotes, backticks,
+    braces, semicolons) while remaining forward-compatible with UUID4 and similar
+    safe identifier formats.
+    """
+    if not run_id or not run_id.strip():
+        return {
+            'error': 'run_id is required and must be non-empty',
+            'error_type': 'ValidationError',
+        }
+    if not _RUN_ID_PATTERN.fullmatch(run_id):
+        return {
+            'error': (
+                f'run_id contains invalid characters: {run_id!r}. '
+                'Only ASCII letters, digits, hyphens, and underscores are allowed.'
+            ),
             'error_type': 'ValidationError',
         }
     return None
