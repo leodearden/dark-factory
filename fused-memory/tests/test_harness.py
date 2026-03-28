@@ -907,6 +907,7 @@ class TestSelectTier:
 
         tier = await harness._select_tier('test-project')
 
+        harness.buffer.get_buffer_stats.assert_called_once_with('test-project')
         assert isinstance(tier, TierConfig)
         assert tier.model == 'sonnet'
         assert tier.episode_limit == 125
@@ -942,6 +943,7 @@ class TestSelectTier:
 
         tier = await harness._select_tier('test-project')
 
+        harness.buffer.get_buffer_stats.assert_called_once_with('test-project')
         assert isinstance(tier, TierConfig)
         assert tier.model == 'opus'
         assert tier.episode_limit == 500
@@ -977,6 +979,7 @@ class TestSelectTier:
 
         tier = await harness._select_tier('test-project')
 
+        harness.buffer.get_buffer_stats.assert_called_once_with('test-project')
         assert isinstance(tier, TierConfig)
         assert tier.model == 'sonnet', (
             "size==threshold should return sonnet (condition is strictly >); "
