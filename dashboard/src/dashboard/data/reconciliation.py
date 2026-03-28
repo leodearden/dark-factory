@@ -42,16 +42,20 @@ def partition_burst_state(
             active.append(agent)
             continue
         # Idle agents with recent writes are still "active" for display
+        last_write_at = agent.get('last_write_at')
+        if last_write_at is None:
+            idle.append(agent)
+            continue
         try:
-            last_write_at = agent.get('last_write_at')
-            if last_write_at is None:
-                raise TypeError('last_write_at is None')
             last_write = parse_utc(last_write_at)
             if (now - last_write).total_seconds() < active_threshold_seconds:
                 active.append(agent)
                 continue
-        except (ValueError, TypeError):
-            pass
+        except (ValueError, TypeError) as exc:
+            logger.debug(
+                'agent %s: bad last_write_at %r (%s)',
+                agent.get('agent_id'), last_write_at, exc,
+            )
         idle.append(agent)
     return active, idle
 

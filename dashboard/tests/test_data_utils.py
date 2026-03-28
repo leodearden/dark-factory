@@ -45,6 +45,15 @@ class TestParseUtc:
         with pytest.raises(TypeError):
             parse_utc(None)  # type: ignore[arg-type]
 
+    def test_none_raises_type_error_with_explicit_message(self):
+        """TypeError raised for None should have the explicit message 'timestamp is None'."""
+        import pytest
+
+        from dashboard.data.utils import parse_utc
+
+        with pytest.raises(TypeError, match='timestamp is None'):
+            parse_utc(None)  # type: ignore[arg-type]
+
 
 class TestTimeagoUsesParseUtc:
     """Tests verifying that app.py uses parse_utc from dashboard.data.utils (DRY)."""

@@ -235,6 +235,31 @@ class TestPartitionBurstState:
         assert len(active) == 0
         assert len(idle) == 1
 
+    def test_malformed_timestamp_logs_debug(self, caplog):
+        """A malformed last_write_at timestamp should emit a DEBUG log with agent_id."""
+        import logging
+
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'bad-agent', 'state': 'idle', 'last_write_at': 'not-a-date'}]
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
+            active, idle = partition_burst_state(agents)
+
+        # Agent still lands in idle (existing behaviour unchanged)
+        assert len(active) == 0
+        assert len(idle) == 1
+
+        # A DEBUG record must be emitted containing 'bad last_write_at' and the agent_id
+        debug_records = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG
+            and r.name == 'dashboard.data.reconciliation'
+        ]
+        assert any(
+            'bad last_write_at' in r.getMessage() and 'bad-agent' in r.getMessage()
+            for r in debug_records
+        ), f"Expected debug log with 'bad last_write_at' and 'bad-agent', got: {[r.getMessage() for r in debug_records]}"
+
 
 class TestFormatDuration:
     """Tests for the format_duration Jinja2 filter (accepts seconds)."""
