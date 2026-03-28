@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import uuid as uuid_mod
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -180,6 +181,67 @@ class MemoryService:
             return await self._execute_mem0_classify_and_add(payload)
         return await self._execute_graphiti_write(operation, payload)
 
+    # ------------------------------------------------------------------
+    # Dedup: remove duplicate edges created by a single add_episode call
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_fact(text: str) -> str:
+        """Normalize a fact string for dedup comparison.
+
+        Replicates graphiti_core's internal normalization:
+        lowercase + collapse whitespace.  Two facts that differ only in
+        capitalisation or spacing are treated as the same edge.
+        """
+        return re.sub(r'\s+', ' ', text.lower()).strip()
+
+    async def _dedup_episode_edges(self, result: Any) -> int:
+        """Remove duplicate edges produced by a single add_episode call.
+
+        Graphiti's LLM extraction pipeline can emit multiple edges that
+        express the same fact (same source_node_uuid, target_node_uuid,
+        and normalised fact text).  This method groups the edges returned
+        in *result* by that triple and deletes all but the first edge in
+        each group via ``bulk_remove_edges``.
+
+        Args:
+            result: The value returned by ``add_episode`` (typically an
+                    AddEpisodeResults object with an ``edges`` attribute).
+                    Handles ``None`` and objects with empty/missing edges
+                    gracefully.
+
+        Returns:
+            Number of duplicate edges removed (0 when nothing to do).
+        """
+        if result is None:
+            return 0
+
+        edges = getattr(result, 'edges', None) or getattr(result, 'entity_edges', None) or []
+        if not edges:
+            return 0
+
+        # Group edges by (source_node_uuid, target_node_uuid, normalized_fact)
+        seen: dict[tuple[str, str, str], str] = {}   # key → first uuid
+        duplicates: list[str] = []
+
+        for edge in edges:
+            src_uuid = getattr(edge, 'source_node_uuid', '') or ''
+            tgt_uuid = getattr(edge, 'target_node_uuid', '') or ''
+            fact_norm = self._normalize_fact(getattr(edge, 'fact', '') or '')
+            edge_uuid = getattr(edge, 'uuid', '') or ''
+            key = (src_uuid, tgt_uuid, fact_norm)
+
+            if key in seen:
+                duplicates.append(edge_uuid)
+            else:
+                seen[key] = edge_uuid
+
+        if not duplicates:
+            return 0
+
+        logger.info('Deduplicating %d edge(s) after add_episode', len(duplicates))
+        return await self.graphiti.bulk_remove_edges(duplicates)
+
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
     ) -> Any:
@@ -211,6 +273,8 @@ class MemoryService:
                 temporal_context=temporal_context,
             ),
         )
+        # Post-write dedup: remove duplicate edges created within this episode
+        await self._dedup_episode_edges(result)
         return result
 
     async def _execute_mem0_write(self, payload: dict[str, Any]) -> Any:
@@ -323,7 +387,7 @@ class MemoryService:
         if result is None:
             return
 
-        edges = getattr(result, 'entity_edges', None) or []
+        edges = getattr(result, 'edges', None) or getattr(result, 'entity_edges', None) or []
         if not edges:
             return
 
