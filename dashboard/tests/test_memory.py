@@ -344,6 +344,8 @@ class TestGetMemoryStatus:
         assert 'offline' not in result
         # Prove port 9000 was actually attempted before falling through to 9001
         assert 9000 in ports_seen
+        # Prove the fallback server (9001) was actually reached
+        assert 9001 in ports_seen
 
 
 # ── get_queue_stats (aggregation) ──────────────────────────────
