@@ -43,12 +43,25 @@
             document.body.addEventListener('htmx:sendError', showError);
         })();
         (function () {
+            function markStampFailed(evt) {
+                var section = evt.detail.target;
+                var name = section && section.getAttribute('data-section');
+                if (!name) return;
+                var stamp = document.querySelector('[data-updated-for="' + name + '"]');
+                if (!stamp) return;
+                stamp.textContent = 'Update failed \u2014 retrying\u2026';
+                stamp.setAttribute('data-update-failed', '1');
+            }
+            document.body.addEventListener('htmx:responseError', markStampFailed);
+            document.body.addEventListener('htmx:timeout', markStampFailed);
+            document.body.addEventListener('htmx:sendError', markStampFailed);
             document.body.addEventListener('htmx:afterSwap', function (evt) {
                 var section = evt.detail.target;
                 var name = section && section.getAttribute('data-section');
                 if (!name) return;
                 var stamp = document.querySelector('[data-updated-for="' + name + '"]');
                 if (!stamp) return;
+                stamp.removeAttribute('data-update-failed');
                 stamp.setAttribute('data-updated-at', String(Date.now()));
                 stamp.textContent = 'Updated just now';
                 section.classList.add('section-refreshed');
@@ -59,6 +72,7 @@
             setInterval(function () {
                 var stamps = document.querySelectorAll('[data-updated-at]');
                 stamps.forEach(function (el) {
+                    if (el.getAttribute('data-update-failed')) return;
                     var ts = parseInt(el.getAttribute('data-updated-at'), 10);
                     var elapsed = Math.floor((Date.now() - ts) / 1000);
                     if (elapsed < 5) {
