@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 import pytest
@@ -146,6 +148,45 @@ CREATE TABLE IF NOT EXISTS run_actions (
 );
 CREATE INDEX IF NOT EXISTS idx_ra_run ON run_actions(run_id);
 """
+
+
+@asynccontextmanager
+async def make_recon_db(
+    tmp_path: Path,
+    inserts: list[str | tuple[str, Any]],
+    *,
+    name: str = 'test.db',
+    schema: str | None = None,
+):
+    """Async context manager that creates a temporary SQLite reconciliation DB.
+
+    Creates a DB at ``tmp_path / name``, applies ``schema`` (defaults to
+    ``RECONCILIATION_SCHEMA``), executes each statement in ``inserts``, then
+    yields an :class:`aiosqlite.Connection` with ``row_factory`` set to
+    :class:`aiosqlite.Row`.  The connection is closed on context exit.
+
+    Each entry in *inserts* is either:
+    - a plain SQL string: executed with ``conn.execute(sql)``
+    - a ``(sql, params)`` tuple: executed with ``conn.execute(sql, params)``
+    """
+    if schema is None:
+        schema = RECONCILIATION_SCHEMA
+
+    db_path = tmp_path / name
+    sync_conn = sqlite3.connect(str(db_path))
+    sync_conn.executescript(schema)
+    for stmt in inserts:
+        if isinstance(stmt, str):
+            sync_conn.execute(stmt)
+        else:
+            sql, params = stmt
+            sync_conn.execute(sql, params)
+    sync_conn.commit()
+    sync_conn.close()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
 
 
 @pytest.fixture()
