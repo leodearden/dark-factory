@@ -6,6 +6,8 @@ from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
+from .test_helpers import _get_opening_tag
+
 
 class TestFormatTriggerFilter:
     """Tests for the format_trigger Jinja2 filter function."""
@@ -636,11 +638,8 @@ class TestReconJournalBadge:
             html = client.get('/partials/recon').text
         assert '<button' in html and 'data-testid="journal-badge"' in html
         # Extract the badge element and verify it's a button, not a span
-        badge_start = html.find('data-testid="journal-badge"')
-        assert badge_start != -1
-        # Walk back to find the opening tag
-        tag_start = html.rfind('<', 0, badge_start)
-        assert html[tag_start:tag_start + 7] == '<button'
+        tag = _get_opening_tag(html, 'data-testid="journal-badge"')
+        assert tag.startswith('<button')
         assert '</button>' in html
 
     def test_badge_has_aria_label(self, client):
@@ -663,12 +662,7 @@ class TestReconJournalBadge:
     def test_badge_no_cursor_pointer(self, client):
         with _patch_recon_data():
             html = client.get('/partials/recon').text
-        badge_start = html.find('data-testid="journal-badge"')
-        assert badge_start != -1
-        tag_start = html.rfind('<', 0, badge_start)
-        # Find closing > of opening tag
-        tag_end = html.find('>', tag_start)
-        opening_tag = html[tag_start:tag_end + 1]
+        opening_tag = _get_opening_tag(html, 'data-testid="journal-badge"')
         assert 'cursor-pointer' not in opening_tag
 
     def test_badge_aria_label_dynamic_count(self, client):
