@@ -239,9 +239,7 @@ async def get_buffer_stats(db: aiosqlite.Connection | None) -> dict:
 
         age = None
         if oldest_ts is not None:
-            oldest_dt = datetime.fromisoformat(oldest_ts)
-            if oldest_dt.tzinfo is None:
-                oldest_dt = oldest_dt.replace(tzinfo=UTC)
+            oldest_dt = _parse_utc(oldest_ts)
             age = (datetime.now(UTC) - oldest_dt).total_seconds()
 
         return {'buffered_count': count, 'oldest_event_age_seconds': age}
