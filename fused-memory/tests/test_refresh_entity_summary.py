@@ -411,3 +411,23 @@ class TestDisallowListForRefreshEntitySummary:
         via DISALLOW_MEMORY_WRITES)."""
         from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
         assert 'mcp__fused-memory__refresh_entity_summary' in STAGE3_DISALLOWED
+
+
+# ---------------------------------------------------------------------------
+# step-13: STAGE1_SYSTEM_PROMPT mentions refresh_entity_summary
+# ---------------------------------------------------------------------------
+
+class TestStage1PromptMentionsRefreshEntitySummary:
+    """STAGE1_SYSTEM_PROMPT must list the tool and guide its usage."""
+
+    def test_prompt_lists_refresh_entity_summary_tool(self):
+        """STAGE1_SYSTEM_PROMPT lists 'refresh_entity_summary' in Available Tools section."""
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        assert 'refresh_entity_summary' in STAGE1_SYSTEM_PROMPT
+
+    def test_prompt_instructs_calling_after_edge_deletion(self):
+        """STAGE1_SYSTEM_PROMPT instructs agent to call refresh after deleting edges."""
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        # The prompt should mention refreshing summary after deleting edges
+        prompt_lower = STAGE1_SYSTEM_PROMPT.lower()
+        assert 'after delet' in prompt_lower or 'after you delet' in prompt_lower
