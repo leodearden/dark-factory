@@ -4,10 +4,50 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import aiosqlite
 import pytest
 from starlette.testclient import TestClient
+
+# Path to the generated tailwind.css (gitignored, built via `make css`)
+_STATIC_DIR = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'static'
+_TAILWIND_CSS = _STATIC_DIR / 'tailwind.css'
+
+# Minimal stub so tests pass on a fresh checkout without running `make css`.
+# Contains the utility classes and keyframes that tests assert on.
+_TAILWIND_STUB = """\
+/* Auto-generated stub for testing — real file built by `make css` */
+.bg-gray-900 { background-color: #111827; }
+.text-gray-100 { color: #f3f4f6; }
+@keyframes section-refresh-pulse {
+    from { background-color: rgba(96, 165, 250, 0.05); }
+    to   { background-color: transparent; }
+}
+.section-refreshed {
+    animation: section-refresh-pulse 600ms ease-out;
+    border-radius: 0.5rem;
+}
+"""
+
+
+@pytest.fixture(autouse=True, scope='session')
+def _ensure_tailwind_css():
+    """Create a stub tailwind.css if the built file is missing.
+
+    The real tailwind.css is gitignored and produced by ``make css``.
+    This fixture ensures tests that fetch ``/static/tailwind.css`` don't
+    get a 404 on a fresh checkout.  If the file already exists (e.g. from
+    a prior ``make css``), it is left untouched.
+    """
+    created = False
+    if not _TAILWIND_CSS.exists():
+        _TAILWIND_CSS.write_text(_TAILWIND_STUB)
+        created = True
+    yield
+    # Clean up only if *we* created the stub
+    if created and _TAILWIND_CSS.exists():
+        _TAILWIND_CSS.unlink()
 
 RECONCILIATION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS watermarks (
