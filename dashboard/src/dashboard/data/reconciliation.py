@@ -56,7 +56,7 @@ def partition_burst_state(
             continue
         # Idle agents with recent writes are still "active" for display
         try:
-            last_write = _parse_utc(agent['last_write_at'])
+            last_write = _parse_utc(agent.get('last_write_at'))
             if (now - last_write).total_seconds() < active_threshold_seconds:
                 active.append(agent)
                 continue
