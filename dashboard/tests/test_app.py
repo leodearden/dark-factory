@@ -346,6 +346,84 @@ class TestOrchestratorsPartialIntegration:
             assert 'No orchestrators detected' in html
 
 
+_PERF_PATHS = {
+    'dark_factory': [
+        {'path': 'one-pass', 'count': 10, 'pct': 50.0},
+        {'path': 'multi-pass', 'count': 4, 'pct': 20.0},
+        {'path': 'via-steward', 'count': 3, 'pct': 15.0},
+    ],
+}
+_PERF_ESCALATIONS = {
+    'dark_factory': {
+        'total_tasks': 20,
+        'steward_count': 3,
+        'interactive_count': 1,
+        'steward_rate': 15.0,
+        'interactive_rate': 5.0,
+        'human_attention': {'zero': 0, 'minimal': 0, 'significant': 1},
+    },
+}
+_PERF_HISTOGRAMS = {
+    'dark_factory': {
+        'outer': {'labels': ['0', '1', '2', '3+'], 'values': [10, 5, 3, 2]},
+        'inner': {'labels': ['0', '1', '2', '3', '4', '5+'], 'values': [8, 6, 3, 2, 1, 0]},
+    },
+}
+_PERF_TTC = {
+    'dark_factory': {'p50': 300_000, 'p75': 450_000, 'p90': 600_000, 'p95': 900_000, 'count': 18},
+}
+
+
+def _patch_perf_integration(paths=_UNSET, escalations=_UNSET, histograms=_UNSET, ttc=_UNSET):
+    """Return an ExitStack that patches all 4 performance data functions."""
+    defaults = {
+        'paths': paths if paths is not _UNSET else _PERF_PATHS,
+        'escalations': escalations if escalations is not _UNSET else _PERF_ESCALATIONS,
+        'histograms': histograms if histograms is not _UNSET else _PERF_HISTOGRAMS,
+        'ttc': ttc if ttc is not _UNSET else _PERF_TTC,
+    }
+    stack = ExitStack()
+    stack.enter_context(patch(
+        'dashboard.app.get_completion_paths',
+        new_callable=AsyncMock,
+        return_value=defaults['paths'],
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_escalation_rates',
+        new_callable=AsyncMock,
+        return_value=defaults['escalations'],
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_loop_histograms',
+        new_callable=AsyncMock,
+        return_value=defaults['histograms'],
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.get_time_centiles',
+        new_callable=AsyncMock,
+        return_value=defaults['ttc'],
+    ))
+    return stack
+
+
+class TestPerformancePartialIntegration:
+    """Integration tests for GET /partials/performance."""
+
+    def test_performance_with_data(self, client):
+        with _patch_perf_integration():
+            resp = client.get('/partials/performance')
+            assert resp.status_code == 200
+            assert 'text/html' in resp.headers['content-type']
+            html = resp.text
+            assert 'Performance' in html
+            assert 'dark_factory' in html
+            assert 'one-pass' in html
+            assert 'Steward' in html
+            assert 'p50' in html
+            assert '5m' in html
+            assert 'new Chart' in html
+
+
 class TestHtmxErrorHandling:
     """Tests for global HTMX error handler script in base.html."""
 
