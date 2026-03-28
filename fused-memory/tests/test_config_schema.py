@@ -234,6 +234,26 @@ class TestYamlSettingsSourceErrorHandling:
             locked_file.chmod(0o644)
 
 
+class TestYamlSettingsSourceEncoding:
+    """Tests for YamlSettingsSource explicit UTF-8 encoding."""
+
+    def _make_source(self, path):
+        from pydantic_settings import BaseSettings
+
+        class _DummySettings(BaseSettings):
+            pass
+
+        return YamlSettingsSource(_DummySettings, config_path=path)
+
+    def test_utf8_yaml_loaded_correctly(self, tmp_path):
+        """YAML files with non-ASCII UTF-8 characters must load correctly."""
+        config_file = tmp_path / 'utf8.yaml'
+        config_file.write_text("description: 'Ünfcödé tëst'", encoding='utf-8')
+        source = self._make_source(config_file)
+        result = source()
+        assert result.get('description') == 'Ünfcödé tëst'
+
+
 class TestYamlSettingsSourceABCContract:
     """Tests for YamlSettingsSource ABC contract compliance."""
 
