@@ -198,3 +198,27 @@ class TestYamlSettingsSourceEnvVarExpansion:
     def test_non_env_string_unchanged(self):
         result = self.source._expand_env_vars('plain-string')
         assert result == 'plain-string'
+
+
+class TestYamlSettingsSourceABCContract:
+    """Tests for YamlSettingsSource ABC contract compliance."""
+
+    def setup_method(self):
+        from pydantic_settings import BaseSettings
+
+        class _DummySettings(BaseSettings):
+            pass
+
+        self.source = YamlSettingsSource(_DummySettings, config_path=None)
+
+    def test_get_field_value_returns_tuple(self):
+        """get_field_value must return tuple[Any, str, bool] per PydanticBaseSettingsSource ABC."""
+        from pydantic.fields import FieldInfo
+
+        field = FieldInfo(annotation=str)
+        result = self.source.get_field_value(field, 'my_field')
+        assert isinstance(result, tuple), f'Expected tuple, got {type(result)}'
+        assert len(result) == 3, f'Expected 3-tuple, got {len(result)}-tuple'
+        assert result[0] is None
+        assert result[1] == 'my_field'
+        assert result[2] is False
