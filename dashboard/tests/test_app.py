@@ -402,6 +402,20 @@ class TestHtmxTimeout:
         section_html = html[orch_idx - 200:orch_idx + 500]
         assert '"timeout": 8000' in section_html or '"timeout":8000' in section_html
 
+    def test_performance_section_has_timeout_12000(self, client):
+        html = client.get('/').text
+        # performance section uses 30s poll interval → 12s timeout
+        perf_idx = html.index('hx-get="/partials/performance"')
+        section_html = html[perf_idx - 200:perf_idx + 500]
+        assert '"timeout": 12000' in section_html or '"timeout":12000' in section_html
+
+    def test_memory_graphs_section_has_timeout_10000(self, client):
+        html = client.get('/').text
+        # memory-graphs section uses 60s poll interval → 10s timeout
+        mg_idx = html.index('hx-get="/partials/memory-graphs"')
+        section_html = html[mg_idx - 200:mg_idx + 500]
+        assert '"timeout": 10000' in section_html or '"timeout":10000' in section_html
+
 
 class TestMainModule:
     """Tests for python -m dashboard entry point."""
@@ -431,7 +445,7 @@ class TestMainModule:
 
 
 class TestAriaLivePollingsections:
-    """Tests that all three auto-polling sections have aria-live='polite'."""
+    """Tests that all five auto-polling sections have aria-live='polite'."""
 
     def test_memory_section_has_aria_live_polite(self, client):
         html = client.get('/').text
@@ -451,6 +465,18 @@ class TestAriaLivePollingsections:
         section_html = html[orch_idx - 100:orch_idx + 300]
         assert 'aria-live="polite"' in section_html
 
-    def test_all_three_sections_have_aria_live(self, client):
+    def test_performance_section_has_aria_live_polite(self, client):
         html = client.get('/').text
-        assert html.count('aria-live="polite"') >= 3
+        perf_idx = html.index('hx-get="/partials/performance"')
+        section_html = html[perf_idx - 100:perf_idx + 300]
+        assert 'aria-live="polite"' in section_html
+
+    def test_memory_graphs_section_has_aria_live_polite(self, client):
+        html = client.get('/').text
+        mg_idx = html.index('hx-get="/partials/memory-graphs"')
+        section_html = html[mg_idx - 100:mg_idx + 300]
+        assert 'aria-live="polite"' in section_html
+
+    def test_polling_sections_have_aria_live(self, client):
+        html = client.get('/').text
+        assert html.count('aria-live="polite"') == 5
