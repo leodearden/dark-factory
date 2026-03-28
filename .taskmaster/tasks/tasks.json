@@ -4446,7 +4446,16 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T05:38:08.480Z"
+        "updatedAt": "2026-03-28T05:38:08.480Z",
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_memory_graphs_partial.py",
+            "dashboard/tests/test_performance_panel.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 261,
@@ -4482,7 +4491,16 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T05:42:02.959Z"
+        "updatedAt": "2026-03-28T05:42:02.959Z",
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_reconciliation.py",
+            "dashboard/tests/conftest.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 264,
