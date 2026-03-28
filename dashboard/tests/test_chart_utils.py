@@ -249,49 +249,43 @@ class TestSeparateLabelNotFound:
 
 
 class TestSeparateLabelBoundsCheck:
-    """Tests for separate_label bounds check when values list is shorter than labels."""
+    """Tests for separate_label upfront length validation."""
 
-    def test_raises_when_label_index_beyond_values_length(self):
-        """ValueError raised when label found but its index >= len(values)."""
-        # labels=['a','b','c'], values=[10], label='c' at idx=2 but values has 1 element
+    def test_raises_when_labels_longer_than_values(self):
+        """ValueError raised when labels list is longer than values list."""
         data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [10]}
-        with pytest.raises(ValueError, match="no corresponding value"):
+        with pytest.raises(ValueError, match="same length"):
             separate_label(data, 'c')
 
-    def test_raises_for_middle_label_beyond_values(self):
-        """ValueError raised when label is found at index beyond values."""
-        # label='b' at idx=1, values has only 1 element (idx 0)
-        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [10]}
-        with pytest.raises(ValueError, match="no corresponding value"):
-            separate_label(data, 'b')
+    def test_raises_when_values_longer_than_labels(self):
+        """ValueError raised when values list is longer than labels list."""
+        data: ChartData = {'labels': ['a'], 'values': [10, 20, 30]}
+        with pytest.raises(ValueError, match="same length"):
+            separate_label(data, 'a')
 
-    def test_error_message_includes_label_name_and_index(self):
-        """ValueError message contains label name and index for debugging."""
+    def test_error_message_includes_lengths(self):
+        """ValueError message contains both list lengths for debugging."""
         data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [10]}
-        with pytest.raises(ValueError, match="'c'"):
+        with pytest.raises(ValueError, match="3 labels"):
             separate_label(data, 'c')
-        with pytest.raises(ValueError, match="index 2"):
+        with pytest.raises(ValueError, match="1 values"):
             separate_label(data, 'c')
 
 
 class TestSeparateLabelBoundsWithinRange:
-    """Tests for separate_label succeeding when label index IS within values bounds."""
+    """Tests for separate_label rejecting mismatched lengths even when index is in range."""
 
-    def test_succeeds_when_label_within_values_bounds_mismatched_length(self):
-        """separate_label succeeds when label idx < len(values) despite overall mismatch."""
+    def test_raises_even_when_label_within_values_bounds(self):
+        """ValueError raised for mismatched lengths even if target idx < len(values)."""
         # labels=['a','b','c'], values=[30, 20], label='a' at idx=0 (within bounds)
+        # Upfront validation catches the length mismatch before extraction.
         data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [30, 20]}
-        remaining, value = separate_label(data, 'a')
-        assert value == 30
-        # remaining has labels=['b','c'] and values=[20]
-        assert remaining['labels'] == ['b', 'c']
-        assert remaining['values'] == [20]
+        with pytest.raises(ValueError, match="same length"):
+            separate_label(data, 'a')
 
-    def test_boundary_case_last_within_bounds(self):
-        """separate_label succeeds when label is at the last valid index of values."""
+    def test_raises_at_boundary_last_within_bounds(self):
+        """ValueError raised for mismatched lengths even at last valid index."""
         # labels=['a','b','c'], values=[30, 20], label='b' at idx=1 (last valid)
         data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [30, 20]}
-        remaining, value = separate_label(data, 'b')
-        assert value == 20
-        assert remaining['labels'] == ['a', 'c']
-        assert remaining['values'] == [30]
+        with pytest.raises(ValueError, match="same length"):
+            separate_label(data, 'b')

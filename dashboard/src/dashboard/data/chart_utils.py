@@ -73,26 +73,24 @@ def separate_label(
 
     Returns:
         A tuple of (remaining_data, extracted_value). If label is not found,
-        returns a shallow copy of data and 0. If label is found but its index
-        exceeds the length of values, raises ValueError.
+        returns a shallow copy of data and 0.
 
     Raises:
-        ValueError: If the label exists but has no corresponding value
-            (i.e., the data is structurally corrupt with mismatched lengths).
+        ValueError: If labels and values have different lengths.
     """
     labels: list[str] = list(data.get('labels', []))
     values: list[int | float] = list(data.get('values', []))
+
+    if len(labels) != len(values):
+        raise ValueError(
+            f"labels and values must have the same length "
+            f"(got {len(labels)} labels and {len(values)} values)"
+        )
 
     if label not in labels:
         return {'labels': labels, 'values': values}, 0
 
     idx = labels.index(label)
-
-    if idx >= len(values):
-        raise ValueError(
-            f"label '{label}' at index {idx} has no corresponding value "
-            f"(values length: {len(values)})"
-        )
 
     extracted_value = values[idx]
     remaining_labels = labels[:idx] + labels[idx + 1:]
