@@ -570,12 +570,21 @@ class TestProjectIdValidation:
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         original_run_stage_via_cli = base_module.run_stage_via_cli
+        original_assemble_payload = stage.assemble_payload
 
         with self._patch_stage(stage):
             # (a) assemble_payload is replaced with a mock instance
             assert isinstance(stage.assemble_payload, (AsyncMock, MagicMock))
             # (b) run_stage_via_cli in the base module is no longer the original function
             assert base_module.run_stage_via_cli is not original_run_stage_via_cli
+
+        # Postconditions: context manager must restore original state on exit
+        # (a) run_stage_via_cli is the original function again
+        assert base_module.run_stage_via_cli is original_run_stage_via_cli
+        # (b) assemble_payload is no longer a mock
+        assert not isinstance(stage.assemble_payload, (AsyncMock, MagicMock))
+        # (c) assemble_payload is exactly the original method reference
+        assert stage.assemble_payload == original_assemble_payload
 
     def test_patch_stage_accepts_cli_side_effect(self, mock_deps):
         """_patch_stage wires a custom cli_side_effect onto the run_stage_via_cli mock."""
