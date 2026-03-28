@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from unittest.mock import patch
 
 import aiosqlite
 
@@ -59,6 +60,24 @@ class TestDbPool:
         assert pool.open_count == 3
         await pool.close_all()
 
+    async def test_get_returns_none_on_connect_os_error(self, tmp_path):
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        pool = DbPool()
+        with patch('aiosqlite.connect', side_effect=OSError('disk error')):
+            result = await pool.get(db_path)
+        assert result is None
+
+    async def test_get_returns_none_on_permission_error(self, tmp_path):
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        pool = DbPool()
+        with patch('pathlib.Path.exists', side_effect=PermissionError('permission denied')):
+            result = await pool.get(db_path)
+        assert result is None
+
 
 class TestWithDb:
     """Tests for the with_db helper."""
@@ -95,3 +114,14 @@ class TestWithDb:
 
             result = await with_db(db, bad_query, [])
             assert result == []
+
+    async def test_returns_default_on_os_error(self, tmp_path):
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            async def raises_os_error(db):
+                raise OSError('disk I/O error')
+
+            result = await with_db(db, raises_os_error, 'default')
+            assert result == 'default'

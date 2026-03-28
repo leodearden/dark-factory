@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import pytest
@@ -216,4 +217,105 @@ class TestGetAgentBreakdown:
         from dashboard.data.write_journal import get_agent_breakdown
 
         result = await get_agent_breakdown(None)
+        assert result == {'labels': [], 'values': []}
+
+
+@pytest.fixture()
+async def no_table_conn(tmp_path):
+    """Connection to an empty DB with no write_ops table."""
+    db_path = tmp_path / 'empty_notables.db'
+    sqlite3.connect(str(db_path)).close()  # empty, no tables
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
+
+
+class TestDataLayerErrorHandling:
+    """Verify all 3 write_journal functions handle errors at data layer."""
+
+    @pytest.mark.asyncio
+    async def test_timeseries_returns_default_on_none_db(self):
+        from dashboard.data.write_journal import get_memory_timeseries
+        result = await get_memory_timeseries(None)
+        assert len(result['labels']) == 24
+        assert sum(result['reads']) == 0
+        assert sum(result['writes']) == 0
+
+    @pytest.mark.asyncio
+    async def test_operations_returns_default_on_none_db(self):
+        from dashboard.data.write_journal import get_operations_breakdown
+        result = await get_operations_breakdown(None)
+        assert result == {'labels': [], 'values': []}
+
+    @pytest.mark.asyncio
+    async def test_agents_returns_default_on_none_db(self):
+        from dashboard.data.write_journal import get_agent_breakdown
+        result = await get_agent_breakdown(None)
+        assert result == {'labels': [], 'values': []}
+
+    @pytest.mark.asyncio
+    async def test_timeseries_returns_default_on_operational_error(self, no_table_conn):
+        from dashboard.data.write_journal import get_memory_timeseries
+        result = await get_memory_timeseries(no_table_conn)
+        assert len(result['labels']) == 24
+        assert sum(result['reads']) == 0
+        assert sum(result['writes']) == 0
+
+    @pytest.mark.asyncio
+    async def test_operations_returns_default_on_operational_error(self, no_table_conn):
+        from dashboard.data.write_journal import get_operations_breakdown
+        result = await get_operations_breakdown(no_table_conn)
+        assert result == {'labels': [], 'values': []}
+
+    @pytest.mark.asyncio
+    async def test_agents_returns_default_on_operational_error(self, no_table_conn):
+        from dashboard.data.write_journal import get_agent_breakdown
+        result = await get_agent_breakdown(no_table_conn)
+        assert result == {'labels': [], 'values': []}
+
+    @pytest.mark.asyncio
+    async def test_timeseries_returns_default_on_os_error(self, tmp_path):
+        from dashboard.data.write_journal import get_memory_timeseries
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            mock_cursor = AsyncMock()
+            mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
+            mock_cursor.__aexit__ = AsyncMock(return_value=False)
+            mock_cursor.fetchall = AsyncMock(side_effect=OSError('disk I/O error'))
+            with patch.object(conn, 'execute', return_value=mock_cursor):
+                result = await get_memory_timeseries(conn)
+        assert len(result['labels']) == 24
+        assert sum(result['reads']) == 0
+        assert sum(result['writes']) == 0
+
+    @pytest.mark.asyncio
+    async def test_operations_returns_default_on_os_error(self, tmp_path):
+        from dashboard.data.write_journal import get_operations_breakdown
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            mock_cursor = AsyncMock()
+            mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
+            mock_cursor.__aexit__ = AsyncMock(return_value=False)
+            mock_cursor.fetchall = AsyncMock(side_effect=OSError('disk I/O error'))
+            with patch.object(conn, 'execute', return_value=mock_cursor):
+                result = await get_operations_breakdown(conn)
+        assert result == {'labels': [], 'values': []}
+
+    @pytest.mark.asyncio
+    async def test_agents_returns_default_on_os_error(self, tmp_path):
+        from dashboard.data.write_journal import get_agent_breakdown
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            mock_cursor = AsyncMock()
+            mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
+            mock_cursor.__aexit__ = AsyncMock(return_value=False)
+            mock_cursor.fetchall = AsyncMock(side_effect=OSError('disk I/O error'))
+            with patch.object(conn, 'execute', return_value=mock_cursor):
+                result = await get_agent_breakdown(conn)
         assert result == {'labels': [], 'values': []}

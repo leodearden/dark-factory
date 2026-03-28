@@ -9,7 +9,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 
 import httpx
 from fastapi import FastAPI, Request
@@ -46,6 +46,27 @@ from dashboard.data.write_journal import (
 
 _pkg_dir = Path(__file__).parent
 logger = logging.getLogger(__name__)
+
+
+_T = TypeVar('_T')
+
+
+def _safe_gather_result(result: object, default: _T, label: str) -> _T:
+    """Return *default* if *result* is an exception, otherwise return *result*.
+
+    Used with ``asyncio.gather(return_exceptions=True)`` to inspect each result
+    independently, preserving sibling results when one coroutine fails.
+
+    Non-Exception BaseExceptions (CancelledError, KeyboardInterrupt, SystemExit)
+    are re-raised so that asyncio cancellation and process signals propagate
+    correctly during shutdown and disconnect.
+    """
+    if isinstance(result, BaseException) and not isinstance(result, Exception):
+        raise result
+    if isinstance(result, Exception):
+        logger.warning('Error fetching %s data: %s', label, result)
+        return default
+    return cast(_T, result)
 
 templates = Jinja2Templates(directory=str(_pkg_dir / 'templates'))
 
@@ -264,17 +285,15 @@ async def memory_graphs_partial(request: Request):
     config = request.app.state.config
     pool: DbPool = request.app.state.db
     db = await pool.get(config.write_journal_db)
-    try:
-        timeseries, operations, agents = await asyncio.gather(
-            get_memory_timeseries(db),
-            get_operations_breakdown(db),
-            get_agent_breakdown(db),
-        )
-    except Exception:
-        logger.warning('Error fetching memory graphs data', exc_info=True)
-        timeseries = {'labels': [], 'reads': [], 'writes': []}
-        operations = {'labels': [], 'values': []}
-        agents = {'labels': [], 'values': []}
+    ts_r, ops_r, agents_r = await asyncio.gather(
+        get_memory_timeseries(db),
+        get_operations_breakdown(db),
+        get_agent_breakdown(db),
+        return_exceptions=True,
+    )
+    timeseries = _safe_gather_result(ts_r, {'labels': [], 'reads': [], 'writes': []}, 'timeseries')
+    operations = _safe_gather_result(ops_r, {'labels': [], 'values': []}, 'operations')
+    agents = _safe_gather_result(agents_r, {'labels': [], 'values': []}, 'agents')
     return templates.TemplateResponse(
         request, 'partials/memory_graphs.html',
         context={
@@ -292,16 +311,23 @@ async def partials_recon(request: Request):
     pool: DbPool = request.app.state.db
     db = await pool.get(config.reconciliation_db)
 
-    buffer_stats, burst_state, watermarks_list, verdict, runs, last_attempted_map = (
-        await asyncio.gather(
-            get_buffer_stats(db),
-            get_burst_state(db),
-            get_watermarks(db),
-            get_latest_verdict(db),
-            get_recent_runs(db),
-            get_last_attempted_run(db),
-        )
+    bs_r, burst_r, wm_r, verdict_r, runs_r, la_r = await asyncio.gather(
+        get_buffer_stats(db),
+        get_burst_state(db),
+        get_watermarks(db),
+        get_latest_verdict(db),
+        get_recent_runs(db),
+        get_last_attempted_run(db),
+        return_exceptions=True,
     )
+    buffer_stats = _safe_gather_result(
+        bs_r, {'buffered_count': 0, 'oldest_event_age_seconds': None}, 'buffer_stats',
+    )
+    burst_state = _safe_gather_result(burst_r, [], 'burst_state')
+    watermarks_list = _safe_gather_result(wm_r, [], 'watermarks')
+    verdict = _safe_gather_result(verdict_r, None, 'latest_verdict')
+    runs = _safe_gather_result(runs_r, [], 'recent_runs')
+    last_attempted_map = _safe_gather_result(la_r, {}, 'last_attempted_run')
 
     # Build per-project view: merge watermarks + last attempted run
     projects: dict[str, dict] = {}
@@ -363,16 +389,17 @@ async def partials_performance(request: Request):
     db = await pool.get(config.runs_db)
     esc_dir = config.escalations_dir
 
-    try:
-        paths, escalations, histograms, ttc = await asyncio.gather(
-            get_completion_paths(db, esc_dir),
-            get_escalation_rates(db, esc_dir),
-            get_loop_histograms(db),
-            get_time_centiles(db),
-        )
-    except Exception:
-        logger.warning('Error fetching performance data', exc_info=True)
-        paths, escalations, histograms, ttc = {}, {}, {}, {}
+    paths_r, esc_r, hist_r, ttc_r = await asyncio.gather(
+        get_completion_paths(db, esc_dir),
+        get_escalation_rates(db, esc_dir),
+        get_loop_histograms(db),
+        get_time_centiles(db),
+        return_exceptions=True,
+    )
+    paths = _safe_gather_result(paths_r, {}, 'completion_paths')
+    escalations = _safe_gather_result(esc_r, {}, 'escalation_rates')
+    histograms = _safe_gather_result(hist_r, {}, 'loop_histograms')
+    ttc = _safe_gather_result(ttc_r, {}, 'time_centiles')
     return templates.TemplateResponse(
         request, 'partials/performance.html',
         context={

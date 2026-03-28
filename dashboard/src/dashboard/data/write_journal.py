@@ -7,10 +7,11 @@ the memory graphs section of the dashboard.
 from __future__ import annotations
 
 import logging
-import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
+
+from dashboard.data.db import with_db
 
 logger = logging.getLogger(__name__)
 
@@ -31,22 +32,22 @@ async def get_memory_timeseries(db: aiosqlite.Connection | None, *, hours: int =
         key = dt.strftime('%Y-%m-%dT%H:00')
         buckets[key] = {'read': 0, 'write': 0}
 
-    if db is not None:
-        try:
-            async with db.execute(
-                "SELECT strftime('%Y-%m-%dT%H:00', created_at) AS hour,"
-                ' kind, COUNT(*) AS cnt'
-                ' FROM write_ops WHERE created_at >= ?'
-                ' GROUP BY hour, kind',
-                (since.isoformat(),),
-            ) as cursor:
-                rows = await cursor.fetchall()
+    since_iso = since.isoformat()
 
-            for hour, kind, cnt in rows:
-                if hour in buckets and kind in ('read', 'write'):
-                    buckets[hour][kind] = cnt
-        except sqlite3.OperationalError:
-            logger.debug('get_memory_timeseries: query failed', exc_info=True)
+    async def _query(db: aiosqlite.Connection) -> list:
+        async with db.execute(
+            "SELECT strftime('%Y-%m-%dT%H:00', created_at) AS hour,"
+            ' kind, COUNT(*) AS cnt'
+            ' FROM write_ops WHERE created_at >= ?'
+            ' GROUP BY hour, kind',
+            (since_iso,),
+        ) as cursor:
+            return list(await cursor.fetchall())
+
+    rows = await with_db(db, _query, [])
+    for hour, kind, cnt in rows:
+        if hour in buckets and kind in ('read', 'write'):
+            buckets[hour][kind] = cnt
 
     sorted_keys = sorted(buckets)
     return {
@@ -61,25 +62,21 @@ async def get_operations_breakdown(db: aiosqlite.Connection | None, *, hours: in
 
     Returns ``{labels: [str, ...], values: [int, ...]}``.
     """
-    if db is None:
-        return {'labels': [], 'values': []}
-
     since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
-    try:
+
+    async def _query(db: aiosqlite.Connection) -> dict:
         async with db.execute(
             'SELECT operation, COUNT(*) AS cnt FROM write_ops'
             ' WHERE created_at >= ? GROUP BY operation ORDER BY cnt DESC',
             (since,),
         ) as cursor:
             rows = await cursor.fetchall()
-    except sqlite3.OperationalError:
-        logger.debug('get_operations_breakdown: query failed', exc_info=True)
-        return {'labels': [], 'values': []}
+        return {
+            'labels': [r[0] or 'unknown' for r in rows],
+            'values': [r[1] for r in rows],
+        }
 
-    return {
-        'labels': [r[0] or 'unknown' for r in rows],
-        'values': [r[1] for r in rows],
-    }
+    return await with_db(db, _query, {'labels': [], 'values': []})
 
 
 async def get_agent_breakdown(db: aiosqlite.Connection | None, *, hours: int = 24) -> dict:
@@ -87,11 +84,9 @@ async def get_agent_breakdown(db: aiosqlite.Connection | None, *, hours: int = 2
 
     Returns ``{labels: [str, ...], values: [int, ...]}``.
     """
-    if db is None:
-        return {'labels': [], 'values': []}
-
     since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
-    try:
+
+    async def _query(db: aiosqlite.Connection) -> dict:
         async with db.execute(
             "SELECT COALESCE(agent_id, 'unknown') AS agent, COUNT(*) AS cnt"
             ' FROM write_ops WHERE created_at >= ?'
@@ -99,11 +94,9 @@ async def get_agent_breakdown(db: aiosqlite.Connection | None, *, hours: int = 2
             (since,),
         ) as cursor:
             rows = await cursor.fetchall()
-    except sqlite3.OperationalError:
-        logger.debug('get_agent_breakdown: query failed', exc_info=True)
-        return {'labels': [], 'values': []}
+        return {
+            'labels': [r[0] for r in rows],
+            'values': [r[1] for r in rows],
+        }
 
-    return {
-        'labels': [r[0] for r in rows],
-        'values': [r[1] for r in rows],
-    }
+    return await with_db(db, _query, {'labels': [], 'values': []})

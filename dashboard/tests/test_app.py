@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import runpy
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
 import pytest
+
+from dashboard.app import _safe_gather_result
 
 PARTIAL_URLS = (
     "/partials/memory",
@@ -269,6 +272,31 @@ class TestReconPartialIntegration:
             html = resp.text
             assert 'No reconciliation runs' in html
 
+    @pytest.mark.parametrize('failing_fn', [
+        'get_buffer_stats',
+        'get_burst_state',
+        'get_watermarks',
+        'get_latest_verdict',
+        'get_recent_runs',
+        'get_last_attempted_run',
+    ])
+    def test_recon_partial_failure(self, client, failing_fn):
+        """One failing recon coroutine should not cause a 500."""
+        with _patch_recon_data(), patch(
+            f'dashboard.app.{failing_fn}',
+            new_callable=AsyncMock,
+            side_effect=RuntimeError('injected error'),
+        ):
+            resp = client.get('/partials/recon')
+            assert resp.status_code == 200
+            html = resp.text
+            # When runs fails, the other data (staleness_timer) still renders
+            if failing_fn != 'get_recent_runs':
+                assert 'staleness_timer' in html
+            # When runs fails, at least the page renders without a 500
+            else:
+                assert 'No reconciliation runs' in html
+
 
 _MOCK_ORCHESTRATOR = {
     'pids': [1234],
@@ -404,6 +432,8 @@ class TestPerformancePartialIntegration:
             assert 'No orchestrator run data yet' in html
 
     def test_performance_backend_error_degrades_gracefully(self, client):
+        # With return_exceptions=True, other results are preserved even when one fails.
+        # get_completion_paths failing → paths={} but ttc still has data, so else branch renders.
         with _patch_perf_integration(), patch(
             'dashboard.app.get_completion_paths',
             new_callable=AsyncMock,
@@ -411,7 +441,39 @@ class TestPerformancePartialIntegration:
         ):
             resp = client.get('/partials/performance')
             assert resp.status_code == 200
-            assert 'No orchestrator run data yet' in resp.text
+
+    @pytest.mark.parametrize('failing_fn', [
+        'get_completion_paths',
+        'get_escalation_rates',
+        'get_loop_histograms',
+        'get_time_centiles',
+    ])
+    def test_performance_partial_failure(self, client, failing_fn):
+        """One failing coroutine should not discard its siblings' data."""
+        with _patch_perf_integration(), patch(
+            f'dashboard.app.{failing_fn}',
+            new_callable=AsyncMock,
+            side_effect=RuntimeError('injected error'),
+        ):
+            resp = client.get('/partials/performance')
+            assert resp.status_code == 200
+            html = resp.text
+            # When paths fails, the template renders empty (all content is paths-keyed)
+            # but we still get a 200 — no 500 from one failed gather coroutine.
+            if failing_fn == 'get_completion_paths':
+                # No 500, template still renders (empty else block since ttc non-empty)
+                assert 'Performance' in html
+            # When escalations fail, paths data (one-pass) still renders
+            if failing_fn == 'get_escalation_rates':
+                assert 'one-pass' in html
+            # When histograms fail, paths and escalations still render
+            if failing_fn == 'get_loop_histograms':
+                assert 'one-pass' in html
+                assert 'Steward' in html
+            # When ttc fails, paths and escalations still render
+            if failing_fn == 'get_time_centiles':
+                assert 'one-pass' in html
+                assert 'Steward' in html
 
 
 _MG_TIMESERIES = {
@@ -488,6 +550,36 @@ class TestMemoryGraphsPartialIntegration:
             resp = client.get('/partials/memory-graphs')
             assert resp.status_code == 200
             assert 'memoryTimeseriesChart' in resp.text
+
+    @pytest.mark.parametrize('failing_fn', [
+        'get_memory_timeseries',
+        'get_operations_breakdown',
+        'get_agent_breakdown',
+    ])
+    def test_memory_graphs_partial_failure(self, client, failing_fn):
+        """One failing coroutine should not discard its siblings' data."""
+        with _patch_memory_graphs_integration(), patch(
+            f'dashboard.app.{failing_fn}',
+            new_callable=AsyncMock,
+            side_effect=RuntimeError('injected error'),
+        ):
+            resp = client.get('/partials/memory-graphs')
+            assert resp.status_code == 200
+            html = resp.text
+            # All chart divs always present
+            assert 'memoryTimeseriesChart' in html
+            assert 'memoryOpsChart' in html
+            assert 'memoryAgentChart' in html
+            # When timeseries fails, ops and agents still have data
+            if failing_fn == 'get_memory_timeseries':
+                assert 'search' in html
+                assert 'claude-interactive' in html
+            # When ops fails, timeseries and agents still render (non-empty data)
+            if failing_fn == 'get_operations_breakdown':
+                assert 'claude-interactive' in html
+            # When agents fails, timeseries and ops still render
+            if failing_fn == 'get_agent_breakdown':
+                assert 'search' in html
 
 
 class TestHtmxErrorHandling:
@@ -624,3 +716,17 @@ class TestAriaLivePollingsections:
     def test_polling_sections_have_aria_live(self, client):
         html = client.get('/').text
         assert html.count('aria-live="polite"') == 5
+
+
+class TestSafeGatherResult:
+    """Tests for the _safe_gather_result helper."""
+
+    def test_safe_gather_result_reraises_cancelled_error(self):
+        """CancelledError (BaseException, not Exception) must propagate, not be swallowed."""
+        with pytest.raises(asyncio.CancelledError):
+            _safe_gather_result(asyncio.CancelledError(), 'default', 'test')
+
+    def test_safe_gather_result_reraises_keyboard_interrupt(self):
+        """KeyboardInterrupt (BaseException, not Exception) must propagate, not be swallowed."""
+        with pytest.raises(KeyboardInterrupt):
+            _safe_gather_result(KeyboardInterrupt(), 'default', 'test')
