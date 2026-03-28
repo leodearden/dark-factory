@@ -69,15 +69,15 @@ class TestTimeagoUsesParseUtc:
     """Tests verifying that app.py uses parse_utc from dashboard.data.utils (DRY)."""
 
     def test_naive_timestamp_timeago_works(self):
-        """timeago with a naive ISO timestamp (no tzinfo) returns a relative string."""
+        """timeago with a naive ISO timestamp (no tzinfo) returns the correct relative string."""
+        from datetime import UTC, datetime, timedelta
+
         from dashboard.app import timeago
 
-        # Naive timestamps must be handled correctly — this documents the expected
-        # behavior after refactoring and serves as a regression guard.
-        result = timeago('2026-03-28T10:00:00')
-        # Result is a non-empty string (relative time, 'just now', or 'Xm/h/d ago')
-        assert isinstance(result, str)
-        assert result != 'never'
+        # Use a dynamic timestamp 5 minutes in the past to avoid hardcoded date rot.
+        # timedelta(minutes=5) yields exactly 300s, so total_minutes == 5 exactly.
+        ts = (datetime.now(UTC) - timedelta(minutes=5)).replace(tzinfo=None).isoformat()
+        assert timeago(ts) == '5m ago'
 
     def test_app_imports_parse_utc_from_utils(self):
         """dashboard.app must import parse_utc from dashboard.data.utils."""
