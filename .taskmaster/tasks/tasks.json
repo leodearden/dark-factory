@@ -3736,6 +3736,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 220,
+        "title": "Add ports_seen tracking to remaining dashboard fallback tests",
+        "description": "Two fallback tests in `dashboard/tests/test_memory.py` have incomplete port-tracking assertions:\n\n1. **test_partial_failure_aggregates_available** (line 385): Does not track which ports were contacted. Add a `ports_seen: set[int] = set()` tracker in the handler and assert both `9000 in ports_seen` and `9001 in ports_seen` — matching the pattern already used in the companion `test_first_server_down_falls_through`.\n\n2. **test_first_server_down_falls_through** (line 346): Asserts `9000 in ports_seen` but not `9001 in ports_seen`. Add `assert 9001 in ports_seen` to verify the fallback server was actually reached (not just inferred from the result payload).\n\nBoth are 1-3 line changes following the existing `ports_seen` pattern.\n\nSource: review-cycle task 204, suggestions from reviewer_test_analyst.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -3748,7 +3759,7 @@
       ],
       "created": "2026-03-28T00:28:18.887Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-28T00:28:18.900Z"
+      "updated": "2026-03-28T00:28:23.910Z"
     }
   }
 }
