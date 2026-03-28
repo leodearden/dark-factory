@@ -4898,7 +4898,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "fused-memory/tests/test_harness.py"
+          ],
+          "modules": [
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 284,
@@ -4909,7 +4917,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/app.py",
+            "dashboard/tests/test_app.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard",
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 285,
