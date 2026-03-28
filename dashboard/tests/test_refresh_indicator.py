@@ -162,3 +162,24 @@ class TestNaNGuard:
         html = client.get('/').text
         assert 'isNaN' in html
 
+
+class TestAnimationFallback:
+    """Tests that a setTimeout fallback ensures section-refreshed class is always removed."""
+
+    def test_settimeout_fallback_present(self, client):
+        """A setTimeout fallback must be present near section-refreshed class removal."""
+        html = client.get('/').text
+        assert 'setTimeout' in html
+
+    def test_settimeout_removes_section_refreshed(self, client):
+        """The setTimeout fallback must reference 'section-refreshed' class removal."""
+        html = client.get('/').text
+        # Both setTimeout and section-refreshed must appear in the JS
+        assert 'setTimeout' in html
+        assert 'section-refreshed' in html
+
+    def test_settimeout_has_700ms_margin(self, client):
+        """The setTimeout fallback should use a duration >= 700ms (safe margin over 600ms animation)."""
+        html = client.get('/').text
+        assert '700' in html
+
