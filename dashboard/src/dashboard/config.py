@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-_DEFAULT_FUSED_MEMORY_URLS = [
+DEFAULT_FUSED_MEMORY_URLS = [
     'http://localhost:8002',
     'http://localhost:8000',
     'http://localhost:8001',
@@ -20,7 +20,7 @@ class DashboardConfig:
     host: str = '127.0.0.1'
     port: int = 8080
     project_root: Path = field(default_factory=lambda: Path('/home/leo/src/dark-factory'))
-    fused_memory_urls: list[str] = field(default_factory=lambda: list(_DEFAULT_FUSED_MEMORY_URLS))
+    fused_memory_urls: list[str] = field(default_factory=lambda: list(DEFAULT_FUSED_MEMORY_URLS))
 
     @property
     def reconciliation_db(self) -> Path:
