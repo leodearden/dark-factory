@@ -1,0 +1,16 @@
+@import "tailwindcss";
+@source "../templates";
+
+/* Hide Alpine-cloaked elements before Alpine initializes */
+[x-cloak] { display: none !important; }
+
+/* Smooth transitions for htmx swaps */
+.htmx-settling {
+    opacity: 0.8;
+    transition: opacity 200ms ease-in;
+}
+
+.htmx-swapping {
+    opacity: 0.5;
+    transition: opacity 100ms ease-out;
+}
