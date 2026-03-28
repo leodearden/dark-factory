@@ -246,6 +246,21 @@ class TestYamlSettingsSourceErrorHandling:
         with pytest.raises(RuntimeError, match=str(config_file)):
             source()
 
+    def test_expand_env_vars_error_includes_original_cause(self, tmp_path, monkeypatch):
+        """The RuntimeError raised for _expand_env_vars failure must chain the original exception."""
+        config_file = tmp_path / 'valid.yaml'
+        config_file.write_text('key: value')
+        source = self._make_source(config_file)
+        original = ValueError('original cause')
+
+        def _raise(val):
+            raise original
+
+        monkeypatch.setattr(source, '_expand_env_vars', _raise)
+        with pytest.raises(RuntimeError) as exc_info:
+            source()
+        assert exc_info.value.__cause__ is original
+
 
 class TestYamlSettingsSourceEncoding:
     """Tests for YamlSettingsSource explicit UTF-8 encoding."""
