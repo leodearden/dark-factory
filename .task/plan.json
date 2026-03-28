@@ -1,0 +1,123 @@
+{
+  "task_id": "279",
+  "title": "Fix regression: restore _PROJECT_ID_GUIDELINE extraction for reconciliation prompts",
+  "files": [
+    "fused-memory/src/fused_memory/reconciliation/prompts/__init__.py",
+    "fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py",
+    "fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py",
+    "fused-memory/tests/test_stages.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/reconciliation/prompts",
+    "fused-memory/src/fused_memory/reconciliation/stages",
+    "fused-memory/tests"
+  ],
+  "analysis": "Commit 0ea23cb5 (stash pop merge conflict resolution) reverted task 134's shared _PROJECT_ID_GUIDELINE extraction. The current state has the guideline `Always pass project_id=\"{self.project_id}\" when calling fused-memory MCP tools.` duplicated as inline f-string fragments in 4 locations across 2 files:\n\n1. memory_consolidator.py line 148 (normal payload)\n2. memory_consolidator.py line 167 (remediation payload)\n3. task_knowledge_sync.py line 98 (TaskKnowledgeSync / Stage 2)\n4. task_knowledge_sync.py line 152 (IntegrityCheck / Stage 3)\n\nThe prompts/__init__.py was stripped to just a docstring (`\"\"\"Stage and judge system prompts.\"\"\"`). The fix re-extracts a `_PROJECT_ID_GUIDELINE` template with a `{tools}` placeholder into __init__.py, creates per-stage constants with baked-in tool lists, and has each stage import and format its constant with `self.project_id` at runtime.\n\nStage 2 has full MCP access (STAGE2_DISALLOWED == DISALLOW_BUILTIN) including expand_task and parse_prd, but the system prompt (stage2.py lines 13-16) only lists 9 task tools. The task requires the guideline's tool list to include expand_task and parse_prd.\n\nTwo inline imports in test_stages.py need hoisting: `import logging` (line 555) and `import tests.test_stages as _self_module` (line 760, though this one has `noqa: PLC0415` and is a self-import for introspection \u2014 keep inline).\n\nThe three duplicate test_stageN_prompt_contains_project_id_guideline tests (removed by the regression) need to be recreated as a single parametrized test covering all three stages.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Hoist `import logging` from test_stages.py line 555 (inside test_whitespace_watermark_project_id_treated_as_empty) to module-level imports",
+      "status": "done",
+      "commit": "77ceddd1",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write tests for _PROJECT_ID_GUIDELINE template and per-stage constants in prompts/__init__.py: (a) _PROJECT_ID_GUIDELINE exists and contains '{tools}' placeholder, (b) _STAGE1_PROJECT_ID_GUIDELINE, _STAGE2_PROJECT_ID_GUIDELINE, _STAGE3_PROJECT_ID_GUIDELINE exist and contain '{project_id}' placeholder, (c) Stage 2's constant includes 'expand_task' and 'parse_prd', (d) Stage 1 does not include task tools, (e) Stage 3 does not include write tools",
+      "status": "done",
+      "commit": "065bd3d0"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Create _PROJECT_ID_GUIDELINE template in prompts/__init__.py with {{project_id}} and {tools} placeholders. Define per-stage constants by calling .format(tools=...) with each stage's allowed tool list. Stage 1: search, get_entity, get_episodes, get_status, add_memory, delete_memory. Stage 2: search, get_entity, get_episodes, add_memory, delete_memory, get_tasks, get_task, set_task_status, add_task, update_task, add_subtask, remove_task, add_dependency, remove_dependency, expand_task, parse_prd. Stage 3: search, get_entity, get_episodes, get_status, get_tasks, get_task.",
+      "status": "done",
+      "commit": "4727f6e7"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write a single @pytest.mark.parametrize test (collapsing three would-be duplicates) that verifies each stage's assembled payload contains the project_id guideline with interpolated project_id. Parametrize over (StageClass, StageId, setup_fn) for MemoryConsolidator, TaskKnowledgeSync, and IntegrityCheck. Each case assembles a payload and asserts `project_id=\"test_proj\"` appears in it. Also assert that Stage 2's payload includes 'project_root=' instruction.",
+      "status": "done",
+      "commit": "8dd05f7d"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Update memory_consolidator.py: import _STAGE1_PROJECT_ID_GUIDELINE from prompts/__init__.py. Replace both inline `Always pass project_id=\"{self.project_id}\"...` strings (normal and remediation payloads, lines 148 and 167) with `_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)`. Update task_knowledge_sync.py: import _STAGE2_PROJECT_ID_GUIDELINE and _STAGE3_PROJECT_ID_GUIDELINE. Replace inline strings in TaskKnowledgeSync.assemble_payload (line 98) and IntegrityCheck.assemble_payload (line 152) with formatted constants. Keep Stage 2's `project_root=` line separate.",
+      "status": "done",
+      "commit": "f2082b51"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Add assertion to parametrized test that each stage's payload contains stage-specific tool names from the guideline (e.g., Stage 1 payload mentions 'add_memory', Stage 2 payload mentions 'expand_task' and 'parse_prd', Stage 3 payload mentions 'get_tasks' but NOT 'add_memory'). This validates the tool-list interpolation actually reaches the payload.",
+      "status": "done",
+      "commit": "434b2e01"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Run full test suite to confirm all existing tests still pass alongside the new parametrized test. Fix any regressions (e.g., existing test_payload_contains_project_id_for_memory_tools should still pass since the new guideline is a superset of the old inline string).",
+      "status": "pending",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use double-brace {{project_id}} in the base template so .format(tools=...) preserves {project_id} for runtime interpolation",
+      "rationale": "Python str.format() requires escaping braces that should survive the first format call. After .format(tools=...), {{project_id}} becomes {project_id}, which each stage then fills with self.project_id at runtime."
+    },
+    {
+      "decision": "Per-stage constants named _STAGE1_PROJECT_ID_GUIDELINE, _STAGE2_PROJECT_ID_GUIDELINE, _STAGE3_PROJECT_ID_GUIDELINE",
+      "rationale": "Task explicitly requires clear names like _STAGE1_PROJECT_ID_GUIDELINE, not abbreviated forms like _S1_PID. The underscore prefix marks them as module-private."
+    },
+    {
+      "decision": "Tool names in the guideline use short names (e.g., 'search') not full MCP-prefixed names (e.g., 'mcp__fused-memory__search')",
+      "rationale": "The guideline is part of the LLM prompt payload \u2014 short names are clearer and match how the system prompts in stage[123].py already reference tools. The LLM knows these map to mcp__fused-memory__* tools."
+    },
+    {
+      "decision": "Keep Stage 2's project_root instruction as a separate line, not folded into the guideline",
+      "rationale": "project_root is Stage 2-specific context (tasks use project_root, not project_id). Mixing it into _PROJECT_ID_GUIDELINE would conflate two different concerns. The guideline template stays focused on project_id + tool list."
+    },
+    {
+      "decision": "Leave inline `import tests.test_stages as _self_module` (line 760) as-is; only hoist `import logging`",
+      "rationale": "The self-import is intentionally inline (marked noqa: PLC0415) to avoid circular import issues and is used only for introspection testing. Hoisting it to module level would run the import at parse time before the module is fully defined."
+    },
+    {
+      "decision": "Do not modify stage2.py system prompt tool list (only the payload guideline)",
+      "rationale": "Task scope is the project_id guideline extraction. The stage2.py system prompt's Available Tools section is a separate concern \u2014 changing it would be scope creep. The guideline's tool list will correctly include expand_task and parse_prd."
+    },
+    {
+      "decision": "Stage 2 guideline includes get_status even though the system prompt (stage2.py) does not list it",
+      "rationale": "Stage 2 only disallows DISALLOW_BUILTIN, so get_status IS accessible. However, aligning the guideline's tool list with what the system prompt explicitly lists is more consistent. Decision: omit get_status from Stage 2 guideline to match the system prompt's tool list, which focuses on memory read/write and task tools. Include only the tools the system prompt references plus expand_task/parse_prd."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "BaseStageValidationTest pattern (shared fixtures, _fake_assemble_payload, _patch_stage)",
+      "where": "fused-memory/tests/test_stages.py lines 382-436",
+      "how": "The new parametrized test for payload project_id guidelines can reuse the mock_deps fixture pattern and async payload assembly approach from TestTaskKnowledgeSyncPayload."
+    },
+    {
+      "what": "TestTaskKnowledgeSyncPayload.test_payload_contains_project_id_for_memory_tools existing test",
+      "where": "fused-memory/tests/test_stages.py line 369",
+      "how": "This test already validates project_id appears in Stage 2 payload. The new parametrized test extends this to all 3 stages. The existing test can remain as-is since it tests a different assertion (specific 'project_id=\"reify\"' string) and serves as a regression guard."
+    },
+    {
+      "what": "DISALLOW_TASK_WRITES, DISALLOW_MEMORY_WRITES lists in cli_stage_runner.py",
+      "where": "fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py lines 27-47",
+      "how": "These lists define which tools each stage can/cannot use, and inform the correct tool list for each per-stage guideline constant. Cross-reference to ensure guideline tool lists match actual permissions."
+    },
+    {
+      "what": "Stage system prompt tool lists",
+      "where": "stage1.py lines 19-26, stage2.py lines 8-16, stage3.py lines 12-19",
+      "how": "The tool lists in the system prompts should be the source of truth for what tools each per-stage guideline enumerates, supplemented by expand_task/parse_prd for Stage 2."
+    }
+  ],
+  "_session_id": "279-6f8f44cf",
+  "_created_at": "2026-03-28T15:54:25.648242+00:00"
+}
