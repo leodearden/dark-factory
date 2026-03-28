@@ -713,6 +713,17 @@ class TestMainModule:
 class TestAriaLivePollingsections:
     """Tests that all five auto-polling sections have aria-live='polite'."""
 
+    @pytest.mark.parametrize('partial_url', PARTIAL_URLS)
+    def test_section_has_aria_live_polite(self, client, partial_url):
+        html = client.get('/').text
+        hx_get = f'hx-get="{partial_url}"'
+        idx = html.find(hx_get)
+        assert idx != -1, f'hx-get for {partial_url} not found in HTML'
+        section_html = html[idx - 100:idx + 300]
+        assert 'aria-live="polite"' in section_html, (
+            f'aria-live="polite" not found near {partial_url}'
+        )
+
     def test_memory_section_has_aria_live_polite(self, client):
         html = client.get('/').text
         memory_idx = html.index('hx-get="/partials/memory"')
