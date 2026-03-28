@@ -20,6 +20,7 @@ from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data.chart_utils import group_top_n
 from dashboard.data.db import DbPool
+from dashboard.data.utils import parse_utc
 from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.performance import (
     get_completion_paths,
@@ -52,11 +53,9 @@ def timeago(value: str | None) -> str:
     if value is None:
         return 'never'
     try:
-        parsed = datetime.fromisoformat(value)
+        parsed = parse_utc(value)
     except (ValueError, TypeError):
         return 'never'
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
     delta = datetime.now(UTC) - parsed
     total_seconds = max(delta.total_seconds(), 0)
     total_minutes = int(total_seconds // 60)

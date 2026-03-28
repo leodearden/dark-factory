@@ -67,7 +67,7 @@
       "id": "step-6",
       "type": "impl",
       "description": "Refactor timeago filter in app.py: import parse_utc from dashboard.data.utils, replace the inline fromisoformat/tzinfo/replace pattern (lines 55-59) with a call to parse_utc(value). Keep the existing try/except (ValueError, TypeError) wrapper and the None early-return. Verify all timeago tests in test_recon_panel.py still pass, plus the new consolidation test.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     }
   ],
