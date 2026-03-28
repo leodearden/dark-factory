@@ -109,13 +109,13 @@ class TestRefreshTrackingJS:
 
 
 class TestRefreshPulseCSS:
-    """Tests that style.css contains the refresh-pulse animation."""
+    """Tests that tailwind.css contains the refresh-pulse animation."""
 
     def test_keyframes_animation_present(self, client):
-        css = client.get('/static/style.css').text
+        css = client.get('/static/tailwind.css').text
         assert '@keyframes section-refresh-pulse' in css
 
     def test_section_refreshed_class_present(self, client):
-        css = client.get('/static/style.css').text
+        css = client.get('/static/tailwind.css').text
         assert '.section-refreshed' in css
 
