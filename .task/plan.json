@@ -53,14 +53,14 @@
       "type": "test",
       "description": "Write new test test_utf8_open_passes_encoding_kwarg in TestYamlSettingsSourceEncoding. Use unittest.mock.patch on 'builtins.open' to intercept the open() call and assert it was called with encoding='utf-8'. The mock should use a side_effect that calls the real open so the test still exercises YAML loading, then verify via mock.call_args that encoding='utf-8' was passed.",
       "status": "done",
-      "commit": "placeholder-step-5"
+      "commit": "d1374124"
     },
     {
       "id": "step-6",
       "type": "impl",
       "description": "Verify step-5 test passes \u2014 no implementation change needed since schema.py line 64 already uses encoding='utf-8'. Run test suite to confirm green.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "placeholder-step-6"
     },
     {
       "id": "step-7",
