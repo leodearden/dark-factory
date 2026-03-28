@@ -711,9 +711,8 @@ class TestBaseStageValidationContract:
         import sys
         # The test module is loaded by pytest; find it in sys.modules
         for name, mod in sys.modules.items():
-            if name.endswith('test_stages') and hasattr(mod, '__file__'):
-                if mod.__file__ and 'test_stages' in mod.__file__:
-                    return getattr(mod, 'BaseStageValidationTest', None)
+            if name.endswith('test_stages') and hasattr(mod, '__file__') and mod.__file__ and 'test_stages' in mod.__file__:
+                return getattr(mod, 'BaseStageValidationTest', None)
         return None
 
     def test_base_class_exists(self):
