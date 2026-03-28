@@ -413,6 +413,22 @@ class GraphitiBackend:
         row = result.result_set[0]
         return (row[0], row[1] or '')
 
+    async def update_node_summary(self, uuid: str, summary: str) -> None:
+        """Update the summary text property on an Entity node.
+
+        Args:
+            uuid: UUID of the Entity node to update.
+            summary: New summary text (may be empty string to clear).
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        cypher = (
+            'MATCH (n:Entity {uuid: $uuid}) '
+            'SET n.summary = $summary'
+        )
+        await graph.query(cypher, {'uuid': uuid, 'summary': summary})
+
     async def get_edge_text(self, uuid: str) -> tuple[str, str]:
         """Return (name, fact) for the RELATES_TO edge with the given UUID.
 
