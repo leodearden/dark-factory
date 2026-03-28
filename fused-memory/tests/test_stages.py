@@ -622,6 +622,27 @@ class TestProjectIdValidation(BaseStageValidationTest):
         # (c) assemble_payload is exactly the original method reference
         assert stage.assemble_payload == original_assemble_payload
 
+    def test_patch_stage_restores_on_exception(self, mock_deps):
+        """_patch_stage restores originals even when an exception is raised inside the with block."""
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        original_run_stage_via_cli = base_module.run_stage_via_cli
+        original_assemble_payload = stage.assemble_payload
+
+        try:
+            with self._patch_stage(stage):
+                raise RuntimeError('boom')
+        except RuntimeError:
+            pass
+
+        # Postconditions: context manager must restore original state on abnormal exit
+        # (a) run_stage_via_cli is the original function again
+        assert base_module.run_stage_via_cli is original_run_stage_via_cli
+        # (b) assemble_payload is no longer a mock
+        assert not isinstance(stage.assemble_payload, _MOCK_TYPES)
+        # (c) assemble_payload is exactly the original method reference
+        assert stage.assemble_payload == original_assemble_payload
+
 
 class TestRunIdValidation(BaseStageValidationTest):
     """BaseStage.run() validates run_id before prompt interpolation."""
