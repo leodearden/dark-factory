@@ -247,8 +247,10 @@ class TestYamlSettingsSourceErrorHandling:
             source()
         assert exc_info.value.__cause__ is not None
 
-    @pytest.mark.skipif(sys.platform == 'win32', reason='chmod not reliable on Windows')
-    @pytest.mark.skipif(os.getuid() == 0, reason='root ignores file permissions')
+    @pytest.mark.skipif(
+        sys.platform == 'win32' or getattr(os, 'getuid', lambda: -1)() == 0,
+        reason='chmod not reliable on Windows or when running as root',
+    )
     def test_unreadable_file_raises_runtime_error(self, tmp_path):
         """An unreadable file must raise RuntimeError with the file path in the message."""
         locked_file = tmp_path / 'locked.yaml'
