@@ -265,6 +265,15 @@ class TestFormatDuration:
         assert 'format_duration' in templates.env.filters
         assert templates.env.filters['format_duration'] is format_duration
 
+    def test_negative_value_returns_dash(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(-30) == '-'
+
+    def test_non_numeric_returns_dash(self):
+        from dashboard.app import format_duration
+
+        assert format_duration('not_a_number') == '-'
 
 
 # --- Mock data for route tests ---
