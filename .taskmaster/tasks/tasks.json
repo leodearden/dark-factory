@@ -4047,11 +4047,11 @@
         "description": "In YamlSettingsSource.__call__ (schema.py:60-68), _expand_env_vars(raw_config) is called on line 68 outside the try/except block that wraps YAML loading (lines 63-67). If env-var expansion raises an unexpected exception (e.g. a re.error from a pathological pattern in a YAML value), it propagates as a raw exception rather than being wrapped in RuntimeError with the file path.\n\nFix: Move the `_expand_env_vars` call inside the try block, or add a second try/except around it that raises RuntimeError with a descriptive message including self.config_path. Add a test case for this scenario.\n\nmemory_hints:\n- search: \"YamlSettingsSource error handling config loading\"\n- entity: \"YamlSettingsSource\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T05:00:08.550Z"
+        "updatedAt": "2026-03-28T05:07:12.540Z"
       },
       {
         "id": "240",
@@ -4301,9 +4301,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T05:04:44.659Z",
+      "lastModified": "2026-03-28T05:07:12.541Z",
       "taskCount": 238,
-      "completedCount": 186,
+      "completedCount": 187,
       "tags": [
         "master"
       ]
