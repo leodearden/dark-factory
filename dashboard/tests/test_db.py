@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch
 
 import aiosqlite
 

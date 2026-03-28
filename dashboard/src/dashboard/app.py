@@ -9,7 +9,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 
 import httpx
 from fastapi import FastAPI, Request
@@ -48,7 +48,10 @@ _pkg_dir = Path(__file__).parent
 logger = logging.getLogger(__name__)
 
 
-def _safe_gather_result(result: object, default: object, label: str) -> object:
+_T = TypeVar('_T')
+
+
+def _safe_gather_result(result: object, default: _T, label: str) -> _T:
     """Return *default* if *result* is an exception, otherwise return *result*.
 
     Used with ``asyncio.gather(return_exceptions=True)`` to inspect each result
@@ -57,7 +60,7 @@ def _safe_gather_result(result: object, default: object, label: str) -> object:
     if isinstance(result, BaseException):
         logger.warning('Error fetching %s data: %s', label, result)
         return default
-    return result
+    return cast(_T, result)
 
 templates = Jinja2Templates(directory=str(_pkg_dir / 'templates'))
 

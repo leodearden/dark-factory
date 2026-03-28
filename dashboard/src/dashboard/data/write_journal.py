@@ -42,7 +42,7 @@ async def get_memory_timeseries(db: aiosqlite.Connection | None, *, hours: int =
             ' GROUP BY hour, kind',
             (since_iso,),
         ) as cursor:
-            return await cursor.fetchall()
+            return list(await cursor.fetchall())
 
     rows = await with_db(db, _query, [])
     for hour, kind, cnt in rows:
