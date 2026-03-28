@@ -17,7 +17,6 @@ import pytest
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
 
-
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.get_valid_edges_for_node
 # ---------------------------------------------------------------------------
@@ -341,7 +340,7 @@ class TestRefreshEntitySummaryMcpTool:
     @pytest.mark.asyncio
     async def test_delegates_to_memory_service(self, mcp_server, mock_service):
         """Tool calls memory_service.refresh_entity_summary with correct entity_uuid."""
-        result = await mcp_server._tool_manager.call_tool(
+        await mcp_server._tool_manager.call_tool(
             'refresh_entity_summary',
             {'entity_uuid': 'node-1', 'project_id': 'dark_factory'},
         )
