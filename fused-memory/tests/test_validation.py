@@ -180,6 +180,10 @@ class TestRequireProjectId:
             require_project_id(invalid)
         assert str(exc_info.value) == err_dict['error']
 
+    def test_injection_vector_newline_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            require_project_id('proj\nid')
+
 
 class TestRequireRunId:
     """require_run_id raises ValueError for invalid run ids, returns None for valid ones."""
