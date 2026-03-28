@@ -22,9 +22,9 @@ if TYPE_CHECKING:
 class MemoryConsolidator(BaseStage):
     """Stage 1: Review and consolidate memories across Graphiti and Mem0."""
 
-    # Tier limits — set by harness before run()
-    episode_limit: int = 500
-    memory_limit: int = 1000
+    # Tier limits — set by harness before run(); None until explicitly assigned
+    episode_limit: int | None = None
+    memory_limit: int | None = None
 
     # Remediation support — set by harness for second pass
     remediation_findings: list[dict] | None = None
