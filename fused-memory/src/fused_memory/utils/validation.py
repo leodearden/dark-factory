@@ -13,6 +13,7 @@ import os
 import re
 
 _RUN_ID_PATTERN = re.compile(r'[a-zA-Z0-9_-]+')
+_PROJECT_ID_PATTERN = re.compile(r'[a-zA-Z0-9_-]+')
 
 
 def validate_project_root(project_root: str) -> dict[str, str] | None:
@@ -26,10 +27,23 @@ def validate_project_root(project_root: str) -> dict[str, str] | None:
 
 
 def validate_project_id(project_id: str) -> dict[str, str] | None:
-    """Return an error dict if project_id is empty, else None."""
+    """Return an error dict if project_id is empty or contains unsafe characters, else None.
+
+    Accepted characters: ASCII letters, digits, hyphens, underscores.
+    This allowlist blocks all prompt-injection vectors (newlines, quotes, backticks,
+    braces, semicolons) while remaining forward-compatible with common identifier formats.
+    """
     if not project_id or not project_id.strip():
         return {
             'error': 'project_id is required and must be non-empty',
+            'error_type': 'ValidationError',
+        }
+    if not _PROJECT_ID_PATTERN.fullmatch(project_id):
+        return {
+            'error': (
+                f'project_id contains invalid characters: {project_id!r}. '
+                'Only ASCII letters, digits, hyphens, and underscores are allowed.'
+            ),
             'error_type': 'ValidationError',
         }
     return None
@@ -66,7 +80,7 @@ def require_project_root(project_root: str) -> None:
 
 
 def require_project_id(project_id: str) -> None:
-    """Raise ValueError if project_id is empty or whitespace-only."""
+    """Raise ValueError if project_id is empty or contains unsafe characters."""
     if err := validate_project_id(project_id):
         raise ValueError(err['error'])
 
