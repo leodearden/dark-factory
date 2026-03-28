@@ -3197,7 +3197,7 @@
         "description": "Two minor fixes from review of task 190:\n\n1. **Move inline `import types` to module top-level** in `test_memory_service.py`: Line 696 has `import types` inside `test_getattr_fallback_missing_attributes`. The same diff moved `import asyncio` to top-level but missed this one. Move it alongside other stdlib imports.\n\n2. **Guard against explicit `labels=None`** in `memory_service.py:get_entity()`: `getattr(n, 'labels', [])` returns `None` when the attribute IS present but set to `None` — the fallback only fires when the attribute is missing. Change to `getattr(n, 'labels', None) or []` to handle both cases. Add a test case with `bare_node.labels = None` to cover this boundary.\n\n## memory_hints\n- search: \"import types inline test_memory_service\"\n- search: \"getattr labels fallback get_entity\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -3210,7 +3210,8 @@
             "fused-memory/tests",
             "fused-memory/src/fused_memory/services"
           ]
-        }
+        },
+        "updatedAt": "2026-03-28T00:38:28.721Z"
       },
       {
         "id": "194",
@@ -3761,7 +3762,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-28T00:38:28.123Z",
+      "lastModified": "2026-03-28T00:38:28.721Z",
       "taskCount": 199,
       "completedCount": 159,
       "tags": [
