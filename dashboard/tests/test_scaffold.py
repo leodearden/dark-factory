@@ -125,6 +125,26 @@ class TestConftestFixtures:
         assert resp.json() == {'status': 'ok'}
 
 
+DASHBOARD_ROOT = Path(__file__).parent.parent
+
+
+class TestMakefile:
+    """Tests that the Makefile exists and has platform detection + checksum verification."""
+
+    def test_makefile_exists(self):
+        assert (DASHBOARD_ROOT / 'Makefile').is_file()
+
+    def test_makefile_has_platform_detection(self):
+        content = (DASHBOARD_ROOT / 'Makefile').read_text()
+        assert 'uname' in content
+        assert 'linux' in content.lower() or 'Linux' in content
+        assert 'darwin' in content.lower() or 'Darwin' in content
+
+    def test_makefile_has_checksum_verification(self):
+        content = (DASHBOARD_ROOT / 'Makefile').read_text()
+        assert 'sha256' in content
+
+
 class TestStaticFiles:
     def test_static_css_served(self, client):
         """Static CSS file should be served at /static/tailwind.css."""
