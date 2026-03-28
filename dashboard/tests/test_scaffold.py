@@ -174,6 +174,35 @@ class TestMakefile:
         content = (DASHBOARD_ROOT / 'Makefile').read_text()
         assert '.DELETE_ON_ERROR' in content
 
+    def test_makefile_has_cleanup_guard(self):
+        """Download recipe must chain commands with && and have rm -f on failure (|| guard)."""
+        content = (DASHBOARD_ROOT / 'Makefile').read_text()
+        # The recipe must use && to chain curl/checksum/chmod
+        assert '&&' in content
+        # The || guard must clean up the binary on any failure
+        assert 'rm -f' in content
+
+    def test_makefile_download_is_single_shell_block(self):
+        """curl, checksum, and chmod must be in one backslash-continued shell block."""
+        content = (DASHBOARD_ROOT / 'Makefile').read_text()
+        # In a single-shell block commands are joined with backslash-newline or && on one line
+        # Verify curl and chmod appear together with && chaining (not as separate recipe lines)
+        # A separate recipe line would have curl on its own line without a trailing backslash
+        lines = content.splitlines()
+        curl_line_idx = None
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('curl ') and 'TAILWIND_BIN' in line:
+                curl_line_idx = i
+                break
+        assert curl_line_idx is not None, 'No curl line found in Makefile'
+        curl_line = lines[curl_line_idx]
+        # The curl line must end with backslash (continuation) or contain &&
+        # indicating it's part of a multi-command shell block
+        assert curl_line.rstrip().endswith('\\') or '&&' in curl_line, (
+            f'curl line is not part of a single shell block: {curl_line!r}'
+        )
+
 
 class TestInputCSS:
     """Tests that input.css contains all required CSS rules including animations."""
