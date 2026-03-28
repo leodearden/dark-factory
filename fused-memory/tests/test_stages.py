@@ -707,37 +707,20 @@ class TestRunIdValidation(BaseStageValidationTest):
 class TestBaseStageValidationContract:
     """Verify that BaseStageValidationTest exists and provides the four shared members."""
 
-    def _get_base_cls(self):
-        import sys
-        # The test module is loaded by pytest; find it in sys.modules
-        for name, mod in sys.modules.items():
-            if name.endswith('test_stages') and hasattr(mod, '__file__') and mod.__file__ and 'test_stages' in mod.__file__:
-                return getattr(mod, 'BaseStageValidationTest', None)
-        return None
-
     def test_base_class_exists(self):
-        cls = self._get_base_cls()
-        assert cls is not None, "BaseStageValidationTest must be defined in test_stages.py"
+        assert BaseStageValidationTest is not None, "BaseStageValidationTest must be defined in test_stages.py"
 
     def test_base_class_has_fake_assemble_payload(self):
-        cls = self._get_base_cls()
-        assert cls is not None, "BaseStageValidationTest not found"
-        assert hasattr(cls, '_fake_assemble_payload'), "missing _fake_assemble_payload"
+        assert hasattr(BaseStageValidationTest, '_fake_assemble_payload'), "missing _fake_assemble_payload"
 
     def test_base_class_has_fake_run_stage_via_cli(self):
-        cls = self._get_base_cls()
-        assert cls is not None, "BaseStageValidationTest not found"
-        assert hasattr(cls, '_fake_run_stage_via_cli'), "missing _fake_run_stage_via_cli"
+        assert hasattr(BaseStageValidationTest, '_fake_run_stage_via_cli'), "missing _fake_run_stage_via_cli"
 
     def test_base_class_has_mock_deps_fixture(self):
-        cls = self._get_base_cls()
-        assert cls is not None, "BaseStageValidationTest not found"
-        assert hasattr(cls, 'mock_deps'), "missing mock_deps fixture"
+        assert hasattr(BaseStageValidationTest, 'mock_deps'), "missing mock_deps fixture"
 
     def test_base_class_has_patch_stage_helper(self):
-        cls = self._get_base_cls()
-        assert cls is not None, "BaseStageValidationTest not found"
-        assert hasattr(cls, '_patch_stage'), "missing _patch_stage helper"
+        assert hasattr(BaseStageValidationTest, '_patch_stage'), "missing _patch_stage helper"
 
 
 class TestTierConfig:
