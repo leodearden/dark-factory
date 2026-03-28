@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+from typing import TypedDict
+
+
+class ChartData(TypedDict):
+    """Typed shape for chart label/value pairs used across the dashboard."""
+
+    labels: list[str]
+    values: list[int | float]
+
 
 def group_top_n(data: dict, n: int = 5) -> dict:
     """Group chart data into top N entries plus an 'Other' aggregate.
