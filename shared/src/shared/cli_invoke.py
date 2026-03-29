@@ -33,6 +33,10 @@ class AgentResult:
     cost_usd: float = 0.0
     duration_ms: int = 0
     turns: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_create_tokens: int | None = None
     session_id: str = ''
     structured_output: Any = None
     subtype: str = ''
