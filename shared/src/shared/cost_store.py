@@ -71,7 +71,7 @@ class CostStore:
         self.db_path = db_path
 
     @classmethod
-    async def open(cls, db_path: Path) -> 'CostStore':
+    async def open(cls, db_path: Path) -> CostStore:
         """Create a CostStore, ensuring the schema and WAL mode are set up."""
         instance = cls(db_path)
         instance.db_path.parent.mkdir(parents=True, exist_ok=True)
