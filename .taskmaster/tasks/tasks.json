@@ -5690,7 +5690,23 @@
           "158"
         ],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "memory_hints": {
+            "entities": [
+              "UsageGate",
+              "CostStore",
+              "Graphiti"
+            ],
+            "queries": [
+              "entity summary stale aspirational PRD content",
+              "Graphiti entity node re-summarization",
+              "entity summary accumulation stale duplicate lines",
+              "task 158 entity summary rebuild mechanism"
+            ]
+          },
+          "_causation_id": "9d395ed6-5638-4dc3-ae3b-d6915ec67c9c"
+        }
       },
       {
         "id": 310,
