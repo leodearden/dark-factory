@@ -5242,7 +5242,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "shared/src/shared/cli_invoke.py",
+            "shared/tests/test_cli_invoke.py"
+          ],
+          "modules": [
+            "shared/src/shared",
+            "shared/tests"
+          ]
+        }
       },
       {
         "id": 295,
@@ -5253,7 +5263,18 @@
         "status": "pending",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "shared/src/shared/cost_store.py",
+            "shared/pyproject.toml",
+            "shared/tests/test_cost_store.py"
+          ],
+          "modules": [
+            "shared/src/shared",
+            "shared/tests"
+          ]
+        }
       },
       {
         "id": 296,
