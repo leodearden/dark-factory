@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from shared.cli_invoke import AgentResult, _SubprocessResult
+from shared.cli_invoke import _SubprocessResult
 
 from orchestrator.agents.invoke import _parse_codex_output, _parse_gemini_output
 
