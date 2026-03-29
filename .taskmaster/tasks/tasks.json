@@ -5306,6 +5306,19 @@
         ],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 300,
+        "title": "Instrument UsageGate cap events with CostStore",
+        "description": "In shared/src/shared/usage_gate.py, accept optional cost_store: CostStore | None = None in UsageGate.__init__ and store as self._cost_store. In _handle_cap_detected, if cost_store is set, call await cost_store.save_account_event(account_name, 'cap_hit', project_id, run_id, details_json, now). In _account_resume_probe_loop on successful resume, write 'resumed' event. When switching to the next account in before_invoke (failover), write 'failover' event with details including the from/to account names. project_id and run_id should be settable properties on UsageGate (set by harness at run start). Update tests in orchestrator/tests/test_usage_gate.py to verify events are written on cap, resume, and failover.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [
+          295
+        ],
+        "priority": "high",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -5318,7 +5331,7 @@
       ],
       "created": "2026-03-29T08:42:16.891Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-29T08:42:50.974Z"
+      "updated": "2026-03-29T08:42:55.418Z"
     }
   }
 }
