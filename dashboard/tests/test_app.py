@@ -715,6 +715,12 @@ class TestTailwindBuild:
         assert 'bg-gray-900' in css
         assert 'text-gray-100' in css
 
+    def test_tailwind_css_has_template_utilities(self, client):
+        css = client.get('/static/tailwind.css').text
+        assert 'border-gray-700' in css, 'border-gray-700 missing from tailwind.css'
+        assert 'animate-pulse' in css, 'animate-pulse missing from tailwind.css'
+        assert 'rounded-lg' in css, 'rounded-lg missing from tailwind.css'
+
 
 class TestFavicon:
     """Tests that the favicon SVG is linked and served."""
