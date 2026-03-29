@@ -163,6 +163,39 @@ class GitOps:
         self.config = config
         self.project_root = project_root
         self.worktree_base = (project_root / config.worktree_dir).resolve()
+        # ── MERGE QUEUE REDESIGN (blocked — see fused-memory task) ─────
+        #
+        # This lock is the sole serialization point for merges to main.
+        # At 64 max concurrency (20+ tasks in practice) with external
+        # actors (steward, L1 watcher, manual work) regularly advancing
+        # main, it causes three production failure modes:
+        #
+        #   1. Ghost loops — already-merged code retries infinitely
+        #      (task 591: 12 iterations, 18 plan steps)
+        #   2. Lock starvation — MERGER agent holds lock for minutes,
+        #      other merges pile up, advance_main exhausts retries
+        #      (tasks 485, 564: 3+ merge failures each)
+        #   3. Branch drift — long-lived branches accumulate commits
+        #      that conflict with now-merged originals on main
+        #
+        # Replacement design: MergeQueue + MergeWorker
+        #   - asyncio.Queue + single worker coroutine owns main advancement
+        #   - CAS update-ref: git update-ref refs/heads/main <new> <old>
+        #   - Already-merged detection: is_ancestor(branch, main) → skip
+        #   - Conflicts rejected immediately, resolved outside queue
+        #   - Front-of-queue re-enqueue on CAS failure
+        #   - Escalation MCP merge_request tool (steward/L1 submit to queue)
+        #   - pre-merge-commit hook blocks direct merges to main
+        #   - Future phase: speculative 2-step pipeline (depth 1)
+        #
+        # Key files: merge_queue.py (new), workflow.py:288-327,
+        #   git_ops.py:598 (CAS), harness.py (lifecycle),
+        #   escalation/server.py (MCP tool), hooks/pre-merge-commit (new)
+        #
+        # Unblock condition: dedicated implementation session with
+        # test coverage for CAS, ghost loop, conflict-outside-queue,
+        # and external-actor scenarios.
+        # ─────────────────────────────────────────────────────────────
         self._merge_lock = asyncio.Lock()
 
     async def create_worktree(self, branch_name: str) -> tuple[Path, str]:
@@ -482,6 +515,32 @@ class GitOps:
             ['git', 'rev-parse', 'HEAD'], cwd=self.project_root,
         )
         return sha
+
+    # ── PHASE 4: Speculative merge-verify pipeline ────────────────────
+    #
+    # Once the merge queue (task 292) is stable and we have metrics on
+    # queue depth and cycle time, consider a 2-step speculative pipeline:
+    #
+    #   Worker A (merger):   dequeue → merge_wt → git merge → scrub
+    #   Worker B (verifier): verify → CAS update-ref → notify
+    #
+    # While B verifies merge N, A speculatively merges N+1 against N's
+    # merge SHA (not current main).  If N succeeds, N+1 is already a
+    # descendant — CAS works immediately.  If N fails, discard N+1 and
+    # re-merge against actual main.  Cap speculation depth at 1.
+    #
+    # Expected throughput gain: ~2-3x when queue depth >3, because
+    # verification (~15-25s) dominates cycle time and is fully overlapped.
+    #
+    # Key risk: verification validity.  N+1 is verified against a tree
+    # that includes N's changes.  If N is later rejected, N+1 passed
+    # verification against a state that never existed on main.  Mitigated
+    # by scoped verification (task_files only) and depth-1 cap.
+    #
+    # Unblock condition: merge queue metrics showing sustained queue
+    # depth >3 and merge cycle time dominating task throughput.
+    # See blocked task that depends on task 292.
+    # ─────────────────────────────────────────────────────────────────
 
     async def advance_main(
         self,
