@@ -3524,9 +3524,14 @@
             "fused-memory/tests"
           ],
           "memory_hints": {
-            "entities": [],
+            "entities": [
+              "TierConfig",
+              "_select_tier"
+            ],
             "queries": [
-              "resolution for: Add opus-tier and boundary parametrized tests for _select_tier"
+              "_select_tier opus threshold ratio tier selection",
+              "TierConfig defaults reconciliation harness",
+              "opus-tier sonnet-tier buffer size boundary testing"
             ]
           }
         }
