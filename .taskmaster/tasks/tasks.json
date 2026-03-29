@@ -5272,9 +5272,17 @@
         "updatedAt": "2026-03-29T08:20:54.776Z",
         "metadata": {
           "memory_hints": {
-            "entities": [],
+            "entities": [
+              "MergeQueue",
+              "MergeWorker",
+              "MERGER"
+            ],
             "queries": [
-              "resolution for: Speculative merge-verify pipeline (Phase 4)"
+              "merge queue asyncio.Queue implementation details",
+              "CAS update-ref advance_main merge verification",
+              "MERGER agent conflict resolution re-submit queue",
+              "merge cycle time queue depth metrics",
+              "speculative merge pipeline design"
             ]
           }
         }
