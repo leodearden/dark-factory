@@ -5379,7 +5379,20 @@
             "shared/tests",
             "orchestrator/src/orchestrator",
             "orchestrator/tests"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "AgentResult",
+              "UsageGate",
+              "CostStore"
+            ],
+            "queries": [
+              "AgentResult token fields extension task 294 completion",
+              "UsageGate active_account_name property",
+              "account_name propagation in invoke_with_cap_retry and steward"
+            ]
+          },
+          "_causation_id": "eaf99cc7-85f9-47d1-8bdd-81c6af26139e"
         }
       },
       {
