@@ -5112,6 +5112,15 @@
             "status": "pending",
             "dependencies": [],
             "parentTaskId": 292
+          },
+          {
+            "id": 2,
+            "title": "Phase B: MergeQueue + MergeWorker module",
+            "description": "New file: orchestrator/src/orchestrator/merge_queue.py. MergeRequest dataclass (task_id, branch, worktree, pre_rebased, task_files, module_configs, asyncio.Future). MergeResult (success, blocked_reason, needs_conflict_resolution, conflict_details). MergeWorker coroutine: dequeue → already-merged check (is_ancestor) → merge_to_main → verify → CAS advance_main → set Future. Front-of-queue re-enqueue on CAS failure. Clean shutdown (set pending Futures to rejected).",
+            "details": "",
+            "status": "pending",
+            "dependencies": [],
+            "parentTaskId": 292
           }
         ],
         "updatedAt": "2026-03-29T08:06:09.475Z",
