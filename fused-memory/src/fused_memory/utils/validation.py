@@ -57,7 +57,7 @@ def _validate_identifier(value: str, field_name: str) -> dict[str, str] | None:
     if not _SAFE_IDENTIFIER_PATTERN.fullmatch(value):
         return {
             'error': (
-                f'{field_name} contains invalid characters: {value!r}. '
+                f'{field_name} contains invalid characters: {_safe_repr(value)}. '
                 'Only ASCII letters, digits, hyphens, and underscores are allowed.'
             ),
             'error_type': 'ValidationError',

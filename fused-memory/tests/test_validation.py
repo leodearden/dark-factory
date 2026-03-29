@@ -649,16 +649,18 @@ class TestTruncationInErrorMessages:
     """Truncation is applied in error messages for oversized inputs."""
 
     def test_validate_identifier_1mb_invalid_string_message_is_short(self):
-        """A 1 MB invalid string must produce an error message shorter than ~250 chars.
+        """A 1 MB invalid string must produce an error message shorter than 400 chars.
 
         Regression: without _safe_repr, repr() of a 1 MB string embeds the full
         million-character repr in the error dict, bloating logs and MCP responses.
+        With _safe_repr(max_len=200), the repr is capped to 200 + 14 ('...(truncated)')
+        = 214 chars, plus ~107 chars of static message overhead = at most ~321 chars total.
         """
         big_value = 'x' * 100 + '`' + 'y' * (1024 * 1024 - 101)  # invalid due to backtick
         result = _validate_identifier(big_value, 'project_id')
         assert result is not None
-        assert len(result['error']) < 250, (
-            f'Error message length {len(result["error"])} exceeds 250 — '
+        assert len(result['error']) < 400, (
+            f'Error message length {len(result["error"])} exceeds 400 — '
             '_validate_identifier must use _safe_repr to cap the embedded value'
         )
 
