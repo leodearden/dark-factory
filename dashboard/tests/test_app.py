@@ -812,3 +812,43 @@ class TestSafeGatherResult:
         """KeyboardInterrupt (BaseException, not Exception) must propagate, not be swallowed."""
         with pytest.raises(KeyboardInterrupt):
             _safe_gather_result(KeyboardInterrupt(), 'default', 'test')
+
+
+class TestNavBar:
+    """Tests for the navigation bar in base.html."""
+
+    def test_nav_element_present(self, client):
+        """A <nav> element must be present in the base layout."""
+        html = client.get('/').text
+        assert '<nav' in html
+
+    def test_dashboard_link_href(self, client):
+        """Nav must contain a link to / (Dashboard)."""
+        html = client.get('/').text
+        assert 'href="/"' in html
+
+    def test_costs_link_href(self, client):
+        """Nav must contain a link to /costs (Costs)."""
+        html = client.get('/').text
+        assert 'href="/costs"' in html
+
+    def test_dashboard_link_text(self, client):
+        """Nav must display 'Dashboard' link text."""
+        html = client.get('/').text
+        assert 'Dashboard' in html
+
+    def test_costs_link_text(self, client):
+        """Nav must display 'Costs' link text."""
+        html = client.get('/').text
+        assert 'Costs' in html
+
+    def test_dashboard_link_active_on_root(self, client):
+        """Dashboard link must have active styling (border-blue-500) when on /."""
+        html = client.get('/').text
+        # The active class should appear near the Dashboard link
+        assert 'border-blue-500' in html
+
+    def test_nav_uses_dark_theme_text(self, client):
+        """Nav links must use dark-theme text colors (text-gray-400 or similar)."""
+        html = client.get('/').text
+        assert 'text-gray-400' in html
