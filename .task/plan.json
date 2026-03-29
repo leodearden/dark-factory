@@ -21,7 +21,7 @@
       "id": "step-2",
       "type": "impl",
       "description": "Run the parametrized test to verify all 3 values ('', 'dark_factory', '.') still match the new pattern. The existing production code in validation.py:72 emits 'project_root must be a non-empty absolute path, got: ...' so the pattern matches without implementation changes.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
