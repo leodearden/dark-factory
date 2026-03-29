@@ -19,11 +19,10 @@ class TestSchemaCreation:
         db_path = tmp_path / 'runs.db'
         await CostStore.open(db_path)
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            async with conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-            ) as cursor:
-                tables = {row[0] for row in await cursor.fetchall()}
+        async with aiosqlite.connect(str(db_path)) as conn, conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ) as cursor:
+            tables = {row[0] for row in await cursor.fetchall()}
 
         assert 'invocations' in tables
         assert 'account_events' in tables
@@ -46,11 +45,10 @@ class TestSchemaCreation:
         db_path = tmp_path / 'runs.db'
         await CostStore.open(db_path)
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            async with conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"
-            ) as cursor:
-                indexes = {row[0] for row in await cursor.fetchall()}
+        async with aiosqlite.connect(str(db_path)) as conn, conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"
+        ) as cursor:
+            indexes = {row[0] for row in await cursor.fetchall()}
 
         assert 'idx_inv_project' in indexes
         assert 'idx_inv_account' in indexes
@@ -67,9 +65,8 @@ class TestWalMode:
         db_path = tmp_path / 'runs.db'
         await CostStore.open(db_path)
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            async with conn.execute('PRAGMA journal_mode') as cursor:
-                row = await cursor.fetchone()
+        async with aiosqlite.connect(str(db_path)) as conn, conn.execute('PRAGMA journal_mode') as cursor:
+            row = await cursor.fetchone()
         assert row is not None
         assert row[0] == 'wal'
 
@@ -150,9 +147,8 @@ class TestSaveInvocation:
         await store.save_invocation(**kwargs)
         await store.save_invocation(**{**kwargs, 'run_id': 'run-2'})
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            async with conn.execute('SELECT id FROM invocations ORDER BY id') as cursor:
-                ids = [row[0] for row in await cursor.fetchall()]
+        async with aiosqlite.connect(str(db_path)) as conn, conn.execute('SELECT id FROM invocations ORDER BY id') as cursor:
+            ids = [row[0] for row in await cursor.fetchall()]
 
         assert ids == [1, 2]
 
@@ -179,13 +175,12 @@ class TestSaveInvocation:
             completed_at='2026-01-01T00:00:01',
         )
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            async with conn.execute('SELECT * FROM invocations') as cursor:
-                rows = await cursor.fetchall()
-                cols = [d[0] for d in cursor.description]
+        async with aiosqlite.connect(str(db_path)) as conn, conn.execute('SELECT * FROM invocations') as cursor:
+            rows = await cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
 
         assert len(rows) == 1
-        row_dict = dict(zip(cols, rows[0]))
+        row_dict = dict(zip(cols, rows[0], strict=False))
         assert row_dict['task_id'] is None
         assert row_dict['input_tokens'] is None
         assert row_dict['output_tokens'] is None
@@ -240,13 +235,12 @@ class TestSaveAccountEvent:
             created_at='2026-01-01T12:00:00',
         )
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            async with conn.execute('SELECT * FROM account_events') as cursor:
-                rows = await cursor.fetchall()
-                cols = [d[0] for d in cursor.description]
+        async with aiosqlite.connect(str(db_path)) as conn, conn.execute('SELECT * FROM account_events') as cursor:
+            rows = await cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
 
         assert len(rows) == 1
-        row_dict = dict(zip(cols, rows[0]))
+        row_dict = dict(zip(cols, rows[0], strict=False))
         assert row_dict['project_id'] is None
         assert row_dict['run_id'] is None
         assert row_dict['details'] is None
