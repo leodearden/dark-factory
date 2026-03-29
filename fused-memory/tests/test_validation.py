@@ -4,6 +4,7 @@ import pytest
 
 from fused_memory.utils.validation import (
     InputValidationError,
+    _safe_repr,
     _validate_identifier,
     require_project_id,
     require_project_root,
@@ -567,6 +568,155 @@ class TestValidateIdentifierDelegation:
         assert validate_run_id(good) == _validate_identifier(good, 'run_id')
 
 
+class TestSafeRepr:
+    """_safe_repr(value, max_len) — truncates repr() output to max_len characters."""
+
+    def test_short_string_returns_full_repr_unchanged(self):
+        """A string whose repr is shorter than max_len is returned as-is."""
+        result = _safe_repr('hello', max_len=200)
+        assert result == repr('hello')
+
+    def test_empty_string_returns_full_repr(self):
+        """Empty string repr is two quote chars — well within any reasonable limit."""
+        result = _safe_repr('', max_len=200)
+        assert result == repr('')
+
+    def test_string_at_exact_limit_is_not_truncated(self):
+        """When repr length equals max_len exactly, no truncation occurs."""
+        # Build a string whose repr is exactly max_len chars.
+        # repr of a plain ASCII string of n chars is n+2 (two quote chars).
+        max_len = 20
+        # 'x' * 18 -> repr is "'xxxxxxxxxxxxxxxxxx'" = 20 chars
+        value = 'x' * (max_len - 2)
+        r = repr(value)
+        assert len(r) == max_len, 'Test setup error: repr length must equal max_len'
+        result = _safe_repr(value, max_len=max_len)
+        assert result == r
+        assert '...(truncated)' not in result
+
+    def test_string_exceeding_limit_is_truncated(self):
+        """A string whose repr exceeds max_len is sliced and '...(truncated)' appended."""
+        max_len = 20
+        value = 'a' * 100  # repr is 102 chars, well over 20
+        result = _safe_repr(value, max_len=max_len)
+        assert result.endswith('...(truncated)')
+        # The non-marker portion must be exactly max_len characters.
+        prefix = result[: -len('...(truncated)')]
+        assert len(prefix) == max_len
+
+    def test_truncated_prefix_matches_repr_slice(self):
+        """The prefix before the truncation marker must match repr(value)[:max_len]."""
+        max_len = 30
+        value = 'b' * 200
+        result = _safe_repr(value, max_len=max_len)
+        expected_prefix = repr(value)[:max_len]
+        assert result == expected_prefix + '...(truncated)'
+
+    def test_non_ascii_chars_repr_expansion_handled(self):
+        """Non-ASCII chars expand in repr(); truncation is applied after expansion."""
+        # Each non-ASCII byte may expand to \\xNN (4 chars) in repr.
+        # A 60-char string of non-ASCII may have repr of 242 chars (60*4 + 2 quotes).
+        value = '\xff' * 60  # each char -> \\xff (4 chars) in repr
+        max_len = 50
+        result = _safe_repr(value, max_len=max_len)
+        assert result.endswith('...(truncated)')
+        prefix = result[: -len('...(truncated)')]
+        assert len(prefix) == max_len
+
+    def test_control_chars_repr_expansion_handled(self):
+        """Control chars like \\n expand in repr(); truncation is applied after."""
+        value = '\n' * 100  # each -> \\n (2 chars) in repr
+        max_len = 40
+        result = _safe_repr(value, max_len=max_len)
+        assert result.endswith('...(truncated)')
+
+    def test_default_max_len_is_200(self):
+        """Default max_len is 200: a 201-char repr triggers truncation without explicit arg."""
+        # repr of n ASCII chars = n+2; need n+2 > 200 -> n >= 199
+        value = 'z' * 199  # repr = 201 chars
+        result = _safe_repr(value)
+        assert result.endswith('...(truncated)')
+
+    def test_default_max_len_is_200_no_truncation_for_199(self):
+        """repr of 198 ASCII chars = 200 chars: must NOT be truncated with default max_len."""
+        value = 'z' * 198  # repr = 200 chars == max_len, no truncation
+        result = _safe_repr(value)
+        assert '...(truncated)' not in result
+        assert result == repr(value)
+
+
+class TestTruncationInErrorMessages:
+    """Truncation is applied in error messages for oversized inputs."""
+
+    def test_validate_identifier_1mb_invalid_string_message_is_short(self):
+        """A 1 MB invalid string must produce an error message shorter than 400 chars.
+
+        Regression: without _safe_repr, repr() of a 1 MB string embeds the full
+        million-character repr in the error dict, bloating logs and MCP responses.
+        With _safe_repr(max_len=200), the repr is capped to 200 + 14 ('...(truncated)')
+        = 214 chars, plus ~107 chars of static message overhead = at most ~321 chars total.
+        """
+        big_value = 'x' * 100 + '`' + 'y' * (1024 * 1024 - 101)  # invalid due to backtick
+        result = _validate_identifier(big_value, 'project_id')
+        assert result is not None
+        assert len(result['error']) < 400, (
+            f'Error message length {len(result["error"])} exceeds 400 — '
+            '_validate_identifier must use _safe_repr to cap the embedded value'
+        )
+
+    def test_validate_identifier_1mb_invalid_string_contains_truncation_marker(self):
+        """The truncation marker must appear in the error message for an oversized input."""
+        big_value = 'bad`' + 'z' * (1024 * 1024)
+        result = _validate_identifier(big_value, 'run_id')
+        assert result is not None
+        assert '...(truncated)' in result['error'], (
+            "Error message must contain '...(truncated)' to indicate value was capped"
+        )
+
+    def test_validate_identifier_1mb_error_dict_shape_preserved(self):
+        """The error dict shape (exactly 'error' and 'error_type' keys) is preserved."""
+        big_value = 'bad\n' + 'a' * (1024 * 1024)
+        result = _validate_identifier(big_value, 'project_id')
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
+
+
+class TestValidateProjectRootTruncation:
+    """validate_project_root must cap the repr() of oversized project_root values."""
+
+    def test_validate_project_root_1mb_relative_path_message_is_short(self):
+        """A 1 MB relative path must produce an error message shorter than 400 chars.
+
+        Regression: without _safe_repr, repr() of a 1 MB string embeds the full
+        million-character repr in the error dict, bloating logs and MCP responses.
+        With _safe_repr(max_len=200), the repr is capped to 200 + 14 ('...(truncated)')
+        = 214 chars, plus ~58 chars of static message overhead = at most ~272 chars total.
+        """
+        big_path = 'x' * (1024 * 1024)  # relative path (no leading '/') — triggers error
+        result = validate_project_root(big_path)
+        assert result is not None
+        assert len(result['error']) < 400, (
+            f'Error message length {len(result["error"])} exceeds 400 — '
+            'validate_project_root must use _safe_repr to cap the embedded value'
+        )
+
+    def test_validate_project_root_1mb_relative_path_contains_truncation_marker(self):
+        """The truncation marker must appear in the error message for an oversized relative path."""
+        big_path = 'y' * (1024 * 1024)
+        result = validate_project_root(big_path)
+        assert result is not None
+        assert '...(truncated)' in result['error'], (
+            "Error message must contain '...(truncated)' to indicate value was capped"
+        )
+
+    def test_validate_project_root_1mb_error_dict_shape_preserved(self):
+        """The error dict shape (exactly 'error' and 'error_type' keys) is preserved."""
+        big_path = 'z' * (1024 * 1024)
+        result = validate_project_root(big_path)
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
+
+
 class TestValidatorErrorDictShape:
     """All validate_* functions return dicts with exactly 'error' and 'error_type' keys."""
 
@@ -584,3 +734,118 @@ class TestValidatorErrorDictShape:
         result = validate_run_id('')
         assert result is not None
         assert set(result.keys()) == {'error', 'error_type'}
+
+
+class TestRequireFunctionsTruncation:
+    """require_* functions delegate to validate_* which uses _safe_repr — truncation is inherited."""
+
+    def test_require_project_id_1mb_invalid_raises_with_short_message(self):
+        """require_project_id raises InputValidationError with a truncated message for a 1MB input.
+
+        Regression: require_project_id delegates to validate_project_id → _validate_identifier.
+        Since _validate_identifier now uses _safe_repr, the raised exception message must
+        also be short, not a million-character string.
+        """
+        big_id = 'bad`' + 'x' * (1024 * 1024)
+        with pytest.raises(InputValidationError) as exc_info:
+            require_project_id(big_id)
+        msg = str(exc_info.value)
+        assert len(msg) < 400, (
+            f'Exception message length {len(msg)} exceeds 400 — '
+            'require_project_id must inherit truncation from _validate_identifier'
+        )
+        assert '...(truncated)' in msg
+
+    def test_require_run_id_1mb_invalid_raises_with_short_message(self):
+        """require_run_id raises InputValidationError with a truncated message for a 1MB input."""
+        big_run = 'bad\n' + 'y' * (1024 * 1024)
+        with pytest.raises(InputValidationError) as exc_info:
+            require_run_id(big_run)
+        msg = str(exc_info.value)
+        assert len(msg) < 400, (
+            f'Exception message length {len(msg)} exceeds 400 — '
+            'require_run_id must inherit truncation from _validate_identifier'
+        )
+        assert '...(truncated)' in msg
+
+    def test_require_project_root_1mb_relative_raises_with_short_message(self):
+        """require_project_root raises InputValidationError with a truncated message for a 1MB relative path."""
+        big_path = 'z' * (1024 * 1024)
+        with pytest.raises(InputValidationError) as exc_info:
+            require_project_root(big_path)
+        msg = str(exc_info.value)
+        assert len(msg) < 400, (
+            f'Exception message length {len(msg)} exceeds 400 — '
+            'require_project_root must inherit truncation from validate_project_root'
+        )
+        assert '...(truncated)' in msg
+
+    def test_require_functions_raise_input_validation_error_not_base_value_error(self):
+        """require_* functions raise InputValidationError (not plain ValueError) for oversized inputs."""
+        big_id = 'bad`' + 'a' * (1024 * 1024)
+        with pytest.raises(InputValidationError):
+            require_project_id(big_id)
+        big_root = 'b' * (1024 * 1024)
+        with pytest.raises(InputValidationError):
+            require_project_root(big_root)
+
+
+class TestNormalLengthInputsDiagnosticQuality:
+    """Normal-length invalid inputs still carry full repr value — truncation must not activate."""
+
+    def test_validate_project_id_short_invalid_contains_full_repr(self):
+        """A short invalid project_id embeds its full repr in the error message.
+
+        Regression guard: truncation must only activate on oversized inputs.
+        A 7-char string with a backtick must still appear in full in the error message
+        so operators can diagnose exactly what was received.
+        """
+        bad_id = 'proj`id'
+        result = validate_project_id(bad_id)
+        assert result is not None
+        assert repr(bad_id) in result['error'], (
+            f'Short invalid value repr must appear untruncated in error message; '
+            f'got: {result["error"]!r}'
+        )
+        assert '...(truncated)' not in result['error']
+
+    def test_validate_run_id_short_invalid_contains_full_repr(self):
+        """A short invalid run_id embeds its full repr in the error message."""
+        bad_run = 'run\nid'
+        result = validate_run_id(bad_run)
+        assert result is not None
+        assert repr(bad_run) in result['error']
+        assert '...(truncated)' not in result['error']
+
+    def test_validate_project_root_short_relative_path_contains_full_repr(self):
+        """A short relative path embeds its full repr in the validate_project_root error message."""
+        rel_path = 'relative/path'
+        result = validate_project_root(rel_path)
+        assert result is not None
+        assert repr(rel_path) in result['error'], (
+            f'Short relative path repr must appear untruncated in error message; '
+            f'got: {result["error"]!r}'
+        )
+        assert '...(truncated)' not in result['error']
+
+    def test_validate_project_id_199_char_invalid_not_truncated(self):
+        """An invalid value whose repr is exactly 199 chars is not truncated.
+
+        repr of 197 ASCII chars = 199 chars (less than default max_len=200).
+        """
+        # 197 plain ASCII chars + a backtick to make it invalid; repr = 'xxx...`' (199 chars incl. quotes)
+        # We want repr length strictly < 200 to be safe from edge cases; use shorter value
+        value_short = 'x' * 50 + '`' + 'y' * 50  # 102 chars, repr = 104 chars
+        result = validate_project_id(value_short)
+        assert result is not None
+        assert '...(truncated)' not in result['error']
+        assert repr(value_short) in result['error']
+
+    def test_require_project_id_short_invalid_raises_with_full_repr(self):
+        """require_project_id exception message contains the full repr for short inputs."""
+        bad_id = 'bad;input'
+        with pytest.raises(InputValidationError) as exc_info:
+            require_project_id(bad_id)
+        msg = str(exc_info.value)
+        assert repr(bad_id) in msg
+        assert '...(truncated)' not in msg

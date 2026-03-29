@@ -29,6 +29,20 @@ class InputValidationError(ValueError):
     """
 
 
+def _safe_repr(value: str, max_len: int = 200) -> str:
+    """Return repr(value) truncated to max_len characters.
+
+    If repr(value) exceeds max_len, slices it to max_len characters and appends
+    '...(truncated)' so callers can see the value was capped.  Truncation happens
+    after calling repr(), so character expansion (e.g. \\n → \\\\n, \\xff → \\\\xff)
+    is accounted for before the cap is applied.
+    """
+    r = repr(value)
+    if len(r) > max_len:
+        return r[:max_len] + '...(truncated)'
+    return r
+
+
 def _validate_identifier(value: str, field_name: str) -> dict[str, str] | None:
     """Shared private helper: validate a single identifier against the safe allowlist.
 
@@ -43,7 +57,7 @@ def _validate_identifier(value: str, field_name: str) -> dict[str, str] | None:
     if not _SAFE_IDENTIFIER_PATTERN.fullmatch(value):
         return {
             'error': (
-                f'{field_name} contains invalid characters: {value!r}. '
+                f'{field_name} contains invalid characters: {_safe_repr(value)}. '
                 'Only ASCII letters, digits, hyphens, and underscores are allowed.'
             ),
             'error_type': 'ValidationError',
@@ -55,7 +69,7 @@ def validate_project_root(project_root: str) -> dict[str, str] | None:
     """Return an error dict if project_root is not a non-empty absolute path, else None."""
     if not project_root or not os.path.isabs(project_root):
         return {
-            'error': f'project_root must be a non-empty absolute path, got: {project_root!r}',
+            'error': f'project_root must be a non-empty absolute path, got: {_safe_repr(project_root)}',
             'error_type': 'ValidationError',
         }
     return None
