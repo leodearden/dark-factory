@@ -93,25 +93,16 @@ class TestGetRecentRuns:
 
     async def test_duration_with_mixed_naive_aware_timestamps(self, tmp_path):
         """Duration calculated correctly when started_at is naive and completed_at is aware."""
-        import sqlite3
-
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'mixed.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(RECONCILIATION_SCHEMA)
-        conn.execute(
+        inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
             "completed_at, events_processed, status) "
             "VALUES ('run-m1', 'dark_factory', 'full', 'test', '2026-03-28T10:00:00', "
-            "'2026-03-28T10:05:00+00:00', 3, 'completed')"
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+            "'2026-03-28T10:05:00+00:00', 3, 'completed')",
+        ]
+        async with make_recon_db(tmp_path, inserts, name='mixed.db') as db:
             runs = await get_recent_runs(db)
         assert len(runs) == 1
         assert runs[0]['duration_seconds'] == pytest.approx(300.0, abs=1.0)
@@ -123,31 +114,23 @@ class TestGetRecentRuns:
         migrations or schema changes.  We create a relaxed schema (no NOT NULL on
         started_at) to simulate such production data corruption.
         """
-        import sqlite3
-
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import RECONCILIATION_SCHEMA, make_recon_db
 
         # Replace 'started_at TEXT NOT NULL' with 'started_at TEXT' to allow NULL
         relaxed_schema = RECONCILIATION_SCHEMA.replace(
             'started_at TEXT NOT NULL', 'started_at TEXT'
         )
-
-        db_path = tmp_path / 'null_started.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(relaxed_schema)
-        conn.execute(
+        inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
             " completed_at, events_processed, status)"
             " VALUES ('run-ns1', 'dark_factory', 'full', 'test', NULL,"
-            " '2026-03-28T10:05:00+00:00', 0, 'completed')"
-        )
-        conn.commit()
-        conn.close()
-
+            " '2026-03-28T10:05:00+00:00', 0, 'completed')",
+        ]
         with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
-            async with aiosqlite.connect(str(db_path)) as db:
-                db.row_factory = aiosqlite.Row
+            async with make_recon_db(
+                tmp_path, inserts, name='null_started.db', schema=relaxed_schema
+            ) as db:
                 runs = await get_recent_runs(db)
 
         assert len(runs) == 1
@@ -162,26 +145,17 @@ class TestGetRecentRuns:
 
         This exercises the ValueError branch of the try/except in get_recent_runs.
         """
-        import sqlite3
-
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'malformed_started.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(RECONCILIATION_SCHEMA)
-        conn.execute(
+        inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
             " completed_at, events_processed, status)"
             " VALUES ('run-mal1', 'dark_factory', 'full', 'test', 'not-a-timestamp',"
-            " '2026-03-28T10:05:00+00:00', 0, 'completed')"
-        )
-        conn.commit()
-        conn.close()
-
+            " '2026-03-28T10:05:00+00:00', 0, 'completed')",
+        ]
         with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
-            async with aiosqlite.connect(str(db_path)) as db:
-                db.row_factory = aiosqlite.Row
+            async with make_recon_db(tmp_path, inserts, name='malformed_started.db') as db:
                 runs = await get_recent_runs(db)
 
         assert len(runs) == 1
@@ -195,38 +169,28 @@ class TestGetRecentRuns:
         Verifies per-row isolation: a bad row yields duration_seconds=None while
         a healthy sibling row still has its duration computed correctly.
         """
-        import sqlite3
-
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import RECONCILIATION_SCHEMA, make_recon_db
 
         # Relaxed schema to allow NULL started_at
         relaxed_schema = RECONCILIATION_SCHEMA.replace(
             'started_at TEXT NOT NULL', 'started_at TEXT'
         )
-
-        db_path = tmp_path / 'mixed_rows.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(relaxed_schema)
-        # Bad row: NULL started_at, valid completed_at
-        conn.execute(
+        inserts = [
+            # Bad row: NULL started_at, valid completed_at
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
             " completed_at, events_processed, status)"
             " VALUES ('run-bad', 'dark_factory', 'full', 'test', NULL,"
-            " '2026-03-28T10:05:00+00:00', 0, 'completed')"
-        )
-        # Good row: valid started_at + completed_at, exactly 5 minutes apart
-        conn.execute(
+            " '2026-03-28T10:05:00+00:00', 0, 'completed')",
+            # Good row: valid started_at + completed_at, exactly 5 minutes apart
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
             " completed_at, events_processed, status)"
             " VALUES ('run-good', 'dark_factory', 'full', 'test',"
-            " '2026-03-28T09:00:00+00:00', '2026-03-28T09:05:00+00:00', 3, 'completed')"
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+            " '2026-03-28T09:00:00+00:00', '2026-03-28T09:05:00+00:00', 3, 'completed')",
+        ]
+        async with make_recon_db(
+            tmp_path, inserts, name='mixed_rows.db', schema=relaxed_schema
+        ) as db:
             runs = await get_recent_runs(db)
 
         assert len(runs) == 2
