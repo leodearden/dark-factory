@@ -5121,6 +5121,15 @@
             "status": "pending",
             "dependencies": [],
             "parentTaskId": 292
+          },
+          {
+            "id": 3,
+            "title": "Phase C: Workflow integration — enqueue+await replaces _merge_lock",
+            "description": "Replace workflow.py lines 288-327 (async with _merge_lock → _merge). Phase 1 pre-rebase stays unchanged (unlocked). Phase 2 becomes: submit MergeRequest to queue, await Future. On CONFLICT result: resolve in own worktree via MERGER agent (outside queue), then re-submit. On ALREADY_MERGED: return DONE. Abandon-and-patch fallback when branch divergence exceeds threshold.",
+            "details": "",
+            "status": "pending",
+            "dependencies": [],
+            "parentTaskId": 292
           }
         ],
         "updatedAt": "2026-03-29T08:06:09.475Z",
