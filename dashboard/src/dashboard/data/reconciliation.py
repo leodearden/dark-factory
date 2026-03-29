@@ -83,7 +83,13 @@ async def get_recent_runs(db: aiosqlite.Connection | None, *, limit: int = 50) -
                     completed = parse_utc(row['completed_at'])
                     duration = (completed - started).total_seconds()
                 except (ValueError, TypeError) as exc:
-                    logger.debug('run %s: bad timestamps (%s)', row['id'], exc)
+                    logger.debug(
+                        'run %s: bad timestamps started_at=%r completed_at=%r (%s)',
+                        row['id'],
+                        row['started_at'],
+                        row['completed_at'],
+                        exc,
+                    )
 
             results.append(
                 {
