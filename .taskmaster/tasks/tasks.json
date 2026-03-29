@@ -5408,7 +5408,18 @@
           "modules": [
             "shared/src/shared",
             "orchestrator/tests"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "CostStore",
+              "UsageGate"
+            ],
+            "queries": [
+              "CostStore save_account_event cap_hit event tracking",
+              "UsageGate cap detection failover account switching",
+              "detect_cap_hit 401 auth error handling"
+            ]
+          }
         },
         "updatedAt": "2026-03-29T09:08:07.788Z"
       },
