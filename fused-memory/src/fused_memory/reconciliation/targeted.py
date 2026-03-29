@@ -126,7 +126,8 @@ class TargetedReconciler:
             )
             return result
 
-        except ValueError:
+        except ValueError as e:
+            logger.warning(f'Targeted reconciliation rejected invalid input: {e}')
             with contextlib.suppress(Exception):
                 await self.journal.complete_run(run_id, 'failed')
             raise
