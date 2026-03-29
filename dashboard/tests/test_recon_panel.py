@@ -180,6 +180,11 @@ class TestFormatDuration:
 
         assert format_duration(float('inf')) == '-'
 
+    def test_sub_second_positive_rounds_up(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(0.7) == '1s'
+
 
 # --- Mock data for route tests ---
 
