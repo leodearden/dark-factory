@@ -7,7 +7,8 @@ from .test_helpers import _get_opening_tag
 _SECTIONS = ('orchestrators', 'performance', 'memory', 'memory-graphs', 'recon')
 
 # Character class used to capture data-section and data-updated-for attribute values.
-_SECTION_NAME_RE = r'[a-z][a-z-]*'
+# Broadened to [a-z0-9][a-z0-9-]* so that digit-containing names (e.g. 'v2-panel') are captured.
+_SECTION_NAME_RE = r'[a-z0-9][a-z0-9-]*'
 
 
 class TestSectionNameRegex:
@@ -129,15 +130,15 @@ class TestSectionTimestampPairing:
         resp = client.get('/')
         assert resp.status_code == 200
         html = resp.text
-        sections = set(re.findall(r'data-section="([a-z][a-z-]*)"', html))
-        timestamps = set(re.findall(r'data-updated-for="([a-z][a-z-]*)"', html))
+        sections = set(re.findall(rf'data-section="({_SECTION_NAME_RE})"', html))
+        timestamps = set(re.findall(rf'data-updated-for="({_SECTION_NAME_RE})"', html))
         assert sections == timestamps
 
     def test_all_expected_sections_paired(self, client):
         resp = client.get('/')
         assert resp.status_code == 200
         html = resp.text
-        sections = set(re.findall(r'data-section="([a-z][a-z-]*)"', html))
+        sections = set(re.findall(rf'data-section="({_SECTION_NAME_RE})"', html))
         assert sections == set(_SECTIONS)
 
 
