@@ -5100,7 +5100,7 @@
         "description": "Replace asyncio.Lock merge serialization with queue-based merge worker. See design comment at git_ops.py:166.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "high",
         "subtasks": [
@@ -5185,7 +5185,7 @@
             "parentId": "undefined"
           }
         ],
-        "updatedAt": "2026-03-29T08:22:54.296Z",
+        "updatedAt": "2026-03-29T08:40:52.216Z",
         "metadata": {
           "memory_hints": {
             "entities": [],
@@ -5236,9 +5236,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T08:22:54.296Z",
+      "lastModified": "2026-03-29T08:40:52.216Z",
       "taskCount": 272,
-      "completedCount": 257,
+      "completedCount": 258,
       "tags": [
         "master"
       ]
