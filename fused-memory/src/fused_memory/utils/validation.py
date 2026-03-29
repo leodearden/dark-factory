@@ -83,18 +83,18 @@ def validate_run_id(run_id: str) -> dict[str, str] | None:
 
 
 def require_project_root(project_root: str) -> None:
-    """Raise ValueError if project_root is not a non-empty absolute path."""
+    """Raise InputValidationError if project_root is not a non-empty absolute path."""
     if err := validate_project_root(project_root):
-        raise ValueError(err['error'])
+        raise InputValidationError(err['error'])
 
 
 def require_project_id(project_id: str) -> None:
-    """Raise ValueError if project_id is empty or contains unsafe characters."""
+    """Raise InputValidationError if project_id is empty or contains unsafe characters."""
     if err := validate_project_id(project_id):
-        raise ValueError(err['error'])
+        raise InputValidationError(err['error'])
 
 
 def require_run_id(run_id: str) -> None:
-    """Raise ValueError if run_id is empty or contains unsafe characters."""
+    """Raise InputValidationError if run_id is empty or contains unsafe characters."""
     if err := validate_run_id(run_id):
-        raise ValueError(err['error'])
+        raise InputValidationError(err['error'])
