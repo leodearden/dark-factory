@@ -4942,7 +4942,7 @@
         "description": "dashboard/src/dashboard/app.py format_duration has correctness issues:\n\n1. int(float('inf')) raises OverflowError not caught by except (TypeError, ValueError) — add OverflowError to the clause\n2. Sub-second positive floats (0 < value < 1) truncate to 0 then return '-' — use round() before int()\n3. Missing test: format_duration(float('inf')) should return '-'\n4. test_small_age_displays_minutes_and_seconds uses 600s (> 300 threshold) but doesn't assert text-yellow-400\n5. No boundary test at exactly 300 seconds (strict > means 300 should be gray, 301 yellow)",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -4955,7 +4955,8 @@
             "dashboard/src/dashboard",
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-29T01:22:25.803Z"
       },
       {
         "id": "285",
@@ -5091,7 +5092,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T01:22:25.464Z",
+      "lastModified": "2026-03-29T01:22:25.803Z",
       "taskCount": 270,
       "completedCount": 248,
       "tags": [
