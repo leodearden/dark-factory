@@ -193,3 +193,19 @@ class TestDoughnutDatalabels:
         # Should have a formatter that computes percentage
         assert 'formatter' in html
         assert '%' in html or 'toFixed' in html
+
+    def test_datalabels_formatter_guards_empty_datasets(self, client):
+        """Datalabels formatter must guard against an empty datasets array."""
+        p1, p2, p3 = _patch_journal_app()
+        with p1, p2, p3:
+            html = client.get('/partials/memory-graphs').text
+        # Guard pattern: extract datasets[0] and short-circuit if undefined
+        assert 'if (!ds)' in html
+
+    def test_tooltip_callback_guards_empty_datasets(self, client):
+        """Tooltip label callback must guard against an empty datasets array."""
+        p1, p2, p3 = _patch_journal_app()
+        with p1, p2, p3:
+            html = client.get('/partials/memory-graphs').text
+        # Guard pattern: var ds = ctx.chart.data.datasets[0]; if (!ds) return '';
+        assert 'var ds = ctx.chart.data.datasets[0]' in html
