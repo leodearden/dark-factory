@@ -18,6 +18,17 @@ import re
 _SAFE_IDENTIFIER_PATTERN = re.compile(r'[a-zA-Z0-9_-]+')
 
 
+class InputValidationError(ValueError):
+    """Raised by require_* functions when an input parameter fails validation.
+
+    Subclasses ValueError for backward compatibility — existing ``except ValueError``
+    clauses and ``pytest.raises(ValueError)`` tests continue to work unchanged.
+    Using a distinct type lets callers distinguish input validation rejections
+    from ValueErrors raised by handler logic (e.g. arithmetic errors, parsing
+    failures inside reconciliation handlers).
+    """
+
+
 def _validate_identifier(value: str, field_name: str) -> dict[str, str] | None:
     """Shared private helper: validate a single identifier against the safe allowlist.
 
