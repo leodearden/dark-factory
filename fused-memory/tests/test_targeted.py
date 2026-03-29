@@ -472,3 +472,18 @@ async def test_reconcile_bulk_rejects_bad_project_root(reconciler, project_root)
             project_id='test-project',
             project_root=project_root,
         )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_task_validation_error_leaves_journal_trace(reconciler, journal):
+    """Validation failures in reconcile_task() must leave a 'failed' run in the journal."""
+    with pytest.raises(ValueError):
+        await reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='',
+            task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
+        )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1, 'Expected exactly one journal run for the failed call'
+    assert runs[0].status == 'failed', f'Expected status=failed, got {runs[0].status!r}'
