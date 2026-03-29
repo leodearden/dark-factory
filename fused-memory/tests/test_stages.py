@@ -636,9 +636,8 @@ class TestProjectIdValidation(BaseStageValidationTest):
         original_run_stage_via_cli = base_module.run_stage_via_cli
         original_assemble_payload = stage.assemble_payload
 
-        with pytest.raises(RuntimeError, match='boom'):
-            with self._patch_stage(stage):
-                raise RuntimeError('boom')
+        with pytest.raises(RuntimeError, match='boom'), self._patch_stage(stage):
+            raise RuntimeError('boom')
 
         # Postconditions: context manager must restore original state on abnormal exit
         # (a) run_stage_via_cli is the original function again
