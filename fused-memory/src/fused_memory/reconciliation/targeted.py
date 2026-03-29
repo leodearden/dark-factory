@@ -1,5 +1,6 @@
 """Targeted reconciliation — lightweight, triggered by task state transitions."""
 
+import contextlib
 import json
 import logging
 import uuid as uuid_mod
@@ -17,7 +18,7 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
-from fused_memory.utils.validation import require_project_root
+from fused_memory.utils.validation import InputValidationError, require_project_root
 
 logger = logging.getLogger(__name__)
 
@@ -125,8 +126,10 @@ class TargetedReconciler:
             )
             return result
 
-        except ValueError:
-            await self.journal.complete_run(run_id, 'failed')
+        except InputValidationError as e:
+            logger.warning(f'Targeted reconciliation rejected invalid input: {e}')
+            with contextlib.suppress(Exception):
+                await self.journal.complete_run(run_id, 'failed')
             raise
 
         except Exception as e:

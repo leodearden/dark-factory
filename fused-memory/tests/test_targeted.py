@@ -487,3 +487,89 @@ async def test_reconcile_task_validation_error_leaves_journal_trace(reconciler, 
     runs = await journal.get_recent_runs('test-project', limit=1)
     assert len(runs) == 1, 'Expected exactly one journal run for the failed call'
     assert runs[0].status == 'failed', f'Expected status=failed, got {runs[0].status!r}'
+
+
+# ── Exception masking safety tests (task-290) ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_validation_error_emits_warning_log(reconciler, caplog):
+    """reconcile_task() must emit a WARNING log when a validation error is caught.
+
+    This mirrors the sibling except Exception block which calls logger.error().
+    The warning must contain 'rejected invalid input' so operators can grep for it.
+    """
+    import logging
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.targeted'), pytest.raises(ValueError):
+        await reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='',  # invalid — triggers InputValidationError
+            task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
+        )
+
+    warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any('rejected invalid input' in msg for msg in warning_messages), (
+        f'Expected WARNING containing "rejected invalid input", got: {warning_messages}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_handler_valueerror_caught_as_exception_not_reraised(
+    mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+):
+    """A plain ValueError from a handler (_on_task_done) must NOT be re-raised.
+
+    With ``except ValueError`` catching all ValueErrors, handler errors are silently
+    re-raised with no log — indistinguishable from input validation errors.  After
+    narrowing to ``except InputValidationError``, plain ValueErrors from handlers fall
+    through to ``except Exception`` which returns an error dict instead of re-raising.
+    """
+    r = TargetedReconciler(
+        mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+    )
+    r.verifier = AsyncMock()
+
+    # Make _on_task_done raise a plain ValueError (simulating internal handler error)
+    r._on_task_done = AsyncMock(side_effect=ValueError('internal handler error'))
+
+    # Should NOT raise — handler ValueError must fall through to except Exception
+    result = await r.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root='/tmp/test',  # valid project_root
+        task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
+    )
+
+    # except Exception returns an error dict, not raises
+    assert 'error' in result, (
+        f'Expected error dict from handler ValueError, got: {result}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_journal_failure_does_not_mask_validation_error(
+    mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+):
+    """If journal.complete_run raises RuntimeError, the original InputValidationError propagates.
+
+    Python does NOT retry except-clauses for exceptions raised inside a handler, so a
+    RuntimeError raised inside ``except ValueError`` propagates instead of the original error.
+    Wrapping journal.complete_run in contextlib.suppress must prevent this masking.
+    """
+    r = TargetedReconciler(
+        mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+    )
+    r.verifier = AsyncMock()
+
+    # Patch the journal on the reconciler instance to blow up on complete_run
+    r.journal = AsyncMock()
+    r.journal.start_run = AsyncMock()
+    r.journal.complete_run = AsyncMock(side_effect=RuntimeError('DB down'))
+    r.journal.add_run_action = AsyncMock()
+
+    # Should raise ValueError (or InputValidationError), NOT RuntimeError
+    with pytest.raises(ValueError):
+        await r.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='',  # invalid — triggers InputValidationError
+            task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
+        )
