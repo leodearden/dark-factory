@@ -3,7 +3,7 @@
 import asyncio
 import types
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -622,8 +622,6 @@ class TestGraphitiBackendRemoveEdge:
     async def test_graphiti_backend_remove_edge(self, mock_config):
         """Unit test for GraphitiBackend.remove_edge — should call
         EntityEdge.get_by_uuid then edge.delete."""
-        from unittest.mock import patch
-
         from fused_memory.backends.graphiti_client import GraphitiBackend
 
         backend = GraphitiBackend(mock_config)
@@ -890,8 +888,6 @@ class TestGetEntity:
         The exception filter iterates all gather results and logs each Exception
         before raising the first one. Both failures must be visible in logs.
         """
-        from unittest.mock import patch
-
         service.graphiti.search_nodes = AsyncMock(
             side_effect=RuntimeError('search_nodes failed')
         )
