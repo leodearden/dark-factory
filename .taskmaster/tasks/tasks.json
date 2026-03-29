@@ -5681,7 +5681,32 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "memory_hints": {
+            "entities": [
+              "UsageGate",
+              "Graphiti",
+              "CostStore"
+            ],
+            "queries": [
+              "duplicate entity nodes fragmented knowledge",
+              "UsageGate entity two nodes different UUIDs",
+              "Graphiti entity merge edge consolidation"
+            ],
+            "known_duplicates": [
+              {
+                "entity": "UsageGate",
+                "nodes": [
+                  "fae8cccb-2e2d-4f4f-a839-1182579709d5",
+                  "0e745450-5569-448d-abcd-73c2b3f135f7"
+                ],
+                "survivor": "0e745450-5569-448d-abcd-73c2b3f135f7"
+              }
+            ]
+          },
+          "_causation_id": "e0fce9c1-100f-4f35-a062-c2847200f7e6"
+        }
       },
       {
         "id": 311,
