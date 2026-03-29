@@ -4619,7 +4619,7 @@
         "description": "The relaxed schema derivation `RECONCILIATION_SCHEMA.replace('started_at TEXT NOT NULL', 'started_at TEXT')` is duplicated in two tests and is fragile — if the schema string changes formatting, the replace silently does nothing and the test fails with a misleading IntegrityError.",
         "details": "## Problem\n\nIn `dashboard/tests/test_reconciliation.py`, two tests (`test_null_started_at_with_completed_at_sets_duration_none` line 131 and `test_null_started_at_does_not_affect_other_rows` line 203) derive a relaxed schema via brittle string replacement. If `RECONCILIATION_SCHEMA` in `conftest.py` ever changes whitespace or column order, the replacement silently produces the original strict schema.\n\n## Fix\n\n1. Define `RELAXED_RECONCILIATION_SCHEMA` (or similar) in `conftest.py` alongside `RECONCILIATION_SCHEMA`, with `started_at TEXT` (no NOT NULL).\n2. Replace both inline `.replace()` calls with a reference to the new constant.\n3. Optionally, add a module-level assertion or comment ensuring the two schemas stay in sync.\n\n## Memory hints\n- search: \"reconciliation test fixtures conftest schema\"\n- search: \"fragile test setup dashboard\"",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -4630,7 +4630,8 @@
           "modules": [
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-29T00:22:50.477Z"
       },
       {
         "id": "270",
@@ -5056,7 +5057,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T00:22:49.937Z",
+      "lastModified": "2026-03-29T00:22:50.477Z",
       "taskCount": 268,
       "completedCount": 242,
       "tags": [
