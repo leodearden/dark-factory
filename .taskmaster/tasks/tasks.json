@@ -4965,7 +4965,7 @@
         "description": "dashboard/tests/test_refresh_indicator.py has fragile patterns:\n\n1. html.index(marker) raises opaque ValueError — replace with assert + find for descriptive failures\n2. html.rfind('<', 0, idx) returns -1 on missing '<' causing silent wrap-around — add assert tag_start != -1\n3. Duplicated 5-line tag-extraction block in two test methods — extract _get_tag_for_section helper\n4. client.get() calls don't assert status 200 — a broken route silently passes absence assertions\n5. Regex r'data-section=\"([a-z][a-z-]*)\"' silently skips sections with digits — broaden to [a-z0-9][a-z0-9-]*",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -4977,7 +4977,7 @@
             "dashboard/tests"
           ]
         },
-        "updatedAt": "2026-03-29T01:26:01.541Z"
+        "updatedAt": "2026-03-29T05:03:49.041Z"
       },
       {
         "id": "286",
@@ -5096,9 +5096,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T01:35:17.437Z",
+      "lastModified": "2026-03-29T05:03:49.041Z",
       "taskCount": 270,
-      "completedCount": 252,
+      "completedCount": 253,
       "tags": [
         "master"
       ]
