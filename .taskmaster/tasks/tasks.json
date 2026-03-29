@@ -5239,7 +5239,7 @@
         "description": "Add input_tokens, output_tokens, cache_read_tokens, cache_create_tokens fields to AgentResult dataclass in shared/src/shared/cli_invoke.py. Parse them from the Claude CLI JSON usage block in _parse_claude_output. The CLI returns usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens — map these to the new fields. For _parse_codex_output and _parse_gemini_output, populate input_tokens and output_tokens from existing token parsing; leave cache fields as None. Update tests in shared/tests/test_cli_invoke.py to verify token parsing for all three backends.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
@@ -5252,7 +5252,8 @@
             "shared/src/shared",
             "shared/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-29T08:47:27.764Z"
       },
       {
         "id": "295",
@@ -5482,7 +5483,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T08:47:27.712Z",
+      "lastModified": "2026-03-29T08:47:27.764Z",
       "taskCount": 282,
       "completedCount": 258,
       "tags": [
