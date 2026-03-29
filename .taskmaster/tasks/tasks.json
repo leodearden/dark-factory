@@ -5514,6 +5514,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 307,
+        "title": "Costs page polish: layout consistency, content test, docstring",
+        "description": "Three small items for the new costs page:\n\n1. **costs.html** (line 6): Add `space-y-8` to the outer `<div class=\"max-w-7xl mx-auto p-6\">` to match index.html's layout pattern.\n\n2. **test_app.py**: Add a test that GET /costs returns expected body content (e.g., 'Costs' heading text, 'coming soon' placeholder).\n\n3. **app.py** (line 216-218): Add a docstring to the `costs()` route handler to match the pattern used by all other handlers.\n\nFiles: dashboard/src/dashboard/templates/costs.html, dashboard/tests/test_app.py, dashboard/src/dashboard/app.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -5526,7 +5537,7 @@
       ],
       "created": "2026-03-29T09:07:50.172Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-29T09:07:51.413Z"
+      "updated": "2026-03-29T09:07:52.355Z"
     }
   }
 }
