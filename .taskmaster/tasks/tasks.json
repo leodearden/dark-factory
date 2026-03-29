@@ -4500,11 +4500,11 @@
         "description": "Reduce test boilerplate in dashboard/tests/test_reconciliation.py and close coverage gaps for partition_burst_state.",
         "details": "## Problem\n\n1. **Boilerplate duplication (9 sites)**: The pattern of creating a custom SQLite DB (import sqlite3, import RECONCILIATION_SCHEMA, create db_path, connect, executescript, INSERT, commit, close, open with aiosqlite + row_factory) is repeated ~9 times across test_reconciliation.py. conftest.py has `reconciliation_db` for the common case but no factory for custom-data variants.\n\n2. **Missing happy-path coverage for partition_burst_state**: TestPartitionBurstState only tests the None-last_write_at error path. Missing tests:\n   - Recent `last_write_at` → agent in `active`\n   - Stale `last_write_at` → agent in `idle` (no debug log)\n   - `state='bursting'` → agent in `active` unconditionally\n\n## Fixes\n\n1. Add a `make_recon_db(tmp_path, inserts)` factory fixture/helper to conftest.py that accepts a list of SQL INSERT strings, creates the schema, executes them, and returns an aiosqlite connection. Refactor existing tests to use it.\n\n2. Add happy-path tests to TestPartitionBurstState covering the three cases above.\n\n## Memory hints\n- search: \"reconciliation test conftest fixture\"\n- search: \"partition_burst_state active idle threshold\"",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-28T20:40:42.376Z",
+        "updatedAt": "2026-03-29T00:17:26.503Z",
         "metadata": {
           "files": [
             "dashboard/tests/test_reconciliation.py",
@@ -5056,9 +5056,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T00:15:12.065Z",
+      "lastModified": "2026-03-29T00:17:26.505Z",
       "taskCount": 268,
-      "completedCount": 240,
+      "completedCount": 241,
       "tags": [
         "master"
       ]
