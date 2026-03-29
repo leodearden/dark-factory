@@ -728,6 +728,9 @@ class TestReconRightColumnLayout:
     def test_right_column_card_has_h_full(self, recon_layout_html):
         assert 'h-full' in recon_layout_html
 
+    def test_no_min_h_400_in_html(self, recon_layout_html):
+        assert 'min-h-[400px]' not in recon_layout_html
+
 
 class TestReconTableHeaderNoWrap:
     """Test that thead tr has whitespace-nowrap to prevent header truncation."""
