@@ -834,8 +834,6 @@ class TestNormalLengthInputsDiagnosticQuality:
         repr of 197 ASCII chars = 199 chars (less than default max_len=200).
         """
         # 197 plain ASCII chars + a backtick to make it invalid; repr = 'xxx...`' (199 chars incl. quotes)
-        value = 'x' * 96 + '`' + 'y' * 100  # 198 chars total, repr = 200 chars
-        r = repr(value)
         # We want repr length strictly < 200 to be safe from edge cases; use shorter value
         value_short = 'x' * 50 + '`' + 'y' * 50  # 102 chars, repr = 104 chars
         result = validate_project_id(value_short)
