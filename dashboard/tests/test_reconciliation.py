@@ -185,6 +185,38 @@ class TestGetRecentRuns:
         assert runs[0]['duration_seconds'] is None
         assert any('bad timestamps' in record.message for record in caplog.records)
 
+    async def test_malformed_completed_at_with_valid_started_at_sets_duration_none(
+        self, tmp_path, caplog
+    ):
+        """Malformed completed_at (non-ISO string) with valid started_at yields duration_seconds=None.
+
+        This exercises the ValueError branch of the try/except in get_recent_runs
+        when started_at parses successfully but completed_at does not.
+        The debug log must include the raw started_at and completed_at values
+        (via 'started_at=' and 'completed_at=' substrings) for diagnosability.
+        """
+        from dashboard.data.reconciliation import get_recent_runs
+        from tests.conftest import make_recon_db
+
+        inserts = [
+            "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
+            " completed_at, events_processed, status)"
+            " VALUES ('run-mal2', 'dark_factory', 'full', 'test',"
+            " '2026-03-28T10:00:00+00:00', 'not-a-timestamp', 0, 'completed')",
+        ]
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
+            async with make_recon_db(tmp_path, inserts, name='malformed_completed.db') as db:
+                runs = await get_recent_runs(db)
+
+        assert len(runs) == 1
+        assert runs[0]['id'] == 'run-mal2'
+        assert runs[0]['duration_seconds'] is None
+        assert any('bad timestamps' in record.message for record in caplog.records)
+        assert any(
+            'started_at=' in record.message and 'completed_at=' in record.message
+            for record in caplog.records
+        )
+
     async def test_null_started_at_does_not_affect_other_rows(self, tmp_path):
         """Bad row with NULL started_at does not prevent other rows from being returned correctly.
 
