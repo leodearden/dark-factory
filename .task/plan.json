@@ -49,7 +49,7 @@
       "id": "step-6",
       "type": "impl",
       "description": "Run the journal trace test to verify the new assertion passes. The production code at targeted.py:93 sets `run_type=RunType.targeted` before validation, so the run in the journal will have run_type='targeted'.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
