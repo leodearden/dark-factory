@@ -33,7 +33,7 @@
       "id": "step-2",
       "type": "impl",
       "description": "Define RELAXED_RECONCILIATION_SCHEMA in conftest.py right after RECONCILIATION_SCHEMA. Construct it as a copy of RECONCILIATION_SCHEMA with 'started_at TEXT NOT NULL' replaced by 'started_at TEXT'. Add a module-level assert that validates 'started_at TEXT NOT NULL' appears in RECONCILIATION_SCHEMA (so the derivation can't silently fail). Also add a comment explaining the relationship. This makes step-1's test pass.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {

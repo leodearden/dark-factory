@@ -150,6 +150,22 @@ CREATE TABLE IF NOT EXISTS run_actions (
 CREATE INDEX IF NOT EXISTS idx_ra_run ON run_actions(run_id);
 """
 
+# Guard: if RECONCILIATION_SCHEMA changes such that the substring no longer
+# exists, we fail at import time with a clear error rather than silently
+# passing a wrong schema to tests.
+assert 'started_at TEXT NOT NULL' in RECONCILIATION_SCHEMA, (
+    "RECONCILIATION_SCHEMA must contain 'started_at TEXT NOT NULL'; "
+    "update RELAXED_RECONCILIATION_SCHEMA derivation if the schema changes."
+)
+
+# RELAXED_RECONCILIATION_SCHEMA is derived from RECONCILIATION_SCHEMA with
+# the NOT NULL constraint removed from started_at.  This allows tests to
+# simulate production data corruption (NULL started_at) without redefining
+# the entire schema as a separate literal that could drift out of sync.
+RELAXED_RECONCILIATION_SCHEMA = RECONCILIATION_SCHEMA.replace(
+    'started_at TEXT NOT NULL', 'started_at TEXT'
+)
+
 
 @asynccontextmanager
 async def make_recon_db(

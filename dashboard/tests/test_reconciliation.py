@@ -16,7 +16,8 @@ def test_relaxed_schema_constant_exists_and_differs():
     - RELAXED_RECONCILIATION_SCHEMA is importable from tests.conftest
     - 'started_at TEXT NOT NULL' is NOT in the relaxed schema
     - 'started_at TEXT' IS in the relaxed schema
-    - The two schemas differ only in the NOT NULL constraint (round-trip check)
+    - The two schemas differ only in the NOT NULL constraint on started_at
+      (forward check: RECONCILIATION_SCHEMA with that one replacement == RELAXED)
     """
     from tests.conftest import RECONCILIATION_SCHEMA, RELAXED_RECONCILIATION_SCHEMA
 
@@ -24,10 +25,11 @@ def test_relaxed_schema_constant_exists_and_differs():
     assert 'started_at TEXT NOT NULL' not in RELAXED_RECONCILIATION_SCHEMA
     # Relaxed schema must still have started_at as nullable TEXT
     assert 'started_at TEXT' in RELAXED_RECONCILIATION_SCHEMA
-    # Round-trip: re-adding NOT NULL must yield the original schema
+    # Forward check: replacing that one constraint in RECONCILIATION_SCHEMA yields RELAXED
+    # (This is correct and avoids the substring ambiguity of the reverse direction.)
     assert (
-        RELAXED_RECONCILIATION_SCHEMA.replace('started_at TEXT', 'started_at TEXT NOT NULL')
-        == RECONCILIATION_SCHEMA
+        RECONCILIATION_SCHEMA.replace('started_at TEXT NOT NULL', 'started_at TEXT')
+        == RELAXED_RECONCILIATION_SCHEMA
     )
     # Sanity: the two constants are not identical
     assert RELAXED_RECONCILIATION_SCHEMA != RECONCILIATION_SCHEMA
