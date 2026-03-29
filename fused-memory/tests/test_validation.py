@@ -3,6 +3,7 @@
 import pytest
 
 from fused_memory.utils.validation import (
+    _validate_identifier,
     require_project_id,
     require_project_root,
     require_run_id,
@@ -10,6 +11,50 @@ from fused_memory.utils.validation import (
     validate_project_root,
     validate_run_id,
 )
+
+
+class TestValidateIdentifierHelper:
+    """_validate_identifier(value, field_name) — private shared helper."""
+
+    def test_empty_string_returns_error_with_field_name(self):
+        result = _validate_identifier('', 'my_field')
+        assert result is not None
+        assert 'error' in result
+        assert 'error_type' in result
+        assert 'my_field' in result['error']
+
+    def test_whitespace_only_returns_error(self):
+        result = _validate_identifier('   ', 'my_field')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_injection_newline_returns_error_with_field_name(self):
+        result = _validate_identifier('bad\nvalue', 'some_field')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'some_field' in result['error']
+
+    def test_valid_identifier_returns_none(self):
+        result = _validate_identifier('valid-id_123', 'project_id')
+        assert result is None
+
+    def test_error_dict_has_exactly_two_keys(self):
+        result = _validate_identifier('', 'field')
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
+
+    def test_character_rejection_error_mentions_field_name(self):
+        result = _validate_identifier('bad`value', 'run_id')
+        assert result is not None
+        assert 'run_id' in result['error']
+
+    def test_trailing_newline_rejected_fullmatch(self):
+        """fullmatch guarantee: trailing newline must be rejected."""
+        result = _validate_identifier('valid-id\n', 'project_id')
+        assert result is not None, (
+            '_validate_identifier accepted trailing newline — must use fullmatch'
+        )
+        assert result['error_type'] == 'ValidationError'
 
 
 class TestValidateRunId:
