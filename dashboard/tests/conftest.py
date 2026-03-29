@@ -23,6 +23,15 @@ _TAILWIND_STUB = """\
 /* Auto-generated stub for testing — real file built by `make css` */
 .bg-gray-900 { background-color: #111827; }
 .text-gray-100 { color: #f3f4f6; }
+.border-gray-700 { border-color: #374151; }
+.rounded-lg { border-radius: 0.5rem; }
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+.animate-pulse {
+    animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
 @keyframes section-refresh-pulse {
     from { background-color: rgba(96, 165, 250, 0.05); }
     to   { background-color: transparent; }
