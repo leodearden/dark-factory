@@ -5243,6 +5243,17 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 295,
+        "title": "Create CostStore in shared/",
+        "description": "New file shared/src/shared/cost_store.py: async aiosqlite writer for per-invocation cost records and account events. Creates two tables in the same runs.db used by RunStore (data/orchestrator/runs.db):\n\ninvocations table: id (autoincrement PK), run_id TEXT NOT NULL, task_id TEXT, project_id TEXT NOT NULL, account_name TEXT NOT NULL, model TEXT NOT NULL, role TEXT NOT NULL, cost_usd REAL NOT NULL, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_create_tokens INTEGER, duration_ms INTEGER NOT NULL, capped BOOLEAN DEFAULT FALSE, started_at TEXT NOT NULL, completed_at TEXT NOT NULL. Indexes on (project_id, completed_at), (account_name, completed_at), (run_id).\n\naccount_events table: id (autoincrement PK), account_name TEXT NOT NULL, event_type TEXT NOT NULL, project_id TEXT, run_id TEXT, details TEXT (JSON blob), created_at TEXT NOT NULL. Index on (account_name, created_at).\n\n__init__ takes db_path: Path, creates parent dirs, runs CREATE TABLE IF NOT EXISTS, sets PRAGMA journal_mode=WAL. Exposes async save_invocation(...) and save_account_event(...). Add aiosqlite to shared's dependencies in pyproject.toml. Write tests in shared/tests/test_cost_store.py: schema creation, save/query roundtrip, WAL mode verification.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -5255,7 +5266,7 @@
       ],
       "created": "2026-03-29T08:42:16.891Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-29T08:42:16.894Z"
+      "updated": "2026-03-29T08:42:22.900Z"
     }
   }
 }
