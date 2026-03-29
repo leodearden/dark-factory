@@ -83,7 +83,6 @@ class TargetedReconciler:
         project_root: str,
     ) -> dict:
         """Run targeted reconciliation for a single task state transition."""
-        require_project_root(project_root)
         run_id = str(uuid_mod.uuid4())
         start = datetime.now(UTC)
 
@@ -99,6 +98,8 @@ class TargetedReconciler:
         await self.journal.start_run(run)
 
         try:
+            require_project_root(project_root)
+
             handler = {
                 'done': self._on_task_done,
                 'blocked': self._on_task_blocked,
@@ -123,6 +124,10 @@ class TargetedReconciler:
                 },
             )
             return result
+
+        except ValueError:
+            await self.journal.complete_run(run_id, 'failed')
+            raise
 
         except Exception as e:
             await self.journal.complete_run(run_id, 'failed')
