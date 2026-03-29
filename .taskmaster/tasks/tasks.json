@@ -5347,6 +5347,19 @@
         ],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 303,
+        "title": "Dashboard cost page tests",
+        "description": "Tests for cost routes and data module in dashboard/tests/test_costs_panel.py following test_performance_panel.py patterns.\n\nTest fixtures: create a populated SQLite DB with invocations and account_events tables containing representative test data — multiple projects, accounts, models, roles, time ranges. Use tmp_path for DB files.\n\nTest cases:\n- GET /costs returns 200, text/html, contains nav bar with 'Costs' active\n- GET / (main dashboard) still works, nav bar with 'Dashboard' active\n- Each /costs/partials/{section} returns 200, text/html\n- Empty state: all partials handle empty DB gracefully (no 500s)\n- Time window: verify ?window=24h filters data correctly\n- Chart data: verify Chart.js canvases are present in by_project, by_account, by_role, trend partials\n- Summary cards: verify metric values render correctly from mock data\n- Events feed: verify event entries render with correct color coding\n- Runs table: verify expandable structure renders\n\nUse patch/AsyncMock pattern from test_performance_panel.py: patch the data functions to return known dicts, assert HTML contains expected values.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [
+          302
+        ],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -5359,7 +5372,7 @@
       ],
       "created": "2026-03-29T08:42:16.891Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-29T08:43:11.585Z"
+      "updated": "2026-03-29T08:43:18.885Z"
     }
   }
 }
