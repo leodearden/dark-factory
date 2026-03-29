@@ -4788,7 +4788,7 @@
         "description": "After the Tailwind local build is re-implemented, update tests in dashboard/tests/test_app.py:\n\n1. Check template-specific Tailwind utilities (e.g. border-gray-700, animate-pulse, rounded-lg) not just reset classes (bg-gray-900, text-gray-100). Also assert file size > 50KB as a coarse completeness guard.\n2. Add negative test: GET /static/style.css returns 404 after rename to input.css.\n3. Assert '<svg' and 'DF' in GET /static/favicon.svg response body (not just status code and content-type).\n\nFiles: dashboard/tests/test_app.py",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [
           "276"
         ],
@@ -4802,7 +4802,7 @@
             "dashboard/tests"
           ]
         },
-        "updatedAt": "2026-03-29T01:06:03.637Z"
+        "updatedAt": "2026-03-29T01:17:54.585Z"
       },
       {
         "id": "278",
@@ -5090,9 +5090,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T01:16:30.480Z",
+      "lastModified": "2026-03-29T01:17:54.585Z",
       "taskCount": 270,
-      "completedCount": 247,
+      "completedCount": 248,
       "tags": [
         "master"
       ]
