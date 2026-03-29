@@ -29,6 +29,36 @@ SECTION_TIMEOUTS = (
 )
 
 
+class TestGetSectionWindow:
+    """Tests for the _get_section_window helper function."""
+
+    def test_returns_correct_window_around_known_hx_get(self):
+        # Simulate HTML with hx-get near the start of a section block
+        html = 'X' * 300 + 'hx-get="/partials/memory"' + 'Y' * 600
+        window = _get_section_window(html, '/partials/memory')
+        assert 'hx-get="/partials/memory"' in window
+
+    def test_raises_assertion_error_when_not_found(self):
+        html = '<div>some html without the url</div>'
+        with pytest.raises(AssertionError, match='/partials/missing'):
+            _get_section_window(html, '/partials/missing')
+
+    def test_clamps_to_string_start_boundary(self):
+        # hx-get is near the very beginning of the string (idx < before)
+        html = 'hx-get="/partials/memory"' + 'Y' * 600
+        window = _get_section_window(html, '/partials/memory')
+        # Should not raise IndexError and should include the hx-get
+        assert 'hx-get="/partials/memory"' in window
+
+    def test_respects_custom_before_after_overrides(self):
+        html = 'A' * 50 + 'hx-get="/partials/memory"' + 'B' * 50
+        window = _get_section_window(html, '/partials/memory', before=10, after=10)
+        hx_get = 'hx-get="/partials/memory"'
+        idx = html.find(hx_get)
+        expected = html[idx - 10:idx + 10]
+        assert window == expected
+
+
 class TestIdiomorphExtension:
     """Tests for idiomorph extension setup in base.html."""
 
