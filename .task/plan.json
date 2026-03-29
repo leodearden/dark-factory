@@ -15,55 +15,55 @@
       "type": "test",
       "description": "Update match pattern in test_reconcile_task_rejects_bad_project_root (line 457): replace `match=re.escape(repr(project_root))` with `match=r'non-empty absolute path'` to anchor on the stable semantic fragment from the validation error message rather than coupling to repr formatting.",
       "status": "done",
-      "commit": null
+      "commit": "0ece2294"
     },
     {
       "id": "step-2",
       "type": "impl",
       "description": "Run the parametrized test to verify all 3 values ('', 'dark_factory', '.') still match the new pattern. The existing production code in validation.py:72 emits 'project_root must be a non-empty absolute path, got: ...' so the pattern matches without implementation changes.",
       "status": "done",
-      "commit": null
+      "commit": "4f3b4300"
     },
     {
       "id": "step-3",
       "type": "test",
       "description": "Update match pattern in test_reconcile_bulk_rejects_bad_project_root (line 469): same change \u2014 replace `match=re.escape(repr(project_root))` with `match=r'non-empty absolute path'`.",
       "status": "done",
-      "commit": null
+      "commit": "d50b92d3"
     },
     {
       "id": "step-4",
       "type": "impl",
       "description": "Run the bulk parametrized test to verify all 3 values still match. Same production code path (require_project_root \u2192 validate_project_root) ensures the pattern matches.",
       "status": "done",
-      "commit": null
+      "commit": "b4d955f7"
     },
     {
       "id": "step-5",
       "type": "test",
       "description": "Add `assert runs[0].run_type == 'targeted'` to test_reconcile_task_validation_error_leaves_journal_trace (after line 489). This verifies the journal trace corresponds to the targeted reconciliation path, not some other run type.",
       "status": "done",
-      "commit": null
+      "commit": "97dfb9de"
     },
     {
       "id": "step-6",
       "type": "impl",
       "description": "Run the journal trace test to verify the new assertion passes. The production code at targeted.py:93 sets `run_type=RunType.targeted` before validation, so the run in the journal will have run_type='targeted'.",
       "status": "done",
-      "commit": null
+      "commit": "ededdc6f"
     },
     {
       "id": "step-7",
       "type": "test",
       "description": "Add new test `test_reconcile_bulk_rejects_bad_project_root_leaves_no_journal_trace` after the existing bulk parametrized test. This test calls `reconcile_bulk_tasks` with an invalid project_root (e.g. ''), expects ValueError, then asserts `journal.get_recent_runs('test-project', limit=1) == []` to document the intentional absence of journal lifecycle in bulk reconciliation.",
       "status": "done",
-      "commit": null
+      "commit": "7562abbb"
     },
     {
       "id": "step-8",
       "type": "impl",
       "description": "Run the new no-journal-trace test to verify it passes. The production code in reconcile_bulk_tasks (targeted.py:360) calls require_project_root before any journal interaction, and there is no journal.start_run call in the bulk path at all, so no journal trace is left.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     }
   ],
