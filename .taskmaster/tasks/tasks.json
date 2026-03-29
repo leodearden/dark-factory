@@ -4494,7 +4494,18 @@
           ],
           "modules": [
             "dashboard/tests/test_app.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "dashboard",
+              "test_app.py"
+            ],
+            "queries": [
+              "dashboard partial integration test pattern assertions",
+              "memory-graphs performance partial template testing",
+              "Idiomorph chart canvas lifecycle htmx:afterSettle"
+            ]
+          }
         }
       },
       {
