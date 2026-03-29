@@ -927,8 +927,13 @@ class TestGetEntity:
         )
         service.graphiti.search = AsyncMock(return_value=[])
 
-        with pytest.raises(asyncio.CancelledError):
+        with patch('fused_memory.services.memory_service.logger') as mock_logger, \
+             pytest.raises(asyncio.CancelledError):
             await service.get_entity('entity', project_id='test')
+
+        # CancelledError is BaseException, NOT Exception — the isinstance(r, Exception)
+        # logging guard must NOT fire, so warning.call_count must be zero.
+        assert mock_logger.warning.call_count == 0
 
     # ------------------------------------------------------------------
     # temporal serialization in edge_data
