@@ -5130,6 +5130,15 @@
             "status": "pending",
             "dependencies": [],
             "parentTaskId": 292
+          },
+          {
+            "id": 4,
+            "title": "Phase D: Harness lifecycle — start/stop MergeWorker",
+            "description": "Harness creates asyncio.Queue and MergeWorker in __init__. Worker started via asyncio.create_task in run() after MCP startup. Queue instance passed to TaskWorkflow via constructor (alongside git_ops, scheduler, etc.). Graceful shutdown: cancel worker, set all pending Futures to rejected. Worker coroutine added to harness lifecycle alongside escalation server.",
+            "details": "",
+            "status": "pending",
+            "dependencies": [],
+            "parentTaskId": 292
           }
         ],
         "updatedAt": "2026-03-29T08:06:09.475Z",
