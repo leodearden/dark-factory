@@ -401,6 +401,11 @@ class TestReconRoute:
         assert '<h2' in html
         assert 'Reconciliation' in html
 
+    def test_large_age_displays_yellow_color(self, client):
+        with _patch_recon_data(buffer_stats={'buffered_count': 3, 'oldest_event_age_seconds': 600.0}):
+            html = client.get('/partials/recon').text
+        assert 'text-yellow-400' in html
+
 
 # --- Empty data constants ---
 
