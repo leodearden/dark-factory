@@ -5157,6 +5157,15 @@
             "status": "pending",
             "dependencies": [],
             "parentTaskId": 292
+          },
+          {
+            "id": 7,
+            "title": "Phase G: pre-merge-commit hook guardrail",
+            "description": "New file: hooks/pre-merge-commit. Blocks git merge into main except in _merge-* worktrees (orchestrator merge worktrees). Explanatory error message directs to merge queue for orchestrator tasks, merge_request MCP tool for steward/L1, --no-verify for emergency bypass. update-ref bypasses hooks so MergeWorker is unaffected. Update hooks/setup.sh if needed.",
+            "details": "",
+            "status": "pending",
+            "dependencies": [],
+            "parentTaskId": 292
           }
         ],
         "updatedAt": "2026-03-29T08:06:09.475Z",
