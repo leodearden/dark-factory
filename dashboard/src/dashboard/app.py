@@ -151,7 +151,7 @@ def format_duration(value: Any) -> str:
     """
     try:
         total = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return '-'
     if total <= 0:
         return '-'
