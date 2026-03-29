@@ -5334,7 +5334,7 @@
         "description": "New file dashboard/src/dashboard/data/costs.py with async query functions following the performance.py pattern. Uses with_db() wrapper from db.py. Queries the invocations and account_events tables created by CostStore (same runs.db).\n\nFunctions:\n- get_cost_summary(db, days=7) — returns {project_id: {total_spend, avg_cost_per_task, active_accounts, cap_events}}\n- get_cost_by_project(db, days=7) — returns {project_id: [{model, total}]} for stacked bar chart\n- get_cost_by_account(db, days=7) — returns {account_name: {spend, invocations, cap_events, last_cap, status}}\n- get_cost_by_role(db, days=7) — returns {project_id: {role: {model: total}}} for stacked bar\n- get_cost_trend(db, days=30) — returns {project_id: [{day, total}]} for line chart\n- get_account_events(db, days=7) — returns [{account_name, event_type, project_id, run_id, details, created_at}] for event log\n- get_run_cost_breakdown(db, days=7) — returns [{run_id, project_id, total_cost, tasks: [{task_id, title, cost, invocations: [...]}]}] for expandable table\n\nEach function handles None db gracefully. Time window filtering uses the same pattern as performance.py (_project_cutoffs or direct date arithmetic). Write unit tests in dashboard/tests/test_costs_data.py with populated test databases.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "295"
         ],
@@ -5349,7 +5349,8 @@
             "dashboard/src/dashboard/data",
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-29T09:05:09.874Z"
       },
       {
         "id": "299",
@@ -5495,7 +5496,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T09:05:09.695Z",
+      "lastModified": "2026-03-29T09:05:09.874Z",
       "taskCount": 283,
       "completedCount": 261,
       "tags": [
