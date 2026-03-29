@@ -29,6 +29,20 @@ class InputValidationError(ValueError):
     """
 
 
+def _safe_repr(value: str, max_len: int = 200) -> str:
+    """Return repr(value) truncated to max_len characters.
+
+    If repr(value) exceeds max_len, slices it to max_len characters and appends
+    '...(truncated)' so callers can see the value was capped.  Truncation happens
+    after calling repr(), so character expansion (e.g. \\n → \\\\n, \\xff → \\\\xff)
+    is accounted for before the cap is applied.
+    """
+    r = repr(value)
+    if len(r) > max_len:
+        return r[:max_len] + '...(truncated)'
+    return r
+
+
 def _validate_identifier(value: str, field_name: str) -> dict[str, str] | None:
     """Shared private helper: validate a single identifier against the safe allowlist.
 
