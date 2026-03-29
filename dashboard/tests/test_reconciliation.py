@@ -9,6 +9,30 @@ import aiosqlite
 import pytest
 
 
+def test_relaxed_schema_constant_exists_and_differs():
+    """RELAXED_RECONCILIATION_SCHEMA must exist in conftest and correctly relax started_at.
+
+    Asserts:
+    - RELAXED_RECONCILIATION_SCHEMA is importable from tests.conftest
+    - 'started_at TEXT NOT NULL' is NOT in the relaxed schema
+    - 'started_at TEXT' IS in the relaxed schema
+    - The two schemas differ only in the NOT NULL constraint (round-trip check)
+    """
+    from tests.conftest import RECONCILIATION_SCHEMA, RELAXED_RECONCILIATION_SCHEMA
+
+    # Relaxed schema must not have the NOT NULL constraint
+    assert 'started_at TEXT NOT NULL' not in RELAXED_RECONCILIATION_SCHEMA
+    # Relaxed schema must still have started_at as nullable TEXT
+    assert 'started_at TEXT' in RELAXED_RECONCILIATION_SCHEMA
+    # Round-trip: re-adding NOT NULL must yield the original schema
+    assert (
+        RELAXED_RECONCILIATION_SCHEMA.replace('started_at TEXT', 'started_at TEXT NOT NULL')
+        == RECONCILIATION_SCHEMA
+    )
+    # Sanity: the two constants are not identical
+    assert RELAXED_RECONCILIATION_SCHEMA != RECONCILIATION_SCHEMA
+
+
 class TestGetRecentRuns:
     """Tests for get_recent_runs."""
 

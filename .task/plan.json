@@ -26,7 +26,7 @@
       "id": "step-1",
       "type": "test",
       "description": "Write test_relaxed_schema_constant_exists_and_differs in test_reconciliation.py: import RELAXED_RECONCILIATION_SCHEMA from conftest, assert it exists, assert 'started_at TEXT NOT NULL' is NOT in the relaxed schema, assert 'started_at TEXT' IS in the relaxed schema, and assert the two schemas differ only in the NOT NULL constraint on started_at (i.e. relaxed_schema.replace('started_at TEXT', 'started_at TEXT NOT NULL') == RECONCILIATION_SCHEMA). This test will fail because the constant doesn't exist yet.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
