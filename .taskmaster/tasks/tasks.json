@@ -4660,7 +4660,7 @@
         "description": "Task 251 introduced PARTIAL_URLS as a module-level constant and parameterized TestMorphSwap, but TestHtmxTimeout and TestAriaLivePollingSections still hardcode the same 5 URLs inline. Complete the refactor:\n\n1. Parameterize TestAriaLivePollingSections with @pytest.mark.parametrize('partial_url', PARTIAL_URLS) — all 5 methods use identical [-100:+300] window and assert aria-live=\"polite\", so this is straightforward.\n\n2. Parameterize TestHtmxTimeout — requires a TIMEOUT_PARAMS tuple pairing each URL with its expected timeout value (8000, 12000, 8000, 12000, 10000).\n\n3. Standardize proximity window sizes across all three test classes (TestMorphSwap uses ±200, TestHtmxTimeout uses -200/+500, TestAriaLivePollingSections uses -100/+300). Pick consistent values and add brief inline comments explaining the rationale.\n\n4. Add defensive `assert hx_get in html, f'{hx_get!r} not found'` before each html.index() call so failures produce AssertionError instead of bare ValueError.\n\nmemory_hints: search \"PARTIAL_URLS proximity-slicing test convention\", search \"dashboard test parameterization\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -4672,7 +4672,7 @@
             "dashboard/tests"
           ]
         },
-        "updatedAt": "2026-03-29T00:13:55.552Z"
+        "updatedAt": "2026-03-29T00:25:39.342Z"
       },
       {
         "id": "272",
@@ -5057,9 +5057,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T00:22:50.477Z",
+      "lastModified": "2026-03-29T00:25:39.342Z",
       "taskCount": 268,
-      "completedCount": 242,
+      "completedCount": 243,
       "tags": [
         "master"
       ]
