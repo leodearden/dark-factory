@@ -515,6 +515,38 @@ async def test_validation_error_emits_warning_log(reconciler, caplog):
 
 
 @pytest.mark.asyncio
+async def test_handler_valueerror_caught_as_exception_not_reraised(
+    mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+):
+    """A plain ValueError from a handler (_on_task_done) must NOT be re-raised.
+
+    With ``except ValueError`` catching all ValueErrors, handler errors are silently
+    re-raised with no log — indistinguishable from input validation errors.  After
+    narrowing to ``except InputValidationError``, plain ValueErrors from handlers fall
+    through to ``except Exception`` which returns an error dict instead of re-raising.
+    """
+    r = TargetedReconciler(
+        mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+    )
+    r.verifier = AsyncMock()
+
+    # Make _on_task_done raise a plain ValueError (simulating internal handler error)
+    r._on_task_done = AsyncMock(side_effect=ValueError('internal handler error'))
+
+    # Should NOT raise — handler ValueError must fall through to except Exception
+    result = await r.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root='/tmp/test',  # valid project_root
+        task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
+    )
+
+    # except Exception returns an error dict, not raises
+    assert 'error' in result, (
+        f'Expected error dict from handler ValueError, got: {result}'
+    )
+
+
+@pytest.mark.asyncio
 async def test_journal_failure_does_not_mask_validation_error(
     mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
 ):
