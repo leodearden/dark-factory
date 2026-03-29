@@ -93,25 +93,16 @@ class TestGetRecentRuns:
 
     async def test_duration_with_mixed_naive_aware_timestamps(self, tmp_path):
         """Duration calculated correctly when started_at is naive and completed_at is aware."""
-        import sqlite3
-
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'mixed.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(RECONCILIATION_SCHEMA)
-        conn.execute(
+        inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
             "completed_at, events_processed, status) "
             "VALUES ('run-m1', 'dark_factory', 'full', 'test', '2026-03-28T10:00:00', "
-            "'2026-03-28T10:05:00+00:00', 3, 'completed')"
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+            "'2026-03-28T10:05:00+00:00', 3, 'completed')",
+        ]
+        async with make_recon_db(tmp_path, inserts, name='mixed.db') as db:
             runs = await get_recent_runs(db)
         assert len(runs) == 1
         assert runs[0]['duration_seconds'] == pytest.approx(300.0, abs=1.0)
@@ -123,31 +114,23 @@ class TestGetRecentRuns:
         migrations or schema changes.  We create a relaxed schema (no NOT NULL on
         started_at) to simulate such production data corruption.
         """
-        import sqlite3
-
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import RECONCILIATION_SCHEMA, make_recon_db
 
         # Replace 'started_at TEXT NOT NULL' with 'started_at TEXT' to allow NULL
         relaxed_schema = RECONCILIATION_SCHEMA.replace(
             'started_at TEXT NOT NULL', 'started_at TEXT'
         )
-
-        db_path = tmp_path / 'null_started.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(relaxed_schema)
-        conn.execute(
+        inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
             " completed_at, events_processed, status)"
             " VALUES ('run-ns1', 'dark_factory', 'full', 'test', NULL,"
-            " '2026-03-28T10:05:00+00:00', 0, 'completed')"
-        )
-        conn.commit()
-        conn.close()
-
+            " '2026-03-28T10:05:00+00:00', 0, 'completed')",
+        ]
         with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
-            async with aiosqlite.connect(str(db_path)) as db:
-                db.row_factory = aiosqlite.Row
+            async with make_recon_db(
+                tmp_path, inserts, name='null_started.db', schema=relaxed_schema
+            ) as db:
                 runs = await get_recent_runs(db)
 
         assert len(runs) == 1
@@ -162,26 +145,17 @@ class TestGetRecentRuns:
 
         This exercises the ValueError branch of the try/except in get_recent_runs.
         """
-        import sqlite3
-
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'malformed_started.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(RECONCILIATION_SCHEMA)
-        conn.execute(
+        inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
             " completed_at, events_processed, status)"
             " VALUES ('run-mal1', 'dark_factory', 'full', 'test', 'not-a-timestamp',"
-            " '2026-03-28T10:05:00+00:00', 0, 'completed')"
-        )
-        conn.commit()
-        conn.close()
-
+            " '2026-03-28T10:05:00+00:00', 0, 'completed')",
+        ]
         with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
-            async with aiosqlite.connect(str(db_path)) as db:
-                db.row_factory = aiosqlite.Row
+            async with make_recon_db(tmp_path, inserts, name='malformed_started.db') as db:
                 runs = await get_recent_runs(db)
 
         assert len(runs) == 1
@@ -195,38 +169,28 @@ class TestGetRecentRuns:
         Verifies per-row isolation: a bad row yields duration_seconds=None while
         a healthy sibling row still has its duration computed correctly.
         """
-        import sqlite3
-
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import RECONCILIATION_SCHEMA, make_recon_db
 
         # Relaxed schema to allow NULL started_at
         relaxed_schema = RECONCILIATION_SCHEMA.replace(
             'started_at TEXT NOT NULL', 'started_at TEXT'
         )
-
-        db_path = tmp_path / 'mixed_rows.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(relaxed_schema)
-        # Bad row: NULL started_at, valid completed_at
-        conn.execute(
+        inserts = [
+            # Bad row: NULL started_at, valid completed_at
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
             " completed_at, events_processed, status)"
             " VALUES ('run-bad', 'dark_factory', 'full', 'test', NULL,"
-            " '2026-03-28T10:05:00+00:00', 0, 'completed')"
-        )
-        # Good row: valid started_at + completed_at, exactly 5 minutes apart
-        conn.execute(
+            " '2026-03-28T10:05:00+00:00', 0, 'completed')",
+            # Good row: valid started_at + completed_at, exactly 5 minutes apart
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
             " completed_at, events_processed, status)"
             " VALUES ('run-good', 'dark_factory', 'full', 'test',"
-            " '2026-03-28T09:00:00+00:00', '2026-03-28T09:05:00+00:00', 3, 'completed')"
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+            " '2026-03-28T09:00:00+00:00', '2026-03-28T09:05:00+00:00', 3, 'completed')",
+        ]
+        async with make_recon_db(
+            tmp_path, inserts, name='mixed_rows.db', schema=relaxed_schema
+        ) as db:
             runs = await get_recent_runs(db)
 
         assert len(runs) == 2
@@ -276,27 +240,16 @@ class TestGetWatermarks:
 
     async def test_multiple_projects(self, tmp_path):
         """Returns watermarks for all projects ordered by project_id."""
-        import sqlite3
-
         from dashboard.data.reconciliation import get_watermarks
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'multi.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(RECONCILIATION_SCHEMA)
-        conn.execute(
+        inserts = [
             "INSERT INTO watermarks (project_id, last_full_run_completed)"
-            " VALUES ('alpha', '2026-03-19T10:00:00+00:00')"
-        )
-        conn.execute(
+            " VALUES ('alpha', '2026-03-19T10:00:00+00:00')",
             "INSERT INTO watermarks (project_id, last_full_run_completed)"
-            " VALUES ('beta', '2026-03-19T11:00:00+00:00')"
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+            " VALUES ('beta', '2026-03-19T11:00:00+00:00')",
+        ]
+        async with make_recon_db(tmp_path, inserts, name='multi.db') as db:
             result = await get_watermarks(db)
         assert len(result) == 2
         assert result[0]['project_id'] == 'alpha'
@@ -320,62 +273,40 @@ class TestGetLastAttemptedRun:
 
     async def test_failed_most_recent(self, tmp_path):
         """Returns a failed run when it's the most recent."""
-        import sqlite3
-
         from dashboard.data.reconciliation import get_last_attempted_run
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'failed.db'
-        conn = sqlite3.connect(str(db_path))
-        from tests.conftest import RECONCILIATION_SCHEMA
-        conn.executescript(RECONCILIATION_SCHEMA)
-        conn.execute(
+        inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
             "completed_at, events_processed, status) "
             "VALUES ('run-f1', 'dark_factory', 'full', 'test', '2026-03-19T12:00:00', "
-            "'2026-03-19T12:01:00', 5, 'failed')"
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+            "'2026-03-19T12:01:00', 5, 'failed')",
+        ]
+        async with make_recon_db(tmp_path, inserts, name='failed.db') as db:
             result = await get_last_attempted_run(db)
         assert 'dark_factory' in result
         assert result['dark_factory']['status'] == 'failed'
 
     async def test_multiple_projects(self, tmp_path):
         """Returns one entry per project, each the most recent run."""
-        import sqlite3
-
         from dashboard.data.reconciliation import get_last_attempted_run
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'multi.db'
-        conn = sqlite3.connect(str(db_path))
-        from tests.conftest import RECONCILIATION_SCHEMA
-        conn.executescript(RECONCILIATION_SCHEMA)
-        conn.execute(
+        inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
             "completed_at, events_processed, status) "
             "VALUES ('a1', 'alpha', 'full', 'test', '2026-03-19T10:00:00', "
-            "'2026-03-19T10:01:00', 2, 'completed')"
-        )
-        conn.execute(
+            "'2026-03-19T10:01:00', 2, 'completed')",
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
             "completed_at, events_processed, status) "
             "VALUES ('a2', 'alpha', 'full', 'test', '2026-03-19T11:00:00', "
-            "'2026-03-19T11:01:00', 3, 'failed')"
-        )
-        conn.execute(
+            "'2026-03-19T11:01:00', 3, 'failed')",
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
             "completed_at, events_processed, status) "
             "VALUES ('b1', 'beta', 'full', 'test', '2026-03-19T09:00:00', "
-            "'2026-03-19T09:01:00', 1, 'completed')"
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+            "'2026-03-19T09:01:00', 1, 'completed')",
+        ]
+        async with make_recon_db(tmp_path, inserts, name='multi.db') as db:
             result = await get_last_attempted_run(db)
         assert len(result) == 2
         assert result['alpha']['id'] == 'a2'  # most recent for alpha
@@ -455,28 +386,22 @@ class TestGetBurstState:
 
     async def test_cooldown_expires_stale_burst(self, tmp_path):
         """Agents with last_write older than cooldown are reported as idle."""
-        import sqlite3
         from datetime import UTC, datetime, timedelta
 
         from dashboard.data.reconciliation import get_burst_state
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'stale.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(RECONCILIATION_SCHEMA)
         now = datetime.now(UTC)
         # last_write_at is 10 minutes ago — well past default 150s cooldown
-        conn.execute(
-            "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
-            " VALUES (?, 'bursting', ?, ?)",
-            ('stale-agent', (now - timedelta(minutes=10)).isoformat(),
-             (now - timedelta(minutes=15)).isoformat()),
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+        inserts = [
+            (
+                "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
+                " VALUES (?, 'bursting', ?, ?)",
+                ('stale-agent', (now - timedelta(minutes=10)).isoformat(),
+                 (now - timedelta(minutes=15)).isoformat()),
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='stale.db') as db:
             result = await get_burst_state(db)
         assert len(result) == 1
         assert result[0]['state'] == 'idle'
@@ -484,28 +409,22 @@ class TestGetBurstState:
 
     async def test_cooldown_preserves_active_burst(self, tmp_path):
         """Agents with recent last_write keep bursting state."""
-        import sqlite3
         from datetime import UTC, datetime, timedelta
 
         from dashboard.data.reconciliation import get_burst_state
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'active.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(RECONCILIATION_SCHEMA)
         now = datetime.now(UTC)
         # last_write_at is 30 seconds ago — within 150s cooldown
-        conn.execute(
-            "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
-            " VALUES (?, 'bursting', ?, ?)",
-            ('active-agent', (now - timedelta(seconds=30)).isoformat(),
-             (now - timedelta(seconds=60)).isoformat()),
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+        inserts = [
+            (
+                "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
+                " VALUES (?, 'bursting', ?, ?)",
+                ('active-agent', (now - timedelta(seconds=30)).isoformat(),
+                 (now - timedelta(seconds=60)).isoformat()),
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='active.db') as db:
             result = await get_burst_state(db)
         assert len(result) == 1
         assert result[0]['state'] == 'bursting'
@@ -527,24 +446,17 @@ class TestGetBurstState:
 
     async def test_malformed_timestamp_logs_debug(self, tmp_path, caplog):
         """A malformed last_write_at in burst_state emits a DEBUG log with agent_id."""
-        import sqlite3
-
         from dashboard.data.reconciliation import get_burst_state
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'malformed.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(RECONCILIATION_SCHEMA)
-        conn.execute(
-            "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
-            " VALUES (?, 'bursting', ?, ?)",
-            ('bad-agent', 'not-a-date', None),
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+        inserts = [
+            (
+                "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
+                " VALUES (?, 'bursting', ?, ?)",
+                ('bad-agent', 'not-a-date', None),
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='malformed.db') as db:
             with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
                 result = await get_burst_state(db)
 
@@ -898,6 +810,37 @@ class TestPartitionBurstState:
         )
         assert len(idle) == 1
 
+    def test_stale_valid_timestamp_emits_no_debug_log(self, caplog):
+        """A stale-but-valid ISO timestamp routes to idle without emitting any debug log.
+
+        The debug log is only emitted for *invalid* timestamps (ValueError/TypeError).
+        A well-formed but stale timestamp (e.g. from 2020) is parsed successfully,
+        found to exceed the activity threshold, and the agent is classified as idle —
+        all without touching the except branch that logs 'bad last_write_at'.
+        """
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [
+            {'agent_id': 'old-agent', 'state': 'idle', 'last_write_at': '2020-01-01T00:00:00+00:00'}
+        ]
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
+            active, idle = partition_burst_state(agents)
+
+        assert len(active) == 0
+        assert len(idle) == 1
+        assert idle[0]['agent_id'] == 'old-agent'
+
+        # No debug log must be emitted — stale-but-valid timestamps are not errors
+        debug_records = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG
+            and r.name == 'dashboard.data.reconciliation'
+        ]
+        assert debug_records == [], (
+            f'Expected no DEBUG logs for valid stale timestamp, got: '
+            f'{[r.getMessage() for r in debug_records]}'
+        )
+
 
 class TestWithDb:
     """Unit tests for the with_db helper function."""
@@ -983,3 +926,88 @@ class TestWithDb:
             if r.levelno == logging.DEBUG and 'dashboard.data.db' in r.name
         ]
         assert debug_records, f'Expected DEBUG log, got: {caplog.records}'
+
+
+class TestMakeReconDb:
+    """Tests for the make_recon_db async context manager helper in conftest.py."""
+
+    async def test_creates_schema_and_executes_plain_sql_inserts(self, tmp_path):
+        """make_recon_db creates schema tables and executes plain SQL inserts."""
+        from tests.conftest import make_recon_db
+
+        inserts = [
+            "INSERT INTO watermarks (project_id) VALUES ('proj-a')",
+            "INSERT INTO watermarks (project_id) VALUES ('proj-b')",
+        ]
+        async with make_recon_db(tmp_path, inserts) as conn, conn.execute(
+            'SELECT project_id FROM watermarks ORDER BY project_id'
+        ) as cur:
+            rows = list(await cur.fetchall())
+        assert len(rows) == 2
+        assert rows[0]['project_id'] == 'proj-a'
+        assert rows[1]['project_id'] == 'proj-b'
+
+    async def test_executes_parameterized_inserts(self, tmp_path):
+        """make_recon_db executes (sql, params) tuple inserts with bound parameters."""
+        from datetime import UTC, datetime
+
+        from tests.conftest import make_recon_db
+
+        now = datetime.now(UTC).isoformat()
+        inserts = [
+            (
+                "INSERT INTO burst_state (agent_id, state, last_write_at)"
+                " VALUES (?, ?, ?)",
+                ('ag-1', 'bursting', now),
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts) as conn, conn.execute(
+            'SELECT agent_id, state FROM burst_state'
+        ) as cur:
+            rows = list(await cur.fetchall())
+        assert len(rows) == 1
+        assert rows[0]['agent_id'] == 'ag-1'
+        assert rows[0]['state'] == 'bursting'
+
+    async def test_row_factory_is_set(self, tmp_path):
+        """Connection yielded by make_recon_db has aiosqlite.Row as row_factory."""
+        import aiosqlite as _aiosqlite
+
+        from tests.conftest import make_recon_db
+
+        async with make_recon_db(tmp_path, []) as conn:
+            assert conn.row_factory is _aiosqlite.Row
+
+    async def test_custom_schema_kwarg(self, tmp_path):
+        """Optional schema= kwarg overrides the default RECONCILIATION_SCHEMA."""
+        from tests.conftest import make_recon_db
+
+        tiny_schema = 'CREATE TABLE IF NOT EXISTS foo (bar TEXT)'
+        inserts = ["INSERT INTO foo (bar) VALUES ('hello')"]
+        async with make_recon_db(tmp_path, inserts, schema=tiny_schema) as conn, conn.execute(
+            'SELECT bar FROM foo'
+        ) as cur:
+            rows = list(await cur.fetchall())
+        assert len(rows) == 1
+        assert rows[0]['bar'] == 'hello'
+
+    async def test_custom_name_kwarg(self, tmp_path):
+        """Optional name= kwarg controls the DB filename."""
+        from tests.conftest import make_recon_db
+
+        async with make_recon_db(tmp_path, [], name='custom.db') as conn:
+            # Connection should still be functional
+            await conn.execute('SELECT 1')
+        assert (tmp_path / 'custom.db').exists()
+
+    async def test_connection_closed_after_context_exit(self, tmp_path):
+        """Connection is closed after the context manager exits."""
+        from tests.conftest import make_recon_db
+
+        captured = []
+        async with make_recon_db(tmp_path, []) as conn:
+            captured.append(conn)
+        # After exit, executing on the connection should raise (closed)
+        import pytest as _pytest
+        with _pytest.raises(Exception):  # noqa: B017
+            await captured[0].execute('SELECT 1')
