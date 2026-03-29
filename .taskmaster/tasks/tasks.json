@@ -5063,10 +5063,11 @@
         "description": "Three related issues in the `except ValueError` handler at targeted.py:128-130:\n\n1. **Exception masking** (critical): If `journal.complete_run(run_id, \"failed\")` raises (e.g. DB connection failure), the original ValueError is lost. Python chains with `__context__` but callers expecting ValueError get an unexpected type. Fix: wrap journal call in try/except or use contextlib.suppress, then unconditionally re-raise.\n\n2. **Missing logging**: The `except ValueError` block has no log entry, while the sibling `except Exception` block calls `logger.error(...)`. Add `logger.warning(f\"Targeted reconciliation rejected invalid input: {e}\")` before re-raising.\n\n3. **Type discrimination** (optional): Any ValueError from handlers (e.g. `_on_task_done`) would be silently re-raised with no log. Consider a custom `ValidationError(ValueError)` subclass in utils/validation.py so the except clause matches by origin, not type.\n\nFiles: fused-memory/src/fused_memory/reconciliation/targeted.py:128-130, fused-memory/src/fused_memory/utils/validation.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-29T01:07:32.127Z"
       },
       {
         "id": "291",
@@ -5082,7 +5083,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T01:07:29.994Z",
+      "lastModified": "2026-03-29T01:07:32.127Z",
       "taskCount": 270,
       "completedCount": 246,
       "tags": [
