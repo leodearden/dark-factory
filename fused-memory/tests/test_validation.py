@@ -645,6 +645,40 @@ class TestSafeRepr:
         assert result == repr(value)
 
 
+class TestTruncationInErrorMessages:
+    """Truncation is applied in error messages for oversized inputs."""
+
+    def test_validate_identifier_1mb_invalid_string_message_is_short(self):
+        """A 1 MB invalid string must produce an error message shorter than ~250 chars.
+
+        Regression: without _safe_repr, repr() of a 1 MB string embeds the full
+        million-character repr in the error dict, bloating logs and MCP responses.
+        """
+        big_value = 'x' * 100 + '`' + 'y' * (1024 * 1024 - 101)  # invalid due to backtick
+        result = _validate_identifier(big_value, 'project_id')
+        assert result is not None
+        assert len(result['error']) < 250, (
+            f'Error message length {len(result["error"])} exceeds 250 — '
+            '_validate_identifier must use _safe_repr to cap the embedded value'
+        )
+
+    def test_validate_identifier_1mb_invalid_string_contains_truncation_marker(self):
+        """The truncation marker must appear in the error message for an oversized input."""
+        big_value = 'bad`' + 'z' * (1024 * 1024)
+        result = _validate_identifier(big_value, 'run_id')
+        assert result is not None
+        assert '...(truncated)' in result['error'], (
+            "Error message must contain '...(truncated)' to indicate value was capped"
+        )
+
+    def test_validate_identifier_1mb_error_dict_shape_preserved(self):
+        """The error dict shape (exactly 'error' and 'error_type' keys) is preserved."""
+        big_value = 'bad\n' + 'a' * (1024 * 1024)
+        result = _validate_identifier(big_value, 'project_id')
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
+
+
 class TestValidatorErrorDictShape:
     """All validate_* functions return dicts with exactly 'error' and 'error_type' keys."""
 
