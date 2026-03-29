@@ -2649,13 +2649,18 @@
               "M5",
               "M5 decomposition",
               "M5 types",
-              "Graphiti"
+              "Graphiti",
+              "CostStore",
+              "UsageGate"
             ],
             "queries": [
               "entity summary accumulation stale duplicate lines",
-              "Graphiti entity summary rebuild deduplication mechanism"
+              "Graphiti entity summary rebuild deduplication mechanism",
+              "CostStore entity summary contradictions extends AgentResult",
+              "UsageGate duplicate entity nodes fragmented knowledge"
             ]
-          }
+          },
+          "_causation_id": "e0fce9c1-100f-4f35-a062-c2847200f7e6"
         }
       },
       {
