@@ -5166,6 +5166,15 @@
             "status": "pending",
             "dependencies": [],
             "parentTaskId": 292
+          },
+          {
+            "id": 8,
+            "title": "Phase H: Test coverage",
+            "description": "Tests for: CAS update-ref success and failure (external actor advances main), ghost loop detection (already-merged branch returns DONE), conflict-outside-queue flow (reject → MERGER in worktree → re-submit), front-of-queue re-enqueue ordering after CAS failure, abandon-and-patch for drifted branches, escalation MCP merge_request tool integration, graceful shutdown (pending Futures rejected), existing merge test suite passes against queue-based implementation.",
+            "details": "",
+            "status": "pending",
+            "dependencies": [],
+            "parentTaskId": 292
           }
         ],
         "updatedAt": "2026-03-29T08:06:09.475Z",
