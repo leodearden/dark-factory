@@ -36,6 +36,15 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 _MOCK_TYPES = (AsyncMock, MagicMock)
 
 
+class TestMockTypesConstant:
+    """Validate the _MOCK_TYPES constant that TestProjectIdValidation depends on."""
+
+    def test_mock_types_constant_defined(self):
+        assert isinstance(_MOCK_TYPES, tuple)
+        assert AsyncMock in _MOCK_TYPES
+        assert MagicMock in _MOCK_TYPES
+
+
 class TestDisallowedToolLists:
     """Verify per-stage disallowed tool lists are correct."""
 
