@@ -5265,6 +5265,19 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 297,
+        "title": "Add account_name to AgentResult and invocation threading",
+        "description": "Add account_name: str = '' field to AgentResult in shared/src/shared/cli_invoke.py. In invoke_with_cap_retry (same file), capture usage_gate.active_account_name before calling invoke_claude_agent and set it on the returned AgentResult. In the steward's _invoke_with_session (orchestrator/src/orchestrator/steward.py), do the same — capture the active account name from the usage gate before invoking and set it on the result. Update tests for both paths to verify account_name is propagated.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [
+          294
+        ],
+        "priority": "high",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -5277,7 +5290,7 @@
       ],
       "created": "2026-03-29T08:42:16.891Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-29T08:42:27.474Z"
+      "updated": "2026-03-29T08:42:34.449Z"
     }
   }
 }
