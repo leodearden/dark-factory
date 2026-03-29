@@ -711,9 +711,8 @@ def recon_layout_html():
     """Class-scoped HTML fixture: fetches /partials/recon once for all layout tests."""
     from dashboard.app import app
 
-    with TestClient(app) as c:
-        with _patch_recon_data():
-            return c.get('/partials/recon').text
+    with TestClient(app) as c, _patch_recon_data():
+        return c.get('/partials/recon').text
 
 
 class TestReconRightColumnLayout:
