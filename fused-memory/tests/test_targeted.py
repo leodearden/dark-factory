@@ -454,7 +454,7 @@ async def test_no_buffer_writes_normally(mock_memory_service, mock_taskmaster, j
 @pytest.mark.parametrize('project_root', ['', 'dark_factory', '.'])
 async def test_reconcile_task_rejects_bad_project_root(reconciler, project_root):
     """reconcile_task() raises ValueError for non-absolute project_root values."""
-    with pytest.raises(ValueError, match=re.escape(repr(project_root))):
+    with pytest.raises(ValueError, match=r'non-empty absolute path'):
         await reconciler.reconcile_task(
             task_id='1', transition='done', project_id='test-project',
             project_root=project_root,

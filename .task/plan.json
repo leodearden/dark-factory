@@ -1,0 +1,112 @@
+{
+  "task_id": "291",
+  "title": "Strengthen targeted reconciliation validation test assertions",
+  "files": [
+    "fused-memory/tests/test_targeted.py"
+  ],
+  "modules": [
+    "fused-memory/tests"
+  ],
+  "analysis": "Task 291 requires four surgical improvements to existing validation tests in test_targeted.py (lines 449-490). All changes are test-only \u2014 no production code modifications.\n\n1. **Semantic match patterns (lines 457, 469)**: Currently `match=re.escape(repr(project_root))` which couples to Python repr formatting. The actual error message from `require_project_root` is: `'project_root must be a non-empty absolute path, got: <repr>'`. We should anchor on the stable semantic fragment `non-empty absolute path` which is the invariant message from validation.py:72.\n\n2. **Bulk no-journal asymmetry test**: `reconcile_bulk_tasks` (targeted.py:353-421) intentionally has NO journal lifecycle \u2014 no `start_run`/`complete_run` calls. This is unlike `reconcile_task` which creates a journal run. A new test should document this intentional asymmetry by asserting `journal.get_recent_runs()` returns empty after a bulk validation failure.\n\n3. **run_type assertion (line 490)**: The existing journal trace test at line 477 verifies status=='failed' but not run_type. Since the journal run is started before validation (targeted.py:90-99 with `run_type=RunType.targeted`), we should assert `runs[0].run_type == 'targeted'` to ensure the trace corresponds to the expected reconciliation path.\n\nAll changes are in a single file. The `re` import is already present (line 3). The `RunType` model is in `fused_memory.models.reconciliation` but we can compare against the string 'targeted' directly since RunType is a StrEnum.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Update match pattern in test_reconcile_task_rejects_bad_project_root (line 457): replace `match=re.escape(repr(project_root))` with `match=r'non-empty absolute path'` to anchor on the stable semantic fragment from the validation error message rather than coupling to repr formatting.",
+      "status": "done",
+      "commit": null
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Run the parametrized test to verify all 3 values ('', 'dark_factory', '.') still match the new pattern. The existing production code in validation.py:72 emits 'project_root must be a non-empty absolute path, got: ...' so the pattern matches without implementation changes.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Update match pattern in test_reconcile_bulk_rejects_bad_project_root (line 469): same change \u2014 replace `match=re.escape(repr(project_root))` with `match=r'non-empty absolute path'`.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Run the bulk parametrized test to verify all 3 values still match. Same production code path (require_project_root \u2192 validate_project_root) ensures the pattern matches.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Add `assert runs[0].run_type == 'targeted'` to test_reconcile_task_validation_error_leaves_journal_trace (after line 489). This verifies the journal trace corresponds to the targeted reconciliation path, not some other run type.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Run the journal trace test to verify the new assertion passes. The production code at targeted.py:93 sets `run_type=RunType.targeted` before validation, so the run in the journal will have run_type='targeted'.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Add new test `test_reconcile_bulk_rejects_bad_project_root_leaves_no_journal_trace` after the existing bulk parametrized test. This test calls `reconcile_bulk_tasks` with an invalid project_root (e.g. ''), expects ValueError, then asserts `journal.get_recent_runs('test-project', limit=1) == []` to document the intentional absence of journal lifecycle in bulk reconciliation.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Run the new no-journal-trace test to verify it passes. The production code in reconcile_bulk_tasks (targeted.py:360) calls require_project_root before any journal interaction, and there is no journal.start_run call in the bulk path at all, so no journal trace is left.",
+      "status": "pending",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use bare `r'non-empty absolute path'` as the match pattern instead of the full compound pattern suggested in the task description",
+      "rationale": "The task suggests either `match=r\"non-empty absolute path\"` or a compound pattern with repr. The bare semantic fragment is sufficient: it's the stable invariant from validation.py:72 ('project_root must be a non-empty absolute path, got: ...'), it decouples from repr formatting entirely, and pytest match does a regex search (not fullmatch) so it will find the fragment within the full message. The compound form re-introduces the repr coupling we're trying to remove."
+    },
+    {
+      "decision": "Compare run_type against string 'targeted' rather than importing RunType enum",
+      "rationale": "RunType is a StrEnum, so `runs[0].run_type == 'targeted'` works via StrEnum's __eq__. This avoids adding an import for RunType to the test file. The existing test_harness.py (line 302) already uses string comparison for run_type, establishing precedent."
+    },
+    {
+      "decision": "New bulk no-journal test uses the `reconciler` and `journal` fixtures directly rather than creating a new reconciler",
+      "rationale": "The existing `reconciler` fixture already injects the `journal` fixture into the TargetedReconciler instance. This matches the pattern used by the existing test_reconcile_task_validation_error_leaves_journal_trace test at line 478."
+    },
+    {
+      "decision": "Place the new no-journal test after the existing bulk parametrized test but before the journal trace test, keeping related tests grouped",
+      "rationale": "The section at line 450 is headed '# Tests for project_root validation (task-156)'. The new test belongs in this group since it validates project_root behavior. Placing it between the bulk validation test and the journal trace test creates a logical flow: task rejects \u2192 bulk rejects \u2192 bulk has no journal trace \u2192 task has journal trace."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Existing `reconciler` fixture (line 60-65)",
+      "where": "test_targeted.py",
+      "how": "Reuse for the new no-journal-trace test \u2014 it already wires up journal, mock_memory_service, mock_taskmaster, and config into a TargetedReconciler instance"
+    },
+    {
+      "what": "Existing `journal` fixture (lines 17-22)",
+      "where": "test_targeted.py",
+      "how": "Inject into the new no-journal-trace test to call get_recent_runs and assert emptiness"
+    },
+    {
+      "what": "Validation error message format from validation.py:72",
+      "where": "fused-memory/src/fused_memory/utils/validation.py",
+      "how": "The stable fragment 'non-empty absolute path' is the semantic anchor for the new match patterns in both parametrized tests"
+    },
+    {
+      "what": "Existing test pattern from test_reconcile_task_validation_error_leaves_journal_trace",
+      "where": "test_targeted.py:477-490",
+      "how": "Mirror its structure (pytest.raises \u2192 journal.get_recent_runs \u2192 assertions) for the new bulk no-journal test, but assert emptiness instead of presence"
+    }
+  ],
+  "_session_id": "291-8e94d7c8",
+  "_created_at": "2026-03-29T08:50:02.270162+00:00"
+}
