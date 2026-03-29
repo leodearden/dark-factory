@@ -272,12 +272,11 @@ If tasks already exist from a prior session, first assess their state before re-
 get_tasks(project_root="<project_root>")
 ```
 
-Check each task against the actual codebase state. Prior sessions may have completed work without updating task statuses. Use `git log`, `grep`, and test runs to verify what's actually done:
+Review the task tree to understand the current state. **Do not change the status of existing tasks** — they may have been set by the user or another session. If a task's status looks wrong, ask the user before changing it.
 
-- **Tasks marked pending but actually done** → `set_task_status(id="<id>", status="done", ...)`
-- **Tasks with stale descriptions** → `update_task(id="<id>", prompt="<better description>", ...)`
-- **Missing tasks** (e.g., integration/e2e) → `add_task(...)` and wire dependencies
-- **Wrong dependencies** → `remove_dependency` / `add_dependency`
+You may:
+- **Add missing tasks** (e.g., integration/e2e) → `add_task(...)` and wire dependencies
+- **Fix wrong dependencies** → `remove_dependency` / `add_dependency`
 
 ### 2. Execute
 

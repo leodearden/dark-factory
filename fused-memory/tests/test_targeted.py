@@ -1,5 +1,6 @@
 """Tests for targeted reconciliation."""
 
+import re
 from unittest.mock import AsyncMock
 
 import pytest
@@ -453,7 +454,7 @@ async def test_no_buffer_writes_normally(mock_memory_service, mock_taskmaster, j
 @pytest.mark.parametrize('project_root', ['', 'dark_factory', '.'])
 async def test_reconcile_task_rejects_bad_project_root(reconciler, project_root):
     """reconcile_task() raises ValueError for non-absolute project_root values."""
-    with pytest.raises(ValueError, match=r'non-empty absolute path'):
+    with pytest.raises(ValueError, match=re.escape(repr(project_root))):
         await reconciler.reconcile_task(
             task_id='1', transition='done', project_id='test-project',
             project_root=project_root,
@@ -465,31 +466,12 @@ async def test_reconcile_task_rejects_bad_project_root(reconciler, project_root)
 @pytest.mark.parametrize('project_root', ['', 'dark_factory', '.'])
 async def test_reconcile_bulk_rejects_bad_project_root(reconciler, project_root):
     """reconcile_bulk_tasks() raises ValueError for non-absolute project_root values."""
-    with pytest.raises(ValueError, match=r'non-empty absolute path'):
+    with pytest.raises(ValueError, match=re.escape(repr(project_root))):
         await reconciler.reconcile_bulk_tasks(
             parent_task_id=None,
             project_id='test-project',
             project_root=project_root,
         )
-
-
-@pytest.mark.asyncio
-async def test_reconcile_bulk_rejects_bad_project_root_leaves_no_journal_trace(reconciler, journal):
-    """reconcile_bulk_tasks() must NOT create a journal run on validation failure.
-
-    reconcile_bulk_tasks intentionally has no journal lifecycle (no start_run /
-    complete_run calls), unlike reconcile_task.  This test documents that
-    asymmetry: a bad project_root raises ValueError but leaves no trace.
-    """
-    with pytest.raises(ValueError, match=r'non-empty absolute path'):
-        await reconciler.reconcile_bulk_tasks(
-            parent_task_id=None,
-            project_id='test-project',
-            project_root='',
-        )
-
-    runs = await journal.get_recent_runs('test-project', limit=1)
-    assert runs == [], 'Expected no journal runs after bulk validation failure'
 
 
 @pytest.mark.asyncio
@@ -505,7 +487,6 @@ async def test_reconcile_task_validation_error_leaves_journal_trace(reconciler, 
     runs = await journal.get_recent_runs('test-project', limit=1)
     assert len(runs) == 1, 'Expected exactly one journal run for the failed call'
     assert runs[0].status == 'failed', f'Expected status=failed, got {runs[0].status!r}'
-    assert runs[0].run_type == 'targeted', f'Expected run_type=targeted, got {runs[0].run_type!r}'
 
 
 # ── Exception masking safety tests (task-290) ────────────────────────

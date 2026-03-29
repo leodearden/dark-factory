@@ -213,11 +213,6 @@ async def index(request: Request):
     return templates.TemplateResponse(request, 'index.html')
 
 
-@app.get('/costs')
-async def costs(request: Request):
-    return templates.TemplateResponse(request, 'costs.html')
-
-
 @app.get('/api/health')
 async def health():
     return {'status': 'ok'}
