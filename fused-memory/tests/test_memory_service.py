@@ -877,6 +877,9 @@ class TestGetEntity:
         with pytest.raises(RuntimeError, match='search_nodes failed'):
             await service.get_entity('entity', project_id='test')
 
+        # gather(return_exceptions=True) settles both coroutines — search() was called
+        service.graphiti.search.assert_called_once()
+
     # ------------------------------------------------------------------
     # both calls fail — both warnings emitted before re-raise
     # ------------------------------------------------------------------
