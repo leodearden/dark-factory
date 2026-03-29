@@ -5641,6 +5641,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 311,
+        "title": "Add temporal guard for PRD-sourced edges in ingestion pipeline",
+        "description": "PRD and task-creation episodes generate Graphiti edges that describe planned/aspirational work as present-tense facts (e.g., 'UsageGate instruments cap events with CostStore' before implementation). This contaminates the knowledge graph with premature facts that mislead downstream consumers. Implement one of: (a) tag PRD-sourced edges with a 'planned' qualifier that distinguishes them from implementation facts, (b) defer implementation-fact edge creation until the corresponding task is marked done, or (c) add a 'planned_at'/'implemented_at' temporal distinction to the edge schema.\n\nMemory hints:\n- Search: 'PRD edges planned work present tense facts temporal'\n- Search: 'add_episode extraction pipeline edge creation'\n- Entities: Graphiti, TaskInterceptor",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -5653,7 +5664,7 @@
       ],
       "created": "2026-03-29T13:24:36.606Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-29T13:24:41.923Z"
+      "updated": "2026-03-29T13:24:48.825Z"
     }
   }
 }
