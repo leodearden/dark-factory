@@ -10,7 +10,7 @@ from shared.cli_invoke import AgentResult
 
 import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageId, Watermark
+from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
     DISALLOW_MEMORY_WRITES,
@@ -508,7 +508,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
                 prior_reports=[],
                 run_id='test-run-4',
             )
-        assert result is not None
+        assert isinstance(result, StageReport)
         assert result.stage == StageId.memory_consolidator
         assert result.completed_at is not None
         assert result.items_flagged == []
@@ -541,7 +541,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
                 prior_reports=[],
                 run_id=run_id,
             )
-        assert result is not None
+        assert isinstance(result, StageReport)
         assert result.stage == StageId.memory_consolidator
         assert result.completed_at is not None
         assert result.items_flagged == []
@@ -926,7 +926,7 @@ class TestRunIdValidation(BaseStageValidationTest):
                 prior_reports=[],
                 run_id=valid_uuid,
             )
-        assert result is not None
+        assert isinstance(result, StageReport)
         assert result.stage == StageId.memory_consolidator
         assert result.completed_at is not None
 
