@@ -487,6 +487,7 @@ async def test_reconcile_task_validation_error_leaves_journal_trace(reconciler, 
     runs = await journal.get_recent_runs('test-project', limit=1)
     assert len(runs) == 1, 'Expected exactly one journal run for the failed call'
     assert runs[0].status == 'failed', f'Expected status=failed, got {runs[0].status!r}'
+    assert runs[0].run_type == 'targeted', f'Expected run_type=targeted, got {runs[0].run_type!r}'
 
 
 # ── Exception masking safety tests (task-290) ────────────────────────

@@ -42,7 +42,7 @@
       "id": "step-5",
       "type": "test",
       "description": "Add `assert runs[0].run_type == 'targeted'` to test_reconcile_task_validation_error_leaves_journal_trace (after line 489). This verifies the journal trace corresponds to the targeted reconciliation path, not some other run type.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
