@@ -150,7 +150,7 @@ def format_duration(value: Any) -> str:
         ≥ 3600s → 'Xh Ym'   (e.g. '17h 25m')
     """
     try:
-        total = int(value)
+        total = int(round(value))
     except (TypeError, ValueError, OverflowError):
         return '-'
     if total <= 0:
