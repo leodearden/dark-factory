@@ -5184,7 +5184,23 @@
             "queries": [
               "resolution for: Replace _merge_lock with MergeQueue + MergeWorker"
             ]
-          }
+          },
+          "block_reason": "Requires dedicated implementation session. The _merge_lock is load-bearing for main branch safety — replacing it without comprehensive tests risks corrupting main at high concurrency (64 max, 20+ in practice). Cannot be a side-task.",
+          "unblock_conditions": [
+            "Dedicated implementation session (not during other orchestrator work)",
+            "Test fixtures covering: CAS update-ref, ghost loop detection, conflict-outside-queue, external-actor CAS race, front-of-queue re-enqueue, abandon-and-patch",
+            "Existing merge test suite passes against new queue-based implementation"
+          ],
+          "design_references": [
+            "git_ops.py:166 — design comment block adjacent to _merge_lock",
+            ".claude/plans/starry-wishing-papert.md — full exploration and design summary"
+          ],
+          "production_failures": [
+            "Task 591: ghost loop (12 iterations, already-merged code)",
+            "Tasks 485/564: lock starvation (MERGER under lock, advance_main exhausted)",
+            "40% conflict rate at prior concurrency levels"
+          ],
+          "future_phase": "Speculative 2-step pipeline (merge N+1 against N while verifying N, depth 1, ~3x throughput). Build after queue is stable with metrics."
         }
       }
     ],
