@@ -61,7 +61,7 @@
       "id": "step-6",
       "type": "test",
       "description": "Run full test_reconciliation.py test suite to confirm all tests pass after the refactoring, especially the two refactored null-started_at tests and the new schema constant test.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     }
   ],
