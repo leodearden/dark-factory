@@ -4879,7 +4879,7 @@
         "description": "Both memory_graphs.html and performance.html access ctx.chart.data.datasets[0].data.reduce(...) without checking datasets is non-empty. If a chart renders with no data (empty dashboard state, HTMX partial re-render), both the datalabels formatter and tooltip callback throw TypeError in the browser.\n\nFix: In both templates, add `var ds = ctx.chart.data.datasets[0]; if (!ds) return '';` before each .data.reduce() call in the datalabels formatter and tooltip label callback. Four call sites total (two per template).",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -4892,7 +4892,7 @@
             "dashboard/src/dashboard/templates/partials"
           ]
         },
-        "updatedAt": "2026-03-29T01:17:56.706Z"
+        "updatedAt": "2026-03-29T01:32:11.627Z"
       },
       {
         "id": "282",
@@ -5094,9 +5094,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T01:31:50.510Z",
+      "lastModified": "2026-03-29T01:32:11.627Z",
       "taskCount": 270,
-      "completedCount": 250,
+      "completedCount": 251,
       "tags": [
         "master"
       ]
