@@ -28,7 +28,7 @@
       "id": "step-3",
       "type": "test",
       "description": "Update match pattern in test_reconcile_bulk_rejects_bad_project_root (line 469): same change \u2014 replace `match=re.escape(repr(project_root))` with `match=r'non-empty absolute path'`.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {

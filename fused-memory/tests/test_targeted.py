@@ -466,7 +466,7 @@ async def test_reconcile_task_rejects_bad_project_root(reconciler, project_root)
 @pytest.mark.parametrize('project_root', ['', 'dark_factory', '.'])
 async def test_reconcile_bulk_rejects_bad_project_root(reconciler, project_root):
     """reconcile_bulk_tasks() raises ValueError for non-absolute project_root values."""
-    with pytest.raises(ValueError, match=re.escape(repr(project_root))):
+    with pytest.raises(ValueError, match=r'non-empty absolute path'):
         await reconciler.reconcile_bulk_tasks(
             parent_task_id=None,
             project_id='test-project',
