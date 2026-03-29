@@ -54,7 +54,7 @@
       "id": "step-5",
       "type": "impl",
       "description": "Refactor test_null_started_at_does_not_affect_other_rows (line ~166): same change \u2014 remove inline RECONCILIATION_SCHEMA import and .replace() call, import RELAXED_RECONCILIATION_SCHEMA from tests.conftest, pass to make_recon_db's schema kwarg.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {

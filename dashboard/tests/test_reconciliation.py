@@ -192,12 +192,8 @@ class TestGetRecentRuns:
         a healthy sibling row still has its duration computed correctly.
         """
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import RECONCILIATION_SCHEMA, make_recon_db
+        from tests.conftest import RELAXED_RECONCILIATION_SCHEMA, make_recon_db
 
-        # Relaxed schema to allow NULL started_at
-        relaxed_schema = RECONCILIATION_SCHEMA.replace(
-            'started_at TEXT NOT NULL', 'started_at TEXT'
-        )
         inserts = [
             # Bad row: NULL started_at, valid completed_at
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
@@ -211,7 +207,7 @@ class TestGetRecentRuns:
             " '2026-03-28T09:00:00+00:00', '2026-03-28T09:05:00+00:00', 3, 'completed')",
         ]
         async with make_recon_db(
-            tmp_path, inserts, name='mixed_rows.db', schema=relaxed_schema
+            tmp_path, inserts, name='mixed_rows.db', schema=RELAXED_RECONCILIATION_SCHEMA
         ) as db:
             runs = await get_recent_runs(db)
 
