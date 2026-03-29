@@ -681,6 +681,42 @@ class TestTruncationInErrorMessages:
         assert set(result.keys()) == {'error', 'error_type'}
 
 
+class TestValidateProjectRootTruncation:
+    """validate_project_root must cap the repr() of oversized project_root values."""
+
+    def test_validate_project_root_1mb_relative_path_message_is_short(self):
+        """A 1 MB relative path must produce an error message shorter than 400 chars.
+
+        Regression: without _safe_repr, repr() of a 1 MB string embeds the full
+        million-character repr in the error dict, bloating logs and MCP responses.
+        With _safe_repr(max_len=200), the repr is capped to 200 + 14 ('...(truncated)')
+        = 214 chars, plus ~58 chars of static message overhead = at most ~272 chars total.
+        """
+        big_path = 'x' * (1024 * 1024)  # relative path (no leading '/') — triggers error
+        result = validate_project_root(big_path)
+        assert result is not None
+        assert len(result['error']) < 400, (
+            f'Error message length {len(result["error"])} exceeds 400 — '
+            'validate_project_root must use _safe_repr to cap the embedded value'
+        )
+
+    def test_validate_project_root_1mb_relative_path_contains_truncation_marker(self):
+        """The truncation marker must appear in the error message for an oversized relative path."""
+        big_path = 'y' * (1024 * 1024)
+        result = validate_project_root(big_path)
+        assert result is not None
+        assert '...(truncated)' in result['error'], (
+            "Error message must contain '...(truncated)' to indicate value was capped"
+        )
+
+    def test_validate_project_root_1mb_error_dict_shape_preserved(self):
+        """The error dict shape (exactly 'error' and 'error_type' keys) is preserved."""
+        big_path = 'z' * (1024 * 1024)
+        result = validate_project_root(big_path)
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
+
+
 class TestValidatorErrorDictShape:
     """All validate_* functions return dicts with exactly 'error' and 'error_type' keys."""
 
