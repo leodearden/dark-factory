@@ -5254,6 +5254,17 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 296,
+        "title": "Add nav bar to dashboard",
+        "description": "Add a minimal navigation bar to dashboard/src/dashboard/templates/base.html with two entries: Dashboard (/) and Costs (/costs). Active page highlighted — use a template variable or URL path check to determine which entry is active. Style consistent with existing dark theme (gray-900 background, gray-100 text, accent color for active). Both index.html and the future costs.html will extend base.html and inherit the nav. Keep it simple — a horizontal bar at the top of the page, above the existing content. Update existing tests to verify nav bar presence.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -5266,7 +5277,7 @@
       ],
       "created": "2026-03-29T08:42:16.891Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-29T08:42:22.900Z"
+      "updated": "2026-03-29T08:42:27.474Z"
     }
   }
 }
