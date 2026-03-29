@@ -715,6 +715,25 @@ class TestTailwindBuild:
         assert 'bg-gray-900' in css
         assert 'text-gray-100' in css
 
+    def test_tailwind_css_has_template_utilities(self, client):
+        css = client.get('/static/tailwind.css').text
+        assert 'border-gray-700' in css, 'border-gray-700 missing from tailwind.css'
+        assert 'animate-pulse' in css, 'animate-pulse missing from tailwind.css'
+        assert 'rounded-lg' in css, 'rounded-lg missing from tailwind.css'
+
+    def test_tailwind_css_minimum_size(self, client):
+        resp = client.get('/static/tailwind.css')
+        css = resp.text
+        if '/* Auto-generated stub for testing' in css:
+            pytest.skip('skipped: running against stub, not a real Tailwind build')
+        assert len(resp.content) > 50_000, (
+            f'tailwind.css is only {len(resp.content)} bytes — build may be incomplete'
+        )
+
+    def test_old_style_css_returns_404(self, client):
+        resp = client.get('/static/style.css')
+        assert resp.status_code == 404, 'style.css was renamed to input.css in task 276; it must not be served'
+
 
 class TestFavicon:
     """Tests that the favicon SVG is linked and served."""
@@ -728,6 +747,14 @@ class TestFavicon:
         resp = client.get('/static/favicon.svg')
         assert resp.status_code == 200
         assert 'image/svg+xml' in resp.headers['content-type']
+
+    def test_favicon_svg_body_has_svg_element(self, client):
+        body = client.get('/static/favicon.svg').text
+        assert '<svg' in body, 'favicon.svg response body does not contain an SVG element'
+
+    def test_favicon_svg_body_has_df_branding(self, client):
+        body = client.get('/static/favicon.svg').text
+        assert 'DF' in body, 'favicon.svg response body is missing the DF branding text'
 
 
 class TestMainModule:
