@@ -1,5 +1,6 @@
 """Tests for targeted reconciliation."""
 
+import re
 from unittest.mock import AsyncMock
 
 import pytest
@@ -450,66 +451,24 @@ async def test_no_buffer_writes_normally(mock_memory_service, mock_taskmaster, j
 
 
 @pytest.mark.asyncio
-async def test_reconcile_task_rejects_empty_project_root(reconciler):
-    """reconcile_task() with project_root='' raises ValueError."""
-    with pytest.raises(ValueError, match='absolute path'):
+@pytest.mark.parametrize('project_root', ['', 'dark_factory', '.'])
+async def test_reconcile_task_rejects_bad_project_root(reconciler, project_root):
+    """reconcile_task() raises ValueError for non-absolute project_root values."""
+    with pytest.raises(ValueError, match=re.escape(repr(project_root))):
         await reconciler.reconcile_task(
             task_id='1', transition='done', project_id='test-project',
-            project_root='',
+            project_root=project_root,
             task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
         )
 
 
 @pytest.mark.asyncio
-async def test_reconcile_task_rejects_relative_project_root(reconciler):
-    """reconcile_task() with project_root='dark_factory' (logical name) raises ValueError."""
-    with pytest.raises(ValueError, match='absolute path'):
-        await reconciler.reconcile_task(
-            task_id='1', transition='done', project_id='test-project',
-            project_root='dark_factory',
-            task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
-        )
-
-
-@pytest.mark.asyncio
-async def test_reconcile_task_rejects_dot_project_root(reconciler):
-    """reconcile_task() with project_root='.' raises ValueError."""
-    with pytest.raises(ValueError, match='absolute path'):
-        await reconciler.reconcile_task(
-            task_id='1', transition='done', project_id='test-project',
-            project_root='.',
-            task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
-        )
-
-
-@pytest.mark.asyncio
-async def test_reconcile_bulk_rejects_empty_project_root(reconciler):
-    """reconcile_bulk_tasks() with project_root='' raises ValueError."""
-    with pytest.raises(ValueError, match='absolute path'):
+@pytest.mark.parametrize('project_root', ['', 'dark_factory', '.'])
+async def test_reconcile_bulk_rejects_bad_project_root(reconciler, project_root):
+    """reconcile_bulk_tasks() raises ValueError for non-absolute project_root values."""
+    with pytest.raises(ValueError, match=re.escape(repr(project_root))):
         await reconciler.reconcile_bulk_tasks(
             parent_task_id=None,
             project_id='test-project',
-            project_root='',
-        )
-
-
-@pytest.mark.asyncio
-async def test_reconcile_bulk_rejects_relative_project_root(reconciler):
-    """reconcile_bulk_tasks() with project_root='dark_factory' raises ValueError."""
-    with pytest.raises(ValueError, match='absolute path'):
-        await reconciler.reconcile_bulk_tasks(
-            parent_task_id=None,
-            project_id='test-project',
-            project_root='dark_factory',
-        )
-
-
-@pytest.mark.asyncio
-async def test_reconcile_bulk_rejects_dot_project_root(reconciler):
-    """reconcile_bulk_tasks() with project_root='.' raises ValueError."""
-    with pytest.raises(ValueError, match='absolute path'):
-        await reconciler.reconcile_bulk_tasks(
-            parent_task_id=None,
-            project_id='test-project',
-            project_root='.',
+            project_root=project_root,
         )
