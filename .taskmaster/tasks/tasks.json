@@ -4721,7 +4721,7 @@
         "description": "Two assertion quality issues in fused-memory/tests/test_stages.py from review of task 208:\n\n1. In test_whitespace_watermark_project_id_treated_as_empty: caplog assertion checks rec.levelno but not rec.name. Add `rec.name == 'fused_memory.reconciliation.stages.base'` to filter to prevent false positives from other loggers.\n\n2. In test_run_allows_matching_watermark_project_id, test_run_allows_empty_watermark_project_id, and test_whitespace_watermark_project_id_treated_as_empty: replace vacuous `assert result is not None` with `assert result.success is True` or similar meaningful assertion (run() never returns None).",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -4733,7 +4733,7 @@
             "fused-memory/tests"
           ]
         },
-        "updatedAt": "2026-03-29T01:16:30.476Z"
+        "updatedAt": "2026-03-29T01:25:55.022Z"
       },
       {
         "id": "275",
@@ -5092,9 +5092,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T01:22:25.803Z",
+      "lastModified": "2026-03-29T01:25:55.022Z",
       "taskCount": 270,
-      "completedCount": 248,
+      "completedCount": 249,
       "tags": [
         "master"
       ]
