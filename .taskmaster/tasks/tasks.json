@@ -5103,7 +5103,17 @@
         "status": "blocked",
         "dependencies": [],
         "priority": "high",
-        "subtasks": [],
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "Phase A: CAS update-ref in advance_main()",
+            "description": "Add expected_old argument to git update-ref at git_ops.py:598. Single-line change: git update-ref refs/heads/main <new_sha> <expected_old_sha>. No behavior change — strictly safer. Foundation for all other phases.",
+            "details": "",
+            "status": "pending",
+            "dependencies": [],
+            "parentTaskId": 292
+          }
+        ],
         "updatedAt": "2026-03-29T08:06:09.475Z",
         "metadata": {
           "memory_hints": {
