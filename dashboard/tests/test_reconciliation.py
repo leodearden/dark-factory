@@ -898,6 +898,37 @@ class TestPartitionBurstState:
         )
         assert len(idle) == 1
 
+    def test_stale_valid_timestamp_emits_no_debug_log(self, caplog):
+        """A stale-but-valid ISO timestamp routes to idle without emitting any debug log.
+
+        The debug log is only emitted for *invalid* timestamps (ValueError/TypeError).
+        A well-formed but stale timestamp (e.g. from 2020) is parsed successfully,
+        found to exceed the activity threshold, and the agent is classified as idle —
+        all without touching the except branch that logs 'bad last_write_at'.
+        """
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [
+            {'agent_id': 'old-agent', 'state': 'idle', 'last_write_at': '2020-01-01T00:00:00+00:00'}
+        ]
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
+            active, idle = partition_burst_state(agents)
+
+        assert len(active) == 0
+        assert len(idle) == 1
+        assert idle[0]['agent_id'] == 'old-agent'
+
+        # No debug log must be emitted — stale-but-valid timestamps are not errors
+        debug_records = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG
+            and r.name == 'dashboard.data.reconciliation'
+        ]
+        assert debug_records == [], (
+            f'Expected no DEBUG logs for valid stale timestamp, got: '
+            f'{[r.getMessage() for r in debug_records]}'
+        )
+
 
 class TestWithDb:
     """Unit tests for the with_db helper function."""
