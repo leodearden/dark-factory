@@ -4639,7 +4639,7 @@
         "description": "The debug log for bad timestamps in get_recent_runs omits raw field values, and there's no test for malformed completed_at with valid started_at.",
         "details": "## Problem\n\n1. **Incomplete debug log**: In `dashboard/src/dashboard/data/reconciliation.py` line 86, the debug log `logger.debug('run %s: bad timestamps (%s)', row['id'], exc)` omits the raw timestamp values. The reference pattern in `partition_burst_state` (line 52-55) includes the bad value for diagnosability.\n\n2. **Missing test**: The try/except wraps both `parse_utc(row['started_at'])` and `parse_utc(row['completed_at'])`. There's a test for malformed `started_at` but no test for malformed `completed_at` with a valid `started_at` — a reachable production path.\n\n## Fix\n\n1. Update the debug log to: `logger.debug('run %s: bad timestamps started_at=%r completed_at=%r (%s)', row['id'], row['started_at'], row['completed_at'], exc)`\n\n2. Add test `test_malformed_completed_at_with_valid_started_at_sets_duration_none` that inserts a row with valid ISO `started_at` and `completed_at='not-a-timestamp'`, then asserts `duration_seconds is None` and debug log is emitted.\n\n## Memory hints\n- search: \"parse_utc utility dashboard reconciliation\"\n- search: \"debug log pattern consistency dashboard\"",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -4652,7 +4652,8 @@
             "dashboard/src/dashboard/data",
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-29T01:07:04.000Z"
       },
       {
         "id": "271",
@@ -5081,7 +5082,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T01:07:03.406Z",
+      "lastModified": "2026-03-29T01:07:04.001Z",
       "taskCount": 270,
       "completedCount": 245,
       "tags": [
