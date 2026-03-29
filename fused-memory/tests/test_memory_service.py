@@ -935,6 +935,30 @@ class TestGetEntity:
         # logging guard must NOT fire, so warning.call_count must be zero.
         assert mock_logger.warning.call_count == 0
 
+    @pytest.mark.asyncio
+    async def test_cancelled_error_from_search_propagates(self, service):
+        """asyncio.CancelledError raised by search() must propagate unchanged.
+
+        Symmetric to test_cancelled_error_propagates, but with search() raising
+        CancelledError (gather index 1) and search_nodes() returning normally
+        (gather index 0).  The detection guard must iterate ALL gather results
+        regardless of which position holds the CancelledError.
+
+        Also asserts logger.warning.call_count == 0 — CancelledError must NOT
+        be logged via the isinstance(r, Exception) guard.
+        """
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(
+            side_effect=asyncio.CancelledError()
+        )
+
+        with patch('fused_memory.services.memory_service.logger') as mock_logger, \
+             pytest.raises(asyncio.CancelledError):
+            await service.get_entity('entity', project_id='test')
+
+        # CancelledError is BaseException, NOT Exception — logging guard must not fire.
+        assert mock_logger.warning.call_count == 0
+
     # ------------------------------------------------------------------
     # temporal serialization in edge_data
     # ------------------------------------------------------------------
