@@ -204,3 +204,20 @@ class TestParseClaudeTokens:
         assert result.output_tokens == 200
         assert result.cache_read_tokens is None
         assert result.cache_create_tokens is None
+
+    def test_null_usage_block_gives_none(self):
+        """Explicit JSON null for usage key should not raise AttributeError."""
+        data = {
+            'subtype': 'success',
+            'result': 'done',
+            'cost_usd': 0.01,
+            'duration_ms': 500,
+            'num_turns': 1,
+            'session_id': 'sess-null',
+            'usage': None,  # JSON null — data.get('usage', {}) returns None here
+        }
+        result = _parse_claude_output(self._make_subprocess_result(data))
+        assert result.input_tokens is None
+        assert result.output_tokens is None
+        assert result.cache_read_tokens is None
+        assert result.cache_create_tokens is None
