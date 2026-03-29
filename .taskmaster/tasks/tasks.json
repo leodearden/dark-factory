@@ -5139,6 +5139,15 @@
             "status": "pending",
             "dependencies": [],
             "parentTaskId": 292
+          },
+          {
+            "id": 5,
+            "title": "Phase E: Remove _merge_lock from GitOps",
+            "description": "Delete self._merge_lock = asyncio.Lock() at git_ops.py:166 (preserving the design comment). Remove all async with self.git_ops._merge_lock usage in workflow.py. The merge queue is now the sole serialization mechanism.",
+            "details": "",
+            "status": "pending",
+            "dependencies": [],
+            "parentTaskId": 292
           }
         ],
         "updatedAt": "2026-03-29T08:06:09.475Z",
