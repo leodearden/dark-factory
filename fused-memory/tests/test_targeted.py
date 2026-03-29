@@ -1,6 +1,5 @@
 """Tests for targeted reconciliation."""
 
-import re
 from unittest.mock import AsyncMock
 
 import pytest
