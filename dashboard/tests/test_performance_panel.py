@@ -213,6 +213,20 @@ class TestCompletionPathsDatalabels:
         assert 'formatter' in html
         assert '%' in html or 'toFixed' in html
 
+    def test_datalabels_formatter_guards_empty_datasets(self, client):
+        """Datalabels formatter must guard against an empty datasets array."""
+        with _patch_perf_data():
+            html = client.get('/partials/performance').text
+        # Guard pattern: extract datasets[0] and short-circuit if undefined
+        assert 'if (!ds)' in html
+
+    def test_tooltip_callback_guards_empty_datasets(self, client):
+        """Tooltip label callback must guard against an empty datasets array."""
+        with _patch_perf_data():
+            html = client.get('/partials/performance').text
+        # Guard pattern: var ds = ctx.chart.data.datasets[0]; if (!ds) return '';
+        assert 'var ds = ctx.chart.data.datasets[0]' in html
+
 
 class TestChartInitTiming:
     """Tests for chart initialization timing fix (htmx:afterSettle instead of double-rAF)."""
