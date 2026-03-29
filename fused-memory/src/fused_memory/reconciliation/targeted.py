@@ -1,5 +1,6 @@
 """Targeted reconciliation — lightweight, triggered by task state transitions."""
 
+import contextlib
 import json
 import logging
 import uuid as uuid_mod
@@ -126,7 +127,8 @@ class TargetedReconciler:
             return result
 
         except ValueError:
-            await self.journal.complete_run(run_id, 'failed')
+            with contextlib.suppress(Exception):
+                await self.journal.complete_run(run_id, 'failed')
             raise
 
         except Exception as e:
