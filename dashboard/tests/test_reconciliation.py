@@ -141,12 +141,8 @@ class TestGetRecentRuns:
         started_at) to simulate such production data corruption.
         """
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import RECONCILIATION_SCHEMA, make_recon_db
+        from tests.conftest import RELAXED_RECONCILIATION_SCHEMA, make_recon_db
 
-        # Replace 'started_at TEXT NOT NULL' with 'started_at TEXT' to allow NULL
-        relaxed_schema = RECONCILIATION_SCHEMA.replace(
-            'started_at TEXT NOT NULL', 'started_at TEXT'
-        )
         inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
             " completed_at, events_processed, status)"
@@ -155,7 +151,7 @@ class TestGetRecentRuns:
         ]
         with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
             async with make_recon_db(
-                tmp_path, inserts, name='null_started.db', schema=relaxed_schema
+                tmp_path, inserts, name='null_started.db', schema=RELAXED_RECONCILIATION_SCHEMA
             ) as db:
                 runs = await get_recent_runs(db)
 

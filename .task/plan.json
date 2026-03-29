@@ -47,7 +47,7 @@
       "id": "step-4",
       "type": "impl",
       "description": "Refactor test_null_started_at_with_completed_at_sets_duration_none (line ~110): remove inline RECONCILIATION_SCHEMA import and .replace() call, import RELAXED_RECONCILIATION_SCHEMA from tests.conftest instead, pass it directly to make_recon_db's schema kwarg.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
