@@ -725,8 +725,8 @@ class TestReconRightColumnLayout:
     def test_no_lg_inset_0_in_html(self, recon_layout_html):
         assert 'lg:inset-0' not in recon_layout_html
 
-    def test_right_column_card_has_h_full(self, recon_layout_html):
-        assert 'h-full' in recon_layout_html
+    def test_right_column_card_has_flex_col_h_full(self, recon_layout_html):
+        assert 'flex flex-col h-full' in recon_layout_html
 
     def test_no_min_h_400_in_html(self, recon_layout_html):
         assert 'min-h-[400px]' not in recon_layout_html
