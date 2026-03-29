@@ -386,28 +386,22 @@ class TestGetBurstState:
 
     async def test_cooldown_expires_stale_burst(self, tmp_path):
         """Agents with last_write older than cooldown are reported as idle."""
-        import sqlite3
         from datetime import UTC, datetime, timedelta
 
         from dashboard.data.reconciliation import get_burst_state
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'stale.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(RECONCILIATION_SCHEMA)
         now = datetime.now(UTC)
         # last_write_at is 10 minutes ago — well past default 150s cooldown
-        conn.execute(
-            "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
-            " VALUES (?, 'bursting', ?, ?)",
-            ('stale-agent', (now - timedelta(minutes=10)).isoformat(),
-             (now - timedelta(minutes=15)).isoformat()),
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+        inserts = [
+            (
+                "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
+                " VALUES (?, 'bursting', ?, ?)",
+                ('stale-agent', (now - timedelta(minutes=10)).isoformat(),
+                 (now - timedelta(minutes=15)).isoformat()),
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='stale.db') as db:
             result = await get_burst_state(db)
         assert len(result) == 1
         assert result[0]['state'] == 'idle'
@@ -415,28 +409,22 @@ class TestGetBurstState:
 
     async def test_cooldown_preserves_active_burst(self, tmp_path):
         """Agents with recent last_write keep bursting state."""
-        import sqlite3
         from datetime import UTC, datetime, timedelta
 
         from dashboard.data.reconciliation import get_burst_state
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'active.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(RECONCILIATION_SCHEMA)
         now = datetime.now(UTC)
         # last_write_at is 30 seconds ago — within 150s cooldown
-        conn.execute(
-            "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
-            " VALUES (?, 'bursting', ?, ?)",
-            ('active-agent', (now - timedelta(seconds=30)).isoformat(),
-             (now - timedelta(seconds=60)).isoformat()),
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+        inserts = [
+            (
+                "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
+                " VALUES (?, 'bursting', ?, ?)",
+                ('active-agent', (now - timedelta(seconds=30)).isoformat(),
+                 (now - timedelta(seconds=60)).isoformat()),
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='active.db') as db:
             result = await get_burst_state(db)
         assert len(result) == 1
         assert result[0]['state'] == 'bursting'
@@ -458,24 +446,17 @@ class TestGetBurstState:
 
     async def test_malformed_timestamp_logs_debug(self, tmp_path, caplog):
         """A malformed last_write_at in burst_state emits a DEBUG log with agent_id."""
-        import sqlite3
-
         from dashboard.data.reconciliation import get_burst_state
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'malformed.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(RECONCILIATION_SCHEMA)
-        conn.execute(
-            "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
-            " VALUES (?, 'bursting', ?, ?)",
-            ('bad-agent', 'not-a-date', None),
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+        inserts = [
+            (
+                "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
+                " VALUES (?, 'bursting', ?, ?)",
+                ('bad-agent', 'not-a-date', None),
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='malformed.db') as db:
             with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
                 result = await get_burst_state(db)
 
