@@ -3,7 +3,7 @@
 import asyncio
 import types
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -622,8 +622,6 @@ class TestGraphitiBackendRemoveEdge:
     async def test_graphiti_backend_remove_edge(self, mock_config):
         """Unit test for GraphitiBackend.remove_edge — should call
         EntityEdge.get_by_uuid then edge.delete."""
-        from unittest.mock import patch
-
         from fused_memory.backends.graphiti_client import GraphitiBackend
 
         backend = GraphitiBackend(mock_config)
@@ -819,11 +817,11 @@ class TestGetEntity:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_search_nodes_failure_raises_and_search_invoked(self, service):
+    async def test_search_nodes_failure_raises_and_search_settles(self, service):
         """When search_nodes raises, exception propagates.
 
-        With concurrent gather, search() is still called (both coroutines
-        are invoked before the exception is inspected).
+        With concurrent gather, search() settles (both coroutines run to
+        completion before the exception is inspected).
         """
         service.graphiti.search_nodes = AsyncMock(
             side_effect=RuntimeError('search_nodes failed')
@@ -833,7 +831,7 @@ class TestGetEntity:
         with pytest.raises(RuntimeError, match='search_nodes failed'):
             await service.get_entity('entity', project_id='test')
 
-        # search() was still invoked in the concurrent gather even though search_nodes failed
+        # search() settles in the concurrent gather even though search_nodes failed
         service.graphiti.search.assert_called_once()
 
     # ------------------------------------------------------------------
@@ -841,11 +839,11 @@ class TestGetEntity:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_search_failure_raises_and_search_nodes_invoked(self, service):
-        """When search() raises, exception propagates AND search_nodes() was called.
+    async def test_search_failure_raises_and_search_nodes_settles(self, service):
+        """When search() raises, exception propagates AND search_nodes() settles.
 
-        With concurrent gather, both coroutines are invoked before any exception is
-        inspected — search_nodes() completes even though search() raises.
+        With concurrent gather, both coroutines run to completion before any exception
+        is inspected — search_nodes() settles even though search() raises.
         """
         service.graphiti.search_nodes = AsyncMock(return_value=[])
         service.graphiti.search = AsyncMock(
@@ -855,7 +853,7 @@ class TestGetEntity:
         with pytest.raises(RuntimeError, match='search failed'):
             await service.get_entity('entity', project_id='test')
 
-        # search_nodes() was invoked in the concurrent gather even though search() failed
+        # search_nodes() settles in the concurrent gather even though search() failed
         service.graphiti.search_nodes.assert_called_once()
 
     # ------------------------------------------------------------------
@@ -879,6 +877,9 @@ class TestGetEntity:
         with pytest.raises(RuntimeError, match='search_nodes failed'):
             await service.get_entity('entity', project_id='test')
 
+        # gather(return_exceptions=True) settles both coroutines — search() was called
+        service.graphiti.search.assert_called_once()
+
     # ------------------------------------------------------------------
     # both calls fail — both warnings emitted before re-raise
     # ------------------------------------------------------------------
@@ -890,8 +891,6 @@ class TestGetEntity:
         The exception filter iterates all gather results and logs each Exception
         before raising the first one. Both failures must be visible in logs.
         """
-        from unittest.mock import patch
-
         service.graphiti.search_nodes = AsyncMock(
             side_effect=RuntimeError('search_nodes failed')
         )
@@ -928,8 +927,37 @@ class TestGetEntity:
         )
         service.graphiti.search = AsyncMock(return_value=[])
 
-        with pytest.raises(asyncio.CancelledError):
+        with patch('fused_memory.services.memory_service.logger') as mock_logger, \
+             pytest.raises(asyncio.CancelledError):
             await service.get_entity('entity', project_id='test')
+
+        # CancelledError is BaseException, NOT Exception — the isinstance(r, Exception)
+        # logging guard must NOT fire, so warning.call_count must be zero.
+        assert mock_logger.warning.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_from_search_propagates(self, service):
+        """asyncio.CancelledError raised by search() must propagate unchanged.
+
+        Symmetric to test_cancelled_error_propagates, but with search() raising
+        CancelledError (gather index 1) and search_nodes() returning normally
+        (gather index 0).  The detection guard must iterate ALL gather results
+        regardless of which position holds the CancelledError.
+
+        Also asserts logger.warning.call_count == 0 — CancelledError must NOT
+        be logged via the isinstance(r, Exception) guard.
+        """
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(
+            side_effect=asyncio.CancelledError()
+        )
+
+        with patch('fused_memory.services.memory_service.logger') as mock_logger, \
+             pytest.raises(asyncio.CancelledError):
+            await service.get_entity('entity', project_id='test')
+
+        # CancelledError is BaseException, NOT Exception — logging guard must not fire.
+        assert mock_logger.warning.call_count == 0
 
     # ------------------------------------------------------------------
     # temporal serialization in edge_data
