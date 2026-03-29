@@ -4574,7 +4574,7 @@
         "description": "validate_project_id and validate_run_id are structurally identical — same emptiness check, same regex pattern, same error-dict shape. The only difference is the field-name string used in error messages. The two pattern constants (_PROJECT_ID_PATTERN and _RUN_ID_PATTERN) are also byte-for-byte identical compiled regexes.\n\nSteps:\n1. Replace _PROJECT_ID_PATTERN and _RUN_ID_PATTERN with a single _SAFE_ID_PATTERN constant\n2. Extract a private `_validate_identifier(value: str, field_name: str) -> dict[str, str] | None` helper\n3. Delegate from both validate_project_id and validate_run_id to the shared helper\n4. Keep the public API unchanged (validate_project_id, validate_run_id, require_project_id, require_run_id)\n5. Ensure all existing tests pass unchanged\n\nIf the two patterns are expected to diverge in the future, the alternative approach is to keep them separate but add explicit comments explaining the deliberate separation. Check memory for any decisions about this.\n\nmemory_hint: search \"validate_project_id allowlist pattern\" for the original implementation decision; get_entity \"validate_project_id\" for current usage.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -4587,7 +4587,8 @@
             "fused-memory/src/fused_memory/utils",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-29T00:04:08.472Z"
       },
       {
         "id": "268",
@@ -5053,7 +5054,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T00:04:08.362Z",
+      "lastModified": "2026-03-29T00:04:08.472Z",
       "taskCount": 268,
       "completedCount": 238,
       "tags": [
