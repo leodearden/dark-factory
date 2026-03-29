@@ -5264,9 +5264,7 @@
         "details": "BLOCKED: Waiting for merge queue (task 292) to be implemented and stable, with real metrics on queue depth and merge cycle time.\n\nUnblock condition: sustained queue depth >3 and merge cycle time dominating task throughput.\n\nDesign notes:\n- Worker A (merger): dequeue, create merge_wt, git merge --no-ff, scrub .task/\n- Worker B (verifier): run_scoped_verification, CAS update-ref, notify task Future\n- Speculative base: merge N+1 against N's merge commit, not current main\n- If N succeeds: N+1 is descendant, CAS works\n- If N fails: discard N+1, re-merge against actual main (one wasted merge ~2s)\n- Key risk: verification validity — N+1 verified against tree containing N's changes; if N rejected, N+1's verify was against non-existent state. Mitigated by scoped verification (task_files only) and depth-1 cap.\n- See comment block above advance_main() in git_ops.py for full rationale",
         "testStrategy": "",
         "status": "blocked",
-        "dependencies": [
-          "292"
-        ],
+        "dependencies": [],
         "priority": "medium",
         "subtasks": [],
         "updatedAt": "2026-03-29T08:20:54.776Z",
