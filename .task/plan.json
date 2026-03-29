@@ -1,0 +1,91 @@
+{
+  "task_id": "164",
+  "title": "Refactor: extract shared project_root validation and parametrize targeted tests",
+  "files": [
+    "fused-memory/tests/test_targeted.py",
+    "fused-memory/src/fused_memory/reconciliation/targeted.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/reconciliation",
+    "fused-memory/tests"
+  ],
+  "analysis": "Part 1 (shared validation helper) is ALREADY COMPLETE: require_project_root() and validate_project_root() already exist in fused_memory/utils/validation.py. Both targeted.py (line 20: import, lines 86+352: usage) and tools.py (line 14: import, 11 usage sites) already delegate to the shared module. Identity tests in test_tools_validation.py and unit tests in test_validation.py already verify this.\n\nPart 2 (parametrize tests) is TODO: Six structurally identical rejection tests at test_targeted.py:449-515 (3 for reconcile_task \u00d7 3 bad values, 3 for reconcile_bulk_tasks \u00d7 3 bad values) should collapse into 2 @pytest.mark.parametrize tests. The error message from require_project_root includes repr(project_root), so match patterns can include the specific bad value for more precise assertions.\n\nPart 3 (journal gap) is TODO: In reconcile_task(), require_project_root(project_root) at line 86 fires BEFORE journal.start_run(run) at line 99, so validation failures leave no audit trail. Fix: move run creation + journal.start_run() before validation, then catch ValueError inside the try block. Add a specific except ValueError clause that journals 'failed' and re-raises (preserving the existing API contract where ValueError propagates to callers like TaskInterceptor._on_reconciliation_done). reconcile_bulk_tasks() has no journal interaction at all, so no journal gap to fix there.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Replace 6 individual validation tests with 2 parametrized tests: test_reconcile_task_rejects_bad_project_root and test_reconcile_bulk_rejects_bad_project_root, each parametrized with @pytest.mark.parametrize('project_root', ['', 'dark_factory', '.']). Use re.escape(repr(project_root)) in match pattern for precise error matching. Delete the 6 old tests (lines 449-515). Run tests to confirm all 6 test cases (3+3) still pass.",
+      "status": "done",
+      "commit": "28f545dd"
+    },
+    {
+      "id": "step-2",
+      "type": "test",
+      "description": "Write failing test test_reconcile_task_validation_error_leaves_journal_trace: call reconcile_task with project_root='' (expect ValueError), then query journal.get_recent_runs('test-project', limit=1) and assert exactly 1 run exists with status 'failed'. This test will FAIL because currently the ValueError fires before journal.start_run().",
+      "status": "done",
+      "commit": "157bdef5"
+    },
+    {
+      "id": "step-3",
+      "type": "impl",
+      "description": "In reconcile_task(): (1) move run_id creation, ReconciliationRun construction, and journal.start_run() ABOVE the require_project_root() call; (2) move require_project_root() inside the existing try block (first statement); (3) add an 'except ValueError' clause before the existing 'except Exception' that calls journal.complete_run(run_id, 'failed') and re-raises. This journals validation failures while preserving the ValueError propagation contract.",
+      "status": "done",
+      "commit": "83c8ec53"
+    },
+    {
+      "id": "step-4",
+      "type": "test",
+      "description": "Run full test suite for test_targeted.py to verify: (a) the 6 parametrized validation cases pass, (b) the new journal trace test passes, (c) all existing tests (done handler, blocked handler, bulk, fencing, etc.) remain green. No regressions.",
+      "status": "done",
+      "commit": "83c8ec53"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Part 1 (shared validation helper) is already implemented \u2014 no code changes needed",
+      "rationale": "require_project_root() and validate_project_root() already exist in fused_memory/utils/validation.py and are imported by both targeted.py and tools.py. Identity tests in test_tools_validation.py and unit tests in test_validation.py already verify this. Attempting to re-extract would be a no-op."
+    },
+    {
+      "decision": "Re-raise ValueError after journaling instead of absorbing into error dict",
+      "rationale": "The existing except Exception block returns {'error': str(e)} without raising. However, the TaskInterceptor._on_reconciliation_done callback relies on task.exception() to detect failures in fire-and-forget background tasks. Changing ValueError to an error dict would silently swallow validation failures at the interceptor layer. Re-raising preserves the existing API contract."
+    },
+    {
+      "decision": "Journal gap fix only applies to reconcile_task(), not reconcile_bulk_tasks()",
+      "rationale": "reconcile_bulk_tasks() has no journal interaction at all (no start_run/complete_run calls). Adding journal support to bulk would be scope creep \u2014 that's a separate enhancement if desired."
+    },
+    {
+      "decision": "Use re.escape(repr(project_root)) in parametrized test match patterns",
+      "rationale": "The error message from require_project_root includes f'{project_root!r}' so matching the specific repr ensures each parametrized case validates the correct bad value appears in the error, not just the generic 'absolute path' substring. The '.' case contains a regex metacharacter, so re.escape is necessary."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "require_project_root() from fused_memory.utils.validation",
+      "where": "fused-memory/src/fused_memory/utils/validation.py:74-77",
+      "how": "Already imported and used in targeted.py. No changes needed \u2014 the shared helper extraction (Part 1) was completed in a prior task."
+    },
+    {
+      "what": "validate_project_root() from fused_memory.utils.validation",
+      "where": "fused-memory/src/fused_memory/utils/validation.py:43-50",
+      "how": "Already imported and used in tools.py. The dict-returning variant is the foundation for the raise-on-error require_project_root() wrapper."
+    },
+    {
+      "what": "journal.get_recent_runs() for verifying journal trace",
+      "where": "fused-memory/src/fused_memory/reconciliation/journal.py:280-305",
+      "how": "Used in test_on_task_done_logs_run_actions to query runs after reconcile_task. Reuse the same pattern in the new journal gap test."
+    },
+    {
+      "what": "Existing reconciler fixture and mock setup",
+      "where": "fused-memory/tests/test_targeted.py:16-73",
+      "how": "The reconciler fixture (with journal, mock_memory_service, mock_taskmaster, config, mock_event_buffer) provides everything needed for the new tests."
+    },
+    {
+      "what": "@pytest.mark.parametrize pattern from test_validation.py",
+      "where": "fused-memory/tests/test_validation.py:438-464",
+      "how": "The injection vector parametrize tests demonstrate the project's convention for parametrized validation tests. Follow the same style."
+    }
+  ],
+  "_session_id": "164-fdce21e5",
+  "_created_at": "2026-03-29T00:22:09.675570+00:00"
+}
