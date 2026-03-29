@@ -4984,7 +4984,7 @@
         "description": "fused-memory/tests/test_memory_service.py has several test gaps and cleanup items:\n\n1. MockNode in conftest.py has no labels field — add labels: list[str] = field(default_factory=list)\n2. No test for non-empty labels pass-through (e.g. ['Service', 'Auth'])\n3. test_cancelled_error_propagates doesn't assert CancelledError is NOT logged as warning (the two-tier guard's purpose)\n4. Add symmetric test: test_cancelled_error_from_search_propagates (search raises CancelledError, search_nodes returns normally)\n5. test_both_failures_raises_first_exception doesn't assert search was called (gather settlement)\n6. Two inline `from unittest.mock import patch` at lines 625/879 — hoist to module-level import\n7. Rename test_*_invoked back to test_*_settles to accurately reflect gather(return_exceptions=True) semantics",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -4996,7 +4996,8 @@
           "modules": [
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-29T01:31:50.506Z"
       },
       {
         "id": "287",
@@ -5093,7 +5094,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T01:31:37.692Z",
+      "lastModified": "2026-03-29T01:31:50.510Z",
       "taskCount": 270,
       "completedCount": 250,
       "tags": [
