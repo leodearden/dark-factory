@@ -5336,7 +5336,17 @@
           295
         ],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/data/costs.py",
+            "dashboard/tests/test_costs_data.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/data",
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 299,
@@ -5351,7 +5361,17 @@
           295
         ],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "shared/src/shared/cli_invoke.py",
+            "shared/tests/test_cli_invoke.py"
+          ],
+          "modules": [
+            "shared/src/shared",
+            "shared/tests"
+          ]
+        }
       },
       {
         "id": 300,
@@ -5364,7 +5384,17 @@
           295
         ],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "shared/src/shared/usage_gate.py",
+            "orchestrator/tests/test_usage_gate.py"
+          ],
+          "modules": [
+            "shared/src/shared",
+            "orchestrator/tests"
+          ]
+        }
       },
       {
         "id": 301,
