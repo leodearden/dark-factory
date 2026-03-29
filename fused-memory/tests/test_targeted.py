@@ -475,6 +475,25 @@ async def test_reconcile_bulk_rejects_bad_project_root(reconciler, project_root)
 
 
 @pytest.mark.asyncio
+async def test_reconcile_bulk_rejects_bad_project_root_leaves_no_journal_trace(reconciler, journal):
+    """reconcile_bulk_tasks() must NOT create a journal run on validation failure.
+
+    reconcile_bulk_tasks intentionally has no journal lifecycle (no start_run /
+    complete_run calls), unlike reconcile_task.  This test documents that
+    asymmetry: a bad project_root raises ValueError but leaves no trace.
+    """
+    with pytest.raises(ValueError, match=r'non-empty absolute path'):
+        await reconciler.reconcile_bulk_tasks(
+            parent_task_id=None,
+            project_id='test-project',
+            project_root='',
+        )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert runs == [], 'Expected no journal runs after bulk validation failure'
+
+
+@pytest.mark.asyncio
 async def test_reconcile_task_validation_error_leaves_journal_trace(reconciler, journal):
     """Validation failures in reconcile_task() must leave a 'failed' run in the journal."""
     with pytest.raises(ValueError):

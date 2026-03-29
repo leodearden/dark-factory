@@ -56,7 +56,7 @@
       "id": "step-7",
       "type": "test",
       "description": "Add new test `test_reconcile_bulk_rejects_bad_project_root_leaves_no_journal_trace` after the existing bulk parametrized test. This test calls `reconcile_bulk_tasks` with an invalid project_root (e.g. ''), expects ValueError, then asserts `journal.get_recent_runs('test-project', limit=1) == []` to document the intentional absence of journal lifecycle in bulk reconciliation.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
