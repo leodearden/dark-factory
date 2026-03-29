@@ -5408,7 +5408,22 @@
           300
         ],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "orchestrator/src/orchestrator/harness.py",
+            "orchestrator/src/orchestrator/workflow.py",
+            "orchestrator/src/orchestrator/steward.py",
+            "orchestrator/tests/test_harness_module_tagging.py",
+            "orchestrator/tests/test_harness_prd_tagging.py",
+            "orchestrator/tests/test_workflow_e2e.py",
+            "orchestrator/tests/test_steward.py"
+          ],
+          "modules": [
+            "orchestrator/src/orchestrator",
+            "orchestrator/tests"
+          ]
+        }
       },
       {
         "id": 302,
@@ -5422,7 +5437,25 @@
           296
         ],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/app.py",
+            "dashboard/src/dashboard/templates/costs.html",
+            "dashboard/src/dashboard/templates/partials/costs/summary.html",
+            "dashboard/src/dashboard/templates/partials/costs/by_project.html",
+            "dashboard/src/dashboard/templates/partials/costs/by_account.html",
+            "dashboard/src/dashboard/templates/partials/costs/by_role.html",
+            "dashboard/src/dashboard/templates/partials/costs/trend.html",
+            "dashboard/src/dashboard/templates/partials/costs/events.html",
+            "dashboard/src/dashboard/templates/partials/costs/runs.html"
+          ],
+          "modules": [
+            "dashboard/src/dashboard",
+            "dashboard/src/dashboard/templates",
+            "dashboard/src/dashboard/templates/partials/costs"
+          ]
+        }
       },
       {
         "id": 303,
