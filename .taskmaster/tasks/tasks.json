@@ -5284,7 +5284,7 @@
         "description": "Add a minimal navigation bar to dashboard/src/dashboard/templates/base.html with two entries: Dashboard (/) and Costs (/costs). Active page highlighted — use a template variable or URL path check to determine which entry is active. Style consistent with existing dark theme (gray-900 background, gray-100 text, accent color for active). Both index.html and the future costs.html will extend base.html and inherit the nav. Keep it simple — a horizontal bar at the top of the page, above the existing content. Update existing tests to verify nav bar presence.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -5298,7 +5298,8 @@
             "dashboard/src/dashboard/templates",
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-29T08:47:28.070Z"
       },
       {
         "id": "297",
@@ -5483,7 +5484,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T08:47:28.033Z",
+      "lastModified": "2026-03-29T08:47:28.071Z",
       "taskCount": 282,
       "completedCount": 258,
       "tags": [
