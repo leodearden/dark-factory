@@ -33,6 +33,10 @@ class AgentResult:
     cost_usd: float = 0.0
     duration_ms: int = 0
     turns: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_create_tokens: int | None = None
     session_id: str = ''
     structured_output: Any = None
     subtype: str = ''
@@ -220,6 +224,12 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     subtype = data.get('subtype', '')
     structured = data.get('structured_output')
 
+    usage = data.get('usage') or {}
+    input_tokens = usage.get('input_tokens')
+    output_tokens = usage.get('output_tokens')
+    cache_read_tokens = usage.get('cache_read_input_tokens')
+    cache_create_tokens = usage.get('cache_creation_input_tokens')
+
     output_text = data.get('result', '')
     if not output_text and isinstance(data.get('messages'), list):
         parts = []
@@ -240,6 +250,10 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         cost_usd=cost,
         duration_ms=duration,
         turns=turns,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_create_tokens=cache_create_tokens,
         session_id=session_id,
         structured_output=structured,
         subtype=subtype,
