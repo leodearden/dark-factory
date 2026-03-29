@@ -5083,11 +5083,11 @@
         "description": "Four test improvements from review of task 164:\n\n1. **Semantic match patterns** (suggestions #2, #6): The parametrized tests at test_targeted.py:453,469 use `re.escape(repr(project_root))` which couples to formatting, not meaning. Use a compound pattern anchored on the stable semantic fragment, e.g. `match=r\"non-empty absolute path\"` or combine both: `match=re.escape(f\"non-empty absolute path, got: {project_root!r}\")`.\n\n2. **Document bulk no-journal asymmetry** (suggestion #7): Add `test_reconcile_bulk_rejects_bad_project_root_leaves_no_journal_trace` that asserts `journal.get_recent_runs(\"test-project\", limit=1) == []` after a validation failure in `reconcile_bulk_tasks`. This documents the intentional absence of a journal trace for bulk (which has no journal run lifecycle).\n\n3. **Verify run_type in journal trace test** (suggestion #8): In `test_reconcile_task_validation_error_leaves_journal_trace` at line 490, add `assert runs[0].run_type == \"targeted\"` to ensure the trace corresponds to the expected reconciliation path.\n\nFiles: fused-memory/tests/test_targeted.py:449-490",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-29T08:47:28.143Z",
+        "updatedAt": "2026-03-29T09:00:46.326Z",
         "metadata": {
           "modules": [
             "fused-memory/tests/test_targeted.py"
@@ -5484,9 +5484,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T08:47:28.143Z",
+      "lastModified": "2026-03-29T09:00:46.329Z",
       "taskCount": 282,
-      "completedCount": 258,
+      "completedCount": 259,
       "tags": [
         "master"
       ]
