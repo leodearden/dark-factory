@@ -5468,7 +5468,15 @@
           302
         ],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_costs_panel.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       }
     ],
     "metadata": {
