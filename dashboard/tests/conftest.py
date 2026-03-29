@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -153,7 +154,7 @@ CREATE INDEX IF NOT EXISTS idx_ra_run ON run_actions(run_id);
 @asynccontextmanager
 async def make_recon_db(
     tmp_path: Path,
-    inserts: list[str | tuple[str, Any]],
+    inserts: Sequence[str | tuple[str, Any]],
     *,
     name: str = 'test.db',
     schema: str | None = None,
