@@ -284,6 +284,15 @@ class TestRequireProjectRoot:
         with pytest.raises(ValueError):
             require_project_root('   ')
 
+    def test_invalid_path_raises_input_validation_error(self):
+        """require_project_root must raise InputValidationError, not a plain ValueError."""
+        with pytest.raises(InputValidationError):
+            require_project_root('relative/path')
+
+    def test_empty_string_raises_input_validation_error(self):
+        with pytest.raises(InputValidationError):
+            require_project_root('')
+
 
 class TestRequireProjectId:
     """require_project_id raises ValueError for invalid ids, returns None for valid ones."""
@@ -309,6 +318,15 @@ class TestRequireProjectId:
 
     def test_injection_vector_newline_raises_valueerror(self):
         with pytest.raises(ValueError):
+            require_project_id('proj\nid')
+
+    def test_empty_string_raises_input_validation_error(self):
+        """require_project_id must raise InputValidationError, not a plain ValueError."""
+        with pytest.raises(InputValidationError):
+            require_project_id('')
+
+    def test_injection_vector_raises_input_validation_error(self):
+        with pytest.raises(InputValidationError):
             require_project_id('proj\nid')
 
 
@@ -337,6 +355,15 @@ class TestRequireRunId:
         with pytest.raises(ValueError) as exc_info:
             require_run_id(invalid)
         assert str(exc_info.value) == err_dict['error']
+
+    def test_empty_string_raises_input_validation_error(self):
+        """require_run_id must raise InputValidationError, not a plain ValueError."""
+        with pytest.raises(InputValidationError):
+            require_run_id('')
+
+    def test_injection_vector_raises_input_validation_error(self):
+        with pytest.raises(InputValidationError):
+            require_run_id('run\nid')
 
 
 class TestValidateProjectId:
