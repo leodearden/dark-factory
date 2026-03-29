@@ -5487,7 +5487,21 @@
           "modules": [
             "orchestrator/src/orchestrator",
             "orchestrator/tests"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "CostStore",
+              "RunStore",
+              "UsageGate",
+              "invoke_with_cap_retry"
+            ],
+            "queries": [
+              "CostStore class location and API methods",
+              "invoke_with_cap_retry cap detection and retry logic",
+              "UsageGate cap events failover account switching",
+              "RunStore database path and WAL mode configuration"
+            ]
+          }
         }
       },
       {
