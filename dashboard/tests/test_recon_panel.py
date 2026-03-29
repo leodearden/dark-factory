@@ -6,6 +6,9 @@ from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
+import pytest
+from starlette.testclient import TestClient
+
 from .test_helpers import _get_opening_tag
 
 
@@ -703,23 +706,32 @@ class TestReconJournalBadge:
         assert 'aria-label="Show 5 journal entries"' in html
 
 
+@pytest.fixture(scope='class')
+def recon_layout_html():
+    """Class-scoped HTML fixture: fetches /partials/recon once for all layout tests."""
+    from dashboard.app import app
+
+    with TestClient(app) as c, _patch_recon_data():
+        return c.get('/partials/recon').text
+
+
 class TestReconRightColumnLayout:
     """Tests for right-column layout: no absolute positioning, natural grid flow."""
 
-    def test_no_lg_absolute_in_html(self, client):
-        with _patch_recon_data():
-            html = client.get('/partials/recon').text
-        assert 'lg:absolute' not in html
+    def test_no_lg_absolute_in_html(self, recon_layout_html):
+        assert 'lg:absolute' not in recon_layout_html
 
-    def test_no_lg_inset_0_in_html(self, client):
-        with _patch_recon_data():
-            html = client.get('/partials/recon').text
-        assert 'lg:inset-0' not in html
+    def test_no_lg_inset_0_in_html(self, recon_layout_html):
+        assert 'lg:inset-0' not in recon_layout_html
 
-    def test_right_column_card_has_h_full(self, client):
-        with _patch_recon_data():
-            html = client.get('/partials/recon').text
-        assert 'h-full' in html
+    def test_right_column_card_has_flex_col_h_full(self, recon_layout_html):
+        assert 'flex flex-col h-full' in recon_layout_html
+
+    def test_no_min_h_400_in_html(self, recon_layout_html):
+        assert 'min-h-[400px]' not in recon_layout_html
+
+    def test_no_lg_relative_in_html(self, recon_layout_html):
+        assert 'lg:relative' not in recon_layout_html
 
 
 class TestReconTableHeaderNoWrap:
@@ -728,7 +740,7 @@ class TestReconTableHeaderNoWrap:
     def test_thead_row_has_whitespace_nowrap(self, client):
         with _patch_recon_data():
             html = client.get('/partials/recon').text
-        assert 'whitespace-nowrap' in html
+        assert 'border-b border-gray-700 whitespace-nowrap' in html
 
 
 class TestReconRunDetailRoute:
