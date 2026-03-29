@@ -734,3 +734,57 @@ class TestValidatorErrorDictShape:
         result = validate_run_id('')
         assert result is not None
         assert set(result.keys()) == {'error', 'error_type'}
+
+
+class TestRequireFunctionsTruncation:
+    """require_* functions delegate to validate_* which uses _safe_repr — truncation is inherited."""
+
+    def test_require_project_id_1mb_invalid_raises_with_short_message(self):
+        """require_project_id raises InputValidationError with a truncated message for a 1MB input.
+
+        Regression: require_project_id delegates to validate_project_id → _validate_identifier.
+        Since _validate_identifier now uses _safe_repr, the raised exception message must
+        also be short, not a million-character string.
+        """
+        big_id = 'bad`' + 'x' * (1024 * 1024)
+        with pytest.raises(InputValidationError) as exc_info:
+            require_project_id(big_id)
+        msg = str(exc_info.value)
+        assert len(msg) < 400, (
+            f'Exception message length {len(msg)} exceeds 400 — '
+            'require_project_id must inherit truncation from _validate_identifier'
+        )
+        assert '...(truncated)' in msg
+
+    def test_require_run_id_1mb_invalid_raises_with_short_message(self):
+        """require_run_id raises InputValidationError with a truncated message for a 1MB input."""
+        big_run = 'bad\n' + 'y' * (1024 * 1024)
+        with pytest.raises(InputValidationError) as exc_info:
+            require_run_id(big_run)
+        msg = str(exc_info.value)
+        assert len(msg) < 400, (
+            f'Exception message length {len(msg)} exceeds 400 — '
+            'require_run_id must inherit truncation from _validate_identifier'
+        )
+        assert '...(truncated)' in msg
+
+    def test_require_project_root_1mb_relative_raises_with_short_message(self):
+        """require_project_root raises InputValidationError with a truncated message for a 1MB relative path."""
+        big_path = 'z' * (1024 * 1024)
+        with pytest.raises(InputValidationError) as exc_info:
+            require_project_root(big_path)
+        msg = str(exc_info.value)
+        assert len(msg) < 400, (
+            f'Exception message length {len(msg)} exceeds 400 — '
+            'require_project_root must inherit truncation from validate_project_root'
+        )
+        assert '...(truncated)' in msg
+
+    def test_require_functions_raise_input_validation_error_not_base_value_error(self):
+        """require_* functions raise InputValidationError (not plain ValueError) for oversized inputs."""
+        big_id = 'bad`' + 'a' * (1024 * 1024)
+        with pytest.raises(InputValidationError):
+            require_project_id(big_id)
+        big_root = 'b' * (1024 * 1024)
+        with pytest.raises(InputValidationError):
+            require_project_root(big_root)
