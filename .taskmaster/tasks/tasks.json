@@ -4679,7 +4679,7 @@
         "description": "In `fused-memory/tests/test_stages.py`, the `test_mock_types_constant_defined` method (line ~758) uses `import tests.test_stages as _self_module` to access `_MOCK_TYPES`, which is already in scope at module level. This is fragile (breaks if pytest's sys.path changes, module is renamed, or import mode is `importlib`) and adds a `# noqa: PLC0415` suppression.\n\nReplace the self-import with direct references:\n```python\ndef test_mock_types_constant_defined(self):\n    \"\"\"_MOCK_TYPES module-level constant must exist and contain AsyncMock and MagicMock.\"\"\"\n    assert isinstance(_MOCK_TYPES, tuple), \"_MOCK_TYPES must be a tuple\"\n    assert AsyncMock in _MOCK_TYPES, \"_MOCK_TYPES must contain AsyncMock\"\n    assert MagicMock in _MOCK_TYPES, \"_MOCK_TYPES must contain MagicMock\"\n```\n\nThis eliminates the noqa suppression and makes the test immune to import path resolution issues.\n\nmemory_hints:\n- search: \"test_stages.py _MOCK_TYPES self-import\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -4691,7 +4691,7 @@
             "fused-memory/tests"
           ]
         },
-        "updatedAt": "2026-03-29T00:15:12.065Z"
+        "updatedAt": "2026-03-29T00:22:49.937Z"
       },
       {
         "id": "273",
@@ -5056,9 +5056,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T00:17:27.162Z",
+      "lastModified": "2026-03-29T00:22:49.937Z",
       "taskCount": 268,
-      "completedCount": 241,
+      "completedCount": 242,
       "tags": [
         "master"
       ]
