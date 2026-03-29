@@ -5439,7 +5439,22 @@
           "modules": [
             "shared/src/shared",
             "shared/tests"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "CostStore class",
+              "RunStore",
+              "AgentResult",
+              "UsageGate"
+            ],
+            "queries": [
+              "CostStore current verified state and location",
+              "CostStore aspirational vs verified facts",
+              "invoke_with_cap_retry instrumentation status",
+              "AgentResult token fields extension task 294"
+            ]
+          },
+          "_causation_id": "4629993e-4d5d-4481-a371-66023dd9e398"
         }
       },
       {
