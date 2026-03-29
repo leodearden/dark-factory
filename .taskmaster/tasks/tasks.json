@@ -5770,7 +5770,21 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "memory_hints": {
+            "entities": [
+              "fused-memory MCP server",
+              "Graphiti"
+            ],
+            "queries": [
+              "task 93 get_entity invalidated edge filtering",
+              "Graphiti edge invalid_at temporal facts",
+              "_search_graphiti invalidated edges search results"
+            ]
+          },
+          "_causation_id": "9d395ed6-5638-4dc3-ae3b-d6915ec67c9c"
+        }
       }
     ],
     "metadata": {
