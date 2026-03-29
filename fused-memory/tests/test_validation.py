@@ -3,6 +3,7 @@
 import pytest
 
 from fused_memory.utils.validation import (
+    InputValidationError,
     _validate_identifier,
     require_project_id,
     require_project_root,
@@ -11,6 +12,61 @@ from fused_memory.utils.validation import (
     validate_project_root,
     validate_run_id,
 )
+
+
+class TestInputValidationError:
+    """InputValidationError — custom exception for input parameter validation failures."""
+
+    def test_is_valueerror_subclass(self):
+        """InputValidationError must be a ValueError subclass for backward compat."""
+        assert issubclass(InputValidationError, ValueError)
+
+    def test_is_exception_subclass(self):
+        """InputValidationError must ultimately be an Exception."""
+        assert issubclass(InputValidationError, Exception)
+
+    def test_preserves_message(self):
+        """Constructor message is preserved and accessible via str()."""
+        msg = 'project_root must be a non-empty absolute path'
+        exc = InputValidationError(msg)
+        assert str(exc) == msg
+
+    def test_catchable_as_valueerror(self):
+        """Raising InputValidationError can be caught with except ValueError (backward compat)."""
+        caught = False
+        try:
+            raise InputValidationError('test message')
+        except ValueError:
+            caught = True
+        assert caught, 'InputValidationError must be catchable as ValueError'
+
+    def test_catchable_as_input_validation_error(self):
+        """Raising InputValidationError can be caught with except InputValidationError."""
+        caught = False
+        try:
+            raise InputValidationError('test message')
+        except InputValidationError:
+            caught = True
+        assert caught
+
+    def test_plain_valueerror_not_caught_as_input_validation_error(self):
+        """A plain ValueError is NOT caught as InputValidationError (it's a subclass, not the other way)."""
+        caught_as_input = False
+        try:
+            raise ValueError('plain error')
+        except InputValidationError:
+            caught_as_input = True
+        except ValueError:
+            pass
+        assert not caught_as_input, (
+            'Plain ValueError must not match except InputValidationError — '
+            'InputValidationError is a subclass OF ValueError, not a superclass'
+        )
+
+    def test_empty_message(self):
+        """InputValidationError with no message is still constructable."""
+        exc = InputValidationError()
+        assert isinstance(exc, ValueError)
 
 
 class TestValidateIdentifierHelper:
