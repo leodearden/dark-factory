@@ -4742,7 +4742,7 @@
         "description": "Two documentation/safety issues from review of task 208:\n\n1. In fused-memory/src/fused_memory/reconciliation/stages/base.py (~line 96-97): the guard reads watermark.project_id assuming it's already stripped by the Pydantic field_validator. Add either a defensive `wm_pid = watermark.project_id.strip()` or a comment warning that model_construct() bypasses this normalization.\n\n2. In fused-memory/src/fused_memory/models/reconciliation.py (~line 147-150): the strip_project_id validator silently returns non-string values unchanged. Add a brief inline comment: `# Non-str values pass through; Pydantic enforces the str type constraint afterwards.`",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -4755,7 +4755,8 @@
             "fused-memory/src/fused_memory/reconciliation/stages",
             "fused-memory/src/fused_memory/models"
           ]
-        }
+        },
+        "updatedAt": "2026-03-29T05:08:52.845Z"
       },
       {
         "id": "276",
@@ -5096,7 +5097,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T05:08:52.525Z",
+      "lastModified": "2026-03-29T05:08:52.845Z",
       "taskCount": 270,
       "completedCount": 256,
       "tags": [
