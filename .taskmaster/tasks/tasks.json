@@ -5735,7 +5735,12 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "absorbed_by_task": 308,
+          "duplicate_note": "Near-duplicate of task 308. Task 308 has broader scope covering both ingestion pipeline and reconciliation post-processing. Memory hints from this task absorbed into 308.",
+          "_causation_id": "e0fce9c1-100f-4f35-a062-c2847200f7e6"
+        }
       },
       {
         "id": 312,
