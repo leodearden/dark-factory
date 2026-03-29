@@ -18,7 +18,7 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
-from fused_memory.utils.validation import require_project_root
+from fused_memory.utils.validation import InputValidationError, require_project_root
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +126,7 @@ class TargetedReconciler:
             )
             return result
 
-        except ValueError as e:
+        except InputValidationError as e:
             logger.warning(f'Targeted reconciliation rejected invalid input: {e}')
             with contextlib.suppress(Exception):
                 await self.journal.complete_run(run_id, 'failed')
