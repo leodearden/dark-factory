@@ -6,6 +6,23 @@ from .test_helpers import _get_opening_tag
 
 _SECTIONS = ('orchestrators', 'performance', 'memory', 'memory-graphs', 'recon')
 
+# Character class used to capture data-section and data-updated-for attribute values.
+_SECTION_NAME_RE = r'[a-z][a-z-]*'
+
+
+class TestSectionNameRegex:
+    """Unit tests for the _SECTION_NAME_RE constant."""
+
+    def test_captures_hyphenated_names(self):
+        """Baseline: the regex must match hyphenated pure-alpha names."""
+        assert re.fullmatch(_SECTION_NAME_RE, 'memory-graphs') is not None
+        assert re.fullmatch(_SECTION_NAME_RE, 'recon') is not None
+        assert re.fullmatch(_SECTION_NAME_RE, 'orchestrators') is not None
+
+    def test_captures_digit_containing_names(self):
+        """Regression: the regex must match names that contain digits (e.g. 'v2-panel')."""
+        assert re.fullmatch(_SECTION_NAME_RE, 'v2-panel') is not None
+
 
 class TestRouteHealth:
     """Sentinel tests: assert HTTP 200 on the two routes exercised throughout this file."""
