@@ -633,3 +633,33 @@ class TestProjectIdNormalizationIntegration:
             'started_at': '2024-01-01T00:00:00Z',
         })
         assert wm.project_id == evt.project_id == run.project_id == self.EXPECTED
+
+
+# ---------------------------------------------------------------------------
+# Step 9: _normalize_project_id non-string passthrough contract
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeProjectIdPassthrough:
+    """_normalize_project_id passes non-str values through unchanged.
+
+    Pydantic enforces the ``str`` type constraint after field_validators run,
+    so the bare ``return v`` branch in _normalize_project_id is intentional —
+    it is NOT a bug.  These tests document that contract.
+    """
+
+    @staticmethod
+    def _normalize(v):
+        from fused_memory.models.reconciliation import _normalize_project_id
+
+        return _normalize_project_id(v)
+
+    def test_integer_passes_through_unchanged(self):
+        assert self._normalize(123) == 123
+
+    def test_none_passes_through_unchanged(self):
+        assert self._normalize(None) is None
+
+    def test_list_passes_through_unchanged(self):
+        result = self._normalize(['x'])
+        assert result == ['x']
