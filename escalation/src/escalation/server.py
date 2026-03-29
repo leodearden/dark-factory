@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
@@ -27,7 +29,10 @@ CATEGORIES = [
 ]
 
 
-def create_server(queue: EscalationQueue) -> FastMCP:
+def create_server(
+    queue: EscalationQueue,
+    merge_queue: asyncio.Queue | None = None,
+) -> FastMCP:
     """Create the escalation MCP server with all tools registered."""
     mcp = FastMCP('escalation')
 
@@ -142,5 +147,45 @@ def create_server(queue: EscalationQueue) -> FastMCP:
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found'}
         return esc.to_dict()
+
+    # --- Merge queue tools ---
+
+    @mcp.tool()
+    async def merge_request(
+        task_id: str,
+        branch: str,
+        worktree: str,
+        description: str = '',
+    ) -> dict[str, Any]:
+        """Submit a merge request to the orchestrator merge queue.
+
+        Use this instead of directly merging into main.  The merge worker
+        handles verification, conflict detection, and atomic ref advancement.
+        Returns the merge outcome (done, conflict, blocked, already_merged).
+        """
+        if merge_queue is None:
+            return {'error': 'Merge queue not available — orchestrator not running'}
+
+        from orchestrator.merge_queue import MergeOutcome, MergeRequest
+        from orchestrator.config import OrchestratorConfig
+
+        future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        await merge_queue.put(MergeRequest(
+            task_id=task_id,
+            branch=branch,
+            worktree=Path(worktree),
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=OrchestratorConfig(),
+            result=future,
+        ))
+
+        outcome = await future
+        return {
+            'status': outcome.status,
+            'reason': outcome.reason,
+            'conflict_details': outcome.conflict_details,
+        }
 
     return mcp

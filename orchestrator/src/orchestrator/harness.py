@@ -129,6 +129,11 @@ class Harness:
         self._escalation_events: dict[str, asyncio.Event] = {}
         self._escalation_task: asyncio.Task | None = None
 
+        # Merge queue — single worker owns all main-branch advancement
+        self._merge_queue: asyncio.Queue = asyncio.Queue()
+        self._merge_worker: object | None = None  # MergeWorker (lazy import)
+        self._merge_worker_task: asyncio.Task | None = None
+
     async def run(self, prd_path: Path | None = None, dry_run: bool = False) -> HarnessReport:
         """Execute the full orchestration pipeline.
 
@@ -142,6 +147,9 @@ class Harness:
 
         # 1b. Start escalation server
         await self._start_escalation_server()
+
+        # 1b2. Start merge worker
+        await self._start_merge_worker()
 
         try:
             # 1c. Dismiss stale escalations from prior runs (non-fatal)
@@ -313,6 +321,7 @@ class Harness:
                     self.report.paused_for_cap = True
                     self.report.cap_pause_duration_secs = self.usage_gate.total_pause_secs
                 await self.usage_gate.shutdown()
+            await self._stop_merge_worker()
             await self._stop_escalation_server()
             await self.mcp.stop()
 
@@ -648,6 +657,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 usage_gate=self.usage_gate,
                 initial_plan=recovered_plan,
                 steward_factory=steward_factory,
+                merge_queue=self._merge_queue,
             )
             outcome = await workflow.run()
 
@@ -804,6 +814,26 @@ Output JSON matching the schema. Every task must appear in the output.
         except OSError as e:
             logger.warning('Failed to save HarnessReport: %s', e)
 
+    async def _start_merge_worker(self) -> None:
+        """Start the merge queue worker as a background asyncio task."""
+        from orchestrator.merge_queue import MergeWorker
+
+        self._merge_worker = MergeWorker(self.git_ops, self._merge_queue)
+        self._merge_worker_task = asyncio.create_task(
+            self._merge_worker.run(), name='merge-worker',
+        )
+        logger.info('Merge worker started')
+
+    async def _stop_merge_worker(self) -> None:
+        """Stop the merge worker gracefully."""
+        if self._merge_worker_task is not None and self._merge_worker is not None:
+            await self._merge_worker.stop()
+            self._merge_worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._merge_worker_task
+            self._merge_worker_task = None
+            logger.info('Merge worker stopped')
+
     async def _start_escalation_server(self) -> None:
         """Start the escalation MCP server as a background asyncio task."""
         if not HAS_ESCALATION:
@@ -817,7 +847,7 @@ Output JSON matching the schema. Every task must appear in the output.
         self._escalation_queue.set_notify_callback(self._on_escalation)
         self._escalation_queue.set_resolve_callback(self._on_escalation_resolved)
 
-        mcp_server = create_server(self._escalation_queue)  # type: ignore[possibly-undefined]
+        mcp_server = create_server(self._escalation_queue, merge_queue=self._merge_queue)  # type: ignore[possibly-undefined]
         host = self.config.escalation.host
         port = self.config.escalation.port
 

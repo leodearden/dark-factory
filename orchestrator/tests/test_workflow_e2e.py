@@ -367,7 +367,13 @@ def _build_workflow(
     agent_stub: AgentStub,
 ) -> tuple[TaskWorkflow, FakeScheduler]:
     """Wire up a TaskWorkflow with all fakes injected."""
+    from orchestrator.merge_queue import MergeWorker
+
     scheduler = FakeScheduler()
+    merge_queue: asyncio.Queue = asyncio.Queue()
+    worker = MergeWorker(git_ops, merge_queue)
+    # Start merge worker — cleaned up when event loop tears down after test
+    asyncio.create_task(worker.run(), name='test-merge-worker')
     workflow = TaskWorkflow(
         assignment=assignment,
         config=config,
@@ -375,6 +381,7 @@ def _build_workflow(
         scheduler=scheduler,  # type: ignore[arg-type]
         briefing=FakeBriefing(),  # type: ignore[arg-type]
         mcp=FakeMcp(),  # type: ignore[arg-type]
+        merge_queue=merge_queue,
     )
     return workflow, scheduler
 
@@ -1213,9 +1220,14 @@ def _build_workflow_with_escalation(
     tmp_path: Path,
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
     """Wire up a TaskWorkflow with an EscalationQueue attached."""
+    from orchestrator.merge_queue import MergeWorker
+
     scheduler = FakeScheduler()
     queue_dir = tmp_path / 'escalation_queue'
     queue = EscalationQueue(queue_dir)
+    merge_queue: asyncio.Queue = asyncio.Queue()
+    worker = MergeWorker(git_ops, merge_queue)
+    asyncio.create_task(worker.run(), name='test-merge-worker')
     workflow = TaskWorkflow(
         assignment=assignment,
         config=config,
@@ -1224,6 +1236,7 @@ def _build_workflow_with_escalation(
         briefing=FakeBriefing(),  # type: ignore[arg-type]
         mcp=FakeMcp(),  # type: ignore[arg-type]
         escalation_queue=queue,
+        merge_queue=merge_queue,
     )
     return workflow, scheduler, queue
 

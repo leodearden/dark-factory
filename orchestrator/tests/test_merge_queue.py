@@ -1,0 +1,344 @@
+"""Tests for merge queue: MergeWorker, CAS update-ref, ghost-loop detection."""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_queue import MergeOutcome, MergeRequest, MergeWorker
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    """Create a temporary git repository with an initial commit."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_setup_repo(repo))
+    return repo
+
+
+async def _setup_repo(repo: Path):
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+@pytest.fixture
+def git_config() -> GitConfig:
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+    )
+
+
+@pytest.fixture
+def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
+    return GitOps(git_config, git_repo)
+
+
+@pytest.fixture
+def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
+    return OrchestratorConfig(project_root=git_repo, git=git_config)
+
+
+def _make_request(
+    task_id: str,
+    branch: str,
+    worktree: Path,
+    config: OrchestratorConfig,
+    pre_rebased: bool = False,
+) -> MergeRequest:
+    future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+    return MergeRequest(
+        task_id=task_id,
+        branch=branch,
+        worktree=worktree,
+        pre_rebased=pre_rebased,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=future,
+    )
+
+
+def _mock_verify_pass():
+    """Return a mock that makes run_scoped_verification always pass."""
+    mock = AsyncMock()
+    mock.return_value.passed = True
+    mock.return_value.summary = ''
+    return mock
+
+
+# ---------------------------------------------------------------------------
+# TestCasUpdateRef — Phase A
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCasUpdateRef:
+    async def test_advance_main_with_expected(self, git_ops: GitOps):
+        """CAS succeeds when expected_main matches actual main."""
+        worktree, _ = await git_ops.create_worktree('cas-ok')
+        (worktree / 'file.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add file')
+
+        result = await git_ops.merge_to_main(worktree, 'cas-ok')
+        assert result.success
+        assert result.merge_worktree is not None
+
+        main_sha = await git_ops.get_main_sha()
+        advanced = await git_ops.advance_main(
+            result.merge_commit,
+            expected_main=main_sha,
+        )
+        assert advanced
+
+        await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+    async def test_advance_main_cas_mismatch(self, git_ops: GitOps):
+        """CAS fails when expected_main is stale (external actor moved main)."""
+        worktree, _ = await git_ops.create_worktree('cas-fail')
+        (worktree / 'file.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add file')
+
+        result = await git_ops.merge_to_main(worktree, 'cas-fail')
+        assert result.success
+        assert result.merge_worktree is not None
+
+        # Simulate external actor advancing main
+        stale_sha = await git_ops.get_main_sha()
+        (git_ops.project_root / 'external.py').write_text('ext = True\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'External commit'], cwd=git_ops.project_root)
+
+        # CAS should fail — expected_main is stale
+        advanced = await git_ops.advance_main(
+            result.merge_commit,
+            expected_main=stale_sha,
+        )
+        assert not advanced
+
+        await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+    async def test_advance_main_none_expected(self, git_ops: GitOps):
+        """Backward compat: no expected_main → unconditional update-ref."""
+        worktree, _ = await git_ops.create_worktree('cas-none')
+        (worktree / 'file.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add file')
+
+        result = await git_ops.merge_to_main(worktree, 'cas-none')
+        assert result.success
+
+        # No expected_main — should work as before
+        advanced = await git_ops.advance_main(result.merge_commit)
+        assert advanced
+
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+
+# ---------------------------------------------------------------------------
+# TestMergeWorker — Phase B
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeWorker:
+    async def test_basic_merge_through_queue(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Submit a merge request → worker merges → file appears on main."""
+        worktree, _ = await git_ops.create_worktree('queue-basic')
+        (worktree / 'queued.py').write_text('queued = True\n')
+        await git_ops.commit(worktree, 'Add queued file')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req = _make_request('1', 'queue-basic', worktree, config)
+            await queue.put(req)
+            result = await asyncio.wait_for(req.result, timeout=30)
+
+        assert result.status == 'done'
+
+        # Verify file is on main
+        _, content, _ = await _run(
+            ['git', 'show', 'main:queued.py'], cwd=git_ops.project_root,
+        )
+        assert 'queued = True' in content
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_already_merged_returns_done(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Branch that's already on main returns already_merged."""
+        worktree, _ = await git_ops.create_worktree('already-merged')
+        (worktree / 'merged.py').write_text('merged = True\n')
+        await git_ops.commit(worktree, 'Add merged file')
+
+        # Merge manually first
+        result = await git_ops.merge_to_main(worktree, 'already-merged')
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # Now submit to queue — should detect already merged
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        req = _make_request('2', 'already-merged', worktree, config)
+        await queue.put(req)
+
+        outcome = await asyncio.wait_for(req.result, timeout=10)
+        assert outcome.status == 'already_merged'
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_conflict_returns_conflict(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Conflicting branch returns conflict status."""
+        # Create worktree FIRST (from current main)
+        worktree, _ = await git_ops.create_worktree('conflict-task')
+
+        # THEN advance main with conflicting change to same file
+        (git_ops.project_root / 'README.md').write_text('# Main version\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main change'],
+            cwd=git_ops.project_root,
+        )
+
+        # Now modify same file in worktree (divergent history)
+        (worktree / 'README.md').write_text('# Task version\n')
+        await git_ops.commit(worktree, 'Task change')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        req = _make_request('3', 'conflict-task', worktree, config)
+        await queue.put(req)
+
+        outcome = await asyncio.wait_for(req.result, timeout=10)
+        assert outcome.status == 'conflict'
+        assert outcome.conflict_details  # non-empty
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_cas_failure_reenqueues_at_front(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """CAS failure → re-enqueue at front → succeeds on retry."""
+        worktree, _ = await git_ops.create_worktree('cas-retry')
+        (worktree / 'retry.py').write_text('retry = True\n')
+        await git_ops.commit(worktree, 'Add retry file')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # Monkey-patch advance_main to fail once, then succeed
+        original = git_ops.advance_main
+        call_count = 0
+
+        async def _fail_then_succeed(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return False  # simulate CAS failure
+            return await original(*args, **kwargs)
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_fail_then_succeed),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('4', 'cas-retry', worktree, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done'
+        assert call_count == 2  # failed once, succeeded on retry
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_graceful_shutdown_drains(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """stop() resolves all pending futures as blocked."""
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+
+        # Don't start worker yet — put items in queue, then stop
+        worktree, _ = await git_ops.create_worktree('shutdown')
+        req = _make_request('5', 'shutdown', worktree, config)
+        await queue.put(req)
+
+        # stop() should drain the queue and resolve the future
+        await worker.stop()
+
+        assert req.result.done()
+        outcome = req.result.result()
+        assert outcome.status == 'blocked'
+        assert 'shutting down' in outcome.reason.lower()
+
+    async def test_verify_failure_returns_blocked(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Post-merge verification failure → blocked."""
+        worktree, _ = await git_ops.create_worktree('verify-fail')
+        (worktree / 'bad.py').write_text('bad = True\n')
+        await git_ops.commit(worktree, 'Add bad file')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # Mock verification to fail
+        mock_verify = AsyncMock()
+        mock_verify.return_value.passed = False
+        mock_verify.return_value.summary = 'tests failed'
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', mock_verify):
+            req = _make_request('6', 'verify-fail', worktree, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked'
+        assert 'verification failed' in outcome.reason.lower()
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task

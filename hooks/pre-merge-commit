@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Pre-merge-commit hook: block direct merges into main.
+#
+# All merges to main should go through the merge queue (MergeWorker in
+# merge_queue.py).  The worker uses update-ref which bypasses all hooks,
+# so this hook does NOT affect the normal orchestrator merge path.
+#
+# Allowed:
+#   - Merges on non-main branches (rebasing, etc.)
+#   - Merges in _merge-* worktrees (the worker's temp merge worktrees)
+#   - Emergency bypass with --no-verify
+#
+# Why: At 64 max concurrency with external actors (steward, L1 watcher,
+# manual work) regularly advancing main, direct merges cause ghost loops,
+# lock starvation, and branch drift.  See task 292 for design rationale.
+
+current_branch="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$current_branch" != "main" ]; then
+    exit 0
+fi
+
+# Allow merges in orchestrator merge worktrees (_merge-<uuid>)
+worktree_name="$(basename "$(pwd)")"
+if [[ "$worktree_name" == _merge-* ]]; then
+    exit 0
+fi
+
+echo ""
+echo "================================================================="
+echo "  pre-merge-commit: BLOCKED -- direct merge into main"
+echo "================================================================="
+echo ""
+echo "  Use the merge queue instead:"
+echo "    Orchestrator tasks:  automatic (merge phase enqueues)"
+echo "    Steward / L1:        mcp__escalation__merge_request tool"
+echo "    Emergency bypass:    git merge --no-verify"
+echo ""
+exit 1

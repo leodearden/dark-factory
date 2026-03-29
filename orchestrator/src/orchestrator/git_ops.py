@@ -163,40 +163,9 @@ class GitOps:
         self.config = config
         self.project_root = project_root
         self.worktree_base = (project_root / config.worktree_dir).resolve()
-        # ── MERGE QUEUE REDESIGN (blocked — see fused-memory task) ─────
-        #
-        # This lock is the sole serialization point for merges to main.
-        # At 64 max concurrency (20+ tasks in practice) with external
-        # actors (steward, L1 watcher, manual work) regularly advancing
-        # main, it causes three production failure modes:
-        #
-        #   1. Ghost loops — already-merged code retries infinitely
-        #      (task 591: 12 iterations, 18 plan steps)
-        #   2. Lock starvation — MERGER agent holds lock for minutes,
-        #      other merges pile up, advance_main exhausts retries
-        #      (tasks 485, 564: 3+ merge failures each)
-        #   3. Branch drift — long-lived branches accumulate commits
-        #      that conflict with now-merged originals on main
-        #
-        # Replacement design: MergeQueue + MergeWorker
-        #   - asyncio.Queue + single worker coroutine owns main advancement
-        #   - CAS update-ref: git update-ref refs/heads/main <new> <old>
-        #   - Already-merged detection: is_ancestor(branch, main) → skip
-        #   - Conflicts rejected immediately, resolved outside queue
-        #   - Front-of-queue re-enqueue on CAS failure
-        #   - Escalation MCP merge_request tool (steward/L1 submit to queue)
-        #   - pre-merge-commit hook blocks direct merges to main
-        #   - Future phase: speculative 2-step pipeline (depth 1)
-        #
-        # Key files: merge_queue.py (new), workflow.py:288-327,
-        #   git_ops.py:598 (CAS), harness.py (lifecycle),
-        #   escalation/server.py (MCP tool), hooks/pre-merge-commit (new)
-        #
-        # Unblock condition: dedicated implementation session with
-        # test coverage for CAS, ghost loop, conflict-outside-queue,
-        # and external-actor scenarios.
-        # ─────────────────────────────────────────────────────────────
-        self._merge_lock = asyncio.Lock()
+        # Merge serialization is handled by MergeWorker in merge_queue.py.
+        # See task 292 for design rationale (ghost loops, lock starvation,
+        # branch drift at 64 max concurrency with external actors).
 
     async def create_worktree(self, branch_name: str) -> tuple[Path, str]:
         """Create a git worktree for a task branch, based off main.
@@ -381,7 +350,7 @@ class GitOps:
         after verification and :meth:`cleanup_merge_worktree` when done.
 
         Never touches ``project_root``'s working tree or index.
-        Caller must hold ``_merge_lock``.
+        Called by the MergeWorker (serialized via the merge queue).
         """
         full_branch = f'{self.config.branch_prefix}{branch}'
         merge_wt: Path | None = None
@@ -548,6 +517,7 @@ class GitOps:
         merge_worktree: Path | None = None,
         branch: str | None = None,
         max_attempts: int = 3,
+        expected_main: str | None = None,
     ) -> bool:
         """Advance main branch ref to *merge_sha* atomically.
 
@@ -558,6 +528,12 @@ class GitOps:
         When *branch* is provided and a rebase fails, the method will abort
         the rebase, reset to current main, and re-merge *branch* before
         retrying.  Up to *max_attempts* rounds are attempted.
+
+        When *expected_main* is provided, the final ``update-ref`` uses a
+        compare-and-swap: ``git update-ref refs/heads/main <new> <old>``.
+        If main has moved (external actor), update-ref fails atomically
+        and this method returns False.  Callers (e.g. the merge queue
+        worker) can re-enqueue on CAS failure.
 
         IMPORTANT: This method is the LAST checkpoint before code reaches
         main.  update-ref bypasses ALL git hooks (including pre-commit),
@@ -653,14 +629,21 @@ class GitOps:
             )
             return False
 
-        # All checks passed — advance the ref
-        rc, _, err = await _run(
-            ['git', 'update-ref',
-             f'refs/heads/{self.config.main_branch}', merge_sha],
-            cwd=self.project_root,
-        )
+        # All checks passed — advance the ref (CAS when expected_main provided)
+        update_cmd = [
+            'git', 'update-ref',
+            f'refs/heads/{self.config.main_branch}', merge_sha,
+        ]
+        if expected_main is not None:
+            update_cmd.append(expected_main)
+        rc, _, err = await _run(update_cmd, cwd=self.project_root)
         if rc != 0:
-            logger.error(f'update-ref failed: {err}')
+            if expected_main is not None:
+                logger.warning(
+                    f'CAS update-ref failed (expected {expected_main[:8]}): {err}'
+                )
+            else:
+                logger.error(f'update-ref failed: {err}')
             return False
 
         logger.info(f'Advanced {self.config.main_branch} to {merge_sha[:8]}')

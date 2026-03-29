@@ -400,6 +400,7 @@ Use this accumulated context when handling new escalations.
         'mcp__escalation__resolve_issue',
         'mcp__escalation__get_escalation',
         'mcp__escalation__get_pending_escalations',
+        'mcp__escalation__merge_request',
         *_STEWARD_MEMORY_TOOLS,
     ],
     default_model='opus',
