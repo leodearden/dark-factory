@@ -7,6 +7,18 @@ from .test_helpers import _get_opening_tag
 _SECTIONS = ('orchestrators', 'performance', 'memory', 'memory-graphs', 'recon')
 
 
+class TestRouteHealth:
+    """Sentinel tests: assert HTTP 200 on the two routes exercised throughout this file."""
+
+    def test_homepage_returns_200(self, client):
+        resp = client.get('/')
+        assert resp.status_code == 200
+
+    def test_css_route_returns_200(self, client):
+        resp = client.get('/static/tailwind.css')
+        assert resp.status_code == 200
+
+
 class TestSectionDataAttributes:
     """Tests that each polling section has a data-section attribute."""
 
