@@ -2915,7 +2915,17 @@
           ],
           "modules": [
             "dashboard/src/dashboard/templates"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "Idiomorph",
+              "Alpine.js"
+            ],
+            "queries": [
+              "Alpine state HTMX morph preservation Idiomorph",
+              "htmx:afterSettle fix pattern Chart.js Idiomorph"
+            ]
+          }
         }
       },
       {
