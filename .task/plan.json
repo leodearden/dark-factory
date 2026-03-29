@@ -39,8 +39,8 @@
       "id": "step-4",
       "type": "impl",
       "description": "In performance.html, add the guard `var ds = ctx.chart.data.datasets[0]; if (!ds) return '';` in the datalabels formatter (line 168) and tooltip label callback (line 177). Replace `ctx.chart.data.datasets[0].data.reduce(...)` with `ds.data.reduce(...)` in both locations.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "e79e4a84"
     }
   ],
   "design_decisions": [
