@@ -29,6 +29,28 @@ SECTION_TIMEOUTS = (
 )
 
 
+def _get_section_window(
+    html: str,
+    partial_url: str,
+    *,
+    # before=200: captures the <section> tag and data-section attribute that precede hx-get
+    # after=500: captures hx-trigger, hx-swap, hx-request (with timeout JSON), and aria-live
+    # that follow hx-get in the polling_section macro attribute order:
+    # data-section → hx-get → hx-trigger → hx-swap → hx-request → aria-live
+    before: int = 200,
+    after: int = 500,
+) -> str:
+    """Return an HTML substring window centred on hx-get="<partial_url>".
+
+    Raises AssertionError (not ValueError) if the URL is not found, giving a
+    clear diagnostic message rather than a bare traceback from str.index().
+    """
+    hx_get = f'hx-get="{partial_url}"'
+    idx = html.find(hx_get)
+    assert idx != -1, f'hx-get for {partial_url} not found in HTML'
+    return html[max(0, idx - before):idx + after]
+
+
 class TestGetSectionWindow:
     """Tests for the _get_section_window helper function."""
 
