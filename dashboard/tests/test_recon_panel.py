@@ -175,6 +175,16 @@ class TestFormatDuration:
 
         assert format_duration('not_a_number') == '-'
 
+    def test_infinity_returns_dash(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(float('inf')) == '-'
+
+    def test_sub_second_positive_rounds_up(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(0.7) == '1s'
+
 
 # --- Mock data for route tests ---
 
@@ -390,6 +400,22 @@ class TestReconRoute:
             html = client.get('/partials/recon').text
         assert '<h2' in html
         assert 'Reconciliation' in html
+
+    def test_large_age_displays_yellow_color(self, client):
+        with _patch_recon_data(buffer_stats={'buffered_count': 3, 'oldest_event_age_seconds': 600.0}):
+            html = client.get('/partials/recon').text
+        assert 'text-yellow-400' in html
+
+    def test_exactly_300s_age_displays_gray_color(self, client):
+        with _patch_recon_data(buffer_stats={'buffered_count': 1, 'oldest_event_age_seconds': 300.0}):
+            html = client.get('/partials/recon').text
+        assert 'text-gray-400' in html
+        assert 'text-yellow-400' not in html
+
+    def test_301s_age_displays_yellow_color(self, client):
+        with _patch_recon_data(buffer_stats={'buffered_count': 1, 'oldest_event_age_seconds': 301.0}):
+            html = client.get('/partials/recon').text
+        assert 'text-yellow-400' in html
 
 
 # --- Empty data constants ---
