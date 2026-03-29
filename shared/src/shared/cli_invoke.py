@@ -224,7 +224,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     subtype = data.get('subtype', '')
     structured = data.get('structured_output')
 
-    usage = data.get('usage', {})
+    usage = data.get('usage') or {}
     input_tokens = usage.get('input_tokens')
     output_tokens = usage.get('output_tokens')
     cache_read_tokens = usage.get('cache_read_input_tokens')
