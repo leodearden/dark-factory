@@ -18,6 +18,28 @@ import re
 _SAFE_IDENTIFIER_PATTERN = re.compile(r'[a-zA-Z0-9_-]+')
 
 
+def _validate_identifier(value: str, field_name: str) -> dict[str, str] | None:
+    """Shared private helper: validate a single identifier against the safe allowlist.
+
+    Returns an error dict if value is empty/whitespace or contains unsafe characters,
+    else returns None.
+    """
+    if not value or not value.strip():
+        return {
+            'error': f'{field_name} is required and must be non-empty',
+            'error_type': 'ValidationError',
+        }
+    if not _SAFE_IDENTIFIER_PATTERN.fullmatch(value):
+        return {
+            'error': (
+                f'{field_name} contains invalid characters: {value!r}. '
+                'Only ASCII letters, digits, hyphens, and underscores are allowed.'
+            ),
+            'error_type': 'ValidationError',
+        }
+    return None
+
+
 def validate_project_root(project_root: str) -> dict[str, str] | None:
     """Return an error dict if project_root is not a non-empty absolute path, else None."""
     if not project_root or not os.path.isabs(project_root):
