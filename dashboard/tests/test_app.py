@@ -686,10 +686,7 @@ class TestHtmxTimeout:
     @pytest.mark.parametrize('partial_url,timeout_ms', SECTION_TIMEOUTS)
     def test_section_has_correct_timeout(self, client, partial_url, timeout_ms):
         html = client.get('/').text
-        hx_get = f'hx-get="{partial_url}"'
-        idx = html.find(hx_get)
-        assert idx != -1, f'hx-get for {partial_url} not found in HTML'
-        section_html = html[idx - 200:idx + 500]
+        section_html = _get_section_window(html, partial_url)
         assert (
             f'"timeout": {timeout_ms}' in section_html
             or f'"timeout":{timeout_ms}' in section_html
