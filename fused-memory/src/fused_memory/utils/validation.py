@@ -69,7 +69,7 @@ def validate_project_root(project_root: str) -> dict[str, str] | None:
     """Return an error dict if project_root is not a non-empty absolute path, else None."""
     if not project_root or not os.path.isabs(project_root):
         return {
-            'error': f'project_root must be a non-empty absolute path, got: {project_root!r}',
+            'error': f'project_root must be a non-empty absolute path, got: {_safe_repr(project_root)}',
             'error_type': 'ValidationError',
         }
     return None
