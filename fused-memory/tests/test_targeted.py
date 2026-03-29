@@ -500,13 +500,12 @@ async def test_validation_error_emits_warning_log(reconciler, caplog):
     The warning must contain 'rejected invalid input' so operators can grep for it.
     """
     import logging
-    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.targeted'):
-        with pytest.raises(ValueError):
-            await reconciler.reconcile_task(
-                task_id='1', transition='done', project_id='test-project',
-                project_root='',  # invalid — triggers InputValidationError
-                task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
-            )
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.targeted'), pytest.raises(ValueError):
+        await reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='',  # invalid — triggers InputValidationError
+            task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
+        )
 
     warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
     assert any('rejected invalid input' in msg for msg in warning_messages), (
@@ -556,8 +555,6 @@ async def test_journal_failure_does_not_mask_validation_error(
     RuntimeError raised inside ``except ValueError`` propagates instead of the original error.
     Wrapping journal.complete_run in contextlib.suppress must prevent this masking.
     """
-    from unittest.mock import patch, AsyncMock as AM
-
     r = TargetedReconciler(
         mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
     )
