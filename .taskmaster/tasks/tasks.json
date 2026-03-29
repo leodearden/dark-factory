@@ -5006,7 +5006,7 @@
         "description": "dashboard/tests/test_recon_panel.py layout tests from task 183 have weak assertions:\n\n1. test_right_column_card_has_h_full asserts bare 'h-full' in full HTML — use 'flex flex-col h-full' for specificity\n2. test_thead_row_has_whitespace_nowrap asserts bare 'whitespace-nowrap' — use 'border-b border-gray-700 whitespace-nowrap'\n3. Missing absence assertions: 'min-h-[400px]' and 'lg:relative' were removed but not tested for absence\n4. TestReconRightColumnLayout fetches identical HTML 3 times — consolidate to one fetch via fixture",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -5018,7 +5018,7 @@
             "dashboard/tests"
           ]
         },
-        "updatedAt": "2026-03-29T01:35:17.437Z"
+        "updatedAt": "2026-03-29T05:06:52.872Z"
       },
       {
         "id": "288",
@@ -5096,9 +5096,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-29T05:04:34.477Z",
+      "lastModified": "2026-03-29T05:06:52.872Z",
       "taskCount": 270,
-      "completedCount": 254,
+      "completedCount": 255,
       "tags": [
         "master"
       ]
