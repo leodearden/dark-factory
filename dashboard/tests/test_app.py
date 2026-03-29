@@ -763,10 +763,7 @@ class TestAriaLivePollingsections:
     @pytest.mark.parametrize('partial_url', PARTIAL_URLS)
     def test_section_has_aria_live_polite(self, client, partial_url):
         html = client.get('/').text
-        hx_get = f'hx-get="{partial_url}"'
-        idx = html.find(hx_get)
-        assert idx != -1, f'hx-get for {partial_url} not found in HTML'
-        section_html = html[idx - 100:idx + 300]
+        section_html = _get_section_window(html, partial_url)
         assert 'aria-live="polite"' in section_html, (
             f'aria-live="polite" not found near {partial_url}'
         )
