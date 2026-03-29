@@ -487,3 +487,38 @@ async def test_reconcile_task_validation_error_leaves_journal_trace(reconciler, 
     runs = await journal.get_recent_runs('test-project', limit=1)
     assert len(runs) == 1, 'Expected exactly one journal run for the failed call'
     assert runs[0].status == 'failed', f'Expected status=failed, got {runs[0].status!r}'
+
+
+# ── Exception masking safety tests (task-290) ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_journal_failure_does_not_mask_validation_error(
+    mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+):
+    """If journal.complete_run raises RuntimeError, the original InputValidationError propagates.
+
+    Python does NOT retry except-clauses for exceptions raised inside a handler, so a
+    RuntimeError raised inside ``except ValueError`` propagates instead of the original error.
+    Wrapping journal.complete_run in contextlib.suppress must prevent this masking.
+    """
+    from unittest.mock import patch, AsyncMock as AM
+
+    r = TargetedReconciler(
+        mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+    )
+    r.verifier = AsyncMock()
+
+    # Patch the journal on the reconciler instance to blow up on complete_run
+    r.journal = AsyncMock()
+    r.journal.start_run = AsyncMock()
+    r.journal.complete_run = AsyncMock(side_effect=RuntimeError('DB down'))
+    r.journal.add_run_action = AsyncMock()
+
+    # Should raise ValueError (or InputValidationError), NOT RuntimeError
+    with pytest.raises(ValueError):
+        await r.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='',  # invalid — triggers InputValidationError
+            task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
+        )
