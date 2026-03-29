@@ -852,3 +852,20 @@ class TestNavBar:
         """Nav links must use dark-theme text colors (text-gray-400 or similar)."""
         html = client.get('/').text
         assert 'text-gray-400' in html
+
+    def test_costs_route_returns_200(self, client):
+        """GET /costs must return a valid 200 response."""
+        resp = client.get('/costs')
+        assert resp.status_code == 200
+
+    def test_costs_page_extends_base(self, client):
+        """The /costs page must include the nav bar from base.html."""
+        html = client.get('/costs').text
+        assert '<nav' in html
+        assert 'href="/"' in html
+
+    def test_costs_link_active_on_costs_page(self, client):
+        """Costs link must have active styling when on /costs."""
+        html = client.get('/costs').text
+        # The active border class should appear near the Costs link
+        assert 'border-blue-500' in html
