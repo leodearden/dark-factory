@@ -93,7 +93,10 @@ class BaseStage:
         require_run_id(run_id)
 
         # Validate watermark.project_id consistency (skip if watermark has no project_id)
-        wm_pid = watermark.project_id
+        # Defensive strip: model_construct() bypasses the Pydantic field_validator that
+        # normally normalizes this.  The `or ''` coerces None (and PydanticUndefined,
+        # also falsy) to empty string so .strip() is always called on a str.
+        wm_pid = (watermark.project_id or '').strip()
         if wm_pid:
             if wm_pid != self.project_id:
                 raise ValueError(

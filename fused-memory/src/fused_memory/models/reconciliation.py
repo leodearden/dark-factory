@@ -149,7 +149,7 @@ def _normalize_project_id(v: object, *, allow_empty: bool = False) -> object:
         if not stripped and not allow_empty:
             raise ValueError('project_id is required and must be non-empty')
         return stripped
-    return v
+    return v  # Non-str values pass through; Pydantic enforces the str type constraint afterwards.
 
 
 class Watermark(BaseModel):

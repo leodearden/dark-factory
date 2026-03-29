@@ -517,6 +517,61 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.started_at <= result.completed_at
 
     @pytest.mark.asyncio
+    async def test_run_handles_model_construct_watermark_with_padded_project_id(self, mock_deps):
+        """model_construct() bypasses the Pydantic field_validator, so watermark.project_id
+        may carry un-stripped whitespace.  BaseStage.run() must not raise a mismatch error
+        in this situation."""
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        # Build a Watermark that bypasses the field_validator — project_id is NOT stripped.
+        padded_watermark = Watermark.model_construct(project_id=' dark_factory ')
+
+        with self._patch_stage(stage):
+            result = await stage.run(
+                events=[],
+                watermark=padded_watermark,
+                prior_reports=[],
+                run_id='test-run-model-construct',
+            )
+        assert isinstance(result, StageReport)
+        assert result.stage == StageId.memory_consolidator
+
+    @pytest.mark.asyncio
+    async def test_run_handles_model_construct_watermark_with_none_project_id(
+        self, mock_deps, caplog
+    ):
+        """model_construct() can produce a Watermark with project_id=None (bypassing
+        validators).  BaseStage.run() must not raise AttributeError when it encounters
+        None — it should treat None the same as an empty project_id and skip the mismatch
+        check with a DEBUG log."""
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        # Build a Watermark that bypasses the field_validator — project_id is None.
+        none_watermark = Watermark.model_construct(project_id=None)
+
+        with self._patch_stage(stage), caplog.at_level(
+            logging.DEBUG, logger='fused_memory.reconciliation.stages.base'
+        ):
+            result = await stage.run(
+                events=[],
+                watermark=none_watermark,
+                prior_reports=[],
+                run_id='test-run-model-construct-none',
+            )
+        assert isinstance(result, StageReport)
+        assert result.stage == StageId.memory_consolidator
+        assert any(
+            ('no project_id' in rec.message.lower() or 'skipping' in rec.message.lower())
+            for rec in caplog.records
+            if rec.name == 'fused_memory.reconciliation.stages.base'
+            and rec.levelno == logging.DEBUG
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         'watermark_pid,run_id',
         [
