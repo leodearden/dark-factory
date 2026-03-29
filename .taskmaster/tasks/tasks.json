@@ -5688,6 +5688,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 312,
+        "title": "Filter or deprioritize invalidated Graphiti edges in search results",
+        "description": "The _search_graphiti method in memory_service.py returns all edges from Graphiti search including those with non-null invalid_at, without filtering or deprioritization. Invalidated edges appear in search results with relevance scores of 0.65-0.85, causing agents to act on superseded facts. Task 93 (done) fixed this for get_entity responses but the search endpoint was not addressed. Fix _search_graphiti to either filter out edges where invalid_at is set, or deprioritize them (e.g., reduce score by 50% and append '[SUPERSEDED]' to content). Filtering is preferred for search since unlike get_entity, search callers rarely need historical context.",
+        "details": "## Problem\n`_search_graphiti` in fused-memory/src/fused_memory/services/memory_service.py (line ~734) returns all Graphiti edges without checking `invalid_at`. Agents using `search()` can silently receive stale facts with high relevance scores.\n\n## Confirmed evidence\nStage 1 reconciliation (run eaf99cc7) identified this as a systemic pattern: invalidated edges with scores 0.65-0.85 appearing in search results across multiple entity queries.\n\n## Implementation\nIn `_search_graphiti` (memory_service.py ~line 744), after getting `invalid_at`:\n- Option A (preferred): Skip edges where `invalid_at is not None` — don't add to results list\n- Option B: Keep but halve the score and prepend '[SUPERSEDED]' to content\n\nIf Option A, consider fetching `limit * 1.5` from Graphiti to compensate for filtered results, then truncate to `limit`.\n\n## Files\n- fused-memory/src/fused_memory/services/memory_service.py (primary)\n\n## Memory hints\n- entity: \"fused-memory MCP server\" — architecture context\n- search: \"task 93 get_entity invalidated edge filtering\" — prior art\n- search: \"Graphiti edge invalid_at temporal facts\" — related edges",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -5700,7 +5711,7 @@
       ],
       "created": "2026-03-29T13:24:36.606Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-29T13:24:48.825Z"
+      "updated": "2026-03-29T13:49:31.821Z"
     }
   }
 }
