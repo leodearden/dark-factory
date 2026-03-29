@@ -788,3 +788,66 @@ class TestRequireFunctionsTruncation:
         big_root = 'b' * (1024 * 1024)
         with pytest.raises(InputValidationError):
             require_project_root(big_root)
+
+
+class TestNormalLengthInputsDiagnosticQuality:
+    """Normal-length invalid inputs still carry full repr value — truncation must not activate."""
+
+    def test_validate_project_id_short_invalid_contains_full_repr(self):
+        """A short invalid project_id embeds its full repr in the error message.
+
+        Regression guard: truncation must only activate on oversized inputs.
+        A 7-char string with a backtick must still appear in full in the error message
+        so operators can diagnose exactly what was received.
+        """
+        bad_id = 'proj`id'
+        result = validate_project_id(bad_id)
+        assert result is not None
+        assert repr(bad_id) in result['error'], (
+            f'Short invalid value repr must appear untruncated in error message; '
+            f'got: {result["error"]!r}'
+        )
+        assert '...(truncated)' not in result['error']
+
+    def test_validate_run_id_short_invalid_contains_full_repr(self):
+        """A short invalid run_id embeds its full repr in the error message."""
+        bad_run = 'run\nid'
+        result = validate_run_id(bad_run)
+        assert result is not None
+        assert repr(bad_run) in result['error']
+        assert '...(truncated)' not in result['error']
+
+    def test_validate_project_root_short_relative_path_contains_full_repr(self):
+        """A short relative path embeds its full repr in the validate_project_root error message."""
+        rel_path = 'relative/path'
+        result = validate_project_root(rel_path)
+        assert result is not None
+        assert repr(rel_path) in result['error'], (
+            f'Short relative path repr must appear untruncated in error message; '
+            f'got: {result["error"]!r}'
+        )
+        assert '...(truncated)' not in result['error']
+
+    def test_validate_project_id_199_char_invalid_not_truncated(self):
+        """An invalid value whose repr is exactly 199 chars is not truncated.
+
+        repr of 197 ASCII chars = 199 chars (less than default max_len=200).
+        """
+        # 197 plain ASCII chars + a backtick to make it invalid; repr = 'xxx...`' (199 chars incl. quotes)
+        value = 'x' * 96 + '`' + 'y' * 100  # 198 chars total, repr = 200 chars
+        r = repr(value)
+        # We want repr length strictly < 200 to be safe from edge cases; use shorter value
+        value_short = 'x' * 50 + '`' + 'y' * 50  # 102 chars, repr = 104 chars
+        result = validate_project_id(value_short)
+        assert result is not None
+        assert '...(truncated)' not in result['error']
+        assert repr(value_short) in result['error']
+
+    def test_require_project_id_short_invalid_raises_with_full_repr(self):
+        """require_project_id exception message contains the full repr for short inputs."""
+        bad_id = 'bad;input'
+        with pytest.raises(InputValidationError) as exc_info:
+            require_project_id(bad_id)
+        msg = str(exc_info.value)
+        assert repr(bad_id) in msg
+        assert '...(truncated)' not in msg
