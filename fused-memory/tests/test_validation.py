@@ -4,6 +4,7 @@ import pytest
 
 from fused_memory.utils.validation import (
     InputValidationError,
+    _safe_repr,
     _validate_identifier,
     require_project_id,
     require_project_root,
@@ -565,6 +566,83 @@ class TestValidateIdentifierDelegation:
     def test_validate_run_id_matches_helper_acceptance(self):
         good = '550e8400-e29b-41d4-a716-446655440000'
         assert validate_run_id(good) == _validate_identifier(good, 'run_id')
+
+
+class TestSafeRepr:
+    """_safe_repr(value, max_len) — truncates repr() output to max_len characters."""
+
+    def test_short_string_returns_full_repr_unchanged(self):
+        """A string whose repr is shorter than max_len is returned as-is."""
+        result = _safe_repr('hello', max_len=200)
+        assert result == repr('hello')
+
+    def test_empty_string_returns_full_repr(self):
+        """Empty string repr is two quote chars — well within any reasonable limit."""
+        result = _safe_repr('', max_len=200)
+        assert result == repr('')
+
+    def test_string_at_exact_limit_is_not_truncated(self):
+        """When repr length equals max_len exactly, no truncation occurs."""
+        # Build a string whose repr is exactly max_len chars.
+        # repr of a plain ASCII string of n chars is n+2 (two quote chars).
+        max_len = 20
+        # 'x' * 18 -> repr is "'xxxxxxxxxxxxxxxxxx'" = 20 chars
+        value = 'x' * (max_len - 2)
+        r = repr(value)
+        assert len(r) == max_len, 'Test setup error: repr length must equal max_len'
+        result = _safe_repr(value, max_len=max_len)
+        assert result == r
+        assert '...(truncated)' not in result
+
+    def test_string_exceeding_limit_is_truncated(self):
+        """A string whose repr exceeds max_len is sliced and '...(truncated)' appended."""
+        max_len = 20
+        value = 'a' * 100  # repr is 102 chars, well over 20
+        result = _safe_repr(value, max_len=max_len)
+        assert result.endswith('...(truncated)')
+        # The non-marker portion must be exactly max_len characters.
+        prefix = result[: -len('...(truncated)')]
+        assert len(prefix) == max_len
+
+    def test_truncated_prefix_matches_repr_slice(self):
+        """The prefix before the truncation marker must match repr(value)[:max_len]."""
+        max_len = 30
+        value = 'b' * 200
+        result = _safe_repr(value, max_len=max_len)
+        expected_prefix = repr(value)[:max_len]
+        assert result == expected_prefix + '...(truncated)'
+
+    def test_non_ascii_chars_repr_expansion_handled(self):
+        """Non-ASCII chars expand in repr(); truncation is applied after expansion."""
+        # Each non-ASCII byte may expand to \\xNN (4 chars) in repr.
+        # A 60-char string of non-ASCII may have repr of 242 chars (60*4 + 2 quotes).
+        value = '\xff' * 60  # each char -> \\xff (4 chars) in repr
+        max_len = 50
+        result = _safe_repr(value, max_len=max_len)
+        assert result.endswith('...(truncated)')
+        prefix = result[: -len('...(truncated)')]
+        assert len(prefix) == max_len
+
+    def test_control_chars_repr_expansion_handled(self):
+        """Control chars like \\n expand in repr(); truncation is applied after."""
+        value = '\n' * 100  # each -> \\n (2 chars) in repr
+        max_len = 40
+        result = _safe_repr(value, max_len=max_len)
+        assert result.endswith('...(truncated)')
+
+    def test_default_max_len_is_200(self):
+        """Default max_len is 200: a 201-char repr triggers truncation without explicit arg."""
+        # repr of n ASCII chars = n+2; need n+2 > 200 -> n >= 199
+        value = 'z' * 199  # repr = 201 chars
+        result = _safe_repr(value)
+        assert result.endswith('...(truncated)')
+
+    def test_default_max_len_is_200_no_truncation_for_199(self):
+        """repr of 198 ASCII chars = 200 chars: must NOT be truncated with default max_len."""
+        value = 'z' * 198  # repr = 200 chars == max_len, no truncation
+        result = _safe_repr(value)
+        assert '...(truncated)' not in result
+        assert result == repr(value)
 
 
 class TestValidatorErrorDictShape:
