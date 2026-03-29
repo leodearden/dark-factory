@@ -240,27 +240,16 @@ class TestGetWatermarks:
 
     async def test_multiple_projects(self, tmp_path):
         """Returns watermarks for all projects ordered by project_id."""
-        import sqlite3
-
         from dashboard.data.reconciliation import get_watermarks
-        from tests.conftest import RECONCILIATION_SCHEMA
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'multi.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(RECONCILIATION_SCHEMA)
-        conn.execute(
+        inserts = [
             "INSERT INTO watermarks (project_id, last_full_run_completed)"
-            " VALUES ('alpha', '2026-03-19T10:00:00+00:00')"
-        )
-        conn.execute(
+            " VALUES ('alpha', '2026-03-19T10:00:00+00:00')",
             "INSERT INTO watermarks (project_id, last_full_run_completed)"
-            " VALUES ('beta', '2026-03-19T11:00:00+00:00')"
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+            " VALUES ('beta', '2026-03-19T11:00:00+00:00')",
+        ]
+        async with make_recon_db(tmp_path, inserts, name='multi.db') as db:
             result = await get_watermarks(db)
         assert len(result) == 2
         assert result[0]['project_id'] == 'alpha'
