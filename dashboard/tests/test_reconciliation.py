@@ -9,6 +9,32 @@ import aiosqlite
 import pytest
 
 
+def test_relaxed_schema_constant_exists_and_differs():
+    """RELAXED_RECONCILIATION_SCHEMA must exist in conftest and correctly relax started_at.
+
+    Asserts:
+    - RELAXED_RECONCILIATION_SCHEMA is importable from tests.conftest
+    - 'started_at TEXT NOT NULL' is NOT in the relaxed schema
+    - 'started_at TEXT' IS in the relaxed schema
+    - The two schemas differ only in the NOT NULL constraint on started_at
+      (forward check: RECONCILIATION_SCHEMA with that one replacement == RELAXED)
+    """
+    from tests.conftest import RECONCILIATION_SCHEMA, RELAXED_RECONCILIATION_SCHEMA
+
+    # Relaxed schema must not have the NOT NULL constraint
+    assert 'started_at TEXT NOT NULL' not in RELAXED_RECONCILIATION_SCHEMA
+    # Relaxed schema must still have started_at as nullable TEXT
+    assert 'started_at TEXT' in RELAXED_RECONCILIATION_SCHEMA
+    # Forward check: replacing that one constraint in RECONCILIATION_SCHEMA yields RELAXED
+    # (This is correct and avoids the substring ambiguity of the reverse direction.)
+    assert (
+        RECONCILIATION_SCHEMA.replace('started_at TEXT NOT NULL', 'started_at TEXT')
+        == RELAXED_RECONCILIATION_SCHEMA
+    )
+    # Sanity: the two constants are not identical
+    assert RELAXED_RECONCILIATION_SCHEMA != RECONCILIATION_SCHEMA
+
+
 class TestGetRecentRuns:
     """Tests for get_recent_runs."""
 
@@ -115,12 +141,8 @@ class TestGetRecentRuns:
         started_at) to simulate such production data corruption.
         """
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import RECONCILIATION_SCHEMA, make_recon_db
+        from tests.conftest import RELAXED_RECONCILIATION_SCHEMA, make_recon_db
 
-        # Replace 'started_at TEXT NOT NULL' with 'started_at TEXT' to allow NULL
-        relaxed_schema = RECONCILIATION_SCHEMA.replace(
-            'started_at TEXT NOT NULL', 'started_at TEXT'
-        )
         inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
             " completed_at, events_processed, status)"
@@ -129,7 +151,7 @@ class TestGetRecentRuns:
         ]
         with caplog.at_level(logging.DEBUG, logger='dashboard.data.reconciliation'):
             async with make_recon_db(
-                tmp_path, inserts, name='null_started.db', schema=relaxed_schema
+                tmp_path, inserts, name='null_started.db', schema=RELAXED_RECONCILIATION_SCHEMA
             ) as db:
                 runs = await get_recent_runs(db)
 
@@ -170,12 +192,8 @@ class TestGetRecentRuns:
         a healthy sibling row still has its duration computed correctly.
         """
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import RECONCILIATION_SCHEMA, make_recon_db
+        from tests.conftest import RELAXED_RECONCILIATION_SCHEMA, make_recon_db
 
-        # Relaxed schema to allow NULL started_at
-        relaxed_schema = RECONCILIATION_SCHEMA.replace(
-            'started_at TEXT NOT NULL', 'started_at TEXT'
-        )
         inserts = [
             # Bad row: NULL started_at, valid completed_at
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
@@ -189,7 +207,7 @@ class TestGetRecentRuns:
             " '2026-03-28T09:00:00+00:00', '2026-03-28T09:05:00+00:00', 3, 'completed')",
         ]
         async with make_recon_db(
-            tmp_path, inserts, name='mixed_rows.db', schema=relaxed_schema
+            tmp_path, inserts, name='mixed_rows.db', schema=RELAXED_RECONCILIATION_SCHEMA
         ) as db:
             runs = await get_recent_runs(db)
 
