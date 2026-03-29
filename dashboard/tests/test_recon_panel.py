@@ -412,6 +412,11 @@ class TestReconRoute:
         assert 'text-gray-400' in html
         assert 'text-yellow-400' not in html
 
+    def test_301s_age_displays_yellow_color(self, client):
+        with _patch_recon_data(buffer_stats={'buffered_count': 1, 'oldest_event_age_seconds': 301.0}):
+            html = client.get('/partials/recon').text
+        assert 'text-yellow-400' in html
+
 
 # --- Empty data constants ---
 
