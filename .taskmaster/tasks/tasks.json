@@ -5659,7 +5659,25 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "memory_hints": {
+            "entities": [
+              "Graphiti",
+              "TaskInterceptor",
+              "CostStore",
+              "UsageGate"
+            ],
+            "queries": [
+              "PRD edges planned work present tense facts temporal",
+              "add_episode extraction pipeline edge creation",
+              "CostStore aspirational vs verified facts",
+              "entity summary pollution from PRD planning episodes"
+            ]
+          },
+          "absorbs_task": 311,
+          "_causation_id": "e0fce9c1-100f-4f35-a062-c2847200f7e6"
+        }
       },
       {
         "id": 309,
