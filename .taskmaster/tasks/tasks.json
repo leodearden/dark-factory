@@ -5283,8 +5283,8 @@
               "MergeQueue MergeWorker resolution decision"
             ]
           },
-          "block_reason": "Waiting for sustained merge queue depth >3 and merge cycle time metrics showing merge is dominating throughput. Formal dependency on task 292 was removed (292=done, approach cancelled). Real blocker is metrics availability, not task completion.",
-          "_causation_id": "4629993e-4d5d-4481-a371-66023dd9e398"
+          "block_reason": "Merge queue (task 292) is implemented monolithically as MergeQueue+MergeWorker and stable. Real blocker: need sustained queue depth >3 and merge cycle time metrics showing merge is dominating throughput before speculative pipeline is justified.",
+          "_causation_id": "eaf99cc7-85f9-47d1-8bdd-81c6af26139e"
         }
       },
       {
