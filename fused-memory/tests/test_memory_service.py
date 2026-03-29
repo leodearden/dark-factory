@@ -817,11 +817,11 @@ class TestGetEntity:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_search_nodes_failure_raises_and_search_invoked(self, service):
+    async def test_search_nodes_failure_raises_and_search_settles(self, service):
         """When search_nodes raises, exception propagates.
 
-        With concurrent gather, search() is still called (both coroutines
-        are invoked before the exception is inspected).
+        With concurrent gather, search() settles (both coroutines run to
+        completion before the exception is inspected).
         """
         service.graphiti.search_nodes = AsyncMock(
             side_effect=RuntimeError('search_nodes failed')
@@ -831,7 +831,7 @@ class TestGetEntity:
         with pytest.raises(RuntimeError, match='search_nodes failed'):
             await service.get_entity('entity', project_id='test')
 
-        # search() was still invoked in the concurrent gather even though search_nodes failed
+        # search() settles in the concurrent gather even though search_nodes failed
         service.graphiti.search.assert_called_once()
 
     # ------------------------------------------------------------------
@@ -839,11 +839,11 @@ class TestGetEntity:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_search_failure_raises_and_search_nodes_invoked(self, service):
-        """When search() raises, exception propagates AND search_nodes() was called.
+    async def test_search_failure_raises_and_search_nodes_settles(self, service):
+        """When search() raises, exception propagates AND search_nodes() settles.
 
-        With concurrent gather, both coroutines are invoked before any exception is
-        inspected — search_nodes() completes even though search() raises.
+        With concurrent gather, both coroutines run to completion before any exception
+        is inspected — search_nodes() settles even though search() raises.
         """
         service.graphiti.search_nodes = AsyncMock(return_value=[])
         service.graphiti.search = AsyncMock(
@@ -853,7 +853,7 @@ class TestGetEntity:
         with pytest.raises(RuntimeError, match='search failed'):
             await service.get_entity('entity', project_id='test')
 
-        # search_nodes() was invoked in the concurrent gather even though search() failed
+        # search_nodes() settles in the concurrent gather even though search() failed
         service.graphiti.search_nodes.assert_called_once()
 
     # ------------------------------------------------------------------
