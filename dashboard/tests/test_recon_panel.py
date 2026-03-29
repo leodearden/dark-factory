@@ -741,7 +741,7 @@ class TestReconTableHeaderNoWrap:
     def test_thead_row_has_whitespace_nowrap(self, client):
         with _patch_recon_data():
             html = client.get('/partials/recon').text
-        assert 'whitespace-nowrap' in html
+        assert 'border-b border-gray-700 whitespace-nowrap' in html
 
 
 class TestReconRunDetailRoute:
