@@ -40,7 +40,7 @@
       "id": "step-3",
       "type": "test",
       "description": "Verify both existing null-started_at tests still pass with the current inline .replace() approach \u2014 this confirms the new constant is compatible. Run the two affected tests to confirm green.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
