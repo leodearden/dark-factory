@@ -99,9 +99,7 @@ class TestMorphSwap:
     @pytest.mark.parametrize('partial_url', PARTIAL_URLS)
     def test_section_uses_morph_swap(self, client, partial_url):
         html = client.get('/').text
-        hx_get = f'hx-get="{partial_url}"'
-        idx = html.index(hx_get)
-        window = html[idx - 200:idx + 200]
+        window = _get_section_window(html, partial_url)
         assert 'hx-swap="morph:innerHTML"' in window
 
     def test_no_plain_innerhtml_on_polling_sections(self, client):
