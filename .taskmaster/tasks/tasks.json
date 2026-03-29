@@ -5600,6 +5600,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 308,
+        "title": "Add temporal guards for PRD-sourced knowledge graph edges",
+        "description": "PRD and task-creation episodes (via parse_prd/expand_task) generate Graphiti edges that describe planned work as current fact. This creates contamination where aspirational state appears as implemented reality in the knowledge graph. For example, reconciliation run 248aca6b found and deleted edges claiming 'CostStore extends AgentResult' (factually wrong) and 'invoke_with_cap_retry is instrumented with CostStore' (task 301 still pending).\n\nSolution: Add a temporal qualifier to edges extracted from PRD/planning episodes. Options include:\n1. Tag PRD-sourced edges with a 'planned' or 'aspirational' qualifier in metadata\n2. Defer edge creation until the corresponding task is marked done\n3. Add a valid_at constraint tied to task completion\n4. Filter PRD-sourced edges from search results unless explicitly requested\n\nThis should be implemented in the add_episode pipeline or the reconciliation post-processing layer.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -5611,7 +5622,8 @@
         "master"
       ],
       "created": "2026-03-29T12:59:23.705Z",
-      "description": "Tasks for master context"
+      "description": "Tasks for master context",
+      "updated": "2026-03-29T13:11:10.410Z"
     }
   }
 }
