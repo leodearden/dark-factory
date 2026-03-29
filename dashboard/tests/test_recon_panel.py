@@ -175,6 +175,11 @@ class TestFormatDuration:
 
         assert format_duration('not_a_number') == '-'
 
+    def test_infinity_returns_dash(self):
+        from dashboard.app import format_duration
+
+        assert format_duration(float('inf')) == '-'
+
 
 # --- Mock data for route tests ---
 
