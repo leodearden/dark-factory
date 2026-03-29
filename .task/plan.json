@@ -35,7 +35,7 @@
       "id": "step-4",
       "type": "impl",
       "description": "Run the bulk parametrized test to verify all 3 values still match. Same production code path (require_project_root \u2192 validate_project_root) ensures the pattern matches.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
