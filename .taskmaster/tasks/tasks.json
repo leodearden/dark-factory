@@ -5285,7 +5285,18 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/base.html",
+            "dashboard/tests/test_app.py",
+            "dashboard/tests/test_scaffold.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates",
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 297,
@@ -5298,7 +5309,21 @@
           294
         ],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "shared/src/shared/cli_invoke.py",
+            "orchestrator/src/orchestrator/steward.py",
+            "shared/tests/test_cli_invoke.py",
+            "orchestrator/tests/test_steward.py"
+          ],
+          "modules": [
+            "shared/src/shared",
+            "shared/tests",
+            "orchestrator/src/orchestrator",
+            "orchestrator/tests"
+          ]
+        }
       },
       {
         "id": 298,
