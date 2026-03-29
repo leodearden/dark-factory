@@ -464,6 +464,26 @@ class TestSymmetricValidatorBehavior:
         )
 
 
+class TestValidateIdentifierDelegation:
+    """validate_project_id and validate_run_id must return identical results to _validate_identifier."""
+
+    def test_validate_project_id_matches_helper_rejection(self):
+        bad = 'proj`id'
+        assert validate_project_id(bad) == _validate_identifier(bad, 'project_id')
+
+    def test_validate_project_id_matches_helper_acceptance(self):
+        good = 'dark_factory'
+        assert validate_project_id(good) == _validate_identifier(good, 'project_id')
+
+    def test_validate_run_id_matches_helper_rejection(self):
+        bad = 'run\nid'
+        assert validate_run_id(bad) == _validate_identifier(bad, 'run_id')
+
+    def test_validate_run_id_matches_helper_acceptance(self):
+        good = '550e8400-e29b-41d4-a716-446655440000'
+        assert validate_run_id(good) == _validate_identifier(good, 'run_id')
+
+
 class TestValidatorErrorDictShape:
     """All validate_* functions return dicts with exactly 'error' and 'error_type' keys."""
 
