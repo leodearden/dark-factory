@@ -273,62 +273,40 @@ class TestGetLastAttemptedRun:
 
     async def test_failed_most_recent(self, tmp_path):
         """Returns a failed run when it's the most recent."""
-        import sqlite3
-
         from dashboard.data.reconciliation import get_last_attempted_run
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'failed.db'
-        conn = sqlite3.connect(str(db_path))
-        from tests.conftest import RECONCILIATION_SCHEMA
-        conn.executescript(RECONCILIATION_SCHEMA)
-        conn.execute(
+        inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
             "completed_at, events_processed, status) "
             "VALUES ('run-f1', 'dark_factory', 'full', 'test', '2026-03-19T12:00:00', "
-            "'2026-03-19T12:01:00', 5, 'failed')"
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+            "'2026-03-19T12:01:00', 5, 'failed')",
+        ]
+        async with make_recon_db(tmp_path, inserts, name='failed.db') as db:
             result = await get_last_attempted_run(db)
         assert 'dark_factory' in result
         assert result['dark_factory']['status'] == 'failed'
 
     async def test_multiple_projects(self, tmp_path):
         """Returns one entry per project, each the most recent run."""
-        import sqlite3
-
         from dashboard.data.reconciliation import get_last_attempted_run
+        from tests.conftest import make_recon_db
 
-        db_path = tmp_path / 'multi.db'
-        conn = sqlite3.connect(str(db_path))
-        from tests.conftest import RECONCILIATION_SCHEMA
-        conn.executescript(RECONCILIATION_SCHEMA)
-        conn.execute(
+        inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
             "completed_at, events_processed, status) "
             "VALUES ('a1', 'alpha', 'full', 'test', '2026-03-19T10:00:00', "
-            "'2026-03-19T10:01:00', 2, 'completed')"
-        )
-        conn.execute(
+            "'2026-03-19T10:01:00', 2, 'completed')",
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
             "completed_at, events_processed, status) "
             "VALUES ('a2', 'alpha', 'full', 'test', '2026-03-19T11:00:00', "
-            "'2026-03-19T11:01:00', 3, 'failed')"
-        )
-        conn.execute(
+            "'2026-03-19T11:01:00', 3, 'failed')",
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
             "completed_at, events_processed, status) "
             "VALUES ('b1', 'beta', 'full', 'test', '2026-03-19T09:00:00', "
-            "'2026-03-19T09:01:00', 1, 'completed')"
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
+            "'2026-03-19T09:01:00', 1, 'completed')",
+        ]
+        async with make_recon_db(tmp_path, inserts, name='multi.db') as db:
             result = await get_last_attempted_run(db)
         assert len(result) == 2
         assert result['alpha']['id'] == 'a2'  # most recent for alpha
