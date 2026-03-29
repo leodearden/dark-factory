@@ -517,6 +517,28 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.started_at <= result.completed_at
 
     @pytest.mark.asyncio
+    async def test_run_handles_model_construct_watermark_with_padded_project_id(self, mock_deps):
+        """model_construct() bypasses the Pydantic field_validator, so watermark.project_id
+        may carry un-stripped whitespace.  BaseStage.run() must not raise a mismatch error
+        in this situation."""
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        # Build a Watermark that bypasses the field_validator — project_id is NOT stripped.
+        padded_watermark = Watermark.model_construct(project_id=' dark_factory ')
+
+        with self._patch_stage(stage):
+            result = await stage.run(
+                events=[],
+                watermark=padded_watermark,
+                prior_reports=[],
+                run_id='test-run-model-construct',
+            )
+        assert isinstance(result, StageReport)
+        assert result.stage == StageId.memory_consolidator
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         'watermark_pid,run_id',
         [
