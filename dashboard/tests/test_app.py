@@ -29,6 +29,58 @@ SECTION_TIMEOUTS = (
 )
 
 
+def _get_section_window(
+    html: str,
+    partial_url: str,
+    *,
+    # before=200: captures the <section> tag and data-section attribute that precede hx-get
+    # after=500: captures hx-trigger, hx-swap, hx-request (with timeout JSON), and aria-live
+    # that follow hx-get in the polling_section macro attribute order:
+    # data-section → hx-get → hx-trigger → hx-swap → hx-request → aria-live
+    before: int = 200,
+    after: int = 500,
+) -> str:
+    """Return an HTML substring window centred on hx-get="<partial_url>".
+
+    Raises AssertionError (not ValueError) if the URL is not found, giving a
+    clear diagnostic message rather than a bare traceback from str.index().
+    """
+    hx_get = f'hx-get="{partial_url}"'
+    idx = html.find(hx_get)
+    assert idx != -1, f'hx-get for {partial_url} not found in HTML'
+    return html[max(0, idx - before):idx + after]
+
+
+class TestGetSectionWindow:
+    """Tests for the _get_section_window helper function."""
+
+    def test_returns_correct_window_around_known_hx_get(self):
+        # Simulate HTML with hx-get near the start of a section block
+        html = 'X' * 300 + 'hx-get="/partials/memory"' + 'Y' * 600
+        window = _get_section_window(html, '/partials/memory')
+        assert 'hx-get="/partials/memory"' in window
+
+    def test_raises_assertion_error_when_not_found(self):
+        html = '<div>some html without the url</div>'
+        with pytest.raises(AssertionError, match='/partials/missing'):
+            _get_section_window(html, '/partials/missing')
+
+    def test_clamps_to_string_start_boundary(self):
+        # hx-get is near the very beginning of the string (idx < before)
+        html = 'hx-get="/partials/memory"' + 'Y' * 600
+        window = _get_section_window(html, '/partials/memory')
+        # Should not raise IndexError and should include the hx-get
+        assert 'hx-get="/partials/memory"' in window
+
+    def test_respects_custom_before_after_overrides(self):
+        html = 'A' * 50 + 'hx-get="/partials/memory"' + 'B' * 50
+        window = _get_section_window(html, '/partials/memory', before=10, after=10)
+        hx_get = 'hx-get="/partials/memory"'
+        idx = html.find(hx_get)
+        expected = html[idx - 10:idx + 10]
+        assert window == expected
+
+
 class TestIdiomorphExtension:
     """Tests for idiomorph extension setup in base.html."""
 
@@ -47,9 +99,7 @@ class TestMorphSwap:
     @pytest.mark.parametrize('partial_url', PARTIAL_URLS)
     def test_section_uses_morph_swap(self, client, partial_url):
         html = client.get('/').text
-        hx_get = f'hx-get="{partial_url}"'
-        idx = html.index(hx_get)
-        window = html[idx - 200:idx + 200]
+        window = _get_section_window(html, partial_url)
         assert 'hx-swap="morph:innerHTML"' in window
 
     def test_no_plain_innerhtml_on_polling_sections(self, client):
@@ -636,10 +686,7 @@ class TestHtmxTimeout:
     @pytest.mark.parametrize('partial_url,timeout_ms', SECTION_TIMEOUTS)
     def test_section_has_correct_timeout(self, client, partial_url, timeout_ms):
         html = client.get('/').text
-        hx_get = f'hx-get="{partial_url}"'
-        idx = html.find(hx_get)
-        assert idx != -1, f'hx-get for {partial_url} not found in HTML'
-        section_html = html[idx - 200:idx + 500]
+        section_html = _get_section_window(html, partial_url)
         assert (
             f'"timeout": {timeout_ms}' in section_html
             or f'"timeout":{timeout_ms}' in section_html
@@ -716,10 +763,7 @@ class TestAriaLivePollingsections:
     @pytest.mark.parametrize('partial_url', PARTIAL_URLS)
     def test_section_has_aria_live_polite(self, client, partial_url):
         html = client.get('/').text
-        hx_get = f'hx-get="{partial_url}"'
-        idx = html.find(hx_get)
-        assert idx != -1, f'hx-get for {partial_url} not found in HTML'
-        section_html = html[idx - 100:idx + 300]
+        section_html = _get_section_window(html, partial_url)
         assert 'aria-live="polite"' in section_html, (
             f'aria-live="polite" not found near {partial_url}'
         )
