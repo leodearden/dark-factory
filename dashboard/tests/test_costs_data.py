@@ -227,7 +227,7 @@ async def empty_costs_conn(empty_costs_db):
 # Tests: get_cost_summary
 # ---------------------------------------------------------------------------
 
-from dashboard.data.costs import get_cost_summary  # noqa: E402
+from dashboard.data.costs import get_cost_by_project, get_cost_summary  # noqa: E402
 
 
 class TestCostSummary:
@@ -258,3 +258,36 @@ class TestCostSummary:
     async def test_empty_db(self, empty_costs_conn):
         result = await get_cost_summary(empty_costs_conn)
         assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Tests: get_cost_by_project
+# ---------------------------------------------------------------------------
+
+class TestCostByProject:
+    @pytest.mark.asyncio
+    async def test_populated(self, costs_conn):
+        result = await get_cost_by_project(costs_conn)
+
+        assert 'dark_factory' in result
+        df_models = {entry['model']: entry['total'] for entry in result['dark_factory']}
+        # opus: 1.00 + 0.80 + 0.60 = 2.40; sonnet: 0.50 + 0.30 = 0.80
+        assert df_models['claude-opus-4-5'] == pytest.approx(2.4, abs=1e-6)
+        assert df_models['claude-sonnet-4-5'] == pytest.approx(0.8, abs=1e-6)
+
+        assert 'reify' in result
+        r_models = {entry['model']: entry['total'] for entry in result['reify']}
+        assert r_models['claude-sonnet-4-5'] == pytest.approx(0.4, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_none_db(self):
+        result = await get_cost_by_project(None)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_multi_project(self, costs_conn):
+        result = await get_cost_by_project(costs_conn)
+        assert 'dark_factory' in result
+        assert 'reify' in result
+        assert len(result['dark_factory']) == 2   # opus and sonnet
+        assert len(result['reify']) == 1           # sonnet only
