@@ -112,7 +112,12 @@ class CostStore:
         await self.open()
         return self
 
-    async def __aexit__(self, *exc: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
         await self.close()
 
     # -- internal helpers -----------------------------------------------------
