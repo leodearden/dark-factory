@@ -5661,7 +5661,7 @@
         "description": "Fix defensive null-value handling bugs and normalise the token-field parsing idiom across _parse_claude_output, _parse_codex_output, and _parse_gemini_output.\n\n**Bugs to fix:**\n- _parse_gemini_output: `data.get('stats', {})` returns None (not {}) when `stats` key is present with JSON null value, causing AttributeError on subsequent `.get()` calls. Fix: `data.get('stats') or {}`.\n- _parse_codex_output: Same pattern — `event.get('usage', {})` returns None when `usage` key is explicitly null. Fix: `event.get('usage') or {}`.\n- The claude parser already handles this correctly with `data.get('usage') or {}`.\n\n**Normalisation:**\n- Extract a shared `_to_token_count(v: int | None) -> int | None` helper that encapsulates the zero-suppression logic (`x or None`), making the convention explicit and DRY across all three parsers.\n- Add a brief docstring or comment on AgentResult token fields explaining that None = provider did not report, and the `or None` normalisation is intentional.\n\n**Tests to add:**\n- Gemini: `stats: null` (explicit JSON null) should return None token fields without raising.\n- Codex: `usage: null` in turn.completed event should return None token fields without raising.\n\nmemory_hints: search \"AgentResult token fields\" and \"null defensive pattern cli_invoke\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -5678,7 +5678,8 @@
             "shared/tests",
             "orchestrator/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-30T22:07:15.172Z"
       },
       {
         "id": "307",
@@ -5922,7 +5923,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-30T22:07:14.632Z",
+      "lastModified": "2026-03-30T22:07:15.172Z",
       "taskCount": 294,
       "completedCount": 265,
       "tags": [
