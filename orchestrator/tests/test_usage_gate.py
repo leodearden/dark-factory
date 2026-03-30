@@ -1228,3 +1228,63 @@ class TestCostStoreFailoverEvent:
         gate._accounts[0].capped = True
         token = await gate.before_invoke()
         assert token == 'token-b'  # failover happened silently
+
+
+# --- All event paths with cost_store=None ---
+
+
+class TestNoCostStore:
+    """Comprehensive test that all three event emission paths silently no-op
+    when cost_store is None — no AttributeError, no TypeError, no output."""
+
+    @pytest.mark.asyncio
+    async def test_cap_hit_no_error(self):
+        gate = _make_gate(num_accounts=1)
+        assert gate._cost_store is None
+        gate.detect_cap_hit("You've hit your usage limit", '', 'claude', 'token-a')
+        await asyncio.sleep(0)
+        assert gate._accounts[0].capped is True  # cap still registered
+
+    @pytest.mark.asyncio
+    async def test_resumed_no_error(self):
+        gate = _make_gate(num_accounts=1)
+        assert gate._cost_store is None
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
+        await gate._account_resume_probe_loop(acct)
+        assert acct.capped is False  # still uncapped correctly
+
+    @pytest.mark.asyncio
+    async def test_failover_no_error(self):
+        gate = _make_gate(num_accounts=2)
+        assert gate._cost_store is None
+        token1 = await gate.before_invoke()
+        assert token1 == 'token-a'
+        gate._accounts[0].capped = True
+        token2 = await gate.before_invoke()
+        assert token2 == 'token-b'  # failover worked silently
+
+    @pytest.mark.asyncio
+    async def test_all_three_paths_no_error(self):
+        """Exercise all three paths in one test to prove no leakage of side-effects."""
+        gate = _make_gate(num_accounts=2, wait_for_reset=False)
+        assert gate._cost_store is None
+
+        # Cap A via detect_cap_hit (cap_hit path)
+        await gate.before_invoke()  # sets last_account_name = max-a
+        gate.detect_cap_hit("You've hit your limit", '', 'claude', 'token-a')
+        await asyncio.sleep(0)
+
+        # Failover to B
+        token = await gate.before_invoke()
+        assert token == 'token-b'
+
+        # Uncap A via probe loop (resumed path)
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
+        await gate._account_resume_probe_loop(acct)
+        assert acct.capped is False
