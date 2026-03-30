@@ -391,9 +391,8 @@ class TestCostStoreOpenClose:
             conn.executescript = failing_executescript
             return conn
 
-        with patch('shared.cost_store.aiosqlite.connect', side_effect=fake_connect):
-            with pytest.raises(RuntimeError, match='schema failure'):
-                await store.open()
+        with patch('shared.cost_store.aiosqlite.connect', side_effect=fake_connect), pytest.raises(RuntimeError, match='schema failure'):
+            await store.open()
 
         assert store._conn is None, '_conn should remain None on setup failure'
         assert close_called, 'Connection must be closed to prevent resource leak'
