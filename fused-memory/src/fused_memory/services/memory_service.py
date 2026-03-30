@@ -348,6 +348,7 @@ class MemoryService:
         """Classify a fact extracted from an episode and write to Mem0 if appropriate."""
         fact_text = payload['fact_text']
         causation_id = payload.get('_causation_id')
+        temporal_context = payload.get('temporal_context')
         write_op_id = str(uuid_mod.uuid4())
         scope = Scope(
             project_id=payload.get('project_id', 'main'),
@@ -366,6 +367,8 @@ class MemoryService:
         }
         if classification.secondary:
             metadata['secondary_category'] = classification.secondary.value
+        if temporal_context == 'planning':
+            metadata['planned'] = True
 
         result = await self._journaled_backend_call(
             write_op_id=write_op_id,
