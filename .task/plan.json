@@ -108,15 +108,15 @@
       "id": "step-13",
       "type": "test",
       "description": "Write TestRunCostBreakdown class: test_populated verifies [{run_id, project_id, total_cost, tasks: [{task_id, title, cost, invocations: [...]}]}] with correct nesting, costs, and task titles from JOIN; test_none_db verifies [] return; test_null_task_id verifies invocations without task_id are grouped under a null/unassigned key.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "7f5ced9a"
     },
     {
       "id": "step-14",
       "type": "impl",
       "description": "Implement get_run_cost_breakdown(). Queries invocations LEFT JOIN task_results ON (invocations.run_id = task_results.run_id AND invocations.task_id = task_results.task_id) WHERE invocations.completed_at >= cutoff. Groups by run_id then task_id, includes all invocation detail rows. Returns total_cost per run as SUM.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "bd13bea0"
     }
   ],
   "design_decisions": [
