@@ -222,3 +222,56 @@ async def get_cost_by_role(
         return result
 
     return await with_db(db, _query, {})
+
+# ---------------------------------------------------------------------------
+# 5. Cost trend (daily time series)
+# ---------------------------------------------------------------------------
+
+async def get_cost_trend(
+    db: aiosqlite.Connection | None,
+    *,
+    days: int = 7,
+) -> dict[str, list[dict]]:
+    """Per-project daily cost totals over the look-back window.
+
+    Returns {project_id: [{day: str, total: float}, ...]}.
+    Entries cover every calendar day in the window (gaps filled with 0.0),
+    ordered chronologically.
+    """
+    since = _cutoff(days)
+    now = datetime.now(UTC)
+
+    # Pre-fill all days in the window (today included)
+    all_days: list[str] = []
+    for i in range(days - 1, -1, -1):
+        day = (now - timedelta(days=i)).strftime('%Y-%m-%d')
+        all_days.append(day)
+
+    async def _query(db: aiosqlite.Connection) -> dict[str, list[dict]]:
+        rows = await db.execute_fetchall(
+            "SELECT project_id, DATE(completed_at) AS day, SUM(cost_usd) AS total "
+            '  FROM invocations '
+            ' WHERE completed_at >= ? '
+            ' GROUP BY project_id, day '
+            ' ORDER BY day',
+            (since,),
+        )
+
+        # Index DB results
+        data: dict[str, dict[str, float]] = {}
+        for row in rows:
+            project_id, day, total = row
+            if project_id not in data:
+                data[project_id] = {}
+            data[project_id][day] = total or 0.0
+
+        # Build gap-filled result
+        result: dict[str, list[dict]] = {}
+        for project_id, day_totals in data.items():
+            result[project_id] = [
+                {'day': d, 'total': day_totals.get(d, 0.0)}
+                for d in all_days
+            ]
+        return result
+
+    return await with_db(db, _query, {})
