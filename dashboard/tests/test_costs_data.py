@@ -228,6 +228,7 @@ async def empty_costs_conn(empty_costs_db):
 # ---------------------------------------------------------------------------
 
 from dashboard.data.costs import (  # noqa: E402
+    get_account_events,
     get_cost_by_account,
     get_cost_by_project,
     get_cost_by_role,
@@ -462,3 +463,68 @@ class TestCostTrend:
         # 7 days total; only today has spending; others should be 0.0
         zero_days = [e for e in df if e['total'] == 0.0]
         assert len(zero_days) == 6  # 6 days back have no data
+
+
+# ---------------------------------------------------------------------------
+# Tests: get_account_events
+# ---------------------------------------------------------------------------
+
+class TestAccountEvents:
+    @pytest.mark.asyncio
+    async def test_populated(self, costs_conn):
+        result = await get_account_events(costs_conn)
+
+        # Should return a list of dicts
+        assert isinstance(result, list)
+        assert len(result) == 3  # 3 account events in fixture
+
+        # Required keys on every entry
+        for entry in result:
+            assert 'account_name' in entry
+            assert 'event_type' in entry
+            assert 'project_id' in entry
+            assert 'run_id' in entry
+            assert 'details' in entry
+            assert 'created_at' in entry
+
+        # Ordered by created_at DESC — most recent first
+        timestamps = [e['created_at'] for e in result]
+        assert timestamps == sorted(timestamps, reverse=True)
+
+        # Event types present: cap_hit (x2) and resumed (x1)
+        event_types = [e['event_type'] for e in result]
+        assert event_types.count('cap_hit') == 2
+        assert event_types.count('resumed') == 1
+
+    @pytest.mark.asyncio
+    async def test_none_db(self):
+        result = await get_account_events(None)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_filters_by_window(self, tmp_path):
+        """Events older than the window should be excluded."""
+        db_path = tmp_path / 'old_events.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+        # One recent event and one very old event
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                ('max-a', 'cap_hit', 'proj', 'r1', None, now.isoformat()),
+                ('max-b', 'cap_hit', 'proj', 'r2', None,
+                 (now - timedelta(days=30)).isoformat()),  # outside 7-day window
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_account_events(aconn, days=7)
+
+        assert len(result) == 1
+        assert result[0]['account_name'] == 'max-a'
