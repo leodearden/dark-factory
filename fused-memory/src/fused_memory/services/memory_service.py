@@ -40,6 +40,7 @@ from fused_memory.services.durable_queue import DurableWriteQueue
 
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
+    from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ class MemoryService:
         self._event_buffer: EventBuffer | None = None
         self._write_journal: WriteJournal | None = None
         self.taskmaster_connected: bool = False
+        self.planned_episode_registry: PlannedEpisodeRegistry | None = None
 
     def set_event_buffer(self, buffer: EventBuffer) -> None:
         """Wire the reconciliation event buffer into the service."""
@@ -84,6 +86,10 @@ class MemoryService:
     def set_write_journal(self, journal: WriteJournal) -> None:
         """Wire the write journal for durable auditing."""
         self._write_journal = journal
+
+    def set_planned_registry(self, registry: PlannedEpisodeRegistry) -> None:
+        """Wire the planned episode registry into the service."""
+        self.planned_episode_registry = registry
 
     async def _emit_event(self, event: ReconciliationEvent) -> None:
         if self._event_buffer:
@@ -94,6 +100,12 @@ class MemoryService:
         await self.graphiti.initialize()
 
         qcfg = self.config.queue
+
+        # Initialize planned episode registry (co-located with durable queue data)
+        from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
+        self.planned_episode_registry = PlannedEpisodeRegistry(data_dir=qcfg.data_dir)
+        await self.planned_episode_registry.initialize()
+
         self.durable_queue = DurableWriteQueue(
             data_dir=qcfg.data_dir,
             execute_write=self._execute_durable_write,
@@ -125,6 +137,9 @@ class MemoryService:
         if self._event_buffer:
             with contextlib.suppress(Exception):
                 await self._event_buffer.close()
+        if self.planned_episode_registry:
+            with contextlib.suppress(Exception):
+                await self.planned_episode_registry.close()
 
     # ------------------------------------------------------------------
     # Journal helper
@@ -275,6 +290,14 @@ class MemoryService:
         )
         # Post-write dedup: remove duplicate edges created within this episode
         await self._dedup_episode_edges(result)
+
+        # Register planning episodes so they can be filtered from search results
+        if temporal_context == 'planning' and self.planned_episode_registry is not None:
+            episode_uuid = payload.get('uuid')
+            group_id = payload.get('group_id', '')
+            if episode_uuid:
+                await self.planned_episode_registry.register(episode_uuid, group_id)
+
         return result
 
     async def _execute_mem0_write(self, payload: dict[str, Any]) -> Any:
