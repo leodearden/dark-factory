@@ -1567,3 +1567,344 @@ class TestExecuteGraphitiWritePlanningRegistration:
         }
         # Should not raise
         await service._execute_graphiti_write('add_episode', payload)
+
+
+class TestSearchGraphitiFiltering:
+    """step-11: _search_graphiti excludes edges whose ALL episodes are in planned registry."""
+
+    @pytest.fixture
+    def service_with_registry(self, service):
+        """Service with a mocked planned_episode_registry."""
+        from unittest.mock import AsyncMock, MagicMock
+        mock_registry = MagicMock()
+        mock_registry.get_planned_uuids = AsyncMock(return_value=set())
+        service.planned_episode_registry = mock_registry
+        return service
+
+    @pytest.mark.asyncio
+    async def test_edge_with_all_planned_episodes_excluded_by_default(
+        self, service_with_registry
+    ):
+        """Edge whose ALL episode UUIDs are in the planned registry is excluded by default."""
+        from tests.conftest import MockEdge, MockNode
+        from fused_memory.models.scope import Scope
+
+        ep1, ep2 = 'plan-ep-1', 'plan-ep-2'
+        service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
+            return_value={ep1, ep2}
+        )
+        service_with_registry.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='PRD: CostStore extends AgentResult',
+                uuid='edge-planned-1',
+                episodes=[ep1, ep2],
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service_with_registry._search_graphiti('CostStore', scope, 10)
+
+        assert len(results) == 0, (
+            'Edge with all-planned episodes must be excluded from default search results'
+        )
+
+    @pytest.mark.asyncio
+    async def test_edge_with_mixed_episodes_not_excluded(
+        self, service_with_registry
+    ):
+        """Edge with mixed episodes (some planned, some not) is NOT excluded."""
+        from tests.conftest import MockEdge
+        from fused_memory.models.scope import Scope
+
+        ep_planned = 'plan-ep-1'
+        ep_real = 'real-ep-2'
+        service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
+            return_value={ep_planned}
+        )
+        service_with_registry.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Fact confirmed in both plan and reality',
+                uuid='edge-mixed-1',
+                episodes=[ep_planned, ep_real],
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service_with_registry._search_graphiti('fact', scope, 10)
+
+        assert len(results) == 1, (
+            'Edge with mixed episodes must NOT be excluded (only exclude all-planned)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_edge_with_no_episodes_not_excluded(
+        self, service_with_registry
+    ):
+        """Edge with no episode provenance is NOT excluded (not a planned edge)."""
+        from tests.conftest import MockEdge
+        from fused_memory.models.scope import Scope
+
+        service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
+            return_value={'plan-ep-1'}
+        )
+        service_with_registry.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Fact with no provenance',
+                uuid='edge-no-ep-1',
+                episodes=[],
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service_with_registry._search_graphiti('fact', scope, 10)
+
+        assert len(results) == 1, 'Edge with no episodes must NOT be excluded'
+
+    @pytest.mark.asyncio
+    async def test_edge_with_non_planned_episodes_not_excluded(
+        self, service_with_registry
+    ):
+        """Edge with all non-planned episodes is NOT excluded."""
+        from tests.conftest import MockEdge
+        from fused_memory.models.scope import Scope
+
+        service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
+            return_value={'plan-ep-1'}
+        )
+        service_with_registry.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Implemented fact',
+                uuid='edge-real-1',
+                episodes=['real-ep-a', 'real-ep-b'],
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service_with_registry._search_graphiti('fact', scope, 10)
+
+        assert len(results) == 1, 'Edge with non-planned episodes must NOT be excluded'
+
+    @pytest.mark.asyncio
+    async def test_no_registry_does_not_filter(self, service):
+        """When planned_episode_registry is None, no filtering occurs."""
+        from tests.conftest import MockEdge
+        from fused_memory.models.scope import Scope
+
+        service.planned_episode_registry = None
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Some fact', uuid='edge-1', episodes=['ep-1']),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('fact', scope, 10)
+
+        assert len(results) == 1, 'Without registry, all edges must be returned'
+
+
+class TestSearchGraphitiIncludePlanned:
+    """step-13: _search_graphiti with include_planned=True includes planned edges and marks them."""
+
+    @pytest.fixture
+    def service_with_registry(self, service):
+        """Service with a mocked planned_episode_registry."""
+        from unittest.mock import AsyncMock, MagicMock
+        mock_registry = MagicMock()
+        mock_registry.get_planned_uuids = AsyncMock(return_value=set())
+        service.planned_episode_registry = mock_registry
+        return service
+
+    @pytest.mark.asyncio
+    async def test_planned_edges_included_when_include_planned_true(
+        self, service_with_registry
+    ):
+        """With include_planned=True, edges that would normally be filtered are included."""
+        from tests.conftest import MockEdge
+        from fused_memory.models.scope import Scope
+
+        ep1, ep2 = 'plan-ep-1', 'plan-ep-2'
+        service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
+            return_value={ep1, ep2}
+        )
+        service_with_registry.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='PRD: CostStore extends AgentResult',
+                uuid='edge-planned-1',
+                episodes=[ep1, ep2],
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service_with_registry._search_graphiti(
+            'CostStore', scope, 10, include_planned=True
+        )
+
+        assert len(results) == 1, (
+            'With include_planned=True, planned edges must be returned'
+        )
+
+    @pytest.mark.asyncio
+    async def test_planned_edges_marked_in_metadata(
+        self, service_with_registry
+    ):
+        """With include_planned=True, planned edges have metadata['planned'] = True."""
+        from tests.conftest import MockEdge
+        from fused_memory.models.scope import Scope
+
+        ep1 = 'plan-ep-1'
+        service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
+            return_value={ep1}
+        )
+        service_with_registry.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='PRD: planned fact',
+                uuid='edge-planned-2',
+                episodes=[ep1],
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service_with_registry._search_graphiti(
+            'planned', scope, 10, include_planned=True
+        )
+
+        assert len(results) == 1
+        assert results[0].metadata.get('planned') is True, (
+            "Planned edges must have metadata['planned'] = True when include_planned=True"
+        )
+
+
+class TestSearchMem0Filtering:
+    """step-15: _search_mem0 filtering — exclude planned=True by default, include with flag."""
+
+    @pytest.mark.asyncio
+    async def test_planned_result_excluded_by_default(self, service):
+        """Result with metadata.planned=True is excluded from default search."""
+        from fused_memory.models.scope import Scope
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm-planned-1',
+                    'memory': 'PRD: system will use GraphQL',
+                    'score': 0.9,
+                    'metadata': {'category': 'decisions_and_rationale', 'planned': True},
+                },
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('GraphQL', scope, 10)
+
+        assert len(results) == 0, (
+            'Result with planned=True must be excluded from default Mem0 search'
+        )
+
+    @pytest.mark.asyncio
+    async def test_planned_result_included_when_include_planned_true(self, service):
+        """Result with metadata.planned=True is included when include_planned=True."""
+        from fused_memory.models.scope import Scope
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm-planned-2',
+                    'memory': 'PRD: system will use GraphQL',
+                    'score': 0.9,
+                    'metadata': {'category': 'decisions_and_rationale', 'planned': True},
+                },
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('GraphQL', scope, 10, include_planned=True)
+
+        assert len(results) == 1, (
+            'Result with planned=True must be included when include_planned=True'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_planned_result_not_excluded(self, service):
+        """Result without planned metadata is NOT excluded."""
+        from fused_memory.models.scope import Scope
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm-real-1',
+                    'memory': 'We use PostgreSQL for persistence',
+                    'score': 0.85,
+                    'metadata': {'category': 'decisions_and_rationale'},
+                },
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('PostgreSQL', scope, 10)
+
+        assert len(results) == 1, 'Non-planned result must NOT be excluded'
+
+
+class TestSearchIncludePlannedPassthrough:
+    """step-17: MemoryService.search passes include_planned to _search_graphiti and _search_mem0."""
+
+    @pytest.mark.asyncio
+    async def test_include_planned_true_passes_through_to_graphiti(self, service):
+        """search(include_planned=True) passes the flag to _search_graphiti."""
+        from unittest.mock import AsyncMock, patch
+
+        captured_kwargs = {}
+
+        async def mock_search_graphiti(query, scope, limit, include_planned=False):
+            captured_kwargs['include_planned'] = include_planned
+            return []
+
+        with patch.object(service, '_search_graphiti', side_effect=mock_search_graphiti):
+            await service.search(
+                query='test', project_id='test', stores=['graphiti'],
+                include_planned=True
+            )
+
+        assert captured_kwargs.get('include_planned') is True, (
+            'include_planned=True must be forwarded to _search_graphiti'
+        )
+
+    @pytest.mark.asyncio
+    async def test_include_planned_false_passes_through_to_mem0(self, service):
+        """search(include_planned=False) [default] passes False to _search_mem0."""
+        from unittest.mock import AsyncMock, patch
+
+        captured_kwargs = {}
+
+        async def mock_search_mem0(query, scope, limit, include_planned=False):
+            captured_kwargs['include_planned'] = include_planned
+            return []
+
+        with patch.object(service, '_search_mem0', side_effect=mock_search_mem0):
+            await service.search(
+                query='test', project_id='test', stores=['mem0'],
+            )
+
+        assert captured_kwargs.get('include_planned') is False, (
+            'include_planned=False (default) must be forwarded to _search_mem0'
+        )
+
+    @pytest.mark.asyncio
+    async def test_include_planned_true_passes_through_to_mem0(self, service):
+        """search(include_planned=True) passes True to _search_mem0."""
+        from unittest.mock import AsyncMock, patch
+
+        captured_kwargs = {}
+
+        async def mock_search_mem0(query, scope, limit, include_planned=False):
+            captured_kwargs['include_planned'] = include_planned
+            return []
+
+        with patch.object(service, '_search_mem0', side_effect=mock_search_mem0):
+            await service.search(
+                query='test', project_id='test', stores=['mem0'],
+                include_planned=True
+            )
+
+        assert captured_kwargs.get('include_planned') is True, (
+            'include_planned=True must be forwarded to _search_mem0'
+        )
