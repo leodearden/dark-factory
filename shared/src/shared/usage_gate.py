@@ -23,8 +23,12 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from shared.config_models import UsageCapConfig
+
+if TYPE_CHECKING:
+    from shared.cost_store import CostStore
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +93,7 @@ class UsageGate:
     capped.  Works with 1 or N accounts.
     """
 
-    def __init__(self, config: UsageCapConfig):
+    def __init__(self, config: UsageCapConfig, *, cost_store: CostStore | None = None):
         self._config: UsageCapConfig = config
         self._open = asyncio.Event()
         self._open.set()  # start open
@@ -98,6 +102,10 @@ class UsageGate:
         self._paused_reason: str = ''
         self._pause_started_at: datetime | None = None
         self._total_pause_secs: float = 0.0
+        self._cost_store: CostStore | None = cost_store
+        self._project_id: str | None = None
+        self._run_id: str | None = None
+        self._last_account_name: str | None = None
 
         self._accounts: list[AccountState] = self._init_accounts()
 
@@ -166,6 +174,17 @@ class UsageGate:
             for acct in self._accounts:
                 if not acct.capped:
                     logger.debug(f'Using account {acct.name}')
+                    # Failover detection: emit event if account changed
+                    if (
+                        self._last_account_name is not None
+                        and self._last_account_name != acct.name
+                    ):
+                        await self._write_cost_event(
+                            acct.name,
+                            'failover',
+                            json.dumps({'from': self._last_account_name, 'to': acct.name}),
+                        )
+                    self._last_account_name = acct.name
                     return acct.token
 
             # All capped — check if any reset times have passed before blocking.
@@ -242,6 +261,7 @@ class UsageGate:
         if acct.pause_started_at is None:
             acct.pause_started_at = datetime.now(UTC)
         logger.warning(f'Account {acct.name} CAPPED: {reason}')
+        self._fire_cost_event(acct.name, 'cap_hit', json.dumps({'reason': reason}))
         self._start_account_resume_probe(acct)
 
         # If all accounts are now capped, close the global gate
@@ -269,6 +289,45 @@ class UsageGate:
                     self._account_resume_probe_loop(acct),
                     name=f'usage-gate-resume-{acct.name}',
                 )
+        except RuntimeError:
+            pass
+
+    async def _write_cost_event(
+        self,
+        account_name: str,
+        event_type: str,
+        details: str,
+    ) -> None:
+        """Write a cost event to CostStore. Silently swallows errors (telemetry only)."""
+        if self._cost_store is None:
+            return
+        try:
+            await self._cost_store.save_account_event(
+                account_name=account_name,
+                event_type=event_type,
+                project_id=self._project_id,
+                run_id=self._run_id,
+                details=details,
+                created_at=datetime.now(UTC).isoformat(),
+            )
+        except Exception as exc:
+            logger.warning('CostStore write failed for %s/%s: %s', account_name, event_type, exc)
+
+    def _fire_cost_event(
+        self,
+        account_name: str,
+        event_type: str,
+        details: str,
+    ) -> None:
+        """Fire-and-forget wrapper for _write_cost_event (for use in sync contexts)."""
+        if self._cost_store is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                self._write_cost_event(account_name, event_type, details),
+                name=f'cost-event-{event_type}-{account_name}',
+            )
         except RuntimeError:
             pass
 
@@ -348,6 +407,7 @@ class UsageGate:
         label = 'reset time passed' if past_reset else f'optimistic probe #{acct.probe_count}'
         logger.info(f'Account {acct.name} RESUMED ({label})')
         self._open.set()
+        await self._write_cost_event(acct.name, 'resumed', json.dumps({'label': label}))
 
     async def shutdown(self) -> None:
         """Cancel all resume probe tasks."""
@@ -387,6 +447,24 @@ class UsageGate:
             if not acct.capped:
                 return acct.name
         return None
+
+    @property
+    def project_id(self) -> str | None:
+        """Project identifier set by the harness at run start."""
+        return self._project_id
+
+    @project_id.setter
+    def project_id(self, value: str | None) -> None:
+        self._project_id = value
+
+    @property
+    def run_id(self) -> str | None:
+        """Run identifier set by the harness at run start."""
+        return self._run_id
+
+    @run_id.setter
+    def run_id(self, value: str | None) -> None:
+        self._run_id = value
 
 
 # --- Helpers ---

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 from shared.config_models import AccountConfig, UsageCapConfig
@@ -47,6 +48,10 @@ def _make_gate(
     gate._paused_reason = ''
     gate._pause_started_at = None
     gate._total_pause_secs = 0.0
+    gate._cost_store = None
+    gate._project_id = None
+    gate._run_id = None
+    gate._last_account_name = None
     tokens = ['token-a', 'token-b', 'token-c']
     gate._accounts = [
         AccountState(name=f'max-{chr(97+i)}', token=tokens[i])
@@ -935,3 +940,351 @@ class TestParseResetsAtWithDate:
         assert dt is not None
         fallback = datetime.now(UTC) + timedelta(hours=1)
         assert abs((dt - fallback).total_seconds()) > 60
+
+
+# --- CostStore init / properties ---
+
+
+class TestCostStoreInit:
+    def test_init_accepts_cost_store_param(self):
+        """UsageGate.__init__ must accept an optional cost_store keyword arg."""
+        mock_cs = AsyncMock()
+        config = UsageCapConfig(wait_for_reset=False, accounts=[])
+        gate = UsageGate(config, cost_store=mock_cs)
+        assert gate._cost_store is mock_cs
+
+    def test_init_cost_store_defaults_to_none(self):
+        """cost_store defaults to None when not supplied."""
+        config = UsageCapConfig(wait_for_reset=False, accounts=[])
+        gate = UsageGate(config)
+        assert gate._cost_store is None
+
+    def test_project_id_defaults_to_none(self):
+        gate = _make_gate()
+        assert gate.project_id is None
+
+    def test_run_id_defaults_to_none(self):
+        gate = _make_gate()
+        assert gate.run_id is None
+
+    def test_project_id_setter(self):
+        gate = _make_gate()
+        gate.project_id = 'my-project'
+        assert gate.project_id == 'my-project'
+
+    def test_run_id_setter(self):
+        gate = _make_gate()
+        gate.run_id = 'run-abc-123'
+        assert gate.run_id == 'run-abc-123'
+
+    def test_last_account_name_defaults_to_none(self):
+        """_last_account_name is initialised to None."""
+        gate = _make_gate()
+        assert gate._last_account_name is None
+
+
+# --- CostStore cap_hit event ---
+
+
+class TestCostStoreCapHitEvent:
+    @pytest.mark.asyncio
+    async def test_cap_hit_calls_save_account_event(self):
+        """detect_cap_hit fires save_account_event('cap_hit') when cost_store is set."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=1)
+        gate._cost_store = mock_cs
+        gate._project_id = 'proj-1'
+        gate._run_id = 'run-42'
+
+        gate.detect_cap_hit(
+            "You've hit your usage limit resets in 3h", '', 'claude', 'token-a',
+        )
+        # Drain the fire-and-forget task
+        await asyncio.sleep(0)
+
+        mock_cs.save_account_event.assert_called_once()
+        call_kwargs = mock_cs.save_account_event.call_args
+        assert call_kwargs.kwargs.get('account_name', call_kwargs.args[0] if call_kwargs.args else None) == 'max-a' or \
+               call_kwargs.args[0] == 'max-a'
+        # event_type must be 'cap_hit'
+        event_type = call_kwargs.kwargs.get('event_type') or call_kwargs.args[1]
+        assert event_type == 'cap_hit'
+
+    @pytest.mark.asyncio
+    async def test_cap_hit_event_carries_project_and_run_ids(self):
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=1)
+        gate._cost_store = mock_cs
+        gate._project_id = 'dark_factory'
+        gate._run_id = 'run-99'
+
+        gate.detect_cap_hit(
+            "You've hit your usage limit resets in 1h", '', 'claude', 'token-a',
+        )
+        await asyncio.sleep(0)
+
+        call = mock_cs.save_account_event.call_args
+        # project_id and run_id must be passed
+        all_args = list(call.args) + list(call.kwargs.values())
+        assert 'dark_factory' in all_args
+        assert 'run-99' in all_args
+
+    @pytest.mark.asyncio
+    async def test_cap_hit_event_details_contains_reason(self):
+        """details field should be a JSON string containing the cap reason."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=1)
+        gate._cost_store = mock_cs
+
+        gate.detect_cap_hit(
+            "You've hit your usage limit", '', 'claude', 'token-a',
+        )
+        await asyncio.sleep(0)
+
+        call = mock_cs.save_account_event.call_args
+        # Find the details arg (should be a JSON string with 'reason' key)
+        all_args = list(call.args) + list(call.kwargs.values())
+        details_str = next((a for a in all_args if isinstance(a, str) and 'reason' in a), None)
+        assert details_str is not None
+        import json as _json
+        details = _json.loads(details_str)
+        assert 'reason' in details
+
+    @pytest.mark.asyncio
+    async def test_no_cap_hit_event_without_cost_store(self):
+        """No event emitted and no error raised when cost_store is None."""
+        gate = _make_gate(num_accounts=1)
+        assert gate._cost_store is None
+        # Should complete without error
+        gate.detect_cap_hit("You've hit your usage limit", '', 'claude', 'token-a')
+        await asyncio.sleep(0)  # no tasks to drain, but no error either
+
+
+# --- CostStore resumed event ---
+
+
+class TestCostStoreResumedEvent:
+    @pytest.mark.asyncio
+    async def test_resumed_event_after_past_reset(self):
+        """'resumed' event is emitted when probe uncaps after resets_at has passed."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=1)
+        gate._cost_store = mock_cs
+        gate._project_id = 'proj-x'
+        gate._run_id = 'run-r1'
+
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)  # past
+
+        await gate._account_resume_probe_loop(acct)
+
+        mock_cs.save_account_event.assert_called_once()
+        call = mock_cs.save_account_event.call_args
+        event_type = call.kwargs.get('event_type') or call.args[1]
+        assert event_type == 'resumed'
+        account_name = call.kwargs.get('account_name') or call.args[0]
+        assert account_name == 'max-a'
+
+    @pytest.mark.asyncio
+    async def test_resumed_event_optimistic_probe(self):
+        """'resumed' event is emitted on optimistic probe (resets_at in future)."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(probe_interval_secs=1, max_probe_interval_secs=10,
+                          num_accounts=1)
+        gate._cost_store = mock_cs
+
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) + timedelta(hours=5)  # future
+
+        await asyncio.wait_for(
+            gate._account_resume_probe_loop(acct), timeout=3.0,
+        )
+
+        mock_cs.save_account_event.assert_called_once()
+        call = mock_cs.save_account_event.call_args
+        event_type = call.kwargs.get('event_type') or call.args[1]
+        assert event_type == 'resumed'
+
+    @pytest.mark.asyncio
+    async def test_resumed_event_details_has_label(self):
+        """details JSON should include 'label' key describing the resume type."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=1)
+        gate._cost_store = mock_cs
+
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
+
+        await gate._account_resume_probe_loop(acct)
+
+        call = mock_cs.save_account_event.call_args
+        all_args = list(call.args) + list(call.kwargs.values())
+        import json as _json
+        details_str = next((a for a in all_args if isinstance(a, str) and 'label' in a), None)
+        assert details_str is not None
+        details = _json.loads(details_str)
+        assert 'label' in details
+
+    @pytest.mark.asyncio
+    async def test_no_resumed_event_without_cost_store(self):
+        """No error when cost_store is None and probe loop completes."""
+        gate = _make_gate(num_accounts=1)
+        assert gate._cost_store is None
+
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
+
+        # Should complete cleanly with no AttributeError
+        await gate._account_resume_probe_loop(acct)
+        assert acct.capped is False
+
+
+# --- CostStore failover event ---
+
+
+class TestCostStoreFailoverEvent:
+    @pytest.mark.asyncio
+    async def test_failover_event_emitted_on_account_switch(self):
+        """When before_invoke switches accounts, a 'failover' event is emitted."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=2)
+        gate._cost_store = mock_cs
+
+        # First call — establishes max-a as last_account_name, no failover
+        token1 = await gate.before_invoke()
+        assert token1 == 'token-a'
+        assert gate._last_account_name == 'max-a'
+        mock_cs.save_account_event.assert_not_called()
+
+        # Cap max-a, second call should pick max-b and emit failover
+        gate._accounts[0].capped = True
+        token2 = await gate.before_invoke()
+        assert token2 == 'token-b'
+        assert gate._last_account_name == 'max-b'
+
+        mock_cs.save_account_event.assert_called_once()
+        call = mock_cs.save_account_event.call_args
+        event_type = call.kwargs.get('event_type') or call.args[1]
+        assert event_type == 'failover'
+
+    @pytest.mark.asyncio
+    async def test_no_failover_on_first_invoke(self):
+        """First call to before_invoke sets last_account_name but emits no event."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=2)
+        gate._cost_store = mock_cs
+
+        await gate.before_invoke()
+        mock_cs.save_account_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_failover_when_same_account(self):
+        """No failover event if same account is returned on consecutive calls."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=2)
+        gate._cost_store = mock_cs
+
+        await gate.before_invoke()
+        mock_cs.save_account_event.assert_not_called()
+
+        await gate.before_invoke()
+        mock_cs.save_account_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failover_details_has_from_and_to(self):
+        """details JSON should include 'from' and 'to' account names."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=2)
+        gate._cost_store = mock_cs
+
+        await gate.before_invoke()
+        gate._accounts[0].capped = True
+        await gate.before_invoke()
+
+        call = mock_cs.save_account_event.call_args
+        all_args = list(call.args) + list(call.kwargs.values())
+        import json as _json
+        details_str = next((a for a in all_args if isinstance(a, str) and 'from' in a), None)
+        assert details_str is not None
+        details = _json.loads(details_str)
+        assert details.get('from') == 'max-a'
+        assert details.get('to') == 'max-b'
+
+    @pytest.mark.asyncio
+    async def test_no_failover_event_without_cost_store(self):
+        """No error on failover when cost_store is None."""
+        gate = _make_gate(num_accounts=2)
+        assert gate._cost_store is None
+
+        await gate.before_invoke()
+        gate._accounts[0].capped = True
+        token = await gate.before_invoke()
+        assert token == 'token-b'  # failover happened silently
+
+
+# --- All event paths with cost_store=None ---
+
+
+class TestNoCostStore:
+    """Comprehensive test that all three event emission paths silently no-op
+    when cost_store is None — no AttributeError, no TypeError, no output."""
+
+    @pytest.mark.asyncio
+    async def test_cap_hit_no_error(self):
+        gate = _make_gate(num_accounts=1)
+        assert gate._cost_store is None
+        gate.detect_cap_hit("You've hit your usage limit", '', 'claude', 'token-a')
+        await asyncio.sleep(0)
+        assert gate._accounts[0].capped is True  # cap still registered
+
+    @pytest.mark.asyncio
+    async def test_resumed_no_error(self):
+        gate = _make_gate(num_accounts=1)
+        assert gate._cost_store is None
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
+        await gate._account_resume_probe_loop(acct)
+        assert acct.capped is False  # still uncapped correctly
+
+    @pytest.mark.asyncio
+    async def test_failover_no_error(self):
+        gate = _make_gate(num_accounts=2)
+        assert gate._cost_store is None
+        token1 = await gate.before_invoke()
+        assert token1 == 'token-a'
+        gate._accounts[0].capped = True
+        token2 = await gate.before_invoke()
+        assert token2 == 'token-b'  # failover worked silently
+
+    @pytest.mark.asyncio
+    async def test_all_three_paths_no_error(self):
+        """Exercise all three paths in one test to prove no leakage of side-effects."""
+        gate = _make_gate(num_accounts=2, wait_for_reset=False)
+        assert gate._cost_store is None
+
+        # Cap A via detect_cap_hit (cap_hit path)
+        await gate.before_invoke()  # sets last_account_name = max-a
+        gate.detect_cap_hit("You've hit your limit", '', 'claude', 'token-a')
+        await asyncio.sleep(0)
+
+        # Failover to B
+        token = await gate.before_invoke()
+        assert token == 'token-b'
+
+        # Uncap A via probe loop (resumed path)
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
+        await gate._account_resume_probe_loop(acct)
+        assert acct.capped is False
