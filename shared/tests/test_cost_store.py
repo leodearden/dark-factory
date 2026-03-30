@@ -315,7 +315,7 @@ class TestCostStoreContextManager:
 
 @pytest.mark.asyncio
 class TestCostStoreOpenClose:
-    """step-3: open() creates persistent WAL connection; close() is idempotent."""
+    """step-3: open() creates persistent WAL connection; close() is idempotent; double-open raises."""
 
     async def test_open_sets_conn(self, tmp_path: Path):
         store = CostStore(tmp_path / 'costs.db')
@@ -365,6 +365,16 @@ class TestCostStoreOpenClose:
         await store.open()
         try:
             assert nested.exists()
+        finally:
+            await store.close()
+
+    async def test_double_open_raises(self, tmp_path: Path):
+        """Calling open() twice raises RuntimeError('CostStore already opened')."""
+        store = CostStore(tmp_path / 'costs.db')
+        await store.open()
+        try:
+            with pytest.raises(RuntimeError, match='CostStore already opened'):
+                await store.open()
         finally:
             await store.close()
 
