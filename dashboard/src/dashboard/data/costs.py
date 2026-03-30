@@ -145,27 +145,31 @@ async def get_cost_by_account(
             (since,),
         )
 
-        # Cap event counts and most-recent event per account
+        # Cap event counts and most-recent event per account.
+        # Use MAX(CASE WHEN event_type='cap_hit' ...) so last_cap_at only holds
+        # cap_hit timestamps (never resumed). Add created_at >= ? guard to the
+        # correlated subquery so status is derived from in-window events only.
         evt_rows = await db.execute_fetchall(
             "SELECT account_name, "
             "       SUM(CASE WHEN event_type = 'cap_hit' THEN 1 ELSE 0 END) AS cap_count, "
-            '       MAX(created_at) AS last_event_at, '
+            "       MAX(CASE WHEN event_type = 'cap_hit' THEN created_at END) AS last_cap_at, "
             '       (SELECT event_type FROM account_events ae2 '
             '         WHERE ae2.account_name = account_events.account_name '
+            '           AND ae2.created_at >= ? '
             '         ORDER BY created_at DESC LIMIT 1) AS last_event_type '
             '  FROM account_events '
             ' WHERE created_at >= ? '
             ' GROUP BY account_name',
-            (since,),
+            (since, since),
         )
 
         # Cap counts and status keyed by account_name
         caps: dict[str, dict] = {}
         for row in evt_rows:
-            account_name, cap_count, last_event_at, last_event_type = row
+            account_name, cap_count, last_cap_at, last_event_type = row
             caps[account_name] = {
                 'cap_events': cap_count or 0,
-                'last_cap': last_event_at if cap_count and cap_count > 0 else None,
+                'last_cap': last_cap_at,  # NULL when no cap_hit in window
                 'status': 'capped' if last_event_type == 'cap_hit' else 'active',
             }
 
