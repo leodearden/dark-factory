@@ -33,6 +33,23 @@ class TestParseGeminiNullStats:
         assert agent_result.cost_usd == 0.0
 
 
+class TestParseGeminiValidStats:
+
+    def test_valid_stats_computes_nonzero_cost(self):
+        """_parse_gemini_output computes non-zero cost when stats contains token counts."""
+        payload = json.dumps({
+            'response': 'hello',
+            'stats': {'input_tokens': 100, 'output_tokens': 50},
+        })
+        result = _make_subprocess_result(stdout=payload)
+        agent_result = _parse_gemini_output(result, 'gemini-3-flash')
+        assert agent_result.success is True
+        assert agent_result.output == 'hello'
+        # gemini-3-flash: input=0.075/1M, output=0.30/1M
+        # cost = (100 * 0.075 + 50 * 0.30) / 1_000_000 = 0.0000225
+        assert agent_result.cost_usd > 0.0
+
+
 class TestParseCodexNullUsage:
 
     def test_null_usage_does_not_raise(self):
