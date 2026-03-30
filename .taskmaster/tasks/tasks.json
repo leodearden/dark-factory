@@ -5635,7 +5635,7 @@
         "description": "Three related issues in the nav bar implementation:\n\n1. **base.html** (lines 31-42): Replace exact `request.url.path == '/'` / `== '/costs'` comparison with `startswith` or a `{% set active_section %}` block variable, so sub-paths highlight correctly. Extract the duplicated active/inactive class strings into a variable or macro to eliminate copy-paste.\n\n2. **test_app.py** TestNavBar: Fix test_dashboard_link_active_on_root and test_costs_link_active_on_costs_page to scope their `border-blue-500` assertions to the correct `<a>` element, and add negative assertions that the *other* link does NOT have the active class.\n\n3. **test_app.py** TestNavBar: Fix test_nav_uses_dark_theme_text — either scope the assertion to the nav element, or replace it with a meaningful test (e.g., verify inactive link has text-gray-400 while active link has text-white).\n\nFiles: dashboard/src/dashboard/templates/base.html, dashboard/tests/test_app.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -5648,7 +5648,8 @@
             "dashboard/src/dashboard/templates",
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-30T18:11:19.922Z"
       },
       {
         "id": "306",
@@ -5894,7 +5895,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-30T18:11:18.997Z",
+      "lastModified": "2026-03-30T18:11:19.922Z",
       "taskCount": 292,
       "completedCount": 263,
       "tags": [
