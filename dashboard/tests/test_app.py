@@ -838,6 +838,15 @@ class TestNavBar:
         html = client.get('/').text
         assert 'Costs' in html
 
+    def test_costs_route_returns_200(self, client):
+        response = client.get('/costs')
+        assert response.status_code == 200
+
+    def test_costs_page_extends_base(self, client):
+        html = client.get('/costs').text
+        assert '<nav' in html
+        assert 'href="/"' in html
+
 
 class TestSafeGatherResult:
     """Tests for the _safe_gather_result helper."""
