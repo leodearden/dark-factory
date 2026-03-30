@@ -89,9 +89,13 @@ class CostStore:
         """Open persistent connection, set WAL + busy_timeout, ensure schema."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = await aiosqlite.connect(str(self.db_path))
-        await conn.execute('PRAGMA journal_mode=WAL')
-        await conn.execute('PRAGMA busy_timeout=30000')
-        await conn.executescript(_SCHEMA)
+        try:
+            await conn.execute('PRAGMA journal_mode=WAL')
+            await conn.execute('PRAGMA busy_timeout=30000')
+            await conn.executescript(_SCHEMA)
+        except BaseException:
+            await conn.close()
+            raise
         self._conn = conn
 
     async def close(self) -> None:
