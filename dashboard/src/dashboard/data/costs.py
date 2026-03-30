@@ -84,6 +84,7 @@ async def get_cost_summary(
 # 2. Cost by project (per-model breakdown)
 # ---------------------------------------------------------------------------
 
+
 async def get_cost_by_project(
     db: aiosqlite.Connection | None,
     *,
@@ -112,6 +113,76 @@ async def get_cost_by_project(
             if project_id not in result:
                 result[project_id] = []
             result[project_id].append({'model': model, 'total': total or 0.0})
+        return result
+
+    return await with_db(db, _query, {})
+
+
+# ---------------------------------------------------------------------------
+# 3. Cost by account
+# ---------------------------------------------------------------------------
+
+async def get_cost_by_account(
+    db: aiosqlite.Connection | None,
+    *,
+    days: int = 7,
+) -> dict[str, dict]:
+    """Per-account cost summary with cap status.
+
+    Returns {account_name: {spend, invocations, cap_events, last_cap, status}}.
+    *status* is 'capped' if the most recent account_event is 'cap_hit' with no
+    subsequent 'resumed'; otherwise 'active'.
+    """
+    since = _cutoff(days)
+
+    async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
+        # Aggregate spend and invocation count per account
+        inv_rows = await db.execute_fetchall(
+            'SELECT account_name, SUM(cost_usd) AS spend, COUNT(*) AS cnt '
+            '  FROM invocations '
+            ' WHERE completed_at >= ? '
+            ' GROUP BY account_name',
+            (since,),
+        )
+
+        # Cap event counts and most-recent event per account
+        evt_rows = await db.execute_fetchall(
+            "SELECT account_name, "
+            "       SUM(CASE WHEN event_type = 'cap_hit' THEN 1 ELSE 0 END) AS cap_count, "
+            '       MAX(created_at) AS last_event_at, '
+            '       (SELECT event_type FROM account_events ae2 '
+            '         WHERE ae2.account_name = account_events.account_name '
+            '         ORDER BY created_at DESC LIMIT 1) AS last_event_type '
+            '  FROM account_events '
+            ' WHERE created_at >= ? '
+            ' GROUP BY account_name',
+            (since,),
+        )
+
+        # Cap counts and status keyed by account_name
+        caps: dict[str, dict] = {}
+        for row in evt_rows:
+            account_name, cap_count, last_event_at, last_event_type = row
+            caps[account_name] = {
+                'cap_events': cap_count or 0,
+                'last_cap': last_event_at if cap_count and cap_count > 0 else None,
+                'status': 'capped' if last_event_type == 'cap_hit' else 'active',
+            }
+
+        result: dict[str, dict] = {}
+        for row in inv_rows:
+            account_name, spend, cnt = row
+            cap_info = caps.get(
+                account_name,
+                {'cap_events': 0, 'last_cap': None, 'status': 'active'},
+            )
+            result[account_name] = {
+                'spend': spend or 0.0,
+                'invocations': cnt or 0,
+                'cap_events': cap_info['cap_events'],
+                'last_cap': cap_info['last_cap'],
+                'status': cap_info['status'],
+            }
         return result
 
     return await with_db(db, _query, {})
