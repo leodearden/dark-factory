@@ -5657,7 +5657,21 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "shared/src/shared/cli_invoke.py",
+            "orchestrator/src/orchestrator/agents/invoke.py",
+            "shared/tests/test_cli_invoke.py",
+            "orchestrator/tests/test_invoke.py"
+          ],
+          "modules": [
+            "shared/src/shared",
+            "orchestrator/src/orchestrator/agents",
+            "shared/tests",
+            "orchestrator/tests"
+          ]
+        }
       },
       {
         "id": 307,
@@ -5668,7 +5682,19 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/costs.html",
+            "dashboard/src/dashboard/app.py",
+            "dashboard/tests/test_app.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates",
+            "dashboard/src/dashboard",
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 308,
