@@ -334,6 +334,69 @@ class TestDualWriteCallbackTemporalContext:
         assert batch[0]['payload'].get('temporal_context') is None
 
 
+class TestExecuteMem0ClassifyAndAddPlanningMetadata:
+    """step-9: _execute_mem0_classify_and_add adds planned=True to metadata when planning."""
+
+    @pytest.mark.asyncio
+    async def test_planning_temporal_context_adds_planned_metadata(self, service):
+        """When payload has temporal_context='planning', metadata must include planned=True."""
+        # Force classifier to route to Mem0 (use a Mem0-primary category)
+        payload = {
+            'fact_text': 'Always use type hints',
+            'project_id': 'test',
+            'temporal_context': 'planning',
+        }
+        await service._execute_mem0_classify_and_add(payload)
+
+        if service.mem0.add.called:
+            call_kwargs = service.mem0.add.call_args[1]
+            metadata = call_kwargs.get('metadata', {})
+            assert metadata.get('planned') is True, (
+                f'Expected planned=True in metadata, got: {metadata}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_no_temporal_context_no_planned_metadata(self, service):
+        """Without temporal_context, planned key must not be in metadata."""
+        payload = {
+            'fact_text': 'Always use type hints',
+            'project_id': 'test',
+            # no temporal_context
+        }
+        await service._execute_mem0_classify_and_add(payload)
+
+        if service.mem0.add.called:
+            call_kwargs = service.mem0.add.call_args[1]
+            metadata = call_kwargs.get('metadata', {})
+            assert 'planned' not in metadata, (
+                f'Unexpected planned key in metadata: {metadata}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_planning_routed_to_mem0_is_tagged(self, service):
+        """Specifically test a fact that should route to Mem0 gets planned=True."""
+        # Preferences/norms always route to Mem0; patch classifier to force it
+        from unittest.mock import AsyncMock, MagicMock
+        from fused_memory.models.enums import MemoryCategory
+        mock_classification = MagicMock()
+        mock_classification.primary = MemoryCategory.preferences_and_norms
+        mock_classification.secondary = None
+        mock_classification.confidence = 0.95
+        service.classifier.classify = AsyncMock(return_value=mock_classification)
+
+        payload = {
+            'fact_text': 'Always use type hints in Python',
+            'project_id': 'test',
+            'temporal_context': 'planning',
+        }
+        await service._execute_mem0_classify_and_add(payload)
+
+        service.mem0.add.assert_called_once()
+        call_kwargs = service.mem0.add.call_args[1]
+        metadata = call_kwargs.get('metadata', {})
+        assert metadata.get('planned') is True
+
+
 class TestReplayFromStore:
     @pytest.mark.asyncio
     async def test_replay_enqueues_mem0_memories(self, service):
