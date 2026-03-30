@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 from shared.config_models import AccountConfig, UsageCapConfig
@@ -47,6 +48,10 @@ def _make_gate(
     gate._paused_reason = ''
     gate._pause_started_at = None
     gate._total_pause_secs = 0.0
+    gate._cost_store = None
+    gate._project_id = None
+    gate._run_id = None
+    gate._last_account_name = None
     tokens = ['token-a', 'token-b', 'token-c']
     gate._accounts = [
         AccountState(name=f'max-{chr(97+i)}', token=tokens[i])
@@ -935,3 +940,44 @@ class TestParseResetsAtWithDate:
         assert dt is not None
         fallback = datetime.now(UTC) + timedelta(hours=1)
         assert abs((dt - fallback).total_seconds()) > 60
+
+
+# --- CostStore init / properties ---
+
+
+class TestCostStoreInit:
+    def test_init_accepts_cost_store_param(self):
+        """UsageGate.__init__ must accept an optional cost_store keyword arg."""
+        mock_cs = AsyncMock()
+        config = UsageCapConfig(wait_for_reset=False, accounts=[])
+        gate = UsageGate(config, cost_store=mock_cs)
+        assert gate._cost_store is mock_cs
+
+    def test_init_cost_store_defaults_to_none(self):
+        """cost_store defaults to None when not supplied."""
+        config = UsageCapConfig(wait_for_reset=False, accounts=[])
+        gate = UsageGate(config)
+        assert gate._cost_store is None
+
+    def test_project_id_defaults_to_none(self):
+        gate = _make_gate()
+        assert gate.project_id is None
+
+    def test_run_id_defaults_to_none(self):
+        gate = _make_gate()
+        assert gate.run_id is None
+
+    def test_project_id_setter(self):
+        gate = _make_gate()
+        gate.project_id = 'my-project'
+        assert gate.project_id == 'my-project'
+
+    def test_run_id_setter(self):
+        gate = _make_gate()
+        gate.run_id = 'run-abc-123'
+        assert gate.run_id == 'run-abc-123'
+
+    def test_last_account_name_defaults_to_none(self):
+        """_last_account_name is initialised to None."""
+        gate = _make_gate()
+        assert gate._last_account_name is None
