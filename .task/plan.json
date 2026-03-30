@@ -1,0 +1,182 @@
+{
+  "task_id": "298",
+  "title": "Dashboard data module for cost queries",
+  "files": [
+    "dashboard/src/dashboard/data/costs.py",
+    "dashboard/tests/test_costs_data.py"
+  ],
+  "modules": [
+    "dashboard/src/dashboard/data",
+    "dashboard/tests"
+  ],
+  "analysis": "Task 298 creates a new read-only data module (costs.py) with 7 async query functions for cost tracking data. The queries target the `invocations` and `account_events` tables created by CostStore (task 295, dependency) in the shared runs.db. The module follows the established patterns from performance.py and write_journal.py: each function takes `db: aiosqlite.Connection | None`, uses the `with_db()` wrapper from db.py for graceful None/error handling, and returns structured dicts for JSON serialization to FastAPI endpoints.\n\nThe CostStore schema (from git commit a46566f8) defines:\n- `invocations` table: id, run_id, task_id, project_id, account_name, model, role, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, duration_ms, capped, started_at, completed_at. Indexed on project_id, account_name, run_id.\n- `account_events` table: id, account_name, event_type, project_id, run_id, details, created_at. Indexed on account_name.\n\nThese tables coexist in runs.db alongside the RunStore tables (runs, task_results). The `get_run_cost_breakdown` function needs to LEFT JOIN invocations with task_results to retrieve task titles.\n\nTime window filtering uses direct date arithmetic (datetime.now(UTC) - timedelta(days=days)), matching the write_journal.py pattern. This is simpler than project-relative cutoffs and more appropriate for cost monitoring where you want to see actual recent spend.\n\nTests follow test_performance.py conventions: embedded schema constant, sync sqlite3 fixtures for DB creation, async aiosqlite connection fixtures, and test classes per function with populated/empty/None coverage.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Create test_costs_data.py with COSTS_SCHEMA constant (invocations + account_events + runs + task_results tables and indexes), populated fixture with multi-project/multi-account/multi-model test data, empty DB fixture, and async connection fixtures. No test methods yet \u2014 just the infrastructure.",
+      "status": "done",
+      "commit": "78f4d013",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write TestCostSummary class: test_populated verifies {project_id: {total_spend, avg_cost_per_task, active_accounts, cap_events}} structure and values against known fixture data; test_none_db verifies {} return; test_empty_db verifies {} return. Import get_cost_summary from dashboard.data.costs (will fail \u2014 module doesn't exist yet).",
+      "status": "done",
+      "commit": "9c11a563"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Create dashboard/src/dashboard/data/costs.py with module docstring, imports (aiosqlite, logging, datetime, with_db), logger, and implement get_cost_summary(). Uses SUM(cost_usd), COUNT(DISTINCT task_id), COUNT(DISTINCT account_name) from invocations + COUNT(*) from account_events WHERE event_type='cap_hit', grouped by project_id, filtered by completed_at >= cutoff.",
+      "status": "done",
+      "commit": "64d9326e"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write TestCostByProject class: test_populated verifies {project_id: [{model, total}]} with correct per-model totals from fixture data; test_none_db verifies {} return; test_multi_project verifies both projects appear.",
+      "status": "done",
+      "commit": "f488ae4e"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Implement get_cost_by_project(). Queries SELECT project_id, model, SUM(cost_usd) FROM invocations WHERE completed_at >= cutoff GROUP BY project_id, model ORDER BY total DESC. Returns {project_id: [{model: str, total: float}]}.",
+      "status": "done",
+      "commit": "73234191"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write TestCostByAccount class: test_populated verifies {account_name: {spend, invocations, cap_events, last_cap, status}} with correct aggregates per account; test_none_db verifies {} return; test_account_with_no_caps verifies cap_events=0 and last_cap=None.",
+      "status": "done",
+      "commit": "112c3862"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Implement get_cost_by_account(). Two queries: (1) SELECT account_name, SUM(cost_usd), COUNT(*) FROM invocations grouped by account_name; (2) SELECT account_name, COUNT(*), MAX(created_at) FROM account_events WHERE event_type='cap_hit' grouped by account_name. Merges results, derives status from most recent event (capped if last event is cap_hit with no subsequent resumed).",
+      "status": "done",
+      "commit": "953db408"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write TestCostByRole class: test_populated verifies {project_id: {role: {model: total}}} with correct nested breakdown; test_none_db verifies {} return; test_single_role verifies structure when only one role exists.",
+      "status": "done",
+      "commit": "6bfe6ef5"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Implement get_cost_by_role(). Queries SELECT project_id, role, model, SUM(cost_usd) FROM invocations WHERE completed_at >= cutoff GROUP BY project_id, role, model. Nests into {project_id: {role: {model: total}}}.",
+      "status": "done",
+      "commit": "ed4c20a5"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write TestCostTrend class: test_populated verifies {project_id: [{day, total}]} returns daily totals in chronological order; test_none_db verifies {} return; test_fills_gaps verifies missing days appear with total=0.",
+      "status": "done",
+      "commit": "6015be35"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Implement get_cost_trend(). Queries SELECT project_id, DATE(completed_at) as day, SUM(cost_usd) FROM invocations WHERE completed_at >= cutoff GROUP BY project_id, day ORDER BY day. Pre-fills all days in the window so the line chart has no gaps.",
+      "status": "done",
+      "commit": "7f56080e"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write TestAccountEvents class: test_populated verifies list of dicts [{account_name, event_type, project_id, run_id, details, created_at}] ordered by created_at DESC; test_none_db verifies [] return; test_filters_by_window verifies old events are excluded.",
+      "status": "done",
+      "commit": "14be78d8"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Implement get_account_events(). Simple SELECT from account_events WHERE created_at >= cutoff ORDER BY created_at DESC. Parses details JSON if present.",
+      "status": "done",
+      "commit": "6f88ee8b"
+    },
+    {
+      "id": "step-13",
+      "type": "test",
+      "description": "Write TestRunCostBreakdown class: test_populated verifies [{run_id, project_id, total_cost, tasks: [{task_id, title, cost, invocations: [...]}]}] with correct nesting, costs, and task titles from JOIN; test_none_db verifies [] return; test_null_task_id verifies invocations without task_id are grouped under a null/unassigned key.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-14",
+      "type": "impl",
+      "description": "Implement get_run_cost_breakdown(). Queries invocations LEFT JOIN task_results ON (invocations.run_id = task_results.run_id AND invocations.task_id = task_results.task_id) WHERE invocations.completed_at >= cutoff. Groups by run_id then task_id, includes all invocation detail rows. Returns total_cost per run as SUM.",
+      "status": "pending",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use direct date arithmetic (datetime.now(UTC) - timedelta(days=days)) for time window filtering instead of project-relative cutoffs",
+      "rationale": "Simpler implementation, matches write_journal.py pattern, and more appropriate for cost monitoring where users want to see actual recent spend rather than spend relative to last activity. The _project_cutoffs pattern from performance.py is designed for task completion data that may be stale; cost data benefits from absolute time windows."
+    },
+    {
+      "decision": "Embed full schema (runs + task_results + invocations + account_events) in test file rather than importing from conftest.py",
+      "rationale": "Follows test_performance.py convention where RUNS_SCHEMA is local to the test file. The costs test needs all four tables since they coexist in runs.db and get_run_cost_breakdown JOINs invocations with task_results. Keeping the schema self-contained avoids coupling test files."
+    },
+    {
+      "decision": "No changes to dashboard/src/dashboard/data/__init__.py",
+      "rationale": "The existing __init__.py is empty (no exports). All other data modules (performance.py, reconciliation.py, write_journal.py) are imported directly by consumers. Following established convention."
+    },
+    {
+      "decision": "get_cost_by_account derives status from account_events history rather than a separate status table",
+      "rationale": "The CostStore schema has no explicit status column. Status is inferred: if the most recent event for an account is 'cap_hit' (not followed by 'resumed'), status is 'capped'; otherwise 'active'. This avoids schema changes while providing useful status information."
+    },
+    {
+      "decision": "get_run_cost_breakdown uses LEFT JOIN with task_results for task titles",
+      "rationale": "The invocations table has task_id but no title. Task titles live in task_results (same runs.db). A LEFT JOIN ensures invocations without a matching task_result still appear (e.g., run-level invocations where task_id is NULL)."
+    },
+    {
+      "decision": "Two new files only \u2014 no existing file modifications",
+      "rationale": "This is a pure additive task. The costs.py module and its tests are self-contained. No routing/endpoint changes needed (those are a separate task). No conftest.py changes since cost-specific fixtures are local to the test file."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "with_db() wrapper",
+      "where": "dashboard/src/dashboard/data/db.py",
+      "how": "Import and use for all 7 query functions. Handles None db \u2192 default return, catches sqlite3.OperationalError and OSError."
+    },
+    {
+      "what": "Module structure pattern (imports, logger, inner _query functions)",
+      "where": "dashboard/src/dashboard/data/performance.py",
+      "how": "Follow exact same layout: __future__ annotations, logging, aiosqlite import, with_db import, logger = logging.getLogger(__name__), async def with inner async def _query."
+    },
+    {
+      "what": "Direct date arithmetic time window pattern",
+      "where": "dashboard/src/dashboard/data/write_journal.py",
+      "how": "Use datetime.now(UTC) - timedelta(days=days) to compute cutoff ISO string for WHERE clauses, same approach as write_journal's hours-based filtering."
+    },
+    {
+      "what": "Test fixture pattern (schema constant + sync setup + async connection)",
+      "where": "dashboard/tests/test_performance.py",
+      "how": "Define COSTS_SCHEMA as string constant, create populated/empty DB fixtures with sqlite3.connect + executescript, wrap with async aiosqlite.connect fixtures setting row_factory = aiosqlite.Row."
+    },
+    {
+      "what": "RunStore schema (runs + task_results tables)",
+      "where": "dashboard/tests/test_performance.py lines 23-59 (RUNS_SCHEMA constant)",
+      "how": "Include these CREATE TABLE statements in the COSTS_SCHEMA constant so get_run_cost_breakdown can LEFT JOIN with task_results for titles."
+    },
+    {
+      "what": "pytest.ini_options asyncio_mode=auto",
+      "where": "dashboard/pyproject.toml",
+      "how": "Already configured \u2014 async test functions work without explicit @pytest.mark.asyncio decorator, though including the marker is consistent with existing tests."
+    }
+  ],
+  "_session_id": "298-ed4906f9",
+  "_created_at": "2026-03-30T17:57:55.962819+00:00"
+}

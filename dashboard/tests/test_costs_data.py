@@ -234,6 +234,7 @@ from dashboard.data.costs import (  # noqa: E402
     get_cost_by_role,
     get_cost_summary,
     get_cost_trend,
+    get_run_cost_breakdown,
 )
 
 
@@ -528,3 +529,103 @@ class TestAccountEvents:
 
         assert len(result) == 1
         assert result[0]['account_name'] == 'max-a'
+
+
+# ---------------------------------------------------------------------------
+# Tests: get_run_cost_breakdown
+# ---------------------------------------------------------------------------
+
+class TestRunCostBreakdown:
+    @pytest.mark.asyncio
+    async def test_populated(self, costs_conn):
+        """Returns list of runs with per-task breakdown and task titles from JOIN."""
+        result = await get_run_cost_breakdown(costs_conn)
+
+        # Should return a list
+        assert isinstance(result, list)
+        assert len(result) == 2  # run-001 (dark_factory) and run-002 (reify)
+
+        # Find run-001
+        run001 = next((r for r in result if r['run_id'] == 'run-001'), None)
+        assert run001 is not None
+        assert run001['project_id'] == 'dark_factory'
+        assert run001['total_cost'] == pytest.approx(3.2, abs=1e-6)
+
+        # run-001 has 3 tasks
+        tasks = {t['task_id']: t for t in run001['tasks']}
+        assert '101' in tasks
+        assert '102' in tasks
+        assert '103' in tasks
+
+        # task 101: 1.00 + 0.50 = 1.50; title from task_results = 'Widget A'
+        t101 = tasks['101']
+        assert t101['cost'] == pytest.approx(1.5, abs=1e-6)
+        assert t101['title'] == 'Widget A'
+        assert isinstance(t101['invocations'], list)
+        assert len(t101['invocations']) == 2  # implementer + reviewer
+
+        # task 102: 0.80 + 0.30 = 1.10; title = 'Widget B'
+        t102 = tasks['102']
+        assert t102['cost'] == pytest.approx(1.1, abs=1e-6)
+        assert t102['title'] == 'Widget B'
+
+        # task 103: 0.60; title = 'Refactor C'
+        t103 = tasks['103']
+        assert t103['cost'] == pytest.approx(0.6, abs=1e-6)
+        assert t103['title'] == 'Refactor C'
+
+        # Find run-002
+        run002 = next((r for r in result if r['run_id'] == 'run-002'), None)
+        assert run002 is not None
+        assert run002['project_id'] == 'reify'
+        assert run002['total_cost'] == pytest.approx(0.4, abs=1e-6)
+        assert len(run002['tasks']) == 1
+        assert run002['tasks'][0]['task_id'] == '201'
+        assert run002['tasks'][0]['title'] == 'Reify task'
+
+    @pytest.mark.asyncio
+    async def test_none_db(self):
+        result = await get_run_cost_breakdown(None)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_null_task_id(self, tmp_path):
+        """Invocations with task_id=NULL are grouped under task_id=None."""
+        db_path = tmp_path / 'null_task.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+
+        # Insert a run
+        conn.execute(
+            'INSERT INTO runs (run_id, project_id, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?)',
+            ('r1', 'proj', (now - timedelta(hours=1)).isoformat(), now.isoformat()),
+        )
+        # Insert invocation with NULL task_id (run-level billing)
+        conn.execute(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('r1', None, 'proj', 'acc', 'claude-sonnet-4-5', 'orchestrator',
+             0.25, 0, (now - timedelta(minutes=30)).isoformat(), now.isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_run_cost_breakdown(aconn)
+
+        assert len(result) == 1
+        run = result[0]
+        assert run['run_id'] == 'r1'
+        assert run['total_cost'] == pytest.approx(0.25, abs=1e-6)
+
+        # Should have one task entry with task_id=None
+        assert len(run['tasks']) == 1
+        t = run['tasks'][0]
+        assert t['task_id'] is None
+        assert t['title'] is None
+        assert t['cost'] == pytest.approx(0.25, abs=1e-6)
