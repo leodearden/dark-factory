@@ -2951,11 +2951,11 @@
         "description": "The reconciliation Recent Runs table shows \"Loading...\" text between every run row. Detail rows use x-show=\"open\" with x-cloak and hx-trigger=\"revealed\", but Idiomorph morphing every 15s briefly makes hidden rows visible, triggering unnecessary HTMX fetches. The \"Loading...\" text from in-flight fetches remains visible.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 159-164).\n\nFix approach: (1) Change hx-trigger from \"revealed\" to a manual trigger fired by the Alpine @click handler (e.g. hx-trigger=\"load-detail\" and dispatch the event on click). This prevents morph-triggered fetches. (2) Use Alpine.store or id-based state preservation to maintain open/closed state across morphs.\n\nmemory_hint: search \"reconciliation detail HTMX\" for prior discussion.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-29T08:47:27.977Z",
+        "updatedAt": "2026-03-30T17:50:44.344Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/recon.html",
@@ -3516,11 +3516,11 @@
         "description": "test_sonnet_tier_selection_sets_consolidator_limits only covers the sonnet path (buffer size 0). Add coverage for:\n\n1. Opus tier: mock get_buffer_stats to return {'size': 16} and assert tier.model=='opus', episode_limit==500, memory_limit==1000\n2. Boundary: size==15 is the exact boundary (threshold * ratio = 10 * 1.5 = 15); test both sides (15 → sonnet, 16 → opus)\n3. Verify run_full_cycle propagates opus limits to MemoryConsolidator\n\nConsider using pytest.mark.parametrize with (size, expected_model, expected_ep_limit, expected_mem_limit) tuples to avoid test duplication.\n\nOrigin: review suggestion on task 200 (suggestion #9).\nmemory_hints: search for \"_select_tier\" and \"opus_threshold_ratio\" in reconciliation harness code; search for \"TierConfig\" defaults",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-29T09:00:46.860Z",
+        "updatedAt": "2026-03-30T17:50:44.375Z",
         "metadata": {
           "files": [
             "fused-memory/tests/test_harness.py"
@@ -5879,7 +5879,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-30T17:50:44.314Z",
+      "lastModified": "2026-03-30T17:50:44.375Z",
       "taskCount": 291,
       "completedCount": 262,
       "tags": [
