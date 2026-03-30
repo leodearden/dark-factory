@@ -1145,3 +1145,86 @@ class TestCostStoreResumedEvent:
         # Should complete cleanly with no AttributeError
         await gate._account_resume_probe_loop(acct)
         assert acct.capped is False
+
+
+# --- CostStore failover event ---
+
+
+class TestCostStoreFailoverEvent:
+    @pytest.mark.asyncio
+    async def test_failover_event_emitted_on_account_switch(self):
+        """When before_invoke switches accounts, a 'failover' event is emitted."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=2)
+        gate._cost_store = mock_cs
+
+        # First call — establishes max-a as last_account_name, no failover
+        token1 = await gate.before_invoke()
+        assert token1 == 'token-a'
+        assert gate._last_account_name == 'max-a'
+        mock_cs.save_account_event.assert_not_called()
+
+        # Cap max-a, second call should pick max-b and emit failover
+        gate._accounts[0].capped = True
+        token2 = await gate.before_invoke()
+        assert token2 == 'token-b'
+        assert gate._last_account_name == 'max-b'
+
+        mock_cs.save_account_event.assert_called_once()
+        call = mock_cs.save_account_event.call_args
+        event_type = call.kwargs.get('event_type') or call.args[1]
+        assert event_type == 'failover'
+
+    @pytest.mark.asyncio
+    async def test_no_failover_on_first_invoke(self):
+        """First call to before_invoke sets last_account_name but emits no event."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=2)
+        gate._cost_store = mock_cs
+
+        await gate.before_invoke()
+        mock_cs.save_account_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_failover_when_same_account(self):
+        """No failover event if same account is returned on consecutive calls."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=2)
+        gate._cost_store = mock_cs
+
+        await gate.before_invoke()
+        mock_cs.save_account_event.assert_not_called()
+
+        await gate.before_invoke()
+        mock_cs.save_account_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failover_details_has_from_and_to(self):
+        """details JSON should include 'from' and 'to' account names."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=2)
+        gate._cost_store = mock_cs
+
+        await gate.before_invoke()
+        gate._accounts[0].capped = True
+        await gate.before_invoke()
+
+        call = mock_cs.save_account_event.call_args
+        all_args = list(call.args) + list(call.kwargs.values())
+        import json as _json
+        details_str = next((a for a in all_args if isinstance(a, str) and 'from' in a), None)
+        assert details_str is not None
+        details = _json.loads(details_str)
+        assert details.get('from') == 'max-a'
+        assert details.get('to') == 'max-b'
+
+    @pytest.mark.asyncio
+    async def test_no_failover_event_without_cost_store(self):
+        """No error on failover when cost_store is None."""
+        gate = _make_gate(num_accounts=2)
+        assert gate._cost_store is None
+
+        await gate.before_invoke()
+        gate._accounts[0].capped = True
+        token = await gate.before_invoke()
+        assert token == 'token-b'  # failover happened silently
