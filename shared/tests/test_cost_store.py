@@ -196,6 +196,55 @@ class TestSaveAccountEvent:
 
 
 @pytest.mark.asyncio
+class TestConnectionReuse:
+    """step-13: aiosqlite.connect is called exactly once during open()."""
+
+    async def test_connect_called_once_for_multiple_saves(self, tmp_path: Path):
+        """Multiple save calls reuse the persistent connection; connect called once."""
+        db_path = tmp_path / 'costs.db'
+
+        real_connect = aiosqlite.connect
+        connect_call_count = 0
+
+        async def counting_connect(path):
+            nonlocal connect_call_count
+            connect_call_count += 1
+            return await real_connect(path)
+
+        with patch('shared.cost_store.aiosqlite.connect', side_effect=counting_connect):
+            async with CostStore(db_path) as store:
+                for i in range(3):
+                    await store.save_invocation(
+                        run_id=f'r{i}',
+                        task_id=None,
+                        project_id='p',
+                        account_name='a',
+                        model='m',
+                        role='r',
+                        cost_usd=0.0,
+                        input_tokens=None,
+                        output_tokens=None,
+                        cache_read_tokens=None,
+                        cache_create_tokens=None,
+                        duration_ms=0,
+                        capped=False,
+                        started_at='2024-01-01T00:00:00',
+                        completed_at='2024-01-01T00:00:00',
+                    )
+                for i in range(2):
+                    await store.save_account_event(
+                        account_name='a',
+                        event_type='cap_hit',
+                        project_id=None,
+                        run_id=None,
+                        details=None,
+                        created_at='2024-01-01T00:00:00',
+                    )
+
+        assert connect_call_count == 1
+
+
+@pytest.mark.asyncio
 class TestCostStoreNotOpenedGuard:
     """step-7: save methods raise RuntimeError when called before open()."""
 
