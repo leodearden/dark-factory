@@ -227,6 +227,83 @@ class TestStewardCapHitBackoff:
 
 
 # ---------------------------------------------------------------------------
+# Account Name Threading
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardAccountName:
+
+    async def test_account_name_set_on_result(self, steward, worktree, mock_mcp):
+        """_invoke_with_session stamps account_name from usage_gate on the result."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='token-a')
+        gate.active_account_name = 'max-d'
+        gate.detect_cap_hit = MagicMock(return_value=False)
+        gate.on_agent_complete = MagicMock()
+        steward.usage_gate = gate
+
+        esc = _make_escalation()
+        mcp_config = mock_mcp.mcp_config_json()
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(session_id='sess-x')
+            result = await steward._invoke_with_session(
+                prompt='test prompt',
+                cwd=worktree,
+                mcp_config=mcp_config,
+                per_invocation_budget=2.0,
+                escalation=esc,
+            )
+
+        assert result.account_name == 'max-d'
+
+    async def test_account_name_reflects_failover_on_cap_hit(
+        self, steward, worktree, mock_mcp, mock_briefing,
+    ):
+        """After cap hit + session reset, account_name reflects the retry account."""
+        from unittest.mock import PropertyMock
+
+        from orchestrator.steward import _CAP_HIT_COOLDOWN_SECS
+
+        call_count = 0
+
+        def detect_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return call_count == 1  # cap hit on first call only
+
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='token-a')
+        gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
+        gate.on_agent_complete = MagicMock()
+        # active_account_name is read twice in cap-hit path: once for capture (loop 1),
+        # once inside continue path (loop 2 capture)
+        type(gate).active_account_name = PropertyMock(
+            side_effect=['max-d', 'max-c'],
+        )
+        steward.usage_gate = gate
+
+        esc = _make_escalation()
+        mcp_config = mock_mcp.mcp_config_json()
+
+        with (
+            patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
+            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_invoke.return_value = _make_result(session_id='sess-new')
+            result = await steward._invoke_with_session(
+                prompt='test prompt',
+                cwd=worktree,
+                mcp_config=mcp_config,
+                per_invocation_budget=2.0,
+                escalation=esc,
+            )
+
+        assert result.account_name == 'max-c'
+
+
+# ---------------------------------------------------------------------------
 # Retry Logic
 # ---------------------------------------------------------------------------
 
