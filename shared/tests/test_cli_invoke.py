@@ -95,6 +95,23 @@ class TestAccountNameThreading:
 
 
 @pytest.mark.asyncio
+class TestAccountNameNoGate:
+
+    async def test_account_name_empty_without_gate(self):
+        """When usage_gate=None, result.account_name is ''."""
+        result = _make_result()
+
+        with patch(
+            'shared.cli_invoke.invoke_claude_agent',
+            new_callable=AsyncMock,
+            return_value=result,
+        ):
+            got = await invoke_with_cap_retry(None, 'test-label', prompt='hi')
+
+        assert got.account_name == ''
+
+
+@pytest.mark.asyncio
 class TestCapHitBackoff:
 
     async def test_sleeps_before_retry_on_cap_hit(self):
