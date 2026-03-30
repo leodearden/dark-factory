@@ -6,7 +6,27 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from shared.cli_invoke import _CAP_HIT_COOLDOWN_SECS, AgentResult, invoke_with_cap_retry
+from shared.cli_invoke import (
+    _CAP_HIT_COOLDOWN_SECS,
+    AgentResult,
+    _to_token_count,
+    invoke_with_cap_retry,
+)
+
+
+class TestToTokenCount:
+
+    def test_zero_returns_none(self):
+        """_to_token_count(0) returns None — zero means provider did not report."""
+        assert _to_token_count(0) is None
+
+    def test_none_returns_none(self):
+        """_to_token_count(None) returns None — provider did not report."""
+        assert _to_token_count(None) is None
+
+    def test_positive_int_returned_unchanged(self):
+        """_to_token_count(42) returns 42 — real token count passes through."""
+        assert _to_token_count(42) == 42
 
 
 def _make_result(**overrides) -> AgentResult:

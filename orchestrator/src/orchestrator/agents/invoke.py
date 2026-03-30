@@ -22,6 +22,7 @@ from shared.cli_invoke import (  # noqa: F401
     _parse_claude_output,
     _run_subprocess,
     _SubprocessResult,
+    _to_token_count,
     invoke_claude_agent,
 )
 
@@ -358,9 +359,9 @@ def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
 
         elif event_type == 'turn.completed':
             num_turns += 1
-            usage = event.get('usage', {})
-            total_input_tokens += usage.get('input_tokens', 0)
-            total_output_tokens += usage.get('output_tokens', 0)
+            usage = event.get('usage') or {}
+            total_input_tokens += _to_token_count(usage.get('input_tokens', 0)) or 0
+            total_output_tokens += _to_token_count(usage.get('output_tokens', 0)) or 0
 
         elif event_type == 'error':
             is_error = True
@@ -475,9 +476,9 @@ def _parse_gemini_output(result: _SubprocessResult, model: str) -> AgentResult:
 
     # Gemini output: {"response": "...", "stats": {"input_tokens": N, "output_tokens": N}}
     output_text = data.get('response', data.get('result', ''))
-    stats = data.get('stats', {})
-    input_tokens = stats.get('input_tokens', 0)
-    output_tokens = stats.get('output_tokens', 0)
+    stats = data.get('stats') or {}
+    input_tokens = _to_token_count(stats.get('input_tokens', 0)) or 0
+    output_tokens = _to_token_count(stats.get('output_tokens', 0)) or 0
 
     rates = _MODEL_COSTS.get(model, {'input': 1.0, 'output': 4.0})
     cost = (input_tokens * rates['input'] + output_tokens * rates['output']) / 1_000_000
