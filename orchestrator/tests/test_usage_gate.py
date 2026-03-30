@@ -981,3 +981,80 @@ class TestCostStoreInit:
         """_last_account_name is initialised to None."""
         gate = _make_gate()
         assert gate._last_account_name is None
+
+
+# --- CostStore cap_hit event ---
+
+
+class TestCostStoreCapHitEvent:
+    @pytest.mark.asyncio
+    async def test_cap_hit_calls_save_account_event(self):
+        """detect_cap_hit fires save_account_event('cap_hit') when cost_store is set."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=1)
+        gate._cost_store = mock_cs
+        gate._project_id = 'proj-1'
+        gate._run_id = 'run-42'
+
+        gate.detect_cap_hit(
+            "You've hit your usage limit resets in 3h", '', 'claude', 'token-a',
+        )
+        # Drain the fire-and-forget task
+        await asyncio.sleep(0)
+
+        mock_cs.save_account_event.assert_called_once()
+        call_kwargs = mock_cs.save_account_event.call_args
+        assert call_kwargs.kwargs.get('account_name', call_kwargs.args[0] if call_kwargs.args else None) == 'max-a' or \
+               call_kwargs.args[0] == 'max-a'
+        # event_type must be 'cap_hit'
+        event_type = call_kwargs.kwargs.get('event_type') or call_kwargs.args[1]
+        assert event_type == 'cap_hit'
+
+    @pytest.mark.asyncio
+    async def test_cap_hit_event_carries_project_and_run_ids(self):
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=1)
+        gate._cost_store = mock_cs
+        gate._project_id = 'dark_factory'
+        gate._run_id = 'run-99'
+
+        gate.detect_cap_hit(
+            "You've hit your usage limit resets in 1h", '', 'claude', 'token-a',
+        )
+        await asyncio.sleep(0)
+
+        call = mock_cs.save_account_event.call_args
+        # project_id and run_id must be passed
+        all_args = list(call.args) + list(call.kwargs.values())
+        assert 'dark_factory' in all_args
+        assert 'run-99' in all_args
+
+    @pytest.mark.asyncio
+    async def test_cap_hit_event_details_contains_reason(self):
+        """details field should be a JSON string containing the cap reason."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=1)
+        gate._cost_store = mock_cs
+
+        gate.detect_cap_hit(
+            "You've hit your usage limit", '', 'claude', 'token-a',
+        )
+        await asyncio.sleep(0)
+
+        call = mock_cs.save_account_event.call_args
+        # Find the details arg (should be a JSON string with 'reason' key)
+        all_args = list(call.args) + list(call.kwargs.values())
+        details_str = next((a for a in all_args if isinstance(a, str) and 'reason' in a), None)
+        assert details_str is not None
+        import json as _json
+        details = _json.loads(details_str)
+        assert 'reason' in details
+
+    @pytest.mark.asyncio
+    async def test_no_cap_hit_event_without_cost_store(self):
+        """No event emitted and no error raised when cost_store is None."""
+        gate = _make_gate(num_accounts=1)
+        assert gate._cost_store is None
+        # Should complete without error
+        gate.detect_cap_hit("You've hit your usage limit", '', 'claude', 'token-a')
+        await asyncio.sleep(0)  # no tasks to drain, but no error either
