@@ -367,3 +367,33 @@ class TestCostStoreOpenClose:
             assert nested.exists()
         finally:
             await store.close()
+
+    async def test_open_no_leak_on_setup_error(self, tmp_path: Path):
+        """If executescript raises after connect, conn is closed and _conn stays None."""
+        store = CostStore(tmp_path / 'costs.db')
+        real_connect = aiosqlite.connect
+        close_called = False
+
+        async def fake_connect(path):
+            nonlocal close_called
+            conn = await real_connect(path)
+            original_close = conn.close
+
+            async def tracking_close():
+                nonlocal close_called
+                close_called = True
+                await original_close()
+
+            async def failing_executescript(_sql: str) -> None:
+                raise RuntimeError('schema failure')
+
+            conn.close = tracking_close
+            conn.executescript = failing_executescript
+            return conn
+
+        with patch('shared.cost_store.aiosqlite.connect', side_effect=fake_connect):
+            with pytest.raises(RuntimeError, match='schema failure'):
+                await store.open()
+
+        assert store._conn is None, '_conn should remain None on setup failure'
+        assert close_called, 'Connection must be closed to prevent resource leak'
