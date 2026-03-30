@@ -2920,11 +2920,11 @@
         "description": "Regression: The orchestrator card renders the task table visible on load but the toggle button says \"Show tasks\". Clicking toggles to \"Hide tasks\" (still visible), then a second click hides the table correctly. On HTMX refresh (every 10s), state resets to the broken initial state. The Alpine x-data state is lost on morph.",
         "details": "Files: dashboard/src/dashboard/templates/partials/orchestrators.html.\n\nTwo issues: (1) Initial Alpine state should default to table hidden (x-show with open:false, but the table HTML is not wrapped in x-show or the logic is inverted). (2) Alpine state resets on every HTMX morph because Idiomorph replaces the x-data element, losing the toggled state. Fix: use Alpine.store('panels') which persists across morphs, or use hx-swap=\"morph:outerHTML\" which Idiomorph handles better for preserving Alpine state.\n\nmemory_hint: search \"Alpine state HTMX morph\" for prior patterns.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-30T17:50:44.314Z",
+        "updatedAt": "2026-03-30T17:50:44.891Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/orchestrators.html",
@@ -5482,7 +5482,7 @@
         "description": "In shared/src/shared/usage_gate.py, accept optional cost_store: CostStore | None = None in UsageGate.__init__ and store as self._cost_store. In _handle_cap_detected, if cost_store is set, call await cost_store.save_account_event(account_name, 'cap_hit', project_id, run_id, details_json, now). In _account_resume_probe_loop on successful resume, write 'resumed' event. When switching to the next account in before_invoke (failover), write 'failover' event with details including the from/to account names. project_id and run_id should be settable properties on UsageGate (set by harness at run start). Update tests in orchestrator/tests/test_usage_gate.py to verify events are written on cap, resume, and failover.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "295"
         ],
@@ -5509,7 +5509,7 @@
             ]
           }
         },
-        "updatedAt": "2026-03-30T17:50:44.464Z"
+        "updatedAt": "2026-03-30T17:50:44.824Z"
       },
       {
         "id": "301",
@@ -5880,7 +5880,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-30T17:50:44.735Z",
+      "lastModified": "2026-03-30T17:50:44.891Z",
       "taskCount": 291,
       "completedCount": 262,
       "tags": [
