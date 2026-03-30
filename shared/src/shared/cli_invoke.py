@@ -21,6 +21,7 @@ _CAP_HIT_COOLDOWN_SECS = 5.0
 
 __all__ = [
     'AgentResult',
+    '_to_token_count',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
 ]
@@ -28,6 +29,15 @@ __all__ = [
 
 @dataclass
 class AgentResult:
+    """Structured result from a CLI agent invocation.
+
+    Token-count convention: ``None`` means the provider did not report a
+    value.  The helper :func:`_to_token_count` normalises both ``0`` and
+    ``None`` to ``None`` because zero tokens are impossible in practice —
+    if a field is zero it means the provider omitted it.  This convention
+    prevents silent cost under-reporting caused by summing ``None`` as 0.
+    """
+
     success: bool
     output: str
     cost_usd: float = 0.0
@@ -38,6 +48,11 @@ class AgentResult:
     subtype: str = ''
     stderr: str = ''
     account_name: str = ''
+
+
+def _to_token_count(v: int | None) -> int | None:
+    """Normalise a token count: 0 and None both mean the provider did not report."""
+    return v or None
 
 
 @dataclass
