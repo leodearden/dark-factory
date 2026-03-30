@@ -27,6 +27,44 @@ class TestCostStoreInit:
 
 
 @pytest.mark.asyncio
+class TestCostStoreNotOpenedGuard:
+    """step-7: save methods raise RuntimeError when called before open()."""
+
+    async def test_save_invocation_raises_if_not_opened(self, tmp_path: Path):
+        store = CostStore(tmp_path / 'costs.db')
+        with pytest.raises(RuntimeError, match='CostStore not opened'):
+            await store.save_invocation(
+                run_id='r1',
+                task_id=None,
+                project_id='proj',
+                account_name='acct',
+                model='claude-3',
+                role='agent',
+                cost_usd=0.01,
+                input_tokens=None,
+                output_tokens=None,
+                cache_read_tokens=None,
+                cache_create_tokens=None,
+                duration_ms=100,
+                capped=False,
+                started_at='2024-01-01T00:00:00',
+                completed_at='2024-01-01T00:00:01',
+            )
+
+    async def test_save_account_event_raises_if_not_opened(self, tmp_path: Path):
+        store = CostStore(tmp_path / 'costs.db')
+        with pytest.raises(RuntimeError, match='CostStore not opened'):
+            await store.save_account_event(
+                account_name='acct',
+                event_type='cap_hit',
+                project_id=None,
+                run_id=None,
+                details=None,
+                created_at='2024-01-01T00:00:00',
+            )
+
+
+@pytest.mark.asyncio
 class TestCostStoreContextManager:
     """step-5: async context manager opens on enter, closes on exit."""
 
