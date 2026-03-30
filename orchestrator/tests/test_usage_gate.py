@@ -1058,3 +1058,90 @@ class TestCostStoreCapHitEvent:
         # Should complete without error
         gate.detect_cap_hit("You've hit your usage limit", '', 'claude', 'token-a')
         await asyncio.sleep(0)  # no tasks to drain, but no error either
+
+
+# --- CostStore resumed event ---
+
+
+class TestCostStoreResumedEvent:
+    @pytest.mark.asyncio
+    async def test_resumed_event_after_past_reset(self):
+        """'resumed' event is emitted when probe uncaps after resets_at has passed."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=1)
+        gate._cost_store = mock_cs
+        gate._project_id = 'proj-x'
+        gate._run_id = 'run-r1'
+
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)  # past
+
+        await gate._account_resume_probe_loop(acct)
+
+        mock_cs.save_account_event.assert_called_once()
+        call = mock_cs.save_account_event.call_args
+        event_type = call.kwargs.get('event_type') or call.args[1]
+        assert event_type == 'resumed'
+        account_name = call.kwargs.get('account_name') or call.args[0]
+        assert account_name == 'max-a'
+
+    @pytest.mark.asyncio
+    async def test_resumed_event_optimistic_probe(self):
+        """'resumed' event is emitted on optimistic probe (resets_at in future)."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(probe_interval_secs=1, max_probe_interval_secs=10,
+                          num_accounts=1)
+        gate._cost_store = mock_cs
+
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) + timedelta(hours=5)  # future
+
+        await asyncio.wait_for(
+            gate._account_resume_probe_loop(acct), timeout=3.0,
+        )
+
+        mock_cs.save_account_event.assert_called_once()
+        call = mock_cs.save_account_event.call_args
+        event_type = call.kwargs.get('event_type') or call.args[1]
+        assert event_type == 'resumed'
+
+    @pytest.mark.asyncio
+    async def test_resumed_event_details_has_label(self):
+        """details JSON should include 'label' key describing the resume type."""
+        mock_cs = AsyncMock()
+        gate = _make_gate(num_accounts=1)
+        gate._cost_store = mock_cs
+
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
+
+        await gate._account_resume_probe_loop(acct)
+
+        call = mock_cs.save_account_event.call_args
+        all_args = list(call.args) + list(call.kwargs.values())
+        import json as _json
+        details_str = next((a for a in all_args if isinstance(a, str) and 'label' in a), None)
+        assert details_str is not None
+        details = _json.loads(details_str)
+        assert 'label' in details
+
+    @pytest.mark.asyncio
+    async def test_no_resumed_event_without_cost_store(self):
+        """No error when cost_store is None and probe loop completes."""
+        gate = _make_gate(num_accounts=1)
+        assert gate._cost_store is None
+
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.pause_started_at = datetime.now(UTC)
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
+
+        # Should complete cleanly with no AttributeError
+        await gate._account_resume_probe_loop(acct)
+        assert acct.capped is False
