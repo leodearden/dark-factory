@@ -27,6 +27,111 @@ class TestCostStoreInit:
 
 
 @pytest.mark.asyncio
+class TestSaveInvocation:
+    """step-9: save_invocation() persists a row with all 15 fields."""
+
+    async def test_save_invocation_full_row(self, tmp_path: Path):
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await store.save_invocation(
+                run_id='run-abc',
+                task_id='task-42',
+                project_id='dark_factory',
+                account_name='max-d',
+                model='claude-3-5-sonnet',
+                role='agent',
+                cost_usd=0.123,
+                input_tokens=500,
+                output_tokens=200,
+                cache_read_tokens=100,
+                cache_create_tokens=50,
+                duration_ms=1234,
+                capped=False,
+                started_at='2024-01-01T00:00:00',
+                completed_at='2024-01-01T00:00:01',
+            )
+            # Verify via raw SQL
+            async with store._conn.execute(
+                'SELECT run_id, task_id, project_id, account_name, model, role, '
+                'cost_usd, input_tokens, output_tokens, cache_read_tokens, '
+                'cache_create_tokens, duration_ms, capped, started_at, completed_at '
+                'FROM invocations'
+            ) as cur:
+                row = await cur.fetchone()
+        assert row[0] == 'run-abc'
+        assert row[1] == 'task-42'
+        assert row[2] == 'dark_factory'
+        assert row[3] == 'max-d'
+        assert row[4] == 'claude-3-5-sonnet'
+        assert row[5] == 'agent'
+        assert abs(row[6] - 0.123) < 1e-9
+        assert row[7] == 500
+        assert row[8] == 200
+        assert row[9] == 100
+        assert row[10] == 50
+        assert row[11] == 1234
+        assert row[12] == 0  # capped=False stored as 0
+        assert row[13] == '2024-01-01T00:00:00'
+        assert row[14] == '2024-01-01T00:00:01'
+
+    async def test_save_invocation_nullable_fields(self, tmp_path: Path):
+        """task_id and token counts can be None."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await store.save_invocation(
+                run_id='run-xyz',
+                task_id=None,
+                project_id='p',
+                account_name='a',
+                model='m',
+                role='r',
+                cost_usd=0.0,
+                input_tokens=None,
+                output_tokens=None,
+                cache_read_tokens=None,
+                cache_create_tokens=None,
+                duration_ms=0,
+                capped=True,
+                started_at='2024-01-01T00:00:00',
+                completed_at='2024-01-01T00:00:00',
+            )
+            async with store._conn.execute(
+                'SELECT task_id, input_tokens, output_tokens, cache_read_tokens, '
+                'cache_create_tokens, capped FROM invocations'
+            ) as cur:
+                row = await cur.fetchone()
+        assert row[0] is None
+        assert row[1] is None
+        assert row[2] is None
+        assert row[3] is None
+        assert row[4] is None
+        assert row[5] == 1  # capped=True stored as 1
+
+    async def test_save_invocation_multiple_rows(self, tmp_path: Path):
+        """Multiple invocations saved in same session."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            for i in range(3):
+                await store.save_invocation(
+                    run_id=f'run-{i}',
+                    task_id=None,
+                    project_id='p',
+                    account_name='a',
+                    model='m',
+                    role='r',
+                    cost_usd=float(i),
+                    input_tokens=None,
+                    output_tokens=None,
+                    cache_read_tokens=None,
+                    cache_create_tokens=None,
+                    duration_ms=i * 100,
+                    capped=False,
+                    started_at='2024-01-01T00:00:00',
+                    completed_at='2024-01-01T00:00:00',
+                )
+            async with store._conn.execute('SELECT COUNT(*) FROM invocations') as cur:
+                (count,) = await cur.fetchone()
+        assert count == 3
+
+
+@pytest.mark.asyncio
 class TestCostStoreNotOpenedGuard:
     """step-7: save methods raise RuntimeError when called before open()."""
 
