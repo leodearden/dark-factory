@@ -728,8 +728,14 @@ class MemoryService:
         agent_id: str | None = None,
         session_id: str | None = None,
         causation_id: str | None = None,
+        include_planned: bool = False,
     ) -> list[MemoryResult]:
-        """Unified search across both stores with automatic fan-out."""
+        """Unified search across both stores with automatic fan-out.
+
+        When include_planned=False (default), edges and memories from planning
+        episodes (temporal_context='planning') are excluded.  Set include_planned=True
+        to include them — useful for reconciliation and auditing.
+        """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
 
         # Determine routing
@@ -744,12 +750,12 @@ class MemoryService:
         if SourceStore.graphiti in route.stores:
             store_list.append(SourceStore.graphiti)
             task_list.append(asyncio.create_task(
-                self._search_graphiti(query, scope, limit)
+                self._search_graphiti(query, scope, limit, include_planned=include_planned)
             ))
         if SourceStore.mem0 in route.stores:
             store_list.append(SourceStore.mem0)
             task_list.append(asyncio.create_task(
-                self._search_mem0(query, scope, limit)
+                self._search_mem0(query, scope, limit, include_planned=include_planned)
             ))
 
         results: list[MemoryResult] = []
@@ -823,14 +829,27 @@ class MemoryService:
         return final
 
     async def _search_graphiti(
-        self, query: str, scope: Scope, limit: int
+        self, query: str, scope: Scope, limit: int, include_planned: bool = False
     ) -> list[MemoryResult]:
-        """Search Graphiti and convert results to MemoryResult."""
+        """Search Graphiti and convert results to MemoryResult.
+
+        When include_planned=False (default), edges whose entire provenance is
+        composed of planned-only episodes are excluded.  When include_planned=True,
+        those edges are returned and marked with metadata['planned'] = True.
+        """
         edges = await self.graphiti.search(
             query=query,
             group_ids=[scope.graphiti_group_id],
             num_results=limit,
         )
+
+        # Fetch planned UUIDs once (avoid per-edge DB hits).
+        planned_uuids: set[str] = set()
+        if self.planned_episode_registry is not None:
+            planned_uuids = await self.planned_episode_registry.get_planned_uuids(
+                scope.graphiti_group_id
+            )
+
         results = []
         for i, edge in enumerate(edges):
             fact = getattr(edge, 'fact', str(edge))
@@ -851,8 +870,21 @@ class MemoryService:
             episodes = getattr(edge, 'episodes', None) or []
             provenance = [str(ep) for ep in episodes]
 
+            # Determine whether this edge is purely aspirational (all episodes planned).
+            is_planned_edge = bool(provenance) and all(
+                ep in planned_uuids for ep in provenance
+            )
+
+            if is_planned_edge and not include_planned:
+                # Skip planning-only edges in normal search results.
+                continue
+
             # Score: rank-based (no explicit score from Graphiti search)
             score = max(0.0, 1.0 - (i * 0.05))
+
+            metadata: dict[str, Any] = {}
+            if is_planned_edge:
+                metadata['planned'] = True
 
             results.append(MemoryResult(
                 id=getattr(edge, 'uuid', str(i)),
@@ -863,13 +895,18 @@ class MemoryService:
                 provenance=provenance,
                 temporal=temporal,
                 entities=entities,
+                metadata=metadata,
             ))
         return results
 
     async def _search_mem0(
-        self, query: str, scope: Scope, limit: int
+        self, query: str, scope: Scope, limit: int, include_planned: bool = False
     ) -> list[MemoryResult]:
-        """Search Mem0 and convert results to MemoryResult."""
+        """Search Mem0 and convert results to MemoryResult.
+
+        When include_planned=False (default), results tagged with planned=True
+        in their metadata are excluded.  When include_planned=True they are returned.
+        """
         response = await self.mem0.search(query=query, scope=scope, limit=limit)
         mem0_results = response.get('results', [])
         results = []
@@ -877,6 +914,10 @@ class MemoryService:
             content = item.get('memory', '')
             score = float(item.get('score', 0.0))
             meta = item.get('metadata', {}) or {}
+
+            # Filter out planning-tagged results unless explicitly requested.
+            if meta.get('planned') is True and not include_planned:
+                continue
 
             category = None
             if 'category' in meta:
