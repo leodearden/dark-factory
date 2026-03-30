@@ -427,6 +427,7 @@ class MemoryService:
                     'agent_id': payload.get('agent_id'),
                     'session_id': payload.get('session_id'),
                     '_causation_id': payload.get('_causation_id'),
+                    'temporal_context': payload.get('temporal_context'),
                 },
             }
             for edge in edges
