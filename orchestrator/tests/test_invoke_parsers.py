@@ -64,3 +64,22 @@ class TestParseCodexNullUsage:
         # Must not raise AttributeError
         agent_result = _parse_codex_output(result, 'o4-mini')
         assert agent_result.success is True
+
+
+class TestParseCodexValidUsage:
+
+    def test_valid_usage_computes_nonzero_cost_and_turns(self):
+        """_parse_codex_output computes non-zero cost and turns == 1 for real usage."""
+        events = [
+            {'type': 'thread.started', 'thread_id': 'tid-2'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'done'}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 200, 'output_tokens': 100}},
+        ]
+        payload = '\n'.join(json.dumps(e) for e in events)
+        result = _make_subprocess_result(stdout=payload)
+        agent_result = _parse_codex_output(result, 'o4-mini')
+        assert agent_result.success is True
+        assert agent_result.turns == 1
+        # o4-mini: input=1.10/1M, output=4.40/1M
+        # cost = (200 * 1.10 + 100 * 4.40) / 1_000_000 = 0.00066
+        assert agent_result.cost_usd > 0.0
