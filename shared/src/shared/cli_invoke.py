@@ -99,8 +99,10 @@ async def invoke_with_cap_retry(
     """
     while True:
         oauth_token = None
+        account_name = ''
         if usage_gate:
             oauth_token = await usage_gate.before_invoke()
+            account_name = usage_gate.active_account_name or ''
 
         result = await invoke_claude_agent(**invoke_kwargs, oauth_token=oauth_token)
 
@@ -125,6 +127,7 @@ async def invoke_with_cap_retry(
             usage_gate.on_agent_complete(result.cost_usd)
         break
 
+    result.account_name = account_name
     return result
 
 
