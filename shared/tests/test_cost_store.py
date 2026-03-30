@@ -132,6 +132,70 @@ class TestSaveInvocation:
 
 
 @pytest.mark.asyncio
+class TestSaveAccountEvent:
+    """step-11: save_account_event() persists a row with all 6 fields."""
+
+    async def test_save_account_event_full_row(self, tmp_path: Path):
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await store.save_account_event(
+                account_name='max-d',
+                event_type='cap_hit',
+                project_id='dark_factory',
+                run_id='run-abc',
+                details='{"reset_at": "2024-01-01T05:00:00"}',
+                created_at='2024-01-01T00:00:00',
+            )
+            async with store._conn.execute(
+                'SELECT account_name, event_type, project_id, run_id, details, created_at '
+                'FROM account_events'
+            ) as cur:
+                row = await cur.fetchone()
+        assert row[0] == 'max-d'
+        assert row[1] == 'cap_hit'
+        assert row[2] == 'dark_factory'
+        assert row[3] == 'run-abc'
+        assert row[4] == '{"reset_at": "2024-01-01T05:00:00"}'
+        assert row[5] == '2024-01-01T00:00:00'
+
+    async def test_save_account_event_nullable_fields(self, tmp_path: Path):
+        """project_id, run_id, and details can be None."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await store.save_account_event(
+                account_name='max-c',
+                event_type='switch',
+                project_id=None,
+                run_id=None,
+                details=None,
+                created_at='2024-06-15T12:00:00',
+            )
+            async with store._conn.execute(
+                'SELECT project_id, run_id, details FROM account_events'
+            ) as cur:
+                row = await cur.fetchone()
+        assert row[0] is None
+        assert row[1] is None
+        assert row[2] is None
+
+    async def test_save_account_event_multiple_rows(self, tmp_path: Path):
+        """Multiple events saved in same session."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            for evt in ('cap_hit', 'switch', 'resume'):
+                await store.save_account_event(
+                    account_name='max-d',
+                    event_type=evt,
+                    project_id=None,
+                    run_id=None,
+                    details=None,
+                    created_at='2024-01-01T00:00:00',
+                )
+            async with store._conn.execute(
+                'SELECT COUNT(*) FROM account_events'
+            ) as cur:
+                (count,) = await cur.fetchone()
+        assert count == 3
+
+
+@pytest.mark.asyncio
 class TestCostStoreNotOpenedGuard:
     """step-7: save methods raise RuntimeError when called before open()."""
 
