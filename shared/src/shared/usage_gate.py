@@ -396,6 +396,7 @@ class UsageGate:
         label = 'reset time passed' if past_reset else f'optimistic probe #{acct.probe_count}'
         logger.info(f'Account {acct.name} RESUMED ({label})')
         self._open.set()
+        await self._write_cost_event(acct.name, 'resumed', json.dumps({'label': label}))
 
     async def shutdown(self) -> None:
         """Cancel all resume probe tasks."""
