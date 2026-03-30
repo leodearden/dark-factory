@@ -80,21 +80,66 @@ class PlannedEpisodeRegistry:
     # ------------------------------------------------------------------
 
     async def register(self, episode_uuid: str, project_id: str) -> None:
-        """Register an episode as planned (idempotent)."""
-        raise NotImplementedError
+        """Register an episode as planned (idempotent).
+
+        Uses INSERT OR IGNORE to handle duplicate calls without raising.
+        """
+        assert self._db is not None
+        from datetime import UTC, datetime
+        created_at = datetime.now(UTC).isoformat()
+        await self._db.execute(
+            'INSERT OR IGNORE INTO planned_episodes (episode_uuid, project_id, created_at) '
+            'VALUES (?, ?, ?)',
+            (episode_uuid, project_id, created_at),
+        )
+        await self._db.commit()
+        logger.debug('Registered planned episode %s for project %s', episode_uuid, project_id)
 
     async def is_planned(self, episode_uuid: str) -> bool:
         """Return True if the episode is registered as planned."""
-        raise NotImplementedError
+        assert self._db is not None
+        cursor = await self._db.execute(
+            'SELECT 1 FROM planned_episodes WHERE episode_uuid = ? LIMIT 1',
+            (episode_uuid,),
+        )
+        row = await cursor.fetchone()
+        return row is not None
 
     async def get_planned_uuids(self, project_id: str) -> set[str]:
         """Return the set of planned episode UUIDs for a project."""
-        raise NotImplementedError
+        assert self._db is not None
+        cursor = await self._db.execute(
+            'SELECT episode_uuid FROM planned_episodes WHERE project_id = ?',
+            (project_id,),
+        )
+        rows = await cursor.fetchall()
+        return {row[0] for row in rows}
 
     async def promote(self, episode_uuid: str) -> None:
         """Remove an episode from the planned registry (promote to real)."""
-        raise NotImplementedError
+        assert self._db is not None
+        await self._db.execute(
+            'DELETE FROM planned_episodes WHERE episode_uuid = ?',
+            (episode_uuid,),
+        )
+        await self._db.commit()
+        logger.debug('Promoted episode %s (removed from planned registry)', episode_uuid)
 
     async def are_all_planned(self, episode_uuids: list[str]) -> bool:
-        """Return True iff the list is non-empty and ALL uuids are planned."""
-        raise NotImplementedError
+        """Return True iff the list is non-empty and ALL uuids are planned.
+
+        An empty list returns False — there are no episodes to call planned.
+        A mixed list (some planned, some not) returns False.
+        """
+        if not episode_uuids:
+            return False
+        assert self._db is not None
+        # Query for how many of the given UUIDs exist in the registry
+        placeholders = ','.join('?' * len(episode_uuids))
+        cursor = await self._db.execute(
+            f'SELECT COUNT(*) FROM planned_episodes WHERE episode_uuid IN ({placeholders})',
+            episode_uuids,
+        )
+        row = await cursor.fetchone()
+        count = row[0] if row else 0
+        return count == len(episode_uuids)
