@@ -27,6 +27,37 @@ class TestCostStoreInit:
 
 
 @pytest.mark.asyncio
+class TestCostStoreContextManager:
+    """step-5: async context manager opens on enter, closes on exit."""
+
+    async def test_context_manager_opens_conn(self, tmp_path: Path):
+        async with CostStore(tmp_path / 'costs.db') as store:
+            assert store._conn is not None
+
+    async def test_context_manager_closes_conn_on_exit(self, tmp_path: Path):
+        async with CostStore(tmp_path / 'costs.db') as store:
+            pass  # just enter and exit
+        assert store._conn is None
+
+    async def test_context_manager_returns_self(self, tmp_path: Path):
+        cs = CostStore(tmp_path / 'costs.db')
+        async with cs as store:
+            assert store is cs
+
+    async def test_context_manager_closes_on_exception(self, tmp_path: Path):
+        """Connection is closed even when body raises."""
+        store = None
+        try:
+            async with CostStore(tmp_path / 'costs.db') as s:
+                store = s
+                raise ValueError('boom')
+        except ValueError:
+            pass
+        assert store is not None
+        assert store._conn is None
+
+
+@pytest.mark.asyncio
 class TestCostStoreOpenClose:
     """step-3: open() creates persistent WAL connection; close() is idempotent."""
 
