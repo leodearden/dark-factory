@@ -275,3 +275,43 @@ async def get_cost_trend(
         return result
 
     return await with_db(db, _query, {})
+
+# ---------------------------------------------------------------------------
+# 6. Account events
+# ---------------------------------------------------------------------------
+
+async def get_account_events(
+    db: aiosqlite.Connection | None,
+    *,
+    days: int = 7,
+) -> list[dict]:
+    """Recent account events (cap_hit, resumed, etc.) within the window.
+
+    Returns [{account_name, event_type, project_id, run_id, details,
+               created_at}, ...] ordered by created_at DESC.
+    *details* is returned as-is (string or None) — callers may parse JSON.
+    """
+    since = _cutoff(days)
+
+    async def _query(db: aiosqlite.Connection) -> list[dict]:
+        rows = await db.execute_fetchall(
+            'SELECT account_name, event_type, project_id, run_id, '
+            '       details, created_at '
+            '  FROM account_events '
+            ' WHERE created_at >= ? '
+            ' ORDER BY created_at DESC',
+            (since,),
+        )
+        return [
+            {
+                'account_name': row[0],
+                'event_type': row[1],
+                'project_id': row[2],
+                'run_id': row[3],
+                'details': row[4],
+                'created_at': row[5],
+            }
+            for row in rows
+        ]
+
+    return await with_db(db, _query, [])
