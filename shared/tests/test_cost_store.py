@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import aiosqlite
 import pytest
@@ -231,7 +231,7 @@ class TestConnectionReuse:
                         started_at='2024-01-01T00:00:00',
                         completed_at='2024-01-01T00:00:00',
                     )
-                for i in range(2):
+                for _i in range(2):
                     await store.save_account_event(
                         account_name='a',
                         event_type='cap_hit',

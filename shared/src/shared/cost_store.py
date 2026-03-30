@@ -102,7 +102,7 @@ class CostStore:
 
     # -- async context manager ------------------------------------------------
 
-    async def __aenter__(self) -> 'CostStore':
+    async def __aenter__(self) -> CostStore:
         await self.open()
         return self
 
