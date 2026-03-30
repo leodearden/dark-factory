@@ -264,8 +264,6 @@ class TestStewardAccountName:
         """After cap hit + session reset, account_name reflects the retry account."""
         from unittest.mock import PropertyMock
 
-        from orchestrator.steward import _CAP_HIT_COOLDOWN_SECS
-
         call_count = 0
 
         def detect_side_effect(*args, **kwargs):
