@@ -291,6 +291,49 @@ class TestDualWriteCallback:
         service.durable_queue.enqueue_batch.assert_not_called()
 
 
+class TestDualWriteCallbackTemporalContext:
+    """step-7: _dual_write_callback propagates temporal_context to Mem0 batch items."""
+
+    @pytest.mark.asyncio
+    async def test_temporal_context_planning_propagated(self, service):
+        """When payload has temporal_context='planning', each batch item includes it."""
+        from tests.conftest import MockAddEpisodeResult, MockEdge
+
+        result = MockAddEpisodeResult(entity_edges=[
+            MockEdge(fact='CostStore extends AgentResult'),
+        ])
+        payload = {
+            'project_id': 'test',
+            'temporal_context': 'planning',
+        }
+        await service._dual_write_callback('dual_write_episode', result, payload)
+
+        service.durable_queue.enqueue_batch.assert_called_once()
+        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        assert len(batch) == 1
+        assert batch[0]['payload']['temporal_context'] == 'planning'
+
+    @pytest.mark.asyncio
+    async def test_no_temporal_context_absent_from_batch(self, service):
+        """When temporal_context is absent in payload, it should NOT appear in batch items."""
+        from tests.conftest import MockAddEpisodeResult, MockEdge
+
+        result = MockAddEpisodeResult(entity_edges=[
+            MockEdge(fact='Auth depends on Redis'),
+        ])
+        payload = {
+            'project_id': 'test',
+            # no temporal_context
+        }
+        await service._dual_write_callback('dual_write_episode', result, payload)
+
+        service.durable_queue.enqueue_batch.assert_called_once()
+        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        assert len(batch) == 1
+        # temporal_context is absent or None — not 'planning'
+        assert batch[0]['payload'].get('temporal_context') is None
+
+
 class TestReplayFromStore:
     @pytest.mark.asyncio
     async def test_replay_enqueues_mem0_memories(self, service):
