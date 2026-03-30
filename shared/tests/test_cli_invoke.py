@@ -24,6 +24,48 @@ class TestAgentResultAccountNameField:
 
 
 @pytest.mark.asyncio
+class TestAccountNameThreading:
+
+    async def test_account_name_set_from_usage_gate(self):
+        """account_name is stamped from usage_gate.active_account_name on success."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='token-a')
+        gate.detect_cap_hit = MagicMock(return_value=False)
+        gate.active_account_name = 'acct-a'
+        gate.on_agent_complete = MagicMock()
+
+        result = _make_result()
+
+        with patch(
+            'shared.cli_invoke.invoke_claude_agent',
+            new_callable=AsyncMock,
+            return_value=result,
+        ):
+            got = await invoke_with_cap_retry(gate, 'test-label', prompt='hi')
+
+        assert got.account_name == 'acct-a'
+
+    async def test_account_name_none_coerced_to_empty(self):
+        """When active_account_name is None, result.account_name is ''."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='token-a')
+        gate.detect_cap_hit = MagicMock(return_value=False)
+        gate.active_account_name = None
+        gate.on_agent_complete = MagicMock()
+
+        result = _make_result()
+
+        with patch(
+            'shared.cli_invoke.invoke_claude_agent',
+            new_callable=AsyncMock,
+            return_value=result,
+        ):
+            got = await invoke_with_cap_retry(gate, 'test-label', prompt='hi')
+
+        assert got.account_name == ''
+
+
+@pytest.mark.asyncio
 class TestCapHitBackoff:
 
     async def test_sleeps_before_retry_on_cap_hit(self):
