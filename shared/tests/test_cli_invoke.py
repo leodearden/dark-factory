@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from shared.cli_invoke import _CAP_HIT_COOLDOWN_SECS, AgentResult, _to_token_count, invoke_with_cap_retry
+from shared.cli_invoke import (
+    _CAP_HIT_COOLDOWN_SECS,
+    AgentResult,
+    _to_token_count,
+    invoke_with_cap_retry,
+)
 
 
 class TestToTokenCount:

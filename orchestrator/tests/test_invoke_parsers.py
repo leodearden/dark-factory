@@ -5,19 +5,23 @@ from __future__ import annotations
 import json
 
 from shared.cli_invoke import _SubprocessResult
+
 from orchestrator.agents.invoke import _parse_codex_output, _parse_gemini_output
 
 
-def _make_subprocess_result(**overrides) -> _SubprocessResult:
+def _make_subprocess_result(
+    stdout: str = '',
+    stderr: str = '',
+    returncode: int = 0,
+    duration_ms: int = 100,
+) -> _SubprocessResult:
     """Construct a _SubprocessResult with sensible defaults."""
-    defaults = dict(
-        stdout='',
-        stderr='',
-        returncode=0,
-        duration_ms=100,
+    return _SubprocessResult(
+        stdout=stdout,
+        stderr=stderr,
+        returncode=returncode,
+        duration_ms=duration_ms,
     )
-    defaults.update(overrides)
-    return _SubprocessResult(**defaults)
 
 
 class TestParseGeminiNullStats:
