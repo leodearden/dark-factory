@@ -250,6 +250,7 @@ class UsageGate:
         if acct.pause_started_at is None:
             acct.pause_started_at = datetime.now(UTC)
         logger.warning(f'Account {acct.name} CAPPED: {reason}')
+        self._fire_cost_event(acct.name, 'cap_hit', json.dumps({'reason': reason}))
         self._start_account_resume_probe(acct)
 
         # If all accounts are now capped, close the global gate
@@ -277,6 +278,45 @@ class UsageGate:
                     self._account_resume_probe_loop(acct),
                     name=f'usage-gate-resume-{acct.name}',
                 )
+        except RuntimeError:
+            pass
+
+    async def _write_cost_event(
+        self,
+        account_name: str,
+        event_type: str,
+        details: str,
+    ) -> None:
+        """Write a cost event to CostStore. Silently swallows errors (telemetry only)."""
+        if self._cost_store is None:
+            return
+        try:
+            await self._cost_store.save_account_event(
+                account_name=account_name,
+                event_type=event_type,
+                project_id=self._project_id,
+                run_id=self._run_id,
+                details=details,
+                created_at=datetime.now(UTC).isoformat(),
+            )
+        except Exception as exc:
+            logger.warning('CostStore write failed for %s/%s: %s', account_name, event_type, exc)
+
+    def _fire_cost_event(
+        self,
+        account_name: str,
+        event_type: str,
+        details: str,
+    ) -> None:
+        """Fire-and-forget wrapper for _write_cost_event (for use in sync contexts)."""
+        if self._cost_store is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                self._write_cost_event(account_name, event_type, details),
+                name=f'cost-event-{event_type}-{account_name}',
+            )
         except RuntimeError:
             pass
 
