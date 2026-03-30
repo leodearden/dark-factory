@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import pytest
+import pytest_asyncio
 
 from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def registry(tmp_path):
     """PlannedEpisodeRegistry backed by a real SQLite DB."""
     reg = PlannedEpisodeRegistry(data_dir=tmp_path / 'registry')
