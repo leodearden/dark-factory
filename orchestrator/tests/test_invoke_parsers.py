@@ -31,3 +31,19 @@ class TestParseGeminiNullStats:
         assert agent_result.success is True
         assert agent_result.output == 'ok'
         assert agent_result.cost_usd == 0.0
+
+
+class TestParseCodexNullUsage:
+
+    def test_null_usage_does_not_raise(self):
+        """_parse_codex_output does not raise AttributeError when usage is JSON null."""
+        events = [
+            {'type': 'thread.started', 'thread_id': 'tid-1'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'hello'}},
+            {'type': 'turn.completed', 'usage': None},
+        ]
+        payload = '\n'.join(json.dumps(e) for e in events)
+        result = _make_subprocess_result(stdout=payload)
+        # Must not raise AttributeError
+        agent_result = _parse_codex_output(result, 'o4-mini')
+        assert agent_result.success is True
