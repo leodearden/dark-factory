@@ -15,6 +15,14 @@ def _make_result(**overrides) -> AgentResult:
     return AgentResult(**defaults)
 
 
+class TestAgentResultAccountNameField:
+
+    def test_account_name_field_defaults_empty(self):
+        """AgentResult has account_name field that defaults to empty string."""
+        result = AgentResult(success=True, output='ok')
+        assert result.account_name == ''
+
+
 @pytest.mark.asyncio
 class TestCapHitBackoff:
 
