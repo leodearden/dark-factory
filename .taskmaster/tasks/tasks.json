@@ -5951,6 +5951,19 @@
         ],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 318,
+        "title": "Strengthen costs data test coverage and fix test quality issues",
+        "description": "Test coverage gaps and quality issues in dashboard/tests/test_costs_data.py identified during review of task 298:\n\n1. **Tautological assertion in test_fills_gaps** (~line 590): `len(zero_days) == 7 - len(non_zero_days)` is always true by construction. Replace with: `assert len(df) == 7` plus `assert any(e['total'] == 0.0 for e in df)` to actually verify gap-filling produces zero entries.\n\n2. **No test for `days` parameter window boundary**: All test_populated tests use default days=7 with all fixtures inside the window. Add a test that inserts one invocation within window and one outside, asserts days=1 excludes old and days=30 includes both.\n\n3. **Single NULL task_id in test_null_task_id** (~line 716): Only one NULL-task_id invocation is inserted. Insert two+ NULL invocations for the same run and assert `len(run['tasks']) == 1` and cost accumulates correctly.\n\n4. **No test for cap-only accounts** (no invocations): Insert cap_hit events for an account with zero invocations in the window and assert expected behavior (account present with spend=0.0 after the code fix in the companion task, or document as intentionally absent).\n\nmemory_hints: search \"test_costs_data.py test quality\", search \"costs.py cap-only account behavior\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [
+          298
+        ],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -5963,7 +5976,7 @@
       ],
       "created": "2026-03-30T22:31:56.856Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-30T22:31:56.871Z"
+      "updated": "2026-03-30T22:32:04.877Z"
     }
   }
 }
