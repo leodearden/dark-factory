@@ -17,6 +17,48 @@ async def registry(tmp_path):
     await reg.close()
 
 
+class TestPromoteAndAreAllPlanned:
+    @pytest.mark.asyncio
+    async def test_promote_removes_from_planned(self, registry):
+        await registry.register('uuid-promote', 'proj-1')
+        assert await registry.is_planned('uuid-promote') is True
+        await registry.promote('uuid-promote')
+        assert await registry.is_planned('uuid-promote') is False
+
+    @pytest.mark.asyncio
+    async def test_promote_nonexistent_is_no_op(self, registry):
+        """Promoting a UUID that was never registered should not raise."""
+        await registry.promote('uuid-never-existed')
+
+    @pytest.mark.asyncio
+    async def test_are_all_planned_all_planned(self, registry):
+        await registry.register('uuid-A', 'proj-1')
+        await registry.register('uuid-B', 'proj-1')
+        assert await registry.are_all_planned(['uuid-A', 'uuid-B']) is True
+
+    @pytest.mark.asyncio
+    async def test_are_all_planned_empty_returns_false(self, registry):
+        assert await registry.are_all_planned([]) is False
+
+    @pytest.mark.asyncio
+    async def test_are_all_planned_mixed_returns_false(self, registry):
+        """If some are planned and some are not, result is False."""
+        await registry.register('uuid-planned', 'proj-1')
+        assert await registry.are_all_planned(['uuid-planned', 'uuid-not-planned']) is False
+
+    @pytest.mark.asyncio
+    async def test_are_all_planned_none_planned_returns_false(self, registry):
+        assert await registry.are_all_planned(['uuid-not-planned-1']) is False
+
+    @pytest.mark.asyncio
+    async def test_promote_then_are_all_planned_returns_false(self, registry):
+        """After promoting an episode, it should no longer count as planned."""
+        await registry.register('uuid-C', 'proj-1')
+        await registry.register('uuid-D', 'proj-1')
+        await registry.promote('uuid-C')
+        assert await registry.are_all_planned(['uuid-C', 'uuid-D']) is False
+
+
 class TestRegisterAndCheck:
     @pytest.mark.asyncio
     async def test_register_then_is_planned_returns_true(self, registry):
