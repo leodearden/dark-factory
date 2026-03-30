@@ -406,3 +406,47 @@ class TestCostStoreOpenClose:
 
         assert store._conn is None, '_conn should remain None on setup failure'
         assert close_called, 'Connection must be closed to prevent resource leak'
+
+
+@pytest.mark.asyncio
+class TestPostCloseGuard:
+    """step-5: after close(), save methods must raise RuntimeError (regression guard)."""
+
+    async def test_save_invocation_raises_after_close(self, tmp_path: Path):
+        """open() -> close() -> save_invocation() must raise RuntimeError('CostStore not opened')."""
+        store = CostStore(tmp_path / 'costs.db')
+        await store.open()
+        await store.close()
+        with pytest.raises(RuntimeError, match='CostStore not opened'):
+            await store.save_invocation(
+                run_id='r1',
+                task_id=None,
+                project_id='proj',
+                account_name='acct',
+                model='claude-3',
+                role='agent',
+                cost_usd=0.01,
+                input_tokens=None,
+                output_tokens=None,
+                cache_read_tokens=None,
+                cache_create_tokens=None,
+                duration_ms=100,
+                capped=False,
+                started_at='2024-01-01T00:00:00',
+                completed_at='2024-01-01T00:00:01',
+            )
+
+    async def test_save_account_event_raises_after_close(self, tmp_path: Path):
+        """open() -> close() -> save_account_event() must raise RuntimeError('CostStore not opened')."""
+        store = CostStore(tmp_path / 'costs.db')
+        await store.open()
+        await store.close()
+        with pytest.raises(RuntimeError, match='CostStore not opened'):
+            await store.save_account_event(
+                account_name='acct',
+                event_type='cap_hit',
+                project_id=None,
+                run_id=None,
+                details=None,
+                created_at='2024-01-01T00:00:00',
+            )
