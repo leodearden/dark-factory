@@ -13,6 +13,7 @@ class TestTopLevelImports:
             AccountConfig,
             AccountState,
             AgentResult,
+            CostStore,
             SessionBudgetExhausted,
             UsageCapConfig,
             UsageGate,
@@ -28,6 +29,7 @@ class TestTopLevelImports:
         assert SessionBudgetExhausted is not None
         assert AccountConfig is not None
         assert UsageCapConfig is not None
+        assert CostStore is not None
 
 
 class TestModuleLevelAll:
