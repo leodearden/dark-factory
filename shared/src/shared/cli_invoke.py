@@ -37,6 +37,7 @@ class AgentResult:
     structured_output: Any = None
     subtype: str = ''
     stderr: str = ''
+    account_name: str = ''
 
 
 @dataclass
