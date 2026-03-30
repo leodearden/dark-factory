@@ -221,3 +221,40 @@ async def empty_costs_conn(empty_costs_db):
     async with aiosqlite.connect(str(empty_costs_db)) as conn:
         conn.row_factory = aiosqlite.Row
         yield conn
+
+
+# ---------------------------------------------------------------------------
+# Tests: get_cost_summary
+# ---------------------------------------------------------------------------
+
+from dashboard.data.costs import get_cost_summary  # noqa: E402
+
+
+class TestCostSummary:
+    @pytest.mark.asyncio
+    async def test_populated(self, costs_conn):
+        result = await get_cost_summary(costs_conn)
+
+        assert 'dark_factory' in result
+        df = result['dark_factory']
+        assert df['total_spend'] == pytest.approx(3.2, abs=1e-6)
+        assert df['avg_cost_per_task'] == pytest.approx(3.2 / 3, abs=1e-6)
+        assert df['active_accounts'] == 2  # max-a and max-b
+        assert df['cap_events'] == 2        # 2 cap_hit events in dark_factory
+
+        assert 'reify' in result
+        r = result['reify']
+        assert r['total_spend'] == pytest.approx(0.4, abs=1e-6)
+        assert r['avg_cost_per_task'] == pytest.approx(0.4, abs=1e-6)
+        assert r['active_accounts'] == 1   # max-a only
+        assert r['cap_events'] == 0         # no cap events for reify
+
+    @pytest.mark.asyncio
+    async def test_none_db(self):
+        result = await get_cost_summary(None)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_empty_db(self, empty_costs_conn):
+        result = await get_cost_summary(empty_costs_conn)
+        assert result == {}
