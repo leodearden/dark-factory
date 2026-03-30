@@ -23,8 +23,12 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from shared.config_models import UsageCapConfig
+
+if TYPE_CHECKING:
+    from shared.cost_store import CostStore
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +93,7 @@ class UsageGate:
     capped.  Works with 1 or N accounts.
     """
 
-    def __init__(self, config: UsageCapConfig):
+    def __init__(self, config: UsageCapConfig, *, cost_store: CostStore | None = None):
         self._config: UsageCapConfig = config
         self._open = asyncio.Event()
         self._open.set()  # start open
@@ -98,6 +102,10 @@ class UsageGate:
         self._paused_reason: str = ''
         self._pause_started_at: datetime | None = None
         self._total_pause_secs: float = 0.0
+        self._cost_store: CostStore | None = cost_store
+        self._project_id: str | None = None
+        self._run_id: str | None = None
+        self._last_account_name: str | None = None
 
         self._accounts: list[AccountState] = self._init_accounts()
 
@@ -387,6 +395,24 @@ class UsageGate:
             if not acct.capped:
                 return acct.name
         return None
+
+    @property
+    def project_id(self) -> str | None:
+        """Project identifier set by the harness at run start."""
+        return self._project_id
+
+    @project_id.setter
+    def project_id(self, value: str | None) -> None:
+        self._project_id = value
+
+    @property
+    def run_id(self) -> str | None:
+        """Run identifier set by the harness at run start."""
+        return self._run_id
+
+    @run_id.setter
+    def run_id(self, value: str | None) -> None:
+        self._run_id = value
 
 
 # --- Helpers ---
