@@ -186,3 +186,39 @@ async def get_cost_by_account(
         return result
 
     return await with_db(db, _query, {})
+
+# ---------------------------------------------------------------------------
+# 4. Cost by role
+# ---------------------------------------------------------------------------
+
+async def get_cost_by_role(
+    db: aiosqlite.Connection | None,
+    *,
+    days: int = 7,
+) -> dict[str, dict]:
+    """Per-project cost broken down by role, then model.
+
+    Returns {project_id: {role: {model: total}}}.
+    """
+    since = _cutoff(days)
+
+    async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
+        rows = await db.execute_fetchall(
+            'SELECT project_id, role, model, SUM(cost_usd) AS total '
+            '  FROM invocations '
+            ' WHERE completed_at >= ? '
+            ' GROUP BY project_id, role, model',
+            (since,),
+        )
+
+        result: dict[str, dict] = {}
+        for row in rows:
+            project_id, role, model, total = row
+            if project_id not in result:
+                result[project_id] = {}
+            if role not in result[project_id]:
+                result[project_id][role] = {}
+            result[project_id][role][model] = total or 0.0
+        return result
+
+    return await with_db(db, _query, {})
