@@ -78,3 +78,40 @@ async def get_cost_summary(
         return result
 
     return await with_db(db, _query, {})
+
+
+# ---------------------------------------------------------------------------
+# 2. Cost by project (per-model breakdown)
+# ---------------------------------------------------------------------------
+
+async def get_cost_by_project(
+    db: aiosqlite.Connection | None,
+    *,
+    days: int = 7,
+) -> dict[str, list[dict]]:
+    """Per-project cost broken down by model.
+
+    Returns {project_id: [{model: str, total: float}, ...]}.
+    Entries are ordered by total descending.
+    """
+    since = _cutoff(days)
+
+    async def _query(db: aiosqlite.Connection) -> dict[str, list[dict]]:
+        rows = await db.execute_fetchall(
+            'SELECT project_id, model, SUM(cost_usd) AS total '
+            '  FROM invocations '
+            ' WHERE completed_at >= ? '
+            ' GROUP BY project_id, model '
+            ' ORDER BY total DESC',
+            (since,),
+        )
+
+        result: dict[str, list[dict]] = {}
+        for row in rows:
+            project_id, model, total = row
+            if project_id not in result:
+                result[project_id] = []
+            result[project_id].append({'model': model, 'total': total or 0.0})
+        return result
+
+    return await with_db(db, _query, {})
