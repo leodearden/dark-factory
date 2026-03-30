@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import runpy
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
@@ -49,6 +50,20 @@ def _get_section_window(
     idx = html.find(hx_get)
     assert idx != -1, f'hx-get for {partial_url} not found in HTML'
     return html[max(0, idx - before):idx + after]
+
+
+def _get_nav_link(html: str, href: str) -> str:
+    """Return the opening <a> tag for a nav link with the given href.
+
+    Uses re.search to extract the tag, enabling scoped class assertions —
+    e.g. asserting 'border-blue-500' is present in the *active* link or
+    absent from the *inactive* link without false positives from other elements.
+    Raises AssertionError with a diagnostic message if the link is not found.
+    """
+    pattern = r'<a\s+[^>]*href="' + re.escape(href) + r'"[^>]*>'
+    m = re.search(pattern, html)
+    assert m is not None, f'No <a href="{href}"> found in HTML'
+    return m.group(0)
 
 
 class TestGetSectionWindow:
