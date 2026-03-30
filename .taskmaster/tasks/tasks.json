@@ -5891,13 +5891,19 @@
         "description": "The orchestrator's own `invoke_with_cap_retry` in `orchestrator/src/orchestrator/agents/invoke.py` mirrors the shared `invoke_with_cap_retry` but does not capture `usage_gate.active_account_name` or stamp `result.account_name`. Callers routed through the orchestrator's multi-backend dispatcher (workflow.py, review_checkpoint.py) always get `account_name == ''` even when a usage gate is active, creating a silent inconsistency with the shared implementation.\n\nApply the same `account_name = usage_gate.active_account_name or ''` capture-and-stamp pattern to the orchestrator's `invoke_with_cap_retry`. Add a parallel test verifying account_name propagation through this code path.\n\nMemory hints: search for \"account_name AgentResult\" and \"invoke_with_cap_retry account threading\" for prior implementation patterns.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [
           "297"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-30T22:15:20.772Z"
+        "updatedAt": "2026-03-30T22:18:18.053Z",
+        "metadata": {
+          "modules": [
+            "orchestrator/src/orchestrator/agents",
+            "orchestrator/tests/test_invoke.py"
+          ]
+        }
       },
       {
         "id": "314",
@@ -5924,7 +5930,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-30T22:15:20.781Z",
+      "lastModified": "2026-03-30T22:18:18.053Z",
       "taskCount": 294,
       "completedCount": 266,
       "tags": [
