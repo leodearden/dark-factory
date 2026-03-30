@@ -359,9 +359,9 @@ def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
 
         elif event_type == 'turn.completed':
             num_turns += 1
-            usage = event.get('usage', {})
-            total_input_tokens += usage.get('input_tokens', 0)
-            total_output_tokens += usage.get('output_tokens', 0)
+            usage = event.get('usage') or {}
+            total_input_tokens += _to_token_count(usage.get('input_tokens', 0)) or 0
+            total_output_tokens += _to_token_count(usage.get('output_tokens', 0)) or 0
 
         elif event_type == 'error':
             is_error = True
