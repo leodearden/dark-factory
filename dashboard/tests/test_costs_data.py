@@ -385,6 +385,76 @@ class TestCostByAccount:
         assert ta['status'] == 'active'
 
     @pytest.mark.asyncio
+    async def test_out_of_window_events(self, tmp_path):
+        """Status and last_cap respect the look-back window boundary.
+
+        acct-x: old 'resumed' (outside window) + recent 'cap_hit' (inside) → capped.
+        acct-y: two old events (outside) + recent 'cap_hit' (inside) → capped.
+        Verifies the correlated subquery uses in-window events for status derivation.
+        """
+        db_path = tmp_path / 'window_events.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+
+        now = datetime.now(UTC)
+        acct_x_cap_ts = (now - timedelta(days=2)).isoformat()
+        acct_y_cap_ts = (now - timedelta(days=1)).isoformat()
+
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                # acct-x: resumed at -30d (outside window), cap_hit at -2d (inside)
+                ('acct-x', 'resumed', 'proj', 'r1', None,
+                 (now - timedelta(days=30)).isoformat()),
+                ('acct-x', 'cap_hit', 'proj', 'r2', None, acct_x_cap_ts),
+                # acct-y: cap_hit at -30d (outside), resumed at -20d (outside),
+                #         cap_hit at -1d (inside)
+                ('acct-y', 'cap_hit', 'proj', 'r3', None,
+                 (now - timedelta(days=30)).isoformat()),
+                ('acct-y', 'resumed', 'proj', 'r4', None,
+                 (now - timedelta(days=20)).isoformat()),
+                ('acct-y', 'cap_hit', 'proj', 'r5', None, acct_y_cap_ts),
+            ],
+        )
+        # Invocations so both accounts appear in inv_rows
+        conn.executemany(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [
+                ('r2', 't1', 'proj', 'acct-x', 'claude-opus-4-5', 'implementer',
+                 0.5, 0,
+                 (now - timedelta(days=2, hours=1)).isoformat(),
+                 (now - timedelta(days=2)).isoformat()),
+                ('r5', 't2', 'proj', 'acct-y', 'claude-opus-4-5', 'implementer',
+                 0.5, 0,
+                 (now - timedelta(days=1, hours=1)).isoformat(),
+                 (now - timedelta(days=1)).isoformat()),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn, days=7)
+
+        # acct-x: in-window cap_hit → capped; last_cap = cap_hit timestamp
+        assert 'acct-x' in result
+        ax = result['acct-x']
+        assert ax['status'] == 'capped'
+        assert ax['last_cap'] == acct_x_cap_ts
+
+        # acct-y: only in-window event is cap_hit → capped
+        assert 'acct-y' in result
+        ay = result['acct-y']
+        assert ay['status'] == 'capped'
+        assert ay['last_cap'] == acct_y_cap_ts
+
+    @pytest.mark.asyncio
     async def test_account_with_no_caps(self, tmp_path):
         """Account that has invocations but no cap events has cap_events=0, last_cap=None."""
         db_path = tmp_path / 'nocap.db'
