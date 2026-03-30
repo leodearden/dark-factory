@@ -227,7 +227,11 @@ async def empty_costs_conn(empty_costs_db):
 # Tests: get_cost_summary
 # ---------------------------------------------------------------------------
 
-from dashboard.data.costs import get_cost_by_project, get_cost_summary  # noqa: E402
+from dashboard.data.costs import (  # noqa: E402
+    get_cost_by_account,
+    get_cost_by_project,
+    get_cost_summary,
+)
 
 
 class TestCostSummary:
@@ -291,3 +295,64 @@ class TestCostByProject:
         assert 'reify' in result
         assert len(result['dark_factory']) == 2   # opus and sonnet
         assert len(result['reify']) == 1           # sonnet only
+
+
+# ---------------------------------------------------------------------------
+# Tests: get_cost_by_account
+# ---------------------------------------------------------------------------
+
+class TestCostByAccount:
+    @pytest.mark.asyncio
+    async def test_populated(self, costs_conn):
+        result = await get_cost_by_account(costs_conn)
+
+        # max-a: invocations in dark_factory (1.00+0.50+0.60) + reify (0.40) = 2.50
+        assert 'max-a' in result
+        ma = result['max-a']
+        assert ma['spend'] == pytest.approx(2.5, abs=1e-6)
+        assert ma['invocations'] == 4
+        assert ma['cap_events'] == 1   # one cap_hit event for max-a
+        assert ma['last_cap'] is not None
+        assert ma['status'] == 'capped'  # cap_hit with no subsequent resumed
+
+        # max-b: invocations 0.80+0.30 = 1.10; cap_hit then resumed → active
+        assert 'max-b' in result
+        mb = result['max-b']
+        assert mb['spend'] == pytest.approx(1.1, abs=1e-6)
+        assert mb['invocations'] == 2
+        assert mb['cap_events'] == 1   # one cap_hit event for max-b
+        assert mb['last_cap'] is not None
+        assert mb['status'] == 'active'  # resumed is most recent event
+
+    @pytest.mark.asyncio
+    async def test_none_db(self):
+        result = await get_cost_by_account(None)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_account_with_no_caps(self, tmp_path):
+        """Account that has invocations but no cap events has cap_events=0, last_cap=None."""
+        db_path = tmp_path / 'nocap.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+        conn.execute(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('r1', 't1', 'proj', 'max-z', 'claude-opus-4-5', 'implementer',
+             0.5, 0, (now - timedelta(hours=1)).isoformat(), now.isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn)
+
+        assert 'max-z' in result
+        mz = result['max-z']
+        assert mz['cap_events'] == 0
+        assert mz['last_cap'] is None
+        assert mz['status'] == 'active'
