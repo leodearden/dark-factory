@@ -1379,3 +1379,85 @@ class TestDualWriteCallbackEdgesField:
             '_dual_write_callback must read from result.edges (got 2 edges) '
             f'but found {len(batch)} items — it may still be reading entity_edges'
         )
+
+
+class TestExecuteGraphitiWritePlanningRegistration:
+    """step-5: _execute_graphiti_write registers episodes when temporal_context='planning'."""
+
+    @pytest.mark.asyncio
+    async def test_planning_episode_registered_in_registry(self, service):
+        """After successful graphiti.add_episode with temporal_context='planning',
+        the episode UUID should be registered in the planned_episode_registry."""
+        mock_registry = MagicMock()
+        mock_registry.register = AsyncMock()
+        service.planned_episode_registry = mock_registry
+
+        payload = {
+            'uuid': 'episode-plan-uuid',
+            'name': 'episode_plan',
+            'content': 'PRD content',
+            'source': 'text',
+            'group_id': 'myproject',
+            'source_description': '[temporal:planning] plan',
+            'temporal_context': 'planning',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+
+        mock_registry.register.assert_called_once_with('episode-plan-uuid', 'myproject')
+
+    @pytest.mark.asyncio
+    async def test_no_temporal_context_skips_registration(self, service):
+        """Without temporal_context, no registration should occur."""
+        mock_registry = MagicMock()
+        mock_registry.register = AsyncMock()
+        service.planned_episode_registry = mock_registry
+
+        payload = {
+            'uuid': 'episode-normal-uuid',
+            'name': 'episode_normal',
+            'content': 'Regular content',
+            'source': 'text',
+            'group_id': 'myproject',
+            'source_description': 'normal',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+
+        mock_registry.register.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_current_temporal_context_skips_registration(self, service):
+        """temporal_context='current' should NOT trigger registration."""
+        mock_registry = MagicMock()
+        mock_registry.register = AsyncMock()
+        service.planned_episode_registry = mock_registry
+
+        payload = {
+            'uuid': 'episode-current-uuid',
+            'name': 'episode_current',
+            'content': 'Current content',
+            'source': 'text',
+            'group_id': 'myproject',
+            'source_description': 'current',
+            'temporal_context': 'current',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+
+        mock_registry.register.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_registry_no_error_on_planning(self, service):
+        """If planned_episode_registry is None (not wired), no error on planning episode."""
+        # Ensure attribute is None (default)
+        service.planned_episode_registry = None
+
+        payload = {
+            'uuid': 'episode-orphan-uuid',
+            'name': 'episode_orphan',
+            'content': 'PRD content',
+            'source': 'text',
+            'group_id': 'myproject',
+            'source_description': 'plan',
+            'temporal_context': 'planning',
+        }
+        # Should not raise
+        await service._execute_graphiti_write('add_episode', payload)
