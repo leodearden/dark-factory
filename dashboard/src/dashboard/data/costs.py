@@ -315,3 +315,89 @@ async def get_account_events(
         ]
 
     return await with_db(db, _query, [])
+
+
+# ---------------------------------------------------------------------------
+# 7. Run cost breakdown
+# ---------------------------------------------------------------------------
+
+async def get_run_cost_breakdown(
+    db: aiosqlite.Connection | None,
+    *,
+    days: int = 7,
+) -> list[dict]:
+    """Per-run cost breakdown grouped by task, with invocation detail.
+
+    Returns a list of run dicts:
+        [{run_id, project_id, total_cost,
+          tasks: [{task_id, title, cost,
+                   invocations: [{model, role, cost_usd, account_name,
+                                  duration_ms, capped}]}]}]
+
+    Invocations with NULL task_id are grouped under task_id=None with title=None.
+    LEFT JOIN with task_results provides task titles.
+    """
+    since = _cutoff(days)
+
+    async def _query(db: aiosqlite.Connection) -> list[dict]:
+        rows = await db.execute_fetchall(
+            'SELECT i.run_id, i.project_id, i.task_id, '
+            '       tr.title, '
+            '       i.model, i.role, i.cost_usd, '
+            '       i.account_name, i.duration_ms, i.capped '
+            '  FROM invocations i '
+            '  LEFT JOIN task_results tr '
+            '    ON i.run_id = tr.run_id AND i.task_id = tr.task_id '
+            ' WHERE i.completed_at >= ? '
+            ' ORDER BY i.run_id, i.task_id, i.id',
+            (since,),
+        )
+
+        # Build nested structure: run_id → task_id → invocations
+        runs: dict[str, dict] = {}
+        for row in rows:
+            run_id, project_id, task_id, title, model, role, cost_usd, \
+                account_name, duration_ms, capped = row
+            cost_usd = cost_usd or 0.0
+
+            if run_id not in runs:
+                runs[run_id] = {
+                    'run_id': run_id,
+                    'project_id': project_id,
+                    'total_cost': 0.0,
+                    'tasks': {},  # task_id → task dict (temporary)
+                }
+            run = runs[run_id]
+            run['total_cost'] += cost_usd
+
+            if task_id not in run['tasks']:
+                run['tasks'][task_id] = {
+                    'task_id': task_id,
+                    'title': title,
+                    'cost': 0.0,
+                    'invocations': [],
+                }
+            task = run['tasks'][task_id]
+            task['cost'] += cost_usd
+            task['invocations'].append({
+                'model': model,
+                'role': role,
+                'cost_usd': cost_usd,
+                'account_name': account_name,
+                'duration_ms': duration_ms,
+                'capped': bool(capped),
+            })
+
+        # Convert to list, converting task dict to list
+        result: list[dict] = []
+        for run in runs.values():
+            tasks_list = list(run['tasks'].values())
+            result.append({
+                'run_id': run['run_id'],
+                'project_id': run['project_id'],
+                'total_cost': run['total_cost'],
+                'tasks': tasks_list,
+            })
+        return result
+
+    return await with_db(db, _query, [])
