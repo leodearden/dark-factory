@@ -450,3 +450,50 @@ class TestPostCloseGuard:
                 details=None,
                 created_at='2024-01-01T00:00:00',
             )
+
+
+@pytest.mark.asyncio
+class TestPersistAcrossReopen:
+    """step-6: data saved before close() survives a close/reopen cycle."""
+
+    async def test_invocation_persists_across_reopen(self, tmp_path: Path):
+        """save_invocation() -> close() -> reopen() -> SELECT verifies row exists."""
+        db_path = tmp_path / 'costs.db'
+
+        # First session: write a row
+        store = CostStore(db_path)
+        await store.open()
+        await store.save_invocation(
+            run_id='run-persist',
+            task_id='task-1',
+            project_id='dark_factory',
+            account_name='max-d',
+            model='claude-3-5-sonnet',
+            role='agent',
+            cost_usd=0.05,
+            input_tokens=100,
+            output_tokens=50,
+            cache_read_tokens=None,
+            cache_create_tokens=None,
+            duration_ms=500,
+            capped=False,
+            started_at='2024-06-01T10:00:00',
+            completed_at='2024-06-01T10:00:01',
+        )
+        await store.close()
+
+        # Second session: reopen and verify row is still there
+        store2 = CostStore(db_path)
+        await store2.open()
+        try:
+            async with store2._conn.execute(
+                'SELECT run_id, task_id, cost_usd FROM invocations'
+            ) as cur:
+                row = await cur.fetchone()
+        finally:
+            await store2.close()
+
+        assert row is not None, 'Row must survive close/reopen cycle'
+        assert row[0] == 'run-persist'
+        assert row[1] == 'task-1'
+        assert abs(row[2] - 0.05) < 1e-9
