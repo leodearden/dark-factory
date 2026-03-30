@@ -4487,11 +4487,11 @@
         "description": "The memory-graphs and performance partial integration tests (added in task 252) have several assertion gaps:\n\n1. **memory-graphs empty test lacks unique assertions**: The template has no conditional empty-state branch — it unconditionally renders all three canvas elements. `test_memory_graphs_empty` should assert that the serialized JSON contains empty arrays (e.g. `'\"labels\": []'` or `'\"reads\": []'`) to verify the template receives and embeds the empty payload correctly.\n\n2. **memory-graphs with-data test missing data value assertions**: Should assert that mock data labels ('search', 'add_memory', 'claude-interactive', 'recon-consolidator') appear in the rendered HTML (they're embedded via `{{ operations | tojson }}`). Without these, the test would pass even if template context variables were swapped.\n\n3. **All-zero timeseries fixture**: `_MG_TIMESERIES` uses `reads=[0]*24` and `writes=[0]*24` even for the positive with-data test case. Add non-zero entries (e.g. `reads[12]=5, writes[12]=3`) and assert they appear in the rendered script block.\n\n4. **Untested performance template branches**: The `{% if escalations.get(project_id) %}` else branch (renders 'No data') and the `{% if esc.interactive_count > 0 %}` false path are untested. Add test cases for: (a) escalations populated but `interactive_count=0`, (b) escalations empty for a project that has paths data.\n\nmemory_hints: search \"dashboard partial integration test pattern\", review test_app.py lines 349-498",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-29T09:03:28.435Z",
+        "updatedAt": "2026-03-30T17:50:44.404Z",
         "metadata": {
           "files": [
             "dashboard/tests/test_memory_graphs_partial.py",
@@ -5406,7 +5406,7 @@
         "description": "New file dashboard/src/dashboard/data/costs.py with async query functions following the performance.py pattern. Uses with_db() wrapper from db.py. Queries the invocations and account_events tables created by CostStore (same runs.db).\n\nFunctions:\n- get_cost_summary(db, days=7) — returns {project_id: {total_spend, avg_cost_per_task, active_accounts, cap_events}}\n- get_cost_by_project(db, days=7) — returns {project_id: [{model, total}]} for stacked bar chart\n- get_cost_by_account(db, days=7) — returns {account_name: {spend, invocations, cap_events, last_cap, status}}\n- get_cost_by_role(db, days=7) — returns {project_id: {role: {model: total}}} for stacked bar\n- get_cost_trend(db, days=30) — returns {project_id: [{day, total}]} for line chart\n- get_account_events(db, days=7) — returns [{account_name, event_type, project_id, run_id, details, created_at}] for event log\n- get_run_cost_breakdown(db, days=7) — returns [{run_id, project_id, total_cost, tasks: [{task_id, title, cost, invocations: [...]}]}] for expandable table\n\nEach function handles None db gracefully. Time window filtering uses the same pattern as performance.py (_project_cutoffs or direct date arithmetic). Write unit tests in dashboard/tests/test_costs_data.py with populated test databases.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [
           "295"
         ],
@@ -5433,7 +5433,7 @@
             ]
           }
         },
-        "updatedAt": "2026-03-29T09:05:09.874Z"
+        "updatedAt": "2026-03-30T17:50:44.435Z"
       },
       {
         "id": "299",
@@ -5879,7 +5879,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-30T17:50:44.375Z",
+      "lastModified": "2026-03-30T17:50:44.436Z",
       "taskCount": 291,
       "completedCount": 262,
       "tags": [
