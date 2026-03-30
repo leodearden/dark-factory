@@ -5911,10 +5911,11 @@
         "description": "Bundle of small CostStore improvements identified during task 304 review.\n\nCode fixes:\n1. Export CostStore from shared/__init__.py and add to __all__ (matching cli_invoke/usage_gate/config_models pattern)\n2. Update test_public_api.py: add cost_store to TestInitAllCompleteness union check and add test_cost_store_all to TestModuleLevelAll\n3. Guard open() against double-call: raise RuntimeError('CostStore already opened') if self._conn is not None\n4. Fix __aexit__ signature to standard 3-arg form: (exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: object) -> None\n5. Type _execute params as tuple[Any, ...] instead of bare tuple\n\nTest additions:\n6. Persist-across-reopen test: open → write → close → reopen → verify row exists\n7. Double-open test: open → open again → assert RuntimeError\n8. Post-close guard tests: open → close → save_invocation/save_account_event → assert RuntimeError\n\nmemory_hints:\n- search: \"CostStore package export double-open guard\"\n- search: \"shared __init__ __all__ convention\"\n- entity: \"CostStore\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-30T22:18:18.387Z"
       },
       {
         "id": "315",
@@ -5930,7 +5931,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-30T22:18:18.053Z",
+      "lastModified": "2026-03-30T22:18:18.390Z",
       "taskCount": 294,
       "completedCount": 266,
       "tags": [
