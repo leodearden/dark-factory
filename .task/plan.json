@@ -1,0 +1,121 @@
+{
+  "task_id": "314",
+  "title": "CostStore hardening: package export, double-open guard, type fixes, test coverage",
+  "files": [
+    "shared/src/shared/__init__.py",
+    "shared/src/shared/cost_store.py",
+    "shared/tests/test_public_api.py",
+    "shared/tests/test_cost_store.py"
+  ],
+  "modules": [
+    "shared/src/shared",
+    "shared/tests"
+  ],
+  "analysis": "CostStore (shared/cost_store.py) is a working async SQLite writer but has gaps identified in task 304 review: (1) not exported from the shared package __init__.py despite other modules (cli_invoke, config_models, usage_gate) following that pattern, (2) open() silently overwrites _conn if called twice (leaking the first connection), (3) __aexit__ uses *exc: Any catch-all instead of the standard 3-arg signature, (4) _execute types params as bare tuple instead of tuple[Any, ...], (5) test_public_api.py doesn't include cost_store in union/module checks. Existing tests cover init, open/close, context manager, not-opened guards, save operations, and connection reuse \u2014 but miss double-open, persist-across-reopen, and post-close scenarios. All changes are confined to 4 files in the shared subproject.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing test_cost_store_all in TestModuleLevelAll (test_public_api.py): assert cost_store.__all__ == {'CostStore'}. Also update test_init_all_covers_all_module_symbols to include cost_store in the union, and test_no_private_symbols_in_any_all to include cost_store. These tests will fail because CostStore is not yet exported from shared/__init__.py.",
+      "status": "done",
+      "commit": "cfd76662"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Add 'from shared.cost_store import CostStore' and 'CostStore' to __all__ in shared/__init__.py. Also add CostStore to test_top_level_imports. This makes step-1 tests pass.",
+      "status": "done",
+      "commit": "baceda57"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing test_double_open_raises in TestCostStoreOpenClose (test_cost_store.py): open() \u2192 open() again \u2192 assert RuntimeError('CostStore already opened'). Currently open() silently overwrites _conn, so this will fail.",
+      "status": "done",
+      "commit": "1f3182f2"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Add double-open guard to CostStore.open(): at method entry, if self._conn is not None raise RuntimeError('CostStore already opened'). This makes step-3 test pass.",
+      "status": "done",
+      "commit": "6d3ef0f4"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing post-close guard tests in new TestPostCloseGuard class (test_cost_store.py): (a) open \u2192 close \u2192 save_invocation \u2192 assert RuntimeError('CostStore not opened'), (b) open \u2192 close \u2192 save_account_event \u2192 assert RuntimeError('CostStore not opened'). These should already pass due to existing _require_conn guard, but formalizes the contract \u2014 write them as explicit regression tests.",
+      "status": "done",
+      "commit": "62345ff4"
+    },
+    {
+      "id": "step-6",
+      "type": "test",
+      "description": "Write persist-across-reopen test in new TestPersistAcrossReopen class (test_cost_store.py): open \u2192 save_invocation \u2192 close \u2192 open again (same path) \u2192 raw SELECT verifies row exists. This validates data survives close/reopen cycle. Should pass with current impl once double-open guard is in place (close sets _conn=None, so reopen is allowed).",
+      "status": "done",
+      "commit": "67a9cd64"
+    },
+    {
+      "id": "step-7",
+      "type": "impl",
+      "description": "Fix __aexit__ signature from (*exc: Any) to standard 3-arg form: (self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: object) -> None. Pure type-safety fix, no behavioral change.",
+      "status": "done",
+      "commit": "f4136c2d"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Fix _execute params type from bare 'tuple' to 'tuple[Any, ...]'. Pure type-safety fix, no behavioral change.",
+      "status": "done",
+      "commit": "75fb231f"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Double-open raises RuntimeError rather than silently closing and reopening",
+      "rationale": "A double-open is always a bug \u2014 silently recovering would mask lifecycle errors. Consistent with _require_conn pattern which also raises RuntimeError for misuse."
+    },
+    {
+      "decision": "__aexit__ exc_tb typed as 'object' not 'TracebackType | None'",
+      "rationale": "Avoids importing types.TracebackType. The 'object' type is sufficient since the parameter is unused (just forwarded to close()). This matches what pyright accepts without additional imports."
+    },
+    {
+      "decision": "Post-close guard tests written even though they pass immediately",
+      "rationale": "These are regression tests for a contract: after close(), writes must raise. Without explicit tests, someone could refactor _require_conn and break this invariant without detection."
+    },
+    {
+      "decision": "Steps 7-8 (type fixes) grouped at end without separate test steps",
+      "rationale": "These are pure signature/type annotation changes with zero behavioral change. No new tests needed \u2014 existing tests already exercise the methods. Pyright/mypy would catch regressions."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "__all__ export pattern from cli_invoke, config_models, usage_gate",
+      "where": "shared/src/shared/__init__.py lines 3-18",
+      "how": "Add 'from shared.cost_store import CostStore' following same import style, add 'CostStore' to __all__ list"
+    },
+    {
+      "what": "TestModuleLevelAll pattern for validating submodule __all__",
+      "where": "shared/tests/test_public_api.py lines 33-63",
+      "how": "Add test_cost_store_all method following same assert set(module.__all__) == {...} pattern"
+    },
+    {
+      "what": "TestInitAllCompleteness union check pattern",
+      "where": "shared/tests/test_public_api.py lines 66-93",
+      "how": "Add cost_store import and include in union calculation and no-private-symbols check"
+    },
+    {
+      "what": "RuntimeError guard pattern from _require_conn",
+      "where": "shared/src/shared/cost_store.py lines 118-122",
+      "how": "Same RuntimeError pattern for double-open: if self._conn is not None: raise RuntimeError('CostStore already opened')"
+    },
+    {
+      "what": "Existing test fixtures (tmp_path, pytest.raises, async context manager patterns)",
+      "where": "shared/tests/test_cost_store.py throughout",
+      "how": "New test classes follow same @pytest.mark.asyncio class pattern, use tmp_path for DB, pytest.raises for error assertions"
+    }
+  ],
+  "_session_id": "314-7b26b14f",
+  "_created_at": "2026-03-30T22:25:37.747079+00:00"
+}
