@@ -5907,6 +5907,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 315,
+        "title": "Extract AsyncSqliteStore base class from duplicated sqlite lifecycle",
+        "description": "Three stores implement identical open/close/WAL/busy_timeout lifecycle patterns:\n- CostStore (shared/src/shared/cost_store.py) — has __aenter__/__aexit__, busy_timeout=30s\n- DurableWriteQueue (fused-memory/src/fused_memory/services/durable_queue.py) — no context manager, busy_timeout=5s\n- WriteJournal (fused-memory/src/fused_memory/services/write_journal.py) — no context manager, no busy_timeout\n\nExtract a small abstract base class to shared/src/shared/async_sqlite_base.py:\n- __init__(db_path: Path)\n- open() with WAL mode, configurable busy_timeout, schema setup via abstract _schema() property\n- close() idempotent\n- __aenter__/__aexit__ async context manager\n- _require_conn() guard\n- Double-open guard (raise if already open)\n\nCostStore subclasses it immediately. DurableWriteQueue and WriteJournal adoption can follow in separate tasks since they live in fused-memory.\n\nAlso extract apply_wal_pragmas(conn, busy_timeout_ms) utility that all three stores can share, keeping timeout values explicit and in sync.\n\nmemory_hints:\n- search: \"AsyncSqliteStore base class sqlite lifecycle dedup\"\n- search: \"DurableWriteQueue WriteJournal CostStore pattern\"\n- entity: \"CostStore\"\n- entity: \"DurableWriteQueue\"\n- entity: \"WriteJournal\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -5919,7 +5930,7 @@
       ],
       "created": "2026-03-30T22:06:52.504Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-30T22:06:52.506Z"
+      "updated": "2026-03-30T22:07:01.089Z"
     }
   }
 }
