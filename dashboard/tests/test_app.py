@@ -815,6 +815,30 @@ class TestAriaLivePollingsections:
         assert html.count('aria-live="polite"') >= 5
 
 
+class TestNavBar:
+    """Tests for the nav bar present in every page via base.html."""
+
+    def test_nav_element_present(self, client):
+        html = client.get('/').text
+        assert '<nav' in html
+
+    def test_dashboard_link_href(self, client):
+        html = client.get('/').text
+        assert 'href="/"' in html
+
+    def test_costs_link_href(self, client):
+        html = client.get('/').text
+        assert 'href="/costs"' in html
+
+    def test_dashboard_link_text(self, client):
+        html = client.get('/').text
+        assert 'Dashboard' in html
+
+    def test_costs_link_text(self, client):
+        html = client.get('/').text
+        assert 'Costs' in html
+
+
 class TestSafeGatherResult:
     """Tests for the _safe_gather_result helper."""
 
