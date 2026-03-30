@@ -1,0 +1,178 @@
+{
+  "task_id": "304",
+  "title": "CostStore: persistent connection + async context manager",
+  "files": [
+    "shared/pyproject.toml",
+    "shared/src/shared/cost_store.py",
+    "shared/tests/test_cost_store.py"
+  ],
+  "modules": [
+    "shared/src/shared",
+    "shared/tests"
+  ],
+  "analysis": "CostStore was created on a feature branch (commit 9fbac067) but never merged to main. The existing implementation opens a fresh aiosqlite.connect() on every save_invocation() and save_account_event() call, and _ensure_schema() also opens its own ephemeral connection via a classmethod open() factory. This task creates the refactored version directly in this worktree with a persistent connection pattern.\n\nThe codebase has two strong precedents for the target pattern: WriteJournal (fused-memory/services/write_journal.py) uses initialize()/close()/_require_db() with a persistent self._db connection, and DurableWriteQueue uses the same pattern with explicit PRAGMA busy_timeout and PRAGMA journal_mode=WAL. Neither uses __aenter__/__aexit__, so this task adds that protocol to CostStore as a first-in-project example for shared/ async resources.\n\nKey refactoring changes from the prior branch version:\n1. Replace classmethod open() with instance open()/close() lifecycle\n2. Hold self._conn as persistent aiosqlite.Connection (set WAL + busy_timeout once)\n3. Add __aenter__/__aexit__ for 'async with CostStore(path) as store:' usage\n4. Extract _execute(sql, params) to deduplicate the execute+commit pattern across save methods\n5. Add _require_conn() guard that raises RuntimeError if save methods called before open()\n\naiosqlite is not currently in shared/pyproject.toml dependencies \u2014 must be added as a prerequisite.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Add aiosqlite>=0.20 to shared/pyproject.toml [project] dependencies",
+      "status": "done",
+      "commit": "69a51fe1",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write test: CostStore.__init__ stores db_path and sets _conn to None",
+      "status": "done",
+      "commit": "97b4b75b"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Implement CostStore.__init__(self, db_path: Path) with self.db_path and self._conn = None; create cost_store.py with _SCHEMA constant (schema SQL without PRAGMA \u2014 pragmas set on connection), __all__ export",
+      "status": "done",
+      "commit": "2cd497ae"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write test: open() creates persistent connection with WAL mode (PRAGMA journal_mode) and busy_timeout=30000ms; verify via PRAGMA queries on the connection. Test close() sets _conn to None and is idempotent (double-close safe)",
+      "status": "done",
+      "commit": "cf70c271"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Implement open() \u2014 mkdir parents, aiosqlite.connect, set PRAGMA journal_mode=WAL, set PRAGMA busy_timeout=30000, run _ensure_schema(), store in self._conn. Implement close() \u2014 close conn if not None, set to None",
+      "status": "done",
+      "commit": "2cd497ae"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write test: async context manager protocol \u2014 'async with CostStore(path) as store:' opens connection on enter, closes on exit. Verify _conn is set during block and None after exit",
+      "status": "done",
+      "commit": "df5b9cb5"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Implement __aenter__(self) -> CostStore (calls open, returns self) and __aexit__(self, *exc) -> None (calls close)",
+      "status": "done",
+      "commit": "2cd497ae"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write test: save_invocation() and save_account_event() raise RuntimeError('CostStore not opened') when called before open()",
+      "status": "done",
+      "commit": "4d73a98e"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Implement _require_conn(self) -> aiosqlite.Connection that raises RuntimeError if self._conn is None; wire into save methods as guard",
+      "status": "done",
+      "commit": "2cd497ae"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write test: save_invocation() persists a row with all 15 fields to the invocations table; verify via raw SQL SELECT. Test nullable fields (task_id=None, token counts=None)",
+      "status": "done",
+      "commit": "abf69944"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Implement _execute(self, sql, params) helper (await conn.execute + await conn.commit) and save_invocation() using _execute with parameterized INSERT",
+      "status": "done",
+      "commit": "2cd497ae"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write test: save_account_event() persists a row with all 6 fields to the account_events table; verify via raw SQL SELECT. Test nullable fields (project_id=None, run_id=None, details=None)",
+      "status": "done",
+      "commit": "f03d0e98"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Implement save_account_event() using _execute with parameterized INSERT",
+      "status": "done",
+      "commit": "2cd497ae"
+    },
+    {
+      "id": "step-13",
+      "type": "test",
+      "description": "Write test: connection reuse \u2014 after open(), multiple save_invocation() and save_account_event() calls do not open additional connections (patch aiosqlite.connect, assert called exactly once during open())",
+      "status": "done",
+      "commit": "0c3a6f07"
+    },
+    {
+      "id": "step-14",
+      "type": "impl",
+      "description": "Verification pass \u2014 should already pass since _execute uses self._conn. No code changes expected",
+      "status": "done",
+      "commit": "0c3a6f07"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Instance open()/close() instead of classmethod open() factory",
+      "rationale": "Task explicitly specifies 'opened in open(), closed in close()' instance lifecycle. This also enables __aenter__/__aexit__ protocol where the constructor is called first, then open() is called by __aenter__. The prior branch had a classmethod open() that mixed construction with connection opening."
+    },
+    {
+      "decision": "Separate PRAGMA from schema SQL \u2014 pragmas set on connection, not in executescript",
+      "rationale": "The prior version had 'PRAGMA journal_mode=WAL;' inside _SCHEMA which was run via executescript on an ephemeral connection. With a persistent connection, pragmas should be set once via individual execute() calls on the connection (consistent with WriteJournal and DurableWriteQueue patterns in fused-memory)."
+    },
+    {
+      "decision": "busy_timeout=30000 (30 seconds) as PRAGMA on persistent connection",
+      "rationale": "Task specifies 30s for robustness under concurrent load. DurableWriteQueue uses 5000ms but that's for a dedicated queue. CostStore shares runs.db with the synchronous RunStore, so a longer timeout prevents failures under WAL lock contention from 10-20 concurrent tasks."
+    },
+    {
+      "decision": "_execute() commits after every write (not batched)",
+      "rationale": "CostStore writes are fire-and-forget on a hot path (per-invocation). Each save should be durable immediately. Batching would risk data loss on crash. The _execute helper encapsulates the execute+commit pattern to deduplicate code in save_invocation and save_account_event."
+    },
+    {
+      "decision": "Do not modify shared/__init__.py or test_public_api.py in this task",
+      "rationale": "The prior branch (ee64d3a8) also did not add CostStore to __init__.py. CostStore is importable directly via 'from shared.cost_store import CostStore'. Adding to the public API surface is a separate concern (likely part of the threading/instrumentation task 299). Keeping scope tight avoids conflicts."
+    },
+    {
+      "decision": "close() is idempotent \u2014 safe to call when already closed",
+      "rationale": "Consistent with WriteJournal and DurableWriteQueue patterns. Prevents errors in cleanup paths where close() might be called multiple times (e.g., explicit close + __aexit__)."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "WriteJournal lifecycle pattern",
+      "where": "fused-memory/src/fused_memory/services/write_journal.py",
+      "how": "Follow _require_db() guard pattern returning connection or raising RuntimeError. Follow initialize()/close() lifecycle naming convention adapted as open()/close() per task spec."
+    },
+    {
+      "what": "DurableWriteQueue PRAGMA setup",
+      "where": "fused-memory/src/fused_memory/services/durable_queue.py lines 111-114",
+      "how": "Reuse the pattern of setting PRAGMA journal_mode=WAL and PRAGMA busy_timeout on the persistent connection immediately after aiosqlite.connect()."
+    },
+    {
+      "what": "Existing test patterns (pytest-asyncio, class-based, tmp_path)",
+      "where": "shared/tests/test_cli_invoke.py, dashboard/tests/test_db.py",
+      "how": "Use @pytest.mark.asyncio class decorator, tmp_path fixture for database files, raw aiosqlite.connect for read-back verification. Use MagicMock/patch patterns for connection reuse test."
+    },
+    {
+      "what": "Schema constant pattern (_SCHEMA)",
+      "where": "orchestrator/src/orchestrator/run_store.py, fused-memory/services/durable_queue.py",
+      "how": "Define _SCHEMA as module-level string constant with CREATE TABLE IF NOT EXISTS and CREATE INDEX IF NOT EXISTS statements. Passed to executescript() during open()."
+    },
+    {
+      "what": "conftest.py sys.path setup",
+      "where": "shared/tests/conftest.py",
+      "how": "Already present \u2014 ensures worktree's local src/ takes precedence over editable install. No changes needed for new test file."
+    }
+  ],
+  "_session_id": "304-417fee58",
+  "_created_at": "2026-03-30T17:55:34.898471+00:00"
+}
