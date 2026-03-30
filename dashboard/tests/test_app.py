@@ -847,6 +847,38 @@ class TestNavBar:
         assert '<nav' in html
         assert 'href="/"' in html
 
+    # Active-state tests — use _get_nav_link for scoped assertions
+
+    def test_dashboard_link_active_on_root(self, client):
+        html = client.get('/').text
+        tag = _get_nav_link(html, '/')
+        assert 'border-blue-500' in tag
+
+    def test_costs_link_not_active_on_root(self, client):
+        html = client.get('/').text
+        tag = _get_nav_link(html, '/costs')
+        assert 'border-blue-500' not in tag
+
+    def test_costs_link_active_on_costs_page(self, client):
+        html = client.get('/costs').text
+        tag = _get_nav_link(html, '/costs')
+        assert 'border-blue-500' in tag
+
+    def test_dashboard_link_not_active_on_costs_page(self, client):
+        html = client.get('/costs').text
+        tag = _get_nav_link(html, '/')
+        assert 'border-blue-500' not in tag
+
+    def test_active_link_has_white_text(self, client):
+        html = client.get('/').text
+        tag = _get_nav_link(html, '/')
+        assert 'text-white' in tag
+
+    def test_inactive_link_has_gray_text(self, client):
+        html = client.get('/').text
+        tag = _get_nav_link(html, '/costs')
+        assert 'text-gray-400' in tag
+
 
 class TestSafeGatherResult:
     """Tests for the _safe_gather_result helper."""
