@@ -230,6 +230,7 @@ async def empty_costs_conn(empty_costs_db):
 from dashboard.data.costs import (  # noqa: E402
     get_cost_by_account,
     get_cost_by_project,
+    get_cost_by_role,
     get_cost_summary,
 )
 
@@ -356,3 +357,57 @@ class TestCostByAccount:
         assert mz['cap_events'] == 0
         assert mz['last_cap'] is None
         assert mz['status'] == 'active'
+
+
+# ---------------------------------------------------------------------------
+# Tests: get_cost_by_role
+# ---------------------------------------------------------------------------
+
+class TestCostByRole:
+    @pytest.mark.asyncio
+    async def test_populated(self, costs_conn):
+        result = await get_cost_by_role(costs_conn)
+
+        assert 'dark_factory' in result
+        df = result['dark_factory']
+
+        # implementer → opus: 1.00 (task 101 max-a) + 0.80 (task 102 max-b) = 1.80
+        assert df['implementer']['claude-opus-4-5'] == pytest.approx(1.8, abs=1e-6)
+        # reviewer → sonnet: 0.50 (task 101 max-a) + 0.30 (task 102 max-b) = 0.80
+        assert df['reviewer']['claude-sonnet-4-5'] == pytest.approx(0.8, abs=1e-6)
+        # debugger → opus: 0.60 (task 103 max-a)
+        assert df['debugger']['claude-opus-4-5'] == pytest.approx(0.6, abs=1e-6)
+
+        assert 'reify' in result
+        r = result['reify']
+        # implementer → sonnet: 0.40
+        assert r['implementer']['claude-sonnet-4-5'] == pytest.approx(0.4, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_none_db(self):
+        result = await get_cost_by_role(None)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_single_role(self, empty_costs_conn, tmp_path):
+        """Single role — structure should still be {project_id: {role: {model: total}}}."""
+        db_path = tmp_path / 'single.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+        conn.execute(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('r1', 't1', 'solo', 'acc', 'claude-opus-4-5', 'implementer',
+             1.5, 0, (now - timedelta(hours=1)).isoformat(), now.isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_role(aconn)
+
+        assert result == {'solo': {'implementer': {'claude-opus-4-5': pytest.approx(1.5)}}}
