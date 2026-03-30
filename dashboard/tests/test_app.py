@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import runpy
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
@@ -49,6 +50,20 @@ def _get_section_window(
     idx = html.find(hx_get)
     assert idx != -1, f'hx-get for {partial_url} not found in HTML'
     return html[max(0, idx - before):idx + after]
+
+
+def _get_nav_link(html: str, href: str) -> str:
+    """Return the opening <a> tag for a nav link with the given href.
+
+    Uses re.search to extract the tag, enabling scoped class assertions —
+    e.g. asserting 'border-blue-500' is present in the *active* link or
+    absent from the *inactive* link without false positives from other elements.
+    Raises AssertionError with a diagnostic message if the link is not found.
+    """
+    pattern = r'<a\s+[^>]*href="' + re.escape(href) + r'"[^>]*>'
+    m = re.search(pattern, html)
+    assert m is not None, f'No <a href="{href}"> found in HTML'
+    return m.group(0)
 
 
 class TestGetSectionWindow:
@@ -798,6 +813,71 @@ class TestAriaLivePollingsections:
     def test_polling_sections_have_aria_live(self, client):
         html = client.get('/').text
         assert html.count('aria-live="polite"') >= 5
+
+
+class TestNavBar:
+    """Tests for the nav bar present in every page via base.html."""
+
+    def test_nav_element_present(self, client):
+        html = client.get('/').text
+        assert '<nav' in html
+
+    def test_dashboard_link_href(self, client):
+        html = client.get('/').text
+        assert 'href="/"' in html
+
+    def test_costs_link_href(self, client):
+        html = client.get('/').text
+        assert 'href="/costs"' in html
+
+    def test_dashboard_link_text(self, client):
+        html = client.get('/').text
+        assert 'Dashboard' in html
+
+    def test_costs_link_text(self, client):
+        html = client.get('/').text
+        assert 'Costs' in html
+
+    def test_costs_route_returns_200(self, client):
+        response = client.get('/costs')
+        assert response.status_code == 200
+
+    def test_costs_page_extends_base(self, client):
+        html = client.get('/costs').text
+        assert '<nav' in html
+        assert 'href="/"' in html
+
+    # Active-state tests — use _get_nav_link for scoped assertions
+
+    def test_dashboard_link_active_on_root(self, client):
+        html = client.get('/').text
+        tag = _get_nav_link(html, '/')
+        assert 'border-blue-500' in tag
+
+    def test_costs_link_not_active_on_root(self, client):
+        html = client.get('/').text
+        tag = _get_nav_link(html, '/costs')
+        assert 'border-blue-500' not in tag
+
+    def test_costs_link_active_on_costs_page(self, client):
+        html = client.get('/costs').text
+        tag = _get_nav_link(html, '/costs')
+        assert 'border-blue-500' in tag
+
+    def test_dashboard_link_not_active_on_costs_page(self, client):
+        html = client.get('/costs').text
+        tag = _get_nav_link(html, '/')
+        assert 'border-blue-500' not in tag
+
+    def test_active_link_has_white_text(self, client):
+        html = client.get('/').text
+        tag = _get_nav_link(html, '/')
+        assert 'text-white' in tag
+
+    def test_inactive_link_has_gray_text(self, client):
+        html = client.get('/').text
+        tag = _get_nav_link(html, '/costs')
+        assert 'text-gray-400' in tag
 
 
 class TestSafeGatherResult:

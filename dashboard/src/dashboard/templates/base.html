@@ -24,8 +24,14 @@
     </script>
 </head>
 <body class="h-full bg-gray-900 text-gray-100" hx-ext="morph">
-    <header class="border-b border-gray-700 px-6 py-4">
+    {% set active_cls = 'border-b-2 border-blue-500 text-white pb-1 text-sm font-medium' %}
+    {% set inactive_cls = 'text-gray-400 hover:text-gray-200 pb-1 text-sm font-medium' %}
+    <header class="border-b border-gray-700 px-6 py-4 flex items-center gap-6">
         <h1 class="text-xl font-semibold">Dark Factory</h1>
+        <nav class="flex items-center gap-6">
+            <a href="/" class="{{ active_cls if request.url.path == '/' else inactive_cls }}">Dashboard</a>
+            <a href="/costs" class="{{ active_cls if request.url.path.startswith('/costs') else inactive_cls }}">Costs</a>
+        </nav>
     </header>
     <main class="container mx-auto px-6 py-8">
         {% block content %}{% endblock %}
