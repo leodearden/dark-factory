@@ -21,7 +21,6 @@ _CAP_HIT_COOLDOWN_SECS = 5.0
 
 __all__ = [
     'AgentResult',
-    '_to_token_count',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
 ]
