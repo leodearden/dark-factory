@@ -5366,7 +5366,7 @@
         "description": "Add account_name: str = '' field to AgentResult in shared/src/shared/cli_invoke.py. In invoke_with_cap_retry (same file), capture usage_gate.active_account_name before calling invoke_claude_agent and set it on the returned AgentResult. In the steward's _invoke_with_session (orchestrator/src/orchestrator/steward.py), do the same — capture the active account name from the usage gate before invoking and set it on the result. Update tests for both paths to verify account_name is propagated.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "294"
         ],
@@ -5398,7 +5398,8 @@
             ]
           },
           "_causation_id": "eaf99cc7-85f9-47d1-8bdd-81c6af26139e"
-        }
+        },
+        "updatedAt": "2026-03-30T17:50:44.631Z"
       },
       {
         "id": "298",
@@ -5879,7 +5880,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-30T17:50:44.464Z",
+      "lastModified": "2026-03-30T17:50:44.631Z",
       "taskCount": 291,
       "completedCount": 262,
       "tags": [
