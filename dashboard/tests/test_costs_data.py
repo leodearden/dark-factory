@@ -334,6 +334,57 @@ class TestCostByAccount:
         assert result == {}
 
     @pytest.mark.asyncio
+    async def test_last_cap_is_cap_hit_timestamp(self, tmp_path):
+        """last_cap must hold the cap_hit timestamp, not the resumed timestamp.
+
+        When an account has cap_hit at T1 then resumed at T2 (T2 > T1),
+        last_cap must equal T1 (cap_hit). The current MAX(created_at)
+        implementation returns T2 (resumed), which is wrong.
+        """
+        db_path = tmp_path / 'cap_order.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+
+        now = datetime.now(UTC)
+        cap_ts = (now - timedelta(hours=4)).isoformat()
+        resumed_ts = (now - timedelta(hours=2)).isoformat()  # more recent
+
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                ('test-acc', 'cap_hit', 'proj', 'r1', None, cap_ts),
+                ('test-acc', 'resumed', 'proj', 'r1', None, resumed_ts),
+            ],
+        )
+        conn.execute(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('r1', 't1', 'proj', 'test-acc', 'claude-opus-4-5', 'implementer',
+             1.0, 0,
+             (now - timedelta(hours=5)).isoformat(),
+             (now - timedelta(hours=1)).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn)
+
+        assert 'test-acc' in result
+        ta = result['test-acc']
+        # last_cap must be the cap_hit timestamp, not the resumed timestamp
+        assert ta['last_cap'] == cap_ts, (
+            f"expected last_cap={cap_ts!r} (cap_hit), got {ta['last_cap']!r}"
+        )
+        # Status: resumed is the most recent in-window event → active
+        assert ta['status'] == 'active'
+
+    @pytest.mark.asyncio
     async def test_account_with_no_caps(self, tmp_path):
         """Account that has invocations but no cap events has cap_events=0, last_cap=None."""
         db_path = tmp_path / 'nocap.db'
