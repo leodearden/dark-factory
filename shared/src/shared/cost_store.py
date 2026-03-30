@@ -128,7 +128,7 @@ class CostStore:
             raise RuntimeError('CostStore not opened')
         return self._conn
 
-    async def _execute(self, sql: str, params: tuple) -> None:
+    async def _execute(self, sql: str, params: tuple[Any, ...]) -> None:
         """Execute a single statement and commit."""
         conn = self._require_conn()
         await conn.execute(sql, params)
