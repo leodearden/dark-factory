@@ -438,6 +438,10 @@ class ReconciliationHarness:
             run.status = RunStatus.completed
             await self.journal.complete_run(run_id, 'completed')
 
+            # Persist stage reports before judge — the judge reads from the DB,
+            # so reports must be committed before firing the async task.
+            await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+
             # Async judge review
             if self.judge:
                 asyncio.create_task(self._run_judge(run_id))
@@ -625,8 +629,6 @@ class ReconciliationHarness:
             stage2 = self.stages[1]
             assert isinstance(stage1, MemoryConsolidator)
             assert isinstance(stage2, TaskKnowledgeSync)
-            stage1.episode_limit = tier.episode_limit
-            stage1.memory_limit = tier.memory_limit
             stage1.remediation_findings = findings
             stage2.remediation_mode = True
 
@@ -648,6 +650,9 @@ class ReconciliationHarness:
             run.completed_at = datetime.now(UTC)
             run.status = RunStatus.completed
             await self.journal.complete_run(run_id, 'completed')
+
+            # Persist stage reports before judge (same fix as run_full_cycle)
+            await self.journal.update_run_stage_reports(run_id, run.stage_reports)
 
             # Judge review for remediation run
             if self.judge:

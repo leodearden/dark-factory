@@ -125,6 +125,44 @@ CREATE INDEX IF NOT EXISTS idx_ra_run ON run_actions(run_id);
 """
 
 
+def _extract_target(op: dict) -> str:
+    """Best-effort target ID extraction from a write_journal op.
+
+    write_ops don't store a dedicated ``target`` column, but the information
+    lives inside ``result_summary`` or ``params``.  This helper pulls it out
+    so the judge (and dashboard) can display what was actually affected.
+    """
+    rs = op.get('result_summary')
+    if isinstance(rs, str):
+        try:
+            rs = json.loads(rs)
+        except (json.JSONDecodeError, TypeError):
+            rs = None
+    params = op.get('params')
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except (json.JSONDecodeError, TypeError):
+            params = None
+
+    if isinstance(rs, dict):
+        if 'id' in rs:
+            return rs['id']
+        if 'memory_ids' in rs:
+            ids = rs['memory_ids']
+            return ids[0] if len(ids) == 1 else f'{len(ids)} memories'
+        if 'episode_id' in rs:
+            return rs['episode_id']
+    if isinstance(params, dict):
+        for key in ('memory_id', 'episode_id', 'entity_id', 'query'):
+            if key in params:
+                val = params[key]
+                if key == 'query':
+                    return val[:80] if isinstance(val, str) else str(val)
+                return str(val)
+    return '?'
+
+
 class ReconciliationJournal:
     """Persistent journal backed by SQLite — one database per project directory."""
 
@@ -566,6 +604,7 @@ class ReconciliationJournal:
             for op in wj_ops:
                 actions.append({
                     **op,
+                    'target': _extract_target(op),
                     'source': 'write_journal',
                 })
 

@@ -272,3 +272,86 @@ async def test_get_run_actions_combined_with_write_journal(journal, tmp_path):
     assert len(combined) == 2
 
     await wj.close()
+
+
+@pytest.mark.asyncio
+async def test_combined_extracts_target_from_write_journal(journal, tmp_path):
+    """Write journal ops get target extracted from result_summary."""
+    from fused_memory.services.write_journal import WriteJournal
+
+    wj = WriteJournal(tmp_path / 'target_wj')
+    await wj.initialize()
+    journal.set_write_journal(wj)
+
+    run_id = str(uuid.uuid4())
+    mem_id = 'abc-123-def'
+    await wj.log_write_op(
+        write_op_id=str(uuid.uuid4()),
+        causation_id=run_id,
+        operation='delete_memory',
+        project_id='test',
+        result_summary={'status': 'deleted', 'store': 'mem0', 'id': mem_id},
+    )
+
+    combined = await journal.get_run_actions_combined(run_id)
+    assert len(combined) == 1
+    assert combined[0]['target'] == mem_id
+
+    await wj.close()
+
+
+class TestExtractTarget:
+    """Unit tests for _extract_target helper."""
+
+    def test_delete_memory_id_from_result(self):
+        from fused_memory.reconciliation.journal import _extract_target
+
+        op = {'result_summary': '{"status":"deleted","id":"mem-42"}'}
+        assert _extract_target(op) == 'mem-42'
+
+    def test_add_memory_single_id(self):
+        from fused_memory.reconciliation.journal import _extract_target
+
+        op = {'result_summary': '{"memory_ids":["ep-1"],"stores":["mem0"]}'}
+        assert _extract_target(op) == 'ep-1'
+
+    def test_add_memory_multiple_ids(self):
+        from fused_memory.reconciliation.journal import _extract_target
+
+        op = {'result_summary': '{"memory_ids":["a","b","c"],"stores":["mem0","graphiti"]}'}
+        assert _extract_target(op) == '3 memories'
+
+    def test_add_episode_id(self):
+        from fused_memory.reconciliation.journal import _extract_target
+
+        op = {'result_summary': '{"episode_id":"ep-99","status":"queued"}'}
+        assert _extract_target(op) == 'ep-99'
+
+    def test_fallback_to_params_memory_id(self):
+        from fused_memory.reconciliation.journal import _extract_target
+
+        op = {'result_summary': '{"status":"deleted"}', 'params': '{"memory_id":"m-7"}'}
+        assert _extract_target(op) == 'm-7'
+
+    def test_fallback_to_params_query(self):
+        from fused_memory.reconciliation.journal import _extract_target
+
+        op = {'result_summary': '{"count":5}', 'params': '{"query":"recent decisions","limit":10}'}
+        assert _extract_target(op) == 'recent decisions'
+
+    def test_dict_inputs(self):
+        from fused_memory.reconciliation.journal import _extract_target
+
+        op = {'result_summary': {'id': 'direct-dict'}}
+        assert _extract_target(op) == 'direct-dict'
+
+    def test_missing_fields_returns_question_mark(self):
+        from fused_memory.reconciliation.journal import _extract_target
+
+        assert _extract_target({}) == '?'
+        assert _extract_target({'result_summary': '{}'}) == '?'
+
+    def test_malformed_json_returns_question_mark(self):
+        from fused_memory.reconciliation.journal import _extract_target
+
+        assert _extract_target({'result_summary': 'not json'}) == '?'
