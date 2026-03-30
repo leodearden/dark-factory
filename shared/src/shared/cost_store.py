@@ -87,6 +87,8 @@ class CostStore:
 
     async def open(self) -> None:
         """Open persistent connection, set WAL + busy_timeout, ensure schema."""
+        if self._conn is not None:
+            raise RuntimeError('CostStore already opened')
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = await aiosqlite.connect(str(self.db_path))
         try:
