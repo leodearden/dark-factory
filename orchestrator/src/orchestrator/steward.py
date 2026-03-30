@@ -311,8 +311,10 @@ class TaskSteward:
 
         while True:
             oauth_token = None
+            account_name = ''
             if self.usage_gate:
                 oauth_token = await self.usage_gate.before_invoke()
+                account_name = self.usage_gate.active_account_name or ''
 
             kwargs: dict = dict(
                 prompt=prompt,
@@ -365,6 +367,7 @@ class TaskSteward:
             if result.session_id:
                 self._session_id = result.session_id
 
+            result.account_name = account_name
             return result
 
     # ------------------------------------------------------------------
