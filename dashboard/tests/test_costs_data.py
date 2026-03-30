@@ -232,6 +232,7 @@ from dashboard.data.costs import (  # noqa: E402
     get_cost_by_project,
     get_cost_by_role,
     get_cost_summary,
+    get_cost_trend,
 )
 
 
@@ -411,3 +412,53 @@ class TestCostByRole:
             result = await get_cost_by_role(aconn)
 
         assert result == {'solo': {'implementer': {'claude-opus-4-5': pytest.approx(1.5)}}}
+
+
+# ---------------------------------------------------------------------------
+# Tests: get_cost_trend
+# ---------------------------------------------------------------------------
+
+class TestCostTrend:
+    @pytest.mark.asyncio
+    async def test_populated(self, costs_conn):
+        result = await get_cost_trend(costs_conn, days=7)
+
+        assert 'dark_factory' in result
+        df = result['dark_factory']
+        assert isinstance(df, list)
+        # All entries should have day and total keys
+        for entry in df:
+            assert 'day' in entry
+            assert 'total' in entry
+            assert isinstance(entry['total'], float)
+
+        # There should be exactly 7 days in the result
+        assert len(df) == 7
+
+        # Entries should be in chronological order
+        days_sorted = [entry['day'] for entry in df]
+        assert days_sorted == sorted(days_sorted)
+
+        # Total for today's day should include fixture invocations
+        # (all invocations were within last few hours, so all on today)
+        total_all = sum(entry['total'] for entry in df)
+        assert total_all == pytest.approx(3.2, abs=1e-6)  # dark_factory total
+
+        assert 'reify' in result
+        total_reify = sum(entry['total'] for entry in result['reify'])
+        assert total_reify == pytest.approx(0.4, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_none_db(self):
+        result = await get_cost_trend(None)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_fills_gaps(self, costs_conn):
+        """All days in the window should appear, even those with no spending."""
+        result = await get_cost_trend(costs_conn, days=7)
+        assert 'dark_factory' in result
+        df = result['dark_factory']
+        # 7 days total; only today has spending; others should be 0.0
+        zero_days = [e for e in df if e['total'] == 0.0]
+        assert len(zero_days) == 6  # 6 days back have no data
