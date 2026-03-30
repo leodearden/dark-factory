@@ -5810,7 +5810,20 @@
               }
             ]
           },
-          "_causation_id": "e0fce9c1-100f-4f35-a062-c2847200f7e6"
+          "_causation_id": "e0fce9c1-100f-4f35-a062-c2847200f7e6",
+          "files": [
+            "fused-memory/src/fused_memory/server/tools.py",
+            "fused-memory/src/fused_memory/services/memory_service.py",
+            "fused-memory/src/fused_memory/backends/graphiti_client.py",
+            "fused-memory/tests/test_memory_service.py",
+            "fused-memory/tests/test_tools_validation.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/server",
+            "fused-memory/src/fused_memory/services",
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/tests"
+          ]
         }
       },
       {
@@ -5852,7 +5865,15 @@
               "_search_graphiti invalidated edges search results"
             ]
           },
-          "_causation_id": "9d395ed6-5638-4dc3-ae3b-d6915ec67c9c"
+          "_causation_id": "9d395ed6-5638-4dc3-ae3b-d6915ec67c9c",
+          "files": [
+            "fused-memory/src/fused_memory/services/memory_service.py",
+            "fused-memory/tests/test_memory_service.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/services",
+            "fused-memory/tests"
+          ]
         }
       }
     ],
