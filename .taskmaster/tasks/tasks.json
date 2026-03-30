@@ -5613,7 +5613,7 @@
         "description": "Refactor CostStore to hold a single persistent aiosqlite.Connection instead of opening/closing a new connection on every save_invocation() and save_account_event() call.\n\nCurrent state: Each write opens a fresh aiosqlite.connect(), executes, commits, closes. _ensure_schema() also opens its own ephemeral connection. For a per-invocation hot path under 10-20 concurrent tasks, this creates excessive connection churn and WAL lock contention.\n\nChanges:\n1. Hold self._conn (opened in open(), closed in close()) — set WAL mode once on this connection\n2. Add __aenter__/__aexit__ async context manager protocol (consistent with other async resources in codebase)\n3. Extract private _execute(sql, params) helper to deduplicate the write pattern across save_invocation and save_account_event\n4. Guard against direct __init__ use: raise RuntimeError if save methods are called before open() (check self._conn is not None)\n5. Set explicit busy_timeout on the persistent connection (e.g., 30s) for robustness under concurrent load\n\nmemory_hints:\n- search: \"CostStore persistent connection async context manager\"\n- search: \"RunStore CostStore async pattern divergence\"\n- entity: \"CostStore\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -5626,7 +5626,8 @@
             "shared/src/shared",
             "shared/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-30T17:50:45.425Z"
       },
       {
         "id": "305",
@@ -5880,7 +5881,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-30T17:50:45.334Z",
+      "lastModified": "2026-03-30T17:50:45.426Z",
       "taskCount": 291,
       "completedCount": 262,
       "tags": [
