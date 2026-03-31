@@ -145,3 +145,39 @@ class TestIdempotentInitialize:
         assert uuids == {'uuid-X', 'uuid-Y'}
 
         await reg.close()
+
+
+class TestRapidCallStability:
+    """step-27/28: Cursor resource-leak regression — methods must remain stable
+    under rapid repeated calls (regression coverage for async-with refactor)."""
+
+    @pytest.mark.asyncio
+    async def test_is_planned_rapid_calls(self, registry):
+        """is_planned() must return correct results across 50 rapid calls."""
+        await registry.register('uuid-rapid', 'proj-r')
+        for _ in range(50):
+            result = await registry.is_planned('uuid-rapid')
+            assert result is True
+        for _ in range(50):
+            result = await registry.is_planned('uuid-not-there')
+            assert result is False
+
+    @pytest.mark.asyncio
+    async def test_get_planned_uuids_rapid_calls(self, registry):
+        """get_planned_uuids() must return a consistent set across 50 rapid calls."""
+        uuids = {f'uuid-r{i}' for i in range(5)}
+        for uid in uuids:
+            await registry.register(uid, 'proj-r')
+        for _ in range(50):
+            result = await registry.get_planned_uuids('proj-r')
+            assert result == uuids
+
+    @pytest.mark.asyncio
+    async def test_are_all_planned_rapid_calls(self, registry):
+        """are_all_planned() must return correct results across 50 rapid calls."""
+        await registry.register('uuid-a', 'proj-r')
+        await registry.register('uuid-b', 'proj-r')
+        for _ in range(50):
+            assert await registry.are_all_planned(['uuid-a', 'uuid-b']) is True
+        for _ in range(50):
+            assert await registry.are_all_planned(['uuid-a', 'uuid-missing']) is False
