@@ -6723,6 +6723,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 364,
+        "title": "Extract journal boilerplate helper in MemoryService",
+        "description": "MemoryService.merge_entities() and refresh_entity_summary() share ~30 lines of identical journal-logging boilerplate: write_op_id generation, success/error_msg scaffolding, try/except/finally with suppressed journal errors, and logger.warning on journal failure. Any future write-journaled method will copy it again.\n\nExtract a private helper such as `_with_journal(self, operation, params, coro, ...)` or an async context manager that handles the write_op_id generation, try/except/finally journaling, and warning suppression. Both methods would shrink to a few lines each.\n\nMemory hints:\n- Search: 'write journal boilerplate MemoryService'\n- Entities: MemoryService, WriteJournal",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6735,7 +6746,7 @@
       ],
       "created": "2026-03-31T14:52:01.850Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T14:52:01.852Z"
+      "updated": "2026-03-31T14:52:07.517Z"
     }
   }
 }
