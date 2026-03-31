@@ -957,3 +957,64 @@ class TestRunCostBreakdown:
         assert t['cost'] == pytest.approx(0.40, abs=1e-6)
         # Both invocation rows must be preserved in the detail list
         assert len(t['invocations']) == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests: Schema index validation
+# ---------------------------------------------------------------------------
+
+class TestSchema:
+    def test_completed_at_index_exists(self, tmp_path):
+        """COSTS_SCHEMA must create idx_inv_completed_at on invocations.
+
+        Every query in costs.py filters WHERE completed_at >= ?, so the
+        index is critical for performance. This test verifies the test-schema
+        constant has the index DDL.
+        """
+        db_path = tmp_path / 'schema_check.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        conn.commit()
+
+        # PRAGMA index_list returns rows: (seq, name, unique, origin, partial)
+        rows = conn.execute("PRAGMA index_list('invocations')").fetchall()
+        index_names = [row[1] for row in rows]
+        conn.close()
+
+        assert 'idx_inv_completed_at' in index_names, (
+            f"idx_inv_completed_at missing from COSTS_SCHEMA indexes: {index_names}"
+        )
+
+    def test_cost_store_schema_has_completed_at_index(self, tmp_path):
+        """_SCHEMA in shared.cost_store must create idx_inv_completed_at.
+
+        The production schema must mirror the test schema for this performance-
+        critical index. This test creates a fresh DB using _SCHEMA (production)
+        and asserts the index is present.
+        """
+        import sys  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        # shared is not a dashboard venv dependency; locate it via relative path
+        # parents[2] = worktree root (e.g. .worktrees/317)
+        shared_src = str(
+            Path(__file__).resolve().parents[2] / 'shared' / 'src'
+        )
+        sys.path.insert(0, shared_src)
+        try:
+            from shared.cost_store import _SCHEMA as PROD_SCHEMA  # noqa: PLC0415
+        finally:
+            sys.path.remove(shared_src)
+
+        db_path = tmp_path / 'prod_schema_check.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(PROD_SCHEMA)
+        conn.commit()
+
+        rows = conn.execute("PRAGMA index_list('invocations')").fetchall()
+        index_names = [row[1] for row in rows]
+        conn.close()
+
+        assert 'idx_inv_completed_at' in index_names, (
+            f"idx_inv_completed_at missing from cost_store._SCHEMA indexes: {index_names}"
+        )
