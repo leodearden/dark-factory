@@ -1,0 +1,86 @@
+{
+  "task_id": "313",
+  "title": "Stamp account_name in orchestrator's invoke_with_cap_retry",
+  "files": [
+    "orchestrator/src/orchestrator/agents/invoke.py",
+    "orchestrator/tests/test_invoke.py"
+  ],
+  "modules": [
+    "orchestrator/src/orchestrator/agents",
+    "orchestrator/tests"
+  ],
+  "analysis": "The orchestrator's invoke_with_cap_retry (orchestrator/src/orchestrator/agents/invoke.py:46-88) dispatches to invoke_agent() (the multi-backend dispatcher) with cap-retry logic mirroring shared/src/shared/cli_invoke.py:128-216. However, it omits the account_name capture-and-stamp pattern present in the shared version. The shared version (1) initializes account_name='' before the loop, (2) captures account_name=usage_gate.active_account_name or '' after before_invoke(), and (3) stamps result.account_name=account_name before returning. The orchestrator version reads active_account_name only for logging inside the cap-hit branch (line 70) but never stamps it on the result. Callers (workflow.py:1088, review_checkpoint.py:124, harness.py:461) all go through this orchestrator version and get account_name==''. The steward has its own parallel cap-retry loop (steward.py:312-371) that already implements this pattern correctly. The fix is small: add 2 lines to capture and 1 line to stamp, matching the shared/steward patterns exactly. Tests follow the well-established pattern from shared/tests/test_cli_invoke.py: mock invoke_agent, configure a MagicMock usage_gate, and verify result.account_name propagation.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Create orchestrator/tests/test_invoke.py with test_account_name_set_from_usage_gate: mock invoke_agent to return a successful AgentResult, configure usage_gate.active_account_name='acct-a', call invoke_with_cap_retry, assert result.account_name=='acct-a'. This test will FAIL because the current code never stamps account_name.",
+      "status": "done",
+      "commit": "325a55af"
+    },
+    {
+      "id": "step-2",
+      "type": "test",
+      "description": "Add test_account_name_none_coerced_to_empty: usage_gate.active_account_name=None, assert result.account_name==''. Add test_account_name_empty_without_gate: usage_gate=None, assert result.account_name==''. Both will FAIL.",
+      "status": "done",
+      "commit": "325a55af"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Add test_account_name_reflects_failover_account: mock detect_cap_hit to return True then False, use PropertyMock for active_account_name returning ['acct-a', 'acct-b', 'acct-b'] (capture, log, retry-capture), patch asyncio.sleep, assert result.account_name=='acct-b'. Will FAIL.",
+      "status": "done",
+      "commit": "325a55af"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "In orchestrator/src/orchestrator/agents/invoke.py invoke_with_cap_retry: (1) Add 'account_name = \"\"' before the while loop. (2) Inside 'if usage_gate:' block after before_invoke(), add 'account_name = usage_gate.active_account_name or \"\"'. (3) After the while loop break, before 'return result', add 'result.account_name = account_name'. This makes all 4 tests pass.",
+      "status": "pending",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Capture account_name immediately after before_invoke(), not after the loop",
+      "rationale": "Matches the shared implementation pattern. active_account_name reflects the account selected by before_invoke(). On cap-hit + failover, the next loop iteration re-captures, so account_name always reflects the account that produced the successful result."
+    },
+    {
+      "decision": "Mock orchestrator.agents.invoke.invoke_agent (not shared.cli_invoke.invoke_claude_agent) in tests",
+      "rationale": "The orchestrator's invoke_with_cap_retry calls invoke_agent (the multi-backend dispatcher), not invoke_claude_agent directly. Mocking the correct target ensures tests validate the actual call chain."
+    },
+    {
+      "decision": "Create a new test_invoke.py rather than extending test_invoke_parsers.py",
+      "rationale": "test_invoke_parsers.py tests parser functions (_parse_codex_output, _parse_gemini_output). The account_name tests cover invoke_with_cap_retry which is a different concern. Separate files match the project's convention of focused test modules."
+    },
+    {
+      "decision": "Do not add cost_store integration to orchestrator's invoke_with_cap_retry",
+      "rationale": "The task scope is limited to account_name stamping. The shared version has cost_store, but adding it here is a separate concern. The orchestrator's version intentionally has a simpler signature."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Test pattern for account_name threading",
+      "where": "shared/tests/test_cli_invoke.py (TestAccountNameThreading, TestAccountNameNoGate)",
+      "how": "Mirror the exact MagicMock setup (gate.before_invoke, gate.detect_cap_hit, gate.active_account_name, gate.on_agent_complete) and assertion pattern, but mock orchestrator.agents.invoke.invoke_agent instead of shared.cli_invoke.invoke_claude_agent"
+    },
+    {
+      "what": "_make_result() helper function pattern",
+      "where": "shared/tests/test_cli_invoke.py:33-36",
+      "how": "Create identical _make_result(**overrides) helper in test_invoke.py for constructing AgentResult with sensible defaults"
+    },
+    {
+      "what": "Cap-hit failover test pattern with PropertyMock",
+      "where": "shared/tests/test_cli_invoke.py:88-115 and orchestrator/tests/test_steward.py:261-301",
+      "how": "Use PropertyMock side_effect list for active_account_name to simulate account switching across cap-hit retry loops"
+    },
+    {
+      "what": "asyncio.sleep mock pattern for cap-hit tests",
+      "where": "shared/tests/test_cli_invoke.py:109-112",
+      "how": "Patch orchestrator.agents.invoke.asyncio.sleep as AsyncMock to avoid real delays in cap-hit retry tests"
+    }
+  ],
+  "_session_id": "313-6c2d36ad",
+  "_created_at": "2026-03-31T13:56:44.503163+00:00"
+}
