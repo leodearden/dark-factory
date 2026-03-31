@@ -748,11 +748,10 @@ class TestPartialFailureResilience:
         assert resp.status_code == 200
 
     def test_summary_shows_fallback_content_on_error(self, client):
-        """On error, summary should render with empty data (no crash)."""
+        """On error, summary should render the empty-data fallback message."""
         with _patch_raises('dashboard.app.get_cost_summary'):
             html = client.get('/costs/partials/summary').text
-        # Should render the template — any valid HTML, not a 500 traceback
-        assert '<' in html
+        assert 'No cost data available for this window.' in html
 
     def test_by_project_returns_200_on_data_error(self, client):
         with _patch_raises('dashboard.app.get_cost_by_project'):

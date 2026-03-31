@@ -38,7 +38,7 @@
       "id": "step-3",
       "type": "test",
       "description": "Tighten test_summary_shows_fallback_content_on_error: replace `assert '<' in html` with `assert 'No cost data available for this window.' in html` \u2014 this is the exact fallback text from summary.html's {% else %} branch when summary is empty",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
