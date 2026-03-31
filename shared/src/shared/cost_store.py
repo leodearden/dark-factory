@@ -46,6 +46,9 @@ CREATE INDEX IF NOT EXISTS idx_inv_account
 CREATE INDEX IF NOT EXISTS idx_inv_run
     ON invocations(run_id);
 
+CREATE INDEX IF NOT EXISTS idx_inv_completed_at
+    ON invocations(completed_at);
+
 CREATE TABLE IF NOT EXISTS account_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     account_name TEXT NOT NULL,
