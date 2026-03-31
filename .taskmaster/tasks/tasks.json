@@ -6257,6 +6257,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 343,
+        "title": "Add hx-sync and fix canvas ID coupling in cost templates",
+        "description": "Two template issues:\n1. **costs.html**: Add `hx-sync=\"abort\"` to each data-cost-section element — window changes trigger 7 parallel requests; clicking again before completion causes stale out-of-order responses\n2. **by_role.html**: Canvas IDs use Jinja2 loop.index (1-based) while JS uses positional forEach index — derive canvas IDs from project key string instead of fragile positional coupling\n\nFiles: dashboard/src/dashboard/templates/costs.html, dashboard/src/dashboard/templates/partials/costs/by_role.html",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6269,7 +6280,7 @@
       ],
       "created": "2026-03-31T09:25:44.356Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T09:26:32.329Z"
+      "updated": "2026-03-31T09:26:36.451Z"
     }
   }
 }
