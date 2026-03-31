@@ -1,0 +1,160 @@
+{
+  "task_id": "312",
+  "title": "Filter or deprioritize invalidated Graphiti edges in search results",
+  "files": [
+    "fused-memory/src/fused_memory/services/memory_service.py",
+    "fused-memory/tests/test_memory_service.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/services",
+    "fused-memory/tests"
+  ],
+  "analysis": "The `_search_graphiti` method (lines 840-909 of memory_service.py) iterates over edges returned by Graphiti's search, extracts `invalid_at` for serialization into the temporal dict, but never checks it for filtering. Edges with non-null `invalid_at` (superseded facts) pass through with rank-based scores of 0.65-0.85 depending on position. The task description prefers Option A: skip edges where `invalid_at is not None`, and over-fetch by requesting `limit * 1.5` (rounded up) from Graphiti to compensate, then truncate results to `limit`.\n\nThe existing `test_search_graphiti_only_invalid_at_returns_temporal` (line 615) tests that an edge with `invalid_at` set IS returned \u2014 this test will need to be updated since after the fix, that edge will be filtered out by default. However, rather than modifying that test (which validates temporal serialization), I'll add new focused tests for the filtering behavior.\n\nThe planned-edge filtering pattern in the same method (lines 883-889) provides excellent prior art: check a condition on the edge, `continue` to skip it. The invalidated-edge filter should go BEFORE the planned-edge filter (fail fast \u2014 no point checking planning status for a superseded edge).\n\nFor over-fetching: the Graphiti search call at line 849 uses `num_results=limit`. This should change to `num_results=int(limit * 1.5) + 1` (the +1 ensures we always fetch at least 1 extra). After the loop, `results[:limit]` truncates.\n\nKey consideration: the existing test at line 615 (`test_search_graphiti_only_invalid_at_returns_temporal`) calls `service.search()` (the public method) and expects an edge with only `invalid_at` set to appear. After the fix, this edge will be filtered. This test must be updated to reflect the new behavior \u2014 its assertion should verify the edge is excluded, OR the test should be restructured to test temporal serialization in a context where the edge has both `valid_at` and `invalid_at` set (i.e., testing serialization on a non-filtered edge via `get_entity` which doesn't filter). I'll update this test to verify the filtering behavior instead, and note it in the plan.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing test: `_search_graphiti` excludes edges where `invalid_at` is not None. Create `TestSearchGraphitiInvalidatedFiltering` class with test `test_edge_with_invalid_at_excluded`. Mock graphiti.search to return one edge with `invalid_at=datetime(...)` and verify `_search_graphiti` returns empty list.",
+      "status": "done",
+      "commit": "99572b17"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "In `_search_graphiti`, add `if invalid_at is not None: continue` after line 866 (where `invalid_at` is extracted), BEFORE the planned-edge check. This filters out superseded edges before any other processing.",
+      "status": "done",
+      "commit": "b951b46a"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing test: `test_edge_without_invalid_at_not_excluded`. Mock graphiti.search to return one edge with `invalid_at=None` (valid edge) and verify it IS returned by `_search_graphiti`.",
+      "status": "done",
+      "commit": "ffdeaeab"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Verify step-3 test passes with the existing implementation (should pass already since the filter only skips non-None invalid_at). No code change expected.",
+      "status": "done",
+      "commit": "ffdeaeab"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing test: `test_mixed_valid_and_invalidated_edges_filtered`. Mock graphiti.search returning 3 edges: 2 valid (invalid_at=None) and 1 invalidated (invalid_at=datetime(...)). Verify `_search_graphiti` returns exactly 2 results, and neither has the invalidated edge's uuid.",
+      "status": "done",
+      "commit": "4f09d530"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Verify step-5 test passes with the implementation from step-2. No code change expected.",
+      "status": "done",
+      "commit": "4f09d530"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing test: `test_overfetch_compensates_for_filtered_edges`. Mock graphiti.search and verify it was called with `num_results=int(limit * 1.5) + 1` instead of `num_results=limit`. Call `_search_graphiti` with `limit=10` and assert graphiti.search was called with `num_results=16`.",
+      "status": "done",
+      "commit": "d829045c"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Change the graphiti.search call from `num_results=limit` to `num_results=int(limit * 1.5) + 1` to over-fetch and compensate for filtered invalidated edges.",
+      "status": "done",
+      "commit": "c097d1a7"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write failing test: `test_results_truncated_to_limit`. Mock graphiti.search returning 15 valid edges (all with invalid_at=None). Call `_search_graphiti` with `limit=10` and verify exactly 10 results are returned.",
+      "status": "done",
+      "commit": "05e624d1"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Add `return results[:limit]` at the end of `_search_graphiti` instead of `return results` to enforce the limit after filtering.",
+      "status": "done",
+      "commit": "2ad6f8cd"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write failing test: `test_scores_reflect_original_rank_position`. When edges at positions 0, 2, 4 survive filtering (positions 1, 3 were invalidated), verify the surviving edges get scores based on their original rank positions (1.0, 0.9, 0.8) not re-ranked positions. This tests that score assignment happens BEFORE filtering, preserving Graphiti's original ranking signal.",
+      "status": "done",
+      "commit": "699de062"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Ensure score calculation `score = max(0.0, 1.0 - (i * 0.05))` uses the enumeration index `i` from the original Graphiti results (which it already does since we use `continue` to skip). Verify step-11 passes \u2014 no code change expected.",
+      "status": "done",
+      "commit": "699de062"
+    },
+    {
+      "id": "step-13",
+      "type": "test",
+      "description": "Update existing test `test_search_graphiti_only_invalid_at_returns_temporal` (line 615) to reflect the new behavior: an edge with only `invalid_at` set should now be EXCLUDED from search results. Change assertion from `len(results) == 1` to `len(results) == 0`. Add a comment explaining the behavioral change from task 312.",
+      "status": "done",
+      "commit": "4b86d9a4"
+    },
+    {
+      "id": "step-14",
+      "type": "impl",
+      "description": "Verify updated test at step-13 passes with current implementation. No code change expected \u2014 this is a test-only correction.",
+      "status": "done",
+      "commit": "4b86d9a4"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use Option A (filter out) rather than Option B (deprioritize with [SUPERSEDED] tag)",
+      "rationale": "Task description explicitly prefers Option A for search. Search callers rarely need historical context \u2014 they want current facts. Deprioritization risks agents still consuming stale facts if they don't check for the [SUPERSEDED] prefix."
+    },
+    {
+      "decision": "Place invalidated-edge filter BEFORE planned-edge filter in the loop",
+      "rationale": "Fail fast: a superseded edge should be skipped regardless of planning status. This avoids unnecessary planned-episode registry lookups for edges that will be discarded anyway."
+    },
+    {
+      "decision": "Over-fetch with `int(limit * 1.5) + 1` instead of `limit * 2`",
+      "rationale": "Task description suggests `limit * 1.5`. The `+1` ensures we always fetch at least 1 extra even for small limits. This is a reasonable balance \u2014 fetching double would waste resources, while 1.5x should compensate for typical invalidation rates."
+    },
+    {
+      "decision": "Preserve original rank-based scoring (scores reflect position in Graphiti's original result set)",
+      "rationale": "The `enumerate(edges)` loop uses the original position `i` for score calculation. When invalidated edges are skipped via `continue`, surviving edges keep their original-position-based scores. This preserves Graphiti's relevance signal rather than artificially inflating scores of lower-ranked results."
+    },
+    {
+      "decision": "Update existing test_search_graphiti_only_invalid_at_returns_temporal rather than deleting it",
+      "rationale": "The test name and structure are still meaningful \u2014 it now validates that invalidated edges are correctly filtered. Deleting would lose test coverage for this edge case."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "MockEdge dataclass from conftest.py",
+      "where": "fused-memory/tests/conftest.py",
+      "how": "Use `from tests.conftest import MockEdge, MockNode` \u2014 already has `invalid_at` field. All new tests follow the same pattern as TestSearchGraphitiFiltering (planned-edge tests)."
+    },
+    {
+      "what": "service fixture with mocked backends",
+      "where": "fused-memory/tests/test_memory_service.py line 16-42",
+      "how": "Reuse the existing `service` fixture which provides a MemoryService with mocked graphiti, mem0, and durable_queue backends."
+    },
+    {
+      "what": "Planned-edge filtering pattern in _search_graphiti",
+      "where": "fused-memory/src/fused_memory/services/memory_service.py lines 883-889",
+      "how": "The `if condition: continue` pattern for skipping edges in the enumeration loop is the exact pattern to follow for invalidated-edge filtering."
+    },
+    {
+      "what": "TestSearchGraphitiFiltering test class structure",
+      "where": "fused-memory/tests/test_memory_service.py lines 1621-1751",
+      "how": "Follow the same class structure, fixture usage, and assertion patterns for the new TestSearchGraphitiInvalidatedFiltering class."
+    }
+  ],
+  "_session_id": "312-15ddc9d4",
+  "_created_at": "2026-03-31T14:56:51.313155+00:00"
+}
