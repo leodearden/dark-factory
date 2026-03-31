@@ -431,13 +431,18 @@ class UsageGate:
             await self._write_cost_event(acct.name, 'resumed', json.dumps({'label': label}))
 
     async def shutdown(self) -> None:
-        """Cancel all resume probe tasks."""
+        """Cancel all resume probe tasks and drain in-flight background cost-event tasks."""
         for acct in self._accounts:
             if acct.resume_task and not acct.resume_task.done():
                 acct.resume_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await acct.resume_task
                 acct.resume_task = None
+
+        for task in list(self._background_tasks):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     @property
     def is_paused(self) -> bool:
