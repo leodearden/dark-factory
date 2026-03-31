@@ -6213,6 +6213,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 339,
+        "title": "Fix incorrect weighted average in cost summary",
+        "description": "**Correctness bug.** The 'Avg Cost / Task' metric in summary.html computes an arithmetic mean of per-project averages, which is mathematically wrong when projects have different task counts. A project with 1000 tasks at $0.01 gets the same weight as one with 1 task at $10.00.\n\nFix: compute weighted average in get_cost_summary backend (total_spend / total_tasks) and pass pre-computed, or accumulate totals in the template.\n\nFiles: dashboard/src/dashboard/templates/partials/costs/summary.html, dashboard/src/dashboard/data/costs.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6225,7 +6236,7 @@
       ],
       "created": "2026-03-31T09:25:44.356Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T09:26:13.760Z"
+      "updated": "2026-03-31T09:26:17.249Z"
     }
   }
 }
