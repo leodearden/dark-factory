@@ -469,6 +469,82 @@ class TestCostsTrendPartial:
 
 
 # ---------------------------------------------------------------------------
+# Step-15: GET /costs/partials/events route tests
+# ---------------------------------------------------------------------------
+
+_MOCK_EVENTS = [
+    {
+        'account_name': 'account-A',
+        'event_type': 'cap_hit',
+        'project_id': 'dark_factory',
+        'run_id': 'run-123',
+        'details': None,
+        'created_at': '2026-03-30T10:00:00+00:00',
+    },
+    {
+        'account_name': 'account-B',
+        'event_type': 'resumed',
+        'project_id': 'dark_factory',
+        'run_id': 'run-456',
+        'details': None,
+        'created_at': '2026-03-30T11:30:00+00:00',
+    },
+]
+
+
+def _patch_events(return_value=_MOCK_EVENTS):
+    return patch(
+        'dashboard.app.get_account_events',
+        new_callable=AsyncMock,
+        return_value=return_value,
+    )
+
+
+class TestCostsEventsPartial:
+    """Tests for GET /costs/partials/events."""
+
+    def test_returns_200(self, client):
+        with _patch_events():
+            resp = client.get('/costs/partials/events')
+        assert resp.status_code == 200
+
+    def test_content_type_html(self, client):
+        with _patch_events():
+            resp = client.get('/costs/partials/events')
+        assert 'text/html' in resp.headers['content-type']
+
+    def test_renders_account_names(self, client):
+        """Account names from the events should appear in the output."""
+        with _patch_events():
+            html = client.get('/costs/partials/events').text
+        assert 'account-A' in html
+        assert 'account-B' in html
+
+    def test_cap_hit_uses_red(self, client):
+        """cap_hit events should have red styling."""
+        with _patch_events():
+            html = client.get('/costs/partials/events').text
+        assert 'red' in html.lower()
+
+    def test_resumed_uses_green(self, client):
+        """resumed events should have green styling."""
+        with _patch_events():
+            html = client.get('/costs/partials/events').text
+        assert 'green' in html.lower()
+
+    def test_handles_empty_list(self, client):
+        with _patch_events(return_value=[]):
+            resp = client.get('/costs/partials/events')
+        assert resp.status_code == 200
+
+    def test_respects_window_param(self, client):
+        with _patch_events() as mock_fn:
+            client.get('/costs/partials/events?window=all')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 3650
+
+
+# ---------------------------------------------------------------------------
 # Step-9: GET /costs/partials/by-account route tests
 # ---------------------------------------------------------------------------
 
