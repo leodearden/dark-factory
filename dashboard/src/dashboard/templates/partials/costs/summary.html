@@ -1,0 +1,94 @@
+{# Cost summary partial — 4 metric cards aggregated across all projects #}
+{% set total_spend = namespace(value=0.0) %}
+{% set active_accounts = namespace(value=0) %}
+{% set cap_events = namespace(value=0) %}
+{% set task_count_sum = namespace(value=0) %}
+{% set weighted_avg = namespace(value=0.0) %}
+
+{% for project_id, data in summary.items() %}
+  {% set total_spend.value = total_spend.value + data.total_spend %}
+  {% set active_accounts.value = active_accounts.value + data.active_accounts %}
+  {% set cap_events.value = cap_events.value + data.cap_events %}
+{% endfor %}
+
+{# avg cost per task — weighted by spend #}
+{% set project_count = summary | length %}
+{% if project_count > 0 %}
+  {% set avg_per_task = namespace(value=0.0) %}
+  {% for project_id, data in summary.items() %}
+    {% set avg_per_task.value = avg_per_task.value + data.avg_cost_per_task %}
+  {% endfor %}
+  {% set avg_per_task_val = avg_per_task.value / project_count %}
+{% else %}
+  {% set avg_per_task_val = 0.0 %}
+{% endif %}
+
+<div>
+  <h3 class="text-sm font-semibold text-gray-300 mb-4">Cost Summary</h3>
+  {% if summary %}
+    <div class="grid grid-cols-2 gap-4 sm:grid-cols-4">
+
+      {# Total Spend #}
+      <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-blue-500">
+        <div class="text-xs text-gray-400 uppercase tracking-wide mb-1">Total Spend</div>
+        <div class="text-2xl font-bold text-white">${{ '%.2f' | format(total_spend.value) }}</div>
+        <div class="text-xs text-gray-500 mt-1">across {{ project_count }} project{{ 's' if project_count != 1 }}</div>
+      </div>
+
+      {# Avg Cost / Task #}
+      <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-green-500">
+        <div class="text-xs text-gray-400 uppercase tracking-wide mb-1">Avg Cost / Task</div>
+        <div class="text-2xl font-bold text-white">${{ '%.4f' | format(avg_per_task_val) }}</div>
+        <div class="text-xs text-gray-500 mt-1">mean across projects</div>
+      </div>
+
+      {# Active Accounts #}
+      <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-yellow-500">
+        <div class="text-xs text-gray-400 uppercase tracking-wide mb-1">Active Accounts</div>
+        <div class="text-2xl font-bold text-white">{{ active_accounts.value }}</div>
+        <div class="text-xs text-gray-500 mt-1">distinct account{{ 's' if active_accounts.value != 1 }}</div>
+      </div>
+
+      {# Cap Events #}
+      <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-red-500">
+        <div class="text-xs text-gray-400 uppercase tracking-wide mb-1">Cap Events</div>
+        <div class="text-2xl font-bold text-white">{{ cap_events.value }}</div>
+        <div class="text-xs text-gray-500 mt-1">cap hits in window</div>
+      </div>
+
+    </div>
+
+    {# Per-project breakdown table #}
+    {% if project_count > 1 %}
+    <div class="mt-4 overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="text-xs text-gray-400 uppercase border-b border-gray-700">
+            <th class="text-left py-2 pr-4">Project</th>
+            <th class="text-right py-2 pr-4">Spend</th>
+            <th class="text-right py-2 pr-4">Avg/Task</th>
+            <th class="text-right py-2 pr-4">Accounts</th>
+            <th class="text-right py-2">Cap Events</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for project_id, data in summary.items() %}
+          <tr class="border-b border-gray-800 hover:bg-gray-800/50">
+            <td class="py-2 pr-4 text-gray-300">{{ project_id | project_name }}</td>
+            <td class="py-2 pr-4 text-right text-white">${{ '%.2f' | format(data.total_spend) }}</td>
+            <td class="py-2 pr-4 text-right text-gray-300">${{ '%.4f' | format(data.avg_cost_per_task) }}</td>
+            <td class="py-2 pr-4 text-right text-gray-300">{{ data.active_accounts }}</td>
+            <td class="py-2 text-right {% if data.cap_events > 0 %}text-red-400{% else %}text-gray-500{% endif %}">
+              {{ data.cap_events }}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+
+  {% else %}
+    <div class="text-gray-500 text-sm py-8 text-center">No cost data available for this window.</div>
+  {% endif %}
+</div>

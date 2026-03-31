@@ -441,3 +441,133 @@ async def partials_performance(request: Request):
             'ttc': ttc,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Costs partials
+# ---------------------------------------------------------------------------
+
+@app.get('/costs/partials/summary')
+async def costs_partials_summary(request: Request):
+    """Cost summary: 4 metric cards aggregated across all projects."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
+    days = _parse_window(request)
+    try:
+        summary = await get_cost_summary(db, days=days)
+    except Exception as exc:
+        logger.warning('Error fetching cost summary: %s', exc)
+        summary = {}
+    return templates.TemplateResponse(
+        request, 'partials/costs/summary.html',
+        context={'summary': summary},
+    )
+
+
+@app.get('/costs/partials/by-project')
+async def costs_partials_by_project(request: Request):
+    """Cost by project: horizontal stacked bar chart."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
+    days = _parse_window(request)
+    try:
+        by_project = await get_cost_by_project(db, days=days)
+    except Exception as exc:
+        logger.warning('Error fetching cost by project: %s', exc)
+        by_project = {}
+    return templates.TemplateResponse(
+        request, 'partials/costs/by_project.html',
+        context={'by_project': by_project},
+    )
+
+
+@app.get('/costs/partials/by-account')
+async def costs_partials_by_account(request: Request):
+    """Cost by account: doughnut chart + table."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
+    days = _parse_window(request)
+    try:
+        by_account = await get_cost_by_account(db, days=days)
+    except Exception as exc:
+        logger.warning('Error fetching cost by account: %s', exc)
+        by_account = {}
+    return templates.TemplateResponse(
+        request, 'partials/costs/by_account.html',
+        context={'by_account': by_account},
+    )
+
+
+@app.get('/costs/partials/by-role')
+async def costs_partials_by_role(request: Request):
+    """Cost by role: horizontal stacked bar chart."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
+    days = _parse_window(request)
+    try:
+        by_role = await get_cost_by_role(db, days=days)
+    except Exception as exc:
+        logger.warning('Error fetching cost by role: %s', exc)
+        by_role = {}
+    return templates.TemplateResponse(
+        request, 'partials/costs/by_role.html',
+        context={'by_role': by_role},
+    )
+
+
+@app.get('/costs/partials/trend')
+async def costs_partials_trend(request: Request):
+    """Cost trend: daily line chart."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
+    days = _parse_window(request)
+    try:
+        trend = await get_cost_trend(db, days=days)
+    except Exception as exc:
+        logger.warning('Error fetching cost trend: %s', exc)
+        trend = {}
+    return templates.TemplateResponse(
+        request, 'partials/costs/trend.html',
+        context={'trend': trend},
+    )
+
+
+@app.get('/costs/partials/events')
+async def costs_partials_events(request: Request):
+    """Account events feed."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
+    days = _parse_window(request)
+    try:
+        events = await get_account_events(db, days=days)
+    except Exception as exc:
+        logger.warning('Error fetching account events: %s', exc)
+        events = []
+    return templates.TemplateResponse(
+        request, 'partials/costs/events.html',
+        context={'events': events},
+    )
+
+
+@app.get('/costs/partials/runs')
+async def costs_partials_runs(request: Request):
+    """Run cost breakdown: expandable drilldown table."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
+    days = _parse_window(request)
+    try:
+        runs = await get_run_cost_breakdown(db, days=days)
+    except Exception as exc:
+        logger.warning('Error fetching run cost breakdown: %s', exc)
+        runs = []
+    return templates.TemplateResponse(
+        request, 'partials/costs/runs.html',
+        context={'runs': runs},
+    )
