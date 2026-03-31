@@ -103,21 +103,21 @@ class PlannedEpisodeRegistry:
     async def is_planned(self, episode_uuid: str) -> bool:
         """Return True if the episode is registered as planned."""
         assert self._db is not None
-        cursor = await self._db.execute(
+        async with self._db.execute(
             'SELECT 1 FROM planned_episodes WHERE episode_uuid = ? LIMIT 1',
             (episode_uuid,),
-        )
-        row = await cursor.fetchone()
+        ) as cursor:
+            row = await cursor.fetchone()
         return row is not None
 
     async def get_planned_uuids(self, project_id: str) -> set[str]:
         """Return the set of planned episode UUIDs for a project."""
         assert self._db is not None
-        cursor = await self._db.execute(
+        async with self._db.execute(
             'SELECT episode_uuid FROM planned_episodes WHERE project_id = ?',
             (project_id,),
-        )
-        rows = await cursor.fetchall()
+        ) as cursor:
+            rows = await cursor.fetchall()
         return {row[0] for row in rows}
 
     async def promote(self, episode_uuid: str) -> None:
@@ -141,10 +141,10 @@ class PlannedEpisodeRegistry:
         assert self._db is not None
         # Query for how many of the given UUIDs exist in the registry
         placeholders = ','.join('?' * len(episode_uuids))
-        cursor = await self._db.execute(
+        async with self._db.execute(
             f'SELECT COUNT(*) FROM planned_episodes WHERE episode_uuid IN ({placeholders})',
             episode_uuids,
-        )
-        row = await cursor.fetchone()
+        ) as cursor:
+            row = await cursor.fetchone()
         count = row[0] if row else 0
         return count == len(episode_uuids)
