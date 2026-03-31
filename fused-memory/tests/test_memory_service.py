@@ -2101,3 +2101,25 @@ class TestSearchGraphitiInvalidatedFiltering:
             f'graphiti.search must be called with num_results={expected_num_results} '
             f'(int(limit * 1.5) + 1 for limit=10), got {actual_num_results}'
         )
+
+    # step-9: results are truncated to limit after filtering
+    @pytest.mark.asyncio
+    async def test_results_truncated_to_limit(self, service):
+        """When Graphiti returns more valid edges than limit, results are capped at limit."""
+        from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        # 15 valid edges returned by Graphiti
+        edges = [
+            MockEdge(fact=f'Fact {n}', uuid=f'edge-valid-{n}', valid_at=dt_valid, invalid_at=None)
+            for n in range(15)
+        ]
+        service.graphiti.search = AsyncMock(return_value=edges)
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('fact', scope, limit=10)
+
+        assert len(results) == 10, (
+            'Results must be truncated to limit=10 when Graphiti returns more valid edges'
+        )
