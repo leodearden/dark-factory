@@ -55,3 +55,72 @@ def make_mock_cost_store() -> AsyncMock:
     store = AsyncMock()
     store.save_account_event = AsyncMock(return_value=None)
     return store
+
+
+# ---------------------------------------------------------------------------
+# step-1: before_invoke race condition — _last_account_name updated before
+#         the failover cost event fires; event uses _fire_cost_event not
+#         await _write_cost_event.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBeforeInvokeRaceCondition:
+    """step-1: _last_account_name updated before failover event fires."""
+
+    async def test_last_account_name_updated_before_fire_cost_event(self):
+        """_last_account_name must equal the NEW account name when _fire_cost_event is called.
+
+        Race condition: currently _write_cost_event is awaited BEFORE
+        _last_account_name is updated, so the event fires with the stale
+        (old) account name still in self._last_account_name.
+
+        After the fix, _last_account_name is set to acct.name BEFORE
+        _fire_cost_event is called.
+        """
+        gate = make_gate(['acct-A', 'acct-B'])
+
+        # Simulate acct-A already used, now capped
+        gate._accounts[0].capped = True
+        gate._last_account_name = 'acct-A'
+
+        captured_name_at_call: list[str | None] = []
+
+        def capture_name(account_name: str, event_type: str, details: str) -> None:
+            # Record gate._last_account_name at the moment the event fires
+            captured_name_at_call.append(gate._last_account_name)
+
+        with patch.object(gate, '_fire_cost_event', side_effect=capture_name):
+            token = await gate.before_invoke()
+
+        assert token == 'fake-token-acct-B'
+        # _fire_cost_event must have been called once
+        assert len(captured_name_at_call) == 1, (
+            '_fire_cost_event was not called — before_invoke still uses _write_cost_event'
+        )
+        # At call time, _last_account_name must already reflect the new account
+        assert captured_name_at_call[0] == 'acct-B', (
+            f'Expected acct-B but got {captured_name_at_call[0]!r} — '
+            'race: _last_account_name not yet updated when event fired'
+        )
+
+    async def test_failover_uses_fire_cost_event_not_write_cost_event(self):
+        """before_invoke must use _fire_cost_event (fire-and-forget) not await _write_cost_event.
+
+        Currently before_invoke does `await self._write_cost_event(...)` which
+        blocks the critical-path return of the OAuth token.  After the fix it
+        must call `self._fire_cost_event(...)` (non-blocking) instead.
+        """
+        gate = make_gate(['acct-A', 'acct-B'])
+
+        gate._accounts[0].capped = True
+        gate._last_account_name = 'acct-A'
+
+        with (
+            patch.object(gate, '_fire_cost_event') as mock_fire,
+            patch.object(gate, '_write_cost_event', new_callable=AsyncMock) as mock_write,
+        ):
+            await gate.before_invoke()
+
+        mock_fire.assert_called_once()
+        mock_write.assert_not_called()
