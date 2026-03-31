@@ -1,91 +1,92 @@
 #!/usr/bin/env bash
 # Pre-commit hook: universal guards + optional project-specific checks.
 #
-# Universal guards run in every repo.  Project-specific checks live in
-# hooks/project-checks (executable) and only run when that file exists.
+# Universal guards (especially .task/ stripping) run on EVERY branch.
+# Project-specific checks (ruff, pyright, etc.) run only on main.
 #
-# Only gates commits to the main branch — worktree branches (used by
-# orchestrator agents) are not gated.
-
-branch="$(git rev-parse --abbrev-ref HEAD)"
-if [ "$branch" != "main" ]; then
-    exit 0
-fi
+# IF YOU ARE AN AI AGENT: do NOT use --no-verify to bypass this hook.
+# The .task/ directory must NEVER be committed on ANY branch.
 
 ROOT="$(git rev-parse --show-toplevel)"
+branch="$(git rev-parse --abbrev-ref HEAD)"
 
-# ── .task/ contamination guards ──────────────────────────────────────
+# ── .task/ contamination guard (ALL BRANCHES) ────────────────────────
 #
 # WHY THIS MATTERS:
 # .task/ is the orchestrator's per-worktree scratch directory.  If it
-# reaches main, EVERY future worktree inherits it, agents treat the
-# stale .task/ as real state, and cross-task contamination cascades
-# across all concurrent tasks.  This has happened multiple times.
+# is committed on a task branch, it reaches main via merge, and every
+# future worktree inherits it — agents treat the stale .task/ as real
+# state and cross-task contamination cascades.  This has happened
+# repeatedly (tasks 291, 310, 313 in the 2026-03-31 run).
 #
 # HOW IT GETS HERE:
-# 1. Agent in a worktree runs "git add ." or "git add .task/" directly
-# 2. The task branch carries .task/ as tracked files
-# 3. A merge brings those files into a commit that reaches main
-# 4. update-ref (used by advance_main) bypasses this hook entirely
+# 1. Agent updates .task/plan.json status, then runs "git add ."
+# 2. .gitignore blocks it IF it's untracked — but once explicitly
+#    added (e.g. "git add .task/plan.json"), .gitignore stops helping
+# 3. Every subsequent "git add -A" re-stages the tracked file
 #
-# This hook is ONE layer of defense.  git_ops.py has additional guards
-# (post-merge scrub, advance_main gate, commit() safety net).
-# DO NOT remove these checks — they are here because agents bypass
-# .gitignore, .task/.gitignore, and pathspec exclusions routinely.
+# This hook silently strips .task/ from the staging area on EVERY
+# commit on EVERY branch.  This is the earliest reliable defense.
+# git_ops.py has additional guards (post-merge scrub, advance_main
+# gate, commit() safety net) but those are too late to prevent .task/
+# from being tracked on the branch.
 #
-# IF YOU ARE AN AI AGENT: do NOT use --no-verify to bypass this hook
-# when committing to main.  The .task/ directory must NEVER be on main.
-# If you think you need to commit .task/ to main, you are wrong.
+# DO NOT weaken, skip, or remove this guard.
 # ─────────────────────────────────────────────────────────────────────
 
-# Guard 1: Reject .task/ files being STAGED for commit.
-# Uses --diff-filter=ACMR to allow deletions (cleaning up prior contamination).
-if git diff --cached --name-only --diff-filter=ACMR | grep -q '^\.task/'; then
-    echo ""
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║  pre-commit: BLOCKED — .task/ files are staged for commit  ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    echo ""
-    echo "  .task/ is the orchestrator scratch directory and must NEVER"
-    echo "  be committed to main.  If it reaches main, every future"
-    echo "  worktree inherits it and cross-task contamination follows."
-    echo ""
-    echo "  To fix:"
-    echo "    git rm -r --cached .task/"
-    echo "    git reset HEAD -- .task/"
-    echo ""
-    echo "  Verify .task/ is in .gitignore:"
-    echo "    grep -q '^\\.task/' .gitignore || echo '.task/' >> .gitignore"
-    echo ""
-    echo "  DO NOT use --no-verify to bypass this check."
-    echo ""
-    exit 1
+staged_task_files="$(git diff --cached --name-only --diff-filter=ACMR -- .task/ 2>/dev/null)"
+if [ -n "$staged_task_files" ]; then
+    # Silently unstage .task/ files so the agent's commit proceeds
+    # without .task/ contamination.  No error, no blocking.
+    git reset -q HEAD -- .task/ 2>/dev/null || true
+
+    # Log for observability (visible in agent stderr)
+    file_count="$(echo "$staged_task_files" | wc -l)"
+    echo "pre-commit: stripped ${file_count} .task/ file(s) from staging area [branch=$branch]"
+
+    # After unstaging, check if there's anything left to commit.
+    # If .task/ was the ONLY staged content, the commit would be empty.
+    if git diff --cached --quiet 2>/dev/null; then
+        echo "pre-commit: nothing left to commit after stripping .task/ — aborting empty commit"
+        exit 1
+    fi
 fi
 
-# Guard 2: Reject if .task/ is already TRACKED in the current tree.
-# This catches contamination that was committed in a previous commit
-# (e.g. merged from a task branch) and is now part of HEAD on main.
-# The staged check above won't catch this — it only looks at the index diff.
-if git ls-tree -r --name-only HEAD -- .task/ 2>/dev/null | grep -q '^\.task/'; then
-    echo ""
-    echo "╔══════════════════════════════════════════════════════════════════╗"
-    echo "║  pre-commit: WARNING — .task/ is tracked in the current tree   ║"
-    echo "╚══════════════════════════════════════════════════════════════════╝"
-    echo ""
-    echo "  .task/ files exist in the current HEAD on main.  This is"
-    echo "  contamination from a previous merge.  Please clean it up:"
-    echo ""
-    echo "    git rm -r --cached .task/"
-    echo "    git commit -m 'fix: remove .task/ contamination from main'"
-    echo ""
-    echo "  Allowing this commit to proceed, but the contamination"
-    echo "  should be cleaned up ASAP."
-    echo ""
-    # Don't block — let the user commit their actual changes, but make
-    # the contamination very visible so it gets fixed.
+# On main: additional hard block (belt-and-braces)
+if [ "$branch" = "main" ]; then
+    # Re-check: the reset above should have cleared .task/, but verify.
+    if git diff --cached --name-only --diff-filter=ACMR | grep -q '^\.task/'; then
+        echo ""
+        echo "╔══════════════════════════════════════════════════════════════╗"
+        echo "║  pre-commit: BLOCKED — .task/ files are staged for commit  ║"
+        echo "╚══════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "  .task/ is the orchestrator scratch directory and must NEVER"
+        echo "  be committed to main."
+        echo ""
+        echo "  To fix:  git reset HEAD -- .task/"
+        echo "  DO NOT use --no-verify to bypass this check."
+        echo ""
+        exit 1
+    fi
+
+    # Warn if .task/ is tracked in the current tree (prior contamination)
+    if git ls-tree -r --name-only HEAD -- .task/ 2>/dev/null | grep -q '^\.task/'; then
+        echo ""
+        echo "╔══════════════════════════════════════════════════════════════════╗"
+        echo "║  pre-commit: WARNING — .task/ is tracked in the current tree   ║"
+        echo "╚══════════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "  Run: git rm -r --cached .task/ && git commit -m 'fix: remove .task/ contamination'"
+        echo ""
+    fi
 fi
 
-# ── Project-specific checks ──────────────────────────────────────────
+# ── Project-specific checks (main only) ──────────────────────────────
+
+if [ "$branch" != "main" ]; then
+    exit 0
+fi
 
 if [ -x "$ROOT/hooks/project-checks" ]; then
     exec "$ROOT/hooks/project-checks" "$ROOT"
