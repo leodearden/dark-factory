@@ -169,9 +169,9 @@ class TestHarnessCostStoreLifecycle:
         harness = Harness(config)
         _patch_harness_infra(harness)
 
-        with patch('orchestrator.harness.CostStore', side_effect=PermissionError('no access')):
-            with patch('orchestrator.harness.logger') as mock_logger:
-                report = await harness.run(dry_run=True)
+        with patch('orchestrator.harness.CostStore', side_effect=PermissionError('no access')), \
+                patch('orchestrator.harness.logger') as mock_logger:
+            report = await harness.run(dry_run=True)
 
         # Run should succeed despite CostStore failure
         assert report is not None
@@ -192,9 +192,9 @@ class TestHarnessCostStoreLifecycle:
         mock_cs = AsyncMock()
         mock_cs.open.side_effect = OSError('disk full')
 
-        with patch('orchestrator.harness.CostStore', return_value=mock_cs):
-            with patch('orchestrator.harness.logger') as mock_logger:
-                report = await harness.run(dry_run=True)
+        with patch('orchestrator.harness.CostStore', return_value=mock_cs), \
+                patch('orchestrator.harness.logger') as mock_logger:
+            report = await harness.run(dry_run=True)
 
         # Run should succeed despite open() failure
         assert report is not None
