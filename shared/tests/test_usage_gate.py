@@ -267,3 +267,32 @@ class TestHandleCapDetectedJsonDumpsGuard:
             gate._handle_cap_detected('usage limit hit', None, token)
 
         mock_fire.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# step-9: json.dumps guard in _account_resume_probe_loop when cost_store is None.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAccountResumeProbLoopJsonDumpsGuard:
+    """step-9: _write_cost_event must not be called in probe loop when cost_store=None."""
+
+    async def test_write_cost_event_not_called_without_cost_store(self):
+        """_write_cost_event must not be called when cost_store=None.
+
+        Currently line 410 calls `await self._write_cost_event(...)` with
+        json.dumps unconditionally, even when cost_store=None (_write_cost_event
+        returns early, but it's still called).  After the fix, the call is
+        wrapped in `if self._cost_store:`.
+        """
+        gate = make_gate(['acct-A'], cost_store=None)
+        acct = gate._accounts[0]
+        acct.capped = True
+        # resets_at in the past → sleep_for=0, probe runs immediately
+        acct.resets_at = datetime.now(UTC) - timedelta(minutes=5)
+
+        with patch.object(gate, '_write_cost_event', new_callable=AsyncMock) as mock_write:
+            await gate._account_resume_probe_loop(acct)
+
+        mock_write.assert_not_called()
