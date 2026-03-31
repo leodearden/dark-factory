@@ -410,3 +410,55 @@ class TestAsyncSqliteBaseContextManager:
             async with store:
                 raise ValueError('boom')
         assert store._conn is None
+
+
+# ---------------------------------------------------------------------------
+# Step-11: AsyncSqliteBase._require_conn()
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncSqliteBaseRequireConn:
+    """Tests for AsyncSqliteBase._require_conn()."""
+
+    def test_require_conn_raises_when_not_opened(self, tmp_path: Path) -> None:
+        """_require_conn() raises RuntimeError('{ClassName} not opened') when _conn is None."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        store = _Store(tmp_path / 'store.db')
+        with pytest.raises(RuntimeError, match='_Store not opened'):
+            store._require_conn()
+
+    @pytest.mark.asyncio
+    async def test_require_conn_returns_connection_when_open(self, tmp_path: Path) -> None:
+        """_require_conn() returns the aiosqlite connection when the store is open."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        async with _Store(tmp_path / 'store.db') as store:
+            conn = store._require_conn()
+            assert conn is store._conn
+
+    @pytest.mark.asyncio
+    async def test_require_conn_raises_after_close(self, tmp_path: Path) -> None:
+        """_require_conn() raises after close() sets _conn to None."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        store = _Store(tmp_path / 'store.db')
+        await store.open()
+        await store.close()
+        with pytest.raises(RuntimeError, match='_Store not opened'):
+            store._require_conn()

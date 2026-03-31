@@ -77,7 +77,7 @@
       "type": "test",
       "description": "Write failing tests for __aenter__/__aexit__: context manager opens conn, closes on normal exit, closes on exception, returns self from __aenter__",
       "status": "done",
-      "commit": "pending"
+      "commit": "a234b4e0"
     },
     {
       "id": "step-10",
@@ -90,8 +90,8 @@
       "id": "step-11",
       "type": "test",
       "description": "Write failing tests for _require_conn(): returns connection when open, raises RuntimeError('{ClassName} not opened') when not open, raises after close",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "pending"
     },
     {
       "id": "step-12",
