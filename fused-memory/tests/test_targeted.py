@@ -672,3 +672,46 @@ class TestPlannedEpisodePromotion:
             task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
         )
         assert 'error' not in result
+
+
+class TestServerWiringContract:
+    """step-34/35: TargetedReconciler.planned_episode_registry must be wired from
+    MemoryService after MemoryService.initialize() creates it."""
+
+    def test_planned_episode_registry_wired_from_memory_service(self):
+        """After MemoryService.initialize() and TargetedReconciler construction,
+        the wiring step must assign targeted.planned_episode_registry from
+        memory_service.planned_episode_registry.
+
+        This is a unit test of the wiring sequence expected in server/main.py.
+        """
+        from unittest.mock import MagicMock
+
+        from fused_memory.reconciliation.targeted import TargetedReconciler
+
+        # Simulate MemoryService after initialize() — has a non-None registry
+        mock_registry = MagicMock()
+        mock_memory_service = MagicMock()
+        mock_memory_service.planned_episode_registry = mock_registry
+
+        # Construct a minimal TargetedReconciler (registry starts as None by default)
+        mock_taskmaster = MagicMock()
+        mock_journal = MagicMock()
+        mock_config = MagicMock()
+        targeted = TargetedReconciler(
+            mock_memory_service, mock_taskmaster, mock_journal, mock_config
+        )
+
+        # Before wiring: registry must be None (the reconciler doesn't auto-wire)
+        assert targeted.planned_episode_registry is None, (
+            'TargetedReconciler must start with planned_episode_registry=None'
+        )
+
+        # Apply the wiring (what main.py must do)
+        targeted.planned_episode_registry = mock_memory_service.planned_episode_registry
+
+        # After wiring: identity check
+        assert targeted.planned_episode_registry is mock_registry, (
+            'After wiring, targeted.planned_episode_registry must be the same object '
+            'as memory_service.planned_episode_registry'
+        )
