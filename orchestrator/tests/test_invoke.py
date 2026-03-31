@@ -5,16 +5,18 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from shared.cli_invoke import AgentResult
 
 from orchestrator.agents.invoke import invoke_with_cap_retry
 
 
-def _make_result(**overrides) -> AgentResult:
-    defaults = dict(success=True, output='ok', cost_usd=0.5, stderr='')
-    defaults.update(overrides)
-    return AgentResult(**defaults)
+def _make_result(
+    success: bool = True,
+    output: str = 'ok',
+    cost_usd: float = 0.5,
+    stderr: str = '',
+) -> AgentResult:
+    return AgentResult(success=success, output=output, cost_usd=cost_usd, stderr=stderr)
 
 
 @pytest.mark.asyncio
