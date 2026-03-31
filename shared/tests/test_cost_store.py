@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
@@ -406,6 +407,43 @@ class TestCostStoreOpenClose:
 
         assert store._conn is None, '_conn should remain None on setup failure'
         assert close_called, 'Connection must be closed to prevent resource leak'
+
+    async def test_concurrent_open_does_not_leak(self, tmp_path: Path):
+        """Two concurrent open() calls must not both succeed; connect() called exactly once.
+
+        Without asyncio.Lock, both coroutines pass the `_conn is not None` guard before
+        either assigns _conn, causing two connections to be opened (orphaning one).
+        With the lock, exactly one open() succeeds and one raises RuntimeError.
+        """
+        db_path = tmp_path / 'costs.db'
+        store = CostStore(db_path)
+
+        real_connect = aiosqlite.connect
+        connect_call_count = 0
+
+        async def counting_connect(path):
+            nonlocal connect_call_count
+            connect_call_count += 1
+            return await real_connect(path)
+
+        with patch('shared.async_sqlite_base.aiosqlite.connect', side_effect=counting_connect):
+            results = await asyncio.gather(
+                store.open(),
+                store.open(),
+                return_exceptions=True,
+            )
+
+        try:
+            successes = [r for r in results if r is None]
+            errors = [r for r in results if isinstance(r, RuntimeError)]
+            assert len(successes) == 1, f'Expected exactly one success, got {successes!r}'
+            assert len(errors) == 1, f'Expected exactly one RuntimeError, got {errors!r}'
+            assert 'already opened' in str(errors[0])
+            assert connect_call_count == 1, (
+                f'Expected connect() called once, got {connect_call_count}'
+            )
+        finally:
+            await store.close()
 
 
 @pytest.mark.asyncio
