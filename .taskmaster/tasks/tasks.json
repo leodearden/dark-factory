@@ -6779,6 +6779,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 369,
+        "title": "Extract blank_db fixture to reduce boilerplate in test_costs_data.py",
+        "description": "The 4-line DB setup block (db_path = tmp_path / '...db', conn = sqlite3.connect(...), conn.executescript(COSTS_SCHEMA), now = datetime.now(UTC)) is repeated 11+ times across test methods. There is already a costs_db fixture for populated DBs but no lightweight fixture for blank schema'd DBs.\n\nChanges needed:\n1. Add a blank_db pytest fixture (to conftest.py or module level) that creates an empty schema'd DB at a tmp_path, returning the path\n2. Refactor existing test methods that create blank DBs to use this fixture\n3. Replace __import__('sqlite3') with direct sqlite3 usage (sqlite3 is already imported at line 5)\n4. Use context managers for sqlite3 connections to prevent resource leaks\n\nmemory_hints: search \"dashboard test fixture convention conftest\" for existing conventions about fixture promotion",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6791,7 +6802,7 @@
       ],
       "created": "2026-03-31T15:04:36.029Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T15:12:41.825Z"
+      "updated": "2026-03-31T15:12:47.796Z"
     }
   }
 }
