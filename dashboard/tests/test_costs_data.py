@@ -267,6 +267,52 @@ class TestCostSummary:
         result = await get_cost_summary(empty_costs_conn)
         assert result == {}
 
+    @pytest.mark.asyncio
+    async def test_days_window_boundary(self, tmp_path):
+        """_cutoff(days) must exclude invocations older than the window.
+
+        Insert two invocations: one 2 hours ago (recent) and one 20 days ago
+        (old). days=1 should include only the recent one; days=30 should
+        include both, producing a higher total_spend.
+        """
+        db_path = tmp_path / 'window.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+        conn.executemany(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [
+                # Recent: 2 hours ago — inside any reasonable window
+                ('r1', 't1', 'proj', 'acc', 'claude-opus-4-5', 'implementer',
+                 0.50, 0,
+                 (now - timedelta(hours=2, minutes=1)).isoformat(),
+                 (now - timedelta(hours=2)).isoformat()),
+                # Old: 20 days ago — outside 7d window, inside 30d window
+                ('r2', 't2', 'proj', 'acc', 'claude-opus-4-5', 'implementer',
+                 1.50, 0,
+                 (now - timedelta(days=20, hours=1)).isoformat(),
+                 (now - timedelta(days=20)).isoformat()),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            narrow = await get_cost_summary(aconn, days=1)
+            wide = await get_cost_summary(aconn, days=30)
+
+        # days=1: only the 2h-ago invocation is included
+        assert 'proj' in narrow
+        assert narrow['proj']['total_spend'] == pytest.approx(0.50, abs=1e-6)
+
+        # days=30: both invocations are included
+        assert 'proj' in wide
+        assert wide['proj']['total_spend'] == pytest.approx(2.00, abs=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # Tests: get_cost_by_project
