@@ -1909,3 +1909,46 @@ class TestSearchIncludePlannedPassthrough:
         assert captured_kwargs.get('include_planned') is True, (
             'include_planned=True must be forwarded to _search_mem0'
         )
+
+
+class TestInitializeLifecycleConflict:
+    """step-29/30: initialize() must not overwrite an externally-set registry."""
+
+    @pytest.mark.asyncio
+    async def test_external_registry_preserved_after_initialize(self, service, mock_config):
+        """If set_planned_registry() was called before initialize(), the external
+        registry must be preserved. Currently FAILS because initialize() unconditionally
+        creates a new registry, replacing the external one.
+        """
+        # Simulate external wiring via set_planned_registry()
+        external_registry = MagicMock()
+        external_registry.initialize = AsyncMock()
+        service.set_planned_registry(external_registry)
+
+        # Patch DurableWriteQueue and PlannedEpisodeRegistry so we can call initialize()
+        # without real backends. The key contract: when planned_episode_registry is already
+        # set externally, initialize() must NOT create a new one.
+        mock_registry_inst = MagicMock()
+        mock_registry_inst.initialize = AsyncMock()
+        MockRegistryCls = MagicMock(return_value=mock_registry_inst)
+
+        mock_dq_inst = MagicMock()
+        mock_dq_inst.initialize = AsyncMock()
+        mock_dq_inst.register_callback = MagicMock()
+
+        with (
+            patch.object(service.graphiti, 'initialize', new_callable=AsyncMock),
+            patch('fused_memory.services.memory_service.DurableWriteQueue', return_value=mock_dq_inst),
+            patch(
+                'fused_memory.services.planned_episode_registry.PlannedEpisodeRegistry',
+                MockRegistryCls,
+            ),
+        ):
+            await service.initialize()
+
+        # The externally-set registry must be the one that's still in place
+        assert service.planned_episode_registry is external_registry, (
+            'initialize() must not replace an externally-set registry'
+        )
+        # PlannedEpisodeRegistry constructor must NOT have been called
+        MockRegistryCls.assert_not_called()
