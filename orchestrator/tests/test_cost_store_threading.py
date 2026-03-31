@@ -163,6 +163,99 @@ class TestHarnessCostStoreLifecycle:
 
         mock_cs.close.assert_awaited_once()
 
+    async def test_cost_store_constructor_failure_degrades_gracefully(self, tmp_path):
+        """When CostStore() constructor raises, _cost_store is None and run completes."""
+        config = _make_config(tmp_path)
+        harness = Harness(config)
+        _patch_harness_infra(harness)
+
+        with patch('orchestrator.harness.CostStore', side_effect=PermissionError('no access')):
+            with patch('orchestrator.harness.logger') as mock_logger:
+                report = await harness.run(dry_run=True)
+
+        # Run should succeed despite CostStore failure
+        assert report is not None
+        # _cost_store should be None (graceful degradation)
+        assert harness._cost_store is None
+        # A warning should have been logged mentioning CostStore unavailable
+        warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        assert any('CostStore unavailable' in c for c in warning_calls), (
+            f'Expected warning about CostStore unavailable, got: {warning_calls}'
+        )
+
+    async def test_cost_store_open_failure_degrades_gracefully(self, tmp_path):
+        """When CostStore.open() raises, _cost_store is None and run completes."""
+        config = _make_config(tmp_path)
+        harness = Harness(config)
+        _patch_harness_infra(harness)
+
+        mock_cs = AsyncMock()
+        mock_cs.open.side_effect = OSError('disk full')
+
+        with patch('orchestrator.harness.CostStore', return_value=mock_cs):
+            with patch('orchestrator.harness.logger') as mock_logger:
+                report = await harness.run(dry_run=True)
+
+        # Run should succeed despite open() failure
+        assert report is not None
+        # _cost_store should be None (graceful degradation)
+        assert harness._cost_store is None
+        # A warning should have been logged mentioning CostStore unavailable
+        warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        assert any('CostStore unavailable' in c for c in warning_calls), (
+            f'Expected warning about CostStore unavailable, got: {warning_calls}'
+        )
+
+    async def test_cost_store_failure_does_not_affect_downstream_workflow(self, tmp_path, monkeypatch):
+        """When CostStore init fails, downstream workflow/steward receives cost_store=None."""
+        from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+
+        config = _make_config(tmp_path)
+        harness = Harness(config)
+        _patch_harness_infra(harness)
+        # Make scheduler return a task so _run_slot is exercised
+        harness.scheduler.get_tasks = AsyncMock(return_value=[
+            {
+                'id': '42',
+                'title': 'Test task',
+                'status': 'pending',
+                'description': 'test',
+                'metadata': {'modules': ['src']},
+                'dependencies': [],
+            }
+        ])
+
+        captured_cost_store = {}
+
+        def patched_workflow_init(self_wf, **kwargs):
+            captured_cost_store['value'] = kwargs.get('cost_store', 'NOT_SET')
+            self_wf._steward = None
+            self_wf.metrics = MagicMock()
+            self_wf.metrics.total_cost_usd = 0.0
+            self_wf.metrics.total_duration_ms = 0
+            self_wf.metrics.agent_invocations = 0
+            self_wf.metrics.execute_iterations = 0
+            self_wf.metrics.verify_attempts = 0
+            self_wf.metrics.review_cycles = 0
+            self_wf.task_id = kwargs.get('assignment', MagicMock()).task_id
+
+        async def fake_workflow_run(self_wf):
+            return WorkflowOutcome.DONE
+
+        monkeypatch.setattr(TaskWorkflow, '__init__', patched_workflow_init)
+        monkeypatch.setattr(TaskWorkflow, 'run', fake_workflow_run)
+        harness.scheduler.release = MagicMock()
+        harness._escalation_events = {}
+
+        with patch('orchestrator.harness.CostStore', side_effect=PermissionError('no access')):
+            report = await harness.run(dry_run=False)
+
+        assert report is not None
+        # Workflow should have received None for cost_store
+        assert captured_cost_store.get('value') is None, (
+            f'Expected cost_store=None passed to workflow, got: {captured_cost_store.get("value")!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: usage_gate integration

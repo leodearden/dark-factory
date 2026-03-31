@@ -151,8 +151,12 @@ class Harness:
         # 0. Generate run identity and open CostStore
         self._run_id = f'run-{uuid.uuid4().hex[:12]}'
         db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
-        self._cost_store = CostStore(db_path)
-        await self._cost_store.open()
+        try:
+            self._cost_store = CostStore(db_path)
+            await self._cost_store.open()
+        except Exception as e:
+            logger.warning(f'CostStore unavailable, cost tracking disabled: {e}')
+            self._cost_store = None
 
         # Attach run context to usage gate so cap-hit events can be correlated
         if self.usage_gate:
