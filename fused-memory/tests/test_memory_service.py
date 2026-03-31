@@ -613,7 +613,12 @@ class TestSearch:
 
     @pytest.mark.asyncio
     async def test_search_graphiti_only_invalid_at_returns_temporal(self, service):
-        """Graphiti search results with only invalid_at set get temporal dict with null valid_at."""
+        """Invalidated edges (non-null invalid_at) are excluded from search results.
+
+        Task 312: changed behavior — previously this test asserted that an edge
+        with only invalid_at set was returned (len==1). After the fix, superseded
+        edges are filtered out, so the result must be empty (len==0).
+        """
         from tests.conftest import MockEdge, MockNode
 
         dt_invalid = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
@@ -633,10 +638,10 @@ class TestSearch:
             project_id='test',
             categories=['entities_and_relations'],
         )
-        assert len(results) == 1
-        assert results[0].temporal is not None
-        assert results[0].temporal['valid_at'] is None
-        assert results[0].temporal['invalid_at'] == '2024-09-01T10:00:00+00:00'
+        # Task 312: invalidated edges are now filtered out — expect empty results
+        assert len(results) == 0, (
+            'Edge with non-null invalid_at must be excluded from search results (task 312)'
+        )
 
 
 class TestDeleteMemory:
