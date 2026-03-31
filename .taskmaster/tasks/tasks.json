@@ -6705,13 +6705,13 @@
         "description": "Three test quality issues in dashboard/tests/test_costs_data.py:\n\n1. **Clock skew in test_trend_days_align_with_cutoff** (lines 735-739): `boundary_ts` is derived from a second `datetime.now(UTC)` call instead of reusing the `now` captured at line 727. This is exactly the clock-skew bug the production fix addresses — if the test runs near UTC midnight, `boundary_ts` can land on a different calendar day than `first_day`, causing sporadic failures. Fix: replace `datetime.now(UTC).replace(...)` with `now.replace(hour=12, minute=0, second=0, microsecond=0)`.\n\n2. **Weak assertion in test_cap_only_account** (line 570): `assert mco['last_cap'] is not None` should be `assert mco['last_cap'] == cap_ts_2` to verify that SQL `MAX(CASE WHEN event_type='cap_hit' THEN created_at END)` returns the most recent timestamp, not just any non-null value.\n\n3. **Missing edge case**: No test verifies that a cap-only account whose cap events are all outside the look-back window is absent from results. Add a test inserting only cap events older than the window and asserting the account is absent.\n\nmemory_hints: search \"test_costs_data clock skew\", search \"cap-only account test\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "317"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-31T15:36:01.014Z",
+        "updatedAt": "2026-03-31T15:38:09.899Z",
         "metadata": {
           "modules": [
             "dashboard/tests/test_costs_data.py"
@@ -6935,7 +6935,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T15:38:09.797Z",
+      "lastModified": "2026-03-31T15:38:09.899Z",
       "taskCount": 353,
       "completedCount": 294,
       "tags": [
