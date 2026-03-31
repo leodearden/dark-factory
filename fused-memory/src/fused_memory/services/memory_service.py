@@ -101,10 +101,13 @@ class MemoryService:
 
         qcfg = self.config.queue
 
-        # Initialize planned episode registry (co-located with durable queue data)
-        from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
-        self.planned_episode_registry = PlannedEpisodeRegistry(data_dir=qcfg.data_dir)
-        await self.planned_episode_registry.initialize()
+        # Initialize planned episode registry (co-located with durable queue data).
+        # If set_planned_registry() was called before initialize(), honour the external
+        # registry instead of creating a new one (preventing the lifecycle conflict).
+        if self.planned_episode_registry is None:
+            from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
+            self.planned_episode_registry = PlannedEpisodeRegistry(data_dir=qcfg.data_dir)
+            await self.planned_episode_registry.initialize()
 
         self.durable_queue = DurableWriteQueue(
             data_dir=qcfg.data_dir,
