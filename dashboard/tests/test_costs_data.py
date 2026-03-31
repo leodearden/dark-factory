@@ -77,6 +77,9 @@ CREATE INDEX IF NOT EXISTS idx_inv_account
 CREATE INDEX IF NOT EXISTS idx_inv_run
     ON invocations(run_id);
 
+CREATE INDEX IF NOT EXISTS idx_inv_completed_at
+    ON invocations(completed_at);
+
 CREATE TABLE IF NOT EXISTS account_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     account_name TEXT NOT NULL,
@@ -519,20 +522,23 @@ class TestCostByAccount:
 
     @pytest.mark.asyncio
     async def test_cap_only_account(self, tmp_path):
-        """Account with cap_hit events but zero invocations is absent from results.
+        """Account with cap_hit events but zero invocations IS present in results.
 
-        get_cost_by_account iterates over the invocations query (inv_rows) to
-        build its result dict. Accounts that only have account_events entries
-        (e.g., a capped account that never ran a task in the window) are
-        excluded because the outer loop never visits them.
+        get_cost_by_account performs a second pass over caps.keys() after the
+        inv_rows loop to emit any account that has cap events but no invocations
+        in the window. This makes capped-but-idle accounts visible in the
+        dashboard, which is important for ops awareness.
 
-        This is intentional: the cost-by-account view is spend-oriented. An
-        account with no spend doesn't appear, even if it has hit its cap.
+        Expected: spend=0.0, invocations=0, cap_events=2, status='capped',
+        last_cap set to the most recent cap_hit timestamp.
         """
         db_path = tmp_path / 'cap_only.db'
         conn = __import__('sqlite3').connect(str(db_path))
         conn.executescript(COSTS_SCHEMA)
         now = datetime.now(UTC)
+
+        cap_ts_1 = (now - timedelta(hours=3)).isoformat()
+        cap_ts_2 = (now - timedelta(hours=1)).isoformat()
 
         # Insert cap_hit events only — no corresponding invocations
         conn.executemany(
@@ -540,10 +546,8 @@ class TestCostByAccount:
             '(account_name, event_type, project_id, run_id, details, created_at) '
             'VALUES (?, ?, ?, ?, ?, ?)',
             [
-                ('max-cap-only', 'cap_hit', 'proj', 'r1', None,
-                 (now - timedelta(hours=3)).isoformat()),
-                ('max-cap-only', 'cap_hit', 'proj', 'r2', None,
-                 (now - timedelta(hours=1)).isoformat()),
+                ('max-cap-only', 'cap_hit', 'proj', 'r1', None, cap_ts_1),
+                ('max-cap-only', 'cap_hit', 'proj', 'r2', None, cap_ts_2),
             ],
         )
         conn.commit()
@@ -553,8 +557,17 @@ class TestCostByAccount:
             aconn.row_factory = aiosqlite.Row
             result = await get_cost_by_account(aconn)
 
-        # Account with only cap events and no invocations is absent — by design.
-        assert 'max-cap-only' not in result
+        # Account with only cap events must be present — capped-but-idle accounts
+        # are operationally significant and must appear in the dashboard.
+        assert 'max-cap-only' in result, (
+            "cap-only account must appear in get_cost_by_account result"
+        )
+        mco = result['max-cap-only']
+        assert mco['spend'] == 0.0
+        assert mco['invocations'] == 0
+        assert mco['cap_events'] == 2
+        assert mco['status'] == 'capped'
+        assert mco['last_cap'] is not None
 
     @pytest.mark.asyncio
     async def test_account_with_no_caps(self, tmp_path):
@@ -691,6 +704,82 @@ class TestCostTrend:
         # Verify gap-filling actually works: exactly 7 days, at least one with 0.0.
         assert len(df) == 7
         assert len(zero_days) > 0
+
+    @pytest.mark.asyncio
+    async def test_trend_days_align_with_cutoff(self, tmp_path):
+        """First and last day in the trend must derive from the same `now`.
+
+        Regression guard for the clock-skew race: _cutoff(days) calls
+        datetime.now(UTC) internally, then get_cost_trend calls datetime.now(UTC)
+        again to build all_days. If these two calls straddle UTC midnight the
+        day list and the SQL cutoff window are misaligned (off-by-one).
+
+        The fix captures `now` once and derives both `since` and `all_days` from
+        it. This test validates the invariant: with days=5, the result must
+        cover exactly 5 days; the first day must be
+        `(now - timedelta(days=4)).strftime('%Y-%m-%d')` and the last must be
+        today; and an invocation inserted at exactly the first-day boundary must
+        appear in the output.
+        """
+        db_path = tmp_path / 'trend_align.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+
+        days = 5
+        # Place an invocation exactly at the start of the first day in the window
+        # (days-1 days before today's midnight equivalent).
+        first_day = (now - timedelta(days=days - 1)).strftime('%Y-%m-%d')
+        last_day = now.strftime('%Y-%m-%d')
+        # Use noon of the first day to avoid midnight ambiguity
+        boundary_ts = (
+            datetime.now(UTC).replace(
+                hour=12, minute=0, second=0, microsecond=0
+            ) - timedelta(days=days - 1)
+        ).isoformat()
+
+        conn.execute(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('r1', 't1', 'proj', 'acc', 'claude-sonnet-4-5', 'implementer',
+             0.75, 0, boundary_ts, boundary_ts),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_trend(aconn, days=days)
+
+        assert 'proj' in result
+        proj_days = result['proj']
+
+        # Exactly `days` entries
+        assert len(proj_days) == days, (
+            f"expected {days} day entries, got {len(proj_days)}: "
+            f"{[e['day'] for e in proj_days]}"
+        )
+
+        # Chronologically ordered
+        day_strs = [e['day'] for e in proj_days]
+        assert day_strs == sorted(day_strs)
+
+        # First day aligns with (now - timedelta(days=days-1))
+        assert day_strs[0] == first_day, (
+            f"expected first day={first_day!r}, got {day_strs[0]!r}"
+        )
+        # Last day is today
+        assert day_strs[-1] == last_day, (
+            f"expected last day={last_day!r}, got {day_strs[-1]!r}"
+        )
+
+        # The boundary invocation must appear in the correct day slot
+        day_totals = {e['day']: e['total'] for e in proj_days}
+        assert day_totals[first_day] == pytest.approx(0.75, abs=1e-6), (
+            f"boundary invocation missing from first day {first_day!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -871,3 +960,66 @@ class TestRunCostBreakdown:
         assert t['cost'] == pytest.approx(0.40, abs=1e-6)
         # Both invocation rows must be preserved in the detail list
         assert len(t['invocations']) == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests: Schema index validation
+# ---------------------------------------------------------------------------
+
+class TestSchema:
+    def test_completed_at_index_exists(self, tmp_path):
+        """COSTS_SCHEMA must create idx_inv_completed_at on invocations.
+
+        Every query in costs.py filters WHERE completed_at >= ?, so the
+        index is critical for performance. This test verifies the test-schema
+        constant has the index DDL.
+        """
+        db_path = tmp_path / 'schema_check.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        conn.commit()
+
+        # PRAGMA index_list returns rows: (seq, name, unique, origin, partial)
+        rows = conn.execute("PRAGMA index_list('invocations')").fetchall()
+        index_names = [row[1] for row in rows]
+        conn.close()
+
+        assert 'idx_inv_completed_at' in index_names, (
+            f"idx_inv_completed_at missing from COSTS_SCHEMA indexes: {index_names}"
+        )
+
+    def test_cost_store_schema_has_completed_at_index(self, tmp_path):
+        """_SCHEMA in shared.cost_store must create idx_inv_completed_at.
+
+        The production schema must mirror the test schema for this performance-
+        critical index. This test creates a fresh DB using _SCHEMA (production)
+        and asserts the index is present.
+        """
+        import sys  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        # shared is not a dashboard venv dependency; locate it via relative path
+        # parents[2] = worktree root (e.g. .worktrees/317)
+        shared_src = str(
+            Path(__file__).resolve().parents[2] / 'shared' / 'src'
+        )
+        sys.path.insert(0, shared_src)
+        try:
+            from shared.cost_store import (  # pyright: ignore[reportMissingImports]
+                _SCHEMA as PROD_SCHEMA,  # noqa: PLC0415
+            )
+        finally:
+            sys.path.remove(shared_src)
+
+        db_path = tmp_path / 'prod_schema_check.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(PROD_SCHEMA)
+        conn.commit()
+
+        rows = conn.execute("PRAGMA index_list('invocations')").fetchall()
+        index_names = [row[1] for row in rows]
+        conn.close()
+
+        assert 'idx_inv_completed_at' in index_names, (
+            f"idx_inv_completed_at missing from cost_store._SCHEMA indexes: {index_names}"
+        )

@@ -188,6 +188,19 @@ async def get_cost_by_account(
                 'last_cap': cap_info['last_cap'],
                 'status': cap_info['status'],
             }
+
+        # Second pass: emit cap-only accounts (cap events but no invocations).
+        # These are operationally significant (capped-but-idle) and must be
+        # visible in the dashboard even though they have no spend.
+        for account_name, cap_info in caps.items():
+            if account_name not in result:
+                result[account_name] = {
+                    'spend': 0.0,
+                    'invocations': 0,
+                    'cap_events': cap_info['cap_events'],
+                    'last_cap': cap_info['last_cap'],
+                    'status': cap_info['status'],
+                }
         return result
 
     return await with_db(db, _query, {})
@@ -243,8 +256,8 @@ async def get_cost_trend(
     Entries cover every calendar day in the window (gaps filled with 0.0),
     ordered chronologically.
     """
-    since = _cutoff(days)
     now = datetime.now(UTC)
+    since = (now - timedelta(days=days)).isoformat()
 
     # Pre-fill all days in the window (today included)
     all_days: list[str] = []
