@@ -6773,10 +6773,11 @@
         "description": "Multiple test gaps in test_merge_entities.py:\n\n1. test_redirects_outgoing_edges only checks call count (>= 3) and dict keys — never inspects the actual Cypher strings for CREATE/DELETE. Should verify Phase 2 and Phase 3 Cypher content.\n2. test_returns_count_dict only tests the 'else 0' branch (empty result_set). The non-empty path (result_set[0][0]) is never exercised. Add a test with sequenced mock results returning actual counts.\n3. No test for incoming edge redirect (Phase 3) — the most asymmetric part that updates target_node_uuid instead of source_node_uuid.\n4. test_deletes_inter_node_edges doesn't verify sur_uuid is in params or that Cypher contains DELETE.\n5. Imprecise assertion (>= 3) should be exact (== 6) to catch regressions that omit a phase.\n\nMemory hints:\n- Search: 'merge_entities test coverage redirect_node_edges'\n- Entities: redirect_node_edges, merge_entities",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-31T15:38:10.267Z"
       },
       {
         "id": 366,
@@ -6935,7 +6936,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T15:38:09.899Z",
+      "lastModified": "2026-03-31T15:38:10.267Z",
       "taskCount": 353,
       "completedCount": 294,
       "tags": [
