@@ -37,8 +37,8 @@
       "id": "step-4",
       "type": "impl",
       "description": "In orchestrator/src/orchestrator/agents/invoke.py invoke_with_cap_retry: (1) Add 'account_name = \"\"' before the while loop. (2) Inside 'if usage_gate:' block after before_invoke(), add 'account_name = usage_gate.active_account_name or \"\"'. (3) After the while loop break, before 'return result', add 'result.account_name = account_name'. This makes all 4 tests pass.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "655737a1"
     }
   ],
   "design_decisions": [
