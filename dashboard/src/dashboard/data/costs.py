@@ -150,20 +150,28 @@ async def get_cost_by_account(
         )
 
         # Cap event counts and most-recent event per account.
+        # Use a CTE with ROW_NUMBER() OVER (...) to rank events per account once
+        # (single-pass), then LEFT JOIN to retrieve the most-recent event_type.
         # Use MAX(CASE WHEN event_type='cap_hit' ...) so last_cap_at only holds
-        # cap_hit timestamps (never resumed). Add created_at >= ? guard to the
-        # correlated subquery so status is derived from in-window events only.
+        # cap_hit timestamps (never resumed). Both CTE and outer WHERE use the
+        # same since cutoff so status is derived from in-window events only.
         evt_rows = await db.execute_fetchall(
-            "SELECT account_name, "
-            "       SUM(CASE WHEN event_type = 'cap_hit' THEN 1 ELSE 0 END) AS cap_count, "
-            "       MAX(CASE WHEN event_type = 'cap_hit' THEN created_at END) AS last_cap_at, "
-            '       (SELECT event_type FROM account_events ae2 '
-            '         WHERE ae2.account_name = account_events.account_name '
-            '           AND ae2.created_at >= ? '
-            '         ORDER BY created_at DESC LIMIT 1) AS last_event_type '
-            '  FROM account_events '
-            ' WHERE created_at >= ? '
-            ' GROUP BY account_name',
+            'WITH latest AS ( '
+            '  SELECT account_name, event_type, '
+            '         ROW_NUMBER() OVER '
+            '           (PARTITION BY account_name ORDER BY created_at DESC) AS rn '
+            '    FROM account_events '
+            '   WHERE created_at >= ? '
+            ') '
+            'SELECT ae.account_name, '
+            "       SUM(CASE WHEN ae.event_type = 'cap_hit' THEN 1 ELSE 0 END) AS cap_count, "
+            "       MAX(CASE WHEN ae.event_type = 'cap_hit' THEN ae.created_at END) AS last_cap_at, "
+            '       le.event_type AS last_event_type '
+            '  FROM account_events ae '
+            '  LEFT JOIN latest le '
+            '    ON ae.account_name = le.account_name AND le.rn = 1 '
+            ' WHERE ae.created_at >= ? '
+            ' GROUP BY ae.account_name',
             (since, since),
         )
 
