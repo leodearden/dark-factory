@@ -660,6 +660,64 @@ class TestPlannedEpisodePromotion:
         reconciler_with_registry.planned_episode_registry.promote.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_dedup_promotion_across_shared_provenance(
+        self, reconciler_with_registry, mock_memory_service
+    ):
+        """When multiple planned search results share provenance episode UUIDs,
+        promote() is called exactly once per unique UUID, not once per occurrence."""
+        from fused_memory.models.enums import SourceStore
+        from fused_memory.models.memory import MemoryResult
+
+        # Two results with overlapping provenance: ep-B appears in both.
+        # Without deduplication, promote() would be called 4 times (A, B, B, C).
+        # With deduplication, it should be called exactly 3 times (A, B, C).
+        result1 = MemoryResult(
+            id='edge-planned-1',
+            content='PRD: FeatureA',
+            category=None,
+            source_store=SourceStore.graphiti,
+            relevance_score=0.9,
+            provenance=['ep-A', 'ep-B'],
+            metadata={'planned': True},
+        )
+        result2 = MemoryResult(
+            id='edge-planned-2',
+            content='PRD: FeatureB',
+            category=None,
+            source_store=SourceStore.graphiti,
+            relevance_score=0.85,
+            provenance=['ep-B', 'ep-C'],
+            metadata={'planned': True},
+        )
+
+        call_results = [[], [result1, result2]]
+        call_index = {'n': 0}
+
+        async def mock_search(**kwargs):
+            idx = call_index['n']
+            call_index['n'] += 1
+            if idx < len(call_results):
+                return call_results[idx]
+            return []
+
+        mock_memory_service.search = mock_search
+
+        await reconciler_with_registry.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='/tmp/test',
+            task_before={'id': '1', 'title': 'FeatureAB', 'status': 'in-progress'},
+        )
+
+        promote = reconciler_with_registry.planned_episode_registry.promote
+        # Exactly 3 unique UUIDs promoted, not 4
+        assert promote.call_count == 3, (
+            f'Expected promote() called 3 times (one per unique UUID), '
+            f'got {promote.call_count}'
+        )
+        promoted_uuids = {call.args[0] for call in promote.call_args_list}
+        assert promoted_uuids == {'ep-A', 'ep-B', 'ep-C'}
+
+    @pytest.mark.asyncio
     async def test_no_registry_no_error_on_task_done(self, reconciler, mock_memory_service):
         """When planned_episode_registry is None (not wired), _on_task_done runs normally."""
         reconciler.planned_episode_registry = None
