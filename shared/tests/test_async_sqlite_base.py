@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
+
+from shared.async_sqlite_base import AsyncSqliteBase
 
 # ---------------------------------------------------------------------------
 # Step-1: apply_wal_pragmas
@@ -64,6 +66,40 @@ class TestApplyWalPragmas:
                 row = await cur.fetchone()
         assert row[0] == 5000
 
+    async def test_wal_fallback_raises_runtime_error(self) -> None:
+        """apply_wal_pragmas raises RuntimeError when journal_mode PRAGMA returns a
+        non-WAL result (e.g. 'delete' on a filesystem that doesn't support WAL)."""
+        from shared.async_sqlite_base import apply_wal_pragmas
+
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchone = AsyncMock(return_value=('delete',))
+        mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_cursor.__aexit__ = AsyncMock(return_value=False)
+
+        mock_conn = AsyncMock()
+        # execute() must return a sync value (the cursor) so `async with conn.execute(...)`
+        # can call __aenter__ on it directly — AsyncMock would return a coroutine instead.
+        mock_conn.execute = MagicMock(return_value=mock_cursor)
+
+        with pytest.raises(RuntimeError, match='WAL'):
+            await apply_wal_pragmas(mock_conn, busy_timeout_ms=5000)
+
+    async def test_wal_none_row_raises_runtime_error(self) -> None:
+        """apply_wal_pragmas raises RuntimeError when journal_mode PRAGMA returns no
+        rows (fetchone() → None). Guards against unexpected empty result sets."""
+        from shared.async_sqlite_base import apply_wal_pragmas
+
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchone = AsyncMock(return_value=None)
+        mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_cursor.__aexit__ = AsyncMock(return_value=False)
+
+        mock_conn = AsyncMock()
+        mock_conn.execute = MagicMock(return_value=mock_cursor)
+
+        with pytest.raises(RuntimeError, match='WAL'):
+            await apply_wal_pragmas(mock_conn, busy_timeout_ms=5000)
+
 
 # ---------------------------------------------------------------------------
 # Concrete test subclass used for AsyncSqliteBase tests
@@ -77,6 +113,12 @@ CREATE TABLE IF NOT EXISTS items (
 """
 
 
+class _SimpleStore(AsyncSqliteBase):
+    @property
+    def _schema(self) -> str:
+        return _SIMPLE_SCHEMA
+
+
 # ---------------------------------------------------------------------------
 # Step-3: AsyncSqliteBase.__init__
 # ---------------------------------------------------------------------------
@@ -86,56 +128,26 @@ class TestAsyncSqliteBaseInit:
     """AsyncSqliteBase.__init__ stores db_path, sets _conn to None, stores busy_timeout_ms."""
 
     def test_init_stores_db_path(self, tmp_path: Path):
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
         db_path = tmp_path / 'store.db'
-        store = _Store(db_path)
+        store = _SimpleStore(db_path)
         assert store.db_path == db_path
 
     def test_init_conn_is_none(self, tmp_path: Path):
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'store.db')
+        store = _SimpleStore(tmp_path / 'store.db')
         assert store._conn is None
 
     def test_init_default_busy_timeout(self, tmp_path: Path):
         """Default busy_timeout_ms is 5000."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'store.db')
+        store = _SimpleStore(tmp_path / 'store.db')
         assert store.busy_timeout_ms == 5000
 
     def test_init_custom_busy_timeout(self, tmp_path: Path):
         """busy_timeout_ms can be overridden at construction."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'store.db', busy_timeout_ms=30000)
+        store = _SimpleStore(tmp_path / 'store.db', busy_timeout_ms=30000)
         assert store.busy_timeout_ms == 30000
 
     def test_cannot_instantiate_without_schema(self, tmp_path: Path):
         """AsyncSqliteBase is abstract; instantiating without _schema raises TypeError."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
         with pytest.raises(TypeError):
             AsyncSqliteBase(tmp_path / 'store.db')  # type: ignore[abstract]
 
@@ -151,14 +163,7 @@ class TestAsyncSqliteBaseOpen:
 
     async def test_open_creates_connection(self, tmp_path: Path) -> None:
         """After open(), _conn is not None."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'store.db')
+        store = _SimpleStore(tmp_path / 'store.db')
         await store.open()
         try:
             assert store._conn is not None
@@ -167,42 +172,21 @@ class TestAsyncSqliteBaseOpen:
 
     async def test_open_sets_wal_mode(self, tmp_path: Path) -> None:
         """WAL journal mode is active after open()."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        async with _Store(tmp_path / 'store.db') as store:  # noqa: SIM117
+        async with _SimpleStore(tmp_path / 'store.db') as store:  # noqa: SIM117
             async with store._conn.execute('PRAGMA journal_mode') as cur:  # type: ignore[union-attr]
                 row = await cur.fetchone()
         assert row[0] == 'wal'
 
     async def test_open_sets_busy_timeout(self, tmp_path: Path) -> None:
         """busy_timeout PRAGMA reflects the configured busy_timeout_ms value."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        async with _Store(tmp_path / 'store.db', busy_timeout_ms=7777) as store:  # noqa: SIM117
+        async with _SimpleStore(tmp_path / 'store.db', busy_timeout_ms=7777) as store:  # noqa: SIM117
             async with store._conn.execute('PRAGMA busy_timeout') as cur:  # type: ignore[union-attr]
                 row = await cur.fetchone()
         assert row[0] == 7777
 
     async def test_open_creates_schema_tables(self, tmp_path: Path) -> None:
         """After open(), tables declared in _schema exist in the database."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        async with _Store(tmp_path / 'store.db') as store:  # noqa: SIM117
+        async with _SimpleStore(tmp_path / 'store.db') as store:  # noqa: SIM117
             async with store._conn.execute(  # type: ignore[union-attr]
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='items'"
             ) as cur:
@@ -211,15 +195,8 @@ class TestAsyncSqliteBaseOpen:
 
     async def test_open_creates_parent_dirs(self, tmp_path: Path) -> None:
         """open() creates parent directories that do not yet exist."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
         nested = tmp_path / 'a' / 'b' / 'c' / 'store.db'
-        store = _Store(nested)
+        store = _SimpleStore(nested)
         await store.open()
         try:
             assert nested.exists()
@@ -228,38 +205,28 @@ class TestAsyncSqliteBaseOpen:
 
     async def test_double_open_raises_runtime_error(self, tmp_path: Path) -> None:
         """A second call to open() raises RuntimeError('{ClassName} already opened')."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'store.db')
+        store = _SimpleStore(tmp_path / 'store.db')
         await store.open()
         try:
-            with pytest.raises(RuntimeError, match='_Store already opened'):
+            with pytest.raises(RuntimeError, match='_SimpleStore already opened'):
                 await store.open()
         finally:
             await store.close()
 
     async def test_open_no_resource_leak_on_schema_failure(self, tmp_path: Path) -> None:
         """If executescript fails during open(), the conn is closed and _conn stays None."""
-        from shared.async_sqlite_base import AsyncSqliteBase
+        store = _SimpleStore(tmp_path / 'broken.db')
 
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'broken.db')
-
-        # Build a mock connection whose executescript raises
+        # Build a mock connection whose executescript raises.
+        # Patch apply_wal_pragmas to a no-op so we can test schema failure in isolation
+        # without needing to replicate aiosqlite's dual-protocol execute() object.
         mock_conn = AsyncMock()
         mock_conn.executescript = AsyncMock(side_effect=RuntimeError('schema failure'))
         mock_conn.close = AsyncMock()
 
-        with patch('aiosqlite.connect', new=AsyncMock(return_value=mock_conn)), pytest.raises(RuntimeError, match='schema failure'):
+        with patch('shared.async_sqlite_base.apply_wal_pragmas', new=AsyncMock()), \
+             patch('aiosqlite.connect', new=AsyncMock(return_value=mock_conn)), \
+             pytest.raises(RuntimeError, match='schema failure'):
             await store.open()
 
         assert store._conn is None
@@ -277,14 +244,7 @@ class TestAsyncSqliteBaseClose:
 
     async def test_close_sets_conn_to_none(self, tmp_path: Path) -> None:
         """After close(), _conn is None."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'store.db')
+        store = _SimpleStore(tmp_path / 'store.db')
         await store.open()
         assert store._conn is not None
         await store.close()
@@ -292,14 +252,7 @@ class TestAsyncSqliteBaseClose:
 
     async def test_close_is_idempotent(self, tmp_path: Path) -> None:
         """Double-close does not raise."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'store.db')
+        store = _SimpleStore(tmp_path / 'store.db')
         await store.open()
         await store.close()
         # Second close should not raise
@@ -308,36 +261,22 @@ class TestAsyncSqliteBaseClose:
 
     async def test_close_never_opened_is_safe(self, tmp_path: Path) -> None:
         """close() on a store that was never opened is a no-op."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'store.db')
+        store = _SimpleStore(tmp_path / 'store.db')
         # Never opened — close() must not raise
         await store.close()
         assert store._conn is None
 
     async def test_data_persists_across_close_reopen(self, tmp_path: Path) -> None:
         """Data written before close() is readable after reopen."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
         db_path = tmp_path / 'store.db'
 
         # Write a row
-        async with _Store(db_path) as store:
+        async with _SimpleStore(db_path) as store:
             await store._conn.execute("INSERT INTO items (name) VALUES ('hello')")  # type: ignore[union-attr]
             await store._conn.commit()  # type: ignore[union-attr]
 
         # Reopen and verify the row is still there
-        async with _Store(db_path) as store:  # noqa: SIM117
+        async with _SimpleStore(db_path) as store:  # noqa: SIM117
             async with store._conn.execute("SELECT name FROM items WHERE name='hello'") as cur:  # type: ignore[union-attr]
                 row = await cur.fetchone()
         assert row is not None
@@ -355,58 +294,38 @@ class TestAsyncSqliteBaseContextManager:
 
     async def test_aenter_opens_connection(self, tmp_path: Path) -> None:
         """__aenter__ opens the connection (_conn is not None inside the block)."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'store.db')
+        store = _SimpleStore(tmp_path / 'store.db')
         async with store:
             assert store._conn is not None
 
     async def test_aenter_returns_self(self, tmp_path: Path) -> None:
         """__aenter__ returns self."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'store.db')
+        store = _SimpleStore(tmp_path / 'store.db')
         async with store as ctx:
             assert ctx is store
 
     async def test_aexit_closes_connection_on_normal_exit(self, tmp_path: Path) -> None:
         """__aexit__ closes the connection after the block exits normally."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'store.db')
+        store = _SimpleStore(tmp_path / 'store.db')
         async with store:
             pass
         assert store._conn is None
 
     async def test_aexit_closes_connection_on_exception(self, tmp_path: Path) -> None:
         """__aexit__ closes the connection even when the body raises."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'store.db')
+        store = _SimpleStore(tmp_path / 'store.db')
         with pytest.raises(ValueError, match='boom'):
             async with store:
                 raise ValueError('boom')
         assert store._conn is None
+
+    def test_aenter_return_annotation_is_self(self) -> None:
+        """__aenter__ must be annotated with typing.Self so subclass context managers
+        preserve the concrete type for static type checkers."""
+        import typing
+
+        hints = typing.get_type_hints(AsyncSqliteBase.__aenter__)
+        assert hints['return'] is typing.Self
 
 
 # ---------------------------------------------------------------------------
@@ -419,43 +338,22 @@ class TestAsyncSqliteBaseRequireConn:
 
     def test_require_conn_raises_when_not_opened(self, tmp_path: Path) -> None:
         """_require_conn() raises RuntimeError('{ClassName} not opened') when _conn is None."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'store.db')
-        with pytest.raises(RuntimeError, match='_Store not opened'):
+        store = _SimpleStore(tmp_path / 'store.db')
+        with pytest.raises(RuntimeError, match='_SimpleStore not opened'):
             store._require_conn()
 
     @pytest.mark.asyncio
     async def test_require_conn_returns_connection_when_open(self, tmp_path: Path) -> None:
         """_require_conn() returns the aiosqlite connection when the store is open."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        async with _Store(tmp_path / 'store.db') as store:
+        async with _SimpleStore(tmp_path / 'store.db') as store:
             conn = store._require_conn()
             assert conn is store._conn
 
     @pytest.mark.asyncio
     async def test_require_conn_raises_after_close(self, tmp_path: Path) -> None:
         """_require_conn() raises after close() sets _conn to None."""
-        from shared.async_sqlite_base import AsyncSqliteBase
-
-        class _Store(AsyncSqliteBase):
-            @property
-            def _schema(self) -> str:
-                return _SIMPLE_SCHEMA
-
-        store = _Store(tmp_path / 'store.db')
+        store = _SimpleStore(tmp_path / 'store.db')
         await store.open()
         await store.close()
-        with pytest.raises(RuntimeError, match='_Store not opened'):
+        with pytest.raises(RuntimeError, match='_SimpleStore not opened'):
             store._require_conn()
