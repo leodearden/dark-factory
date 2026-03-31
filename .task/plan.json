@@ -58,8 +58,8 @@
       "id": "step-7",
       "type": "impl",
       "description": "Wrap the close body in try/finally so _conn is always cleared: `if self._conn is not None: try: await self._conn.close() finally: self._conn = None`. This matches the defensive pattern in open() and makes step-5 and step-6 tests pass.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "554f6183"
     }
   ],
   "design_decisions": [
