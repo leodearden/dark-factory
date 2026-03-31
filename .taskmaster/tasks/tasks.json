@@ -6042,6 +6042,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 325,
+        "title": "Extract cost route handler boilerplate into shared helper",
+        "description": "All 7 cost partial route handlers in app.py repeat an identical 3-line db-acquisition preamble (config/pool/db) and each implements its own try/except instead of reusing _safe_gather_result. Additionally, pool.get() is called outside the try/except, so a pool failure bypasses the graceful-degradation error boundary.\n\nExtract an async helper (e.g. _get_runs_db(request)) or FastAPI Depends() that encapsulates the db acquisition. Wrap pool.get() inside the error boundary. This matches the existing _safe_gather_result / _parse_window pattern of centralizing repeated cross-cutting logic.\n\nmemory_hints:\n- search: \"DbPool aiosqlite connection pattern\"\n- search: \"_safe_gather_result error handling\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6054,7 +6065,7 @@
       ],
       "created": "2026-03-31T08:39:20.275Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T08:39:20.278Z"
+      "updated": "2026-03-31T08:39:26.568Z"
     }
   }
 }
