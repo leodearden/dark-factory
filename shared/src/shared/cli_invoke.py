@@ -9,10 +9,12 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,10 @@ class AgentResult:
     subtype: str = ''
     stderr: str = ''
     account_name: str = ''
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_create_tokens: int | None = None
 
 
 def _to_token_count(v: int | None) -> int | None:
@@ -122,6 +128,12 @@ async def invoke_claude_agent(
 async def invoke_with_cap_retry(
     usage_gate: UsageGate | None,
     label: str,
+    *,
+    cost_store: CostStore | None = None,
+    run_id: str = '',
+    task_id: str = '',
+    project_id: str = '',
+    role: str = '',
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -129,8 +141,12 @@ async def invoke_with_cap_retry(
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
 
+    When *cost_store* is provided, successful invocations are recorded via
+    ``save_invocation()`` and cap-hit events via ``save_account_event()``.
+
     All keyword arguments are forwarded to ``invoke_claude_agent()``.
     """
+    model = invoke_kwargs.get('model', 'opus')
     while True:
         oauth_token = None
         account_name = ''
@@ -138,12 +154,26 @@ async def invoke_with_cap_retry(
             oauth_token = await usage_gate.before_invoke()
             account_name = usage_gate.active_account_name or ''
 
+        started_at = datetime.now(UTC).isoformat()
         result = await invoke_claude_agent(**invoke_kwargs, oauth_token=oauth_token)
+        completed_at = datetime.now(UTC).isoformat()
 
         if usage_gate and usage_gate.detect_cap_hit(
             result.stderr, result.output, 'claude', oauth_token=oauth_token,
         ):
             acct_name = usage_gate.active_account_name
+            if cost_store:
+                try:
+                    await cost_store.save_account_event(
+                        account_name=account_name,
+                        event_type='cap_hit',
+                        project_id=project_id or None,
+                        run_id=run_id or None,
+                        details=label,
+                        created_at=datetime.now(UTC).isoformat(),
+                    )
+                except Exception:
+                    logger.warning('Failed to save cap_hit event', exc_info=True)
             if acct_name:
                 logger.warning(
                     f'{label}: cap hit, sleeping {_CAP_HIT_COOLDOWN_SECS}s '
@@ -162,6 +192,27 @@ async def invoke_with_cap_retry(
         break
 
     result.account_name = account_name
+    if cost_store:
+        try:
+            await cost_store.save_invocation(
+                run_id=run_id,
+                task_id=task_id or None,
+                project_id=project_id,
+                account_name=account_name,
+                model=model,
+                role=role,
+                cost_usd=result.cost_usd,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                cache_read_tokens=result.cache_read_tokens,
+                cache_create_tokens=result.cache_create_tokens,
+                duration_ms=result.duration_ms,
+                capped=False,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+        except Exception:
+            logger.warning('Failed to save invocation cost', exc_info=True)
     return result
 
 
@@ -258,6 +309,12 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     subtype = data.get('subtype', '')
     structured = data.get('structured_output')
 
+    usage = data.get('usage') or {}
+    input_tokens = _to_token_count(usage.get('input_tokens'))
+    output_tokens = _to_token_count(usage.get('output_tokens'))
+    cache_read_tokens = _to_token_count(usage.get('cache_read_input_tokens'))
+    cache_create_tokens = _to_token_count(usage.get('cache_creation_input_tokens'))
+
     output_text = data.get('result', '')
     if not output_text and isinstance(data.get('messages'), list):
         parts = []
@@ -282,6 +339,10 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         structured_output=structured,
         subtype=subtype,
         stderr=result.stderr,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_create_tokens=cache_create_tokens,
     )
 
 
