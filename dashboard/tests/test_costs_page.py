@@ -958,3 +958,15 @@ class TestHxSyncOnSections:
         """All hx-sync attributes must use the this:abort strategy."""
         html = client.get('/costs').text
         assert 'hx-sync="this:abort"' in html or "hx-sync='this:abort'" in html
+
+    def test_hx_sync_on_each_section(self, client):
+        """Each individual section (by data-cost-section value) must have hx-sync."""
+        html = client.get('/costs').text
+        sections = ['summary', 'by-project', 'by-account', 'by-role', 'trend', 'events', 'runs']
+        for section in sections:
+            # Find the section marker and verify hx-sync appears nearby
+            # We check by counting that hx-sync appears once per section block
+            marker = f'data-cost-section="{section}"'
+            assert marker in html, f'Section {section!r} not found in page'
+        # Verify the total count of hx-sync attributes equals number of sections
+        assert html.count('hx-sync="this:abort"') == len(sections)
