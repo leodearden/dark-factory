@@ -65,3 +65,36 @@ class TestByRoleDomScoping:
         assert container_pos < script_pos, (
             'data-by-role-container must appear before the <script> tag'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-3: Render guard tests (TestByRoleRenderGuard)
+# ---------------------------------------------------------------------------
+
+
+class TestByRoleRenderGuard:
+    """Tests that by_role.html prevents double-render via a rendered boolean guard."""
+
+    def test_rendered_guard_variable_declared(self, client):
+        """Script must declare a 'rendered' boolean guard variable."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert 'var rendered = false' in html
+
+    def test_render_charts_starts_with_guard_check(self, client):
+        """renderCharts function body must start with the guard check."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert 'if (rendered) return' in html
+
+    def test_htmx_after_settle_listener_present(self, client):
+        """htmx:afterSettle listener must still be registered."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert "htmx:afterSettle" in html
+
+    def test_rendered_set_to_true_inside_render_charts(self, client):
+        """renderCharts must set rendered = true to latch after first execution."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert 'rendered = true' in html
