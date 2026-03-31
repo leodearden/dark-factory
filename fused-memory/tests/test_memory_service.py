@@ -2123,3 +2123,43 @@ class TestSearchGraphitiInvalidatedFiltering:
         assert len(results) == 10, (
             'Results must be truncated to limit=10 when Graphiti returns more valid edges'
         )
+
+    # step-11: scores reflect original rank position from Graphiti, not re-ranked positions
+    @pytest.mark.asyncio
+    async def test_scores_reflect_original_rank_position(self, service):
+        """Surviving edges keep scores from their original Graphiti rank positions.
+
+        Graphiti returns 5 edges at positions 0-4. Edges at positions 1 and 3
+        are invalidated (invalid_at set). The surviving edges at positions 0, 2,
+        and 4 must score 1.0, 0.9, 0.8 respectively (score = max(0, 1 - i*0.05)),
+        NOT re-ranked to 1.0, 0.95, 0.9 based on their post-filter positions.
+        """
+        from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        dt_invalid = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Fact at pos 0', uuid='pos-0', valid_at=dt_valid, invalid_at=None),        # i=0, score=1.00
+            MockEdge(fact='Superseded at pos 1', uuid='pos-1', valid_at=dt_valid, invalid_at=dt_invalid),  # filtered
+            MockEdge(fact='Fact at pos 2', uuid='pos-2', valid_at=dt_valid, invalid_at=None),        # i=2, score=0.90
+            MockEdge(fact='Superseded at pos 3', uuid='pos-3', valid_at=dt_valid, invalid_at=dt_invalid),  # filtered
+            MockEdge(fact='Fact at pos 4', uuid='pos-4', valid_at=dt_valid, invalid_at=None),        # i=4, score=0.80
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('fact', scope, limit=10)
+
+        assert len(results) == 3, 'Three edges should survive filtering'
+
+        scores_by_id = {r.id: r.relevance_score for r in results}
+        assert scores_by_id['pos-0'] == pytest.approx(1.00), (
+            'Edge at original rank 0 must score 1.0 (1.0 - 0*0.05)'
+        )
+        assert scores_by_id['pos-2'] == pytest.approx(0.90), (
+            'Edge at original rank 2 must score 0.9 (1.0 - 2*0.05)'
+        )
+        assert scores_by_id['pos-4'] == pytest.approx(0.80), (
+            'Edge at original rank 4 must score 0.8 (1.0 - 4*0.05)'
+        )
