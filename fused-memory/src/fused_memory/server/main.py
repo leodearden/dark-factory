@@ -159,6 +159,9 @@ async def run_server():
             targeted = TargetedReconciler(
                 memory_service, taskmaster, recon_journal, config, event_buffer,
             )
+            # Wire the planned episode registry so _on_task_done can promote planned
+            # episodes when tasks complete (otherwise the promotion code is dead code).
+            targeted.planned_episode_registry = memory_service.planned_episode_registry
 
         from fused_memory.middleware.task_file_committer import TaskFileCommitter
 
