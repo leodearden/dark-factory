@@ -163,9 +163,8 @@ class TestCostsPage:
     def test_default_window_7d_marked_active(self, client):
         """Without ?window=, the 7d button should be visually active."""
         html = client.get('/costs').text
-        # The page must indicate 7d is the default/active window
-        # We check that 7d appears as the default in Alpine state or aria-pressed
-        assert '7d' in html
+        # The page must indicate 7d is the default/active window via Alpine.store init
+        assert "Alpine.store('costs', { window: \"7d\" })" in html
 
 
 # ---------------------------------------------------------------------------

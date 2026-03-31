@@ -24,7 +24,7 @@
       "id": "step-1",
       "type": "test",
       "description": "Tighten test_default_window_7d_marked_active: replace `assert '7d' in html` with assertion that Alpine.store init contains '7d' as the default window value \u2014 check for `Alpine.store('costs', { window: \"7d\" })` in the rendered HTML",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
