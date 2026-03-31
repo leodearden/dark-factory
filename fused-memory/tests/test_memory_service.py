@@ -1569,6 +1569,33 @@ class TestExecuteGraphitiWritePlanningRegistration:
         # Should not raise
         await service._execute_graphiti_write('add_episode', payload)
 
+    @pytest.mark.asyncio
+    async def test_empty_group_id_skips_registration(self, service):
+        """When group_id is empty string in payload, register() must NOT be called.
+
+        Currently FAILS because the code calls register(uuid, '') with an empty
+        group_id, silently making the episode invisible to search filtering which
+        queries by actual project_id (never matches '').
+        """
+        mock_registry = MagicMock()
+        mock_registry.register = AsyncMock()
+        service.planned_episode_registry = mock_registry
+
+        # Payload with temporal_context='planning' but group_id is empty string
+        payload = {
+            'uuid': 'episode-empty-group',
+            'name': 'episode_emptygroup',
+            'content': 'PRD content with empty group_id',
+            'source': 'text',
+            'group_id': '',  # Empty — falsy group_id
+            'source_description': '[temporal:planning] plan',
+            'temporal_context': 'planning',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+
+        # Registration must be skipped — not called with empty group_id
+        mock_registry.register.assert_not_called()
+
 
 class TestSearchGraphitiFiltering:
     """step-11: _search_graphiti excludes edges whose ALL episodes are in planned registry."""
