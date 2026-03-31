@@ -6307,7 +6307,15 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-31T09:35:27.652Z"
+        "updatedAt": "2026-03-31T09:35:27.652Z",
+        "metadata": {
+          "files": [
+            "shared/src/shared/usage_gate.py"
+          ],
+          "modules": [
+            "shared/src/shared"
+          ]
+        }
       },
       {
         "id": 337,
@@ -6318,7 +6326,19 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "shared/src/shared/usage_gate.py",
+            "orchestrator/src/orchestrator/harness.py",
+            "fused-memory/src/fused_memory/reconciliation/harness.py"
+          ],
+          "modules": [
+            "shared/src/shared",
+            "orchestrator/src/orchestrator",
+            "fused-memory/src/fused_memory/reconciliation"
+          ]
+        }
       },
       {
         "id": 338,
