@@ -6349,7 +6349,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "orchestrator/tests/test_usage_gate.py"
+          ],
+          "modules": [
+            "orchestrator/tests"
+          ]
+        }
       },
       {
         "id": 339,
@@ -6360,7 +6368,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/partials/costs/summary.html",
+            "dashboard/src/dashboard/data/costs.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates",
+            "dashboard/src/dashboard/data"
+          ]
+        }
       },
       {
         "id": 340,
