@@ -315,7 +315,7 @@ class TestCostStoreContextManager:
 
 @pytest.mark.asyncio
 class TestCostStoreOpenClose:
-    """step-3: open() creates persistent WAL connection; close() is idempotent."""
+    """step-3: open() creates persistent WAL connection; close() is idempotent; double-open raises."""
 
     async def test_open_sets_conn(self, tmp_path: Path):
         store = CostStore(tmp_path / 'costs.db')
@@ -368,6 +368,16 @@ class TestCostStoreOpenClose:
         finally:
             await store.close()
 
+    async def test_double_open_raises(self, tmp_path: Path):
+        """Calling open() twice raises RuntimeError('CostStore already opened')."""
+        store = CostStore(tmp_path / 'costs.db')
+        await store.open()
+        try:
+            with pytest.raises(RuntimeError, match='CostStore already opened'):
+                await store.open()
+        finally:
+            await store.close()
+
     async def test_open_no_leak_on_setup_error(self, tmp_path: Path):
         """If executescript raises after connect, conn is closed and _conn stays None."""
         store = CostStore(tmp_path / 'costs.db')
@@ -396,3 +406,94 @@ class TestCostStoreOpenClose:
 
         assert store._conn is None, '_conn should remain None on setup failure'
         assert close_called, 'Connection must be closed to prevent resource leak'
+
+
+@pytest.mark.asyncio
+class TestPostCloseGuard:
+    """step-5: after close(), save methods must raise RuntimeError (regression guard)."""
+
+    async def test_save_invocation_raises_after_close(self, tmp_path: Path):
+        """open() -> close() -> save_invocation() must raise RuntimeError('CostStore not opened')."""
+        store = CostStore(tmp_path / 'costs.db')
+        await store.open()
+        await store.close()
+        with pytest.raises(RuntimeError, match='CostStore not opened'):
+            await store.save_invocation(
+                run_id='r1',
+                task_id=None,
+                project_id='proj',
+                account_name='acct',
+                model='claude-3',
+                role='agent',
+                cost_usd=0.01,
+                input_tokens=None,
+                output_tokens=None,
+                cache_read_tokens=None,
+                cache_create_tokens=None,
+                duration_ms=100,
+                capped=False,
+                started_at='2024-01-01T00:00:00',
+                completed_at='2024-01-01T00:00:01',
+            )
+
+    async def test_save_account_event_raises_after_close(self, tmp_path: Path):
+        """open() -> close() -> save_account_event() must raise RuntimeError('CostStore not opened')."""
+        store = CostStore(tmp_path / 'costs.db')
+        await store.open()
+        await store.close()
+        with pytest.raises(RuntimeError, match='CostStore not opened'):
+            await store.save_account_event(
+                account_name='acct',
+                event_type='cap_hit',
+                project_id=None,
+                run_id=None,
+                details=None,
+                created_at='2024-01-01T00:00:00',
+            )
+
+
+@pytest.mark.asyncio
+class TestPersistAcrossReopen:
+    """step-6: data saved before close() survives a close/reopen cycle."""
+
+    async def test_invocation_persists_across_reopen(self, tmp_path: Path):
+        """save_invocation() -> close() -> reopen() -> SELECT verifies row exists."""
+        db_path = tmp_path / 'costs.db'
+
+        # First session: write a row
+        store = CostStore(db_path)
+        await store.open()
+        await store.save_invocation(
+            run_id='run-persist',
+            task_id='task-1',
+            project_id='dark_factory',
+            account_name='max-d',
+            model='claude-3-5-sonnet',
+            role='agent',
+            cost_usd=0.05,
+            input_tokens=100,
+            output_tokens=50,
+            cache_read_tokens=None,
+            cache_create_tokens=None,
+            duration_ms=500,
+            capped=False,
+            started_at='2024-06-01T10:00:00',
+            completed_at='2024-06-01T10:00:01',
+        )
+        await store.close()
+
+        # Second session: reopen and verify row is still there
+        store2 = CostStore(db_path)
+        await store2.open()
+        try:
+            async with store2._conn.execute(
+                'SELECT run_id, task_id, cost_usd FROM invocations'
+            ) as cur:
+                row = await cur.fetchone()
+        finally:
+            await store2.close()
+
+        assert row is not None, 'Row must survive close/reopen cycle'
+        assert row[0] == 'run-persist'
+        assert row[1] == 'task-1'
+        assert abs(row[2] - 0.05) < 1e-9

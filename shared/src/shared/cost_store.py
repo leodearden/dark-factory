@@ -87,6 +87,8 @@ class CostStore:
 
     async def open(self) -> None:
         """Open persistent connection, set WAL + busy_timeout, ensure schema."""
+        if self._conn is not None:
+            raise RuntimeError('CostStore already opened')
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = await aiosqlite.connect(str(self.db_path))
         try:
@@ -110,7 +112,12 @@ class CostStore:
         await self.open()
         return self
 
-    async def __aexit__(self, *exc: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
         await self.close()
 
     # -- internal helpers -----------------------------------------------------
@@ -121,7 +128,7 @@ class CostStore:
             raise RuntimeError('CostStore not opened')
         return self._conn
 
-    async def _execute(self, sql: str, params: tuple) -> None:
+    async def _execute(self, sql: str, params: tuple[Any, ...]) -> None:
         """Execute a single statement and commit."""
         conn = self._require_conn()
         await conn.execute(sql, params)
