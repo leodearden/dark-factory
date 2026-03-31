@@ -1,0 +1,202 @@
+{
+  "task_id": "310",
+  "title": "Add entity merge capability to Graphiti/fused-memory",
+  "files": [
+    "fused-memory/src/fused_memory/backends/graphiti_client.py",
+    "fused-memory/src/fused_memory/services/memory_service.py",
+    "fused-memory/src/fused_memory/server/tools.py",
+    "fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py",
+    "fused-memory/tests/test_merge_entities.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/backends",
+    "fused-memory/src/fused_memory/services",
+    "fused-memory/src/fused_memory/server",
+    "fused-memory/src/fused_memory/reconciliation",
+    "fused-memory/tests"
+  ],
+  "analysis": "The task requires adding an entity merge MCP tool that consolidates duplicate entity nodes in Graphiti. Currently, the same real-world concept can exist as multiple Entity nodes with different UUIDs, fragmenting knowledge. The tool accepts two entity UUIDs (deprecated + surviving), redirects all edges from the deprecated node to the surviving node, merges their summaries, and deletes the deprecated node.\n\nThe codebase follows a clear three-layer pattern: Backend (graphiti_client.py) \u2192 Service (memory_service.py) \u2192 MCP Tool (tools.py). The refresh_entity_summary feature is the closest analog \u2014 it touches the same three layers and was implemented with the same TDD pattern we'll follow.\n\nKey technical challenge: FalkorDB (the graph backend) does not support changing relationship endpoints. To redirect edges, we must CREATE new edges with identical properties (including vecf32 embeddings) pointing to the surviving node, then DELETE the originals. Individual property assignment in Cypher (SET new.prop = old.prop) preserves vecf32 types, unlike properties() extraction.\n\nThe merge operation has three Cypher phases: (1) delete inter-node edges between the two merging entities (they become meaningless), (2) redirect outgoing edges from deprecated to surviving, (3) redirect incoming edges to deprecated to surviving. After redirect, the deprecated node is DETACH DELETEd and the surviving node's summary is rebuilt via existing refresh_entity_summary.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Create test file fused-memory/tests/test_merge_entities.py with imports and test infrastructure (conftest fixtures are already available: mock_config, make_backend, make_graph_mock)",
+      "status": "done",
+      "commit": "664188e9",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing tests for GraphitiBackend.redirect_node_edges(): (a) redirects outgoing edges \u2014 verifies Cypher creates new edges from surviving\u2192target and deletes old edges from deprecated\u2192target, (b) redirects incoming edges \u2014 verifies source\u2192deprecated edges become source\u2192surviving, (c) deletes inter-node edges \u2014 edges between deprecated and surviving are removed before redirect, (d) returns count dict with outgoing/incoming/deleted counts, (e) raises RuntimeError when not initialized, (f) handles empty edge sets gracefully (returns zeros)",
+      "status": "done",
+      "commit": "fd8891b4"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Implement GraphitiBackend.redirect_node_edges(deprecated_uuid, surviving_uuid) with three Cypher queries: (1) DELETE inter-node edges between the two UUIDs, (2) MATCH deprecated outgoing edges, CREATE identical edges from surviving node with all properties copied (uuid, name, fact, fact_embedding, valid_at, invalid_at, created_at, group_id, episodes, updated source_node_uuid), DELETE old, (3) Same for incoming edges with updated target_node_uuid. Returns dict with counts: {outgoing_redirected, incoming_redirected, inter_node_deleted}",
+      "status": "done",
+      "commit": "519cac4d"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing tests for GraphitiBackend.delete_entity_node(uuid): (a) executes DETACH DELETE Cypher with correct UUID parameter, (b) raises NodeNotFoundError when node doesn't exist (verified via pre-check query), (c) raises RuntimeError when not initialized",
+      "status": "done",
+      "commit": "80434357"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Implement GraphitiBackend.delete_entity_node(uuid) \u2014 validates node exists (reusing get_node_text pattern), then issues MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n",
+      "status": "done",
+      "commit": "d57b43d5"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing tests for GraphitiBackend.merge_entities(deprecated_uuid, surviving_uuid): (a) validates both nodes exist (calls get_node_text for both, raises NodeNotFoundError if either missing), (b) calls redirect_node_edges then delete_entity_node then refresh_entity_summary in correct order, (c) returns audit dict with keys: surviving_uuid, surviving_name, deprecated_uuid, deprecated_name, edges_redirected (sub-dict), surviving_summary (before/after), (d) when deprecated node has zero edges, merge still succeeds (delete node + refresh summary)",
+      "status": "done",
+      "commit": "e9ab76cd"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Implement GraphitiBackend.merge_entities(deprecated_uuid, surviving_uuid) \u2014 orchestrates: get_node_text for both (validation + names), redirect_node_edges, delete_entity_node, refresh_entity_summary on surviving node. Returns structured audit result dict",
+      "status": "done",
+      "commit": "71dacdc8"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing tests for MemoryService.merge_entities(): (a) delegates to graphiti.merge_entities with correct UUIDs, (b) logs via write_journal with operation='merge_entities' and params containing both UUIDs, (c) journal failure does not mask successful merge (try/finally pattern), (d) backend failure is still journaled with success=False, (e) works without journal (journal=None)",
+      "status": "done",
+      "commit": "8e69141a"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Implement MemoryService.merge_entities(deprecated_uuid, surviving_uuid, project_id, agent_id, session_id, causation_id, _source) following the exact try/finally journal pattern from refresh_entity_summary. Delegates to self.graphiti.merge_entities()",
+      "status": "done",
+      "commit": "1cd63170"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write failing tests for MCP tool merge_entities: (a) tool is registered in MCP server, (b) delegates to memory_service.merge_entities with correct parameters, (c) rejects empty project_id with ValidationError, (d) rejects empty/whitespace deprecated_uuid with ValidationError, (e) rejects empty/whitespace surviving_uuid with ValidationError, (f) rejects same UUID for both params with ValidationError, (g) exception from memory_service returns error dict (not raised)",
+      "status": "done",
+      "commit": "427f56ee"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Implement merge_entities MCP tool in tools.py following established patterns: @mcp.tool() decorator, identity resolution, project_id validation, UUID validation (non-empty, not equal), causation extraction, delegation to memory_service.merge_entities, error handling returning dict. Update FUSED_MEMORY_INSTRUCTIONS to document the new tool under Management section",
+      "status": "done",
+      "commit": "a3186670"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write failing test that 'mcp__fused-memory__merge_entities' is in DISALLOW_MEMORY_WRITES list (so Stage 3 read-only reconciliation cannot invoke it) and NOT in STAGE1_DISALLOWED (so Stage 1 memory consolidation can use it for dedup)",
+      "status": "done",
+      "commit": "486cc0a2"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Add 'mcp__fused-memory__merge_entities' to DISALLOW_MEMORY_WRITES list in cli_stage_runner.py",
+      "status": "done",
+      "commit": "cfe3a81a"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use 'deprecated_uuid' and 'surviving_uuid' parameter names instead of generic 'source'/'target'",
+      "rationale": "Makes the destructive intent clear in the API \u2014 the deprecated node is deleted, the surviving node persists. Prevents accidental misuse where the caller confuses which node is kept."
+    },
+    {
+      "decision": "Copy edge properties individually in Cypher (SET new.prop = old.prop) rather than using properties() bulk copy",
+      "rationale": "FalkorDB's properties() function may not preserve the vecf32 vector type for fact_embedding. Direct property reference within the same Cypher query preserves types. Explicitly listing properties also makes the operation auditable and resistant to schema changes."
+    },
+    {
+      "decision": "Delete inter-node edges before redirecting other edges",
+      "rationale": "Edges connecting the two merging entities become meaningless after merge (would be self-loops). Deleting them first simplifies the redirect Cypher by excluding the surviving node UUID from the WHERE clause."
+    },
+    {
+      "decision": "Preserve original edge UUIDs on redirected edges",
+      "rationale": "Maintains traceability \u2014 any existing references to edge UUIDs (e.g., in episode.edges lists, search result caches, or audit logs) remain valid. The edge identity doesn't change, only its endpoints."
+    },
+    {
+      "decision": "No automatic duplicate edge deduplication at merge time",
+      "rationale": "If both nodes had edges to the same third entity with similar facts, the redirected edges may create duplicates. This is handled naturally by refresh_entity_summary (which deduplicates facts in the summary). Edge-level dedup is a separate concern that can be addressed via existing delete_memory workflow."
+    },
+    {
+      "decision": "Implement merge_entities at the backend level rather than as a service-only orchestration",
+      "rationale": "The merge requires multiple low-level Cypher operations that should be co-located for atomicity reasoning. The backend method orchestrates redirect + delete + refresh in sequence. The service layer adds journaling, and the tool layer adds validation. This follows the same pattern as refresh_entity_summary."
+    },
+    {
+      "decision": "Use DETACH DELETE for deprecated node removal",
+      "rationale": "After edge redirect, the deprecated node may still have non-RELATES_TO relationships (e.g., community links, internal Graphiti metadata). DETACH DELETE cleanly removes all remaining relationships, which is safe because we've already redirected all RELATES_TO edges."
+    },
+    {
+      "decision": "Single new test file (test_merge_entities.py) mirroring test_refresh_entity_summary.py structure",
+      "rationale": "Follows the established pattern of grouping backend, service, and MCP tool tests for a single feature in one file with separate TestClass groups. Keeps the feature self-contained and easy to find."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "GraphitiBackend.get_node_text(uuid)",
+      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py:397",
+      "how": "Reuse to validate both entity UUIDs exist before merge and to get their names for the audit result. Raises NodeNotFoundError for invalid UUIDs."
+    },
+    {
+      "what": "GraphitiBackend.refresh_entity_summary(node_uuid)",
+      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py:416",
+      "how": "Call after merge to rebuild the surviving node's summary from all its edges (original + redirected). Already handles fact deduplication."
+    },
+    {
+      "what": "NodeNotFoundError exception class",
+      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py:25",
+      "how": "Reuse for validation when either UUID doesn't exist. Already used by get_node_text."
+    },
+    {
+      "what": "WriteJournal try/finally pattern from refresh_entity_summary",
+      "where": "fused-memory/src/fused_memory/services/memory_service.py:1149-1207",
+      "how": "Copy the exact pattern: write_op_id, try/except/finally with journal.log_write_op, journal failure suppressed with warning log. Ensures journal never masks backend success/failure."
+    },
+    {
+      "what": "_resolve_identity, _extract_causation, validate_project_id helpers",
+      "where": "fused-memory/src/fused_memory/server/tools.py:75-130",
+      "how": "Standard tool handler preamble: resolve agent/session from MCP context, extract causation ID from metadata, validate project_id format."
+    },
+    {
+      "what": "MCP tool error handling pattern (return error dict, don't raise)",
+      "where": "fused-memory/src/fused_memory/server/tools.py (all tool handlers)",
+      "how": "All tools catch Exception, return {'error': str(e), 'error_type': type(e).__name__}. Follow identical pattern."
+    },
+    {
+      "what": "conftest.py fixtures: mock_config, make_backend, make_graph_mock",
+      "where": "fused-memory/tests/conftest.py",
+      "how": "make_backend creates GraphitiBackend with mock client. make_graph_mock creates FalkorDB graph mock with AsyncMock query/ro_query returning configurable result_set rows. Use the cast-patching pattern from test_refresh_entity_summary.py."
+    },
+    {
+      "what": "MCP tool test pattern from TestRefreshEntitySummaryMcpTool",
+      "where": "fused-memory/tests/test_refresh_entity_summary.py:312-388",
+      "how": "Create AsyncMock service, build MCP server via create_mcp_server, call tools via server._tool_manager.call_tool. Parse TextContent responses. Verify delegation and validation."
+    },
+    {
+      "what": "DISALLOW_MEMORY_WRITES list pattern",
+      "where": "fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py:40-48",
+      "how": "Add 'mcp__fused-memory__merge_entities' to the existing list. This automatically includes it in STAGE3_DISALLOWED (which extends DISALLOW_MEMORY_WRITES) while keeping it available to Stage 1."
+    },
+    {
+      "what": "Cypher driver access pattern: cast(Any, client.driver)._get_graph(None)",
+      "where": "fused-memory/src/fused_memory/backends/graphiti_client.py (multiple methods)",
+      "how": "Standard pattern to access the FalkorDB graph for raw Cypher queries. Used consistently across all backend methods that issue direct Cypher."
+    }
+  ],
+  "_session_id": "310-3e8368e3",
+  "_created_at": "2026-03-31T14:29:46.848926+00:00"
+}
