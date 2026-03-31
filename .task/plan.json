@@ -45,7 +45,7 @@
       "id": "step-4",
       "type": "impl",
       "description": "Verify step-3 passes: when get_cost_summary raises, the handler sets summary={}, and the template renders the empty-data fallback message",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
