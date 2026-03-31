@@ -9,6 +9,8 @@ from unittest.mock import patch
 MOCK_ORCHESTRATOR_RUNNING = {
     'pids': [1234],
     'prd': '/home/leo/src/dark-factory/prd/dashboard.md',
+    'label': '/home/leo/src/dark-factory/prd/dashboard.md',
+    'project_root': '/home/leo/src/dark-factory',
     'running': True,
     'started': 'Mar18',
     'tasks': [
@@ -234,6 +236,8 @@ class TestTaskTable:
 MOCK_ORCHESTRATOR_COMPLETED = {
     'pids': [5678],
     'prd': '/other/memory.md',
+    'label': '/other/memory.md',
+    'project_root': '/other',
     'running': False,
     'started': 'Mar17',
     'tasks': [],
@@ -308,6 +312,8 @@ class TestOrchestratorBadgeAriaLabels:
 MOCK_ORCHESTRATOR_MULTI_PID = {
     'pids': [1234, 5678],
     'prd': '/home/leo/src/dark-factory/prd/dashboard.md',
+    'label': '/home/leo/src/dark-factory/prd/dashboard.md',
+    'project_root': '/home/leo/src/dark-factory',
     'running': True,
     'started': 'Mar18',
     'tasks': [],
@@ -351,3 +357,50 @@ class TestOrchestratorMultiPid:
         assert '222' in html
         assert '333' in html
         assert '111, 222, 333' in html
+
+
+MOCK_ORCHESTRATOR_NO_PRD = {
+    'pids': [9999],
+    'prd': None,
+    'label': '/home/leo/src/reify',
+    'project_root': '/home/leo/src/reify',
+    'running': True,
+    'started': 'Mar30',
+    'tasks': [
+        {'id': 1, 'title': 'Init project', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+    ],
+    'worktrees': {},
+    'summary': {
+        'total': 1,
+        'done': 1,
+        'in_progress': 0,
+        'blocked': 0,
+        'pending': 0,
+    },
+}
+
+
+class TestOrchestratorNoPrd:
+    """Tests for orchestrator cards where prd is None (config-only or bare run)."""
+
+    def test_returns_200(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_NO_PRD]):
+            resp = client.get('/partials/orchestrators')
+        assert resp.status_code == 200
+
+    def test_label_shows_project_dir(self, client):
+        """When prd is None, label falls back to project root — last segment displayed."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_NO_PRD]):
+            html = client.get('/partials/orchestrators').text
+        assert 'reify' in html
+
+    def test_count_badge(self, client):
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_NO_PRD]):
+            html = client.get('/partials/orchestrators').text
+        assert '>1<' in html
+
+    def test_alpine_key_no_error(self, client):
+        """Alpine.js store key derived from label works without errors."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_NO_PRD]):
+            html = client.get('/partials/orchestrators').text
+        assert '$store.panels' in html
