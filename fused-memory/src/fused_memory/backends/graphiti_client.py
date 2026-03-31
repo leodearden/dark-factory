@@ -394,6 +394,114 @@ class GraphitiBackend:
         await graph.query(delete_cypher, {'uuids': uuids})
         return found
 
+    async def redirect_node_edges(
+        self, deprecated_uuid: str, surviving_uuid: str
+    ) -> dict:
+        """Redirect all RELATES_TO edges from deprecated node to surviving node.
+
+        Three Cypher phases:
+        (1) Count and delete inter-node edges between the two nodes (they become
+            meaningless self-loops after merge).
+        (2) Count then redirect outgoing edges: deprecated→target becomes
+            surviving→target (all properties copied individually to preserve
+            vecf32 embedding type).
+        (3) Count then redirect incoming edges: source→deprecated becomes
+            source→surviving.
+
+        Args:
+            deprecated_uuid: UUID of the entity node to be deleted.
+            surviving_uuid: UUID of the entity node that will absorb the edges.
+
+        Returns:
+            Dict with keys: outgoing_redirected, incoming_redirected,
+            inter_node_deleted.
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+
+        # Phase 1: Delete inter-node edges (edges between the two merging nodes)
+        count_inter = await graph.query(
+            'MATCH (dep:Entity {uuid: $dep_uuid})-[e:RELATES_TO]-(sur:Entity {uuid: $sur_uuid}) '
+            'RETURN count(e) AS cnt',
+            {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
+        )
+        inter_node_deleted = (
+            int(count_inter.result_set[0][0]) if count_inter.result_set else 0
+        )
+        await graph.query(
+            'MATCH (dep:Entity {uuid: $dep_uuid})-[e:RELATES_TO]-(sur:Entity {uuid: $sur_uuid}) '
+            'DELETE e',
+            {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
+        )
+
+        # Phase 2: Redirect outgoing edges (deprecated → target)
+        count_out = await graph.query(
+            'MATCH (dep:Entity {uuid: $dep_uuid})-[e:RELATES_TO]->() '
+            'RETURN count(e) AS cnt',
+            {'dep_uuid': deprecated_uuid},
+        )
+        outgoing_redirected = (
+            int(count_out.result_set[0][0]) if count_out.result_set else 0
+        )
+        await graph.query(
+            'MATCH (dep:Entity {uuid: $dep_uuid})-[old:RELATES_TO]->(target) '
+            'WITH old, target '
+            'MATCH (sur:Entity {uuid: $sur_uuid}) '
+            'CREATE (sur)-[new:RELATES_TO]->(target) '
+            'SET new.uuid = old.uuid, '
+            '    new.name = old.name, '
+            '    new.fact = old.fact, '
+            '    new.fact_embedding = old.fact_embedding, '
+            '    new.valid_at = old.valid_at, '
+            '    new.invalid_at = old.invalid_at, '
+            '    new.created_at = old.created_at, '
+            '    new.group_id = old.group_id, '
+            '    new.episodes = old.episodes, '
+            '    new.source_node_uuid = $sur_uuid '
+            'DELETE old',
+            {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
+        )
+
+        # Phase 3: Redirect incoming edges (source → deprecated)
+        count_in = await graph.query(
+            'MATCH ()-[e:RELATES_TO]->(dep:Entity {uuid: $dep_uuid}) '
+            'RETURN count(e) AS cnt',
+            {'dep_uuid': deprecated_uuid},
+        )
+        incoming_redirected = (
+            int(count_in.result_set[0][0]) if count_in.result_set else 0
+        )
+        await graph.query(
+            'MATCH (source)-[old:RELATES_TO]->(dep:Entity {uuid: $dep_uuid}) '
+            'WITH old, source '
+            'MATCH (sur:Entity {uuid: $sur_uuid}) '
+            'CREATE (source)-[new:RELATES_TO]->(sur) '
+            'SET new.uuid = old.uuid, '
+            '    new.name = old.name, '
+            '    new.fact = old.fact, '
+            '    new.fact_embedding = old.fact_embedding, '
+            '    new.valid_at = old.valid_at, '
+            '    new.invalid_at = old.invalid_at, '
+            '    new.created_at = old.created_at, '
+            '    new.group_id = old.group_id, '
+            '    new.episodes = old.episodes, '
+            '    new.target_node_uuid = $sur_uuid '
+            'DELETE old',
+            {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
+        )
+
+        logger.info(
+            'redirect_node_edges: dep=%s sur=%s inter_deleted=%d out=%d in=%d',
+            deprecated_uuid, surviving_uuid, inter_node_deleted,
+            outgoing_redirected, incoming_redirected,
+        )
+        return {
+            'outgoing_redirected': outgoing_redirected,
+            'incoming_redirected': incoming_redirected,
+            'inter_node_deleted': inter_node_deleted,
+        }
+
     async def get_node_text(self, uuid: str) -> tuple[str, str]:
         """Return (name, summary) for the Entity node with the given UUID.
 
