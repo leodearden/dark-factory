@@ -2951,11 +2951,11 @@
         "description": "The reconciliation Recent Runs table shows \"Loading...\" text between every run row. Detail rows use x-show=\"open\" with x-cloak and hx-trigger=\"revealed\", but Idiomorph morphing every 15s briefly makes hidden rows visible, triggering unnecessary HTMX fetches. The \"Loading...\" text from in-flight fetches remains visible.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 159-164).\n\nFix approach: (1) Change hx-trigger from \"revealed\" to a manual trigger fired by the Alpine @click handler (e.g. hx-trigger=\"load-detail\" and dispatch the event on click). This prevents morph-triggered fetches. (2) Use Alpine.store or id-based state preservation to maintain open/closed state across morphs.\n\nmemory_hint: search \"reconciliation detail HTMX\" for prior discussion.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-31T13:54:34.687Z",
+        "updatedAt": "2026-03-31T13:54:35.150Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/recon.html",
@@ -6304,11 +6304,11 @@
         "description": "Two areas in shared/src/shared/usage_gate.py:\n\n**before_invoke race + latency (lines 178-187):**\n- Move `_last_account_name` assignment before `await _write_cost_event` to prevent concurrent callers seeing stale state\n- Switch failover branch from `await _write_cost_event` to fire-and-forget `_fire_cost_event` to unblock token return\n\n**_fire_cost_event hardening (lines 316-332):**\n- Store `loop.create_task()` references in a set to prevent GC collection before completion\n- Narrow `except RuntimeError: pass` to only catch `get_running_loop()` failure, not all RuntimeErrors\n- Add warning log on caught errors instead of silent discard\n- Guard `json.dumps` calls behind `if self._cost_store` in `_handle_cap_detected` (line 264) and `_account_resume_probe_loop` (line 410)\n\nFiles: shared/src/shared/usage_gate.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-03-31T13:54:34.827Z",
+        "updatedAt": "2026-03-31T13:54:35.188Z",
         "metadata": {
           "files": [
             "shared/src/shared/usage_gate.py"
@@ -6509,7 +6509,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T13:54:35.076Z",
+      "lastModified": "2026-03-31T13:54:35.188Z",
       "taskCount": 324,
       "completedCount": 280,
       "tags": [
