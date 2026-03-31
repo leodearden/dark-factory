@@ -1,0 +1,116 @@
+{# Cost by account partial — doughnut chart + account table #}
+<div>
+  <h3 class="text-sm font-semibold text-gray-300 mb-4">Cost by Account</h3>
+  {% if by_account %}
+    <div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
+
+      {# Doughnut chart #}
+      <div class="bg-gray-800 rounded-lg p-4" style="height: 250px; position: relative">
+        <canvas id="costByAccountChart"></canvas>
+      </div>
+
+      {# Account table #}
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="text-xs text-gray-400 uppercase border-b border-gray-700">
+              <th class="text-left py-2 pr-3">Account</th>
+              <th class="text-right py-2 pr-3">Spend</th>
+              <th class="text-right py-2 pr-3">Inv.</th>
+              <th class="text-right py-2 pr-3">Caps</th>
+              <th class="text-right py-2 pr-3">Last Cap</th>
+              <th class="text-right py-2">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for account_name, data in by_account.items() %}
+            <tr class="border-b border-gray-800 hover:bg-gray-800/50">
+              <td class="py-2 pr-3 text-gray-300 font-mono text-xs">{{ account_name }}</td>
+              <td class="py-2 pr-3 text-right text-white">${{ '%.2f' | format(data.spend) }}</td>
+              <td class="py-2 pr-3 text-right text-gray-300">{{ data.invocations }}</td>
+              <td class="py-2 pr-3 text-right {% if data.cap_events > 0 %}text-red-400{% else %}text-gray-500{% endif %}">
+                {{ data.cap_events }}
+              </td>
+              <td class="py-2 pr-3 text-right text-gray-400 text-xs">{{ data.last_cap | timeago }}</td>
+              <td class="py-2 text-right">
+                {% if data.status == 'capped' %}
+                  <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-900/50 text-red-300 border border-red-700">
+                    capped
+                  </span>
+                {% else %}
+                  <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-900/50 text-green-300 border border-green-700">
+                    active
+                  </span>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% else %}
+    <div class="text-gray-500 text-sm py-8 text-center">No account data available for this window.</div>
+  {% endif %}
+</div>
+
+<script>
+(function() {
+  var byAccount = {{ by_account | tojson }};
+
+  var palette = [
+    '#60a5fa','#34d399','#fbbf24','#f87171','#a78bfa',
+    '#fb923c','#38bdf8','#4ade80','#e879f9','#94a3b8'
+  ];
+
+  function getOrDestroyChart(canvasId) {
+    var el = document.getElementById(canvasId);
+    if (!el) return null;
+    var existing = Chart.getChart(el);
+    if (existing) existing.destroy();
+    return el;
+  }
+
+  function renderChart() {
+    var el = getOrDestroyChart('costByAccountChart');
+    if (!el) return;
+
+    var labels = Object.keys(byAccount);
+    var values = labels.map(function(k) { return byAccount[k].spend || 0; });
+
+    new Chart(el, {
+      type: 'doughnut',
+      data: {
+        labels: labels,
+        datasets: [{
+          data: values,
+          backgroundColor: labels.map(function(_, i) { return palette[i % palette.length]; }),
+          borderWidth: 1,
+          borderColor: '#1f2937',
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { labels: { color: '#9ca3af', font: { size: 11 } } },
+          datalabels: {
+            display: true,
+            color: '#fff',
+            font: { size: 10 },
+            formatter: function(value, ctx) {
+              var total = ctx.dataset.data.reduce(function(a, b) { return a + b; }, 0);
+              return total > 0 ? (value / total * 100).toFixed(1) + '%' : '';
+            },
+          },
+        },
+      },
+    });
+  }
+
+  document.addEventListener('htmx:afterSettle', renderChart, { once: true });
+  if (document.readyState !== 'loading') {
+    renderChart();
+  }
+})();
+</script>

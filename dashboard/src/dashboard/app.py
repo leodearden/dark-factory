@@ -20,6 +20,15 @@ from fastapi.templating import Jinja2Templates
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data.chart_utils import ChartData, group_top_n
+from dashboard.data.costs import (
+    get_account_events,
+    get_cost_by_account,
+    get_cost_by_project,
+    get_cost_by_role,
+    get_cost_summary,
+    get_cost_trend,
+    get_run_cost_breakdown,
+)
 from dashboard.data.db import DbPool
 from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.performance import (
@@ -46,6 +55,23 @@ from dashboard.data.write_journal import (
 
 _pkg_dir = Path(__file__).parent
 logger = logging.getLogger(__name__)
+
+_WINDOW_DAYS: dict[str, int] = {
+    '24h': 1,
+    '7d': 7,
+    '30d': 30,
+    'all': 3650,
+}
+
+
+def _parse_window(request: Any) -> int:
+    """Parse the ``window`` query parameter and return the corresponding days int.
+
+    Valid values: '24h' → 1, '7d' → 7, '30d' → 30, 'all' → 3650.
+    Missing or unknown values default to 7.
+    """
+    window = request.query_params.get('window', '7d')
+    return _WINDOW_DAYS.get(window, 7)
 
 
 _T = TypeVar('_T')
@@ -215,7 +241,9 @@ async def index(request: Request):
 
 @app.get('/costs')
 async def costs(request: Request):
-    return templates.TemplateResponse(request, 'costs.html')
+    window_raw = request.query_params.get('window', '7d')
+    window = window_raw if window_raw in _WINDOW_DAYS else '7d'
+    return templates.TemplateResponse(request, 'costs.html', context={'window': window})
 
 
 @app.get('/api/health')
@@ -413,4 +441,134 @@ async def partials_performance(request: Request):
             'histograms': histograms,
             'ttc': ttc,
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Costs partials
+# ---------------------------------------------------------------------------
+
+@app.get('/costs/partials/summary')
+async def costs_partials_summary(request: Request):
+    """Cost summary: 4 metric cards aggregated across all projects."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
+    days = _parse_window(request)
+    try:
+        summary = await get_cost_summary(db, days=days)
+    except Exception as exc:
+        logger.warning('Error fetching cost summary: %s', exc)
+        summary = {}
+    return templates.TemplateResponse(
+        request, 'partials/costs/summary.html',
+        context={'summary': summary},
+    )
+
+
+@app.get('/costs/partials/by-project')
+async def costs_partials_by_project(request: Request):
+    """Cost by project: horizontal stacked bar chart."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
+    days = _parse_window(request)
+    try:
+        by_project = await get_cost_by_project(db, days=days)
+    except Exception as exc:
+        logger.warning('Error fetching cost by project: %s', exc)
+        by_project = {}
+    return templates.TemplateResponse(
+        request, 'partials/costs/by_project.html',
+        context={'by_project': by_project},
+    )
+
+
+@app.get('/costs/partials/by-account')
+async def costs_partials_by_account(request: Request):
+    """Cost by account: doughnut chart + table."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
+    days = _parse_window(request)
+    try:
+        by_account = await get_cost_by_account(db, days=days)
+    except Exception as exc:
+        logger.warning('Error fetching cost by account: %s', exc)
+        by_account = {}
+    return templates.TemplateResponse(
+        request, 'partials/costs/by_account.html',
+        context={'by_account': by_account},
+    )
+
+
+@app.get('/costs/partials/by-role')
+async def costs_partials_by_role(request: Request):
+    """Cost by role: horizontal stacked bar chart."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
+    days = _parse_window(request)
+    try:
+        by_role = await get_cost_by_role(db, days=days)
+    except Exception as exc:
+        logger.warning('Error fetching cost by role: %s', exc)
+        by_role = {}
+    return templates.TemplateResponse(
+        request, 'partials/costs/by_role.html',
+        context={'by_role': by_role},
+    )
+
+
+@app.get('/costs/partials/trend')
+async def costs_partials_trend(request: Request):
+    """Cost trend: daily line chart."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
+    days = _parse_window(request)
+    try:
+        trend = await get_cost_trend(db, days=days)
+    except Exception as exc:
+        logger.warning('Error fetching cost trend: %s', exc)
+        trend = {}
+    return templates.TemplateResponse(
+        request, 'partials/costs/trend.html',
+        context={'trend': trend},
+    )
+
+
+@app.get('/costs/partials/events')
+async def costs_partials_events(request: Request):
+    """Account events feed."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
+    days = _parse_window(request)
+    try:
+        events = await get_account_events(db, days=days)
+    except Exception as exc:
+        logger.warning('Error fetching account events: %s', exc)
+        events = []
+    return templates.TemplateResponse(
+        request, 'partials/costs/events.html',
+        context={'events': events},
+    )
+
+
+@app.get('/costs/partials/runs')
+async def costs_partials_runs(request: Request):
+    """Run cost breakdown: expandable drilldown table."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.runs_db)
+    days = _parse_window(request)
+    try:
+        runs = await get_run_cost_breakdown(db, days=days)
+    except Exception as exc:
+        logger.warning('Error fetching run cost breakdown: %s', exc)
+        runs = []
+    return templates.TemplateResponse(
+        request, 'partials/costs/runs.html',
+        context={'runs': runs},
     )

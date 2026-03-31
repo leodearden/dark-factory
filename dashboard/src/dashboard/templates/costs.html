@@ -3,8 +3,148 @@
 {% block title %}Costs — Dark Factory{% endblock %}
 
 {% block content %}
+<script>
+  document.addEventListener('alpine:init', () => {
+    Alpine.store('costs', { window: {{ window | default("7d") | tojson }} });
+  });
+</script>
 <div class="space-y-8 max-w-7xl mx-auto p-6">
-    <h2 class="text-2xl font-semibold text-gray-100">Costs</h2>
-    <p class="text-gray-400">Cost tracking coming soon.</p>
+
+  {# ── Window selector ─────────────────────────────────────────────────────── #}
+  <div class="flex items-center gap-3" id="costs-window-selector">
+    <span class="text-sm text-gray-400 font-medium">Window:</span>
+    {% for win in ['24h', '7d', '30d', 'all'] %}
+    <button
+      @click="Alpine.store('costs').window = '{{ win }}'; document.querySelectorAll('[data-cost-section]').forEach(function(el){ htmx.trigger(el, 'costs-window-changed'); })"
+      :class="$store.costs.window === '{{ win }}' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'"
+      class="px-3 py-1 rounded text-sm font-medium transition-colors"
+    >{{ win }}</button>
+    {% endfor %}
+  </div>
+
+  {# ── Summary ──────────────────────────────────────────────────────────────── #}
+  <div>
+    <section
+      data-cost-section="summary"
+      hx-get="/costs/partials/summary"
+      hx-trigger="load, every 30s, costs-window-changed"
+      hx-vals='js:{window: Alpine.store("costs").window}'
+      hx-swap="morph:innerHTML"
+      hx-request='{"timeout": 10000}'
+      aria-live="polite"
+    >
+      <div class="animate-pulse grid grid-cols-4 gap-4">
+        <div class="h-24 bg-gray-800 rounded"></div>
+        <div class="h-24 bg-gray-800 rounded"></div>
+        <div class="h-24 bg-gray-800 rounded"></div>
+        <div class="h-24 bg-gray-800 rounded"></div>
+      </div>
+    </section>
+    <div class="text-xs text-gray-500 mt-1 h-4" data-updated-for="summary" aria-hidden="true"></div>
+  </div>
+
+  {# ── Cost by Project ──────────────────────────────────────────────────────── #}
+  <div>
+    <section
+      data-cost-section="by-project"
+      hx-get="/costs/partials/by-project"
+      hx-trigger="load, every 60s, costs-window-changed"
+      hx-vals='js:{window: Alpine.store("costs").window}'
+      hx-swap="morph:innerHTML"
+      hx-request='{"timeout": 10000}'
+      aria-live="polite"
+    >
+      <div class="animate-pulse h-48 bg-gray-800 rounded"></div>
+    </section>
+    <div class="text-xs text-gray-500 mt-1 h-4" data-updated-for="by-project" aria-hidden="true"></div>
+  </div>
+
+  {# ── Cost by Account ──────────────────────────────────────────────────────── #}
+  <div>
+    <section
+      data-cost-section="by-account"
+      hx-get="/costs/partials/by-account"
+      hx-trigger="load, every 60s, costs-window-changed"
+      hx-vals='js:{window: Alpine.store("costs").window}'
+      hx-swap="morph:innerHTML"
+      hx-request='{"timeout": 10000}'
+      aria-live="polite"
+    >
+      <div class="animate-pulse h-48 bg-gray-800 rounded"></div>
+    </section>
+    <div class="text-xs text-gray-500 mt-1 h-4" data-updated-for="by-account" aria-hidden="true"></div>
+  </div>
+
+  {# ── Cost by Role ─────────────────────────────────────────────────────────── #}
+  <div>
+    <section
+      data-cost-section="by-role"
+      hx-get="/costs/partials/by-role"
+      hx-trigger="load, every 60s, costs-window-changed"
+      hx-vals='js:{window: Alpine.store("costs").window}'
+      hx-swap="morph:innerHTML"
+      hx-request='{"timeout": 10000}'
+      aria-live="polite"
+    >
+      <div class="animate-pulse h-48 bg-gray-800 rounded"></div>
+    </section>
+    <div class="text-xs text-gray-500 mt-1 h-4" data-updated-for="by-role" aria-hidden="true"></div>
+  </div>
+
+  {# ── Cost Trend ───────────────────────────────────────────────────────────── #}
+  <div>
+    <section
+      data-cost-section="trend"
+      hx-get="/costs/partials/trend"
+      hx-trigger="load, every 60s, costs-window-changed"
+      hx-vals='js:{window: Alpine.store("costs").window}'
+      hx-swap="morph:innerHTML"
+      hx-request='{"timeout": 10000}'
+      aria-live="polite"
+    >
+      <div class="animate-pulse h-48 bg-gray-800 rounded"></div>
+    </section>
+    <div class="text-xs text-gray-500 mt-1 h-4" data-updated-for="trend" aria-hidden="true"></div>
+  </div>
+
+  {# ── Account Events ───────────────────────────────────────────────────────── #}
+  <div>
+    <section
+      data-cost-section="events"
+      hx-get="/costs/partials/events"
+      hx-trigger="load, every 30s, costs-window-changed"
+      hx-vals='js:{window: Alpine.store("costs").window}'
+      hx-swap="morph:innerHTML"
+      hx-request='{"timeout": 10000}'
+      aria-live="polite"
+    >
+      <div class="animate-pulse space-y-2">
+        <div class="h-12 bg-gray-800 rounded"></div>
+        <div class="h-12 bg-gray-800 rounded"></div>
+      </div>
+    </section>
+    <div class="text-xs text-gray-500 mt-1 h-4" data-updated-for="events" aria-hidden="true"></div>
+  </div>
+
+  {# ── Run Cost Breakdown ───────────────────────────────────────────────────── #}
+  <div>
+    <section
+      data-cost-section="runs"
+      hx-get="/costs/partials/runs"
+      hx-trigger="load, every 60s, costs-window-changed"
+      hx-vals='js:{window: Alpine.store("costs").window}'
+      hx-swap="morph:innerHTML"
+      hx-request='{"timeout": 10000}'
+      aria-live="polite"
+    >
+      <div class="animate-pulse space-y-2">
+        <div class="h-10 bg-gray-800 rounded"></div>
+        <div class="h-10 bg-gray-800 rounded"></div>
+        <div class="h-10 bg-gray-800 rounded"></div>
+      </div>
+    </section>
+    <div class="text-xs text-gray-500 mt-1 h-4" data-updated-for="runs" aria-hidden="true"></div>
+  </div>
+
 </div>
 {% endblock %}

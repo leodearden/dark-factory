@@ -1,0 +1,102 @@
+{# Run cost breakdown — expandable drilldown table #}
+<div>
+  <h3 class="text-sm font-semibold text-gray-300 mb-4">Run Cost Breakdown</h3>
+  {% if runs %}
+    <div class="space-y-2">
+      {% for run in runs %}
+        <div x-data="{ open: false }" class="bg-gray-800 rounded-lg overflow-hidden">
+
+          {# Run header row — click to expand #}
+          <button
+            type="button"
+            class="w-full flex items-center justify-between px-4 py-3 hover:bg-gray-700/50 transition-colors text-left"
+            @click="open = !open"
+            :aria-expanded="open"
+          >
+            <div class="flex items-center gap-3 min-w-0">
+              <span class="text-xs text-gray-400 font-mono truncate">{{ run.run_id }}</span>
+              <span class="text-xs text-gray-500">{{ run.project_id | project_name }}</span>
+            </div>
+            <div class="flex items-center gap-3 flex-shrink-0">
+              <span class="text-sm font-semibold text-white">${{ '%.4f' | format(run.total_cost) }}</span>
+              <svg class="w-4 h-4 text-gray-400 transition-transform" :class="open ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+              </svg>
+            </div>
+          </button>
+
+          {# Expanded task list #}
+          <div x-show="open" x-cloak class="border-t border-gray-700">
+            {% for task in run.tasks %}
+              <div x-data="{ taskOpen: false }" class="border-b border-gray-700/50 last:border-0">
+
+                {# Task row #}
+                <button
+                  type="button"
+                  class="w-full flex items-center justify-between px-6 py-2 hover:bg-gray-700/30 transition-colors text-left"
+                  @click="taskOpen = !taskOpen"
+                  :aria-expanded="taskOpen"
+                >
+                  <div class="flex items-center gap-2 min-w-0">
+                    <span class="text-xs text-blue-400 font-mono flex-shrink-0">
+                      {% if task.task_id %}#{{ task.task_id }}{% else %}—{% endif %}
+                    </span>
+                    <span class="text-xs text-gray-300 truncate">
+                      {% if task.title %}{{ task.title }}{% else %}<em class="text-gray-500">unassigned</em>{% endif %}
+                    </span>
+                  </div>
+                  <div class="flex items-center gap-2 flex-shrink-0">
+                    <span class="text-xs text-gray-300">${{ '%.4f' | format(task.cost) }}</span>
+                    <svg class="w-3 h-3 text-gray-500 transition-transform" :class="taskOpen ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                    </svg>
+                  </div>
+                </button>
+
+                {# Invocation detail rows #}
+                <div x-show="taskOpen" x-cloak class="bg-gray-900/40">
+                  <table class="w-full text-xs">
+                    <thead>
+                      <tr class="text-gray-500 uppercase border-b border-gray-700/50">
+                        <th class="text-left px-8 py-1.5">Model</th>
+                        <th class="text-left py-1.5 pr-3">Role</th>
+                        <th class="text-left py-1.5 pr-3">Account</th>
+                        <th class="text-right py-1.5 pr-3">Cost</th>
+                        <th class="text-right py-1.5 pr-3">Duration</th>
+                        <th class="text-right py-1.5 pr-3">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {% for inv in task.invocations %}
+                        <tr class="border-b border-gray-700/30 last:border-0 hover:bg-gray-800/50">
+                          <td class="px-8 py-1.5 text-gray-300 font-mono">{{ inv.model }}</td>
+                          <td class="py-1.5 pr-3 text-gray-400">{{ inv.role }}</td>
+                          <td class="py-1.5 pr-3 text-gray-400 font-mono">{{ inv.account_name }}</td>
+                          <td class="py-1.5 pr-3 text-right text-white">${{ '%.4f' | format(inv.cost_usd) }}</td>
+                          <td class="py-1.5 pr-3 text-right text-gray-400">{{ inv.duration_ms | format_duration_ms }}</td>
+                          <td class="py-1.5 pr-3 text-right">
+                            {% if inv.capped %}
+                              <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-red-900/50 text-red-300 border border-red-700">
+                                capped
+                              </span>
+                            {% else %}
+                              <span class="text-gray-500">—</span>
+                            {% endif %}
+                          </td>
+                        </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+
+              </div>
+            {% endfor %}
+          </div>
+
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="text-gray-500 text-sm py-8 text-center">No run data available for this window.</div>
+  {% endif %}
+</div>
