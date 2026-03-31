@@ -346,6 +346,7 @@ async def get_run_cost_breakdown(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    limit: int = 500,
 ) -> list[dict]:
     """Per-run cost breakdown grouped by task, with invocation detail.
 
@@ -357,6 +358,7 @@ async def get_run_cost_breakdown(
 
     Invocations with NULL task_id are grouped under task_id=None with title=None.
     LEFT JOIN with task_results provides task titles.
+    *limit* caps the number of invocation rows fetched from SQL (default 500).
     """
     since = _cutoff(days)
 
@@ -370,8 +372,9 @@ async def get_run_cost_breakdown(
             '  LEFT JOIN task_results tr '
             '    ON i.run_id = tr.run_id AND i.task_id = tr.task_id '
             ' WHERE i.completed_at >= ? '
-            ' ORDER BY i.run_id, i.task_id, i.id',
-            (since,),
+            ' ORDER BY i.run_id, i.task_id, i.id'
+            ' LIMIT ?',
+            (since, limit),
         )
 
         # Build nested structure: run_id → task_id → invocations
