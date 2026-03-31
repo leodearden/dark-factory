@@ -54,15 +54,15 @@
       "id": "step-6",
       "type": "impl",
       "description": "Verify step-5 passes with the zero-guard already in the template ({% if task_count_sum.value > 0 %}). If not, add the guard. This should pass without additional changes if step-4 was implemented correctly with the zero-guard.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "05900d05"
     },
     {
       "id": "step-7",
       "type": "test",
       "description": "Update existing mock data in test_costs_panel.py (_MOCK_SUMMARY) and test_costs_page.py (_MOCK_SUMMARY) to include 'task_count' field in each project dict, consistent with the new backend contract. Verify all existing tests still pass. This ensures backward compatibility of the entire test suite with the new field.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "76daf5fd"
     },
     {
       "id": "step-8",
