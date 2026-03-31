@@ -94,3 +94,72 @@ class TestRedirectNodeEdges:
         assert result['outgoing_redirected'] == 0
         assert result['incoming_redirected'] == 0
         assert result['inter_node_deleted'] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-3: GraphitiBackend.delete_entity_node
+# ---------------------------------------------------------------------------
+
+class TestDeleteEntityNode:
+    """GraphitiBackend.delete_entity_node(uuid) removes an entity node."""
+
+    @pytest.mark.asyncio
+    async def test_executes_detach_delete(self, mock_config, make_backend, make_graph_mock):
+        """Issues DETACH DELETE Cypher for the given UUID."""
+        backend = make_backend(mock_config)
+        # Pre-check query returns a node (row exists), then delete query
+        check_row = [['NodeName', 'some summary']]
+        graph = MagicMock()
+        graph.query = AsyncMock(side_effect=[
+            MagicMock(result_set=check_row),  # pre-check: node exists
+            MagicMock(result_set=[]),           # detach delete
+        ])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.delete_entity_node('node-uuid-1')
+        assert graph.query.await_count == 2
+        # Second call should contain DETACH DELETE
+        second_call = graph.query.call_args_list[1]
+        args = second_call[0]
+        cypher = args[0] if args else ''
+        assert 'DETACH DELETE' in cypher
+
+    @pytest.mark.asyncio
+    async def test_passes_uuid_as_param(self, mock_config, make_backend, make_graph_mock):
+        """Passes node UUID as parameter to the Cypher query."""
+        backend = make_backend(mock_config)
+        node_uuid = 'my-node-uuid'
+        graph = MagicMock()
+        graph.query = AsyncMock(side_effect=[
+            MagicMock(result_set=[['Name', '']]),  # pre-check
+            MagicMock(result_set=[]),               # delete
+        ])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.delete_entity_node(node_uuid)
+        # Both calls should pass uuid param
+        for call in graph.query.call_args_list:
+            args = call[0]
+            params = args[1] if len(args) > 1 else {}
+            assert params.get('uuid') == node_uuid
+
+    @pytest.mark.asyncio
+    async def test_raises_node_not_found_when_missing(self, mock_config, make_backend):
+        """Raises NodeNotFoundError when node doesn't exist."""
+        backend = make_backend(mock_config)
+        graph = MagicMock()
+        graph.query = AsyncMock(return_value=MagicMock(result_set=[]))
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            with pytest.raises(NodeNotFoundError):
+                await backend.delete_entity_node('missing-uuid')
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        """Raises RuntimeError when client is not initialized."""
+        backend = GraphitiBackend(mock_config)  # client is None
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.delete_entity_node('node-uuid-1')
