@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import aiosqlite
+from shared.async_sqlite_base import AsyncSqliteBase
 
 __all__ = ['CostStore']
 
@@ -61,7 +61,7 @@ CREATE INDEX IF NOT EXISTS idx_acct_evt_account
 """
 
 
-class CostStore:
+class CostStore(AsyncSqliteBase):
     """Persistent-connection SQLite writer for cost records and account events.
 
     Lifecycle::
@@ -80,53 +80,13 @@ class CostStore:
     """
 
     def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
-        self._conn: aiosqlite.Connection | None = None
+        super().__init__(db_path, busy_timeout_ms=30000)
 
-    # -- lifecycle ------------------------------------------------------------
-
-    async def open(self) -> None:
-        """Open persistent connection, set WAL + busy_timeout, ensure schema."""
-        if self._conn is not None:
-            raise RuntimeError('CostStore already opened')
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = await aiosqlite.connect(str(self.db_path))
-        try:
-            await conn.execute('PRAGMA journal_mode=WAL')
-            await conn.execute('PRAGMA busy_timeout=30000')
-            await conn.executescript(_SCHEMA)
-        except BaseException:
-            await conn.close()
-            raise
-        self._conn = conn
-
-    async def close(self) -> None:
-        """Close the connection. Idempotent — safe to call when already closed."""
-        if self._conn is not None:
-            await self._conn.close()
-            self._conn = None
-
-    # -- async context manager ------------------------------------------------
-
-    async def __aenter__(self) -> CostStore:
-        await self.open()
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: object,
-    ) -> None:
-        await self.close()
+    @property
+    def _schema(self) -> str:
+        return _SCHEMA
 
     # -- internal helpers -----------------------------------------------------
-
-    def _require_conn(self) -> aiosqlite.Connection:
-        """Return the open connection or raise RuntimeError."""
-        if self._conn is None:
-            raise RuntimeError('CostStore not opened')
-        return self._conn
 
     async def _execute(self, sql: str, params: tuple[Any, ...]) -> None:
         """Execute a single statement and commit."""
