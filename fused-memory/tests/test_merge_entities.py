@@ -112,6 +112,28 @@ class TestRedirectNodeEdges:
             await backend.redirect_node_edges('dep-uuid', 'sur-uuid')
 
     @pytest.mark.asyncio
+    async def test_returns_nonzero_counts(self, mock_config, make_backend):
+        """Exercises the non-empty result_set branch (int(result_set[0][0])) for all three count queries."""
+        backend = make_backend(mock_config)
+        graph = MagicMock()
+        # 6 calls in order: count_inter, delete_inter, count_out, redirect_out, count_in, redirect_in
+        graph.query = AsyncMock(side_effect=[
+            MagicMock(result_set=[[3]]),  # Phase 1 count: inter_node_deleted=3
+            MagicMock(result_set=[]),     # Phase 1 delete
+            MagicMock(result_set=[[5]]),  # Phase 2 count: outgoing_redirected=5
+            MagicMock(result_set=[]),     # Phase 2 redirect
+            MagicMock(result_set=[[2]]),  # Phase 3 count: incoming_redirected=2
+            MagicMock(result_set=[]),     # Phase 3 redirect
+        ])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            result = await backend.redirect_node_edges('dep-uuid', 'sur-uuid')
+        assert result['inter_node_deleted'] == 3
+        assert result['outgoing_redirected'] == 5
+        assert result['incoming_redirected'] == 2
+
+    @pytest.mark.asyncio
     async def test_handles_empty_edge_sets(self, mock_config, make_backend, make_graph_mock):
         """When no edges exist, returns zeros for all counts."""
         backend = make_backend(mock_config)
