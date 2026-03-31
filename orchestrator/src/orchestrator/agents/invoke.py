@@ -56,11 +56,13 @@ async def invoke_with_cap_retry(
     All keyword arguments are forwarded to ``invoke_agent()``.
     """
     backend = invoke_kwargs.get('backend', 'claude')
+    account_name = ''
 
     while True:
         oauth_token = None
         if usage_gate:
             oauth_token = await usage_gate.before_invoke()
+            account_name = usage_gate.active_account_name or ''
 
         result = await invoke_agent(**invoke_kwargs, oauth_token=oauth_token)
 
@@ -85,6 +87,7 @@ async def invoke_with_cap_retry(
             usage_gate.on_agent_complete(result.cost_usd)
         break
 
+    result.account_name = account_name
     return result
 
 
