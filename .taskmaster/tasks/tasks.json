@@ -5442,7 +5442,7 @@
         "description": "In shared/src/shared/cli_invoke.py, add optional cost_store: CostStore | None = None parameter to invoke_with_cap_retry, along with run_id: str = '', task_id: str = '', project_id: str = '', role: str = '' keyword args. After a successful invocation (after the break), call await cost_store.save_invocation() with the result's cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, duration_ms, account_name, plus the passed-in run_id/task_id/project_id/role/model. On cap-hit detection (before the retry sleep), call await cost_store.save_account_event() with event_type='cap_hit'. Record started_at before invoke and completed_at after. Pass model from invoke_kwargs. Update tests in shared/tests/test_cli_invoke.py to verify CostStore is called with correct args on success and on cap-hit.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [
           "294",
           "297",
@@ -5478,7 +5478,7 @@
           },
           "_causation_id": "4629993e-4d5d-4481-a371-66023dd9e398"
         },
-        "updatedAt": "2026-03-31T03:19:01.367Z"
+        "updatedAt": "2026-03-31T09:38:19.453Z"
       },
       {
         "id": "300",
@@ -6301,9 +6301,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T09:35:27.652Z",
+      "lastModified": "2026-03-31T09:38:19.453Z",
       "taskCount": 324,
-      "completedCount": 278,
+      "completedCount": 279,
       "tags": [
         "master"
       ]
