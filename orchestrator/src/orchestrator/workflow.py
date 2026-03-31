@@ -1140,6 +1140,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             effort=effort_val,
             backend=backend_val,
             timeout_seconds=self.config.invocation_timeout,
+            cost_store=self._cost_store,
+            run_id=self._run_id,
+            task_id=self.task_id,
+            project_id=self._project_id,
+            role=role_key,
         )
 
         # Track metrics

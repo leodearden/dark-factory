@@ -1657,3 +1657,135 @@ class TestCostStoreConstructor:
         assert workflow._cost_store is None
         assert workflow._run_id == ''
         assert workflow._project_id == ''
+
+
+@pytest.mark.asyncio
+class TestInvokeForwardsCostStore:
+    """workflow._invoke() forwards cost_store/run_id/task_id/project_id/role."""
+
+    async def test_invoke_forwards_cost_store_kwargs_to_cap_retry(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch
+    ):
+        """_invoke passes cost_store, run_id, task_id, project_id, role to invoke_with_cap_retry."""
+        from unittest.mock import AsyncMock, MagicMock
+        from orchestrator.agents.roles import ARCHITECT
+
+        mock_cost_store = MagicMock()
+        workflow = TaskWorkflow(
+            assignment=task_assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=FakeScheduler(),  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=FakeMcp(),  # type: ignore[arg-type]
+            cost_store=mock_cost_store,
+            run_id='run-testrun12345',
+            project_id='dark_factory',
+        )
+
+        captured_kwargs: dict = {}
+
+        async def fake_invoke_with_cap_retry(usage_gate, label, **kwargs):
+            captured_kwargs.update(kwargs)
+            return AgentResult(success=True, output='{}', cost_usd=0.10)
+
+        monkeypatch.setattr(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            fake_invoke_with_cap_retry,
+        )
+
+        await workflow._invoke(
+            role=ARCHITECT,
+            prompt='Write a plan',
+            cwd=tmp_path,
+        )
+
+        assert captured_kwargs['cost_store'] is mock_cost_store
+        assert captured_kwargs['run_id'] == 'run-testrun12345'
+        assert captured_kwargs['task_id'] == '42'
+        assert captured_kwargs['project_id'] == 'dark_factory'
+        assert captured_kwargs['role'] == 'architect'
+
+    async def test_invoke_normalizes_reviewer_role(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch
+    ):
+        """reviewer_test_analyst role is normalized to 'reviewer' in kwargs."""
+        from unittest.mock import AsyncMock, MagicMock
+        from orchestrator.agents.roles import ALL_REVIEWERS
+
+        reviewer_role = ALL_REVIEWERS[0]  # e.g. reviewer_test_analyst
+
+        mock_cost_store = MagicMock()
+        workflow = TaskWorkflow(
+            assignment=task_assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=FakeScheduler(),  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=FakeMcp(),  # type: ignore[arg-type]
+            cost_store=mock_cost_store,
+            run_id='run-reviewer001',
+            project_id='dark_factory',
+        )
+
+        captured_kwargs: dict = {}
+
+        async def fake_invoke_with_cap_retry(usage_gate, label, **kwargs):
+            captured_kwargs.update(kwargs)
+            review = {'reviewer': reviewer_role.name, 'verdict': 'PASS', 'issues': []}
+            return AgentResult(
+                success=True,
+                output='{}',
+                structured_output=review,
+                cost_usd=0.05,
+            )
+
+        monkeypatch.setattr(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            fake_invoke_with_cap_retry,
+        )
+
+        await workflow._invoke(
+            role=reviewer_role,
+            prompt='Review the code',
+            cwd=tmp_path,
+        )
+
+        # role_key = role.name.split('_')[0] → 'reviewer'
+        assert captured_kwargs['role'] == 'reviewer'
+
+    async def test_invoke_no_cost_store_still_passes_none(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch
+    ):
+        """When cost_store=None, None is still forwarded to invoke_with_cap_retry."""
+        from orchestrator.agents.roles import ARCHITECT
+
+        workflow = TaskWorkflow(
+            assignment=task_assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=FakeScheduler(),  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=FakeMcp(),  # type: ignore[arg-type]
+        )
+
+        captured_kwargs: dict = {}
+
+        async def fake_invoke_with_cap_retry(usage_gate, label, **kwargs):
+            captured_kwargs.update(kwargs)
+            return AgentResult(success=True, output='{}', cost_usd=0.0)
+
+        monkeypatch.setattr(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            fake_invoke_with_cap_retry,
+        )
+
+        await workflow._invoke(
+            role=ARCHITECT,
+            prompt='Write a plan',
+            cwd=tmp_path,
+        )
+
+        assert captured_kwargs['cost_store'] is None
+        assert captured_kwargs['run_id'] == ''
+        assert captured_kwargs['project_id'] == ''
