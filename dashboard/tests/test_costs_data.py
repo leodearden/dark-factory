@@ -768,13 +768,16 @@ class TestCostTrend:
         result = await get_cost_trend(costs_conn, days=7)
         assert 'dark_factory' in result
         df = result['dark_factory']
-        # 7 days total; only today (UTC) has spending; others should be 0.0.
-        # Use a dynamic assertion so this passes near UTC midnight when fixture
-        # invocations might span two calendar days.
-        zero_days = [e for e in df if e['total'] == 0.0]
-        # Verify gap-filling actually works: exactly 7 days, at least one with 0.0.
         assert len(df) == 7
-        assert len(zero_days) > 0
+        zero_days = [e for e in df if e['total'] == 0.0]
+        non_zero_days = [e for e in df if e['total'] > 0]
+        # Fixture: all dark_factory invocations are within ~2h of 'now'.
+        # In a 7-day window only today has spend (possibly yesterday near
+        # UTC midnight). Hard-coded from fixture knowledge, not derived
+        # from the actual result.
+        assert len(non_zero_days) >= 1, "fixture must produce at least one day with spend"
+        assert len(non_zero_days) <= 2, "fixture spend spans at most 2 calendar days"
+        assert len(zero_days) >= 5, "gap-filling must produce at least 5 zero-value days"
 
     @pytest.mark.asyncio
     async def test_trend_days_align_with_cutoff(self, tmp_path):
