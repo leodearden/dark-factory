@@ -87,8 +87,10 @@ class AsyncSqliteBase(abc.ABC):
         """Close the connection. Idempotent — safe to call when already closed."""
         async with self._lifecycle_lock:
             if self._conn is not None:
-                await self._conn.close()
-                self._conn = None
+                try:
+                    await self._conn.close()
+                finally:
+                    self._conn = None
 
     async def __aenter__(self) -> Self:
         await self.open()
