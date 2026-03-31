@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
@@ -369,12 +370,36 @@ class TestCostStoreOpenClose:
             await store.close()
 
     async def test_double_open_raises(self, tmp_path: Path):
-        """Calling open() twice raises RuntimeError('CostStore already opened')."""
+        """Calling open() twice raises RuntimeError('CostStore already opened').
+
+        After the second open() raises, the store must still be functional:
+        _conn must not be None and save_invocation must succeed.
+        """
         store = CostStore(tmp_path / 'costs.db')
         await store.open()
         try:
             with pytest.raises(RuntimeError, match='CostStore already opened'):
                 await store.open()
+            # _conn must not be corrupted by the failed second open
+            assert store._conn is not None, '_conn was corrupted by rejected double-open'
+            # store must still be usable
+            await store.save_invocation(
+                run_id='r-after-double-open',
+                task_id=None,
+                project_id='proj',
+                account_name='acct',
+                model='claude-3',
+                role='agent',
+                cost_usd=0.01,
+                input_tokens=None,
+                output_tokens=None,
+                cache_read_tokens=None,
+                cache_create_tokens=None,
+                duration_ms=100,
+                capped=False,
+                started_at='2024-01-01T00:00:00',
+                completed_at='2024-01-01T00:00:01',
+            )
         finally:
             await store.close()
 
@@ -406,6 +431,43 @@ class TestCostStoreOpenClose:
 
         assert store._conn is None, '_conn should remain None on setup failure'
         assert close_called, 'Connection must be closed to prevent resource leak'
+
+    async def test_concurrent_open_does_not_leak(self, tmp_path: Path):
+        """Two concurrent open() calls must not both succeed; connect() called exactly once.
+
+        Without asyncio.Lock, both coroutines pass the `_conn is not None` guard before
+        either assigns _conn, causing two connections to be opened (orphaning one).
+        With the lock, exactly one open() succeeds and one raises RuntimeError.
+        """
+        db_path = tmp_path / 'costs.db'
+        store = CostStore(db_path)
+
+        real_connect = aiosqlite.connect
+        connect_call_count = 0
+
+        async def counting_connect(path):
+            nonlocal connect_call_count
+            connect_call_count += 1
+            return await real_connect(path)
+
+        with patch('shared.async_sqlite_base.aiosqlite.connect', side_effect=counting_connect):
+            results = await asyncio.gather(
+                store.open(),
+                store.open(),
+                return_exceptions=True,
+            )
+
+        try:
+            successes = [r for r in results if r is None]
+            errors = [r for r in results if isinstance(r, RuntimeError)]
+            assert len(successes) == 1, f'Expected exactly one success, got {successes!r}'
+            assert len(errors) == 1, f'Expected exactly one RuntimeError, got {errors!r}'
+            assert 'already opened' in str(errors[0])
+            assert connect_call_count == 1, (
+                f'Expected connect() called once, got {connect_call_count}'
+            )
+        finally:
+            await store.close()
 
 
 @pytest.mark.asyncio
@@ -497,6 +559,43 @@ class TestPersistAcrossReopen:
         assert row[0] == 'run-persist'
         assert row[1] == 'task-1'
         assert abs(row[2] - 0.05) < 1e-9
+
+    async def test_account_event_persists_across_reopen(self, tmp_path: Path):
+        """save_account_event() -> close() -> reopen() -> SELECT verifies row exists."""
+        db_path = tmp_path / 'costs.db'
+
+        # First session: write a row
+        store = CostStore(db_path)
+        await store.open()
+        await store.save_account_event(
+            account_name='max-d',
+            event_type='cap_hit',
+            project_id='dark_factory',
+            run_id='run-persist',
+            details='{"reset_at": "2024-01-01T05:00:00"}',
+            created_at='2024-06-01T10:00:00',
+        )
+        await store.close()
+
+        # Second session: reopen and verify row is still there
+        store2 = CostStore(db_path)
+        await store2.open()
+        try:
+            async with store2._conn.execute(
+                'SELECT account_name, event_type, project_id, run_id, details, created_at'
+                ' FROM account_events'
+            ) as cur:
+                row = await cur.fetchone()
+        finally:
+            await store2.close()
+
+        assert row is not None, 'Row must survive close/reopen cycle'
+        assert row[0] == 'max-d'
+        assert row[1] == 'cap_hit'
+        assert row[2] == 'dark_factory'
+        assert row[3] == 'run-persist'
+        assert row[4] == '{"reset_at": "2024-01-01T05:00:00"}'
+        assert row[5] == '2024-06-01T10:00:00'
 
 
 # ---------------------------------------------------------------------------
