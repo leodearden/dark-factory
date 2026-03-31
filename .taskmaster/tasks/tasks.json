@@ -6640,6 +6640,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 358,
+        "title": "Make test_default_window_7d_marked_active assertion less brittle",
+        "description": "In test_costs_page.py, `test_default_window_7d_marked_active` asserts the exact JS string:\n```python\nassert \"Alpine.store('costs', { window: \\\"7d\\\" })\" in html\n```\n\nThis is sensitive to: (1) whitespace around braces, (2) quote style, (3) any new property added to the store initializer. A trivially equivalent template change breaks the test with no real behavioral regression.\n\nFix: Split into two independent semantic checks:\n- `assert \"Alpine.store('costs'\" in html` (store registration exists)\n- `assert 'window' in html and '\"7d\"' in html` or use a regex like `re.search(r\"Alpine\\.store\\(['\\\"]costs['\\\"].*window.*7d\", html)` that is tolerant of whitespace/quote variation.\n\nmemory_hints:\n- search: \"Alpine.store costs assertion style test_costs_page\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6652,7 +6663,7 @@
       ],
       "created": "2026-03-31T14:32:29.974Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T14:32:29.978Z"
+      "updated": "2026-03-31T14:32:35.868Z"
     }
   }
 }
