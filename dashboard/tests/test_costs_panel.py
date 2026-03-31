@@ -745,6 +745,46 @@ class TestSummaryCards:
         assert 'solo_project' not in html
         assert 'Avg/Task' not in html
 
+    def test_weighted_avg_cost_per_task(self, client):
+        """Avg Cost / Task must be a weighted average (total_spend / total_tasks),
+        NOT the arithmetic mean of per-project averages.
+
+        Project A: total_spend=10.00, task_count=100, avg=0.10
+        Project B: total_spend=10.00, task_count=1,   avg=10.00
+
+        Correct weighted avg = 20.00 / 101 ≈ 0.1980
+        Broken arithmetic mean = (0.10 + 10.00) / 2 = 5.05
+        """
+        two_project_summary = {
+            'proj_a': {
+                'total_spend': 10.00,
+                'task_count': 100,
+                'avg_cost_per_task': 0.10,
+                'active_accounts': 1,
+                'cap_events': 0,
+            },
+            'proj_b': {
+                'total_spend': 10.00,
+                'task_count': 1,
+                'avg_cost_per_task': 10.00,
+                'active_accounts': 1,
+                'cap_events': 0,
+            },
+        }
+        with _patch_cost_data(summary=two_project_summary):
+            html = client.get('/costs/partials/summary').text
+
+        # Correct weighted average: 20.00 / 101 = 0.198019...
+        assert '$0.1980' in html
+        # Broken arithmetic mean must NOT appear
+        assert '$5.0500' not in html
+
+    def test_weighted_avg_subtitle(self, client):
+        """The Avg Cost / Task subtitle must say 'weighted by task count'."""
+        with _patch_cost_data():
+            html = client.get('/costs/partials/summary').text
+        assert 'weighted by task count' in html
+
 
 # ---------------------------------------------------------------------------
 # Step-15 / Step-16: TestEventsFeed
