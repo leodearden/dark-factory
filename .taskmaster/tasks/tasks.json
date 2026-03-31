@@ -6016,11 +6016,24 @@
         "description": "Task 315 extracted AsyncSqliteBase but only migrated CostStore (in shared/). Four fused-memory stores still duplicate the identical open/WAL-pragma/executescript/close lifecycle:\n\n- DurableWriteQueue (fused-memory/src/fused_memory/services/durable_queue.py)\n- WriteJournal (fused-memory/src/fused_memory/services/write_journal.py)\n- EventBuffer (fused-memory/src/fused_memory/reconciliation/event_buffer.py)\n- ReconciliationJournal (fused-memory/src/fused_memory/reconciliation/journal.py)\n\nEach has 30-50 lines of boilerplate that AsyncSqliteBase eliminates. They differ only in schema DDL and busy_timeout_ms — both already parameterized by the base class.\n\nMigration pattern per store:\n- Replace initialize()/open() with AsyncSqliteBase.open()\n- Drop _db/_require_db boilerplate (use _require_conn())\n- Implement _schema as a property\n- Pass busy_timeout_ms to super().__init__()\n- For stores using `row_factory = aiosqlite.Row`: override open(), call super().open(), then set row_factory\n\nDepends on task 315 being merged to main.\n\nmemory_hints:\n- search: \"AsyncSqliteBase base class sqlite lifecycle dedup\"\n- entity: \"DurableWriteQueue\"\n- entity: \"WriteJournal\"\n- entity: \"EventBuffer\"\n- entity: \"ReconciliationJournal\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-31T08:45:12.098Z"
+        "updatedAt": "2026-03-31T08:48:23.245Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/src/fused_memory/services",
+            "fused-memory/tests/test_durable_queue.py",
+            "fused-memory/tests/test_e2e_durable_queue.py",
+            "fused-memory/tests/test_event_buffer.py",
+            "fused-memory/tests/test_journal.py",
+            "fused-memory/tests/test_journaling_integration.py",
+            "fused-memory/tests/test_sqlite_migration.py",
+            "fused-memory/tests/test_write_journal.py"
+          ]
+        }
       },
       {
         "id": "323",
@@ -6069,7 +6082,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T08:45:12.098Z",
+      "lastModified": "2026-03-31T08:48:23.246Z",
       "taskCount": 305,
       "completedCount": 274,
       "tags": [
