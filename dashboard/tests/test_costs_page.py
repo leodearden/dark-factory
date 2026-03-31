@@ -173,3 +173,83 @@ class TestCostsPage:
         # The page must indicate 7d is the default/active window
         # We check that 7d appears as the default in Alpine state or aria-pressed
         assert '7d' in html
+
+
+# ---------------------------------------------------------------------------
+# Step-5: GET /costs/partials/summary route tests
+# ---------------------------------------------------------------------------
+
+_MOCK_SUMMARY = {
+    'dark_factory': {
+        'total_spend': 12.34,
+        'avg_cost_per_task': 0.56,
+        'active_accounts': 3,
+        'cap_events': 2,
+    },
+    'other_project': {
+        'total_spend': 5.00,
+        'avg_cost_per_task': 0.25,
+        'active_accounts': 1,
+        'cap_events': 0,
+    },
+}
+
+
+def _patch_summary(return_value=_MOCK_SUMMARY):
+    return patch(
+        'dashboard.app.get_cost_summary',
+        new_callable=AsyncMock,
+        return_value=return_value,
+    )
+
+
+class TestCostsSummaryPartial:
+    """Tests for GET /costs/partials/summary."""
+
+    def test_returns_200(self, client):
+        with _patch_summary():
+            resp = client.get('/costs/partials/summary')
+        assert resp.status_code == 200
+
+    def test_content_type_html(self, client):
+        with _patch_summary():
+            resp = client.get('/costs/partials/summary')
+        assert 'text/html' in resp.headers['content-type']
+
+    def test_renders_total_spend(self, client):
+        with _patch_summary():
+            html = client.get('/costs/partials/summary').text
+        # Should show a dollar amount for combined spend (12.34 + 5.00 = 17.34 or per-project)
+        assert '$' in html
+
+    def test_renders_active_accounts(self, client):
+        with _patch_summary():
+            html = client.get('/costs/partials/summary').text
+        # Should show account count
+        assert 'account' in html.lower()
+
+    def test_renders_cap_events(self, client):
+        with _patch_summary():
+            html = client.get('/costs/partials/summary').text
+        # Should show cap event info
+        assert 'cap' in html.lower()
+
+    def test_handles_empty_data(self, client):
+        with _patch_summary(return_value={}):
+            resp = client.get('/costs/partials/summary')
+        assert resp.status_code == 200
+
+    def test_respects_window_param(self, client):
+        """Window query param should be forwarded to get_cost_summary via days arg."""
+        with _patch_summary() as mock_fn:
+            client.get('/costs/partials/summary?window=24h')
+        mock_fn.assert_called_once()
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 1
+
+    def test_default_window_7d(self, client):
+        """Without ?window=, days=7 should be used."""
+        with _patch_summary() as mock_fn:
+            client.get('/costs/partials/summary')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 7
