@@ -6247,7 +6247,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_costs_data.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 334,
@@ -6258,7 +6266,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_costs_data.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 335,
@@ -6269,7 +6285,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/data/costs.py",
+            "dashboard/tests/test_costs_data.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/data",
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 336,
