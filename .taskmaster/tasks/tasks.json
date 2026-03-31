@@ -6286,7 +6286,7 @@
         "description": "Address correctness and robustness issues in dashboard/src/dashboard/data/costs.py (merged from task 298 and 302 reviews):\n- Fix clock skew in get_cost_trend: capture `now = datetime.now(UTC)` once, derive cutoff from it\n- Replace tuple unpacking with named column access (row['col']) in all 7 query functions — schema drift causes unhandled ValueError\n- Fix silent data omission in get_cost_by_account: include accounts with cap events but zero invocations\n- Replace correlated subquery in get_cost_by_account with CTE using ROW_NUMBER()\n- Add LIMIT parameter to get_run_cost_breakdown (default 500) and get_account_events (default 200)\n- Add completed_at index to invocations schema (CREATE INDEX IF NOT EXISTS idx_inv_completed_at)\n\nFiles: dashboard/src/dashboard/data/costs.py, dashboard/tests/test_costs_data.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -6299,7 +6299,8 @@
             "dashboard/src/dashboard/data",
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-31T15:17:44.558Z"
       },
       {
         "id": "336",
@@ -6806,7 +6807,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T15:17:44.294Z",
+      "lastModified": "2026-03-31T15:17:44.558Z",
       "taskCount": 349,
       "completedCount": 290,
       "tags": [
