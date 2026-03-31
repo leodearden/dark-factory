@@ -339,6 +339,7 @@ def create_mcp_server(
         limit: int = 10,
         agent_id: str | None = None,
         session_id: str | None = None,
+        include_planned: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Search across both memory stores with automatic routing.
@@ -353,6 +354,11 @@ def create_mcp_server(
         category, that category is inferred on Graphiti results (which otherwise
         lack category metadata).
 
+        By default, results from planning episodes (temporal_context='planning')
+        are excluded to prevent aspirational/PRD content from contaminating
+        factual search results.  Set include_planned=True to include them — useful
+        for reconciliation, auditing, or explicitly querying planned work.
+
         Args:
             query: Natural language query
             project_id: Project scope (required)
@@ -361,6 +367,7 @@ def create_mcp_server(
             limit: Max results (default: 10)
             agent_id: Filter by authoring agent (optional, auto-derived from MCP context)
             session_id: Filter by session (optional, auto-derived from MCP context)
+            include_planned: Include planning-episode edges (default: False)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         if err := validate_project_id(project_id):
@@ -381,6 +388,7 @@ def create_mcp_server(
                 limit=limit,
                 agent_id=agent_id,
                 session_id=session_id,
+                include_planned=include_planned,
             )
             response = {'results': [r.model_dump() for r in results]}
             await _log_read(

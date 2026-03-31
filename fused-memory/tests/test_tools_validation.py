@@ -103,3 +103,72 @@ class TestToolsValidationIntegration:
         )
         # Validation must short-circuit before reaching the task interceptor
         mock_task_interceptor.get_tasks.assert_not_called()
+
+
+class TestSearchIncludePlannedMCPTool:
+    """step-19: MCP search tool accepts and forwards include_planned parameter."""
+
+    @pytest.mark.asyncio
+    async def test_include_planned_forwarded_to_service(self):
+        """search MCP tool passes include_planned=True to memory_service.search."""
+        mock_service = AsyncMock()
+        mock_service.search.return_value = []
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'search',
+            {
+                'query': 'test query',
+                'project_id': 'test',
+                'include_planned': True,
+            },
+        )
+
+        mock_service.search.assert_called_once()
+        call_kwargs = mock_service.search.call_args[1]
+        assert call_kwargs.get('include_planned') is True, (
+            'include_planned=True must be forwarded from MCP search tool to memory_service.search'
+        )
+
+    @pytest.mark.asyncio
+    async def test_include_planned_defaults_to_false(self):
+        """search MCP tool passes include_planned=False when not specified."""
+        mock_service = AsyncMock()
+        mock_service.search.return_value = []
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'search',
+            {
+                'query': 'test query',
+                'project_id': 'test',
+            },
+        )
+
+        mock_service.search.assert_called_once()
+        call_kwargs = mock_service.search.call_args[1]
+        assert call_kwargs.get('include_planned', False) is False, (
+            'include_planned must default to False in MCP search tool'
+        )
+
+    @pytest.mark.asyncio
+    async def test_include_planned_false_forwarded_to_service(self):
+        """search MCP tool passes include_planned=False when explicitly set to False."""
+        mock_service = AsyncMock()
+        mock_service.search.return_value = []
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'search',
+            {
+                'query': 'test query',
+                'project_id': 'test',
+                'include_planned': False,
+            },
+        )
+
+        mock_service.search.assert_called_once()
+        call_kwargs = mock_service.search.call_args[1]
+        assert call_kwargs.get('include_planned') is False, (
+            'include_planned=False must be forwarded to memory_service.search'
+        )

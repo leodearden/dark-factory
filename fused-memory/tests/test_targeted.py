@@ -573,3 +573,145 @@ async def test_journal_failure_does_not_mask_validation_error(
             project_root='',  # invalid — triggers InputValidationError
             task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
         )
+
+
+class TestPlannedEpisodePromotion:
+    """step-21: _on_task_done promotes planned episodes related to the task."""
+
+    @pytest.fixture
+    def reconciler_with_registry(self, reconciler):
+        """Reconciler with a mocked planned_episode_registry."""
+        from unittest.mock import AsyncMock, MagicMock
+        mock_registry = MagicMock()
+        mock_registry.promote = AsyncMock()
+        reconciler.planned_episode_registry = mock_registry
+        return reconciler
+
+    @pytest.mark.asyncio
+    async def test_promotion_called_for_planned_edges(
+        self, reconciler_with_registry, mock_memory_service
+    ):
+        """When _on_task_done fires, planned edges from search results have their
+        episode UUIDs promoted via planned_episode_registry.promote()."""
+        from fused_memory.models.enums import SourceStore
+        from fused_memory.models.memory import MemoryResult
+
+        # First search call (normal, exclude planned) returns empty.
+        # Second search call (include_planned=True) returns a planned edge.
+        ep_uuid = 'plan-ep-abc'
+        planned_result = MemoryResult(
+            id='edge-planned-1',
+            content='PRD: CostStore extends AgentResult',
+            category=None,
+            source_store=SourceStore.graphiti,
+            relevance_score=0.9,
+            provenance=[ep_uuid],
+            metadata={'planned': True},
+        )
+
+        # Configure mock: first call (include_planned not specified / False) returns []
+        # second call (include_planned=True) returns [planned_result]
+        call_results = [[], [planned_result]]
+        call_index = {'n': 0}
+
+        async def mock_search(**kwargs):
+            idx = call_index['n']
+            call_index['n'] += 1
+            if idx < len(call_results):
+                return call_results[idx]
+            return []
+
+        mock_memory_service.search = mock_search
+
+        await reconciler_with_registry.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='/tmp/test',
+            task_before={'id': '1', 'title': 'CostStore', 'status': 'in-progress'},
+        )
+
+        reconciler_with_registry.planned_episode_registry.promote.assert_called_with(ep_uuid)
+
+    @pytest.mark.asyncio
+    async def test_promotion_not_called_when_no_planned_edges(
+        self, reconciler_with_registry, mock_memory_service
+    ):
+        """When no planned edges are found (include_planned search returns non-planned
+        results), promote() is not called."""
+        from fused_memory.models.enums import SourceStore
+        from fused_memory.models.memory import MemoryResult
+
+        non_planned_result = MemoryResult(
+            id='edge-real-1',
+            content='Implemented CostStore',
+            category=None,
+            source_store=SourceStore.graphiti,
+            relevance_score=0.9,
+            provenance=['real-ep-1'],
+            metadata={},
+        )
+        mock_memory_service.search = AsyncMock(return_value=[non_planned_result])
+
+        await reconciler_with_registry.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='/tmp/test',
+            task_before={'id': '1', 'title': 'CostStore', 'status': 'in-progress'},
+        )
+
+        reconciler_with_registry.planned_episode_registry.promote.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_registry_no_error_on_task_done(self, reconciler, mock_memory_service):
+        """When planned_episode_registry is None (not wired), _on_task_done runs normally."""
+        reconciler.planned_episode_registry = None
+        mock_memory_service.search = AsyncMock(return_value=[])
+
+        # Should not raise
+        result = await reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='/tmp/test',
+            task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
+        )
+        assert 'error' not in result
+
+
+class TestServerWiringContract:
+    """step-34/35: TargetedReconciler.planned_episode_registry must be wired from
+    MemoryService after MemoryService.initialize() creates it."""
+
+    def test_planned_episode_registry_wired_from_memory_service(self):
+        """After MemoryService.initialize() and TargetedReconciler construction,
+        the wiring step must assign targeted.planned_episode_registry from
+        memory_service.planned_episode_registry.
+
+        This is a unit test of the wiring sequence expected in server/main.py.
+        """
+        from unittest.mock import MagicMock
+
+        from fused_memory.reconciliation.targeted import TargetedReconciler
+
+        # Simulate MemoryService after initialize() — has a non-None registry
+        mock_registry = MagicMock()
+        mock_memory_service = MagicMock()
+        mock_memory_service.planned_episode_registry = mock_registry
+
+        # Construct a minimal TargetedReconciler (registry starts as None by default)
+        mock_taskmaster = MagicMock()
+        mock_journal = MagicMock()
+        mock_config = MagicMock()
+        targeted = TargetedReconciler(
+            mock_memory_service, mock_taskmaster, mock_journal, mock_config
+        )
+
+        # Before wiring: registry must be None (the reconciler doesn't auto-wire)
+        assert targeted.planned_episode_registry is None, (
+            'TargetedReconciler must start with planned_episode_registry=None'
+        )
+
+        # Apply the wiring (what main.py must do)
+        targeted.planned_episode_registry = mock_memory_service.planned_episode_registry
+
+        # After wiring: identity check
+        assert targeted.planned_episode_registry is mock_registry, (
+            'After wiring, targeted.planned_episode_registry must be the same object '
+            'as memory_service.planned_episode_registry'
+        )

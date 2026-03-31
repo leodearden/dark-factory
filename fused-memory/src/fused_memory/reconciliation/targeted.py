@@ -5,6 +5,7 @@ import json
 import logging
 import uuid as uuid_mod
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.config.schema import FusedMemoryConfig
@@ -19,6 +20,9 @@ from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import InputValidationError, require_project_root
+
+if TYPE_CHECKING:
+    from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,7 @@ class TargetedReconciler:
         self.config = config.reconciliation
         self.verifier = CodebaseVerifier(config.reconciliation)
         self.buffer = event_buffer
+        self.planned_episode_registry: PlannedEpisodeRegistry | None = None
 
     async def _fenced_add_memory(
         self,
@@ -189,6 +194,37 @@ class TargetedReconciler:
             {'query': f'{title} {description}'[:200], 'results': len(related)},
             causation_id=run_id,
         )
+
+        # 1.5. Promote planned episodes related to this completed task.
+        #      Now that the task is done, aspirational edges become factual —
+        #      remove them from the planned registry so they appear in normal search.
+        if self.planned_episode_registry is not None:
+            try:
+                planned_related = await self.memory.search(
+                    query=f'{title} {description}',
+                    project_id=project_id,
+                    limit=10,
+                    causation_id=run_id,
+                    include_planned=True,
+                )
+                promoted: list[str] = []
+                for r in planned_related:
+                    if r.metadata.get('planned'):
+                        for ep_uuid in r.provenance:
+                            await self.planned_episode_registry.promote(ep_uuid)
+                            promoted.append(ep_uuid)
+                if promoted:
+                    result['actions'].append({
+                        'type': 'planned_episodes_promoted',
+                        'count': len(promoted),
+                    })
+                    await self.journal.add_run_action(
+                        run_id, 'write', 'registry', 'promote',
+                        {'task_id': task_id, 'promoted_count': len(promoted)},
+                        causation_id=run_id,
+                    )
+            except Exception as e:
+                logger.warning(f'Planned episode promotion failed for task {task_id}: {e}')
 
         # 2. If sparse knowledge, verify against codebase and write findings
         if len(related) < 2:

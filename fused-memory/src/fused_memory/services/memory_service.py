@@ -40,6 +40,7 @@ from fused_memory.services.durable_queue import DurableWriteQueue
 
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
+    from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ class MemoryService:
         self._event_buffer: EventBuffer | None = None
         self._write_journal: WriteJournal | None = None
         self.taskmaster_connected: bool = False
+        self.planned_episode_registry: PlannedEpisodeRegistry | None = None
 
     def set_event_buffer(self, buffer: EventBuffer) -> None:
         """Wire the reconciliation event buffer into the service."""
@@ -84,6 +86,10 @@ class MemoryService:
     def set_write_journal(self, journal: WriteJournal) -> None:
         """Wire the write journal for durable auditing."""
         self._write_journal = journal
+
+    def set_planned_registry(self, registry: PlannedEpisodeRegistry) -> None:
+        """Wire the planned episode registry into the service."""
+        self.planned_episode_registry = registry
 
     async def _emit_event(self, event: ReconciliationEvent) -> None:
         if self._event_buffer:
@@ -94,6 +100,15 @@ class MemoryService:
         await self.graphiti.initialize()
 
         qcfg = self.config.queue
+
+        # Initialize planned episode registry (co-located with durable queue data).
+        # If set_planned_registry() was called before initialize(), honour the external
+        # registry instead of creating a new one (preventing the lifecycle conflict).
+        if self.planned_episode_registry is None:
+            from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
+            self.planned_episode_registry = PlannedEpisodeRegistry(data_dir=qcfg.data_dir)
+            await self.planned_episode_registry.initialize()
+
         self.durable_queue = DurableWriteQueue(
             data_dir=qcfg.data_dir,
             execute_write=self._execute_durable_write,
@@ -125,6 +140,9 @@ class MemoryService:
         if self._event_buffer:
             with contextlib.suppress(Exception):
                 await self._event_buffer.close()
+        if self.planned_episode_registry:
+            with contextlib.suppress(Exception):
+                await self.planned_episode_registry.close()
 
     # ------------------------------------------------------------------
     # Journal helper
@@ -275,6 +293,20 @@ class MemoryService:
         )
         # Post-write dedup: remove duplicate edges created within this episode
         await self._dedup_episode_edges(result)
+
+        # Register planning episodes so they can be filtered from search results
+        if temporal_context == 'planning' and self.planned_episode_registry is not None:
+            episode_uuid = payload.get('uuid')
+            group_id = payload.get('group_id')
+            if episode_uuid and group_id:
+                await self.planned_episode_registry.register(episode_uuid, group_id)
+            elif episode_uuid and not group_id:
+                logger.warning(
+                    'Skipping planned episode registration: group_id missing from payload '
+                    'for episode %s',
+                    episode_uuid,
+                )
+
         return result
 
     async def _execute_mem0_write(self, payload: dict[str, Any]) -> Any:
@@ -325,6 +357,7 @@ class MemoryService:
         """Classify a fact extracted from an episode and write to Mem0 if appropriate."""
         fact_text = payload['fact_text']
         causation_id = payload.get('_causation_id')
+        temporal_context = payload.get('temporal_context')
         write_op_id = str(uuid_mod.uuid4())
         scope = Scope(
             project_id=payload.get('project_id', 'main'),
@@ -343,6 +376,8 @@ class MemoryService:
         }
         if classification.secondary:
             metadata['secondary_category'] = classification.secondary.value
+        if temporal_context == 'planning':
+            metadata['planned'] = True
 
         result = await self._journaled_backend_call(
             write_op_id=write_op_id,
@@ -404,6 +439,7 @@ class MemoryService:
                     'agent_id': payload.get('agent_id'),
                     'session_id': payload.get('session_id'),
                     '_causation_id': payload.get('_causation_id'),
+                    'temporal_context': payload.get('temporal_context'),
                 },
             }
             for edge in edges
@@ -701,8 +737,14 @@ class MemoryService:
         agent_id: str | None = None,
         session_id: str | None = None,
         causation_id: str | None = None,
+        include_planned: bool = False,
     ) -> list[MemoryResult]:
-        """Unified search across both stores with automatic fan-out."""
+        """Unified search across both stores with automatic fan-out.
+
+        When include_planned=False (default), edges and memories from planning
+        episodes (temporal_context='planning') are excluded.  Set include_planned=True
+        to include them — useful for reconciliation and auditing.
+        """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
 
         # Determine routing
@@ -717,12 +759,12 @@ class MemoryService:
         if SourceStore.graphiti in route.stores:
             store_list.append(SourceStore.graphiti)
             task_list.append(asyncio.create_task(
-                self._search_graphiti(query, scope, limit)
+                self._search_graphiti(query, scope, limit, include_planned=include_planned)
             ))
         if SourceStore.mem0 in route.stores:
             store_list.append(SourceStore.mem0)
             task_list.append(asyncio.create_task(
-                self._search_mem0(query, scope, limit)
+                self._search_mem0(query, scope, limit, include_planned=include_planned)
             ))
 
         results: list[MemoryResult] = []
@@ -796,14 +838,27 @@ class MemoryService:
         return final
 
     async def _search_graphiti(
-        self, query: str, scope: Scope, limit: int
+        self, query: str, scope: Scope, limit: int, include_planned: bool = False
     ) -> list[MemoryResult]:
-        """Search Graphiti and convert results to MemoryResult."""
+        """Search Graphiti and convert results to MemoryResult.
+
+        When include_planned=False (default), edges whose entire provenance is
+        composed of planned-only episodes are excluded.  When include_planned=True,
+        those edges are returned and marked with metadata['planned'] = True.
+        """
         edges = await self.graphiti.search(
             query=query,
             group_ids=[scope.graphiti_group_id],
             num_results=limit,
         )
+
+        # Fetch planned UUIDs once (avoid per-edge DB hits).
+        planned_uuids: set[str] = set()
+        if self.planned_episode_registry is not None:
+            planned_uuids = await self.planned_episode_registry.get_planned_uuids(
+                scope.graphiti_group_id
+            )
+
         results = []
         for i, edge in enumerate(edges):
             fact = getattr(edge, 'fact', str(edge))
@@ -824,8 +879,21 @@ class MemoryService:
             episodes = getattr(edge, 'episodes', None) or []
             provenance = [str(ep) for ep in episodes]
 
+            # Determine whether this edge is purely aspirational (all episodes planned).
+            is_planned_edge = bool(provenance) and all(
+                ep in planned_uuids for ep in provenance
+            )
+
+            if is_planned_edge and not include_planned:
+                # Skip planning-only edges in normal search results.
+                continue
+
             # Score: rank-based (no explicit score from Graphiti search)
             score = max(0.0, 1.0 - (i * 0.05))
+
+            metadata: dict[str, Any] = {}
+            if is_planned_edge:
+                metadata['planned'] = True
 
             results.append(MemoryResult(
                 id=getattr(edge, 'uuid', str(i)),
@@ -836,13 +904,18 @@ class MemoryService:
                 provenance=provenance,
                 temporal=temporal,
                 entities=entities,
+                metadata=metadata,
             ))
         return results
 
     async def _search_mem0(
-        self, query: str, scope: Scope, limit: int
+        self, query: str, scope: Scope, limit: int, include_planned: bool = False
     ) -> list[MemoryResult]:
-        """Search Mem0 and convert results to MemoryResult."""
+        """Search Mem0 and convert results to MemoryResult.
+
+        When include_planned=False (default), results tagged with planned=True
+        in their metadata are excluded.  When include_planned=True they are returned.
+        """
         response = await self.mem0.search(query=query, scope=scope, limit=limit)
         mem0_results = response.get('results', [])
         results = []
@@ -850,6 +923,10 @@ class MemoryService:
             content = item.get('memory', '')
             score = float(item.get('score', 0.0))
             meta = item.get('metadata', {}) or {}
+
+            # Filter out planning-tagged results unless explicitly requested.
+            if meta.get('planned') is True and not include_planned:
+                continue
 
             category = None
             if 'category' in meta:
