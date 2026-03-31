@@ -6389,7 +6389,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/app.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        }
       },
       {
         "id": 341,
@@ -6400,7 +6408,23 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/base.html",
+            "dashboard/src/dashboard/templates/costs.html",
+            "dashboard/src/dashboard/templates/partials/costs/by_account.html",
+            "dashboard/src/dashboard/templates/partials/costs/by_project.html",
+            "dashboard/src/dashboard/templates/partials/costs/by_role.html",
+            "dashboard/src/dashboard/templates/partials/costs/trend.html",
+            "dashboard/src/dashboard/templates/partials/memory_graphs.html",
+            "dashboard/src/dashboard/templates/partials/performance.html",
+            "dashboard/src/dashboard/templates/partials/chart_utils.html"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates"
+          ]
+        }
       },
       {
         "id": 342,
@@ -6411,7 +6435,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_costs_page.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 343,
