@@ -1,0 +1,277 @@
+{
+  "task_id": "302",
+  "title": "Costs page template and routes",
+  "files": [
+    "dashboard/src/dashboard/app.py",
+    "dashboard/src/dashboard/templates/costs.html",
+    "dashboard/src/dashboard/templates/partials/costs/summary.html",
+    "dashboard/src/dashboard/templates/partials/costs/by_project.html",
+    "dashboard/src/dashboard/templates/partials/costs/by_account.html",
+    "dashboard/src/dashboard/templates/partials/costs/by_role.html",
+    "dashboard/src/dashboard/templates/partials/costs/trend.html",
+    "dashboard/src/dashboard/templates/partials/costs/events.html",
+    "dashboard/src/dashboard/templates/partials/costs/runs.html",
+    "dashboard/tests/test_costs_page.py"
+  ],
+  "modules": [
+    "dashboard/src/dashboard",
+    "dashboard/src/dashboard/templates",
+    "dashboard/src/dashboard/templates/partials/costs",
+    "dashboard/tests"
+  ],
+  "analysis": "The costs page is a new dashboard view at GET /costs. The data layer (costs.py with 7 query functions) already exists from tasks 298/296. The existing costs.html is a stub extending base.html with a 'coming soon' message. The costs route already exists in app.py but returns the stub template. This task replaces the stub with a full HTMX-polled page with 7 partial sections, each backed by its own route under /costs/partials/{section}.\n\nKey patterns to follow from existing code:\n- asyncio.gather with return_exceptions=True + _safe_gather_result for parallel data fetches\n- polling_section macro for HTMX section wrappers (NOT used here \u2014 costs needs custom hx-vals for window param, which the macro doesn't support)\n- Chart.js 4.5.1 with getOrDestroyChart pattern, htmx:afterSettle initialization, same 10-color palette\n- Morphing DOM swap via idiomorph (hx-swap='morph:innerHTML')\n- Template filters: timeago, format_duration_ms, project_name already registered\n\nThe time window selector (24h/7d/30d/all) uses HTMX hx-vals with js: prefix to dynamically include the window query parameter. Buttons trigger a custom 'window-changed' event that re-triggers all cost partials. Server-side, a _WINDOW_DAYS mapping converts window strings to days integers for the costs.py functions.\n\nAll 7 costs.py functions accept a days= keyword parameter, so the route handlers just need to parse window \u2192 days and pass through. The routes use asyncio.gather only where multiple data functions feed a single partial (none do currently \u2014 each partial maps 1:1 to a data function), so individual await is sufficient.\n\nTest strategy follows test_app.py patterns: mock data functions at the app module level, use TestClient to hit routes, assert 200 status and key HTML content. Chart template tests verify JS variables are embedded correctly (following test_memory_graphs_partial.py pattern).",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Create the dashboard/src/dashboard/templates/partials/costs/ directory",
+      "status": "done",
+      "commit": "f36bb88a",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing tests for the window parameter parsing helper (_WINDOW_DAYS mapping and _parse_window function). Tests: valid window strings map to correct days (24h\u21921, 7d\u21927, 30d\u219230, all\u21923650), invalid/missing defaults to 7, returns int.",
+      "status": "done",
+      "commit": "559719be"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Implement _WINDOW_DAYS dict and _parse_window(request) helper in app.py. Maps window query param strings to days integers. Default 7d. Add import of costs data functions.",
+      "status": "done",
+      "commit": "f37729b2"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing tests for the costs page template (GET /costs). Tests: returns 200, contains HTMX polling sections for all 7 partials (summary, by-project, by-account, by-role, trend, events, runs), contains window selector buttons (24h/7d/30d/all), 7d button is active by default, sections use morph:innerHTML swap, nav bar 'costs' link is active.",
+      "status": "done",
+      "commit": "71960b5f"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Replace costs.html stub with full page template. Window selector with 4 buttons using Alpine.js state + htmx custom event 'costs-window-changed'. 7 inline polling sections (not using macro, since hx-vals needed for dynamic window param). Each section has data-cost-section, hx-get, hx-trigger with poll interval (summary 30s, charts 60s, events 30s, runs 60s), hx-vals='js:{window: currentWindow}', hx-swap='morph:innerHTML', skeleton placeholders. Update GET /costs route to pass window param to template context.",
+      "status": "done",
+      "commit": "1de06a20"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing tests for GET /costs/partials/summary route. Tests: returns 200 with mocked get_cost_summary data, renders 4 metric cards (total spend, avg cost/task, active accounts, cap events), handles empty data gracefully, respects window query param.",
+      "status": "done",
+      "commit": "922797d8"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Add GET /costs/partials/summary route in app.py. Calls get_cost_summary(db, days=days). Create summary.html partial template with 4 metric cards in a grid, aggregating across projects: total spend ($X.XX), avg cost/task ($X.XX), active accounts (N), cap events (N). Use bg-gray-800 cards with colored accent borders.",
+      "status": "done",
+      "commit": "f5e1b808"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing tests for GET /costs/partials/by-project route. Tests: returns 200 with mocked get_cost_by_project data, renders Chart.js horizontal stacked bar config in JS, uses consistent color palette, handles empty data.",
+      "status": "done",
+      "commit": "2ae00553"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Add GET /costs/partials/by-project route in app.py. Create by_project.html partial with horizontal stacked bar chart (Chart.js). X-axis: cost in USD, Y-axis: project names. Segments by model. Uses getOrDestroyChart pattern and htmx:afterSettle init. 10-color palette from memory_graphs.html.",
+      "status": "done",
+      "commit": "327b102f"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write failing tests for GET /costs/partials/by-account route. Tests: returns 200, renders doughnut chart JS config, renders account table with spend/invocations/cap_events/last_cap/status columns, status badge colors (capped=red, active=green), handles empty data.",
+      "status": "done",
+      "commit": "45dfe52e"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Add GET /costs/partials/by-account route in app.py. Create by_account.html partial with two-column layout: left doughnut chart (spend by account) with datalabels percentages, right table with columns account_name, spend, invocations, cap_events, last_cap (timeago filter), status (color-coded badge). Uses group_top_n for chart data.",
+      "status": "done",
+      "commit": "c7b2fb72"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write failing tests for GET /costs/partials/by-role route. Tests: returns 200, renders horizontal stacked bar chart JS, segments by model within each role, handles empty data.",
+      "status": "done",
+      "commit": "f07003d4"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Add GET /costs/partials/by-role route in app.py. Create by_role.html partial with horizontal stacked bar chart. Y-axis: role names, segments by model. Per-project sections if multiple projects. Uses same palette.",
+      "status": "done",
+      "commit": "1cae9bc5"
+    },
+    {
+      "id": "step-13",
+      "type": "test",
+      "description": "Write failing tests for GET /costs/partials/trend route. Tests: returns 200, renders Chart.js line chart config, one line per project, labels are day strings, handles empty data.",
+      "status": "done",
+      "commit": "9b9679ec"
+    },
+    {
+      "id": "step-14",
+      "type": "impl",
+      "description": "Add GET /costs/partials/trend route in app.py. Create trend.html partial with daily cost line chart. One dataset per project with distinct colors from palette. X-axis: day labels, Y-axis: cost in USD. Responsive, maintainAspectRatio=false.",
+      "status": "done",
+      "commit": "68b10d97"
+    },
+    {
+      "id": "step-15",
+      "type": "test",
+      "description": "Write failing tests for GET /costs/partials/events route. Tests: returns 200, renders chronological event feed, events color-coded by event_type (cap_hit=red, resumed=green), shows account_name and timestamp (timeago), handles empty list.",
+      "status": "done",
+      "commit": "e0423416"
+    },
+    {
+      "id": "step-16",
+      "type": "impl",
+      "description": "Add GET /costs/partials/events route in app.py. Create events.html partial with chronological feed. Each event is a card/row with colored left border (cap_hit=red-500, resumed=green-500, other=gray-500), account name, event type badge, project name, timestamp via timeago filter.",
+      "status": "done",
+      "commit": "521aaa66"
+    },
+    {
+      "id": "step-17",
+      "type": "test",
+      "description": "Write failing tests for GET /costs/partials/runs route. Tests: returns 200, renders expandable run rows with total_cost, renders task sub-rows with invocation detail on expand (Alpine x-show), handles empty list, handles runs with null task_id.",
+      "status": "done",
+      "commit": "cb1bddc6"
+    },
+    {
+      "id": "step-18",
+      "type": "impl",
+      "description": "Add GET /costs/partials/runs route in app.py. Create runs.html partial with expandable drilldown table. Top level: run_id, project (project_name filter), total_cost. Click to expand (Alpine x-data/x-show): task rows with task_id, title, cost. Further expand: invocation detail rows with model, role, cost_usd, account, duration (format_duration_ms), capped badge.",
+      "status": "done",
+      "commit": "cea5c78a"
+    },
+    {
+      "id": "step-19",
+      "type": "test",
+      "description": "Write integration tests for window selector behavior: costs page with ?window=24h passes window to partial URLs in hx-get attributes, 24h button has active styling, default (no param) uses 7d. Test that partial routes pass correct days to data functions via mock assertion on call args.",
+      "status": "done",
+      "commit": "3c2c22ff"
+    },
+    {
+      "id": "step-20",
+      "type": "impl",
+      "description": "Wire up window parameter end-to-end: costs route reads window query param and passes to template context; template uses window value in section hx-vals and button active states. Partial routes read window param and call data functions with corresponding days value.",
+      "status": "done",
+      "commit": "3c2c22ff"
+    },
+    {
+      "id": "step-21",
+      "type": "test",
+      "description": "Write tests for partial failure resilience: when a data function raises RuntimeError, the partial route still returns 200 with graceful fallback content (empty state). Tests for at least summary and by-project partials.",
+      "status": "done",
+      "commit": "51e63fe6"
+    },
+    {
+      "id": "step-22",
+      "type": "impl",
+      "description": "Ensure all partial route handlers wrap data function calls with try/except or use _safe_gather_result pattern, returning sensible defaults ({} or []) on failure. Templates handle empty data with 'No data available' messages.",
+      "status": "done",
+      "commit": "51e63fe6"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Inline HTMX section attributes in costs.html instead of using polling_section macro",
+      "rationale": "The polling_section macro doesn't support hx-vals, which is needed for the dynamic window query parameter. Each cost section needs hx-vals='js:{window: currentWindow}' to include the selected time window. Modifying the shared macro would risk breaking index.html sections. Inline attributes are a clean alternative for this page's unique requirements."
+    },
+    {
+      "decision": "Use Alpine.js store + HTMX custom event for window selector",
+      "rationale": "Alpine.js is already loaded in base.html and used for collapsible panels. Storing the current window in a JS variable and triggering 'costs-window-changed' custom event allows all sections to re-fetch with the new window value via hx-vals='js:{}'. This avoids a full page reload and follows HTMX patterns for coordinating multiple polling sections."
+    },
+    {
+      "decision": "Map 'all' window to days=3650 instead of removing the WHERE clause",
+      "rationale": "All 7 costs.py functions use _cutoff(days) to compute a datetime filter. Passing days=3650 (10 years) effectively returns all data without requiring a code path that removes the WHERE clause. This is simpler and keeps the data functions unchanged."
+    },
+    {
+      "decision": "One route handler per partial (no asyncio.gather within partials)",
+      "rationale": "Each of the 7 partial sections maps 1:1 to a single costs.py data function. There's no benefit to asyncio.gather when there's only one coroutine. This keeps handlers simple. The parallelism comes from HTMX fetching all 7 partials concurrently from the browser."
+    },
+    {
+      "decision": "Use getOrDestroyChart pattern for all Chart.js charts",
+      "rationale": "Existing charts in memory_graphs.html and performance.html use this pattern to prevent canvas/memory leaks when HTMX morphing replaces chart containers. Cost charts must follow the same pattern: check Chart.getChart(canvasId), destroy if exists, then create new. Initialize on htmx:afterSettle with {once: true}."
+    },
+    {
+      "decision": "Separate test file (test_costs_page.py) for all cost route and template tests",
+      "rationale": "The existing test_app.py is already 895 lines. Cost page tests will add substantial volume (7 partials \u00d7 multiple test cases each). A dedicated file keeps tests organized and matches the pattern of test_memory_graphs_partial.py and test_performance_panel.py."
+    },
+    {
+      "decision": "Poll intervals: summary 30s, by-project 60s, by-account 60s, by-role 60s, trend 60s, events 30s, runs 60s",
+      "rationale": "Per task specification: summary and events at 30s (more dynamic data), all chart and table sections at 60s (less volatile, more expensive to render). Matches the dashboard's existing tiered polling pattern."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "base.html template with nav bar",
+      "where": "dashboard/src/dashboard/templates/base.html",
+      "how": "costs.html extends base.html. Nav bar already has /costs link with active state detection via request.url.path.startswith('/costs'). No changes needed to base.html."
+    },
+    {
+      "what": "_safe_gather_result helper",
+      "where": "dashboard/src/dashboard/app.py line 54-69",
+      "how": "Used in partial route handlers when wrapping data function results. Handles exceptions gracefully and returns defaults."
+    },
+    {
+      "what": "All 7 costs.py data functions",
+      "where": "dashboard/src/dashboard/data/costs.py",
+      "how": "Each partial route calls exactly one costs.py function: get_cost_summary, get_cost_by_project, get_cost_by_account, get_cost_by_role, get_cost_trend, get_account_events, get_run_cost_breakdown. All accept days= keyword for window filtering."
+    },
+    {
+      "what": "group_top_n chart utility",
+      "where": "dashboard/src/dashboard/data/chart_utils.py",
+      "how": "Used in by-account partial to limit doughnut chart slices to top 5 accounts + 'Other' aggregate."
+    },
+    {
+      "what": "Chart.js color palette",
+      "where": "dashboard/src/dashboard/templates/partials/memory_graphs.html line 28-30",
+      "how": "Reuse the same 10-color palette array ['#60a5fa','#34d399','#fbbf24','#f87171','#a78bfa','#fb923c','#38bdf8','#4ade80','#e879f9','#94a3b8'] for all cost charts to maintain visual consistency."
+    },
+    {
+      "what": "getOrDestroyChart pattern",
+      "where": "dashboard/src/dashboard/templates/partials/memory_graphs.html",
+      "how": "All Chart.js charts in cost partials use the same IIFE + Chart.getChart(id).destroy() + new Chart() + htmx:afterSettle listener pattern."
+    },
+    {
+      "what": "Template filters (timeago, format_duration_ms, project_name)",
+      "where": "dashboard/src/dashboard/app.py lines 74-192",
+      "how": "Used in cost partial templates: timeago for event timestamps and last_cap, format_duration_ms for invocation durations, project_name for display-friendly project labels."
+    },
+    {
+      "what": "COSTS_SCHEMA test fixture and costs_db/costs_conn fixtures",
+      "where": "dashboard/tests/test_costs_data.py",
+      "how": "Import COSTS_SCHEMA and fixture patterns for any integration tests that need a populated database rather than mocked data functions."
+    },
+    {
+      "what": "TestClient fixture",
+      "where": "dashboard/tests/conftest.py line 243-248",
+      "how": "Reuse the existing client fixture for HTTP integration tests against cost routes."
+    },
+    {
+      "what": "_get_section_window and _get_nav_link test helpers",
+      "where": "dashboard/tests/test_app.py lines 32-65",
+      "how": "Can be imported for scoped HTML assertions on cost page sections and nav state, or replicated in the new test file."
+    },
+    {
+      "what": "DbPool and with_db database access pattern",
+      "where": "dashboard/src/dashboard/data/db.py",
+      "how": "Partial route handlers access the runs.db via request.app.state.db pool, same as performance partial. The costs.py functions internally use with_db for null-safe database access."
+    }
+  ],
+  "_session_id": "302-4c783f6c",
+  "_created_at": "2026-03-31T03:27:25.069075+00:00"
+}
