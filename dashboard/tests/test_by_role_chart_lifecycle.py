@@ -98,3 +98,49 @@ class TestByRoleRenderGuard:
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
         assert 'rendered = true' in html
+
+
+# ---------------------------------------------------------------------------
+# Step-5: Orphaned chart cleanup tests (TestByRoleChartCleanup)
+# ---------------------------------------------------------------------------
+
+
+class TestByRoleChartCleanup:
+    """Tests that by_role.html tracks and destroys chart instances to prevent orphans."""
+
+    def test_chart_instances_array_declared(self, client):
+        """Script must declare a chartInstances tracking array."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert 'var chartInstances = []' in html
+
+    def test_cleanup_charts_function_present(self, client):
+        """Script must define a cleanupCharts function."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert 'function cleanupCharts' in html
+
+    def test_cleanup_charts_called_in_render_charts(self, client):
+        """cleanupCharts() must be called at the start of renderCharts."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        # cleanupCharts() call must appear before 'new Chart(' in renderCharts body
+        cleanup_pos = html.find('cleanupCharts()')
+        new_chart_pos = html.find('new Chart(')
+        assert cleanup_pos != -1, 'cleanupCharts() call not found'
+        assert new_chart_pos != -1, 'new Chart( not found'
+        assert cleanup_pos < new_chart_pos, (
+            'cleanupCharts() must be called before new Chart() in renderCharts'
+        )
+
+    def test_chart_instances_pushed_after_creation(self, client):
+        """New Chart instances must be pushed into chartInstances array."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert 'chartInstances.push(' in html
+
+    def test_get_or_destroy_chart_function_removed(self, client):
+        """The old getOrDestroyChart standalone function must no longer appear."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert 'function getOrDestroyChart' not in html
