@@ -106,6 +106,7 @@ class UsageGate:
         self._project_id: str | None = None
         self._run_id: str | None = None
         self._last_account_name: str | None = None
+        self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
 
         self._accounts: list[AccountState] = self._init_accounts()
 
@@ -174,17 +175,22 @@ class UsageGate:
             for acct in self._accounts:
                 if not acct.capped:
                     logger.debug(f'Using account {acct.name}')
-                    # Failover detection: emit event if account changed
+                    # Failover detection: emit event if account changed.
+                    # Update _last_account_name FIRST to close the race window,
+                    # then fire the event non-blocking (fire-and-forget).
                     if (
                         self._last_account_name is not None
                         and self._last_account_name != acct.name
                     ):
-                        await self._write_cost_event(
+                        old_name = self._last_account_name
+                        self._last_account_name = acct.name
+                        self._fire_cost_event(
                             acct.name,
                             'failover',
-                            json.dumps({'from': self._last_account_name, 'to': acct.name}),
+                            json.dumps({'from': old_name, 'to': acct.name}),
                         )
-                    self._last_account_name = acct.name
+                    else:
+                        self._last_account_name = acct.name
                     return acct.token
 
             # All capped — check if any reset times have passed before blocking.
@@ -261,7 +267,8 @@ class UsageGate:
         if acct.pause_started_at is None:
             acct.pause_started_at = datetime.now(UTC)
         logger.warning(f'Account {acct.name} CAPPED: {reason}')
-        self._fire_cost_event(acct.name, 'cap_hit', json.dumps({'reason': reason}))
+        if self._cost_store:
+            self._fire_cost_event(acct.name, 'cap_hit', json.dumps({'reason': reason}))
         self._start_account_resume_probe(acct)
 
         # If all accounts are now capped, close the global gate
@@ -324,12 +331,23 @@ class UsageGate:
             return
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(
+        except RuntimeError:
+            logger.warning(
+                'No running event loop for cost event %s/%s', event_type, account_name
+            )
+            return
+        try:
+            task = loop.create_task(
                 self._write_cost_event(account_name, event_type, details),
                 name=f'cost-event-{event_type}-{account_name}',
             )
-        except RuntimeError:
-            pass
+        except RuntimeError as exc:
+            logger.warning(
+                'Failed to schedule cost event %s/%s: %s', event_type, account_name, exc
+            )
+            return
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _refresh_capped_accounts(self) -> bool:
         """Check reset times for all capped accounts. Return True if any uncapped."""
@@ -407,7 +425,8 @@ class UsageGate:
         label = 'reset time passed' if past_reset else f'optimistic probe #{acct.probe_count}'
         logger.info(f'Account {acct.name} RESUMED ({label})')
         self._open.set()
-        await self._write_cost_event(acct.name, 'resumed', json.dumps({'label': label}))
+        if self._cost_store:
+            await self._write_cost_event(acct.name, 'resumed', json.dumps({'label': label}))
 
     async def shutdown(self) -> None:
         """Cancel all resume probe tasks."""
