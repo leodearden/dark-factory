@@ -174,7 +174,7 @@ class TestAsyncSqliteBaseOpen:
             def _schema(self) -> str:
                 return _SIMPLE_SCHEMA
 
-        async with _Store(tmp_path / 'store.db') as store:
+        async with _Store(tmp_path / 'store.db') as store:  # noqa: SIM117
             async with store._conn.execute('PRAGMA journal_mode') as cur:  # type: ignore[union-attr]
                 row = await cur.fetchone()
         assert row[0] == 'wal'
@@ -188,7 +188,7 @@ class TestAsyncSqliteBaseOpen:
             def _schema(self) -> str:
                 return _SIMPLE_SCHEMA
 
-        async with _Store(tmp_path / 'store.db', busy_timeout_ms=7777) as store:
+        async with _Store(tmp_path / 'store.db', busy_timeout_ms=7777) as store:  # noqa: SIM117
             async with store._conn.execute('PRAGMA busy_timeout') as cur:  # type: ignore[union-attr]
                 row = await cur.fetchone()
         assert row[0] == 7777
@@ -202,7 +202,7 @@ class TestAsyncSqliteBaseOpen:
             def _schema(self) -> str:
                 return _SIMPLE_SCHEMA
 
-        async with _Store(tmp_path / 'store.db') as store:
+        async with _Store(tmp_path / 'store.db') as store:  # noqa: SIM117
             async with store._conn.execute(  # type: ignore[union-attr]
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='items'"
             ) as cur:
@@ -245,8 +245,6 @@ class TestAsyncSqliteBaseOpen:
 
     async def test_open_no_resource_leak_on_schema_failure(self, tmp_path: Path) -> None:
         """If executescript fails during open(), the conn is closed and _conn stays None."""
-        from unittest.mock import AsyncMock, patch
-
         from shared.async_sqlite_base import AsyncSqliteBase
 
         class _Store(AsyncSqliteBase):
@@ -261,9 +259,8 @@ class TestAsyncSqliteBaseOpen:
         mock_conn.executescript = AsyncMock(side_effect=RuntimeError('schema failure'))
         mock_conn.close = AsyncMock()
 
-        with patch('aiosqlite.connect', new=AsyncMock(return_value=mock_conn)):
-            with pytest.raises(RuntimeError, match='schema failure'):
-                await store.open()
+        with patch('aiosqlite.connect', new=AsyncMock(return_value=mock_conn)), pytest.raises(RuntimeError, match='schema failure'):
+            await store.open()
 
         assert store._conn is None
         mock_conn.close.assert_called_once()
@@ -340,7 +337,7 @@ class TestAsyncSqliteBaseClose:
             await store._conn.commit()  # type: ignore[union-attr]
 
         # Reopen and verify the row is still there
-        async with _Store(db_path) as store:
+        async with _Store(db_path) as store:  # noqa: SIM117
             async with store._conn.execute("SELECT name FROM items WHERE name='hello'") as cur:  # type: ignore[union-attr]
                 row = await cur.fetchone()
         assert row is not None
