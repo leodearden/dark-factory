@@ -600,6 +600,12 @@ class TestMemoryGraphsPartialIntegration:
             assert 'By operation' in html
             assert 'By agent' in html
             assert 'new Chart' in html
+            # Verify mock data VALUES appear in the rendered HTML via {{ operations | tojson }}
+            # and {{ agents | tojson }}, proving the template context variables are wired up.
+            assert '"search"' in html
+            assert '"add_memory"' in html
+            assert '"claude-interactive"' in html
+            assert '"recon-consolidator"' in html
 
     def test_memory_graphs_empty(self, client):
         with _patch_memory_graphs_integration(
