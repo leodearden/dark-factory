@@ -95,6 +95,13 @@ class ReviewCheckpoint:
 
     async def _run_review(self, mode: str, modules: list[str]) -> ReviewReport:
         """Shared implementation for focused and full reviews."""
+        # Guard: reject pytest tmp_path fixtures to prevent junk escalations
+        project_str = str(self.config.project_root)
+        if '/tmp/pytest-' in project_str or '/tmp/pytest' in project_str:
+            raise ValueError(
+                f'Refusing to run review against pytest fixture path: {project_str}'
+            )
+
         review_id = datetime.now(UTC).strftime('%Y%m%dT%H%M%S')
         start = time.monotonic()
 
