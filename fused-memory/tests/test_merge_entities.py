@@ -16,7 +16,6 @@ import pytest
 
 from fused_memory.backends.graphiti_client import GraphitiBackend, NodeNotFoundError
 
-
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.redirect_node_edges
 # ---------------------------------------------------------------------------
@@ -55,7 +54,6 @@ class TestRedirectNodeEdges:
         # First query call should target inter-node edges
         first_call = graph.query.call_args_list[0]
         args = first_call[0]
-        cypher = args[0] if args else ''
         params = args[1] if len(args) > 1 else {}
         # Both UUIDs should appear in params
         assert dep_uuid in params.values() or any(
@@ -153,9 +151,8 @@ class TestDeleteEntityNode:
         graph.query = AsyncMock(return_value=MagicMock(result_set=[]))
         cast_target = MagicMock()
         cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            with pytest.raises(NodeNotFoundError):
-                await backend.delete_entity_node('missing-uuid')
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target), pytest.raises(NodeNotFoundError):
+            await backend.delete_entity_node('missing-uuid')
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
