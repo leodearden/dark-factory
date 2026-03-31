@@ -6098,7 +6098,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/app.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard"
+          ]
+        }
       },
       {
         "id": 326,
@@ -6109,7 +6117,16 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/costs.html",
+            "dashboard/src/dashboard/templates/partials/performance.html"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates"
+          ]
+        }
       },
       {
         "id": 327,
