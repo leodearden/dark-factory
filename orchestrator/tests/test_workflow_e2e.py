@@ -1667,7 +1667,8 @@ class TestInvokeForwardsCostStore:
         self, config, git_ops, task_assignment, tmp_path, monkeypatch
     ):
         """_invoke passes cost_store, run_id, task_id, project_id, role to invoke_with_cap_retry."""
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import MagicMock
+
         from orchestrator.agents.roles import ARCHITECT
 
         mock_cost_store = MagicMock()
@@ -1710,7 +1711,8 @@ class TestInvokeForwardsCostStore:
         self, config, git_ops, task_assignment, tmp_path, monkeypatch
     ):
         """reviewer_test_analyst role is normalized to 'reviewer' in kwargs."""
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import MagicMock
+
         from orchestrator.agents.roles import ALL_REVIEWERS
 
         reviewer_role = ALL_REVIEWERS[0]  # e.g. reviewer_test_analyst

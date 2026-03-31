@@ -13,15 +13,15 @@ Verifies:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -158,10 +158,8 @@ class TestHarnessCostStoreLifecycle:
         with patch('orchestrator.harness.CostStore') as MockCostStore:
             mock_cs = AsyncMock()
             MockCostStore.return_value = mock_cs
-            try:
+            with contextlib.suppress(RuntimeError):
                 await harness.run(dry_run=True)
-            except RuntimeError:
-                pass
 
         mock_cs.close.assert_awaited_once()
 
@@ -287,8 +285,6 @@ class TestRunSlotCostStoreInjection:
         harness._cost_store = mock_cost_store
 
         captured_kwargs: dict = {}
-
-        original_init = None
 
         from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 

@@ -661,7 +661,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 def _make_steward(
                     worktree: Path, *, _assign=assignment,
                 ) -> TaskSteward:  # type: ignore[name-defined]
-                    return TaskSteward(
+                    return TaskSteward(  # type: ignore[possibly-unbound]
                         task_id=_assign.task_id,
                         task=_assign.task,
                         worktree=worktree,
@@ -861,7 +861,7 @@ Output JSON matching the schema. Every task must appear in the output.
     async def _stop_merge_worker(self) -> None:
         """Stop the merge worker gracefully."""
         if self._merge_worker_task is not None and self._merge_worker is not None:
-            await self._merge_worker.stop()
+            await self._merge_worker.stop()  # type: ignore[attr-defined]
             self._merge_worker_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._merge_worker_task

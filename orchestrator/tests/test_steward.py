@@ -734,7 +734,7 @@ class TestStewardSaveInvocation:
         self, worktree, mock_config, mock_queue, mock_mcp, mock_briefing
     ):
         """save_invocation is NOT called when a cap-hit triggers retry."""
-        from unittest.mock import AsyncMock, MagicMock, patch, call
+        from unittest.mock import AsyncMock, MagicMock, patch
 
         mock_cost_store = MagicMock()
         mock_cost_store.save_invocation = AsyncMock()
@@ -760,19 +760,21 @@ class TestStewardSaveInvocation:
         )
 
         esc = _make_escalation()
-        cap_result = _make_result(cost=0.0, session_id=None)
+        cap_result = _make_result(cost=0.0, session_id='')
         success_result = _make_result(cost=1.0, session_id='sess-after-cap')
 
-        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
-            with patch('asyncio.sleep', new_callable=AsyncMock):
-                mock_invoke.side_effect = [cap_result, success_result]
-                await s._invoke_with_session(
-                    prompt='Handle',
-                    cwd=worktree,
-                    mcp_config={'mcpServers': {}},
-                    per_invocation_budget=5.0,
-                    escalation=esc,
-                )
+        with (
+            patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_invoke.side_effect = [cap_result, success_result]
+            await s._invoke_with_session(
+                prompt='Handle',
+                cwd=worktree,
+                mcp_config={'mcpServers': {}},
+                per_invocation_budget=5.0,
+                escalation=esc,
+            )
 
         # save_invocation called exactly once (after success, not on cap-hit)
         mock_cost_store.save_invocation.assert_awaited_once()
