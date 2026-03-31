@@ -939,3 +939,22 @@ class TestAlpineV3StorePattern:
         html = client.get('/costs').text
         # The store init should embed the window value; default is 7d
         assert "'7d'" in html or '"7d"' in html
+
+
+# ---------------------------------------------------------------------------
+# Task-343 step-1: hx-sync on cost sections
+# ---------------------------------------------------------------------------
+
+
+class TestHxSyncOnSections:
+    """All 7 cost sections must carry hx-sync="this:abort" to abort stale in-flight requests."""
+
+    def test_all_sections_have_hx_sync(self, client):
+        """The rendered /costs page must contain hx-sync on all 7 data-cost-section elements."""
+        html = client.get('/costs').text
+        assert html.count('hx-sync=') == 7
+
+    def test_hx_sync_uses_abort_strategy(self, client):
+        """All hx-sync attributes must use the this:abort strategy."""
+        html = client.get('/costs').text
+        assert 'hx-sync="this:abort"' in html or "hx-sync='this:abort'" in html
