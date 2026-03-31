@@ -2028,3 +2028,28 @@ class TestSearchGraphitiInvalidatedFiltering:
         assert len(results) == 0, (
             'Edge with non-null invalid_at must be excluded from search results'
         )
+
+    # step-3: edge with invalid_at=None is NOT excluded
+    @pytest.mark.asyncio
+    async def test_edge_without_invalid_at_not_excluded(self, service):
+        """Edge with invalid_at=None (valid fact) is included in _search_graphiti results."""
+        from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Service A is healthy',
+                uuid='edge-valid-1',
+                valid_at=dt_valid,
+                invalid_at=None,
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('Service A', scope, 10)
+
+        assert len(results) == 1, (
+            'Edge with invalid_at=None must be included in search results'
+        )
+        assert results[0].id == 'edge-valid-1'
