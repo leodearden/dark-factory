@@ -168,3 +168,66 @@ class TestFireCostEventTaskStorage:
             f'Expected empty set after completion, but {len(gate._background_tasks)} task(s) remain — '
             'done_callback not calling discard()'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-5: RuntimeError handling in _fire_cost_event is narrowed to only
+#         the get_running_loop() call; errors from create_task() propagate.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFireCostEventRuntimeErrorHandling:
+    """step-5: only 'no running event loop' RuntimeError is caught; create_task errors propagate."""
+
+    async def test_no_running_loop_logs_warning(self, caplog):
+        """RuntimeError from get_running_loop() must be caught and a warning logged.
+
+        Currently the broad except swallows it silently (no log). After the fix,
+        a logger.warning is emitted with the event type and account name.
+        """
+        import logging
+
+        gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
+
+        with (
+            patch('shared.usage_gate.asyncio.get_running_loop',
+                  side_effect=RuntimeError('no running event loop')),
+            caplog.at_level(logging.WARNING, logger='shared.usage_gate'),
+        ):
+            gate._fire_cost_event('acct-A', 'cap_hit', '{}')
+
+        assert any(
+            'no running event loop' in record.message.lower()
+            or 'cap_hit' in record.message
+            or 'acct-A' in record.message
+            for record in caplog.records
+        ), (
+            f'Expected a warning log for missing event loop, got: {[r.message for r in caplog.records]}'
+        )
+
+    async def test_create_task_error_propagates(self):
+        """RuntimeError from loop.create_task() must propagate, not be silently swallowed.
+
+        Currently the broad except RuntimeError catches it. After the fix,
+        create_task() is outside the try block so its errors propagate.
+        """
+        gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
+
+        mock_loop = MagicMock()
+
+        captured_coro: list = []
+
+        def raising_create_task(coro, **kwargs):
+            # Close the coroutine to avoid ResourceWarning about unawaited coro
+            captured_coro.append(coro)
+            coro.close()
+            raise RuntimeError('scheduler is shutting down')
+
+        mock_loop.create_task.side_effect = raising_create_task
+
+        with (
+            patch('shared.usage_gate.asyncio.get_running_loop', return_value=mock_loop),
+            pytest.raises(RuntimeError, match='scheduler is shutting down'),
+        ):
+            gate._fire_cost_event('acct-A', 'cap_hit', '{}')
