@@ -6209,7 +6209,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_costs_data.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 332,
@@ -6220,7 +6228,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_costs_data.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 333,
