@@ -545,6 +545,122 @@ class TestCostsEventsPartial:
 
 
 # ---------------------------------------------------------------------------
+# Step-17: GET /costs/partials/runs route tests
+# ---------------------------------------------------------------------------
+
+_MOCK_RUNS = [
+    {
+        'run_id': 'run-abc-123',
+        'project_id': 'dark_factory',
+        'total_cost': 4.20,
+        'tasks': [
+            {
+                'task_id': '42',
+                'title': 'Implement feature X',
+                'cost': 3.50,
+                'invocations': [
+                    {
+                        'model': 'claude-sonnet',
+                        'role': 'implementer',
+                        'cost_usd': 2.00,
+                        'account_name': 'account-A',
+                        'duration_ms': 15000,
+                        'capped': False,
+                    },
+                    {
+                        'model': 'claude-opus',
+                        'role': 'reviewer',
+                        'cost_usd': 1.50,
+                        'account_name': 'account-B',
+                        'duration_ms': 8000,
+                        'capped': True,
+                    },
+                ],
+            },
+            {
+                'task_id': None,
+                'title': None,
+                'cost': 0.70,
+                'invocations': [
+                    {
+                        'model': 'claude-haiku',
+                        'role': 'orchestrator',
+                        'cost_usd': 0.70,
+                        'account_name': 'account-A',
+                        'duration_ms': 3000,
+                        'capped': False,
+                    },
+                ],
+            },
+        ],
+    },
+]
+
+
+def _patch_runs(return_value=_MOCK_RUNS):
+    return patch(
+        'dashboard.app.get_run_cost_breakdown',
+        new_callable=AsyncMock,
+        return_value=return_value,
+    )
+
+
+class TestCostsRunsPartial:
+    """Tests for GET /costs/partials/runs."""
+
+    def test_returns_200(self, client):
+        with _patch_runs():
+            resp = client.get('/costs/partials/runs')
+        assert resp.status_code == 200
+
+    def test_content_type_html(self, client):
+        with _patch_runs():
+            resp = client.get('/costs/partials/runs')
+        assert 'text/html' in resp.headers['content-type']
+
+    def test_renders_run_id(self, client):
+        """Run ID should appear in the rendered output."""
+        with _patch_runs():
+            html = client.get('/costs/partials/runs').text
+        assert 'run-abc-123' in html
+
+    def test_renders_total_cost(self, client):
+        """Total cost for runs should appear."""
+        with _patch_runs():
+            html = client.get('/costs/partials/runs').text
+        assert '$' in html
+
+    def test_renders_task_title(self, client):
+        """Task titles should appear in the expandable details."""
+        with _patch_runs():
+            html = client.get('/costs/partials/runs').text
+        assert 'Implement feature X' in html
+
+    def test_renders_capped_badge(self, client):
+        """Capped invocations should show a 'capped' badge."""
+        with _patch_runs():
+            html = client.get('/costs/partials/runs').text
+        assert 'capped' in html.lower()
+
+    def test_handles_null_task_id(self, client):
+        """Runs with null task_id should still render without errors."""
+        with _patch_runs():
+            resp = client.get('/costs/partials/runs')
+        assert resp.status_code == 200
+
+    def test_handles_empty_list(self, client):
+        with _patch_runs(return_value=[]):
+            resp = client.get('/costs/partials/runs')
+        assert resp.status_code == 200
+
+    def test_respects_window_param(self, client):
+        with _patch_runs() as mock_fn:
+            client.get('/costs/partials/runs?window=7d')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 7
+
+
+# ---------------------------------------------------------------------------
 # Step-9: GET /costs/partials/by-account route tests
 # ---------------------------------------------------------------------------
 
