@@ -80,7 +80,7 @@
       "id": "step-9",
       "type": "test",
       "description": "Tighten test_renders_total_spend: replace `assert '$' in html` with `assert '$17.34' in html` \u2014 the computed value from mock data (dark_factory: 12.34 + other_project: 5.00 = 17.34, formatted via '%.2f')",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {

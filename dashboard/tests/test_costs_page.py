@@ -213,8 +213,8 @@ class TestCostsSummaryPartial:
     def test_renders_total_spend(self, client):
         with _patch_summary():
             html = client.get('/costs/partials/summary').text
-        # Should show a dollar amount for combined spend (12.34 + 5.00 = 17.34 or per-project)
-        assert '$' in html
+        # Should show combined spend: dark_factory 12.34 + other_project 5.00 = 17.34
+        assert '$17.34' in html
 
     def test_renders_active_accounts(self, client):
         with _patch_summary():
