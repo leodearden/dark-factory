@@ -597,6 +597,77 @@ class TestCostByAccount:
         assert mz['last_cap'] is None
         assert mz['status'] == 'active'
 
+    @pytest.mark.asyncio
+    async def test_cap_only_account_with_out_of_window_invocations(self, tmp_path):
+        """Account with in-window cap event but only out-of-window invocations appears in result.
+
+        This is a more realistic production edge case than test_cap_only_account:
+        the account ('max-ghost') has invocations that aged out of the look-back
+        window, so inv_rows yields zero rows for it. However, it still has a
+        cap_hit event inside the window. The second-pass gap-fill (costs.py line 195)
+        must surface this account with spend=0.0 and invocations=0.
+
+        Setup:
+          - 2 invocations for 'max-ghost' at 20d ago (outside days=7)
+          - 1 cap_hit event for 'max-ghost' at 2h ago (inside days=7)
+
+        Expected result for 'max-ghost':
+          spend=0.0, invocations=0, cap_events=1, status='capped',
+          last_cap == cap_hit timestamp
+        """
+        db_path = tmp_path / 'ghost_cap.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+
+        cap_ts = (now - timedelta(hours=2)).isoformat()
+
+        # Two invocations at 20d ago — outside days=7 window
+        conn.executemany(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [
+                ('r1', 't1', 'proj', 'max-ghost', 'claude-opus-4-5', 'implementer',
+                 1.00, 0,
+                 (now - timedelta(days=20, hours=1)).isoformat(),
+                 (now - timedelta(days=20)).isoformat()),
+                ('r1', 't2', 'proj', 'max-ghost', 'claude-sonnet-4-5', 'reviewer',
+                 0.50, 0,
+                 (now - timedelta(days=20, hours=2)).isoformat(),
+                 (now - timedelta(days=20, hours=1)).isoformat()),
+            ],
+        )
+        # One cap_hit event at 2h ago — inside days=7 window
+        conn.execute(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            ('max-ghost', 'cap_hit', 'proj', 'r1', None, cap_ts),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn, days=7)
+
+        # 'max-ghost' must appear via the second-pass gap-fill even though it
+        # has no in-window invocations.
+        assert 'max-ghost' in result, (
+            "account with out-of-window invocations but in-window cap event "
+            "must appear in get_cost_by_account result via second-pass gap-fill"
+        )
+        mg = result['max-ghost']
+        assert mg['spend'] == pytest.approx(0.0, abs=1e-6)
+        assert mg['invocations'] == 0
+        assert mg['cap_events'] == 1
+        assert mg['status'] == 'capped'
+        assert mg['last_cap'] == cap_ts, (
+            f"expected last_cap={cap_ts!r}, got {mg['last_cap']!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: get_cost_by_role
