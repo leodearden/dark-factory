@@ -241,7 +241,8 @@ async def index(request: Request):
 
 @app.get('/costs')
 async def costs(request: Request):
-    return templates.TemplateResponse(request, 'costs.html')
+    window = request.query_params.get('window', '7d')
+    return templates.TemplateResponse(request, 'costs.html', context={'window': window})
 
 
 @app.get('/api/health')
