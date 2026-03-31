@@ -859,3 +859,67 @@ class TestCostsByAccountPartial:
             client.get('/costs/partials/by-account?window=7d')
         _, kwargs = mock_fn.call_args
         assert kwargs.get('days') == 7
+
+
+# ---------------------------------------------------------------------------
+# Step-23: Alpine v3 store pattern tests
+# ---------------------------------------------------------------------------
+
+
+class TestAlpineV3StorePattern:
+    """Verify costs.html uses Alpine v3 store API, not the deprecated Alpine v2 __x API."""
+
+    def test_alpine_store_costs_registration_present(self, client):
+        """costs.html must register an Alpine.store('costs', ...) store."""
+        html = client.get('/costs').text
+        assert "Alpine.store('costs'" in html or 'Alpine.store("costs"' in html
+
+    def test_no_alpine_v2_private_api(self, client):
+        """The __x private Alpine v2 API must not appear anywhere in the page."""
+        html = client.get('/costs').text
+        assert '__x.$data' not in html
+
+    def test_no_alpine_v2_null_guard(self, client):
+        """The '__x &&' null-guard pattern from Alpine v2 must not appear."""
+        html = client.get('/costs').text
+        assert '__x &&' not in html
+
+    def test_hx_vals_use_alpine_store(self, client):
+        """All hx-vals expressions must read from Alpine.store(\"costs\").window."""
+        html = client.get('/costs').text
+        # Count occurrences — there are 7 sections, each with one hx-vals
+        assert 'Alpine.store("costs").window' in html or "Alpine.store('costs').window" in html
+
+    def test_hx_vals_count(self, client):
+        """All 7 section hx-vals must use the store (not the old __x expression)."""
+        html = client.get('/costs').text
+        # Old pattern used getElementById + __x; new pattern uses Alpine.store
+        old_pattern_count = html.count('__x.$data.currentWindow')
+        assert old_pattern_count == 0
+
+    def test_button_click_writes_to_store(self, client):
+        """@click handlers on window selector buttons must write to Alpine.store('costs').window."""
+        html = client.get('/costs').text
+        # Must contain store write; old pattern was `currentWindow = '...'`
+        assert "Alpine.store('costs').window" in html or 'Alpine.store("costs").window' in html
+
+    def test_button_class_binding_reads_from_store(self, client):
+        """Button :class bindings must read from $store.costs.window (not currentWindow)."""
+        html = client.get('/costs').text
+        assert '$store.costs.window' in html
+
+    def test_no_x_data_currentwindow(self, client):
+        """The x-data component with currentWindow must not be present (state is in global store)."""
+        html = client.get('/costs').text
+        assert 'currentWindow' not in html
+
+    def test_alpine_init_listener_present(self, client):
+        """The store must be initialized via an alpine:init event listener."""
+        html = client.get('/costs').text
+        assert "alpine:init" in html
+
+    def test_store_default_window_7d(self, client):
+        """The store initialization must default to '7d'."""
+        html = client.get('/costs').text
+        # The store init should embed the window value; default is 7d
+        assert "'7d'" in html or '"7d"' in html
