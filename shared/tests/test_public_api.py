@@ -70,19 +70,26 @@ class TestModuleLevelAll:
         assert hasattr(cost_store, '__all__'), 'cost_store must define __all__'
         assert set(cost_store.__all__) == {'CostStore'}
 
+    def test_async_sqlite_base_all(self):
+        from shared import async_sqlite_base
+
+        assert hasattr(async_sqlite_base, '__all__'), 'async_sqlite_base must define __all__'
+        assert set(async_sqlite_base.__all__) == {'apply_wal_pragmas', 'AsyncSqliteBase'}
+
 
 class TestInitAllCompleteness:
     """Verify that shared.__all__ covers the union of all module __all__ entries."""
 
     def test_init_all_covers_all_module_symbols(self):
         import shared
-        from shared import cli_invoke, config_models, cost_store, usage_gate
+        from shared import async_sqlite_base, cli_invoke, config_models, cost_store, usage_gate
 
         union = (
             set(cli_invoke.__all__)
             | set(usage_gate.__all__)
             | set(config_models.__all__)
             | set(cost_store.__all__)
+            | set(async_sqlite_base.__all__)
         )
         assert set(shared.__all__) == union, (
             f'shared.__all__ must equal union of submodule __all__.\n'
@@ -92,7 +99,7 @@ class TestInitAllCompleteness:
 
     def test_no_private_symbols_in_any_all(self):
         import shared
-        from shared import cli_invoke, config_models, cost_store, usage_gate
+        from shared import async_sqlite_base, cli_invoke, config_models, cost_store, usage_gate
 
         for module, name in [
             (shared, 'shared'),
@@ -100,6 +107,7 @@ class TestInitAllCompleteness:
             (usage_gate, 'usage_gate'),
             (config_models, 'config_models'),
             (cost_store, 'cost_store'),
+            (async_sqlite_base, 'async_sqlite_base'),
         ]:
             private = [s for s in module.__all__ if s.startswith('_')]
             assert private == [], (

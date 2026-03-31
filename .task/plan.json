@@ -112,14 +112,14 @@
       "type": "impl",
       "description": "Refactor CostStore to subclass AsyncSqliteBase: remove duplicated __init__/open/close/__aenter__/__aexit__/_require_conn, add _schema property returning _SCHEMA constant, __init__ calls super().__init__(db_path, busy_timeout_ms=30000). Keep _execute and public API methods unchanged. Run existing test_cost_store.py to verify backward compat.",
       "status": "done",
-      "commit": "pending"
+      "commit": "d13406d4"
     },
     {
       "id": "step-15",
       "type": "test",
       "description": "Update test_public_api.py: add AsyncSqliteBase and apply_wal_pragmas to expected exports in test_init_all_covers_all_module_symbols, add test_async_sqlite_base_all checking module __all__",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "pending"
     },
     {
       "id": "step-16",
