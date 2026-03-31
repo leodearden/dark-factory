@@ -319,3 +319,80 @@ class TestCostsByProjectPartial:
             client.get('/costs/partials/by-project?window=30d')
         _, kwargs = mock_fn.call_args
         assert kwargs.get('days') == 30
+
+
+# ---------------------------------------------------------------------------
+# Step-9: GET /costs/partials/by-account route tests
+# ---------------------------------------------------------------------------
+
+_MOCK_BY_ACCOUNT = {
+    'account-A': {
+        'spend': 9.50,
+        'invocations': 50,
+        'cap_events': 1,
+        'last_cap': '2026-03-30T10:00:00+00:00',
+        'status': 'capped',
+    },
+    'account-B': {
+        'spend': 3.20,
+        'invocations': 20,
+        'cap_events': 0,
+        'last_cap': None,
+        'status': 'active',
+    },
+}
+
+
+def _patch_by_account(return_value=_MOCK_BY_ACCOUNT):
+    return patch(
+        'dashboard.app.get_cost_by_account',
+        new_callable=AsyncMock,
+        return_value=return_value,
+    )
+
+
+class TestCostsByAccountPartial:
+    """Tests for GET /costs/partials/by-account."""
+
+    def test_returns_200(self, client):
+        with _patch_by_account():
+            resp = client.get('/costs/partials/by-account')
+        assert resp.status_code == 200
+
+    def test_renders_doughnut_chart(self, client):
+        """Must include a canvas for the doughnut chart."""
+        with _patch_by_account():
+            html = client.get('/costs/partials/by-account').text
+        assert 'canvas' in html.lower()
+        assert 'doughnut' in html.lower()
+
+    def test_renders_account_table(self, client):
+        """Must include a table with account data."""
+        with _patch_by_account():
+            html = client.get('/costs/partials/by-account').text
+        assert 'account-A' in html
+        assert 'account-B' in html
+
+    def test_capped_status_badge(self, client):
+        """Capped accounts should show red status badge."""
+        with _patch_by_account():
+            html = client.get('/costs/partials/by-account').text
+        # Red color class for capped accounts
+        assert 'red' in html.lower()
+
+    def test_active_status_badge(self, client):
+        """Active accounts should show green status badge."""
+        with _patch_by_account():
+            html = client.get('/costs/partials/by-account').text
+        assert 'green' in html.lower()
+
+    def test_handles_empty_data(self, client):
+        with _patch_by_account(return_value={}):
+            resp = client.get('/costs/partials/by-account')
+        assert resp.status_code == 200
+
+    def test_respects_window_param(self, client):
+        with _patch_by_account() as mock_fn:
+            client.get('/costs/partials/by-account?window=7d')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 7
