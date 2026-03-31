@@ -908,9 +908,13 @@ class TestRunCostBreakdown:
     async def test_null_task_id(self, tmp_path):
         """Multiple NULL-task_id invocations are grouped into a single task entry.
 
-        Two orchestrator invocations with task_id=NULL (run-level billing) must
-        collapse into one task dict (task_id=None), with costs accumulated and
-        both invocation rows preserved in the detail list.
+        Three invocations with task_id=NULL but DIFFERENT model/role values
+        (claude-sonnet-4-5/orchestrator × 2, claude-opus-4-5/debugger × 1)
+        must all collapse into one task dict (task_id=None), with costs
+        accumulated and all three invocation rows preserved in the detail list.
+
+        This tests that heterogeneous model/role attributes don't accidentally
+        produce separate task entries — the grouping key is task_id only.
         """
         db_path = tmp_path / 'null_task.db'
         conn = __import__('sqlite3').connect(str(db_path))
@@ -923,7 +927,10 @@ class TestRunCostBreakdown:
             'VALUES (?, ?, ?, ?)',
             ('r1', 'proj', (now - timedelta(hours=1)).isoformat(), now.isoformat()),
         )
-        # Insert TWO invocations with NULL task_id (run-level billing)
+        # Insert THREE invocations with NULL task_id (run-level billing):
+        #   inv-1: sonnet / orchestrator  → 0.25
+        #   inv-2: sonnet / orchestrator  → 0.15
+        #   inv-3: opus   / debugger      → 0.10  (different model AND role)
         conn.executemany(
             'INSERT INTO invocations '
             '(run_id, task_id, project_id, account_name, model, role, '
@@ -932,11 +939,15 @@ class TestRunCostBreakdown:
             [
                 ('r1', None, 'proj', 'acc', 'claude-sonnet-4-5', 'orchestrator',
                  0.25, 0,
-                 (now - timedelta(minutes=40)).isoformat(),
-                 (now - timedelta(minutes=30)).isoformat()),
+                 (now - timedelta(minutes=50)).isoformat(),
+                 (now - timedelta(minutes=40)).isoformat()),
                 ('r1', None, 'proj', 'acc', 'claude-sonnet-4-5', 'orchestrator',
                  0.15, 0,
-                 (now - timedelta(minutes=20)).isoformat(),
+                 (now - timedelta(minutes=30)).isoformat(),
+                 (now - timedelta(minutes=20)).isoformat()),
+                ('r1', None, 'proj', 'acc', 'claude-opus-4-5', 'debugger',
+                 0.10, 0,
+                 (now - timedelta(minutes=15)).isoformat(),
                  (now - timedelta(minutes=10)).isoformat()),
             ],
         )
@@ -950,16 +961,29 @@ class TestRunCostBreakdown:
         assert len(result) == 1
         run = result[0]
         assert run['run_id'] == 'r1'
-        assert run['total_cost'] == pytest.approx(0.40, abs=1e-6)
+        assert run['total_cost'] == pytest.approx(0.50, abs=1e-6)
 
-        # Both NULLs must be grouped into exactly ONE task entry
+        # All three NULLs must be grouped into exactly ONE task entry
         assert len(run['tasks']) == 1
         t = run['tasks'][0]
         assert t['task_id'] is None
         assert t['title'] is None
-        assert t['cost'] == pytest.approx(0.40, abs=1e-6)
-        # Both invocation rows must be preserved in the detail list
-        assert len(t['invocations']) == 2
+        assert t['cost'] == pytest.approx(0.50, abs=1e-6)
+        # All three invocation rows must be preserved in the detail list
+        assert len(t['invocations']) == 3
+
+        # Verify each invocation's model/role/cost_usd are individually correct.
+        # Sort by cost_usd descending: 0.25, 0.15, 0.10.
+        invs = sorted(t['invocations'], key=lambda x: x['cost_usd'], reverse=True)
+        assert invs[0]['cost_usd'] == pytest.approx(0.25, abs=1e-6)
+        assert invs[0]['model'] == 'claude-sonnet-4-5'
+        assert invs[0]['role'] == 'orchestrator'
+        assert invs[1]['cost_usd'] == pytest.approx(0.15, abs=1e-6)
+        assert invs[1]['model'] == 'claude-sonnet-4-5'
+        assert invs[1]['role'] == 'orchestrator'
+        assert invs[2]['cost_usd'] == pytest.approx(0.10, abs=1e-6)
+        assert invs[2]['model'] == 'claude-opus-4-5'
+        assert invs[2]['role'] == 'debugger'
 
 
 # ---------------------------------------------------------------------------
