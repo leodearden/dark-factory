@@ -7,7 +7,7 @@
         <h4 class="text-xs text-gray-400 uppercase mb-2">{{ project_id | project_name }}</h4>
       {% endif %}
       <div class="bg-gray-800 rounded-lg p-4 mb-4" style="height: 220px; position: relative">
-        <canvas id="costByRoleChart_{{ loop.index }}"></canvas>
+        <canvas id="costByRoleChart_{{ project_id | css_id }}"></canvas>
       </div>
     {% endfor %}
   {% else %}
