@@ -6627,10 +6627,11 @@
         "description": "Two bugs in shared/src/shared/usage_gate.py introduced by task 336:\n\n**1. Coroutine leak (lines 339-348):** When `loop.create_task()` raises RuntimeError (e.g. 'Event loop is closed' during shutdown), the coroutine object passed to it is never closed. Python will emit 'RuntimeWarning: coroutine was never awaited' when GC collects it. Fix: extract the coroutine before create_task, close it in the except block:\n```python\ncoro = self._write_cost_event(account_name, event_type, details)\ntry:\n    task = loop.create_task(coro, name=f'cost-event-{event_type}-{account_name}')\nexcept RuntimeError as exc:\n    coro.close()\n    logger.warning('Failed to schedule cost event %s/%s: %s', event_type, account_name, exc)\n    return\n```\n\n**2. shutdown() doesn't drain _background_tasks (lines 431-438):** `_background_tasks` was introduced to prevent GC of fire-and-forget cost events, but `shutdown()` only cancels resume probe tasks — it ignores pending background tasks. In-flight cost event coroutines will be abandoned, producing 'Task was destroyed but it is pending' warnings. Fix: after cancelling resume tasks, cancel+await background tasks:\n```python\nfor task in list(self._background_tasks):\n    task.cancel()\n    with contextlib.suppress(asyncio.CancelledError):\n        await task\n```\n\n**3. before_invoke guard consistency (line 187-191):** The failover branch calls `json.dumps(...)` unconditionally before `_fire_cost_event`, while `_handle_cap_detected` (line 270) and `_account_resume_probe_loop` (line 428) guard with `if self._cost_store:`. Add the same guard for consistency.\n\nAdd test coverage for shutdown() with non-empty _background_tasks.\n\nmemory_hints: search \"UsageGate _background_tasks shutdown lifecycle\" and \"fire_cost_event coroutine leak\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-31T15:22:17.218Z"
       },
       {
         "id": "356",
@@ -6830,7 +6831,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T15:22:16.907Z",
+      "lastModified": "2026-03-31T15:22:17.218Z",
       "taskCount": 351,
       "completedCount": 292,
       "tags": [
