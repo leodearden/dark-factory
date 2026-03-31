@@ -38,6 +38,35 @@ def _resolve_project_root(prd: str, default_root: Path) -> Path:
     return default_root
 
 
+def _read_project_root_from_config(config_path: str) -> Path | None:
+    """Extract ``project_root`` from an orchestrator config YAML file.
+
+    Handles ``${VAR:default}`` env-var expansion for the project_root value.
+    Returns ``None`` if the file can't be read or doesn't contain project_root.
+    """
+    import os
+
+    import yaml
+
+    try:
+        raw = yaml.safe_load(Path(config_path).read_text())
+    except (FileNotFoundError, yaml.YAMLError, OSError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get('project_root')
+    if not isinstance(value, str):
+        return None
+    # Expand ${VAR:default} patterns (matching orchestrator config.py behavior)
+    expanded = re.sub(
+        r'\$\{([^:}]+)(?::([^}]*))?\}',
+        lambda m: os.environ.get(m.group(1), m.group(2) or ''),
+        value,
+    )
+    p = Path(expanded)
+    return p.resolve() if p.is_absolute() else None
+
+
 def _scan_worktrees(worktrees_dir: Path) -> dict[str, dict]:
     """Scan a .worktrees/ directory and return {task_id: artifact_data}."""
     worktrees: dict[str, dict] = {}
@@ -70,8 +99,15 @@ def _extract_task_id(dirname: str) -> str | None:
 def find_running_orchestrators() -> list[dict]:
     """Scan ``ps aux`` for running orchestrator processes.
 
-    Returns a list of dicts with keys: pid (int), prd (str), running (bool),
-    started (str). Returns [] on subprocess failure or if no orchestrators found.
+    Detects three launch patterns:
+
+    1. ``orchestrator run --prd <path>`` — extracts prd path
+    2. ``orchestrator run --config <path>`` — extracts config path
+    3. ``orchestrator run`` (no flags) — bare run of existing tasks
+
+    Returns a list of dicts with keys: pid (int), prd (str | None),
+    config_path (str | None), running (bool), started (str).
+    Returns [] on subprocess failure or if no orchestrators found.
     """
     try:
         result = subprocess.run(
@@ -87,7 +123,7 @@ def find_running_orchestrators() -> list[dict]:
     for line in result.stdout.splitlines():
         if 'orchestrator' not in line:
             continue
-        if '--prd' not in line:
+        if 'orchestrator run' not in line:
             continue
         if 'grep' in line:
             continue
@@ -99,20 +135,20 @@ def find_running_orchestrators() -> list[dict]:
         try:
             pid = int(fields[1])
             started = fields[8]
-
-            prd_match = re.search(r'--prd\s+(\S+)', line)
-            if not prd_match:
-                continue
-
-            orchestrators.append({
-                'pid': pid,
-                'prd': prd_match.group(1),
-                'running': True,
-                'started': started,
-            })
         except (ValueError, IndexError):
             logger.warning('Skipping malformed ps line: %s', line.strip())
             continue
+
+        prd_match = re.search(r'--prd\s+(\S+)', line)
+        config_match = re.search(r'--config\s+(\S+)', line)
+
+        orchestrators.append({
+            'pid': pid,
+            'prd': prd_match.group(1) if prd_match else None,
+            'config_path': config_match.group(1) if config_match else None,
+            'running': True,
+            'started': started,
+        })
 
     return orchestrators
 
@@ -255,20 +291,29 @@ def discover_orchestrators(config: DashboardConfig) -> list[dict]:
     if not processes:
         return []
 
-    # Group processes by PRD path — multiple PIDs targeting the same PRD
-    # are merged into a single entry with a 'pids' list.
-    groups: dict[str, list[dict]] = {}
+    def _resolve_root(proc: dict) -> Path:
+        """Resolve project root from process info: prd > config > default."""
+        if proc.get('prd'):
+            return _resolve_project_root(proc['prd'], config.project_root)
+        if proc.get('config_path'):
+            root = _read_project_root_from_config(proc['config_path'])
+            if root is not None:
+                return root
+        return config.project_root
+
+    # Group processes by resolved project root — multiple PIDs targeting the
+    # same project are merged into a single entry with a 'pids' list.
+    groups: dict[Path, list[dict]] = {}
     for proc in processes:
-        groups.setdefault(proc['prd'], []).append(proc)
+        root = _resolve_root(proc)
+        groups.setdefault(root, []).append(proc)
 
     # Cache per-project data so we don't re-read the same tasks.json
-    # when multiple PRDs share a project root.
+    # when multiple processes share a project root.
     project_cache: dict[Path, tuple[list[dict], dict[str, dict]]] = {}
 
     result: list[dict] = []
-    for prd, group in groups.items():
-        project_root = _resolve_project_root(prd, config.project_root)
-
+    for project_root, group in groups.items():
         if project_root not in project_cache:
             tasks_json = project_root / '.taskmaster' / 'tasks' / 'tasks.json'
             worktrees_dir = project_root / '.worktrees'
@@ -285,9 +330,16 @@ def discover_orchestrators(config: DashboardConfig) -> list[dict]:
             'blocked': sum(1 for t in tasks if t.get('status') == 'blocked'),
             'pending': sum(1 for t in tasks if t.get('status') == 'pending'),
         }
+
+        # Display label: prefer PRD path, fall back to project root path
+        prd = next((p['prd'] for p in group if p.get('prd')), None)
+        label = prd if prd else str(project_root)
+
         result.append({
             'pids': [p['pid'] for p in group],
             'prd': prd,
+            'label': label,
+            'project_root': str(project_root),
             'running': any(p['running'] for p in group),
             'started': group[0]['started'],
             'tasks': tasks,

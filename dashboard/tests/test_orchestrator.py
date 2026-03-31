@@ -17,8 +17,8 @@ class TestFindRunningOrchestrators:
 
         ps_output = (
             "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n"
-            "leo       1234  0.5  1.2 123456  7890 ?        Sl   Mar18   0:05 python -m orchestrator --prd /home/leo/prd1.md\n"
-            "leo       5678  0.3  0.8 234567  4567 ?        Sl   10:30   0:02 python -m orchestrator --prd /home/leo/prd2.md\n"
+            "leo       1234  0.5  1.2 123456  7890 ?        Sl   Mar18   0:05 python -m orchestrator run --prd /home/leo/prd1.md\n"
+            "leo       5678  0.3  0.8 234567  4567 ?        Sl   10:30   0:02 python -m orchestrator run --prd /home/leo/prd2.md\n"
         )
         mock_result = subprocess.CompletedProcess(args=['ps', 'aux'], returncode=0, stdout=ps_output, stderr='')
 
@@ -28,6 +28,7 @@ class TestFindRunningOrchestrators:
         assert len(result) == 2
         assert result[0]['pid'] == 1234
         assert result[0]['prd'] == '/home/leo/prd1.md'
+        assert result[0]['config_path'] is None
         assert result[0]['running'] is True
         assert isinstance(result[0]['started'], str)
         assert result[1]['pid'] == 5678
@@ -42,8 +43,8 @@ class TestFindRunningOrchestrators:
 
         ps_output = (
             "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n"
-            "leo       1234  0.5  1.2 123456  7890 ?        Sl   Mar18   0:05 python -m orchestrator --prd /home/leo/prd1.md\n"
-            "leo       9999  0.0  0.0  12345   678 pts/0    S+   10:31   0:00 grep orchestrator\n"
+            "leo       1234  0.5  1.2 123456  7890 ?        Sl   Mar18   0:05 python -m orchestrator run --prd /home/leo/prd1.md\n"
+            "leo       9999  0.0  0.0  12345   678 pts/0    S+   10:31   0:00 grep orchestrator run\n"
         )
         mock_result = subprocess.CompletedProcess(args=['ps', 'aux'], returncode=0, stdout=ps_output, stderr='')
 
@@ -127,8 +128,8 @@ class TestFindRunningOrchestrators:
 
         ps_output = (
             "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n"
-            "leo       N/A   0.5  1.2 123456  7890 ?        Sl   Mar18   0:05 python -m orchestrator --prd /home/leo/bad.md\n"
-            "leo       4321  0.3  0.8 234567  4567 ?        Sl   10:30   0:02 python -m orchestrator --prd /home/leo/good.md\n"
+            "leo       N/A   0.5  1.2 123456  7890 ?        Sl   Mar18   0:05 python -m orchestrator run --prd /home/leo/bad.md\n"
+            "leo       4321  0.3  0.8 234567  4567 ?        Sl   10:30   0:02 python -m orchestrator run --prd /home/leo/good.md\n"
         )
         mock_result = subprocess.CompletedProcess(args=['ps', 'aux'], returncode=0, stdout=ps_output, stderr='')
 
@@ -148,8 +149,8 @@ class TestFindRunningOrchestrators:
 
         ps_output = (
             "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n"
-            "leo 999 orchestrator --prd\n"
-            "leo       8888  0.3  0.8 234567  4567 ?        Sl   10:30   0:02 python -m orchestrator --prd /home/leo/ok.md\n"
+            "leo 999 orchestrator run --prd\n"
+            "leo       8888  0.3  0.8 234567  4567 ?        Sl   10:30   0:02 python -m orchestrator run --prd /home/leo/ok.md\n"
         )
         mock_result = subprocess.CompletedProcess(args=['ps', 'aux'], returncode=0, stdout=ps_output, stderr='')
 
@@ -159,6 +160,67 @@ class TestFindRunningOrchestrators:
         assert len(result) == 1
         assert result[0]['pid'] == 8888
         assert result[0]['prd'] == '/home/leo/ok.md'
+
+    def test_detects_config_flag_orchestrator(self):
+        """Orchestrator with --config flag is detected with config_path extracted."""
+        import subprocess
+        from unittest.mock import patch
+
+        from dashboard.data.orchestrator import find_running_orchestrators
+
+        ps_output = (
+            "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n"
+            "leo       2222  1.6  0.1 2361784 82580 ?       Sl   18:48   0:10 python orchestrator run --config /home/leo/src/reify/orchestrator.yaml\n"
+        )
+        mock_result = subprocess.CompletedProcess(args=['ps', 'aux'], returncode=0, stdout=ps_output, stderr='')
+
+        with patch('dashboard.data.orchestrator.subprocess.run', return_value=mock_result):
+            result = find_running_orchestrators()
+
+        assert len(result) == 1
+        assert result[0]['pid'] == 2222
+        assert result[0]['prd'] is None
+        assert result[0]['config_path'] == '/home/leo/src/reify/orchestrator.yaml'
+
+    def test_detects_bare_orchestrator_run(self):
+        """Orchestrator with no flags (bare 'orchestrator run') is detected."""
+        import subprocess
+        from unittest.mock import patch
+
+        from dashboard.data.orchestrator import find_running_orchestrators
+
+        ps_output = (
+            "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n"
+            "leo       3333  0.4  0.0 847184 52816 ?        Sl   18:48   0:02 /home/leo/src/dark-factory/orchestrator/.venv/bin/python3 /home/leo/src/dark-factory/orchestrator/.venv/bin/orchestrator run\n"
+        )
+        mock_result = subprocess.CompletedProcess(args=['ps', 'aux'], returncode=0, stdout=ps_output, stderr='')
+
+        with patch('dashboard.data.orchestrator.subprocess.run', return_value=mock_result):
+            result = find_running_orchestrators()
+
+        assert len(result) == 1
+        assert result[0]['pid'] == 3333
+        assert result[0]['prd'] is None
+        assert result[0]['config_path'] is None
+
+    def test_filters_non_run_orchestrator_lines(self):
+        """Lines containing 'orchestrator' but not 'orchestrator run' are excluded."""
+        import subprocess
+        from unittest.mock import patch
+
+        from dashboard.data.orchestrator import find_running_orchestrators
+
+        ps_output = (
+            "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n"
+            "leo       4444  0.1  0.5 123456  7890 ?        Sl   Mar18   0:05 python -m dashboard.app --orchestrator-panel\n"
+            "leo       5555  0.1  0.5 123456  7890 ?        Sl   Mar18   0:05 uv run --project orchestrator orchestrator status\n"
+        )
+        mock_result = subprocess.CompletedProcess(args=['ps', 'aux'], returncode=0, stdout=ps_output, stderr='')
+
+        with patch('dashboard.data.orchestrator.subprocess.run', return_value=mock_result):
+            result = find_running_orchestrators()
+
+        assert result == []
 
 
 class TestLoadTaskTree:
@@ -502,7 +564,7 @@ class TestDiscoverOrchestrators:
 
         # Mock one running orchestrator — PRD inside tmp_path so project root resolves
         prd_path = str(tmp_path / 'prd.md')
-        mock_procs = [{'pid': 1234, 'prd': prd_path, 'running': True, 'started': 'Mar18'}]
+        mock_procs = [{'pid': 1234, 'prd': prd_path, 'config_path': None, 'running': True, 'started': 'Mar18'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
 
@@ -540,7 +602,7 @@ class TestDiscoverOrchestrators:
         config = DashboardConfig(project_root=tmp_path)
 
         # PRD inside tmp_path but no .taskmaster — falls back to config.project_root
-        mock_procs = [{'pid': 5678, 'prd': str(tmp_path / 'prd.md'), 'running': True, 'started': '10:30'}]
+        mock_procs = [{'pid': 5678, 'prd': str(tmp_path / 'prd.md'), 'config_path': None, 'running': True, 'started': '10:30'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
 
@@ -574,7 +636,7 @@ class TestDiscoverOrchestrators:
         (task_dir / 'plan.json').write_text(json.dumps({'steps': steps}))
 
         prd_path = str(tmp_path / 'prd.md')
-        mock_procs = [{'pid': 9000, 'prd': prd_path, 'running': True, 'started': 'Mar19'}]
+        mock_procs = [{'pid': 9000, 'prd': prd_path, 'config_path': None, 'running': True, 'started': 'Mar19'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
 
@@ -613,7 +675,7 @@ class TestDiscoverOrchestrators:
             d.mkdir()
 
         prd_path = str(tmp_path / 'prd.md')
-        mock_procs = [{'pid': 1111, 'prd': prd_path, 'running': True, 'started': 'Mar19'}]
+        mock_procs = [{'pid': 1111, 'prd': prd_path, 'config_path': None, 'running': True, 'started': 'Mar19'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
 
@@ -632,7 +694,7 @@ class TestDiscoverOrchestrators:
 
         config = DashboardConfig(project_root=tmp_path)
 
-        mock_procs = [{'pid': 1234, 'prd': '/home/leo/prd.md', 'running': True, 'started': 'Mar18'}]
+        mock_procs = [{'pid': 1234, 'prd': '/home/leo/prd.md', 'config_path': None, 'running': True, 'started': 'Mar18'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
 
@@ -668,8 +730,8 @@ class TestDiscoverOrchestrators:
         # Two processes with identical PRD path but different PIDs
         prd_path = str(tmp_path / 'prd.md')
         mock_procs = [
-            {'pid': 1234, 'prd': prd_path, 'running': True, 'started': 'Mar18'},
-            {'pid': 5678, 'prd': prd_path, 'running': False, 'started': 'Mar18'},
+            {'pid': 1234, 'prd': prd_path, 'config_path': None, 'running': True, 'started': 'Mar18'},
+            {'pid': 5678, 'prd': prd_path, 'config_path': None, 'running': False, 'started': 'Mar18'},
         ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
@@ -683,8 +745,8 @@ class TestDiscoverOrchestrators:
         assert '1' in entry['worktrees']
         assert entry['summary']['total'] == 1
 
-    def test_different_prds_produce_separate_entries(self, tmp_path):
-        """Two processes with different PRD paths produce two separate entries."""
+    def test_different_projects_produce_separate_entries(self, tmp_path):
+        """Two processes targeting different project roots produce two separate entries."""
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -692,18 +754,23 @@ class TestDiscoverOrchestrators:
 
         config = DashboardConfig(project_root=tmp_path)
 
-        # Two processes on different PRDs
+        # Create two separate projects with .taskmaster/ dirs
+        proj_a = tmp_path / 'proj_a'
+        (proj_a / '.taskmaster').mkdir(parents=True)
+        proj_b = tmp_path / 'proj_b'
+        (proj_b / '.taskmaster').mkdir(parents=True)
+
         mock_procs = [
-            {'pid': 1234, 'prd': '/prd1.md', 'running': True, 'started': 'Mar18'},
-            {'pid': 5678, 'prd': '/prd2.md', 'running': True, 'started': 'Mar18'},
+            {'pid': 1234, 'prd': str(proj_a / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
+            {'pid': 5678, 'prd': str(proj_b / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
         ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
 
         assert len(result) == 2
-        pids_by_prd = {entry['prd']: entry['pids'] for entry in result}
-        assert pids_by_prd['/prd1.md'] == [1234]
-        assert pids_by_prd['/prd2.md'] == [5678]
+        pids_by_root = {entry['project_root']: entry['pids'] for entry in result}
+        assert pids_by_root[str(proj_a)] == [1234]
+        assert pids_by_root[str(proj_b)] == [5678]
 
     def test_grouped_running_true_when_any_running(self, tmp_path):
         """Grouped entry has running=True if at least one process is still running."""
@@ -716,8 +783,8 @@ class TestDiscoverOrchestrators:
 
         # One running, one not — grouped result should be running=True
         mock_procs = [
-            {'pid': 1234, 'prd': '/prd.md', 'running': True, 'started': 'Mar18'},
-            {'pid': 5678, 'prd': '/prd.md', 'running': False, 'started': 'Mar17'},
+            {'pid': 1234, 'prd': '/prd.md', 'config_path': None, 'running': True, 'started': 'Mar18'},
+            {'pid': 5678, 'prd': '/prd.md', 'config_path': None, 'running': False, 'started': 'Mar17'},
         ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
@@ -736,8 +803,8 @@ class TestDiscoverOrchestrators:
 
         # Both not running — grouped result should be running=False
         mock_procs = [
-            {'pid': 1234, 'prd': '/prd.md', 'running': False, 'started': 'Mar18'},
-            {'pid': 5678, 'prd': '/prd.md', 'running': False, 'started': 'Mar17'},
+            {'pid': 1234, 'prd': '/prd.md', 'config_path': None, 'running': False, 'started': 'Mar18'},
+            {'pid': 5678, 'prd': '/prd.md', 'config_path': None, 'running': False, 'started': 'Mar17'},
         ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
@@ -837,26 +904,26 @@ class TestDiscoverOrchestratorsPerProject:
         ]}))
 
         mock_procs = [
-            {'pid': 1000, 'prd': str(proj_a / 'docs' / 'prd.md'), 'running': True, 'started': 'Mar18'},
-            {'pid': 2000, 'prd': str(proj_b / 'docs' / 'prd.md'), 'running': True, 'started': 'Mar18'},
+            {'pid': 1000, 'prd': str(proj_a / 'docs' / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
+            {'pid': 2000, 'prd': str(proj_b / 'docs' / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
         ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
 
-        by_prd = {e['prd']: e for e in result}
+        by_root = {e['project_root']: e for e in result}
 
-        a_entry = by_prd[str(proj_a / 'docs' / 'prd.md')]
+        a_entry = by_root[str(proj_a)]
         assert len(a_entry['tasks']) == 2
         assert a_entry['summary']['total'] == 2
         assert a_entry['summary']['done'] == 1
 
-        b_entry = by_prd[str(proj_b / 'docs' / 'prd.md')]
+        b_entry = by_root[str(proj_b)]
         assert len(b_entry['tasks']) == 1
         assert b_entry['summary']['total'] == 1
         assert b_entry['summary']['pending'] == 1
 
-    def test_same_project_prds_share_task_tree(self, tmp_path):
-        """Two PRDs in the same project see the same task tree."""
+    def test_same_project_prds_merged_into_single_entry(self, tmp_path):
+        """Two PRDs in the same project are merged into one entry (grouped by project root)."""
         import json
         from unittest.mock import patch
 
@@ -871,16 +938,16 @@ class TestDiscoverOrchestratorsPerProject:
         ]}))
 
         mock_procs = [
-            {'pid': 1000, 'prd': str(tmp_path / 'prd1.md'), 'running': True, 'started': 'Mar18'},
-            {'pid': 2000, 'prd': str(tmp_path / 'prd2.md'), 'running': True, 'started': 'Mar18'},
+            {'pid': 1000, 'prd': str(tmp_path / 'prd1.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
+            {'pid': 2000, 'prd': str(tmp_path / 'prd2.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
         ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
 
-        # Both see the same task tree
-        assert len(result) == 2
-        for entry in result:
-            assert len(entry['tasks']) == 1
+        # Both resolve to the same project root → merged into one entry
+        assert len(result) == 1
+        assert set(result[0]['pids']) == {1000, 2000}
+        assert len(result[0]['tasks']) == 1
 
     def test_worktrees_loaded_per_project(self, tmp_path):
         """Each orchestrator sees worktrees from its own project."""
@@ -913,17 +980,17 @@ class TestDiscoverOrchestratorsPerProject:
         (wt_b / 'plan.json').write_text(json.dumps({'steps': [{'id': 's1', 'status': 'pending'}]}))
 
         mock_procs = [
-            {'pid': 1000, 'prd': str(proj_a / 'prd.md'), 'running': True, 'started': 'Mar18'},
-            {'pid': 2000, 'prd': str(proj_b / 'prd.md'), 'running': True, 'started': 'Mar18'},
+            {'pid': 1000, 'prd': str(proj_a / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
+            {'pid': 2000, 'prd': str(proj_b / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
         ]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
 
-        by_prd = {e['prd']: e for e in result}
-        assert set(by_prd[str(proj_a / 'prd.md')]['worktrees'].keys()) == {'3'}
-        assert by_prd[str(proj_a / 'prd.md')]['worktrees']['3']['phase'] == 'DONE'
-        assert set(by_prd[str(proj_b / 'prd.md')]['worktrees'].keys()) == {'5'}
-        assert by_prd[str(proj_b / 'prd.md')]['worktrees']['5']['phase'] == 'EXECUTE'
+        by_root = {e['project_root']: e for e in result}
+        assert set(by_root[str(proj_a)]['worktrees'].keys()) == {'3'}
+        assert by_root[str(proj_a)]['worktrees']['3']['phase'] == 'DONE'
+        assert set(by_root[str(proj_b)]['worktrees'].keys()) == {'5'}
+        assert by_root[str(proj_b)]['worktrees']['5']['phase'] == 'EXECUTE'
 
     def test_fallback_to_config_project_root(self, tmp_path):
         """When PRD path has no .taskmaster/ ancestor, falls back to config project_root."""
@@ -940,7 +1007,7 @@ class TestDiscoverOrchestratorsPerProject:
             {'id': '1', 'title': 'T', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
         ]}))
 
-        mock_procs = [{'pid': 1000, 'prd': '/nonexistent/prd.md', 'running': True, 'started': 'Mar18'}]
+        mock_procs = [{'pid': 1000, 'prd': '/nonexistent/prd.md', 'config_path': None, 'running': True, 'started': 'Mar18'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
             result = discover_orchestrators(config)
 

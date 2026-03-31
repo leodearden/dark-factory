@@ -7,12 +7,12 @@
 
   {% if orchestrators %}
     {% for orch in orchestrators %}
-      {% set orch_key = orch.prd | replace('/', '-') | replace('.', '-') %}
+      {% set orch_key = orch.label | replace('/', '-') | replace('.', '-') %}
       <div x-data id="orch-{{ orch_key }}" class="bg-gray-800 rounded-lg p-6 mb-4">
         <div class="flex items-center gap-3">
           {% if orch.pids|length > 1 %}<span class="text-gray-100 font-semibold">PIDs {{ orch.pids|join(", ") }}</span>{% else %}<span class="text-gray-100 font-semibold">PID {{ orch.pids[0] }}</span>{% endif %}
           {{ status_badge('running' if orch.running else 'completed', aria_label='Orchestrator status', color='bg-green-600' if orch.running else 'bg-gray-600') }}
-          <span class="text-gray-400 text-sm">{{ orch.prd.split('/')[-1] }}</span>
+          <span class="text-gray-400 text-sm">{{ orch.label.split('/')[-1] }}</span>
         </div>
 
         {% if orch.summary.total > 0 %}
