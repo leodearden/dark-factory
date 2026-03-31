@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -216,6 +217,34 @@ def project_name(value: str | None) -> str:
 
 
 templates.env.filters['project_name'] = project_name
+
+
+def css_id(value: str | None) -> str:
+    """Convert a string to a safe CSS/HTML ID by replacing non-alphanumeric characters.
+
+    Rules:
+    - Replace any character that is not alphanumeric or underscore with an underscore.
+    - Collapse consecutive underscores into a single underscore.
+    - Strip leading and trailing underscores.
+    - If the result is empty, return 'unknown'.
+
+    Examples:
+        None                          -> 'unknown'
+        ''                            -> 'unknown'
+        'dark_factory'                -> 'dark_factory'
+        '/home/leo/src/dark-factory'  -> 'home_leo_src_dark_factory'
+        'my-project.name here'        -> 'my_project_name_here'
+        '---'                         -> 'unknown'
+    """
+    if not value:
+        return 'unknown'
+    result = re.sub(r'[^a-zA-Z0-9_]', '_', value)
+    result = re.sub(r'_+', '_', result)
+    result = result.strip('_')
+    return result or 'unknown'
+
+
+templates.env.filters['css_id'] = css_id
 
 
 @asynccontextmanager
