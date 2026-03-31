@@ -20,6 +20,15 @@ from fastapi.templating import Jinja2Templates
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data.chart_utils import ChartData, group_top_n
+from dashboard.data.costs import (
+    get_account_events,
+    get_cost_by_account,
+    get_cost_by_project,
+    get_cost_by_role,
+    get_cost_summary,
+    get_cost_trend,
+    get_run_cost_breakdown,
+)
 from dashboard.data.db import DbPool
 from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.performance import (
@@ -36,15 +45,6 @@ from dashboard.data.reconciliation import (
     get_latest_verdict,
     get_recent_runs,
     get_watermarks,
-)
-from dashboard.data.costs import (
-    get_account_events,
-    get_cost_by_account,
-    get_cost_by_project,
-    get_cost_by_role,
-    get_cost_summary,
-    get_cost_trend,
-    get_run_cost_breakdown,
 )
 from dashboard.data.utils import parse_utc
 from dashboard.data.write_journal import (
