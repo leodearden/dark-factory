@@ -187,14 +187,14 @@
       "id": "step-22",
       "type": "impl",
       "description": "In TargetedReconciler, add planned_episode_registry attribute (optional, default None). In _on_task_done, after step 1 (search for existing knowledge), add step 1.5: search with include_planned=True for title+description. For each result with metadata.get('planned'), extract provenance UUIDs and call registry.promote(uuid). Log promotion as journal action.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "3a43c3f3"
     },
     {
       "id": "step-23",
       "type": "test",
       "description": "Write integration test in test_temporal_guards.py: full round-trip \u2014 add_episode with temporal_context='planning' enqueues correctly; _execute_graphiti_write registers planned episode; _search_graphiti excludes the edge; after promote, _search_graphiti includes the edge. Uses real PlannedEpisodeRegistry with tmp_path SQLite, mocked graphiti/mem0 backends.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
