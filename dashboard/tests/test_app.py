@@ -1054,30 +1054,30 @@ class TestPollingErrorRecovery:
         )
 
     def test_response_error_has_recovery_listener(self, client):
-        """htmx:responseError must appear at least twice: once in error display handler, once in recovery."""
+        """htmx:responseError must appear at least 3 times: once in showError, once in markStampFailed, once in poll recovery."""
         html = client.get('/').text
         count = html.count('htmx:responseError')
-        assert count >= 2, (
-            f"Expected 'htmx:responseError' to appear at least 2 times (got {count}) — "
-            "one for error display, one for poll recovery."
+        assert count >= 3, (
+            f"Expected 'htmx:responseError' to appear at least 3 times (got {count}) — "
+            "once in showError, once in markStampFailed, once in poll recovery."
         )
 
     def test_timeout_has_recovery_listener(self, client):
-        """htmx:timeout must appear at least twice: once in error display handler, once in recovery."""
+        """htmx:timeout must appear at least 3 times: once in showError, once in markStampFailed, once in poll recovery."""
         html = client.get('/').text
         count = html.count('htmx:timeout')
-        assert count >= 2, (
-            f"Expected 'htmx:timeout' to appear at least 2 times (got {count}) — "
-            "one for error display, one for poll recovery."
+        assert count >= 3, (
+            f"Expected 'htmx:timeout' to appear at least 3 times (got {count}) — "
+            "once in showError, once in markStampFailed, once in poll recovery."
         )
 
     def test_send_error_has_recovery_listener(self, client):
-        """htmx:sendError must appear at least twice: once in error display handler, once in recovery."""
+        """htmx:sendError must appear at least 3 times: once in showError, once in markStampFailed, once in poll recovery."""
         html = client.get('/').text
         count = html.count('htmx:sendError')
-        assert count >= 2, (
-            f"Expected 'htmx:sendError' to appear at least 2 times (got {count}) — "
-            "one for error display, one for poll recovery."
+        assert count >= 3, (
+            f"Expected 'htmx:sendError' to appear at least 3 times (got {count}) — "
+            "once in showError, once in markStampFailed, once in poll recovery."
         )
 
 
