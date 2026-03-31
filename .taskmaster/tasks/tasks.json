@@ -6246,6 +6246,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 342,
+        "title": "Tighten weak test assertions in test_costs_page.py",
+        "description": "Fix 8 weak/misleading assertions in dashboard/tests/test_costs_page.py:\n1. test_default_window_7d_marked_active: assert Alpine store contains '7d' default (not just string '7d' anywhere)\n2. test_summary_shows_fallback_content_on_error: assert specific fallback text, not `'<' in html`\n3. test_hx_vals_count: assert Alpine.store pattern count == 7 (currently only asserts old pattern == 0)\n4. test_sections_use_morph_swap: assert morph:innerHTML count == 7 (currently asserts presence once)\n5. test_renders_total_spend: assert computed value '$17.34' not just '$'\n6. test_handles_null_task_id: add content assertions beyond status_code\n7. TestCostsByAccountPartial: add assertions for spend values from mock data\n8. test_role_names_appear_in_output: assert all mock roles, not just 'implementer'\n\nFiles: dashboard/tests/test_costs_page.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6258,7 +6269,7 @@
       ],
       "created": "2026-03-31T09:25:44.356Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T09:26:27.112Z"
+      "updated": "2026-03-31T09:26:32.329Z"
     }
   }
 }
