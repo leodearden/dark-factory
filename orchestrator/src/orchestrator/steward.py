@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from datetime import UTC, datetime
+
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
 
@@ -355,7 +357,9 @@ class TaskSteward:
             if self._session_id is not None:
                 kwargs['resume_session_id'] = self._session_id
 
+            started_at = datetime.now(UTC).isoformat()
             result: AgentResult = await invoke_agent(**kwargs)
+            completed_at = datetime.now(UTC).isoformat()
 
             # Cap-hit: sleep, then reset session (can't resume across account switch)
             if self.usage_gate and self.usage_gate.detect_cap_hit(
@@ -390,6 +394,30 @@ class TaskSteward:
                 self._session_id = result.session_id
 
             result.account_name = account_name
+
+            # Record cost to CostStore if available
+            if self._cost_store is not None:
+                try:
+                    await self._cost_store.save_invocation(
+                        run_id=self._run_id,
+                        task_id=self.task_id,
+                        project_id=self._project_id,
+                        account_name=account_name,
+                        model=self.config.models.steward,
+                        role='steward',
+                        cost_usd=result.cost_usd,
+                        input_tokens=result.input_tokens,
+                        output_tokens=result.output_tokens,
+                        cache_read_tokens=result.cache_read_tokens,
+                        cache_create_tokens=result.cache_create_tokens,
+                        duration_ms=result.duration_ms,
+                        capped=False,
+                        started_at=started_at,
+                        completed_at=completed_at,
+                    )
+                except Exception:
+                    logger.warning('Failed to save steward invocation cost', exc_info=True)
+
             return result
 
     # ------------------------------------------------------------------
