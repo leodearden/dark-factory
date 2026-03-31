@@ -6595,6 +6595,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 354,
+        "title": "Remove unused are_all_planned method from PlannedEpisodeRegistry",
+        "description": "PlannedEpisodeRegistry.are_all_planned() is defined, tested, and has correct semantics — but it is never called from any production code path. The _search_graphiti method instead calls get_planned_uuids() once and inlines the `all(ep in planned_uuids for ep in provenance)` check directly (a more efficient bulk-fetch approach).\n\nThe method is dead code with 5 dedicated test cases. Additionally, it lacks project_id scoping (queries globally), which is inconsistent with get_planned_uuids() that properly scopes by project_id.\n\nFix: Remove are_all_planned() and its test cases, since the production code has chosen the bulk-fetch strategy. This removes duplicated logic and shrinks the API surface.\n\nmemory_hints: search for \"are_all_planned\" and \"PlannedEpisodeRegistry dead code\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6607,7 +6618,7 @@
       ],
       "created": "2026-03-31T14:20:35.758Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T14:20:52.961Z"
+      "updated": "2026-03-31T14:20:59.379Z"
     }
   }
 }
