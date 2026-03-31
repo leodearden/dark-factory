@@ -105,8 +105,4 @@ reconciliation:
     wait_for_reset: true
     probe_interval_secs: 300
     max_probe_interval_secs: 1800
-    accounts:
-      - name: max-b
-        oauth_token_env: CLAUDE_OAUTH_TOKEN_B
-      - name: max-a
-        oauth_token_env: CLAUDE_OAUTH_TOKEN_A
+    accounts_file: "${DARK_FACTORY_ROOT:/home/leo/src/dark-factory}/config/usage-accounts.yaml"
