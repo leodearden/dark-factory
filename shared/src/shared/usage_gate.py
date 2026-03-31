@@ -267,7 +267,8 @@ class UsageGate:
         if acct.pause_started_at is None:
             acct.pause_started_at = datetime.now(UTC)
         logger.warning(f'Account {acct.name} CAPPED: {reason}')
-        self._fire_cost_event(acct.name, 'cap_hit', json.dumps({'reason': reason}))
+        if self._cost_store:
+            self._fire_cost_event(acct.name, 'cap_hit', json.dumps({'reason': reason}))
         self._start_account_resume_probe(acct)
 
         # If all accounts are now capped, close the global gate
