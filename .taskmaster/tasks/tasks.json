@@ -6584,6 +6584,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 353,
+        "title": "Extract shared AsyncSQLiteService base for SQLite lifecycle",
+        "description": "Three classes now repeat identical SQLite initialization boilerplate: DurableWriteQueue, EventBuffer, and PlannedEpisodeRegistry. Each has the same `PRAGMA journal_mode=WAL` + `PRAGMA busy_timeout=5000` setup, the same `_db: aiosqlite.Connection | None` field, and the same initialize()/close() lifecycle shape.\n\nConsider introducing a small `AsyncSQLiteService` base class or a module-level `_open_db(path)` helper that applies the standard PRAGMAs. This would reduce three copies of identical PRAGMA setup to one and make future PRAGMA changes apply uniformly.\n\nmemory_hints: search for \"SQLite PRAGMA boilerplate\" and \"DurableWriteQueue EventBuffer PlannedEpisodeRegistry\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6596,7 +6607,7 @@
       ],
       "created": "2026-03-31T14:20:35.758Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T14:20:48.165Z"
+      "updated": "2026-03-31T14:20:52.961Z"
     }
   }
 }
