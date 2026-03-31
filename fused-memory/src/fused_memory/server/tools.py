@@ -15,6 +15,7 @@ from fused_memory.utils.validation import validate_project_id, validate_project_
 
 if TYPE_CHECKING:
     from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.reconciliation.harness import ReconciliationHarness
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
@@ -133,6 +134,8 @@ def create_mcp_server(
     memory_service: MemoryService,
     task_interceptor: TaskInterceptor | None = None,
     write_journal: WriteJournal | None = None,
+    *,
+    reconciliation_harness: ReconciliationHarness | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
@@ -756,6 +759,35 @@ def create_mcp_server(
         except Exception as e:
             logger.error(f'trigger_reconciliation error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def unhalt_reconciliation(project_id: str) -> dict[str, Any]:
+        """Clear a judge-imposed halt on reconciliation for a project.
+
+        The judge halts a project when it detects serious issues or error
+        trends. This tool clears the halt so reconciliation cycles can resume.
+
+        Args:
+            project_id: Project to unhalt
+        """
+        if err := validate_project_id(project_id):
+            return err
+        if reconciliation_harness is None or reconciliation_harness.judge is None:
+            return {
+                'error': 'Reconciliation harness or judge is not configured.',
+                'error_type': 'ConfigurationError',
+            }
+        was_halted = reconciliation_harness.judge.is_halted(project_id)
+        reconciliation_harness.judge.unhalt(project_id)
+        return {
+            'status': 'unhalted' if was_halted else 'already_running',
+            'project_id': project_id,
+            'message': (
+                f'Reconciliation unhalted for {project_id}. Next cycle will run within ~5 seconds.'
+                if was_halted
+                else f'Project {project_id} was not halted.'
+            ),
+        }
 
     # ------------------------------------------------------------------
     # Task proxy tools (always registered; errors if Taskmaster unavailable)

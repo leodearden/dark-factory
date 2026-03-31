@@ -183,7 +183,10 @@ async def run_server():
         task_interceptor = TaskInterceptor(taskmaster, None, event_buffer, task_committer)
 
     # Create MCP server with both memory and task tools
-    mcp = create_mcp_server(memory_service, task_interceptor, write_journal)
+    mcp = create_mcp_server(
+        memory_service, task_interceptor, write_journal,
+        reconciliation_harness=reconciliation_harness,
+    )
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.port
     mcp.settings.stateless_http = config.server.stateless_http
