@@ -849,7 +849,7 @@ class MemoryService:
         edges = await self.graphiti.search(
             query=query,
             group_ids=[scope.graphiti_group_id],
-            num_results=limit,
+            num_results=int(limit * 1.5) + 1,
         )
 
         # Fetch planned UUIDs once (avoid per-edge DB hits).
