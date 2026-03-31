@@ -64,7 +64,7 @@ _WINDOW_DAYS: dict[str, int] = {
 }
 
 
-def _parse_window(request: Request) -> int:
+def _parse_window(request: Any) -> int:
     """Parse the ``window`` query parameter and return the corresponding days int.
 
     Valid values: '24h' → 1, '7d' → 7, '30d' → 30, 'all' → 3650.

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
-
 
 # ---------------------------------------------------------------------------
 # Step-1: _WINDOW_DAYS mapping and _parse_window helper
@@ -39,12 +37,7 @@ class TestParseWindow:
 
     def _make_request(self, window: str | None):
         """Create a minimal fake request with a query_params dict."""
-        from starlette.testclient import TestClient
-        from dashboard.app import app
-
-        # Use TestClient to make real requests and test via route
-        # We'll test _parse_window directly via its module.
-        # Build a mock Request with query_params
+        # Build a duck-typed fake request with query_params for _parse_window
         class FakeQueryParams:
             def __init__(self, d):
                 self._d = d
