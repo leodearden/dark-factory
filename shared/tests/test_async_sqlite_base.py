@@ -345,3 +345,68 @@ class TestAsyncSqliteBaseClose:
                 row = await cur.fetchone()
         assert row is not None
         assert row[0] == 'hello'
+
+
+# ---------------------------------------------------------------------------
+# Step-9: AsyncSqliteBase context manager (__aenter__ / __aexit__)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAsyncSqliteBaseContextManager:
+    """Tests for AsyncSqliteBase.__aenter__ and __aexit__."""
+
+    async def test_aenter_opens_connection(self, tmp_path: Path) -> None:
+        """__aenter__ opens the connection (_conn is not None inside the block)."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        store = _Store(tmp_path / 'store.db')
+        async with store:
+            assert store._conn is not None
+
+    async def test_aenter_returns_self(self, tmp_path: Path) -> None:
+        """__aenter__ returns self."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        store = _Store(tmp_path / 'store.db')
+        async with store as ctx:
+            assert ctx is store
+
+    async def test_aexit_closes_connection_on_normal_exit(self, tmp_path: Path) -> None:
+        """__aexit__ closes the connection after the block exits normally."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        store = _Store(tmp_path / 'store.db')
+        async with store:
+            pass
+        assert store._conn is None
+
+    async def test_aexit_closes_connection_on_exception(self, tmp_path: Path) -> None:
+        """__aexit__ closes the connection even when the body raises."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        store = _Store(tmp_path / 'store.db')
+        with pytest.raises(ValueError, match='boom'):
+            async with store:
+                raise ValueError('boom')
+        assert store._conn is None
