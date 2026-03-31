@@ -1,0 +1,85 @@
+{# Cost trend partial — daily line chart with one line per project #}
+<div>
+  <h3 class="text-sm font-semibold text-gray-300 mb-4">Cost Trend (Daily)</h3>
+  {% if trend %}
+    <div class="bg-gray-800 rounded-lg p-4" style="height: 280px; position: relative">
+      <canvas id="costTrendChart"></canvas>
+    </div>
+  {% else %}
+    <div class="text-gray-500 text-sm py-8 text-center">No trend data available for this window.</div>
+  {% endif %}
+</div>
+
+<script>
+(function() {
+  var trend = {{ trend | tojson }};
+
+  var palette = [
+    '#60a5fa','#34d399','#fbbf24','#f87171','#a78bfa',
+    '#fb923c','#38bdf8','#4ade80','#e879f9','#94a3b8'
+  ];
+
+  function getOrDestroyChart(canvasId) {
+    var el = document.getElementById(canvasId);
+    if (!el) return null;
+    var existing = Chart.getChart(el);
+    if (existing) existing.destroy();
+    return el;
+  }
+
+  function renderChart() {
+    var el = getOrDestroyChart('costTrendChart');
+    if (!el) return;
+
+    var projectIds = Object.keys(trend);
+    if (projectIds.length === 0) return;
+
+    // Use labels from the first project (all projects share the same day range)
+    var labels = trend[projectIds[0]].map(function(d) { return d.day; });
+
+    var datasets = projectIds.map(function(projectId, idx) {
+      return {
+        label: projectId,
+        data: trend[projectId].map(function(d) { return d.total; }),
+        borderColor: palette[idx % palette.length],
+        backgroundColor: palette[idx % palette.length] + '33',  // 20% opacity fill
+        borderWidth: 2,
+        pointRadius: 3,
+        tension: 0.3,
+        fill: false,
+      };
+    });
+
+    new Chart(el, {
+      type: 'line',
+      data: { labels: labels, datasets: datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { labels: { color: '#9ca3af', font: { size: 11 } } },
+        },
+        scales: {
+          x: {
+            ticks: { color: '#9ca3af', maxRotation: 45 },
+            grid: { color: 'rgba(75,85,99,0.3)' },
+          },
+          y: {
+            ticks: {
+              color: '#9ca3af',
+              callback: function(v) { return '$' + v.toFixed(2); },
+            },
+            grid: { color: 'rgba(75,85,99,0.3)' },
+            beginAtZero: true,
+          },
+        },
+      },
+    });
+  }
+
+  document.addEventListener('htmx:afterSettle', renderChart, { once: true });
+  if (document.readyState !== 'loading') {
+    renderChart();
+  }
+})();
+</script>
