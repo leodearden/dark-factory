@@ -586,8 +586,9 @@ class TestCostTrend:
         # Use a dynamic assertion so this passes near UTC midnight when fixture
         # invocations might span two calendar days.
         zero_days = [e for e in df if e['total'] == 0.0]
-        non_zero_days = {e['day'] for e in df if e['total'] > 0}
-        assert len(zero_days) == 7 - len(non_zero_days)
+        # Verify gap-filling actually works: exactly 7 days, at least one with 0.0.
+        assert len(df) == 7
+        assert len(zero_days) > 0
 
 
 # ---------------------------------------------------------------------------
