@@ -66,7 +66,7 @@
       "id": "step-7",
       "type": "test",
       "description": "Tighten test_sections_use_morph_swap: replace `assert 'morph:innerHTML' in html` with `assert html.count('morph:innerHTML') == 7` to verify all 7 polling sections use morph swap, not just one",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {

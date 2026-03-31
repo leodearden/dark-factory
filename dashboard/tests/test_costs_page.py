@@ -150,9 +150,9 @@ class TestCostsPage:
         assert 'all' in html.lower()
 
     def test_sections_use_morph_swap(self, client):
-        """All HTMX polling sections must use morph:innerHTML for DOM diffing."""
+        """All 7 HTMX polling sections must use morph:innerHTML for DOM diffing."""
         html = client.get('/costs').text
-        assert 'morph:innerHTML' in html
+        assert html.count('morph:innerHTML') == 7
 
     def test_nav_costs_link_is_active(self, client):
         """The 'Costs' nav link should have the active class on the /costs page."""
