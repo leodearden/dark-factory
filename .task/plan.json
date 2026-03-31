@@ -1,0 +1,172 @@
+{
+  "task_id": "322",
+  "title": "Migrate fused-memory SQLite stores to AsyncSqliteBase",
+  "files": [
+    "fused-memory/src/fused_memory/reconciliation/event_buffer.py",
+    "fused-memory/src/fused_memory/reconciliation/journal.py",
+    "fused-memory/src/fused_memory/server/main.py",
+    "fused-memory/src/fused_memory/services/memory_service.py",
+    "fused-memory/tests/test_sqlite_migration.py",
+    "fused-memory/tests/test_event_buffer.py",
+    "fused-memory/tests/test_journal.py",
+    "fused-memory/tests/test_harness.py",
+    "fused-memory/tests/test_task_interceptor.py",
+    "fused-memory/tests/test_targeted.py",
+    "fused-memory/tests/test_durable_queue.py",
+    "fused-memory/tests/test_e2e_durable_queue.py",
+    "fused-memory/tests/test_write_journal.py",
+    "fused-memory/tests/test_journaling_integration.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/reconciliation",
+    "fused-memory/src/fused_memory/services",
+    "fused-memory/src/fused_memory/server",
+    "fused-memory/tests"
+  ],
+  "analysis": "Task 315 extracted AsyncSqliteBase (shared/src/shared/async_sqlite_base.py) and migrated DurableWriteQueue and WriteJournal to it. Two stores remain on the raw aiosqlite pattern: EventBuffer and ReconciliationJournal. Both use manual initialize()/close() with duplicated WAL pragma setup, their own _require_db() guard, and manual _db attribute management.\n\nKey findings:\n- DurableWriteQueue and WriteJournal are already migrated but NO callers have been updated: server/main.py, memory_service.py, and all test files still call .initialize() which no longer exists on these classes. This task must update all callers to .open().\n- EventBuffer supports db_path=None \u2192 ':memory:' for fallback/testing. Path(':memory:').parent resolves to Path('.') so AsyncSqliteBase's mkdir works fine.\n- ReconciliationJournal does NOT set WAL pragmas or busy_timeout currently. After migration it will get WAL + busy_timeout=5000 via the base class \u2014 this is a behavioral improvement, not a regression, and matches EventBuffer which shares the same reconciliation.db file.\n- ReconciliationJournal has a post-schema migration (ALTER TABLE runs ADD COLUMN triggered_by) that must remain in the open() override.\n- Both EventBuffer and ReconciliationJournal share the same reconciliation.db path in production. Both need row_factory = aiosqlite.Row.\n- Tests for EventBuffer access _require_db() directly in 8 places; these must become _require_conn().\n- The tools.py fallback creates EventBuffer(db_path=None) without calling initialize() \u2014 this stays as-is (never opened).",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Verify AsyncSqliteBase exists at shared/src/shared/async_sqlite_base.py and DurableWriteQueue/WriteJournal already inherit from it. Confirm the base class API: __init__(db_path, busy_timeout_ms=5000), open(), close(), _require_conn(), abstract _schema property.",
+      "status": "done",
+      "commit": "abafeb12",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Create fused-memory/tests/test_sqlite_migration.py with failing tests for EventBuffer: assert it is a subclass of AsyncSqliteBase, can be opened/closed via .open()/.close(), exposes _schema property, uses _require_conn() (not _require_db), and works with db_path=None for in-memory mode.",
+      "status": "done",
+      "commit": "abafeb12"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Migrate EventBuffer to inherit from AsyncSqliteBase: (1) add 'from shared.async_sqlite_base import AsyncSqliteBase' import, (2) change class to inherit AsyncSqliteBase, (3) in __init__ convert db_path=None to Path(':memory:'), call super().__init__(path, busy_timeout_ms=5000), keep all other instance vars, (4) add @property _schema returning _BUFFER_SCHEMA_SQL, (5) replace initialize() with open() override: await super().open() then self._require_conn().row_factory = aiosqlite.Row, (6) replace all _require_db() calls with _require_conn() (19 occurrences), (7) update close() to call super().close() instead of manual _db.close()/_db=None.",
+      "status": "done",
+      "commit": "abafeb12"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Update fused-memory/tests/test_event_buffer.py: replace all .initialize() calls with .open() (~25 occurrences), replace all ._require_db() calls with ._require_conn() (8 occurrences in tests that directly access the connection for assertions).",
+      "status": "done",
+      "commit": "abafeb12"
+    },
+    {
+      "id": "step-4",
+      "type": "test",
+      "description": "Add ReconciliationJournal migration tests to test_sqlite_migration.py: assert it is a subclass of AsyncSqliteBase, can be opened/closed via .open()/.close(), exposes _schema property, uses _require_conn(), and the triggered_by column migration runs correctly during open().",
+      "status": "done",
+      "commit": "abafeb12"
+    },
+    {
+      "id": "step-5",
+      "type": "impl",
+      "description": "Migrate ReconciliationJournal to inherit from AsyncSqliteBase: (1) add import, (2) change class to inherit AsyncSqliteBase, (3) in __init__ keep data_dir attribute, compute db_path = data_dir / 'reconciliation.db', call super().__init__(db_path, busy_timeout_ms=5000), keep _write_journal attribute, (4) add @property _schema returning SCHEMA_SQL, (5) replace initialize() with open() override: await super().open(), set row_factory, then triggered_by migration, (6) replace all _require_db() calls with _require_conn() (16 occurrences), (7) update close() to call super().close().",
+      "status": "done",
+      "commit": "abafeb12"
+    },
+    {
+      "id": "step-6",
+      "type": "test",
+      "description": "Update fused-memory/tests/test_journal.py: replace all .initialize() calls with .open() (3 occurrences: fixture + 2 WriteJournal usages in combined action tests).",
+      "status": "done",
+      "commit": "abafeb12"
+    },
+    {
+      "id": "step-7",
+      "type": "impl",
+      "description": "Update production callers in server/main.py: change 4 .initialize() calls to .open() \u2014 write_journal (line 107), recon_journal (line 136), event_buffer (lines 151 and 184). Update memory_service.py: change durable_queue.initialize() to .open() (line 125).",
+      "status": "done",
+      "commit": "abafeb12"
+    },
+    {
+      "id": "step-8",
+      "type": "test",
+      "description": "Update fused-memory/tests/test_harness.py: replace .initialize() with .open() for journal and event_buffer fixtures (2 occurrences).",
+      "status": "done",
+      "commit": "abafeb12"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Update fused-memory/tests/test_task_interceptor.py: replace event_buffer .initialize() with .open() (1 occurrence in fixture).",
+      "status": "done",
+      "commit": "abafeb12"
+    },
+    {
+      "id": "step-10",
+      "type": "test",
+      "description": "Update fused-memory/tests/test_targeted.py: replace journal .initialize() with .open() (1 occurrence in fixture).",
+      "status": "done",
+      "commit": "abafeb12"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Update already-migrated store test files: (1) test_durable_queue.py \u2014 replace .initialize() with .open() (~10 occurrences), (2) test_e2e_durable_queue.py \u2014 replace .initialize() with .open() (~3 occurrences), (3) test_write_journal.py \u2014 replace .initialize() with .open() (3 occurrences), (4) test_journaling_integration.py \u2014 replace .initialize() with .open() (1 occurrence).",
+      "status": "done",
+      "commit": "abafeb12"
+    },
+    {
+      "id": "step-12",
+      "type": "test",
+      "description": "Add final verification tests to test_sqlite_migration.py: parametrized test asserting all 4 stores (DurableWriteQueue, WriteJournal, EventBuffer, ReconciliationJournal) are subclasses of AsyncSqliteBase and share the same lifecycle contract (open/close/context-manager). Verify no store has an initialize() method.",
+      "status": "done",
+      "commit": "abafeb12"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Update all callers from .initialize() to .open() rather than adding a backward-compat alias",
+      "rationale": "The task explicitly says 'Replace initialize()/open() with AsyncSqliteBase.open()'. A clean break is better than maintaining two names for the same operation. All callers are within fused-memory (no external consumers)."
+    },
+    {
+      "decision": "EventBuffer converts db_path=None to Path(':memory:') in __init__",
+      "rationale": "AsyncSqliteBase requires a Path for db_path. Path(':memory:').parent resolves to Path('.') which is safe for mkdir, and aiosqlite.connect(':memory:') works correctly. This preserves the existing in-memory fallback behavior used in server/main.py and tools.py."
+    },
+    {
+      "decision": "ReconciliationJournal gains WAL mode and busy_timeout=5000ms after migration",
+      "rationale": "Currently ReconciliationJournal sets neither WAL nor busy_timeout \u2014 a gap compared to every other store. Both EventBuffer and ReconciliationJournal operate on the same reconciliation.db file, so EventBuffer was already enabling WAL mode implicitly. Making it explicit via the base class is safer and consistent."
+    },
+    {
+      "decision": "Keep data_dir attribute on ReconciliationJournal after migration",
+      "rationale": "The base class provides db_path (= data_dir / 'reconciliation.db'), but ReconciliationJournal's constructor signature accepts data_dir for semantic clarity. The attribute costs nothing and preserves the existing constructor contract."
+    },
+    {
+      "decision": "ReconciliationJournal triggered_by migration stays in open() override",
+      "rationale": "The ALTER TABLE migration is idempotent and must run after schema creation. Placing it in the open() override after super().open() maintains the same execution order as the original initialize()."
+    },
+    {
+      "decision": "tools.py fallback EventBuffer(db_path=None) is left as-is (never opened)",
+      "rationale": "The fallback buffer is used only for tool registration in TaskInterceptor. It is never opened, so _require_conn() will fail if anything tries to use it \u2014 matching current _require_db() behavior. No change needed."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "AsyncSqliteBase (open/close/context-manager/guard)",
+      "where": "shared/src/shared/async_sqlite_base.py",
+      "how": "Both EventBuffer and ReconciliationJournal inherit from it, replacing 30-50 lines of duplicated lifecycle boilerplate per class"
+    },
+    {
+      "what": "DurableWriteQueue migration pattern (row_factory in open() override)",
+      "where": "fused-memory/src/fused_memory/services/durable_queue.py lines 110-117",
+      "how": "Both remaining stores follow the identical pattern: override open(), call super().open(), then set self._require_conn().row_factory = aiosqlite.Row"
+    },
+    {
+      "what": "WriteJournal migration pattern (schema migration in open())",
+      "where": "fused-memory/src/fused_memory/services/write_journal.py lines 66-70",
+      "how": "ReconciliationJournal's triggered_by ALTER TABLE migration follows the same pattern: run after super().open() in the open() override"
+    },
+    {
+      "what": "apply_wal_pragmas utility",
+      "where": "shared/src/shared/async_sqlite_base.py line 20",
+      "how": "Called automatically by AsyncSqliteBase.open() \u2014 no manual PRAGMA setup needed in any store"
+    }
+  ],
+  "_session_id": "322-b89b01f0",
+  "_created_at": "2026-03-31T15:38:04.017865+00:00"
+}
