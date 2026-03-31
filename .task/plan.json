@@ -59,7 +59,7 @@
       "id": "step-6",
       "type": "impl",
       "description": "Verify step-5 passes: costs.html has exactly 7 hx-vals expressions each containing Alpine.store(\"costs\").window",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
