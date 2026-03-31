@@ -9,16 +9,13 @@
   {% set total_spend.value = total_spend.value + data.total_spend %}
   {% set active_accounts.value = active_accounts.value + data.active_accounts %}
   {% set cap_events.value = cap_events.value + data.cap_events %}
+  {% set task_count_sum.value = task_count_sum.value + (data.task_count | default(0)) %}
 {% endfor %}
 
-{# avg cost per task — weighted by spend #}
+{# avg cost per task — weighted by task count across all projects #}
 {% set project_count = summary | length %}
-{% if project_count > 0 %}
-  {% set avg_per_task = namespace(value=0.0) %}
-  {% for project_id, data in summary.items() %}
-    {% set avg_per_task.value = avg_per_task.value + data.avg_cost_per_task %}
-  {% endfor %}
-  {% set avg_per_task_val = avg_per_task.value / project_count %}
+{% if task_count_sum.value > 0 %}
+  {% set avg_per_task_val = total_spend.value / task_count_sum.value %}
 {% else %}
   {% set avg_per_task_val = 0.0 %}
 {% endif %}
@@ -39,7 +36,7 @@
       <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-green-500">
         <div class="text-xs text-gray-400 uppercase tracking-wide mb-1">Avg Cost / Task</div>
         <div class="text-2xl font-bold text-white">${{ '%.4f' | format(avg_per_task_val) }}</div>
-        <div class="text-xs text-gray-500 mt-1">mean across projects</div>
+        <div class="text-xs text-gray-500 mt-1">weighted by task count</div>
       </div>
 
       {# Active Accounts #}
