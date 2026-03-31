@@ -6573,6 +6573,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 352,
+        "title": "Normalize PlannedEpisodeRegistry wiring pattern",
+        "description": "PlannedEpisodeRegistry has inconsistent wiring compared to the established _event_buffer/_write_journal pattern:\n\n1. `planned_episode_registry` is a public attribute while `_event_buffer` and `_write_journal` are private (underscore prefix)\n2. `set_planned_registry()` exists but is never called in main.py — production uses direct attribute access instead\n3. Registry is auto-created inside `initialize()`, whereas _event_buffer/_write_journal follow strict external-wiring (never created inside initialize())\n\nFix: Choose one pattern and apply consistently. Recommended: follow the event_buffer/write_journal pattern — rename to `_planned_episode_registry`, create externally in main.py, wire via setter, add a property accessor if needed.\n\nmemory_hints: search for \"MemoryService wiring pattern\" and \"event_buffer write_journal lifecycle\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6585,7 +6596,7 @@
       ],
       "created": "2026-03-31T14:20:35.758Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T14:20:42.291Z"
+      "updated": "2026-03-31T14:20:48.165Z"
     }
   }
 }
