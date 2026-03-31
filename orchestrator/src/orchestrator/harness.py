@@ -658,7 +658,9 @@ Output JSON matching the schema. Every task must appear in the output.
             if HAS_STEWARD and self._escalation_queue:
                 esc_q = self._escalation_queue  # capture for closure (narrows type)
 
-                def _make_steward(worktree: Path, *, _assign=assignment) -> TaskSteward:  # type: ignore[name-defined]
+                def _make_steward(
+                    worktree: Path, *, _assign=assignment,
+                ) -> TaskSteward:  # type: ignore[name-defined]
                     return TaskSteward(
                         task_id=_assign.task_id,
                         task=_assign.task,
@@ -668,6 +670,9 @@ Output JSON matching the schema. Every task must appear in the output.
                         escalation_queue=esc_q,
                         briefing=self.briefing,
                         usage_gate=self.usage_gate,
+                        cost_store=self._cost_store,
+                        run_id=self._run_id,
+                        project_id=self.config.fused_memory.project_id,
                     )
                 steward_factory = _make_steward
 
@@ -684,6 +689,9 @@ Output JSON matching the schema. Every task must appear in the output.
                 initial_plan=recovered_plan,
                 steward_factory=steward_factory,
                 merge_queue=self._merge_queue,
+                cost_store=self._cost_store,
+                run_id=self._run_id,
+                project_id=self.config.fused_memory.project_id,
             )
             outcome = await workflow.run()
 

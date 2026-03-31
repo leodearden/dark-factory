@@ -12,6 +12,7 @@ Verifies:
 
 from __future__ import annotations
 
+import asyncio
 import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -249,3 +250,147 @@ class TestHarnessRunStoreRunId:
 
         assert captured_run_id.get('saved'), 'save_run was not called'
         assert captured_run_id['run_id'] == harness._run_id
+
+
+# ---------------------------------------------------------------------------
+# Tests: _run_slot passes cost_store/run_id/project_id to TaskWorkflow
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunSlotCostStoreInjection:
+    """Harness._run_slot passes cost_store, run_id, project_id to TaskWorkflow."""
+
+    def _make_assignment(self):
+        from orchestrator.scheduler import TaskAssignment
+        return TaskAssignment(
+            task_id='77',
+            task={
+                'id': '77',
+                'title': 'Slot test task',
+                'description': 'test',
+                'status': 'pending',
+                'metadata': {'modules': ['src']},
+                'dependencies': [],
+            },
+            modules=['src'],
+        )
+
+    async def test_run_slot_passes_cost_store_to_workflow(self, tmp_path, monkeypatch):
+        """TaskWorkflow receives cost_store, run_id, project_id from harness attributes."""
+        config = _make_config(tmp_path)
+        harness = Harness(config)
+
+        # Pre-set harness attributes as run() would
+        harness._run_id = 'run-slottest1234'
+        mock_cost_store = MagicMock()
+        harness._cost_store = mock_cost_store
+
+        captured_kwargs: dict = {}
+
+        original_init = None
+
+        from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+
+        def patched_workflow_init(self_wf, **kwargs):
+            captured_kwargs.update(kwargs)
+            # Set minimal attributes so _run_slot can extract metrics
+            self_wf._steward = None
+            self_wf.metrics = MagicMock()
+            self_wf.metrics.total_cost_usd = 0.0
+            self_wf.metrics.total_duration_ms = 0
+            self_wf.metrics.agent_invocations = 0
+            self_wf.metrics.execute_iterations = 0
+            self_wf.metrics.verify_attempts = 0
+            self_wf.metrics.review_cycles = 0
+            self_wf.task_id = kwargs.get('assignment', MagicMock()).task_id
+
+        async def fake_workflow_run(self_wf):
+            return WorkflowOutcome.DONE
+
+        monkeypatch.setattr(TaskWorkflow, '__init__', patched_workflow_init)
+        monkeypatch.setattr(TaskWorkflow, 'run', fake_workflow_run)
+
+        assignment = self._make_assignment()
+        sem = asyncio.Semaphore(1)
+        sem._value = 0  # pre-acquired
+
+        # Use a mock to avoid git/scheduler calls
+        harness.scheduler.release = MagicMock()
+        harness._escalation_events = {}
+
+        await harness._run_slot(assignment, sem)
+
+        assert captured_kwargs.get('cost_store') is mock_cost_store
+        assert captured_kwargs.get('run_id') == 'run-slottest1234'
+        assert captured_kwargs.get('project_id') == config.fused_memory.project_id
+
+    async def test_run_slot_passes_cost_store_to_steward_factory(
+        self, tmp_path, monkeypatch
+    ):
+        """steward_factory lambda passes cost_store/run_id/project_id to TaskSteward."""
+        from orchestrator.scheduler import TaskAssignment
+        from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+
+        config = _make_config(tmp_path)
+        harness = Harness(config)
+        harness._run_id = 'run-stewardfact99'
+        mock_cost_store = MagicMock()
+        harness._cost_store = mock_cost_store
+
+        # Set up a mock escalation queue so steward_factory is created
+        mock_esc_queue = MagicMock()
+        harness._escalation_queue = mock_esc_queue
+        harness._escalation_events = {}
+
+        captured_wf_kwargs: dict = {}
+        steward_factory_captured = {}
+
+        def patched_workflow_init(self_wf, **kwargs):
+            captured_wf_kwargs.update(kwargs)
+            steward_factory_captured['factory'] = kwargs.get('steward_factory')
+            self_wf._steward = None
+            self_wf.metrics = MagicMock()
+            self_wf.metrics.total_cost_usd = 0.0
+            self_wf.metrics.total_duration_ms = 0
+            self_wf.metrics.agent_invocations = 0
+            self_wf.metrics.execute_iterations = 0
+            self_wf.metrics.verify_attempts = 0
+            self_wf.metrics.review_cycles = 0
+            self_wf.task_id = '77'
+
+        async def fake_workflow_run(self_wf):
+            return WorkflowOutcome.DONE
+
+        monkeypatch.setattr(TaskWorkflow, '__init__', patched_workflow_init)
+        monkeypatch.setattr(TaskWorkflow, 'run', fake_workflow_run)
+
+        assignment = TaskAssignment(
+            task_id='77',
+            task={'id': '77', 'title': 'SF test', 'description': 'test',
+                  'status': 'pending', 'metadata': {}, 'dependencies': []},
+            modules=['src'],
+        )
+        sem = asyncio.Semaphore(1)
+        sem._value = 0
+        harness.scheduler.release = MagicMock()
+
+        await harness._run_slot(assignment, sem)
+
+        # Steward factory should exist (escalation queue was set)
+        factory = steward_factory_captured.get('factory')
+        assert factory is not None, 'steward_factory was not set on TaskWorkflow'
+
+        # Call the factory to see what TaskSteward gets
+        from orchestrator.steward import TaskSteward
+        captured_steward_kwargs: dict = {}
+
+        def patched_steward_init(self_s, **kwargs):
+            captured_steward_kwargs.update(kwargs)
+
+        monkeypatch.setattr(TaskSteward, '__init__', patched_steward_init)
+        factory(tmp_path)
+
+        assert captured_steward_kwargs.get('cost_store') is mock_cost_store
+        assert captured_steward_kwargs.get('run_id') == 'run-stewardfact99'
+        assert captured_steward_kwargs.get('project_id') == config.fused_memory.project_id
