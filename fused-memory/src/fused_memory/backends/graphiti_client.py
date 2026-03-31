@@ -394,6 +394,198 @@ class GraphitiBackend:
         await graph.query(delete_cypher, {'uuids': uuids})
         return found
 
+    async def redirect_node_edges(
+        self, deprecated_uuid: str, surviving_uuid: str
+    ) -> dict:
+        """Redirect all RELATES_TO edges from deprecated node to surviving node.
+
+        Three Cypher phases:
+        (1) Count and delete inter-node edges between the two nodes (they become
+            meaningless self-loops after merge).
+        (2) Count then redirect outgoing edges: deprecated→target becomes
+            surviving→target (all properties copied individually to preserve
+            vecf32 embedding type).
+        (3) Count then redirect incoming edges: source→deprecated becomes
+            source→surviving.
+
+        Args:
+            deprecated_uuid: UUID of the entity node to be deleted.
+            surviving_uuid: UUID of the entity node that will absorb the edges.
+
+        Returns:
+            Dict with keys: outgoing_redirected, incoming_redirected,
+            inter_node_deleted.
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+
+        # Phase 1: Delete inter-node edges (edges between the two merging nodes)
+        count_inter = await graph.query(
+            'MATCH (dep:Entity {uuid: $dep_uuid})-[e:RELATES_TO]-(sur:Entity {uuid: $sur_uuid}) '
+            'RETURN count(e) AS cnt',
+            {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
+        )
+        inter_node_deleted = (
+            int(count_inter.result_set[0][0]) if count_inter.result_set else 0
+        )
+        await graph.query(
+            'MATCH (dep:Entity {uuid: $dep_uuid})-[e:RELATES_TO]-(sur:Entity {uuid: $sur_uuid}) '
+            'DELETE e',
+            {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
+        )
+
+        # Phase 2: Redirect outgoing edges (deprecated → target)
+        count_out = await graph.query(
+            'MATCH (dep:Entity {uuid: $dep_uuid})-[e:RELATES_TO]->() '
+            'RETURN count(e) AS cnt',
+            {'dep_uuid': deprecated_uuid},
+        )
+        outgoing_redirected = (
+            int(count_out.result_set[0][0]) if count_out.result_set else 0
+        )
+        await graph.query(
+            'MATCH (dep:Entity {uuid: $dep_uuid})-[old:RELATES_TO]->(target) '
+            'WITH old, target '
+            'MATCH (sur:Entity {uuid: $sur_uuid}) '
+            'CREATE (sur)-[new:RELATES_TO]->(target) '
+            'SET new.uuid = old.uuid, '
+            '    new.name = old.name, '
+            '    new.fact = old.fact, '
+            '    new.fact_embedding = old.fact_embedding, '
+            '    new.valid_at = old.valid_at, '
+            '    new.invalid_at = old.invalid_at, '
+            '    new.created_at = old.created_at, '
+            '    new.group_id = old.group_id, '
+            '    new.episodes = old.episodes, '
+            '    new.source_node_uuid = $sur_uuid '
+            'DELETE old',
+            {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
+        )
+
+        # Phase 3: Redirect incoming edges (source → deprecated)
+        count_in = await graph.query(
+            'MATCH ()-[e:RELATES_TO]->(dep:Entity {uuid: $dep_uuid}) '
+            'RETURN count(e) AS cnt',
+            {'dep_uuid': deprecated_uuid},
+        )
+        incoming_redirected = (
+            int(count_in.result_set[0][0]) if count_in.result_set else 0
+        )
+        await graph.query(
+            'MATCH (source)-[old:RELATES_TO]->(dep:Entity {uuid: $dep_uuid}) '
+            'WITH old, source '
+            'MATCH (sur:Entity {uuid: $sur_uuid}) '
+            'CREATE (source)-[new:RELATES_TO]->(sur) '
+            'SET new.uuid = old.uuid, '
+            '    new.name = old.name, '
+            '    new.fact = old.fact, '
+            '    new.fact_embedding = old.fact_embedding, '
+            '    new.valid_at = old.valid_at, '
+            '    new.invalid_at = old.invalid_at, '
+            '    new.created_at = old.created_at, '
+            '    new.group_id = old.group_id, '
+            '    new.episodes = old.episodes, '
+            '    new.target_node_uuid = $sur_uuid '
+            'DELETE old',
+            {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
+        )
+
+        logger.info(
+            'redirect_node_edges: dep=%s sur=%s inter_deleted=%d out=%d in=%d',
+            deprecated_uuid, surviving_uuid, inter_node_deleted,
+            outgoing_redirected, incoming_redirected,
+        )
+        return {
+            'outgoing_redirected': outgoing_redirected,
+            'incoming_redirected': incoming_redirected,
+            'inter_node_deleted': inter_node_deleted,
+        }
+
+    async def merge_entities(
+        self, deprecated_uuid: str, surviving_uuid: str
+    ) -> dict:
+        """Merge two entity nodes by redirecting edges and deleting the deprecated node.
+
+        Orchestrates the full merge workflow:
+        1. Validate both nodes exist via get_node_text (raises NodeNotFoundError if
+           either is missing).
+        2. Redirect all RELATES_TO edges from deprecated to surviving via
+           redirect_node_edges.
+        3. Delete the deprecated node via delete_entity_node.
+        4. Rebuild the surviving node's summary via refresh_entity_summary.
+
+        Args:
+            deprecated_uuid: UUID of the entity node to be deleted.
+            surviving_uuid: UUID of the entity node that absorbs the edges.
+
+        Returns:
+            Audit dict with keys: surviving_uuid, surviving_name, deprecated_uuid,
+            deprecated_name, edges_redirected (sub-dict with redirect counts),
+            surviving_summary (dict with old/new summary and edge_count).
+
+        Raises:
+            NodeNotFoundError: if either UUID does not exist.
+            RuntimeError: if the backend is not initialized.
+        """
+        # Validate both nodes exist and capture their names
+        dep_name, _ = await self.get_node_text(deprecated_uuid)
+        sur_name, _ = await self.get_node_text(surviving_uuid)
+
+        # Redirect edges
+        edges_redirected = await self.redirect_node_edges(deprecated_uuid, surviving_uuid)
+
+        # Delete the deprecated node
+        await self.delete_entity_node(deprecated_uuid)
+
+        # Rebuild the surviving node's summary
+        refresh_result = await self.refresh_entity_summary(surviving_uuid)
+
+        logger.info(
+            'merge_entities: dep=%s (%r) sur=%s (%r) redirected=%s',
+            deprecated_uuid, dep_name, surviving_uuid, sur_name, edges_redirected,
+        )
+        return {
+            'surviving_uuid': surviving_uuid,
+            'surviving_name': sur_name,
+            'deprecated_uuid': deprecated_uuid,
+            'deprecated_name': dep_name,
+            'edges_redirected': edges_redirected,
+            'surviving_summary': {
+                'before': refresh_result.get('old_summary', ''),
+                'after': refresh_result.get('new_summary', ''),
+                'edge_count': refresh_result.get('edge_count', 0),
+            },
+        }
+
+    async def delete_entity_node(self, uuid: str) -> None:
+        """Delete an Entity node and all remaining relationships.
+
+        Validates that the node exists first, then issues DETACH DELETE.
+
+        Args:
+            uuid: UUID of the Entity node to delete.
+
+        Raises:
+            NodeNotFoundError: if no node with that UUID exists.
+            RuntimeError: if the backend is not initialized.
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        # Pre-check: verify node exists before deleting
+        check_result = await graph.query(
+            'MATCH (n:Entity {uuid: $uuid}) RETURN n.name, n.summary',
+            {'uuid': uuid},
+        )
+        if not check_result.result_set:
+            raise NodeNotFoundError(f'Entity node not found: {uuid}')
+        await graph.query(
+            'MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n',
+            {'uuid': uuid},
+        )
+        logger.info('delete_entity_node: deleted node=%s', uuid)
+
     async def get_node_text(self, uuid: str) -> tuple[str, str]:
         """Return (name, summary) for the Entity node with the given UUID.
 

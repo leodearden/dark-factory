@@ -52,6 +52,8 @@ Task operations (when Taskmaster is connected):
 Management:
 - delete_memory: Remove a specific memory (edges for Graphiti, vector entries for Mem0)
 - delete_episode: Remove a Graphiti episode (with optional cascade)
+- refresh_entity_summary: Rebuild an entity node's summary from its valid edges
+- merge_entities: Consolidate two duplicate entity nodes (redirects edges, deletes deprecated)
 - get_status: Health check for all backends
 
 Reconciliation:
@@ -647,6 +649,58 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'refresh_entity_summary error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def merge_entities(
+        deprecated_uuid: str,
+        surviving_uuid: str,
+        project_id: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Consolidate two duplicate entity nodes into one by redirecting all edges.
+
+        When the same real-world concept exists as two separate Entity nodes (e.g.,
+        'Anthropic' and 'Anthropic Inc'), use this tool to merge them. All RELATES_TO
+        edges from the deprecated node are redirected to the surviving node. The
+        deprecated node is then deleted and the surviving node's summary is rebuilt
+        from its (now-combined) edges.
+
+        This operation is irreversible. Always verify both UUIDs before calling.
+
+        Args:
+            deprecated_uuid: UUID of the entity node to delete (will be removed)
+            surviving_uuid: UUID of the entity node to keep (absorbs all edges)
+            project_id: Project scope (required)
+            agent_id: Which agent is calling (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := validate_project_id(project_id):
+            return err
+        if not deprecated_uuid or not deprecated_uuid.strip():
+            return {'error': 'deprecated_uuid must be a non-empty string', 'error_type': 'ValidationError'}
+        if not surviving_uuid or not surviving_uuid.strip():
+            return {'error': 'surviving_uuid must be a non-empty string', 'error_type': 'ValidationError'}
+        if deprecated_uuid.strip() == surviving_uuid.strip():
+            return {'error': 'deprecated_uuid and surviving_uuid must be different', 'error_type': 'ValidationError'}
+        try:
+            causation_id, source, _ = _extract_causation(metadata, agent_id)
+            return await memory_service.merge_entities(
+                deprecated_uuid=deprecated_uuid,
+                surviving_uuid=surviving_uuid,
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                causation_id=causation_id,
+                _source=source,
+            )
+        except Exception as e:
+            logger.error(f'merge_entities error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
