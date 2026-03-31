@@ -66,6 +66,38 @@ class TestApplyWalPragmas:
                 row = await cur.fetchone()
         assert row[0] == 5000
 
+    async def test_wal_fallback_raises_runtime_error(self) -> None:
+        """apply_wal_pragmas raises RuntimeError when journal_mode PRAGMA returns a
+        non-WAL result (e.g. 'delete' on a filesystem that doesn't support WAL)."""
+        from shared.async_sqlite_base import apply_wal_pragmas
+
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchone = AsyncMock(return_value=('delete',))
+        mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_cursor.__aexit__ = AsyncMock(return_value=False)
+
+        mock_conn = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value=mock_cursor)
+
+        with pytest.raises(RuntimeError, match='WAL'):
+            await apply_wal_pragmas(mock_conn, busy_timeout_ms=5000)
+
+    async def test_wal_none_row_raises_runtime_error(self) -> None:
+        """apply_wal_pragmas raises RuntimeError when journal_mode PRAGMA returns no
+        rows (fetchone() → None). Guards against unexpected empty result sets."""
+        from shared.async_sqlite_base import apply_wal_pragmas
+
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchone = AsyncMock(return_value=None)
+        mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_cursor.__aexit__ = AsyncMock(return_value=False)
+
+        mock_conn = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value=mock_cursor)
+
+        with pytest.raises(RuntimeError, match='WAL'):
+            await apply_wal_pragmas(mock_conn, busy_timeout_ms=5000)
+
 
 # ---------------------------------------------------------------------------
 # Concrete test subclass used for AsyncSqliteBase tests
