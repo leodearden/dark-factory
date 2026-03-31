@@ -374,6 +374,7 @@ class TestCostsByRolePartial:
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
         assert 'implementer' in html
+        assert 'reviewer' in html
 
     def test_handles_empty_data(self, client):
         with _patch_by_role(return_value={}):

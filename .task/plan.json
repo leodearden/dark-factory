@@ -122,7 +122,7 @@
       "id": "step-15",
       "type": "test",
       "description": "Tighten test_role_names_appear_in_output: add assertion for 'reviewer' in html alongside existing 'implementer' check \u2014 both role names from _MOCK_BY_ROLE should appear in the rendered Chart.js config via tojson",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
