@@ -963,6 +963,124 @@ class TestRunCostBreakdown:
 
 
 # ---------------------------------------------------------------------------
+# Tests: days parameter filtering (cross-function parametric)
+# ---------------------------------------------------------------------------
+
+class TestDaysParameter:
+    """Parametric coverage of the _cutoff(days) window filter across query functions.
+
+    Each test case exercises a different query function with days=1, days=7, and
+    days=30 to verify that the window correctly excludes/includes a 20-day-old
+    invocation that falls outside the narrow window but inside the wide window.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fn_name", [
+        "summary",
+        "by_project",
+        "by_account",
+        "by_role",
+        "account_events",
+    ])
+    async def test_days_controls_lookback_window(self, tmp_path, fn_name):
+        """days parameter controls look-back for each query function.
+
+        DB setup: one invocation at 2h ago (cost=0.50) and one at 20d ago
+        (cost=1.50), plus one cap_hit event at each offset.
+
+        - days=1 and days=7 see only the 2h-ago record (narrow window).
+        - days=30 sees both records (wide window).
+        """
+        db_path = tmp_path / f'days_{fn_name}.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+        recent_ts = (now - timedelta(hours=2)).isoformat()
+        old_ts = (now - timedelta(days=20)).isoformat()
+
+        conn.executemany(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [
+                ('r1', 't1', 'proj', 'acc', 'claude-opus-4-5', 'implementer',
+                 0.50, 0,
+                 (now - timedelta(hours=2, minutes=5)).isoformat(),
+                 recent_ts),
+                ('r2', 't2', 'proj', 'acc', 'claude-opus-4-5', 'implementer',
+                 1.50, 0,
+                 (now - timedelta(days=20, hours=1)).isoformat(),
+                 old_ts),
+            ],
+        )
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                ('acc', 'cap_hit', 'proj', 'r1', None, recent_ts),
+                ('acc', 'cap_hit', 'proj', 'r2', None, old_ts),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        fn_map = {
+            'summary': get_cost_summary,
+            'by_project': get_cost_by_project,
+            'by_account': get_cost_by_account,
+            'by_role': get_cost_by_role,
+            'account_events': get_account_events,
+        }
+        fn = fn_map[fn_name]
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            narrow1 = await fn(aconn, days=1)
+            narrow7 = await fn(aconn, days=7)
+            wide30 = await fn(aconn, days=30)
+
+        def _metric(result, name):
+            """Extract the key numeric metric for each function's result."""
+            if name == 'summary':
+                return result.get('proj', {}).get('total_spend', 0.0)
+            if name == 'by_project':
+                return sum(e['total'] for e in result.get('proj', []))
+            if name == 'by_account':
+                return result.get('acc', {}).get('invocations', 0)
+            if name == 'by_role':
+                proj = result.get('proj', {})
+                return sum(
+                    v for role_data in proj.values() for v in role_data.values()
+                )
+            if name == 'account_events':
+                return len(result)
+            return 0
+
+        # Integer metrics (invocation/event counts)
+        if fn_name in ('by_account', 'account_events'):
+            narrow_expected: int | float = 1
+            wide_expected: int | float = 2
+        else:
+            narrow_expected = 0.50
+            wide_expected = 2.00
+
+        assert _metric(narrow1, fn_name) == pytest.approx(narrow_expected, abs=1e-6), (
+            f"{fn_name}: days=1 narrow expected {narrow_expected}, "
+            f"got {_metric(narrow1, fn_name)}"
+        )
+        assert _metric(narrow7, fn_name) == pytest.approx(narrow_expected, abs=1e-6), (
+            f"{fn_name}: days=7 narrow expected {narrow_expected}, "
+            f"got {_metric(narrow7, fn_name)}"
+        )
+        assert _metric(wide30, fn_name) == pytest.approx(wide_expected, abs=1e-6), (
+            f"{fn_name}: days=30 wide expected {wide_expected}, "
+            f"got {_metric(wide30, fn_name)}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tests: Schema index validation
 # ---------------------------------------------------------------------------
 
