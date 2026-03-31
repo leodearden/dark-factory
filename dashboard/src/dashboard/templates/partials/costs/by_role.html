@@ -19,6 +19,7 @@
   var container = document.currentScript.closest('[data-by-role-container]');
   var byRole = {{ by_role | tojson }};
   var rendered = false;
+  var chartInstances = [];
 
   var palette = [
     '#60a5fa','#34d399','#fbbf24','#f87171','#a78bfa',
@@ -33,20 +34,23 @@
     return null;
   }
 
-  function getOrDestroyChart(el) {
-    if (!el) return null;
-    var existing = Chart.getChart(el);
-    if (existing) existing.destroy();
-    return el;
+  function cleanupCharts() {
+    chartInstances.forEach(function(chart) {
+      try { chart.destroy(); } catch (e) {}
+    });
+    chartInstances = [];
   }
 
   function renderCharts() {
     if (rendered) return;
     rendered = true;
+    cleanupCharts();
     var projectIds = Object.keys(byRole);
     projectIds.forEach(function(projectId) {
-      var el = getOrDestroyChart(findProjectCanvas(projectId));
+      var el = findProjectCanvas(projectId);
       if (!el) return;
+      var existing = Chart.getChart(el);
+      if (existing) existing.destroy();
 
       var rolesData = byRole[projectId];
       var roleNames = Object.keys(rolesData);
@@ -70,7 +74,7 @@
         };
       });
 
-      new Chart(el, {
+      var chart = new Chart(el, {
         type: 'bar',
         data: { labels: roleNames, datasets: datasets },
         options: {
@@ -94,6 +98,7 @@
           },
         },
       });
+      chartInstances.push(chart);
     });
   }
 
