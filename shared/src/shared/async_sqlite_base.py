@@ -79,7 +79,7 @@ class AsyncSqliteBase(abc.ABC):
             await self._conn.close()
             self._conn = None
 
-    async def __aenter__(self) -> 'AsyncSqliteBase':
+    async def __aenter__(self) -> AsyncSqliteBase:
         await self.open()
         return self
 
