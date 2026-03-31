@@ -5936,10 +5936,11 @@
         "description": "Follow-up from task 306 review. Address interrelated issues with the `_to_token_count` helper introduced in the null-handling hardening pass.\n\n**Documentation fix:**\n- Move the token-count convention docstring from `AgentResult` (which has no token fields — only `cost_usd`) to `_to_token_count`'s own docstring. Keep `AgentResult`'s docstring focused on what the dataclass represents.\n\n**Export/visibility fix:**\n- `_to_token_count` is private (underscore-prefixed) but imported cross-package into `orchestrator/agents/invoke.py`. Either: (a) rename to `to_token_count`, add to `__all__`, or (b) inline the trivial `v or None` at the two orchestrator call sites and remove the cross-package import.\n\n**Call-site pattern fix:**\n- `_to_token_count(usage.get('input_tokens', 0)) or 0` is a no-op roundtrip: `.get('x', 0)` provides 0, `_to_token_count(0)` returns None, `or 0` converts back to 0. Net effect = `usage.get('input_tokens', 0)`. Fix: either drop the helper at arithmetic sites (use `usage.get('input_tokens') or 0`), or drop the `.get()` default and trailing `or 0` (use just the helper). Four call sites affected: orchestrator/agents/invoke.py lines 363-364 and 480-481.\n\n**Test improvements:**\n- `TestParseCodexNullUsage.test_null_usage_does_not_raise`: add assertions for `output == 'hello'`, `cost_usd == 0.0`, `turns == 1`.\n- Add absent-key tests (not just null-value) for both gemini `stats` and codex `usage` to cover both branches of the `or {}` guard.\n\nmemory_hints: search \"_to_token_count helper\" and \"AgentResult token fields documentation\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-31T08:21:46.075Z"
       },
       {
         "id": "317",
@@ -6022,7 +6023,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T08:21:45.987Z",
+      "lastModified": "2026-03-31T08:21:46.075Z",
       "taskCount": 301,
       "completedCount": 272,
       "tags": [
