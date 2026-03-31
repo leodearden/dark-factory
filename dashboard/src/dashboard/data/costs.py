@@ -302,12 +302,14 @@ async def get_account_events(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    limit: int = 200,
 ) -> list[dict]:
     """Recent account events (cap_hit, resumed, etc.) within the window.
 
     Returns [{account_name, event_type, project_id, run_id, details,
                created_at}, ...] ordered by created_at DESC.
     *details* is returned as-is (string or None) — callers may parse JSON.
+    *limit* caps the number of rows returned (default 200).
     """
     since = _cutoff(days)
 
@@ -317,8 +319,9 @@ async def get_account_events(
             '       details, created_at '
             '  FROM account_events '
             ' WHERE created_at >= ? '
-            ' ORDER BY created_at DESC',
-            (since,),
+            ' ORDER BY created_at DESC'
+            ' LIMIT ?',
+            (since, limit),
         )
         return [
             {
