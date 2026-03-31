@@ -3516,11 +3516,11 @@
         "description": "test_sonnet_tier_selection_sets_consolidator_limits only covers the sonnet path (buffer size 0). Add coverage for:\n\n1. Opus tier: mock get_buffer_stats to return {'size': 16} and assert tier.model=='opus', episode_limit==500, memory_limit==1000\n2. Boundary: size==15 is the exact boundary (threshold * ratio = 10 * 1.5 = 15); test both sides (15 → sonnet, 16 → opus)\n3. Verify run_full_cycle propagates opus limits to MemoryConsolidator\n\nConsider using pytest.mark.parametrize with (size, expected_model, expected_ep_limit, expected_mem_limit) tuples to avoid test duplication.\n\nOrigin: review suggestion on task 200 (suggestion #9).\nmemory_hints: search for \"_select_tier\" and \"opus_threshold_ratio\" in reconciliation harness code; search for \"TierConfig\" defaults",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-30T17:50:44.375Z",
+        "updatedAt": "2026-03-31T03:02:44.594Z",
         "metadata": {
           "files": [
             "fused-memory/tests/test_harness.py"
@@ -5976,7 +5976,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T03:02:44.195Z",
+      "lastModified": "2026-03-31T03:02:44.610Z",
       "taskCount": 297,
       "completedCount": 268,
       "tags": [
