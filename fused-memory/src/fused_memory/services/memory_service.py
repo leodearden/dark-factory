@@ -913,7 +913,8 @@ class MemoryService:
                 entities=entities,
                 metadata=metadata,
             ))
-        return results
+        # Truncate to the original limit (over-fetch may have produced extras).
+        return results[:limit]
 
     async def _search_mem0(
         self, query: str, scope: Scope, limit: int, include_planned: bool = False
