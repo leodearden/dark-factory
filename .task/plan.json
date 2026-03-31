@@ -5,6 +5,7 @@
     "fused-memory/src/fused_memory/services/planned_episode_registry.py",
     "fused-memory/src/fused_memory/services/memory_service.py",
     "fused-memory/src/fused_memory/server/tools.py",
+    "fused-memory/src/fused_memory/server/main.py",
     "fused-memory/src/fused_memory/reconciliation/targeted.py",
     "fused-memory/tests/test_planned_episode_registry.py",
     "fused-memory/tests/test_temporal_guards.py",
@@ -18,7 +19,7 @@
     "fused-memory/src/fused_memory/reconciliation",
     "fused-memory/tests"
   ],
-  "analysis": "PRD and planning episodes ingested via add_episode generate Graphiti edges that describe planned/aspirational work as current fact. The temporal_context='planning' parameter already exists and prepends '[temporal:planning]' to source_description, but this is only a text hint \u2014 it doesn't prevent edges from appearing in normal search results as factual statements.\n\nThe contamination vector: an agent ingests PRD content via add_episode(temporal_context='planning'), Graphiti's LLM extracts edges like 'CostStore extends AgentResult' as facts, and these appear in search results indistinguishable from real implemented state.\n\nSolution: Planned Episode Registry + post-filter pattern.\n\n1. Track which episode UUIDs are 'planning' episodes in a lightweight SQLite-backed registry (PlannedEpisodeRegistry)\n2. After add_episode with temporal_context='planning', register the episode UUID\n3. During search, post-filter: if ALL of an edge's episode UUIDs are in the planned registry, exclude the edge by default\n4. Add include_planned parameter to search to allow explicit inclusion (for reconciliation/auditing)\n5. Tag Mem0 dual-writes from planning episodes with planned=true metadata, filter similarly\n6. When a task is marked done, promote related planned episodes (remove from registry) so their edges become visible\n\nThis approach avoids modifying FalkorDB edge properties (which graphiti_core might not load during search) and keeps our layer cleanly separated from graphiti internals. Each edge's episodes list (provenance) is the join key \u2014 if ALL contributing episodes are planned, the edge is aspirational.",
+  "analysis": "PRD and planning episodes ingested via add_episode generate Graphiti edges that describe planned/aspirational work as current fact. The temporal_context='planning' parameter already exists and prepends '[temporal:planning]' to source_description, but this is only a text hint \u2014 it doesn't prevent edges from appearing in normal search results as factual statements.\n\nThe contamination vector: an agent ingests PRD content via add_episode(temporal_context='planning'), Graphiti's LLM extracts edges like 'CostStore extends AgentResult' as facts, and these appear in search results indistinguishable from real implemented state.\n\nSolution: Planned Episode Registry + post-filter pattern.\n\n1. Track which episode UUIDs are 'planning' episodes in a lightweight SQLite-backed registry (PlannedEpisodeRegistry)\n2. After add_episode with temporal_context='planning', register the episode UUID\n3. During search, post-filter: if ALL of an edge's episode UUIDs are in the planned registry, exclude the edge by default\n4. Add include_planned parameter to search to allow explicit inclusion (for reconciliation/auditing)\n5. Tag Mem0 dual-writes from planning episodes with planned=true metadata, filter similarly\n6. When a task is marked done, promote related planned episodes (remove from registry) so their edges become visible\n\nThis approach avoids modifying FalkorDB edge properties (which graphiti_core might not load during search) and keeps our layer cleanly separated from graphiti internals. Each edge's episodes list (provenance) is the join key \u2014 if ALL contributing episodes are planned, the edge is aspirational.\n\n--- Review Fix Analysis (steps 25-35) ---\n\nSix blocking issues found during review require fix steps:\n\n1. [double_initialize_leak] PlannedEpisodeRegistry.initialize() has no guard against double-call \u2014 orphans the first SQLite connection. Fix: early return if self._db is not None.\n\n2. [resource_leak] Cursor objects in is_planned/get_planned_uuids/are_all_planned are never explicitly closed. In a long-running server these accumulate. Fix: use `async with self._db.execute(...) as cursor:` pattern.\n\n3. [lifecycle_conflict] set_planned_registry() and initialize() both unconditionally overwrite self.planned_episode_registry. Fix: initialize() skips creation if registry already set externally.\n\n4. [silent_data_loss] group_id falls back to '' when missing from payload, making planned episodes unfindable by project_id. Fix: skip registration with warning when group_id is falsy.\n\n5. [vacuous_assertion] Two tests gate assertions on `if service.mem0.add.called` \u2014 pass without testing anything when classifier routes to Graphiti. Fix: force Mem0 routing via classifier mock.\n\n6. [incomplete_wiring] TargetedReconciler.planned_episode_registry is never wired in main.py, making the entire promotion feature dead code at runtime. Fix: add wiring line after MemoryService.initialize().",
   "prerequisites": [
     {
       "id": "pre-1",
@@ -203,6 +204,83 @@
       "description": "Fix any integration issues found in step-23. Ensure the full pipeline works end-to-end: planning episode \u2192 registry \u2192 search exclusion \u2192 promotion \u2192 search inclusion.",
       "status": "done",
       "commit": "666d89c2"
+    },
+    {
+      "id": "step-25",
+      "type": "test",
+      "description": "Fix [reviewer_robustness:double_initialize_leak]. Write test in test_planned_episode_registry.py: calling initialize() twice on the same PlannedEpisodeRegistry instance is safe and idempotent \u2014 the second call returns without opening a new connection. Verify: register data from before the second initialize() call is still accessible (proving the original connection wasn't orphaned). Test should fail against current code because the second initialize() opens a new connection to the same DB file (which works but leaks the old handle).",
+      "status": "done",
+      "commit": "e1ba6ef3"
+    },
+    {
+      "id": "step-26",
+      "type": "impl",
+      "description": "Fix [reviewer_robustness:double_initialize_leak]. Add guard at the top of PlannedEpisodeRegistry.initialize(): `if self._db is not None: return`. This makes initialize() idempotent \u2014 safe to call multiple times without leaking the previous aiosqlite connection handle.",
+      "status": "done",
+      "commit": "68c142ca"
+    },
+    {
+      "id": "step-27",
+      "type": "test",
+      "description": "Fix [reviewer_robustness:resource_leak]. Add explicit regression tests in test_planned_episode_registry.py that exercise is_planned, get_planned_uuids, and are_all_planned in rapid succession (e.g., 50 calls in a loop) to confirm they work correctly after the cursor refactor. These serve as regression coverage for the async-context-manager refactor in step-28. (Existing tests already cover correctness, so these focus on repeated-call stability.)",
+      "status": "done",
+      "commit": "6004d2a4"
+    },
+    {
+      "id": "step-28",
+      "type": "impl",
+      "description": "Fix [reviewer_robustness:resource_leak]. In planned_episode_registry.py, refactor is_planned(), get_planned_uuids(), and are_all_planned() to use `async with self._db.execute(...) as cursor:` instead of bare `cursor = await self._db.execute(...)`. This ensures each cursor's statement handle is released immediately after fetchone/fetchall, preventing accumulation in the long-running server process. The register() and promote() methods that don't reuse cursors are fine as-is.",
+      "status": "done",
+      "commit": "71b01b19"
+    },
+    {
+      "id": "step-29",
+      "type": "test",
+      "description": "Fix [reviewer_robustness:lifecycle_conflict]. Write failing test in test_memory_service.py: create a mock external PlannedEpisodeRegistry, call service.set_planned_registry(external_registry), then call service.initialize(). After initialize(), service.planned_episode_registry must still be the external_registry instance (identity check with `is`). Currently fails because initialize() unconditionally creates a new registry, replacing the external one.",
+      "status": "done",
+      "commit": "ea28de5d"
+    },
+    {
+      "id": "step-30",
+      "type": "impl",
+      "description": "Fix [reviewer_robustness:lifecycle_conflict]. In MemoryService.initialize(), wrap the PlannedEpisodeRegistry creation block with `if self.planned_episode_registry is None:`. Only import, instantiate, and initialize a new registry when no registry has been externally wired via set_planned_registry(). This makes the two wiring paths composable: external wiring takes precedence, auto-creation is the fallback.",
+      "status": "done",
+      "commit": "fa222e21"
+    },
+    {
+      "id": "step-31",
+      "type": "test",
+      "description": "Fix [reviewer_robustness:silent_data_loss]. Write failing test in test_memory_service.py: call _execute_graphiti_write with temporal_context='planning', a valid uuid, but group_id missing from payload. Assert that planned_episode_registry.register() is NOT called (registration skipped). Currently fails because the code calls register(uuid, '') with an empty-string group_id, silently making the episode invisible to search filtering which queries by actual project_id.",
+      "status": "done",
+      "commit": "5d694313"
+    },
+    {
+      "id": "step-32",
+      "type": "impl",
+      "description": "Fix [reviewer_robustness:silent_data_loss]. In MemoryService._execute_graphiti_write, replace `group_id = payload.get('group_id', '')` with `group_id = payload.get('group_id')`. Change the registration guard to `if episode_uuid and group_id:` so registration is skipped when group_id is None/empty. Add `logger.warning('Skipping planned episode registration: group_id missing from payload for episode %s', episode_uuid)` in the else branch so the data gap is visible in logs.",
+      "status": "done",
+      "commit": "7e614501"
+    },
+    {
+      "id": "step-33",
+      "type": "test",
+      "description": "Fix [reviewer_test_analyst:vacuous_assertion]. Rewrite the two vacuous tests in TestExecuteMem0ClassifyAndAddPlanningMetadata (test_planning_temporal_context_adds_planned_metadata and test_no_temporal_context_no_planned_metadata). Both must force Mem0 routing by patching the classifier to return MemoryCategory.preferences_and_norms (matching the pattern in test_planning_routed_to_mem0_is_tagged). Remove the `if service.mem0.add.called` guard. Assert unconditionally: service.mem0.add.assert_called_once(), then inspect kwargs. For the no-temporal-context variant, assert 'planned' not in metadata unconditionally.",
+      "status": "done",
+      "commit": "2bc275fa"
+    },
+    {
+      "id": "step-34",
+      "type": "test",
+      "description": "Fix [reviewer_architect_reviewer:incomplete_wiring]. Write test verifying the server wiring contract: after MemoryService is initialized (creating its internal planned_episode_registry) and TargetedReconciler is constructed, the wiring step `targeted.planned_episode_registry = memory_service.planned_episode_registry` must be performed so targeted.planned_episode_registry is not None. This is a unit test of the wiring sequence \u2014 mock MemoryService with a non-None planned_episode_registry attribute, create TargetedReconciler, apply the wiring, assert identity.",
+      "status": "done",
+      "commit": "e2f8c4dc"
+    },
+    {
+      "id": "step-35",
+      "type": "impl",
+      "description": "Fix [reviewer_architect_reviewer:incomplete_wiring]. In server/main.py, after the TargetedReconciler is instantiated (line ~161), add: `targeted.planned_episode_registry = memory_service.planned_episode_registry`. This connects the registry created during MemoryService.initialize() to the reconciler, making the promotion code in _on_task_done (which checks `if self.planned_episode_registry is not None`) actually execute at runtime.",
+      "status": "done",
+      "commit": "4e7b790d"
     }
   ],
   "design_decisions": [
@@ -233,6 +311,22 @@
     {
       "decision": "Tag Mem0 dual-writes with planned metadata for consistent cross-store filtering",
       "rationale": "Facts extracted from planning episodes are dual-written to Mem0. Without tagging, these Mem0 entries would appear in search even when Graphiti edges are filtered. Adding 'planned': True to Mem0 metadata enables the same filter logic in _search_mem0."
+    },
+    {
+      "decision": "PlannedEpisodeRegistry.initialize() is idempotent via early-return guard",
+      "rationale": "Chosen over raising RuntimeError because server restart paths and test setups may inadvertently call initialize() twice. Idempotent behavior is safer \u2014 the guard `if self._db is not None: return` prevents leaking the previous SQLite connection handle while keeping the API forgiving."
+    },
+    {
+      "decision": "MemoryService.initialize() defers to externally-set registry (if-None guard)",
+      "rationale": "If set_planned_registry() was called before initialize(), the external registry must be honored. Unconditionally creating a new one would orphan the external registry's open connection and silently discard the caller's intent. The `if self.planned_episode_registry is None` guard makes the two wiring paths composable without ordering constraints."
+    },
+    {
+      "decision": "Skip registration with warning when group_id is missing, rather than raising",
+      "rationale": "Raising would fail the entire add_episode write for a secondary feature (registry tracking). Skipping with a warning preserves write availability while making the data gap visible in logs. The graphiti write itself accesses payload['group_id'] directly (KeyError on missing), so this path is only reachable if upstream contract changes \u2014 but the defensive guard prevents silent corruption."
+    },
+    {
+      "decision": "Use async-with context manager for all read cursors in PlannedEpisodeRegistry",
+      "rationale": "aiosqlite cursors returned by execute() hold live statement handles. In a long-running server with many search operations, unclosed cursors accumulate without bound. The `async with self._db.execute(...) as cursor:` pattern releases the handle immediately after fetch, matching SQLite best practices for resource-constrained processes."
     }
   ],
   "reuse": [
@@ -275,8 +369,13 @@
       "what": "TargetedReconciler fixture and test patterns",
       "where": "fused-memory/tests/test_targeted.py",
       "how": "Extend existing reconciler fixture to include mocked planned_episode_registry. Follow same patterns for testing _on_task_done promotion."
+    },
+    {
+      "what": "Forced classifier routing pattern for Mem0 tests",
+      "where": "fused-memory/tests/test_memory_service.py:376-398 (test_planning_routed_to_mem0_is_tagged)",
+      "how": "Step 33 reuses this exact pattern \u2014 patch classifier to force MemoryCategory.preferences_and_norms routing \u2014 to fix the vacuous assertion tests that currently skip assertions when classifier routes to Graphiti."
     }
   ],
   "_session_id": "308-46298e63",
-  "_created_at": "2026-03-30T22:14:04.307375+00:00"
+  "_created_at": "2026-03-31T03:25:36.573057+00:00"
 }
