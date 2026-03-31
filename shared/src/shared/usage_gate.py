@@ -184,11 +184,12 @@ class UsageGate:
                     ):
                         old_name = self._last_account_name
                         self._last_account_name = acct.name
-                        self._fire_cost_event(
-                            acct.name,
-                            'failover',
-                            json.dumps({'from': old_name, 'to': acct.name}),
-                        )
+                        if self._cost_store:
+                            self._fire_cost_event(
+                                acct.name,
+                                'failover',
+                                json.dumps({'from': old_name, 'to': acct.name}),
+                            )
                     else:
                         self._last_account_name = acct.name
                     return acct.token

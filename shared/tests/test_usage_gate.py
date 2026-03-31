@@ -77,7 +77,9 @@ class TestBeforeInvokeRaceCondition:
         After the fix, _last_account_name is set to acct.name BEFORE
         _fire_cost_event is called.
         """
-        gate = make_gate(['acct-A', 'acct-B'])
+        # cost_store must be set so the `if self._cost_store:` guard in before_invoke
+        # allows _fire_cost_event to be called (task-355 step-8 guard).
+        gate = make_gate(['acct-A', 'acct-B'], cost_store=make_mock_cost_store())
 
         # Simulate acct-A already used, now capped
         gate._accounts[0].capped = True
@@ -110,7 +112,8 @@ class TestBeforeInvokeRaceCondition:
         blocks the critical-path return of the OAuth token.  After the fix it
         must call `self._fire_cost_event(...)` (non-blocking) instead.
         """
-        gate = make_gate(['acct-A', 'acct-B'])
+        # cost_store must be set so the `if self._cost_store:` guard allows the event.
+        gate = make_gate(['acct-A', 'acct-B'], cost_store=make_mock_cost_store())
 
         gate._accounts[0].capped = True
         gate._last_account_name = 'acct-A'
