@@ -5984,10 +5984,11 @@
         "description": "Three improvements identified during task 314 review:\n\n1. **Race-condition guard in open()** (cost_store.py:88-101): The double-open guard checks `self._conn is not None` synchronously but then suspends at `await aiosqlite.connect(...)`. Two concurrent coroutines can both pass the guard before either sets `self._conn`, orphaning a connection. Fix: add `self._open_lock = asyncio.Lock()` in `__init__` and wrap the guard + connection setup in `async with self._open_lock`.\n\n2. **Incomplete assertion in test_double_open_raises** (test_cost_store.py:371-379): After verifying the second `open()` raises, assert that `_conn` is still valid and the store is still functional. If the guard accidentally nullified `_conn` before raising, the test would still pass while leaving the store broken.\n\n3. **Missing account_event persistence test** (test_cost_store.py:455-499): TestPersistAcrossReopen only tests `save_invocation` rows. Add a symmetric `test_account_event_persists_across_reopen` that writes via `save_account_event`, closes, reopens, and verifies the row survived.\n\nmemory_hints:\n- search: \"CostStore asyncio.Lock race condition open guard\"\n- search: \"CostStore persist across reopen test\"\n- entity: \"CostStore\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-31T09:22:29.983Z"
       },
       {
         "id": "320",
@@ -6150,7 +6151,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T09:22:29.834Z",
+      "lastModified": "2026-03-31T09:22:29.983Z",
       "taskCount": 311,
       "completedCount": 277,
       "tags": [
