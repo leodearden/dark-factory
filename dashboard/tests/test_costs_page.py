@@ -1088,8 +1088,8 @@ class TestByRoleCanvasIds:
 class TestByRoleJsUsesProjectKey:
     """by_role partial JS must derive canvas IDs from project key via cssId() helper."""
 
-    def test_by_role_js_uses_project_key_not_index(self, client):
-        """The rendered by-role partial JS must use cssId(projectId) not projIdx + 1."""
+    def test_by_role_js_uses_data_attribute_not_index(self, client):
+        """The rendered by-role partial JS must use data-project-id lookup, not positional index."""
         with patch(
             'dashboard.app.get_cost_by_role',
             new_callable=AsyncMock,
@@ -1098,15 +1098,39 @@ class TestByRoleJsUsesProjectKey:
             html = client.get('/costs/partials/by-role').text
         # Old positional pattern must NOT appear
         assert 'projIdx + 1' not in html
-        # New key-based pattern must appear
-        assert 'cssId' in html
+        # Canvas elements must have data-project-id attributes
+        assert 'data-project-id="dark_factory"' in html
+        assert 'data-project-id="other_project"' in html
 
-    def test_by_role_js_has_css_id_helper(self, client):
-        """The rendered by-role partial JS must define a cssId() helper function."""
+    def test_by_role_js_has_find_project_canvas(self, client):
+        """The rendered by-role partial JS must define a findProjectCanvas() helper."""
         with patch(
             'dashboard.app.get_cost_by_role',
             new_callable=AsyncMock,
             return_value=_MOCK_BY_ROLE_TWO_PROJECTS,
         ):
             html = client.get('/costs/partials/by-role').text
-        assert 'function cssId' in html
+        assert 'function findProjectCanvas' in html
+
+    def test_by_role_canvas_ids_unique_on_collision(self, client):
+        """When two project IDs normalize to the same css_id, canvas HTML IDs stay unique."""
+        colliding_data = {
+            'dark-factory': {
+                'implementer': {'claude-sonnet': 1.0},
+            },
+            'dark_factory': {
+                'implementer': {'claude-opus': 2.0},
+            },
+        }
+        with patch(
+            'dashboard.app.get_cost_by_role',
+            new_callable=AsyncMock,
+            return_value=colliding_data,
+        ):
+            html = client.get('/costs/partials/by-role').text
+        # Both canvases must have unique IDs via loop.index0 suffix
+        assert 'costByRoleChart_dark_factory_0' in html
+        assert 'costByRoleChart_dark_factory_1' in html
+        # Both must carry distinct data-project-id attributes for JS lookup
+        assert 'data-project-id="dark-factory"' in html
+        assert 'data-project-id="dark_factory"' in html
