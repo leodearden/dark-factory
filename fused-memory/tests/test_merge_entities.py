@@ -280,3 +280,117 @@ class TestMergeEntities:
         backend.delete_entity_node.assert_awaited_once_with('dep-uuid')
         backend.refresh_entity_summary.assert_awaited_once_with('sur-uuid')
         assert result['surviving_uuid'] == 'sur-uuid'
+
+
+# ---------------------------------------------------------------------------
+# step-7: MemoryService.merge_entities
+# ---------------------------------------------------------------------------
+
+class TestMemoryServiceMergeEntities:
+    """MemoryService.merge_entities() delegates to graphiti backend with journaling."""
+
+    @pytest.fixture
+    def service(self, mock_config):
+        """MemoryService with mocked graphiti backend."""
+        from fused_memory.services.memory_service import MemoryService
+        svc = MemoryService(mock_config)
+        svc.graphiti = MagicMock()
+        svc.graphiti.merge_entities = AsyncMock(return_value={
+            'surviving_uuid': 'sur-uuid',
+            'surviving_name': 'SurvivingName',
+            'deprecated_uuid': 'dep-uuid',
+            'deprecated_name': 'DeprecatedName',
+            'edges_redirected': {'outgoing_redirected': 2, 'incoming_redirected': 1, 'inter_node_deleted': 0},
+            'surviving_summary': {'before': 'old', 'after': 'new', 'edge_count': 3},
+        })
+        svc.mem0 = MagicMock()
+        svc.durable_queue = MagicMock()
+        svc.durable_queue.enqueue = AsyncMock(return_value=1)
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_graphiti_backend(self, service):
+        """Calls graphiti.merge_entities with correct UUIDs."""
+        result = await service.merge_entities(
+            deprecated_uuid='dep-uuid',
+            surviving_uuid='sur-uuid',
+            project_id='dark_factory',
+        )
+        service.graphiti.merge_entities.assert_awaited_once_with('dep-uuid', 'sur-uuid')
+        assert result['surviving_uuid'] == 'sur-uuid'
+
+    @pytest.mark.asyncio
+    async def test_logs_via_write_journal_when_present(self, service):
+        """Logs write op via write journal when journal is set."""
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        service.set_write_journal(mock_journal)
+        await service.merge_entities(
+            deprecated_uuid='dep-uuid',
+            surviving_uuid='sur-uuid',
+            project_id='dark_factory',
+            agent_id='test-agent',
+        )
+        mock_journal.log_write_op.assert_awaited_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs.get('operation') == 'merge_entities'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_journal_params_contain_both_uuids(self, service):
+        """Journal params dict contains both deprecated_uuid and surviving_uuid."""
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        service.set_write_journal(mock_journal)
+        await service.merge_entities(
+            deprecated_uuid='dep-uuid',
+            surviving_uuid='sur-uuid',
+            project_id='dark_factory',
+        )
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        params = call_kwargs.get('params', {})
+        assert params.get('deprecated_uuid') == 'dep-uuid'
+        assert params.get('surviving_uuid') == 'sur-uuid'
+
+    @pytest.mark.asyncio
+    async def test_journal_failure_does_not_mask_success(self, service):
+        """Journal failure does not prevent returning successful result."""
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock(side_effect=RuntimeError('journal down'))
+        service.set_write_journal(mock_journal)
+        result = await service.merge_entities(
+            deprecated_uuid='dep-uuid',
+            surviving_uuid='sur-uuid',
+            project_id='dark_factory',
+        )
+        assert result['surviving_uuid'] == 'sur-uuid'
+
+    @pytest.mark.asyncio
+    async def test_backend_failure_is_journaled(self, service):
+        """When backend raises, journal is still called with success=False."""
+        service.graphiti.merge_entities = AsyncMock(
+            side_effect=ValueError('node not found')
+        )
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        service.set_write_journal(mock_journal)
+        with pytest.raises(ValueError, match='node not found'):
+            await service.merge_entities(
+                deprecated_uuid='dep-uuid',
+                surviving_uuid='sur-uuid',
+                project_id='dark_factory',
+            )
+        mock_journal.log_write_op.assert_awaited_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs.get('success') is False
+
+    @pytest.mark.asyncio
+    async def test_works_without_journal(self, service):
+        """Works correctly when no write journal is set."""
+        service._write_journal = None
+        result = await service.merge_entities(
+            deprecated_uuid='dep-uuid',
+            surviving_uuid='sur-uuid',
+            project_id='dark_factory',
+        )
+        assert result['surviving_uuid'] == 'sur-uuid'
