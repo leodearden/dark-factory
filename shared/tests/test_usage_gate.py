@@ -446,3 +446,61 @@ class TestShutdownBackgroundTasks:
         await gate.shutdown()
 
         assert len(gate._background_tasks) == 0
+
+
+# ---------------------------------------------------------------------------
+# task-355 step-6 & step-7: before_invoke() must guard the failover event
+#                            with `if self._cost_store:`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBeforeInvokeGuardConsistency:
+    """task-355 steps 6+7: failover event in before_invoke() must respect cost_store guard."""
+
+    async def test_before_invoke_failover_no_json_dumps_without_cost_store(self):
+        """json.dumps and _fire_cost_event must NOT be called when cost_store=None.
+
+        Currently lines 187-191 call json.dumps({'from': ..., 'to': ...}) as an
+        argument to _fire_cost_event unconditionally, even when cost_store=None.
+        _fire_cost_event would early-return, but json.dumps is still evaluated.
+
+        After the fix, the entire block is wrapped in `if self._cost_store:`,
+        matching the pattern in _handle_cap_detected and _account_resume_probe_loop.
+        """
+        gate = make_gate(['acct-A', 'acct-B'], cost_store=None)
+
+        # Simulate acct-A already used, now capped — triggers failover to acct-B.
+        gate._accounts[0].capped = True
+        gate._last_account_name = 'acct-A'
+
+        with (
+            patch('shared.usage_gate.json.dumps') as mock_dumps,
+            patch.object(gate, '_fire_cost_event') as mock_fire,
+        ):
+            token = await gate.before_invoke()
+
+        assert token == 'fake-token-acct-B'
+        mock_dumps.assert_not_called()
+        mock_fire.assert_not_called()
+
+    async def test_before_invoke_failover_fires_event_with_cost_store(self):
+        """_fire_cost_event MUST be called during failover when cost_store is set.
+
+        Positive control for the guard: when cost_store is not None, the failover
+        event must still fire.
+        """
+        gate = make_gate(['acct-A', 'acct-B'], cost_store=make_mock_cost_store())
+
+        # Simulate acct-A already used, now capped — triggers failover to acct-B.
+        gate._accounts[0].capped = True
+        gate._last_account_name = 'acct-A'
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            token = await gate.before_invoke()
+
+        assert token == 'fake-token-acct-B'
+        mock_fire.assert_called_once()
+        call_args = mock_fire.call_args
+        assert call_args[0][0] == 'acct-B'   # account_name
+        assert call_args[0][1] == 'failover'  # event_type
