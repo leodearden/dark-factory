@@ -379,3 +379,70 @@ class TestAccountResumeProbLoopJsonDumpsGuard:
             await gate._account_resume_probe_loop(acct)
 
         mock_write.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# task-355 step-3 & step-4: shutdown() must drain _background_tasks.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestShutdownBackgroundTasks:
+    """task-355 steps 3+4: shutdown() must cancel and await in-flight background tasks."""
+
+    async def test_shutdown_cancels_and_awaits_background_tasks(self):
+        """shutdown() must cancel in-flight cost-event tasks and drain _background_tasks.
+
+        Currently shutdown() only cancels per-account resume probe tasks and
+        ignores _background_tasks.  In-flight tasks remain pending after shutdown,
+        producing 'Task was destroyed but it is pending' warnings.
+
+        After the fix, shutdown() iterates _background_tasks, cancels each, and
+        awaits them (suppressing CancelledError), leaving _background_tasks empty.
+        """
+        gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
+
+        # Make the cost-store block so tasks stay in-flight when shutdown() is called.
+        block_event = asyncio.Event()
+
+        async def blocking_save(*args, **kwargs):
+            await block_event.wait()
+
+        gate._cost_store.save_account_event.side_effect = blocking_save
+
+        # Fire two events — creates two tasks in _background_tasks.
+        gate._fire_cost_event('acct-A', 'cap_hit', '{}')
+        gate._fire_cost_event('acct-A', 'cap_hit', '{}')
+
+        # Yield to the event loop so the tasks start running and block on blocking_save.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert len(gate._background_tasks) == 2, (
+            f'Expected 2 in-flight tasks, got {len(gate._background_tasks)}'
+        )
+
+        # shutdown() must cancel and drain the in-flight tasks.
+        await gate.shutdown()
+
+        assert len(gate._background_tasks) == 0, (
+            f'Expected empty _background_tasks after shutdown(), '
+            f'got {len(gate._background_tasks)} remaining — '
+            'shutdown() is not draining _background_tasks'
+        )
+
+    async def test_shutdown_with_empty_background_tasks(self):
+        """shutdown() must succeed without error when _background_tasks is empty.
+
+        Regression guard: the new draining loop must handle the empty-set case
+        gracefully (iterating over an empty set is a no-op).
+        """
+        gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
+
+        # No events fired → set is empty.
+        assert len(gate._background_tasks) == 0
+
+        # Must not raise.
+        await gate.shutdown()
+
+        assert len(gate._background_tasks) == 0
