@@ -42,6 +42,10 @@ def _patch_harness_infra(harness: Harness) -> None:
     harness._stop_merge_worker = AsyncMock()
     harness._tag_task_modules = AsyncMock()
     harness._recover_crashed_tasks = AsyncMock()
+    # Disable review checkpoint — tests use tmp_path as project_root, and
+    # an enabled review_checkpoint would invoke a real Claude agent against
+    # that empty directory, generating junk escalations.
+    harness.review_checkpoint = None
     # Return one pending task so run() doesn't raise "no pending tasks"
     harness.scheduler.get_tasks = AsyncMock(return_value=[
         {
