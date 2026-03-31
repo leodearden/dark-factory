@@ -6757,6 +6757,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 367,
+        "title": "Fix css_id filter robustness and test accuracy",
+        "description": "Four items in dashboard css_id filter and its tests:\n\n1. **Type safety** (app.py:241): css_id() doesn't coerce to str(); an integer project key crashes re.sub() with TypeError. Add `str(value)` coercion after falsy guard.\n\n2. **Misleading test name** (test_costs_page.py:1025): test_no_leading_digit_issue uses '---' not digits; rename to test_all_separator_input_returns_unknown and add actual digit-leading test.\n\n3. **Missing edge case** (test_costs_page.py:1030): No test for digit-leading CSS ID input ('123abc'). Document whether this is acceptable.\n\n4. **Imprecise assertion** (test_costs_page.py:1071): test_by_role_canvas_ids_use_project_key uses substring match; verify full ID format including loop.index0 suffix.\n\nFiles: dashboard/src/dashboard/app.py, dashboard/tests/test_costs_page.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6769,7 +6780,7 @@
       ],
       "created": "2026-03-31T15:04:36.029Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T15:04:36.033Z"
+      "updated": "2026-03-31T15:04:40.997Z"
     }
   }
 }
