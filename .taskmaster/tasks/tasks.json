@@ -6582,10 +6582,11 @@
         "description": "All core PlannedEpisodeRegistry methods (register, is_planned, get_planned_uuids, promote, are_all_planned) use `assert self._db is not None` to guard against use before initialization. Python's -O flag silently disables assert statements, turning these into no-ops that produce cryptic AttributeError on None.\n\nAdditionally, in MemoryService.initialize(), if PlannedEpisodeRegistry.initialize() raises (e.g., disk full), self.planned_episode_registry is left pointing to a broken instance (_db=None). Retry calls skip re-creation because the guard sees non-None.\n\nFixes:\n1. Replace each `assert self._db is not None` with `if self._db is None: raise RuntimeError('PlannedEpisodeRegistry not initialized')`\n2. In MemoryService.initialize(), wrap registry creation in try/except and reset to None on failure: `try: ...; except Exception: self.planned_episode_registry = None; raise`\n\nmemory_hints: search for \"PlannedEpisodeRegistry\" and \"assert guard robustness\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-31T15:22:13.520Z"
       },
       {
         "id": "352",
@@ -6829,7 +6830,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T15:22:13.418Z",
+      "lastModified": "2026-03-31T15:22:13.520Z",
       "taskCount": 351,
       "completedCount": 291,
       "tags": [
