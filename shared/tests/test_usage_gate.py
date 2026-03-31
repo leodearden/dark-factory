@@ -124,3 +124,47 @@ class TestBeforeInvokeRaceCondition:
 
         mock_fire.assert_called_once()
         mock_write.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# step-3: _fire_cost_event stores the Task to prevent GC; done-callback
+#         removes it from the set after completion.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFireCostEventTaskStorage:
+    """step-3: _fire_cost_event stores task reference in _background_tasks."""
+
+    async def test_task_stored_immediately_after_fire(self):
+        """Task must be in gate._background_tasks right after _fire_cost_event returns.
+
+        Currently loop.create_task() result is discarded, so _background_tasks
+        either doesn't exist or is empty.
+        """
+        gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
+
+        gate._fire_cost_event('acct-A', 'cap_hit', '{"reason": "test"}')
+
+        assert hasattr(gate, '_background_tasks'), (
+            '_background_tasks set not found — add it in __init__'
+        )
+        assert len(gate._background_tasks) == 1, (
+            f'Expected 1 task, found {len(gate._background_tasks)} — '
+            'task reference is not being stored'
+        )
+
+    async def test_task_removed_after_completion(self):
+        """After the task finishes, done_callback must remove it from _background_tasks."""
+        gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
+
+        gate._fire_cost_event('acct-A', 'cap_hit', '{"reason": "test"}')
+
+        # Give the event loop a chance to run the coroutine to completion
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)  # two yields to ensure done-callback fires
+
+        assert len(gate._background_tasks) == 0, (
+            f'Expected empty set after completion, but {len(gate._background_tasks)} task(s) remain — '
+            'done_callback not calling discard()'
+        )
