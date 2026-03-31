@@ -613,7 +613,12 @@ class TestSearch:
 
     @pytest.mark.asyncio
     async def test_search_graphiti_only_invalid_at_returns_temporal(self, service):
-        """Graphiti search results with only invalid_at set get temporal dict with null valid_at."""
+        """Invalidated edges (non-null invalid_at) are excluded from search results.
+
+        Task 312: changed behavior — previously this test asserted that an edge
+        with only invalid_at set was returned (len==1). After the fix, superseded
+        edges are filtered out, so the result must be empty (len==0).
+        """
         from tests.conftest import MockEdge, MockNode
 
         dt_invalid = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
@@ -633,10 +638,10 @@ class TestSearch:
             project_id='test',
             categories=['entities_and_relations'],
         )
-        assert len(results) == 1
-        assert results[0].temporal is not None
-        assert results[0].temporal['valid_at'] is None
-        assert results[0].temporal['invalid_at'] == '2024-09-01T10:00:00+00:00'
+        # Task 312: invalidated edges are now filtered out — expect empty results
+        assert len(results) == 0, (
+            'Edge with non-null invalid_at must be excluded from search results (task 312)'
+        )
 
 
 class TestDeleteMemory:
@@ -2000,3 +2005,166 @@ class TestInitializeLifecycleConflict:
         )
         # PlannedEpisodeRegistry constructor must NOT have been called
         MockRegistryCls.assert_not_called()
+
+
+class TestSearchGraphitiInvalidatedFiltering:
+    """Task 312: _search_graphiti filters out edges where invalid_at is not None."""
+
+    # step-1: edge with invalid_at set is excluded
+    @pytest.mark.asyncio
+    async def test_edge_with_invalid_at_excluded(self, service):
+        """Edge with non-null invalid_at is excluded from _search_graphiti results."""
+        from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
+
+        dt_invalid = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Service B deprecated',
+                uuid='edge-invalidated-1',
+                valid_at=None,
+                invalid_at=dt_invalid,
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('Service B', scope, 10)
+
+        assert len(results) == 0, (
+            'Edge with non-null invalid_at must be excluded from search results'
+        )
+
+    # step-3: edge with invalid_at=None is NOT excluded
+    @pytest.mark.asyncio
+    async def test_edge_without_invalid_at_not_excluded(self, service):
+        """Edge with invalid_at=None (valid fact) is included in _search_graphiti results."""
+        from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Service A is healthy',
+                uuid='edge-valid-1',
+                valid_at=dt_valid,
+                invalid_at=None,
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('Service A', scope, 10)
+
+        assert len(results) == 1, (
+            'Edge with invalid_at=None must be included in search results'
+        )
+        assert results[0].id == 'edge-valid-1'
+
+    # step-5: mixed valid and invalidated edges — only valid ones survive
+    @pytest.mark.asyncio
+    async def test_mixed_valid_and_invalidated_edges_filtered(self, service):
+        """3 edges (2 valid, 1 invalidated) → exactly 2 results, invalidated excluded."""
+        from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        dt_invalid = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Current fact A', uuid='edge-valid-a', valid_at=dt_valid, invalid_at=None),
+            MockEdge(fact='Superseded fact B', uuid='edge-invalid-b', valid_at=dt_valid, invalid_at=dt_invalid),
+            MockEdge(fact='Current fact C', uuid='edge-valid-c', valid_at=dt_valid, invalid_at=None),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('fact', scope, 10)
+
+        assert len(results) == 2, (
+            'Only 2 of 3 edges are valid; 1 invalidated edge must be excluded'
+        )
+        result_ids = {r.id for r in results}
+        assert 'edge-invalid-b' not in result_ids, (
+            'Invalidated edge must not appear in results'
+        )
+        assert 'edge-valid-a' in result_ids
+        assert 'edge-valid-c' in result_ids
+
+    # step-7: _search_graphiti over-fetches from Graphiti to compensate for filtered edges
+    @pytest.mark.asyncio
+    async def test_overfetch_compensates_for_filtered_edges(self, service):
+        """_search_graphiti calls graphiti.search with num_results=int(limit*1.5)+1."""
+        from fused_memory.models.scope import Scope
+
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        scope = Scope(project_id='test')
+        await service._search_graphiti('query', scope, limit=10)
+
+        service.graphiti.search.assert_called_once()
+        call_kwargs = service.graphiti.search.call_args
+        actual_num_results = call_kwargs.kwargs.get('num_results', call_kwargs.args[2] if len(call_kwargs.args) > 2 else None)
+        expected_num_results = int(10 * 1.5) + 1  # = 16
+        assert actual_num_results == expected_num_results, (
+            f'graphiti.search must be called with num_results={expected_num_results} '
+            f'(int(limit * 1.5) + 1 for limit=10), got {actual_num_results}'
+        )
+
+    # step-9: results are truncated to limit after filtering
+    @pytest.mark.asyncio
+    async def test_results_truncated_to_limit(self, service):
+        """When Graphiti returns more valid edges than limit, results are capped at limit."""
+        from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        # 15 valid edges returned by Graphiti
+        edges = [
+            MockEdge(fact=f'Fact {n}', uuid=f'edge-valid-{n}', valid_at=dt_valid, invalid_at=None)
+            for n in range(15)
+        ]
+        service.graphiti.search = AsyncMock(return_value=edges)
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('fact', scope, limit=10)
+
+        assert len(results) == 10, (
+            'Results must be truncated to limit=10 when Graphiti returns more valid edges'
+        )
+
+    # step-11: scores reflect original rank position from Graphiti, not re-ranked positions
+    @pytest.mark.asyncio
+    async def test_scores_reflect_original_rank_position(self, service):
+        """Surviving edges keep scores from their original Graphiti rank positions.
+
+        Graphiti returns 5 edges at positions 0-4. Edges at positions 1 and 3
+        are invalidated (invalid_at set). The surviving edges at positions 0, 2,
+        and 4 must score 1.0, 0.9, 0.8 respectively (score = max(0, 1 - i*0.05)),
+        NOT re-ranked to 1.0, 0.95, 0.9 based on their post-filter positions.
+        """
+        from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        dt_invalid = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Fact at pos 0', uuid='pos-0', valid_at=dt_valid, invalid_at=None),        # i=0, score=1.00
+            MockEdge(fact='Superseded at pos 1', uuid='pos-1', valid_at=dt_valid, invalid_at=dt_invalid),  # filtered
+            MockEdge(fact='Fact at pos 2', uuid='pos-2', valid_at=dt_valid, invalid_at=None),        # i=2, score=0.90
+            MockEdge(fact='Superseded at pos 3', uuid='pos-3', valid_at=dt_valid, invalid_at=dt_invalid),  # filtered
+            MockEdge(fact='Fact at pos 4', uuid='pos-4', valid_at=dt_valid, invalid_at=None),        # i=4, score=0.80
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('fact', scope, limit=10)
+
+        assert len(results) == 3, 'Three edges should survive filtering'
+
+        scores_by_id = {r.id: r.relevance_score for r in results}
+        assert scores_by_id['pos-0'] == pytest.approx(1.00), (
+            'Edge at original rank 0 must score 1.0 (1.0 - 0*0.05)'
+        )
+        assert scores_by_id['pos-2'] == pytest.approx(0.90), (
+            'Edge at original rank 2 must score 0.9 (1.0 - 2*0.05)'
+        )
+        assert scores_by_id['pos-4'] == pytest.approx(0.80), (
+            'Edge at original rank 4 must score 0.8 (1.0 - 4*0.05)'
+        )

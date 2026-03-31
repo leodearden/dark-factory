@@ -849,7 +849,7 @@ class MemoryService:
         edges = await self.graphiti.search(
             query=query,
             group_ids=[scope.graphiti_group_id],
-            num_results=limit,
+            num_results=int(limit * 1.5) + 1,
         )
 
         # Fetch planned UUIDs once (avoid per-edge DB hits).
@@ -864,6 +864,13 @@ class MemoryService:
             fact = getattr(edge, 'fact', str(edge))
             valid_at = getattr(edge, 'valid_at', None)
             invalid_at = getattr(edge, 'invalid_at', None)
+
+            # Skip superseded edges (invalid_at set means the fact has been
+            # replaced by a newer edge).  Check this before anything else to
+            # avoid unnecessary work on edges that will be discarded.
+            if invalid_at is not None:
+                continue
+
             temporal = _serialize_temporal(valid_at, invalid_at)
 
             # Extract entity names from source/target nodes
@@ -906,7 +913,8 @@ class MemoryService:
                 entities=entities,
                 metadata=metadata,
             ))
-        return results
+        # Truncate to the original limit (over-fetch may have produced extras).
+        return results[:limit]
 
     async def _search_mem0(
         self, query: str, scope: Scope, limit: int, include_planned: bool = False
