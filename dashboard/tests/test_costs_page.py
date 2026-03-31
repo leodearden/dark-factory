@@ -661,6 +661,81 @@ class TestCostsRunsPartial:
 
 
 # ---------------------------------------------------------------------------
+# Step-19: Window selector integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestWindowSelectorIntegration:
+    """Integration tests for window parameter propagation."""
+
+    def test_costs_page_with_24h_window(self, client):
+        """GET /costs?window=24h returns 200."""
+        resp = client.get('/costs?window=24h')
+        assert resp.status_code == 200
+
+    def test_costs_page_with_all_window(self, client):
+        """GET /costs?window=all returns 200."""
+        resp = client.get('/costs?window=all')
+        assert resp.status_code == 200
+
+    def test_summary_partial_24h_calls_data_fn_with_days_1(self, client):
+        """?window=24h → get_cost_summary called with days=1."""
+        with _patch_summary() as mock_fn:
+            client.get('/costs/partials/summary?window=24h')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 1
+
+    def test_by_project_partial_30d_calls_data_fn_with_days_30(self, client):
+        """?window=30d → get_cost_by_project called with days=30."""
+        with _patch_by_project() as mock_fn:
+            client.get('/costs/partials/by-project?window=30d')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 30
+
+    def test_by_account_partial_all_calls_data_fn_with_days_3650(self, client):
+        """?window=all → get_cost_by_account called with days=3650."""
+        with _patch_by_account() as mock_fn:
+            client.get('/costs/partials/by-account?window=all')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 3650
+
+    def test_by_role_partial_7d_calls_data_fn_with_days_7(self, client):
+        """?window=7d → get_cost_by_role called with days=7."""
+        with _patch_by_role() as mock_fn:
+            client.get('/costs/partials/by-role?window=7d')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 7
+
+    def test_trend_partial_24h_calls_data_fn_with_days_1(self, client):
+        """?window=24h → get_cost_trend called with days=1."""
+        with _patch_trend() as mock_fn:
+            client.get('/costs/partials/trend?window=24h')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 1
+
+    def test_events_partial_30d_calls_data_fn_with_days_30(self, client):
+        """?window=30d → get_account_events called with days=30."""
+        with _patch_events() as mock_fn:
+            client.get('/costs/partials/events?window=30d')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 30
+
+    def test_runs_partial_all_calls_data_fn_with_days_3650(self, client):
+        """?window=all → get_run_cost_breakdown called with days=3650."""
+        with _patch_runs() as mock_fn:
+            client.get('/costs/partials/runs?window=all')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 3650
+
+    def test_invalid_window_defaults_to_7(self, client):
+        """Invalid ?window=bogus → days=7 (default) for any partial."""
+        with _patch_summary() as mock_fn:
+            client.get('/costs/partials/summary?window=bogus')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 7
+
+
+# ---------------------------------------------------------------------------
 # Step-9: GET /costs/partials/by-account route tests
 # ---------------------------------------------------------------------------
 
