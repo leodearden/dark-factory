@@ -36,6 +36,7 @@ class _StewardReescalated(Exception):
 
 if TYPE_CHECKING:
     from orchestrator.usage_gate import UsageGate
+    from shared.cost_store import CostStore
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +136,9 @@ class TaskWorkflow:
         initial_plan: dict | None = None,
         steward_factory=None,
         merge_queue: asyncio.Queue | None = None,
+        cost_store: CostStore | None = None,
+        run_id: str = '',
+        project_id: str = '',
     ):
         self.assignment = assignment
         self.config = config
@@ -170,6 +174,11 @@ class TaskWorkflow:
 
         self._steward_factory = steward_factory
         self._steward: Any | None = None
+
+        # Cost tracking — optional; when None, cost recording is silently skipped
+        self._cost_store = cost_store
+        self._run_id = run_id
+        self._project_id = project_id
 
     @property
     def _task_files(self) -> list[str] | None:

@@ -1595,3 +1595,65 @@ class TestReviewerErrors:
         assert outcome == WorkflowOutcome.DONE
         # robustness was called twice (initial fail + retry success)
         assert call_counts['reviewer_robustness'] == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests: CostStore threading
+# ---------------------------------------------------------------------------
+
+
+class TestCostStoreConstructor:
+    """TaskWorkflow accepts cost_store, run_id, project_id as optional params."""
+
+    def test_defaults_to_none_when_not_provided(
+        self, config, git_ops, task_assignment
+    ):
+        """cost_store, run_id, project_id are None/'' by default."""
+        workflow = TaskWorkflow(
+            assignment=task_assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=FakeScheduler(),  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=FakeMcp(),  # type: ignore[arg-type]
+        )
+        assert workflow._cost_store is None
+        assert workflow._run_id == ''
+        assert workflow._project_id == ''
+
+    def test_stores_cost_store_as_attribute(
+        self, config, git_ops, task_assignment
+    ):
+        """When cost_store is provided it is accessible as self._cost_store."""
+        from unittest.mock import MagicMock
+        mock_cost_store = MagicMock()
+        workflow = TaskWorkflow(
+            assignment=task_assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=FakeScheduler(),  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=FakeMcp(),  # type: ignore[arg-type]
+            cost_store=mock_cost_store,
+            run_id='run-abc123def456',
+            project_id='dark_factory',
+        )
+        assert workflow._cost_store is mock_cost_store
+        assert workflow._run_id == 'run-abc123def456'
+        assert workflow._project_id == 'dark_factory'
+
+    def test_backward_compat_no_cost_store_args(
+        self, config, git_ops, task_assignment
+    ):
+        """Constructing TaskWorkflow without cost_store args still works."""
+        workflow = TaskWorkflow(
+            assignment=task_assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=FakeScheduler(),  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=FakeMcp(),  # type: ignore[arg-type]
+        )
+        assert workflow._cost_store is None
+        assert workflow._run_id == ''
+        assert workflow._project_id == ''
