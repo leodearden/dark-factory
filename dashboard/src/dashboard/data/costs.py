@@ -71,6 +71,7 @@ async def get_cost_summary(
             task_count = task_count or 0
             result[project_id] = {
                 'total_spend': total_spend,
+                'task_count': task_count,
                 'avg_cost_per_task': total_spend / task_count if task_count else 0.0,
                 'active_accounts': account_count or 0,
                 'cap_events': cap_by_project.get(project_id, 0),
