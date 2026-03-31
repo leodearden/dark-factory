@@ -6495,7 +6495,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_cost_store.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       }
     ],
     "metadata": {
