@@ -73,7 +73,7 @@
       "id": "step-8",
       "type": "impl",
       "description": "Verify step-7 passes: costs.html has exactly 7 `hx-swap=\"morph:innerHTML\"` attributes",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
