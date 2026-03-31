@@ -1206,6 +1206,73 @@ class MemoryService:
 
         return result
 
+    async def merge_entities(
+        self,
+        deprecated_uuid: str,
+        surviving_uuid: str,
+        project_id: str = 'main',
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
+    ) -> dict:
+        """Merge two Graphiti entity nodes by redirecting edges and deleting the deprecated.
+
+        Delegates to GraphitiBackend.merge_entities(), which validates both nodes,
+        redirects all edges from the deprecated node to the surviving node, deletes
+        the deprecated node, and refreshes the surviving node's summary.
+        Logs the operation via write journal if available.
+
+        Args:
+            deprecated_uuid: UUID of the entity node to be deleted.
+            surviving_uuid: UUID of the entity node that absorbs the edges.
+            project_id: Project scope (for journal logging).
+            agent_id: Which agent is calling (optional).
+            session_id: Session context (optional).
+            causation_id: Reconciliation causation ID (optional).
+            _source: Source label for journal entry.
+
+        Returns:
+            Audit dict from backend: {surviving_uuid, surviving_name, deprecated_uuid,
+            deprecated_name, edges_redirected, surviving_summary}.
+        """
+        write_op_id = str(uuid_mod.uuid4())
+        success = True
+        error_msg = None
+        result: dict = {}
+        try:
+            result = await self.graphiti.merge_entities(deprecated_uuid, surviving_uuid)
+        except Exception as e:
+            success = False
+            error_msg = str(e)
+            raise
+        finally:
+            if self._write_journal:
+                try:
+                    await self._write_journal.log_write_op(
+                        write_op_id=write_op_id,
+                        causation_id=causation_id,
+                        source=_source,
+                        operation='merge_entities',
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        params={
+                            'deprecated_uuid': deprecated_uuid,
+                            'surviving_uuid': surviving_uuid,
+                        },
+                        result_summary=result if success else None,
+                        success=success,
+                        error=error_msg,
+                    )
+                except Exception as journal_exc:
+                    logger.warning(
+                        'merge_entities: journal log_write_op failed: %s',
+                        journal_exc,
+                    )
+
+        return result
+
     # ------------------------------------------------------------------
     # Management
     # ------------------------------------------------------------------
