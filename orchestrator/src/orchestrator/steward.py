@@ -20,10 +20,9 @@ import contextlib
 import json
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-from datetime import UTC, datetime
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
@@ -31,12 +30,12 @@ from orchestrator.agents.roles import STEWARD
 if TYPE_CHECKING:
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
+    from shared.cost_store import CostStore
 
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.config import OrchestratorConfig
     from orchestrator.mcp_lifecycle import McpLifecycle
     from orchestrator.usage_gate import UsageGate
-    from shared.cost_store import CostStore
 
 logger = logging.getLogger(__name__)
 

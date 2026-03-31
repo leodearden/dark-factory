@@ -35,8 +35,9 @@ class _StewardReescalated(Exception):
         self.escalations = escalations
 
 if TYPE_CHECKING:
-    from orchestrator.usage_gate import UsageGate
     from shared.cost_store import CostStore
+
+    from orchestrator.usage_gate import UsageGate
 
 
 # ---------------------------------------------------------------------------
