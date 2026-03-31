@@ -34,11 +34,17 @@ class TestRedirectNodeEdges:
         cast_target._get_graph = MagicMock(return_value=graph)
         with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
             result = await backend.redirect_node_edges('dep-uuid', 'sur-uuid')
-        # Should have called graph.query at least 3 times (inter-node, outgoing, incoming)
-        assert graph.query.await_count >= 3
+        # Should have called graph.query exactly 6 times: 2 per phase (count + action) × 3 phases
+        assert graph.query.await_count == 6
         assert 'outgoing_redirected' in result
         assert 'incoming_redirected' in result
         assert 'inter_node_deleted' in result
+        # Phase 2 redirect query is the 4th call (index 3); must contain CREATE, DELETE, source_node_uuid
+        phase2_redirect_call = graph.query.call_args_list[3]
+        phase2_cypher = phase2_redirect_call[0][0]
+        assert 'CREATE' in phase2_cypher
+        assert 'DELETE' in phase2_cypher
+        assert 'source_node_uuid' in phase2_cypher
 
     @pytest.mark.asyncio
     async def test_deletes_inter_node_edges(self, mock_config, make_backend, make_graph_mock):
