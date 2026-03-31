@@ -297,9 +297,15 @@ class MemoryService:
         # Register planning episodes so they can be filtered from search results
         if temporal_context == 'planning' and self.planned_episode_registry is not None:
             episode_uuid = payload.get('uuid')
-            group_id = payload.get('group_id', '')
-            if episode_uuid:
+            group_id = payload.get('group_id')
+            if episode_uuid and group_id:
                 await self.planned_episode_registry.register(episode_uuid, group_id)
+            elif episode_uuid and not group_id:
+                logger.warning(
+                    'Skipping planned episode registration: group_id missing from payload '
+                    'for episode %s',
+                    episode_uuid,
+                )
 
         return result
 
