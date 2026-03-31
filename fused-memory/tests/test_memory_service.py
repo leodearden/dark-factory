@@ -2053,3 +2053,31 @@ class TestSearchGraphitiInvalidatedFiltering:
             'Edge with invalid_at=None must be included in search results'
         )
         assert results[0].id == 'edge-valid-1'
+
+    # step-5: mixed valid and invalidated edges — only valid ones survive
+    @pytest.mark.asyncio
+    async def test_mixed_valid_and_invalidated_edges_filtered(self, service):
+        """3 edges (2 valid, 1 invalidated) → exactly 2 results, invalidated excluded."""
+        from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        dt_invalid = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Current fact A', uuid='edge-valid-a', valid_at=dt_valid, invalid_at=None),
+            MockEdge(fact='Superseded fact B', uuid='edge-invalid-b', valid_at=dt_valid, invalid_at=dt_invalid),
+            MockEdge(fact='Current fact C', uuid='edge-valid-c', valid_at=dt_valid, invalid_at=None),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('fact', scope, 10)
+
+        assert len(results) == 2, (
+            'Only 2 of 3 edges are valid; 1 invalidated edge must be excluded'
+        )
+        result_ids = {r.id for r in results}
+        assert 'edge-invalid-b' not in result_ids, (
+            'Invalidated edge must not appear in results'
+        )
+        assert 'edge-valid-a' in result_ids
+        assert 'edge-valid-c' in result_ids
