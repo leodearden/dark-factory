@@ -6814,6 +6814,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 372,
+        "title": "Harden planned episode promotion test assertions",
+        "description": "Two test gaps in TestPlannedEpisodePromotion (test_targeted.py): (1) test_dedup_promotion_across_shared_provenance verifies promote() call count and UUID set, but does not assert the returned result dict contains the correct deduplicated count in the 'planned_episodes_promoted' action — a regression recording count=4 instead of 3 would pass undetected. Add: `assert any(a == {'type': 'planned_episodes_promoted', 'count': 3} for a in result['actions'])`. (2) test_promotion_called_for_planned_edges uses `assert_called_with(ep_uuid)` which only checks the last call, not call count — change to `assert_called_once_with(ep_uuid)`. Also clean up the 3 redundant inline imports of SourceStore/MemoryResult at lines 596-597, 640-641, 668-669 (already imported at module scope).\n\nmemory_hints: search for \"planned episode promotion tests\" and \"test_targeted TestPlannedEpisodePromotion\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6826,7 +6837,7 @@
       ],
       "created": "2026-03-31T15:21:55.357Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T15:21:55.360Z"
+      "updated": "2026-03-31T15:22:02.244Z"
     }
   }
 }
