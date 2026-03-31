@@ -68,6 +68,9 @@ class TestParseCodexNullUsage:
         # Must not raise AttributeError
         agent_result = _parse_codex_output(result, 'o4-mini')
         assert agent_result.success is True
+        assert agent_result.output == 'hello'
+        assert agent_result.cost_usd == 0.0
+        assert agent_result.turns == 1
 
 
 class TestParseCodexValidUsage:
