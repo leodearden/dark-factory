@@ -1,0 +1,282 @@
+{
+  "task_id": "308",
+  "title": "Add temporal guards for PRD-sourced knowledge graph edges",
+  "files": [
+    "fused-memory/src/fused_memory/services/planned_episode_registry.py",
+    "fused-memory/src/fused_memory/services/memory_service.py",
+    "fused-memory/src/fused_memory/server/tools.py",
+    "fused-memory/src/fused_memory/reconciliation/targeted.py",
+    "fused-memory/tests/test_planned_episode_registry.py",
+    "fused-memory/tests/test_temporal_guards.py",
+    "fused-memory/tests/test_memory_service.py",
+    "fused-memory/tests/test_targeted.py",
+    "fused-memory/tests/conftest.py"
+  ],
+  "modules": [
+    "fused-memory/src/fused_memory/services",
+    "fused-memory/src/fused_memory/server",
+    "fused-memory/src/fused_memory/reconciliation",
+    "fused-memory/tests"
+  ],
+  "analysis": "PRD and planning episodes ingested via add_episode generate Graphiti edges that describe planned/aspirational work as current fact. The temporal_context='planning' parameter already exists and prepends '[temporal:planning]' to source_description, but this is only a text hint \u2014 it doesn't prevent edges from appearing in normal search results as factual statements.\n\nThe contamination vector: an agent ingests PRD content via add_episode(temporal_context='planning'), Graphiti's LLM extracts edges like 'CostStore extends AgentResult' as facts, and these appear in search results indistinguishable from real implemented state.\n\nSolution: Planned Episode Registry + post-filter pattern.\n\n1. Track which episode UUIDs are 'planning' episodes in a lightweight SQLite-backed registry (PlannedEpisodeRegistry)\n2. After add_episode with temporal_context='planning', register the episode UUID\n3. During search, post-filter: if ALL of an edge's episode UUIDs are in the planned registry, exclude the edge by default\n4. Add include_planned parameter to search to allow explicit inclusion (for reconciliation/auditing)\n5. Tag Mem0 dual-writes from planning episodes with planned=true metadata, filter similarly\n6. When a task is marked done, promote related planned episodes (remove from registry) so their edges become visible\n\nThis approach avoids modifying FalkorDB edge properties (which graphiti_core might not load during search) and keeps our layer cleanly separated from graphiti internals. Each edge's episodes list (provenance) is the join key \u2014 if ALL contributing episodes are planned, the edge is aspirational.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Create PlannedEpisodeRegistry module file (fused-memory/src/fused_memory/services/planned_episode_registry.py) with empty class skeleton and __init__ imports",
+      "status": "done",
+      "commit": "c54356f1",
+      "tests": []
+    },
+    {
+      "id": "pre-2",
+      "description": "Create test file scaffolds: test_planned_episode_registry.py and test_temporal_guards.py with imports and basic fixtures",
+      "status": "done",
+      "commit": "c54356f1",
+      "tests": []
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing tests for PlannedEpisodeRegistry: register(episode_uuid, project_id), is_planned(episode_uuid) \u2192 bool, get_planned_uuids(project_id) \u2192 set[str]. Test register+check round-trip, project isolation, and idempotent re-register. Uses tmp_path for SQLite.",
+      "status": "done",
+      "commit": "ac087af9"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Implement PlannedEpisodeRegistry with SQLite backing: initialize() creates table (episode_uuid TEXT PK, project_id TEXT, created_at TEXT), register(), is_planned(), get_planned_uuids(), close(). Use aiosqlite following DurableWriteQueue/EventBuffer patterns.",
+      "status": "done",
+      "commit": "305718f9"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing tests for PlannedEpisodeRegistry.promote(episode_uuid) and are_all_planned(episode_uuids) \u2192 bool. Test: promote removes from planned set; are_all_planned returns True only when ALL uuids are planned; empty list returns False; mixed planned/unplanned returns False.",
+      "status": "done",
+      "commit": "7a0fdb9e"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Implement promote(episode_uuid) \u2014 DELETE from table. Implement are_all_planned(episode_uuids) \u2014 query planned set for project, check all uuids present. Empty list returns False.",
+      "status": "done",
+      "commit": "305718f9"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing test for _execute_graphiti_write: when temporal_context='planning' is in payload, after successful graphiti.add_episode, the episode UUID should be registered in the planned_episode_registry. When temporal_context is None or 'current', no registration. Mock planned_registry on service fixture.",
+      "status": "done",
+      "commit": "8bef5b68"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Add planned_episode_registry attribute to MemoryService (default None). In _execute_graphiti_write, after dedup, if temporal_context == 'planning' and self.planned_episode_registry is not None, call registry.register(payload['uuid'], payload['group_id']). Add set_planned_registry() wiring method. Initialize registry in MemoryService.initialize() using qcfg.data_dir, close in close().",
+      "status": "done",
+      "commit": "6d312d8a"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing test for _dual_write_callback: when payload contains temporal_context='planning', each enqueued mem0_classify_and_add item should include temporal_context in its payload. When temporal_context is absent, it should not be in Mem0 payloads.",
+      "status": "done",
+      "commit": "2d0185f1"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "In _dual_write_callback, add 'temporal_context': payload.get('temporal_context') to each batch item's payload dict. Note: temporal_context is popped in _execute_graphiti_write, but the durable queue deserializes a fresh copy for callbacks, so it's available in the callback payload.",
+      "status": "done",
+      "commit": "dacf1523"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write failing test for _execute_mem0_classify_and_add: when payload contains temporal_context='planning', the Mem0 metadata should include 'planned': True. When temporal_context is absent/None, no 'planned' key in metadata.",
+      "status": "done",
+      "commit": "e2b0f8e1"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "In _execute_mem0_classify_and_add, extract temporal_context from payload. If temporal_context == 'planning', add 'planned': True to the metadata dict before calling mem0.add().",
+      "status": "done",
+      "commit": "c2e1d49f"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Write failing tests for _search_graphiti filtering: (a) edge with ALL episodes in planned registry is excluded by default; (b) edge with mixed episodes (some planned, some not) is NOT excluded; (c) edge with no episodes is NOT excluded; (d) edge with all non-planned episodes is NOT excluded. Use MockEdge with episodes set, mock planned_episode_registry.are_all_planned.",
+      "status": "done",
+      "commit": "d977537d"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Modify _search_graphiti signature to accept include_planned: bool = False. After building MemoryResult list, if not include_planned and self.planned_episode_registry, get planned_uuids for the project. For each result, check if ALL provenance episode UUIDs are in planned_uuids. If so, exclude the result. Use set intersection: if provenance and all(ep in planned_uuids for ep in provenance).",
+      "status": "done",
+      "commit": "a1af5bfe"
+    },
+    {
+      "id": "step-13",
+      "type": "test",
+      "description": "Write failing tests for _search_graphiti with include_planned=True: (a) planned edges are included; (b) included planned edges have metadata['planned'] = True set on the MemoryResult.",
+      "status": "done",
+      "commit": "d977537d"
+    },
+    {
+      "id": "step-14",
+      "type": "impl",
+      "description": "When include_planned=True, don't filter. But for edges that would be filtered (all episodes planned), set result.metadata['planned'] = True so callers can distinguish them. Also set metadata['planned'] = True on planned edges even when they're being filtered (for the include_planned=True path).",
+      "status": "done",
+      "commit": "a1af5bfe"
+    },
+    {
+      "id": "step-15",
+      "type": "test",
+      "description": "Write failing tests for _search_mem0 filtering: (a) result with metadata.planned=True excluded by default; (b) result with metadata.planned=True included when include_planned=True; (c) result without planned metadata NOT excluded.",
+      "status": "done",
+      "commit": "d977537d"
+    },
+    {
+      "id": "step-16",
+      "type": "impl",
+      "description": "Modify _search_mem0 signature to accept include_planned: bool = False. After building MemoryResult list, if not include_planned, filter out results where source metadata has 'planned': True.",
+      "status": "done",
+      "commit": "a1af5bfe"
+    },
+    {
+      "id": "step-17",
+      "type": "test",
+      "description": "Write failing test for MemoryService.search: include_planned parameter is passed through to both _search_graphiti and _search_mem0. When include_planned=True, planned results appear; when False (default), they don't.",
+      "status": "done",
+      "commit": "d977537d"
+    },
+    {
+      "id": "step-18",
+      "type": "impl",
+      "description": "Add include_planned: bool = False parameter to MemoryService.search(). Pass it through to _search_graphiti() and _search_mem0() calls.",
+      "status": "done",
+      "commit": "a1af5bfe"
+    },
+    {
+      "id": "step-19",
+      "type": "test",
+      "description": "Write failing test for MCP search tool: include_planned parameter is accepted and forwarded to memory_service.search(). Verify validation (must be bool).",
+      "status": "done",
+      "commit": "6e871431"
+    },
+    {
+      "id": "step-20",
+      "type": "impl",
+      "description": "Add include_planned: bool = False parameter to the MCP search() tool in tools.py. Pass it through to memory_service.search(). Update the tool docstring to document the parameter.",
+      "status": "done",
+      "commit": "d9a72444"
+    },
+    {
+      "id": "step-21",
+      "type": "test",
+      "description": "Write failing test for planned episode promotion on task done: when _on_task_done fires, it should search for planned edges related to the task (using include_planned=True), extract their provenance episode UUIDs, and call planned_episode_registry.promote() for each. Mock registry on the reconciler.",
+      "status": "done",
+      "commit": "84de80c0"
+    },
+    {
+      "id": "step-22",
+      "type": "impl",
+      "description": "In TargetedReconciler, add planned_episode_registry attribute (optional, default None). In _on_task_done, after step 1 (search for existing knowledge), add step 1.5: search with include_planned=True for title+description. For each result with metadata.get('planned'), extract provenance UUIDs and call registry.promote(uuid). Log promotion as journal action.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-23",
+      "type": "test",
+      "description": "Write integration test in test_temporal_guards.py: full round-trip \u2014 add_episode with temporal_context='planning' enqueues correctly; _execute_graphiti_write registers planned episode; _search_graphiti excludes the edge; after promote, _search_graphiti includes the edge. Uses real PlannedEpisodeRegistry with tmp_path SQLite, mocked graphiti/mem0 backends.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-24",
+      "type": "impl",
+      "description": "Fix any integration issues found in step-23. Ensure the full pipeline works end-to-end: planning episode \u2192 registry \u2192 search exclusion \u2192 promotion \u2192 search inclusion.",
+      "status": "pending",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use a Planned Episode Registry (episode-level tracking) instead of tagging individual edges in FalkorDB",
+      "rationale": "graphiti_core may not load custom edge properties during search, so setting a 'planned' property on FalkorDB edges could be silently ignored. Tracking at the episode level is cleaner: we control the data, it's join-able via edge provenance (episodes list), and it doesn't depend on graphiti_core internals. The episode is the natural unit since that's where temporal_context is specified."
+    },
+    {
+      "decision": "Post-filter search results rather than modifying Graphiti Cypher queries",
+      "rationale": "We wrap graphiti_core's search() and don't control its internal Cypher. Post-filtering in _search_graphiti is simpler and doesn't require upstream library modifications. The cost is wasted search slots (some results are filtered), but this is acceptable for the current use case where planned edges are a small fraction."
+    },
+    {
+      "decision": "Exclude planned edges by default, include via explicit flag",
+      "rationale": "The contamination problem occurs because planned edges appear in normal search. Default exclusion prevents this. Explicit include_planned=True is needed for reconciliation (which must see all edges), auditing, and the promotion flow (task done handler searches for planned edges to promote). This follows the principle of least surprise."
+    },
+    {
+      "decision": "An edge is 'planned' only if ALL its contributing episodes are planned",
+      "rationale": "An edge may have provenance from multiple episodes. If any non-planning episode contributed the same fact, the fact has been observed outside planning context and should not be hidden. Only edges whose entire provenance is from planning episodes are aspirational."
+    },
+    {
+      "decision": "Promotion removes episodes from the planned registry rather than adding a 'promoted' flag",
+      "rationale": "Simpler data model \u2014 once promoted, the episode is just a normal episode. No need to distinguish 'never-planned' from 'promoted'. The registry shrinks over time as work is completed, which is healthy for query performance."
+    },
+    {
+      "decision": "SQLite-backed registry following existing EventBuffer/DurableQueue patterns",
+      "rationale": "Consistent with the project's existing persistence patterns. Each service component has its own SQLite database. aiosqlite provides async access. The registry uses the same data_dir as the durable queue for co-location."
+    },
+    {
+      "decision": "Tag Mem0 dual-writes with planned metadata for consistent cross-store filtering",
+      "rationale": "Facts extracted from planning episodes are dual-written to Mem0. Without tagging, these Mem0 entries would appear in search even when Graphiti edges are filtered. Adding 'planned': True to Mem0 metadata enables the same filter logic in _search_mem0."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "MockEdge, MockNode, MockAddEpisodeResult dataclasses",
+      "where": "fused-memory/tests/conftest.py",
+      "how": "Use existing mock types for testing edge filtering. MockEdge already has an episodes field for provenance tracking."
+    },
+    {
+      "what": "aiosqlite + initialize/close lifecycle pattern",
+      "where": "fused-memory/src/fused_memory/services/durable_queue.py and reconciliation/event_buffer.py",
+      "how": "Follow the same async SQLite pattern: initialize() creates tables, close() closes connection, all ops use async context manager."
+    },
+    {
+      "what": "MemoryService service fixture with mocked backends",
+      "where": "fused-memory/tests/test_memory_service.py:15-42",
+      "how": "Extend existing service fixture to include mocked planned_episode_registry. Add registry mock with AsyncMock for register, promote, are_all_planned, get_planned_uuids."
+    },
+    {
+      "what": "temporal_context parameter flow",
+      "where": "tools.py \u2192 memory_service.py \u2192 durable_queue payload \u2192 graphiti_client.py",
+      "how": "Extend the existing temporal_context flow rather than creating a parallel mechanism. The parameter already reaches _execute_graphiti_write; add registry call at that point."
+    },
+    {
+      "what": "MemoryResult.metadata dict",
+      "where": "fused-memory/src/fused_memory/models/memory.py:38",
+      "how": "Use the existing metadata field to carry 'planned': True on results. No model changes needed \u2014 it's already dict = Field(default_factory=dict)."
+    },
+    {
+      "what": "Reconciliation journal action logging",
+      "where": "fused-memory/src/fused_memory/reconciliation/targeted.py:172-176",
+      "how": "Log promotion actions using the same journal.add_run_action pattern used for knowledge capture."
+    },
+    {
+      "what": "FusedMemoryConfig.queue.data_dir",
+      "where": "fused-memory/src/fused_memory/config/schema.py",
+      "how": "Use the same data_dir for the planned episode registry SQLite file, keeping all persistent service data co-located."
+    },
+    {
+      "what": "TargetedReconciler fixture and test patterns",
+      "where": "fused-memory/tests/test_targeted.py",
+      "how": "Extend existing reconciler fixture to include mocked planned_episode_registry. Follow same patterns for testing _on_task_done promotion."
+    }
+  ],
+  "_session_id": "308-46298e63",
+  "_created_at": "2026-03-30T22:14:04.307375+00:00"
+}
