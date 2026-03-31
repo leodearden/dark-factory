@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import abc
 from pathlib import Path
+from typing import Self
 
 import aiosqlite
 
@@ -79,7 +80,7 @@ class AsyncSqliteBase(abc.ABC):
             await self._conn.close()
             self._conn = None
 
-    async def __aenter__(self) -> AsyncSqliteBase:
+    async def __aenter__(self) -> Self:
         await self.open()
         return self
 
