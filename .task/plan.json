@@ -1,0 +1,116 @@
+{
+  "task_id": "365",
+  "title": "Strengthen merge_entities test assertions",
+  "files": [
+    "fused-memory/tests/test_merge_entities.py"
+  ],
+  "modules": [
+    "fused-memory/tests"
+  ],
+  "analysis": "The task addresses 5 specific test gaps in TestRedirectNodeEdges within test_merge_entities.py. All changes are test-only \u2014 the production code in graphiti_client.py already implements the behavior correctly, but the tests are insufficiently precise to catch regressions.\n\nGap analysis against redirect_node_edges source (graphiti_client.py lines 397-503):\n\n1. test_redirects_outgoing_edges (line 27): Uses make_graph_mock([]) which returns the same empty result for all 6 queries. Asserts `await_count >= 3` (should be == 6) and only checks dict key presence \u2014 never inspects the Cypher strings passed to graph.query() for Phase 2 content (CREATE, DELETE, source_node_uuid).\n\n2. test_returns_count_dict (line 64): Uses make_graph_mock([]) so result_set is always empty list, only exercising the `else 0` branch. The `int(result_set[0][0])` path is never tested. Need sequenced mock results via side_effect.\n\n3. No test for incoming edge redirect (Phase 3): Phase 3 is the most asymmetric part \u2014 it sets target_node_uuid instead of source_node_uuid. No test verifies this distinction.\n\n4. test_deletes_inter_node_edges (line 44): Checks dep_uuid appears in params but never verifies sur_uuid is also in params (inter-node edges are BETWEEN both nodes). Also never verifies the Cypher contains DELETE.\n\n5. The `>= 3` assertion (line 38) should be `== 6` since redirect_node_edges makes exactly 6 graph.query calls: 2 per phase (count + action) \u00d7 3 phases.\n\nApproach: Modify existing tests to strengthen assertions and add 2 new tests. All use the existing make_graph_mock/make_backend fixtures, except the non-zero count test which needs manual side_effect setup. Tests will inspect call_args_list to verify Cypher content.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Strengthen test_redirects_outgoing_edges: change `>= 3` to `== 6` (exact query count for 3 phases \u00d7 2 queries each), and add assertions that inspect call_args_list for Phase 2 Cypher \u2014 the redirect query (4th call, index 3) must contain 'CREATE', 'DELETE', and 'source_node_uuid'.",
+      "status": "done",
+      "commit": "02f492e5"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Run pytest on test_redirects_outgoing_edges to verify the strengthened assertions pass against the existing redirect_node_edges implementation. No production code changes needed.",
+      "status": "done",
+      "commit": "02f492e5"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Add test_redirects_incoming_edges_cypher: new test in TestRedirectNodeEdges that verifies Phase 3 Cypher content. The incoming redirect query (6th call, index 5) must contain 'CREATE', 'DELETE', and 'target_node_uuid' (NOT source_node_uuid). This tests the asymmetry between Phase 2 and Phase 3.",
+      "status": "done",
+      "commit": "a126ed6e"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Run pytest on test_redirects_incoming_edges_cypher to verify it passes. No production code changes needed.",
+      "status": "done",
+      "commit": "a126ed6e"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Strengthen test_deletes_inter_node_edges: add assertion that sur_uuid ('sur-xyz') also appears in the first query's params (inter-node edges are between BOTH nodes), and verify the second query (index 1) Cypher string contains 'DELETE'.",
+      "status": "done",
+      "commit": "e5ae3147"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Run pytest on test_deletes_inter_node_edges to verify the strengthened assertions pass. No production code changes needed.",
+      "status": "done",
+      "commit": "e5ae3147"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Add test_returns_nonzero_counts: new test in TestRedirectNodeEdges that exercises the non-empty result_set branch (`int(result_set[0][0])`). Set up graph.query with side_effect returning 6 sequenced MagicMock results: count results [[3]], [[5]], [[2]] alternating with empty action results []. Assert the returned dict has inter_node_deleted=3, outgoing_redirected=5, incoming_redirected=2.",
+      "status": "done",
+      "commit": "86f58095"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Run pytest on test_returns_nonzero_counts to verify the sequenced mock results are correctly parsed by redirect_node_edges. No production code changes needed.",
+      "status": "done",
+      "commit": "86f58095"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Inspect Cypher via call_args_list indexing rather than string matching on all calls",
+      "rationale": "redirect_node_edges makes exactly 6 queries in deterministic order. Indexing specific calls (e.g., index 3 for Phase 2 redirect, index 5 for Phase 3 redirect) is more precise than scanning all calls with substring matching, and makes test failures easier to diagnose."
+    },
+    {
+      "decision": "Use side_effect with 6 sequenced MagicMock results for the non-zero count test instead of extending make_graph_mock",
+      "rationale": "make_graph_mock is a shared fixture designed for simple cases (single return value). Adding sequenced-result support would complicate it for a single test. Manual setup with side_effect is clearer and self-contained."
+    },
+    {
+      "decision": "Assert == 6 for query count rather than exact per-phase counts",
+      "rationale": "The implementation has exactly 3 phases \u00d7 2 queries (count + action) = 6 total. An exact count catches regressions where a phase is accidentally omitted or duplicated, which >= 3 would miss."
+    },
+    {
+      "decision": "Test Phase 3 asymmetry (target_node_uuid) as a separate test rather than combining with Phase 2 test",
+      "rationale": "The incoming-vs-outgoing asymmetry (target_node_uuid vs source_node_uuid) is the most subtle part of redirect_node_edges. A dedicated test makes the intent clear and produces a meaningful test name in failure reports."
+    },
+    {
+      "decision": "Keep all changes in the existing test file without adding new test classes",
+      "rationale": "The new tests (incoming edges cypher, nonzero counts) logically belong in TestRedirectNodeEdges alongside the existing tests. Adding a new class would fragment related assertions."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "make_graph_mock fixture",
+      "where": "fused-memory/tests/conftest.py lines 120-142",
+      "how": "Reused for all tests except test_returns_nonzero_counts. Provides graph mock with AsyncMock query/ro_query and configurable result_set."
+    },
+    {
+      "what": "make_backend fixture",
+      "where": "fused-memory/tests/conftest.py lines 102-117",
+      "how": "Reused for all tests to create GraphitiBackend with mocked client."
+    },
+    {
+      "what": "Existing cast patching pattern",
+      "where": "fused-memory/tests/test_merge_entities.py lines 33-36",
+      "how": "All tests reuse the same pattern: create cast_target MagicMock, set _get_graph return value, patch 'fused_memory.backends.graphiti_client.cast'."
+    },
+    {
+      "what": "mock_config fixture",
+      "where": "fused-memory/tests/conftest.py lines 173-204",
+      "how": "Reused for all tests as first argument to make_backend."
+    }
+  ],
+  "_session_id": "365-a2a3ac06",
+  "_created_at": "2026-03-31T15:41:37.592606+00:00"
+}
