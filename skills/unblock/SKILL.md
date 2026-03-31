@@ -181,11 +181,9 @@ The merge procedure is iterative — don't assume one pass will be enough:
 3. Fix any failures.
 4. On green: rebase on main again — other tasks may have merged while you were fixing.
 5. Repeat steps 2-4 until stable (rebase is clean AND verification passes with no new changes needed).
-6. Merge to main with `--no-ff`.
-7. Run verification on main.
-8. Fix any post-merge failures, commit.
-9. On green: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>")`
-10. Clean up: `git worktree remove .worktrees/<TASK_ID>` and `git branch -d task/<TASK_ID>`
+6. Use `/merge-queue` to merge. It routes through the orchestrator's merge queue when available (preventing races with concurrent tasks) and falls back to direct merge when the orchestrator isn't running.
+7. On green: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>")`
+8. Clean up: `git worktree remove .worktrees/<TASK_ID>` and `git branch -d task/<TASK_ID>`
 
 *If this is an escalated task (pending escalation, agent is paused):*
 
