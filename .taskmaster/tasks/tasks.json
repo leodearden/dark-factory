@@ -5795,7 +5795,7 @@
         "description": "Add an entity merge MCP tool that consolidates duplicate entity nodes in Graphiti. Currently, the same real-world concept can end up as multiple entity nodes with different UUIDs, fragmenting knowledge across them. The tool should accept two entity UUIDs, merge their edge sets and summaries, and redirect all references to the surviving node. Example: two separate UsageGate nodes (fae8cccb, 0e745450) exist with different summaries and edge sets.\n\nMemory hints:\n- Search: 'duplicate entity nodes fragmented knowledge'\n- Entities: UsageGate, Graphiti",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -5836,7 +5836,8 @@
             "fused-memory/src/fused_memory/backends",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-31T14:22:36.971Z"
       },
       {
         "id": "311",
@@ -6632,7 +6633,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T14:22:36.895Z",
+      "lastModified": "2026-03-31T14:22:36.971Z",
       "taskCount": 335,
       "completedCount": 284,
       "tags": [
