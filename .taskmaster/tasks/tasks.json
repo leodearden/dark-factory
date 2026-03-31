@@ -6007,6 +6007,17 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 322,
+        "title": "Migrate fused-memory SQLite stores to AsyncSqliteBase",
+        "description": "Task 315 extracted AsyncSqliteBase but only migrated CostStore (in shared/). Four fused-memory stores still duplicate the identical open/WAL-pragma/executescript/close lifecycle:\n\n- DurableWriteQueue (fused-memory/src/fused_memory/services/durable_queue.py)\n- WriteJournal (fused-memory/src/fused_memory/services/write_journal.py)\n- EventBuffer (fused-memory/src/fused_memory/reconciliation/event_buffer.py)\n- ReconciliationJournal (fused-memory/src/fused_memory/reconciliation/journal.py)\n\nEach has 30-50 lines of boilerplate that AsyncSqliteBase eliminates. They differ only in schema DDL and busy_timeout_ms — both already parameterized by the base class.\n\nMigration pattern per store:\n- Replace initialize()/open() with AsyncSqliteBase.open()\n- Drop _db/_require_db boilerplate (use _require_conn())\n- Implement _schema as a property\n- Pass busy_timeout_ms to super().__init__()\n- For stores using `row_factory = aiosqlite.Row`: override open(), call super().open(), then set row_factory\n\nDepends on task 315 being merged to main.\n\nmemory_hints:\n- search: \"AsyncSqliteBase base class sqlite lifecycle dedup\"\n- entity: \"DurableWriteQueue\"\n- entity: \"WriteJournal\"\n- entity: \"EventBuffer\"\n- entity: \"ReconciliationJournal\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6019,7 +6030,7 @@
       ],
       "created": "2026-03-31T08:21:20.154Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T08:21:20.158Z"
+      "updated": "2026-03-31T08:21:28.581Z"
     }
   }
 }
