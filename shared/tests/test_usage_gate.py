@@ -12,7 +12,6 @@ import pytest
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import UsageGate
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
