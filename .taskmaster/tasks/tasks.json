@@ -6529,6 +6529,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 348,
+        "title": "Consolidate duplicated _MOCK_SUMMARY test fixture",
+        "description": "Both test_costs_page.py and test_costs_panel.py define identical `_MOCK_SUMMARY` dicts that must be kept in sync manually. Extract into a shared location (tests/conftest.py fixture or tests/fixtures.py constant) and import in both files. This prevents future field additions from requiring parallel edits.\n\nMemory hints: search(\"dashboard cost test fixtures mock summary\", project_id=\"dark_factory\")",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6541,7 +6552,7 @@
       ],
       "created": "2026-03-31T14:14:24.177Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T14:14:24.179Z"
+      "updated": "2026-03-31T14:14:27.320Z"
     }
   }
 }
