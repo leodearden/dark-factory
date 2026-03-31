@@ -5564,7 +5564,7 @@
         "description": "New dashboard page at GET /costs. Create dashboard/src/dashboard/templates/costs.html extending base.html with nav bar active on 'costs'. Add HTMX-polled sections for each cost panel, each with its own partial endpoint under GET /costs/partials/{section}.\n\nPartials and templates (in dashboard/src/dashboard/templates/partials/costs/):\n- summary.html — 4 metric cards (total spend, avg cost/task, active accounts, cap events)\n- by_project.html — horizontal stacked bar chart (Chart.js) by project, segments by model\n- by_account.html — doughnut chart + table with spend, invocations, cap events, last cap, status\n- by_role.html — horizontal stacked bar by role, segments by model\n- trend.html — daily cost line chart, one line per project\n- events.html — chronological account event feed, color-coded by event type\n- runs.html — expandable run/task/invocation drilldown table\n\nTime window selector: 24h / 7d / 30d / all. Implemented as HTMX buttons that set a query param (window=24h etc), re-triggering all partials. Default 7d.\n\nRoutes in app.py: add GET /costs returning costs.html, and GET /costs/partials/{section} handlers that call the corresponding costs.py data functions and render the partial templates. Follow the existing pattern of asyncio.gather for parallel data fetches. Poll intervals: summary 30s, charts 60s, events 30s, runs 60s.\n\nChart color scheme consistent with existing performance charts.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "298",
           "296"
@@ -5588,7 +5588,8 @@
             "dashboard/src/dashboard/templates",
             "dashboard/src/dashboard/templates/partials/costs"
           ]
-        }
+        },
+        "updatedAt": "2026-03-31T03:19:01.707Z"
       },
       {
         "id": "303",
@@ -5987,7 +5988,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T03:19:01.367Z",
+      "lastModified": "2026-03-31T03:19:01.711Z",
       "taskCount": 298,
       "completedCount": 269,
       "tags": [
