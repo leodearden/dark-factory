@@ -126,7 +126,7 @@
       "type": "impl",
       "description": "Update shared/src/shared/__init__.py: import and export AsyncSqliteBase and apply_wal_pragmas from async_sqlite_base module, add to __all__. Add __all__ to async_sqlite_base.py module.",
       "status": "done",
-      "commit": "pending"
+      "commit": "ae3ffda1"
     }
   ],
   "design_decisions": [
