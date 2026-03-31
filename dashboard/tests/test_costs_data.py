@@ -267,6 +267,52 @@ class TestCostSummary:
         result = await get_cost_summary(empty_costs_conn)
         assert result == {}
 
+    @pytest.mark.asyncio
+    async def test_days_window_boundary(self, tmp_path):
+        """_cutoff(days) must exclude invocations older than the window.
+
+        Insert two invocations: one 2 hours ago (recent) and one 20 days ago
+        (old). days=1 should include only the recent one; days=30 should
+        include both, producing a higher total_spend.
+        """
+        db_path = tmp_path / 'window.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+        conn.executemany(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [
+                # Recent: 2 hours ago — inside any reasonable window
+                ('r1', 't1', 'proj', 'acc', 'claude-opus-4-5', 'implementer',
+                 0.50, 0,
+                 (now - timedelta(hours=2, minutes=1)).isoformat(),
+                 (now - timedelta(hours=2)).isoformat()),
+                # Old: 20 days ago — outside 7d window, inside 30d window
+                ('r2', 't2', 'proj', 'acc', 'claude-opus-4-5', 'implementer',
+                 1.50, 0,
+                 (now - timedelta(days=20, hours=1)).isoformat(),
+                 (now - timedelta(days=20)).isoformat()),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            narrow = await get_cost_summary(aconn, days=1)
+            wide = await get_cost_summary(aconn, days=30)
+
+        # days=1: only the 2h-ago invocation is included
+        assert 'proj' in narrow
+        assert narrow['proj']['total_spend'] == pytest.approx(0.50, abs=1e-6)
+
+        # days=30: both invocations are included
+        assert 'proj' in wide
+        assert wide['proj']['total_spend'] == pytest.approx(2.00, abs=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # Tests: get_cost_by_project
@@ -455,6 +501,45 @@ class TestCostByAccount:
         assert ay['last_cap'] == acct_y_cap_ts
 
     @pytest.mark.asyncio
+    async def test_cap_only_account(self, tmp_path):
+        """Account with cap_hit events but zero invocations is absent from results.
+
+        get_cost_by_account iterates over the invocations query (inv_rows) to
+        build its result dict. Accounts that only have account_events entries
+        (e.g., a capped account that never ran a task in the window) are
+        excluded because the outer loop never visits them.
+
+        This is intentional: the cost-by-account view is spend-oriented. An
+        account with no spend doesn't appear, even if it has hit its cap.
+        """
+        db_path = tmp_path / 'cap_only.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+
+        # Insert cap_hit events only — no corresponding invocations
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                ('max-cap-only', 'cap_hit', 'proj', 'r1', None,
+                 (now - timedelta(hours=3)).isoformat()),
+                ('max-cap-only', 'cap_hit', 'proj', 'r2', None,
+                 (now - timedelta(hours=1)).isoformat()),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn)
+
+        # Account with only cap events and no invocations is absent — by design.
+        assert 'max-cap-only' not in result
+
+    @pytest.mark.asyncio
     async def test_account_with_no_caps(self, tmp_path):
         """Account that has invocations but no cap events has cap_events=0, last_cap=None."""
         db_path = tmp_path / 'nocap.db'
@@ -586,8 +671,9 @@ class TestCostTrend:
         # Use a dynamic assertion so this passes near UTC midnight when fixture
         # invocations might span two calendar days.
         zero_days = [e for e in df if e['total'] == 0.0]
-        non_zero_days = {e['day'] for e in df if e['total'] > 0}
-        assert len(zero_days) == 7 - len(non_zero_days)
+        # Verify gap-filling actually works: exactly 7 days, at least one with 0.0.
+        assert len(df) == 7
+        assert len(zero_days) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -714,7 +800,12 @@ class TestRunCostBreakdown:
 
     @pytest.mark.asyncio
     async def test_null_task_id(self, tmp_path):
-        """Invocations with task_id=NULL are grouped under task_id=None."""
+        """Multiple NULL-task_id invocations are grouped into a single task entry.
+
+        Two orchestrator invocations with task_id=NULL (run-level billing) must
+        collapse into one task dict (task_id=None), with costs accumulated and
+        both invocation rows preserved in the detail list.
+        """
         db_path = tmp_path / 'null_task.db'
         conn = __import__('sqlite3').connect(str(db_path))
         conn.executescript(COSTS_SCHEMA)
@@ -726,14 +817,22 @@ class TestRunCostBreakdown:
             'VALUES (?, ?, ?, ?)',
             ('r1', 'proj', (now - timedelta(hours=1)).isoformat(), now.isoformat()),
         )
-        # Insert invocation with NULL task_id (run-level billing)
-        conn.execute(
+        # Insert TWO invocations with NULL task_id (run-level billing)
+        conn.executemany(
             'INSERT INTO invocations '
             '(run_id, task_id, project_id, account_name, model, role, '
             ' cost_usd, capped, started_at, completed_at) '
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            ('r1', None, 'proj', 'acc', 'claude-sonnet-4-5', 'orchestrator',
-             0.25, 0, (now - timedelta(minutes=30)).isoformat(), now.isoformat()),
+            [
+                ('r1', None, 'proj', 'acc', 'claude-sonnet-4-5', 'orchestrator',
+                 0.25, 0,
+                 (now - timedelta(minutes=40)).isoformat(),
+                 (now - timedelta(minutes=30)).isoformat()),
+                ('r1', None, 'proj', 'acc', 'claude-sonnet-4-5', 'orchestrator',
+                 0.15, 0,
+                 (now - timedelta(minutes=20)).isoformat(),
+                 (now - timedelta(minutes=10)).isoformat()),
+            ],
         )
         conn.commit()
         conn.close()
@@ -745,11 +844,13 @@ class TestRunCostBreakdown:
         assert len(result) == 1
         run = result[0]
         assert run['run_id'] == 'r1'
-        assert run['total_cost'] == pytest.approx(0.25, abs=1e-6)
+        assert run['total_cost'] == pytest.approx(0.40, abs=1e-6)
 
-        # Should have one task entry with task_id=None
+        # Both NULLs must be grouped into exactly ONE task entry
         assert len(run['tasks']) == 1
         t = run['tasks'][0]
         assert t['task_id'] is None
         assert t['title'] is None
-        assert t['cost'] == pytest.approx(0.25, abs=1e-6)
+        assert t['cost'] == pytest.approx(0.40, abs=1e-6)
+        # Both invocation rows must be preserved in the detail list
+        assert len(t['invocations']) == 2
