@@ -370,12 +370,36 @@ class TestCostStoreOpenClose:
             await store.close()
 
     async def test_double_open_raises(self, tmp_path: Path):
-        """Calling open() twice raises RuntimeError('CostStore already opened')."""
+        """Calling open() twice raises RuntimeError('CostStore already opened').
+
+        After the second open() raises, the store must still be functional:
+        _conn must not be None and save_invocation must succeed.
+        """
         store = CostStore(tmp_path / 'costs.db')
         await store.open()
         try:
             with pytest.raises(RuntimeError, match='CostStore already opened'):
                 await store.open()
+            # _conn must not be corrupted by the failed second open
+            assert store._conn is not None, '_conn was corrupted by rejected double-open'
+            # store must still be usable
+            await store.save_invocation(
+                run_id='r-after-double-open',
+                task_id=None,
+                project_id='proj',
+                account_name='acct',
+                model='claude-3',
+                role='agent',
+                cost_usd=0.01,
+                input_tokens=None,
+                output_tokens=None,
+                cache_read_tokens=None,
+                cache_create_tokens=None,
+                duration_ms=100,
+                capped=False,
+                started_at='2024-01-01T00:00:00',
+                completed_at='2024-01-01T00:00:01',
+            )
         finally:
             await store.close()
 
