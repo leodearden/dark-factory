@@ -6691,6 +6691,19 @@
         ],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 362,
+        "title": "Align since/all_days window boundary in get_cost_trend",
+        "description": "In costs.py get_cost_trend, the SQL cutoff `since = (now - timedelta(days=days)).isoformat()` reaches back a full `days`-day interval, but `all_days` only covers `days-1` days back from today (via `range(days-1, -1, -1)`). Invocations whose `DATE(completed_at)` falls in the gap `[now - days days, now - (days-1) days)` are fetched by SQL but silently dropped during gap-fill because that calendar date is not in `all_days`.\n\nThis is pre-existing behavior (not introduced by task 317) but means `since` scans one extra day of rows unnecessarily. Either narrow `since` to `(now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()` or widen `all_days` to start from `now - timedelta(days=days)`. Need to determine intended semantic first.\n\nmemory_hints: search \"get_cost_trend window boundary\", search \"costs.py since all_days\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [
+          317
+        ],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6703,7 +6716,7 @@
       ],
       "created": "2026-03-31T14:42:05.469Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T14:42:20.335Z"
+      "updated": "2026-03-31T14:42:26.450Z"
     }
   }
 }
