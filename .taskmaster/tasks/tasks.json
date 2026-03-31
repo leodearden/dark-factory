@@ -6617,6 +6617,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 356,
+        "title": "UsageGate test quality improvements (naming, assertions, coverage)",
+        "description": "Cleanup and hardening of shared/tests/test_usage_gate.py from task 336 review:\n\n**Naming fixes:**\n- Rename `TestAccountResumeProbLoopJsonDumpsGuard` → `TestAccountResumeProbeLoopJsonDumpsGuard` (typo: missing 'e')\n- Remove 'step-N' labels from class docstrings and comments — implementation-phase metadata that is opaque to future maintainers\n\n**Import cleanup:**\n- Move `import logging` from 3 inline occurrences (lines 188, 216, 247) to module-level imports\n\n**Assertion improvements:**\n- `test_no_running_loop_logs_warning` (line 199): Replace weak three-way OR assertion with targeted check: `assert any('no running event loop for cost event' in r.message.lower() for r in caplog.records)`\n- `test_last_account_name_updated_before_fire_cost_event` (line 88): Capture and assert the `details` argument passed to `_fire_cost_event` to verify `{'from': 'acct-A', 'to': 'acct-B'}` payload correctness\n\n**Coverage gaps:**\n- Add `test_first_call_sets_last_account_name` — tests the else branch where `_last_account_name` is None or same account (currently untested)\n- Add test for repeated same-account call (no failover path)\n\n**Test robustness:**\n- `test_task_removed_after_completion` (line 156): Replace brittle `await asyncio.sleep(0)` x2 with `await asyncio.gather(*list(gate._background_tasks))` to drain deterministically\n\n**Boilerplate reduction:**\n- `test_create_task_error_is_non_fatal` and `test_create_task_error_logs_warning` share ~25 lines of identical setup — extract helper or parameterize\n\n**Docstring fix:**\n- `TestFireCostEventRuntimeErrorHandling` docstring says \"create_task errors propagate\" but they are caught — update to match actual behavior\n\nmemory_hints: search \"UsageGate test quality\" and \"test_usage_gate.py\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6629,7 +6640,7 @@
       ],
       "created": "2026-03-31T14:22:09.168Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T14:22:09.170Z"
+      "updated": "2026-03-31T14:22:22.023Z"
     }
   }
 }
