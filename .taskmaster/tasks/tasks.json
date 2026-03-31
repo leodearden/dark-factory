@@ -6224,6 +6224,17 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 340,
+        "title": "Extract shared cost endpoint utilities in app.py",
+        "description": "DRY issues in dashboard/src/dashboard/app.py:\n1. Fix _parse_window type annotation: `request: Any` → `request: Request` (import already present)\n2. Add `_parse_window_str(request) -> str` helper for the /costs page route (currently inlines its own validation)\n3. Extract `_get_costs_db(request) -> (db, days)` helper — all 7 cost partial handlers repeat the same 4-line DB setup\n4. Align error fallback defaults with data function return types (some use {} others [])\n\nFiles: dashboard/src/dashboard/app.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6236,7 +6247,7 @@
       ],
       "created": "2026-03-31T09:25:44.356Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T09:26:17.249Z"
+      "updated": "2026-03-31T09:26:21.225Z"
     }
   }
 }
