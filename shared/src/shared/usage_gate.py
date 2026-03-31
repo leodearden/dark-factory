@@ -106,6 +106,7 @@ class UsageGate:
         self._project_id: str | None = None
         self._run_id: str | None = None
         self._last_account_name: str | None = None
+        self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
 
         self._accounts: list[AccountState] = self._init_accounts()
 
@@ -329,12 +330,17 @@ class UsageGate:
             return
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(
-                self._write_cost_event(account_name, event_type, details),
-                name=f'cost-event-{event_type}-{account_name}',
-            )
         except RuntimeError:
-            pass
+            logger.warning(
+                'No running event loop for cost event %s/%s', event_type, account_name
+            )
+            return
+        task = loop.create_task(
+            self._write_cost_event(account_name, event_type, details),
+            name=f'cost-event-{event_type}-{account_name}',
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _refresh_capped_accounts(self) -> bool:
         """Check reset times for all capped accounts. Return True if any uncapped."""
