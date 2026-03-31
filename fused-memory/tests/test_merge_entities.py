@@ -80,6 +80,23 @@ class TestRedirectNodeEdges:
         assert isinstance(result['inter_node_deleted'], int)
 
     @pytest.mark.asyncio
+    async def test_redirects_incoming_edges_cypher(self, mock_config, make_backend, make_graph_mock):
+        """Phase 3 Cypher sets target_node_uuid (not source_node_uuid) to distinguish incoming from outgoing redirect."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        cast_target = MagicMock()
+        cast_target._get_graph = MagicMock(return_value=graph)
+        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
+            await backend.redirect_node_edges('dep-uuid', 'sur-uuid')
+        # Phase 3 redirect query is the 6th call (index 5)
+        phase3_redirect_call = graph.query.call_args_list[5]
+        phase3_cypher = phase3_redirect_call[0][0]
+        assert 'CREATE' in phase3_cypher
+        assert 'DELETE' in phase3_cypher
+        assert 'target_node_uuid' in phase3_cypher
+        assert 'source_node_uuid' not in phase3_cypher
+
+    @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
         """Raises RuntimeError when client is not initialized."""
         backend = GraphitiBackend(mock_config)  # client is None
