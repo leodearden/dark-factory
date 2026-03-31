@@ -253,3 +253,69 @@ class TestCostsSummaryPartial:
             client.get('/costs/partials/summary')
         _, kwargs = mock_fn.call_args
         assert kwargs.get('days') == 7
+
+
+# ---------------------------------------------------------------------------
+# Step-7: GET /costs/partials/by-project route tests
+# ---------------------------------------------------------------------------
+
+_MOCK_BY_PROJECT = {
+    'dark_factory': [
+        {'model': 'claude-sonnet', 'total': 8.50},
+        {'model': 'claude-opus', 'total': 3.84},
+    ],
+    'other_project': [
+        {'model': 'claude-haiku', 'total': 1.20},
+    ],
+}
+
+
+def _patch_by_project(return_value=_MOCK_BY_PROJECT):
+    return patch(
+        'dashboard.app.get_cost_by_project',
+        new_callable=AsyncMock,
+        return_value=return_value,
+    )
+
+
+class TestCostsByProjectPartial:
+    """Tests for GET /costs/partials/by-project."""
+
+    def test_returns_200(self, client):
+        with _patch_by_project():
+            resp = client.get('/costs/partials/by-project')
+        assert resp.status_code == 200
+
+    def test_content_type_html(self, client):
+        with _patch_by_project():
+            resp = client.get('/costs/partials/by-project')
+        assert 'text/html' in resp.headers['content-type']
+
+    def test_renders_chart_canvas(self, client):
+        """By-project partial must contain a Chart.js canvas element."""
+        with _patch_by_project():
+            html = client.get('/costs/partials/by-project').text
+        assert 'canvas' in html.lower()
+
+    def test_renders_chart_js_config(self, client):
+        """Chart.js dataset config must appear in the rendered script."""
+        with _patch_by_project():
+            html = client.get('/costs/partials/by-project').text
+        assert 'new Chart' in html
+
+    def test_uses_color_palette(self, client):
+        """Must use the standard 10-color palette."""
+        with _patch_by_project():
+            html = client.get('/costs/partials/by-project').text
+        assert '#60a5fa' in html  # first color from palette
+
+    def test_handles_empty_data(self, client):
+        with _patch_by_project(return_value={}):
+            resp = client.get('/costs/partials/by-project')
+        assert resp.status_code == 200
+
+    def test_respects_window_param(self, client):
+        with _patch_by_project() as mock_fn:
+            client.get('/costs/partials/by-project?window=30d')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 30
