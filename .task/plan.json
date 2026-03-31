@@ -195,13 +195,13 @@
       "type": "test",
       "description": "Write integration test in test_temporal_guards.py: full round-trip \u2014 add_episode with temporal_context='planning' enqueues correctly; _execute_graphiti_write registers planned episode; _search_graphiti excludes the edge; after promote, _search_graphiti includes the edge. Uses real PlannedEpisodeRegistry with tmp_path SQLite, mocked graphiti/mem0 backends.",
       "status": "done",
-      "commit": null
+      "commit": "694e2c35"
     },
     {
       "id": "step-24",
       "type": "impl",
       "description": "Fix any integration issues found in step-23. Ensure the full pipeline works end-to-end: planning episode \u2192 registry \u2192 search exclusion \u2192 promotion \u2192 search inclusion.",
-      "status": "pending",
+      "status": "done",
       "commit": null
     }
   ],
