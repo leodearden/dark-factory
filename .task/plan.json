@@ -108,7 +108,7 @@
       "id": "step-13",
       "type": "test",
       "description": "Tighten TestCostsByAccountPartial: add a new test method test_renders_spend_values that asserts '$9.50' and '$3.20' appear in the rendered HTML \u2014 the exact spend values from _MOCK_BY_ACCOUNT formatted via '%.2f'",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {

@@ -854,6 +854,13 @@ class TestCostsByAccountPartial:
             html = client.get('/costs/partials/by-account').text
         assert 'green' in html.lower()
 
+    def test_renders_spend_values(self, client):
+        """Spend values from mock data should appear formatted in the output."""
+        with _patch_by_account():
+            html = client.get('/costs/partials/by-account').text
+        assert '$9.50' in html
+        assert '$3.20' in html
+
     def test_handles_empty_data(self, client):
         with _patch_by_account(return_value={}):
             resp = client.get('/costs/partials/by-account')
