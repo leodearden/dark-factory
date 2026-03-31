@@ -502,6 +502,62 @@ class GraphitiBackend:
             'inter_node_deleted': inter_node_deleted,
         }
 
+    async def merge_entities(
+        self, deprecated_uuid: str, surviving_uuid: str
+    ) -> dict:
+        """Merge two entity nodes by redirecting edges and deleting the deprecated node.
+
+        Orchestrates the full merge workflow:
+        1. Validate both nodes exist via get_node_text (raises NodeNotFoundError if
+           either is missing).
+        2. Redirect all RELATES_TO edges from deprecated to surviving via
+           redirect_node_edges.
+        3. Delete the deprecated node via delete_entity_node.
+        4. Rebuild the surviving node's summary via refresh_entity_summary.
+
+        Args:
+            deprecated_uuid: UUID of the entity node to be deleted.
+            surviving_uuid: UUID of the entity node that absorbs the edges.
+
+        Returns:
+            Audit dict with keys: surviving_uuid, surviving_name, deprecated_uuid,
+            deprecated_name, edges_redirected (sub-dict with redirect counts),
+            surviving_summary (dict with old/new summary and edge_count).
+
+        Raises:
+            NodeNotFoundError: if either UUID does not exist.
+            RuntimeError: if the backend is not initialized.
+        """
+        # Validate both nodes exist and capture their names
+        dep_name, _ = await self.get_node_text(deprecated_uuid)
+        sur_name, _ = await self.get_node_text(surviving_uuid)
+
+        # Redirect edges
+        edges_redirected = await self.redirect_node_edges(deprecated_uuid, surviving_uuid)
+
+        # Delete the deprecated node
+        await self.delete_entity_node(deprecated_uuid)
+
+        # Rebuild the surviving node's summary
+        refresh_result = await self.refresh_entity_summary(surviving_uuid)
+
+        logger.info(
+            'merge_entities: dep=%s (%r) sur=%s (%r) redirected=%s',
+            deprecated_uuid, dep_name, surviving_uuid, sur_name, edges_redirected,
+        )
+        return {
+            'surviving_uuid': surviving_uuid,
+            'surviving_name': sur_name,
+            'deprecated_uuid': deprecated_uuid,
+            'deprecated_name': dep_name,
+            'edges_redirected': edges_redirected,
+            'surviving_summary': {
+                'before': refresh_result.get('old_summary', ''),
+                'after': refresh_result.get('new_summary', ''),
+                'edge_count': refresh_result.get('edge_count', 0),
+            },
+        }
+
     async def delete_entity_node(self, uuid: str) -> None:
         """Delete an Entity node and all remaining relationships.
 
