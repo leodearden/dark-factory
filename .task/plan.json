@@ -1,0 +1,196 @@
+{
+  "task_id": "342",
+  "title": "Tighten weak test assertions in test_costs_page.py",
+  "files": [
+    "dashboard/tests/test_costs_page.py"
+  ],
+  "modules": [
+    "dashboard/tests"
+  ],
+  "analysis": "This task fixes 8 weak/misleading assertions in test_costs_page.py. All changes are test-only \u2014 no production code modifications needed. Each fix replaces a vague assertion (e.g. checking for '$' anywhere, checking '<' in HTML, checking a single occurrence) with a precise assertion that validates the actual expected rendered output. The test file already passes (110 tests); tightened assertions should also pass since the underlying templates render correct data. Key observations: (1) costs.html has exactly 7 sections with morph:innerHTML and Alpine.store hx-vals patterns, (2) summary.html renders total_spend as '$17.34' from mock data (12.34 + 5.00), (3) error fallback renders 'No cost data available for this window.', (4) Alpine store init is `Alpine.store('costs', { window: \"7d\" })`, (5) by_account.html renders spend as '$9.50' and '$3.20', (6) by_role.html embeds role names via tojson and Chart.js labels, (7) runs.html renders null task_id as em-dash and null title as 'unassigned'.",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Verify all 110 existing tests pass as baseline before making changes",
+      "status": "done",
+      "commit": null,
+      "tests": [
+        "dashboard/tests/test_costs_page.py"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Tighten test_default_window_7d_marked_active: replace `assert '7d' in html` with assertion that Alpine.store init contains '7d' as the default window value \u2014 check for `Alpine.store('costs', { window: \"7d\" })` in the rendered HTML",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Verify step-1 passes: the costs.html template renders `Alpine.store('costs', { window: \"7d\" })` when no ?window= param is provided",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Tighten test_summary_shows_fallback_content_on_error: replace `assert '<' in html` with `assert 'No cost data available for this window.' in html` \u2014 this is the exact fallback text from summary.html's {% else %} branch when summary is empty",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Verify step-3 passes: when get_cost_summary raises, the handler sets summary={}, and the template renders the empty-data fallback message",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Tighten test_hx_vals_count: add assertion that `Alpine.store(\"costs\").window` (or single-quote variant) appears exactly 7 times \u2014 one per section (summary, by-project, by-account, by-role, trend, events, runs). Keep existing old_pattern_count == 0 assertion",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Verify step-5 passes: costs.html has exactly 7 hx-vals expressions each containing Alpine.store(\"costs\").window",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Tighten test_sections_use_morph_swap: replace `assert 'morph:innerHTML' in html` with `assert html.count('morph:innerHTML') == 7` to verify all 7 polling sections use morph swap, not just one",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Verify step-7 passes: costs.html has exactly 7 `hx-swap=\"morph:innerHTML\"` attributes",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Tighten test_renders_total_spend: replace `assert '$' in html` with `assert '$17.34' in html` \u2014 the computed value from mock data (dark_factory: 12.34 + other_project: 5.00 = 17.34, formatted via '%.2f')",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Verify step-9 passes: summary.html aggregates total_spend across projects and formats as $17.34",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Tighten test_handles_null_task_id: add content assertions beyond status_code \u2014 fetch HTML and assert the em-dash placeholder appears for null task_id (the template renders '\u2014' when task.task_id is None) and assert 'unassigned' appears for null title",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Verify step-11 passes: runs.html renders '\u2014' for null task_id and '<em class=\"text-gray-500\">unassigned</em>' for null title",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-13",
+      "type": "test",
+      "description": "Tighten TestCostsByAccountPartial: add a new test method test_renders_spend_values that asserts '$9.50' and '$3.20' appear in the rendered HTML \u2014 the exact spend values from _MOCK_BY_ACCOUNT formatted via '%.2f'",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-14",
+      "type": "impl",
+      "description": "Verify step-13 passes: by_account.html renders spend as '${{ \"%.2f\" | format(data.spend) }}' which produces '$9.50' and '$3.20' from mock data",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-15",
+      "type": "test",
+      "description": "Tighten test_role_names_appear_in_output: add assertion for 'reviewer' in html alongside existing 'implementer' check \u2014 both role names from _MOCK_BY_ROLE should appear in the rendered Chart.js config via tojson",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-16",
+      "type": "impl",
+      "description": "Verify step-15 passes: by_role.html embeds by_role via tojson which includes both 'implementer' and 'reviewer' keys, and Chart.js labels include roleNames from Object.keys()",
+      "status": "pending",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Assert Alpine.store init pattern for 7d default rather than aria-pressed or CSS class",
+      "rationale": "The costs.html template uses Alpine.store('costs', { window: \"7d\" }) for state management. This is the authoritative source of the default window. Asserting on the store init is more robust than checking button CSS classes which depend on Alpine runtime evaluation."
+    },
+    {
+      "decision": "Assert exact fallback text string rather than HTML structure",
+      "rationale": "The summary.html template has a single, specific fallback message: 'No cost data available for this window.' Asserting this exact text is far more meaningful than '<' in html (which is trivially true for any HTML response) and will catch regressions in the fallback UX."
+    },
+    {
+      "decision": "Assert exact counts (7) for morph:innerHTML and Alpine.store hx-vals patterns",
+      "rationale": "There are exactly 7 polling sections in costs.html. Counting ensures all sections have the pattern, not just one. If a section is added without the pattern, the count will fail. If a section is removed without updating tests, the count will also fail."
+    },
+    {
+      "decision": "Assert computed dollar values from mock data rather than just '$' presence",
+      "rationale": "Asserting '$17.34' for total spend and '$9.50'/'$3.20' for account spend validates the template's aggregation logic and formatting. Just checking for '$' would pass even if the template was broken and rendered a static dollar sign."
+    },
+    {
+      "decision": "Add content assertions for null task_id test rather than replacing status_code check",
+      "rationale": "Keep the existing status_code == 200 assertion (verifying no crash) and add content assertions for the em-dash placeholder and 'unassigned' text. This tests both resilience and correct rendering."
+    },
+    {
+      "decision": "Add a new test method for account spend values rather than expanding existing test",
+      "rationale": "TestCostsByAccountPartial already has focused tests for specific concerns (chart, table, badges). Adding a separate test_renders_spend_values method follows the existing pattern of one concern per test."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "_MOCK_SUMMARY data fixture",
+      "where": "test_costs_page.py line 175-188",
+      "how": "The combined total_spend (12.34 + 5.00 = 17.34) drives the tighter assertion in test_renders_total_spend"
+    },
+    {
+      "what": "_MOCK_BY_ACCOUNT data fixture",
+      "where": "test_costs_page.py line 791-806",
+      "how": "The spend values (9.50, 3.20) drive the new test_renders_spend_values assertions"
+    },
+    {
+      "what": "_MOCK_BY_ROLE data fixture",
+      "where": "test_costs_page.py line 321-329",
+      "how": "Contains both 'implementer' and 'reviewer' role keys that should appear in rendered output"
+    },
+    {
+      "what": "_MOCK_RUNS data fixture with null task_id entry",
+      "where": "test_costs_page.py line 544-590",
+      "how": "Second task entry has task_id=None and title=None; template renders '\u2014' and 'unassigned' fallbacks"
+    },
+    {
+      "what": "Existing _patch_* context manager helpers",
+      "where": "test_costs_page.py (_patch_summary, _patch_by_account, _patch_by_role, _patch_runs)",
+      "how": "All tightened tests reuse the existing patch helpers unchanged \u2014 no new mocking infrastructure needed"
+    },
+    {
+      "what": "client fixture from conftest.py",
+      "where": "dashboard/tests/conftest.py line 243-248",
+      "how": "Starlette TestClient wrapping dashboard app \u2014 all tests already use this"
+    }
+  ],
+  "_session_id": "342-d7709ba9",
+  "_created_at": "2026-03-31T14:12:50.412680+00:00"
+}
