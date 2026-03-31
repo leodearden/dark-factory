@@ -5893,13 +5893,13 @@
         "description": "The orchestrator's own `invoke_with_cap_retry` in `orchestrator/src/orchestrator/agents/invoke.py` mirrors the shared `invoke_with_cap_retry` but does not capture `usage_gate.active_account_name` or stamp `result.account_name`. Callers routed through the orchestrator's multi-backend dispatcher (workflow.py, review_checkpoint.py) always get `account_name == ''` even when a usage gate is active, creating a silent inconsistency with the shared implementation.\n\nApply the same `account_name = usage_gate.active_account_name or ''` capture-and-stamp pattern to the orchestrator's `invoke_with_cap_retry`. Add a parallel test verifying account_name propagation through this code path.\n\nMemory hints: search for \"account_name AgentResult\" and \"invoke_with_cap_retry account threading\" for prior implementation patterns.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [
           "297"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-30T22:34:00.497Z",
+        "updatedAt": "2026-03-31T13:54:34.776Z",
         "metadata": {
           "modules": [
             "orchestrator/src/orchestrator/agents",
@@ -5949,13 +5949,13 @@
         "description": "Three targeted fixes in dashboard/src/dashboard/data/costs.py identified during review of task 298:\n\n1. **Clock skew race in get_cost_trend** (lines 245-246): `_cutoff(days)` and `datetime.now(UTC)` are called separately. If they straddle a UTC midnight boundary, `since` covers an earlier day than `all_days`, silently dropping a day's spending or showing a zero-day. Fix: capture `now = datetime.now(UTC)` once at the top and derive `since` from it.\n\n2. **Silent omission of cap-only accounts in get_cost_by_account** (lines 155-190): Result dict is built by iterating `inv_rows` (accounts with invocations). An account that has cap_hit events but zero completed invocations in the window is present in `caps` but never emitted in `result`. Fix: after the inv_rows loop, add a second pass over `caps.keys()` to emit accounts absent from result with spend=0.0, invocations=0.\n\n3. **Missing completed_at index on invocations table**: Every query in costs.py filters `WHERE completed_at >= ?` but there is no index on this column. Add `CREATE INDEX IF NOT EXISTS idx_inv_completed_at ON invocations(completed_at);` to the CostStore schema (and test schema constant in test_costs_data.py).\n\nmemory_hints: search \"clock skew race costs.py\", search \"CostStore schema invocations table\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [
           "298"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-31T03:21:35.255Z",
+        "updatedAt": "2026-03-31T13:54:34.803Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data",
@@ -6508,7 +6508,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T13:54:34.749Z",
+      "lastModified": "2026-03-31T13:54:34.803Z",
       "taskCount": 324,
       "completedCount": 280,
       "tags": [
