@@ -30,11 +30,17 @@ __all__ = [
 class AgentResult:
     """Structured result from a CLI agent invocation.
 
-    Token-count convention: ``None`` means the provider did not report a
-    value.  The helper :func:`_to_token_count` normalises both ``0`` and
-    ``None`` to ``None`` because zero tokens are impossible in practice —
-    if a field is zero it means the provider omitted it.  This convention
-    prevents silent cost under-reporting caused by summing ``None`` as 0.
+    Fields:
+    - ``success``: whether the agent completed without error
+    - ``output``: the primary text response from the agent
+    - ``cost_usd``: total cost in USD (0.0 if not reported by the provider)
+    - ``duration_ms``: wall-clock time in milliseconds
+    - ``turns``: number of agentic turns (0 if not tracked)
+    - ``session_id``: provider session identifier for resumption
+    - ``structured_output``: parsed JSON output if an output schema was requested
+    - ``subtype``: provider-specific result subtype (e.g. ``"success"``, ``"error"``)
+    - ``stderr``: captured stderr from the CLI process
+    - ``account_name``: the OAuth account used for this invocation
     """
 
     success: bool
@@ -50,7 +56,21 @@ class AgentResult:
 
 
 def _to_token_count(v: int | None) -> int | None:
-    """Normalise a token count: 0 and None both mean the provider did not report."""
+    """Normalise a raw token count from a provider response to ``Optional[int]``.
+
+    ``None`` means the provider did not report a value.  Both ``0`` and
+    ``None`` are normalised to ``None`` because zero tokens are impossible in
+    practice — if a field is zero it means the provider omitted it.
+
+    This convention prevents silent cost under-reporting caused by treating an
+    absent field as ``0`` when summing token counts.
+
+    Usage guidance: use this helper when you need ``Optional[int]`` semantics
+    (e.g. accumulating across multiple turns where absence must be distinguished
+    from zero).  At arithmetic sites that immediately discard ``None`` via
+    ``or 0``, prefer ``value.get('field') or 0`` directly — the roundtrip
+    through this helper adds no value there.
+    """
     return v or None
 
 
