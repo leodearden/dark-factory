@@ -24,7 +24,13 @@ async def apply_wal_pragmas(conn: aiosqlite.Connection, *, busy_timeout_ms: int)
         busy_timeout_ms: Milliseconds to wait for a locked database.
             Pass 0 to skip setting the busy_timeout pragma entirely.
     """
-    await conn.execute('PRAGMA journal_mode=WAL')
+    async with conn.execute('PRAGMA journal_mode=WAL') as cur:
+        row = await cur.fetchone()
+    if row is None or row[0] != 'wal':
+        got = row[0] if row is not None else None
+        raise RuntimeError(
+            f'Failed to enable WAL journal mode (got {got!r})'
+        )
     if busy_timeout_ms != 0:
         await conn.execute(f'PRAGMA busy_timeout={busy_timeout_ms}')
 

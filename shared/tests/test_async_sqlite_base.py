@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
@@ -77,7 +77,9 @@ class TestApplyWalPragmas:
         mock_cursor.__aexit__ = AsyncMock(return_value=False)
 
         mock_conn = AsyncMock()
-        mock_conn.execute = AsyncMock(return_value=mock_cursor)
+        # execute() must return a sync value (the cursor) so `async with conn.execute(...)`
+        # can call __aenter__ on it directly — AsyncMock would return a coroutine instead.
+        mock_conn.execute = MagicMock(return_value=mock_cursor)
 
         with pytest.raises(RuntimeError, match='WAL'):
             await apply_wal_pragmas(mock_conn, busy_timeout_ms=5000)
@@ -93,7 +95,7 @@ class TestApplyWalPragmas:
         mock_cursor.__aexit__ = AsyncMock(return_value=False)
 
         mock_conn = AsyncMock()
-        mock_conn.execute = AsyncMock(return_value=mock_cursor)
+        mock_conn.execute = MagicMock(return_value=mock_cursor)
 
         with pytest.raises(RuntimeError, match='WAL'):
             await apply_wal_pragmas(mock_conn, busy_timeout_ms=5000)
@@ -215,12 +217,16 @@ class TestAsyncSqliteBaseOpen:
         """If executescript fails during open(), the conn is closed and _conn stays None."""
         store = _SimpleStore(tmp_path / 'broken.db')
 
-        # Build a mock connection whose executescript raises
+        # Build a mock connection whose executescript raises.
+        # Patch apply_wal_pragmas to a no-op so we can test schema failure in isolation
+        # without needing to replicate aiosqlite's dual-protocol execute() object.
         mock_conn = AsyncMock()
         mock_conn.executescript = AsyncMock(side_effect=RuntimeError('schema failure'))
         mock_conn.close = AsyncMock()
 
-        with patch('aiosqlite.connect', new=AsyncMock(return_value=mock_conn)), pytest.raises(RuntimeError, match='schema failure'):
+        with patch('shared.async_sqlite_base.apply_wal_pragmas', new=AsyncMock()), \
+             patch('aiosqlite.connect', new=AsyncMock(return_value=mock_conn)), \
+             pytest.raises(RuntimeError, match='schema failure'):
             await store.open()
 
         assert store._conn is None
