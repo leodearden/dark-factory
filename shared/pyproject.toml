@@ -10,7 +10,7 @@ name = "dark-factory-shared"
 version = "0.1.0"
 description = "Shared utilities for the dark-factory software factory"
 requires-python = ">=3.11,<4"
-dependencies = ["pydantic>=2.7", "aiosqlite>=0.20"]
+dependencies = ["pydantic>=2.7", "aiosqlite>=0.20", "pyyaml>=6.0"]
 
 [dependency-groups]
 dev = [

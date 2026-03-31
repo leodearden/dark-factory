@@ -1,6 +1,11 @@
 """Shared configuration models used across dark-factory subsystems."""
 
-from pydantic import BaseModel, Field
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+from pydantic import BaseModel, Field, model_validator
 
 __all__ = [
     'AccountConfig',
@@ -27,3 +32,26 @@ class UsageCapConfig(BaseModel):
     probe_interval_secs: int = Field(default=300)
     max_probe_interval_secs: int = Field(default=1800)
     accounts: list[AccountConfig] = Field(default_factory=list)
+    accounts_file: str | None = Field(
+        default=None,
+        description='Path to shared YAML file with accounts list (overrides inline accounts)',
+    )
+
+    @model_validator(mode='after')
+    def _load_accounts_file(self) -> UsageCapConfig:
+        """Load accounts from external file when accounts_file is set."""
+        if not self.accounts_file:
+            return self
+        path = Path(self.accounts_file)
+        if not path.is_absolute():
+            path = path.resolve()
+        if not path.exists():
+            import logging
+            logging.getLogger(__name__).warning(
+                f'accounts_file not found: {path} — using inline accounts'
+            )
+            return self
+        data = yaml.safe_load(path.read_text())
+        entries = data.get('accounts', [])
+        self.accounts = [AccountConfig(**entry) for entry in entries]
+        return self
