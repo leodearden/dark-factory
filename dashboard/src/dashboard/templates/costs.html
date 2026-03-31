@@ -3,17 +3,20 @@
 {% block title %}Costs — Dark Factory{% endblock %}
 
 {% block content %}
+<script>
+  document.addEventListener('alpine:init', () => {
+    Alpine.store('costs', { window: '{{ window | default("7d") }}' });
+  });
+</script>
 <div class="space-y-8 max-w-7xl mx-auto p-6">
 
   {# ── Window selector ─────────────────────────────────────────────────────── #}
-  <div class="flex items-center gap-3"
-       x-data="{ currentWindow: '{{ window | default('7d') }}' }"
-       id="costs-window-selector">
+  <div class="flex items-center gap-3" id="costs-window-selector">
     <span class="text-sm text-gray-400 font-medium">Window:</span>
     {% for win in ['24h', '7d', '30d', 'all'] %}
     <button
-      @click="currentWindow = '{{ win }}'; document.querySelectorAll('[data-cost-section]').forEach(function(el){ htmx.trigger(el, 'costs-window-changed'); })"
-      :class="currentWindow === '{{ win }}' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'"
+      @click="Alpine.store('costs').window = '{{ win }}'; document.querySelectorAll('[data-cost-section]').forEach(function(el){ htmx.trigger(el, 'costs-window-changed'); })"
+      :class="$store.costs.window === '{{ win }}' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'"
       class="px-3 py-1 rounded text-sm font-medium transition-colors"
     >{{ win }}</button>
     {% endfor %}
@@ -25,7 +28,7 @@
       data-cost-section="summary"
       hx-get="/costs/partials/summary"
       hx-trigger="load, every 30s, costs-window-changed"
-      hx-vals='js:{window: (document.getElementById("costs-window-selector") && document.getElementById("costs-window-selector").__x && document.getElementById("costs-window-selector").__x.$data.currentWindow) || "7d"}'
+      hx-vals='js:{window: Alpine.store("costs").window}'
       hx-swap="morph:innerHTML"
       hx-request='{"timeout": 10000}'
       aria-live="polite"
@@ -46,7 +49,7 @@
       data-cost-section="by-project"
       hx-get="/costs/partials/by-project"
       hx-trigger="load, every 60s, costs-window-changed"
-      hx-vals='js:{window: (document.getElementById("costs-window-selector") && document.getElementById("costs-window-selector").__x && document.getElementById("costs-window-selector").__x.$data.currentWindow) || "7d"}'
+      hx-vals='js:{window: Alpine.store("costs").window}'
       hx-swap="morph:innerHTML"
       hx-request='{"timeout": 10000}'
       aria-live="polite"
@@ -62,7 +65,7 @@
       data-cost-section="by-account"
       hx-get="/costs/partials/by-account"
       hx-trigger="load, every 60s, costs-window-changed"
-      hx-vals='js:{window: (document.getElementById("costs-window-selector") && document.getElementById("costs-window-selector").__x && document.getElementById("costs-window-selector").__x.$data.currentWindow) || "7d"}'
+      hx-vals='js:{window: Alpine.store("costs").window}'
       hx-swap="morph:innerHTML"
       hx-request='{"timeout": 10000}'
       aria-live="polite"
@@ -78,7 +81,7 @@
       data-cost-section="by-role"
       hx-get="/costs/partials/by-role"
       hx-trigger="load, every 60s, costs-window-changed"
-      hx-vals='js:{window: (document.getElementById("costs-window-selector") && document.getElementById("costs-window-selector").__x && document.getElementById("costs-window-selector").__x.$data.currentWindow) || "7d"}'
+      hx-vals='js:{window: Alpine.store("costs").window}'
       hx-swap="morph:innerHTML"
       hx-request='{"timeout": 10000}'
       aria-live="polite"
@@ -94,7 +97,7 @@
       data-cost-section="trend"
       hx-get="/costs/partials/trend"
       hx-trigger="load, every 60s, costs-window-changed"
-      hx-vals='js:{window: (document.getElementById("costs-window-selector") && document.getElementById("costs-window-selector").__x && document.getElementById("costs-window-selector").__x.$data.currentWindow) || "7d"}'
+      hx-vals='js:{window: Alpine.store("costs").window}'
       hx-swap="morph:innerHTML"
       hx-request='{"timeout": 10000}'
       aria-live="polite"
@@ -110,7 +113,7 @@
       data-cost-section="events"
       hx-get="/costs/partials/events"
       hx-trigger="load, every 30s, costs-window-changed"
-      hx-vals='js:{window: (document.getElementById("costs-window-selector") && document.getElementById("costs-window-selector").__x && document.getElementById("costs-window-selector").__x.$data.currentWindow) || "7d"}'
+      hx-vals='js:{window: Alpine.store("costs").window}'
       hx-swap="morph:innerHTML"
       hx-request='{"timeout": 10000}'
       aria-live="polite"
@@ -129,7 +132,7 @@
       data-cost-section="runs"
       hx-get="/costs/partials/runs"
       hx-trigger="load, every 60s, costs-window-changed"
-      hx-vals='js:{window: (document.getElementById("costs-window-selector") && document.getElementById("costs-window-selector").__x && document.getElementById("costs-window-selector").__x.$data.currentWindow) || "7d"}'
+      hx-vals='js:{window: Alpine.store("costs").window}'
       hx-swap="morph:innerHTML"
       hx-request='{"timeout": 10000}'
       aria-live="polite"
