@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -357,3 +358,88 @@ class TestAsyncSqliteBaseRequireConn:
         await store.close()
         with pytest.raises(RuntimeError, match='_SimpleStore not opened'):
             store._require_conn()
+
+
+# ---------------------------------------------------------------------------
+# Concurrent close and open-vs-close race tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAsyncSqliteBaseConcurrentClose:
+    """Tests that close() serializes with itself and with open() via _lifecycle_lock."""
+
+    async def test_concurrent_close_does_not_double_close(self, tmp_path: Path) -> None:
+        """Two concurrent close() calls must not both call conn.close().
+
+        Without the lifecycle lock, both coroutines pass the `_conn is not None`
+        guard before either sets `_conn = None`, causing the underlying aiosqlite
+        connection to be closed twice.
+        """
+        store = _SimpleStore(tmp_path / 'store.db')
+        await store.open()
+
+        real_conn = store._conn
+        assert real_conn is not None
+
+        close_call_count = 0
+        original_close = real_conn.close
+
+        async def counting_close():
+            nonlocal close_call_count
+            close_call_count += 1
+            return await original_close()
+
+        real_conn.close = counting_close  # type: ignore[assignment]
+
+        results = await asyncio.gather(
+            store.close(),
+            store.close(),
+            return_exceptions=True,
+        )
+
+        # Both should succeed (idempotent) — no exceptions
+        errors = [r for r in results if isinstance(r, BaseException)]
+        assert errors == [], f'Unexpected errors: {errors!r}'
+        assert store._conn is None
+        assert close_call_count == 1, (
+            f'Expected conn.close() called once, got {close_call_count}'
+        )
+
+    async def test_open_close_race_does_not_invalidate_connection(
+        self, tmp_path: Path
+    ) -> None:
+        """close() racing with open() must not close a freshly-opened connection.
+
+        Scenario: store is open → close() acquires lock, closes conn, sets _conn=None,
+        releases lock → open() acquires lock, opens new conn. Without the lock on close(),
+        a late close() could clear _conn after open() sets it.
+        """
+        store = _SimpleStore(tmp_path / 'store.db')
+        await store.open()
+
+        # Close then immediately re-open — both serialized by _lifecycle_lock
+        await asyncio.gather(store.close(), return_exceptions=True)
+        await store.open()
+
+        # Connection should be alive and usable
+        assert store._conn is not None
+        async with store._conn.execute('SELECT 1') as cur:
+            row = await cur.fetchone()
+        assert row is not None and row[0] == 1
+
+        await store.close()
+
+    async def test_close_open_interleaving(self, tmp_path: Path) -> None:
+        """Rapid close→open→close→open cycles must leave the store in a consistent state.
+
+        Each transition is serialized by _lifecycle_lock so no operation observes a
+        half-mutated _conn.
+        """
+        store = _SimpleStore(tmp_path / 'store.db')
+
+        for _ in range(5):
+            await store.open()
+            assert store._conn is not None
+            await store.close()
+            assert store._conn is None

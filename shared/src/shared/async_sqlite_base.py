@@ -61,7 +61,7 @@ class AsyncSqliteBase(abc.ABC):
         self.db_path = db_path
         self.busy_timeout_ms = busy_timeout_ms
         self._conn: aiosqlite.Connection | None = None
-        self._open_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
 
     @property
     @abc.abstractmethod
@@ -70,7 +70,7 @@ class AsyncSqliteBase(abc.ABC):
 
     async def open(self) -> None:
         """Open persistent connection, set WAL + busy_timeout, ensure schema."""
-        async with self._open_lock:
+        async with self._lifecycle_lock:
             if self._conn is not None:
                 raise RuntimeError(f'{type(self).__name__} already opened')
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,9 +85,10 @@ class AsyncSqliteBase(abc.ABC):
 
     async def close(self) -> None:
         """Close the connection. Idempotent — safe to call when already closed."""
-        if self._conn is not None:
-            await self._conn.close()
-            self._conn = None
+        async with self._lifecycle_lock:
+            if self._conn is not None:
+                await self._conn.close()
+                self._conn = None
 
     async def __aenter__(self) -> Self:
         await self.open()
