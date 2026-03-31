@@ -443,3 +443,61 @@ class TestAsyncSqliteBaseConcurrentClose:
             assert store._conn is not None
             await store.close()
             assert store._conn is None
+
+
+# ---------------------------------------------------------------------------
+# Exception-safety tests for close()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAsyncSqliteBaseCloseExceptionSafety:
+    """Tests that close() clears _conn even when conn.close() raises."""
+
+    async def test_close_clears_conn_even_on_exception(self, tmp_path: Path) -> None:
+        """_conn is set to None even when conn.close() raises OSError.
+
+        Without try/finally, an OSError from conn.close() leaves _conn pointing
+        to the stale object, making the store permanently stuck — neither retrying
+        close() nor calling open() can succeed.
+        """
+        store = _SimpleStore(tmp_path / 'store.db')
+        await store.open()
+        assert store._conn is not None
+
+        # Replace the real connection with a mock whose close() raises OSError
+        mock_conn = AsyncMock()
+        mock_conn.close = AsyncMock(side_effect=OSError('disk failure'))
+        store._conn = mock_conn  # type: ignore[assignment]
+
+        # The OSError must propagate (not be swallowed)
+        with pytest.raises(OSError, match='disk failure'):
+            await store.close()
+
+        # _conn must be None even though close() raised
+        assert store._conn is None
+
+    async def test_open_succeeds_after_failed_close(self, tmp_path: Path) -> None:
+        """open() succeeds after a close() that raised.
+
+        Without try/finally, _conn retains the stale reference after a failed
+        close(). A subsequent open() then raises RuntimeError('already opened')
+        because the non-None guard triggers on the stale reference.
+        """
+        store = _SimpleStore(tmp_path / 'store.db')
+        await store.open()
+
+        # Inject a mock that raises on close()
+        mock_conn = AsyncMock()
+        mock_conn.close = AsyncMock(side_effect=OSError('disk failure'))
+        store._conn = mock_conn  # type: ignore[assignment]
+
+        # close() raises but must clear _conn
+        with pytest.raises(OSError, match='disk failure'):
+            await store.close()
+
+        # After the failed close, open() must succeed — not raise RuntimeError
+        await store.open()
+        assert store._conn is not None
+
+        await store.close()
