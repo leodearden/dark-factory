@@ -6540,6 +6540,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 349,
+        "title": "Add edge-case tests for cost summary weighted average",
+        "description": "Two gaps in test coverage for the weighted average computation in the cost summary partial:\n\n1. **Non-zero spend with zero tasks:** Test with `total_spend > 0` and `task_count = 0` (data inconsistency where cost records exist but task attribution is missing). The template guard `{% if task_count_sum.value > 0 %}` should prevent division by zero — verify it renders `$0.0000` and returns 200.\n\n2. **Missing task_count key fallback:** Test with a mock summary dict that omits `task_count` from one project entry. The template uses `(data.task_count | default(0))` — verify the fallback works correctly and the displayed average only reflects projects with known task counts.\n\nMemory hints: search(\"task 339 weighted average cost summary fix\", project_id=\"dark_factory\")",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6552,7 +6563,7 @@
       ],
       "created": "2026-03-31T14:14:24.177Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T14:14:27.320Z"
+      "updated": "2026-03-31T14:14:33.334Z"
     }
   }
 }
