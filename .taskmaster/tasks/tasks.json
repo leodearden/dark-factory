@@ -6887,6 +6887,17 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 376,
+        "title": "Make _discover_module_configs public or route through config object",
+        "description": "verify.py:295 imports _discover_module_configs (a private function with underscore prefix) from orchestrator.config and uses it cross-module in run_full_verification(). This violates the private naming convention and was flagged by pyright as reportPrivateUsage. Fix: either (1) rename to discover_module_configs (make public), or (2) expose it via a method on OrchestratorConfig (e.g. config.discover_module_configs(project_root)). Option 2 is cleaner since load_config() already calls it internally.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6899,7 +6910,7 @@
       ],
       "created": "2026-03-31T15:37:38.941Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T15:37:38.944Z"
+      "updated": "2026-03-31T15:37:43.184Z"
     }
   }
 }
