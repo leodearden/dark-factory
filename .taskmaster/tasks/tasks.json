@@ -6858,6 +6858,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 374,
+        "title": "Add test coverage for get_cost_by_account CTE status logic",
+        "description": "The CTE with ROW_NUMBER() refactor in get_cost_by_account is the most complex query change from task 335 but has no dedicated tests for the status derivation logic. Add a TestCostByAccountStatus class with cases for:\n1. Account whose last event is cap_hit → status='capped'\n2. Account whose last event is 'resumed' after a cap_hit → status='active'\n3. Account not present in account_events at all → status defaults to 'active'\n4. Account with cap events but zero invocations (cap-only account)\n\nAlso fix minor test quality issues in the same file:\n- Replace `__import__('sqlite3').connect(...)` with `sqlite3.connect(...)` (sqlite3 is already imported at line 5)\n- Tighten assertion in test_limit_restricts_invocation_rows from `<= 3` to `== 3`\n\nFiles: dashboard/tests/test_costs_data.py\n\nmemory_hints:\n- search: \"get_cost_by_account CTE ROW_NUMBER status derivation\"\n- entity: test_costs_data.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6870,7 +6881,7 @@
       ],
       "created": "2026-03-31T15:33:42.852Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T15:33:42.856Z"
+      "updated": "2026-03-31T15:33:48.813Z"
     }
   }
 }
