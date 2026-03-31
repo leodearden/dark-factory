@@ -6202,6 +6202,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 338,
+        "title": "Clean up CostStore test assertions and add failure-mode tests",
+        "description": "Test quality and coverage in orchestrator/tests/test_usage_gate.py:\n\n**Assertion cleanup:**\n- Replace fragile `call_kwargs.args[0]` fallback patterns with direct kwargs access (production code uses kwargs only)\n- Extract repeated `call.kwargs.get('event_type') or call.args[1]` into a test helper\n- Strengthen weak `'dark_factory' in all_args` to check specific kwargs\n- Remove duplicate `import json as _json` from 3 test method bodies (use module-level import)\n\n**Missing coverage:**\n- Add test: raising CostStore.save_account_event doesn't crash the gate (_write_cost_event swallows exceptions)\n- Add test: _fire_cost_event when no event loop is running (except RuntimeError: pass branch)\n\nFiles: orchestrator/tests/test_usage_gate.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6214,7 +6225,7 @@
       ],
       "created": "2026-03-31T09:25:44.356Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T09:26:07.401Z"
+      "updated": "2026-03-31T09:26:13.760Z"
     }
   }
 }
