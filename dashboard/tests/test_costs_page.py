@@ -1078,3 +1078,35 @@ class TestByRoleCanvasIds:
             html = client.get('/costs/partials/by-role').text
         assert 'costByRoleChart_1' not in html
         assert 'costByRoleChart_2' not in html
+
+
+# ---------------------------------------------------------------------------
+# Task-343 step-9: by_role JS uses project key not positional index
+# ---------------------------------------------------------------------------
+
+
+class TestByRoleJsUsesProjectKey:
+    """by_role partial JS must derive canvas IDs from project key via cssId() helper."""
+
+    def test_by_role_js_uses_project_key_not_index(self, client):
+        """The rendered by-role partial JS must use cssId(projectId) not projIdx + 1."""
+        with patch(
+            'dashboard.app.get_cost_by_role',
+            new_callable=AsyncMock,
+            return_value=_MOCK_BY_ROLE_TWO_PROJECTS,
+        ):
+            html = client.get('/costs/partials/by-role').text
+        # Old positional pattern must NOT appear
+        assert 'projIdx + 1' not in html
+        # New key-based pattern must appear
+        assert 'cssId' in html
+
+    def test_by_role_js_has_css_id_helper(self, client):
+        """The rendered by-role partial JS must define a cssId() helper function."""
+        with patch(
+            'dashboard.app.get_cost_by_role',
+            new_callable=AsyncMock,
+            return_value=_MOCK_BY_ROLE_TWO_PROJECTS,
+        ):
+            html = client.get('/costs/partials/by-role').text
+        assert 'function cssId' in html
