@@ -785,6 +785,22 @@ class TestSummaryCards:
             html = client.get('/costs/partials/summary').text
         assert 'weighted by task count' in html
 
+    def test_weighted_avg_zero_tasks_no_div_by_zero(self, client):
+        """When all projects have task_count=0, avg must be '$0.0000' — no crash."""
+        zero_tasks_summary = {
+            'proj_zero': {
+                'total_spend': 0.0,
+                'task_count': 0,
+                'avg_cost_per_task': 0.0,
+                'active_accounts': 1,
+                'cap_events': 0,
+            },
+        }
+        with _patch_cost_data(summary=zero_tasks_summary):
+            resp = client.get('/costs/partials/summary')
+        assert resp.status_code == 200
+        assert '$0.0000' in resp.text
+
 
 # ---------------------------------------------------------------------------
 # Step-15 / Step-16: TestEventsFeed
