@@ -68,8 +68,8 @@
       "id": "step-8",
       "type": "impl",
       "description": "Run the full cost-related test suite (test_costs_data.py, test_costs_panel.py, test_costs_page.py) and fix any remaining failures. Ensure the existing test_aggregated_total_spend and other summary panel tests still pass with the updated mock data and template.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "02589700"
     }
   ],
   "design_decisions": [
