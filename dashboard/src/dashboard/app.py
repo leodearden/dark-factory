@@ -37,6 +37,15 @@ from dashboard.data.reconciliation import (
     get_recent_runs,
     get_watermarks,
 )
+from dashboard.data.costs import (
+    get_account_events,
+    get_cost_by_account,
+    get_cost_by_project,
+    get_cost_by_role,
+    get_cost_summary,
+    get_cost_trend,
+    get_run_cost_breakdown,
+)
 from dashboard.data.utils import parse_utc
 from dashboard.data.write_journal import (
     get_agent_breakdown,
@@ -46,6 +55,23 @@ from dashboard.data.write_journal import (
 
 _pkg_dir = Path(__file__).parent
 logger = logging.getLogger(__name__)
+
+_WINDOW_DAYS: dict[str, int] = {
+    '24h': 1,
+    '7d': 7,
+    '30d': 30,
+    'all': 3650,
+}
+
+
+def _parse_window(request: Request) -> int:
+    """Parse the ``window`` query parameter and return the corresponding days int.
+
+    Valid values: '24h' → 1, '7d' → 7, '30d' → 30, 'all' → 3650.
+    Missing or unknown values default to 7.
+    """
+    window = request.query_params.get('window', '7d')
+    return _WINDOW_DAYS.get(window, 7)
 
 
 _T = TypeVar('_T')
