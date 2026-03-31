@@ -115,7 +115,7 @@
       "id": "step-14",
       "type": "impl",
       "description": "Verify step-13 passes: by_account.html renders spend as '${{ \"%.2f\" | format(data.spend) }}' which produces '$9.50' and '$3.20' from mock data",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
