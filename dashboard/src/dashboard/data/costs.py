@@ -62,13 +62,16 @@ async def get_cost_summary(
             ' GROUP BY project_id',
             (since,),
         )
-        cap_by_project: dict[str, int] = {row[0]: row[1] for row in cap_rows}
+        cap_by_project: dict[str, int] = {
+            row['project_id']: row['cap_count'] for row in cap_rows
+        }
 
         result: dict[str, dict] = {}
         for row in inv_rows:
-            project_id, total_spend, task_count, account_count = row
-            total_spend = total_spend or 0.0
-            task_count = task_count or 0
+            project_id = row['project_id']
+            total_spend = row['total_spend'] or 0.0
+            task_count = row['task_count'] or 0
+            account_count = row['account_count']
             result[project_id] = {
                 'total_spend': total_spend,
                 'task_count': task_count,
@@ -110,10 +113,10 @@ async def get_cost_by_project(
 
         result: dict[str, list[dict]] = {}
         for row in rows:
-            project_id, model, total = row
+            project_id = row['project_id']
             if project_id not in result:
                 result[project_id] = []
-            result[project_id].append({'model': model, 'total': total or 0.0})
+            result[project_id].append({'model': row['model'], 'total': row['total'] or 0.0})
         return result
 
     return await with_db(db, _query, {})
@@ -167,23 +170,23 @@ async def get_cost_by_account(
         # Cap counts and status keyed by account_name
         caps: dict[str, dict] = {}
         for row in evt_rows:
-            account_name, cap_count, last_cap_at, last_event_type = row
+            account_name = row['account_name']
             caps[account_name] = {
-                'cap_events': cap_count or 0,
-                'last_cap': last_cap_at,  # NULL when no cap_hit in window
-                'status': 'capped' if last_event_type == 'cap_hit' else 'active',
+                'cap_events': row['cap_count'] or 0,
+                'last_cap': row['last_cap_at'],  # NULL when no cap_hit in window
+                'status': 'capped' if row['last_event_type'] == 'cap_hit' else 'active',
             }
 
         result: dict[str, dict] = {}
         for row in inv_rows:
-            account_name, spend, cnt = row
+            account_name = row['account_name']
             cap_info = caps.get(
                 account_name,
                 {'cap_events': 0, 'last_cap': None, 'status': 'active'},
             )
             result[account_name] = {
-                'spend': spend or 0.0,
-                'invocations': cnt or 0,
+                'spend': row['spend'] or 0.0,
+                'invocations': row['cnt'] or 0,
                 'cap_events': cap_info['cap_events'],
                 'last_cap': cap_info['last_cap'],
                 'status': cap_info['status'],
@@ -231,12 +234,13 @@ async def get_cost_by_role(
 
         result: dict[str, dict] = {}
         for row in rows:
-            project_id, role, model, total = row
+            project_id = row['project_id']
+            role = row['role']
             if project_id not in result:
                 result[project_id] = {}
             if role not in result[project_id]:
                 result[project_id][role] = {}
-            result[project_id][role][model] = total or 0.0
+            result[project_id][role][row['model']] = row['total'] or 0.0
         return result
 
     return await with_db(db, _query, {})
@@ -278,10 +282,10 @@ async def get_cost_trend(
         # Index DB results
         data: dict[str, dict[str, float]] = {}
         for row in rows:
-            project_id, day, total = row
+            project_id = row['project_id']
             if project_id not in data:
                 data[project_id] = {}
-            data[project_id][day] = total or 0.0
+            data[project_id][row['day']] = row['total'] or 0.0
 
         # Build gap-filled result
         result: dict[str, list[dict]] = {}
@@ -325,12 +329,12 @@ async def get_account_events(
         )
         return [
             {
-                'account_name': row[0],
-                'event_type': row[1],
-                'project_id': row[2],
-                'run_id': row[3],
-                'details': row[4],
-                'created_at': row[5],
+                'account_name': row['account_name'],
+                'event_type': row['event_type'],
+                'project_id': row['project_id'],
+                'run_id': row['run_id'],
+                'details': row['details'],
+                'created_at': row['created_at'],
             }
             for row in rows
         ]
@@ -380,14 +384,14 @@ async def get_run_cost_breakdown(
         # Build nested structure: run_id → task_id → invocations
         runs: dict[str, dict] = {}
         for row in rows:
-            run_id, project_id, task_id, title, model, role, cost_usd, \
-                account_name, duration_ms, capped = row
-            cost_usd = cost_usd or 0.0
+            run_id = row['run_id']
+            task_id = row['task_id']
+            cost_usd = row['cost_usd'] or 0.0
 
             if run_id not in runs:
                 runs[run_id] = {
                     'run_id': run_id,
-                    'project_id': project_id,
+                    'project_id': row['project_id'],
                     'total_cost': 0.0,
                     'tasks': {},  # task_id → task dict (temporary)
                 }
@@ -397,19 +401,19 @@ async def get_run_cost_breakdown(
             if task_id not in run['tasks']:
                 run['tasks'][task_id] = {
                     'task_id': task_id,
-                    'title': title,
+                    'title': row['title'],
                     'cost': 0.0,
                     'invocations': [],
                 }
             task = run['tasks'][task_id]
             task['cost'] += cost_usd
             task['invocations'].append({
-                'model': model,
-                'role': role,
+                'model': row['model'],
+                'role': row['role'],
                 'cost_usd': cost_usd,
-                'account_name': account_name,
-                'duration_ms': duration_ms,
-                'capped': bool(capped),
+                'account_name': row['account_name'],
+                'duration_ms': row['duration_ms'],
+                'capped': bool(row['capped']),
             })
 
         # Convert to list, converting task dict to list
