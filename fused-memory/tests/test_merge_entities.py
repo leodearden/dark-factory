@@ -394,3 +394,141 @@ class TestMemoryServiceMergeEntities:
             project_id='dark_factory',
         )
         assert result['surviving_uuid'] == 'sur-uuid'
+
+
+# ---------------------------------------------------------------------------
+# step-9: MCP tool merge_entities
+# ---------------------------------------------------------------------------
+
+class TestMergeEntitiesMcpTool:
+    """MCP tool merge_entities is registered and delegates correctly."""
+
+    @pytest.fixture
+    def mock_service(self):
+        """Mock MemoryService for tool registration."""
+        svc = AsyncMock()
+        svc.merge_entities = AsyncMock(return_value={
+            'surviving_uuid': 'sur-uuid',
+            'surviving_name': 'SurvivingName',
+            'deprecated_uuid': 'dep-uuid',
+            'deprecated_name': 'DeprecatedName',
+            'edges_redirected': {'outgoing_redirected': 2, 'incoming_redirected': 1, 'inter_node_deleted': 0},
+            'surviving_summary': {'before': 'old', 'after': 'new', 'edge_count': 3},
+        })
+        return svc
+
+    @pytest.fixture
+    def mcp_server(self, mock_service):
+        """MCP server with mock memory service."""
+        from fused_memory.server.tools import create_mcp_server
+        return create_mcp_server(mock_service)
+
+    @pytest.mark.asyncio
+    async def test_tool_is_registered(self, mcp_server):
+        """merge_entities is registered as an MCP tool."""
+        tool_names = [t.name for t in await mcp_server.list_tools()]
+        assert 'merge_entities' in tool_names
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_memory_service(self, mcp_server, mock_service):
+        """Tool calls memory_service.merge_entities with correct UUIDs."""
+        await mcp_server._tool_manager.call_tool(
+            'merge_entities',
+            {
+                'deprecated_uuid': 'dep-uuid',
+                'surviving_uuid': 'sur-uuid',
+                'project_id': 'dark_factory',
+            },
+        )
+        mock_service.merge_entities.assert_awaited_once()
+        call_kwargs = mock_service.merge_entities.call_args[1]
+        assert call_kwargs.get('deprecated_uuid') == 'dep-uuid'
+        assert call_kwargs.get('surviving_uuid') == 'sur-uuid'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_empty_project_id_returns_error(self, mcp_server, mock_service):
+        """Empty project_id returns validation error dict."""
+        import json
+        result = await mcp_server._tool_manager.call_tool(
+            'merge_entities',
+            {'deprecated_uuid': 'dep-uuid', 'surviving_uuid': 'sur-uuid', 'project_id': ''},
+        )
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            parsed = json.loads(content)
+        else:
+            parsed = result
+        assert 'error' in parsed
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_empty_deprecated_uuid_returns_error(self, mcp_server, mock_service):
+        """Empty deprecated_uuid returns validation error dict."""
+        import json
+        result = await mcp_server._tool_manager.call_tool(
+            'merge_entities',
+            {'deprecated_uuid': '', 'surviving_uuid': 'sur-uuid', 'project_id': 'dark_factory'},
+        )
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            parsed = json.loads(content)
+        else:
+            parsed = result
+        assert 'error' in parsed
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_empty_surviving_uuid_returns_error(self, mcp_server, mock_service):
+        """Empty surviving_uuid returns validation error dict."""
+        import json
+        result = await mcp_server._tool_manager.call_tool(
+            'merge_entities',
+            {'deprecated_uuid': 'dep-uuid', 'surviving_uuid': '', 'project_id': 'dark_factory'},
+        )
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            parsed = json.loads(content)
+        else:
+            parsed = result
+        assert 'error' in parsed
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_same_uuid_returns_error(self, mcp_server, mock_service):
+        """Same UUID for both params returns validation error."""
+        import json
+        result = await mcp_server._tool_manager.call_tool(
+            'merge_entities',
+            {'deprecated_uuid': 'same-uuid', 'surviving_uuid': 'same-uuid', 'project_id': 'dark_factory'},
+        )
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            parsed = json.loads(content)
+        else:
+            parsed = result
+        assert 'error' in parsed
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exception_returns_error_dict(self, mcp_server, mock_service):
+        """Exception from memory_service returns error dict (not raised)."""
+        import json
+        mock_service.merge_entities = AsyncMock(
+            side_effect=RuntimeError('FalkorDB connection failed')
+        )
+        result = await mcp_server._tool_manager.call_tool(
+            'merge_entities',
+            {'deprecated_uuid': 'dep-uuid', 'surviving_uuid': 'sur-uuid', 'project_id': 'dark_factory'},
+        )
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            parsed = json.loads(content)
+        else:
+            parsed = result
+        assert 'error' in parsed
+        assert 'FalkorDB connection failed' in parsed['error']
