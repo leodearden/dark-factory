@@ -6004,10 +6004,11 @@
         "description": "Three improvements to the AsyncSqliteBase extracted in task 315:\n\n1. **Self return type regression** (highest priority): `__aenter__` returns `AsyncSqliteBase` instead of `Self`. This means `async with CostStore(path) as store:` gives `store: AsyncSqliteBase`, losing all subclass-specific methods (e.g. `save_invocation`). Fix: `from typing import Self` and annotate `async def __aenter__(self) -> Self:`.\n\n2. **WAL pragma verification**: `PRAGMA journal_mode=WAL` result is never read back. On unusual filesystems SQLite can silently fall back to DELETE mode. Fix: read the pragma result and assert it equals 'wal', raising RuntimeError if not.\n\n3. **Test _Store class duplication**: The concrete `_Store(AsyncSqliteBase)` subclass is redefined ~20 times inside individual test methods. Extract a single module-level `_SimpleStore` class and reuse it.\n\nmemory_hints:\n- search: \"AsyncSqliteBase Self typing __aenter__ return type\"\n- entity: \"AsyncSqliteBase\"\n- entity: \"CostStore\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-31T08:34:11.499Z"
       },
       {
         "id": "322",
@@ -6034,7 +6035,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T08:34:11.287Z",
+      "lastModified": "2026-03-31T08:34:11.499Z",
       "taskCount": 302,
       "completedCount": 273,
       "tags": [
