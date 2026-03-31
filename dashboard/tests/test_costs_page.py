@@ -896,6 +896,9 @@ class TestAlpineV3StorePattern:
         # Old pattern used getElementById + __x; new pattern uses Alpine.store
         old_pattern_count = html.count('__x.$data.currentWindow')
         assert old_pattern_count == 0
+        # All 7 sections should have Alpine.store("costs").window in hx-vals
+        new_pattern_count = html.count('Alpine.store("costs").window')
+        assert new_pattern_count == 7
 
     def test_button_click_writes_to_store(self, client):
         """@click handlers on window selector buttons must write to Alpine.store('costs').window."""

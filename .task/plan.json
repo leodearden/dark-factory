@@ -52,7 +52,7 @@
       "id": "step-5",
       "type": "test",
       "description": "Tighten test_hx_vals_count: add assertion that `Alpine.store(\"costs\").window` (or single-quote variant) appears exactly 7 times \u2014 one per section (summary, by-project, by-account, by-role, trend, events, runs). Keep existing old_pattern_count == 0 assertion",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
