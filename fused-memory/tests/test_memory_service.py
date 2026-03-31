@@ -339,8 +339,17 @@ class TestExecuteMem0ClassifyAndAddPlanningMetadata:
 
     @pytest.mark.asyncio
     async def test_planning_temporal_context_adds_planned_metadata(self, service):
-        """When payload has temporal_context='planning', metadata must include planned=True."""
-        # Force classifier to route to Mem0 (use a Mem0-primary category)
+        """When payload has temporal_context='planning', metadata must include planned=True.
+
+        Forces Mem0 routing via classifier mock to remove the vacuous-assertion risk.
+        """
+        from fused_memory.models.enums import MemoryCategory
+        mock_classification = MagicMock()
+        mock_classification.primary = MemoryCategory.preferences_and_norms
+        mock_classification.secondary = None
+        mock_classification.confidence = 0.95
+        service.classifier.classify = AsyncMock(return_value=mock_classification)
+
         payload = {
             'fact_text': 'Always use type hints',
             'project_id': 'test',
@@ -348,16 +357,27 @@ class TestExecuteMem0ClassifyAndAddPlanningMetadata:
         }
         await service._execute_mem0_classify_and_add(payload)
 
-        if service.mem0.add.called:
-            call_kwargs = service.mem0.add.call_args[1]
-            metadata = call_kwargs.get('metadata', {})
-            assert metadata.get('planned') is True, (
-                f'Expected planned=True in metadata, got: {metadata}'
-            )
+        # Unconditional assertion — classifier is forced to Mem0 so this must be called
+        service.mem0.add.assert_called_once()
+        call_kwargs = service.mem0.add.call_args[1]
+        metadata = call_kwargs.get('metadata', {})
+        assert metadata.get('planned') is True, (
+            f'Expected planned=True in metadata, got: {metadata}'
+        )
 
     @pytest.mark.asyncio
     async def test_no_temporal_context_no_planned_metadata(self, service):
-        """Without temporal_context, planned key must not be in metadata."""
+        """Without temporal_context, planned key must not be in metadata.
+
+        Forces Mem0 routing via classifier mock to remove the vacuous-assertion risk.
+        """
+        from fused_memory.models.enums import MemoryCategory
+        mock_classification = MagicMock()
+        mock_classification.primary = MemoryCategory.preferences_and_norms
+        mock_classification.secondary = None
+        mock_classification.confidence = 0.95
+        service.classifier.classify = AsyncMock(return_value=mock_classification)
+
         payload = {
             'fact_text': 'Always use type hints',
             'project_id': 'test',
@@ -365,12 +385,13 @@ class TestExecuteMem0ClassifyAndAddPlanningMetadata:
         }
         await service._execute_mem0_classify_and_add(payload)
 
-        if service.mem0.add.called:
-            call_kwargs = service.mem0.add.call_args[1]
-            metadata = call_kwargs.get('metadata', {})
-            assert 'planned' not in metadata, (
-                f'Unexpected planned key in metadata: {metadata}'
-            )
+        # Unconditional assertion — classifier is forced to Mem0 so this must be called
+        service.mem0.add.assert_called_once()
+        call_kwargs = service.mem0.add.call_args[1]
+        metadata = call_kwargs.get('metadata', {})
+        assert 'planned' not in metadata, (
+            f'Unexpected planned key in metadata: {metadata}'
+        )
 
     @pytest.mark.asyncio
     async def test_planning_routed_to_mem0_is_tagged(self, service):
