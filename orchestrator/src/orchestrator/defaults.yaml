@@ -24,6 +24,9 @@ steward_lifetime_budget: 12.0
 steward_max_retries: 3
 steward_completion_timeout: 300.0
 
+# Pre-triage threshold for review suggestions (count)
+suggestion_triage_threshold: 10
+
 # Wall-clock backstop for any single agent invocation (seconds)
 invocation_timeout: 7200.0
 
@@ -35,6 +38,7 @@ models:
   reviewer: "sonnet"
   merger: "opus"
   steward: "opus"
+  triage: "sonnet"
   module_tagger: "sonnet"
   deep_reviewer: "opus"
 
@@ -46,6 +50,7 @@ budgets:
   reviewer: 2.0
   merger: 5.0
   steward: 5.0
+  triage: 2.0
   module_tagger: 2.0
   deep_reviewer: 15.0
 
@@ -57,6 +62,7 @@ max_turns:
   reviewer: 30
   merger: 50
   steward: 100
+  triage: 25
   module_tagger: 30
   deep_reviewer: 100
 
@@ -68,6 +74,7 @@ effort:
   reviewer: "medium"
   merger: "max"
   steward: "high"
+  triage: "medium"
   module_tagger: "medium"
   deep_reviewer: "max"
 
@@ -79,6 +86,7 @@ backends:
   reviewer: "claude"
   merger: "claude"
   steward: "claude"
+  triage: "claude"
   module_tagger: "claude"
   deep_reviewer: "claude"
 
@@ -114,14 +122,4 @@ usage_cap:
   wait_for_reset: true
   probe_interval_secs: 300
   max_probe_interval_secs: 1800
-  accounts:
-    - name: max-e
-      oauth_token_env: CLAUDE_OAUTH_TOKEN_E
-    - name: max-c
-      oauth_token_env: CLAUDE_OAUTH_TOKEN_C
-    - name: max-b
-      oauth_token_env: CLAUDE_OAUTH_TOKEN_B
-    - name: max-d
-      oauth_token_env: CLAUDE_OAUTH_TOKEN_D
-#    - name: max-a
-#      oauth_token_env: CLAUDE_OAUTH_TOKEN_A
+  accounts_file: "${DARK_FACTORY_ROOT:/home/leo/src/dark-factory}/config/usage-accounts.yaml"

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import MagicMock, patch  # noqa: F401
+from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
 
 import pytest
 
@@ -231,3 +231,208 @@ class TestReviewLoopRouting:
         suggestions = [{'description': 'something'}]
         reviews = _fake_reviews(suggestions)
         wf._escalate_suggestions(reviews)
+
+
+# ---------------------------------------------------------------------------
+# Pre-triage integration (steward)
+# ---------------------------------------------------------------------------
+
+
+def _make_steward(*, config_overrides=None, suggestion_count=15):
+    """Build a minimal TaskSteward with mocked dependencies."""
+    from pathlib import Path
+    from orchestrator.steward import TaskSteward
+
+    config = MagicMock()
+    config.project_root = Path('/tmp/project')
+    config.steward_lifetime_budget = 12.0
+    config.steward_max_retries = 3
+    config.suggestion_triage_threshold = 10
+    config.models.triage = 'sonnet'
+    config.budgets.triage = 2.0
+    config.max_turns.triage = 25
+    config.effort.triage = 'medium'
+    config.backends.triage = 'claude'
+    config.models.steward = 'opus'
+    config.budgets.steward = 5.0
+    config.max_turns.steward = 100
+    config.effort.steward = 'high'
+    config.backends.steward = 'claude'
+    config.escalation.host = '127.0.0.1'
+    config.escalation.port = 8100
+    if config_overrides:
+        for k, v in config_overrides.items():
+            setattr(config, k, v)
+
+    queue = MagicMock()
+    queue.make_id.return_value = 'esc-42-1'
+    queue.get_by_task.return_value = []
+
+    briefing = MagicMock()
+    briefing.build_steward_initial_prompt = AsyncMock(return_value='initial prompt')
+
+    mcp = MagicMock()
+    mcp.mcp_config_json.return_value = {}
+
+    task = {'id': '42', 'title': 'Test Task', 'description': 'desc'}
+    steward = TaskSteward(
+        task_id='42',
+        task=task,
+        worktree=Path('/tmp/worktree'),
+        config=config,
+        mcp=mcp,
+        escalation_queue=queue,
+        briefing=briefing,
+        usage_gate=None,
+    )
+    return steward
+
+
+def _make_suggestions(n):
+    """Generate n fake review suggestions."""
+    return [
+        {
+            'reviewer': 'test_analyst',
+            'severity': 'suggestion',
+            'location': f'src/mod{i}.py:{i * 10}',
+            'category': 'coverage',
+            'description': f'Missing test for case {i}',
+            'suggested_fix': f'Add test for case {i}',
+        }
+        for i in range(n)
+    ]
+
+
+def _fake_agent_result(*, cost=0.5, turns=3, structured_output=None):
+    """Return a mock AgentResult."""
+    result = MagicMock()
+    result.cost_usd = cost
+    result.duration_ms = 2000
+    result.turns = turns
+    result.success = True
+    result.session_id = 'sess-123'
+    result.stderr = ''
+    result.output = ''
+    result.structured_output = structured_output
+    result.account_name = ''
+    return result
+
+
+class TestPreTriageSuggestions:
+    @pytest.mark.asyncio
+    async def test_pre_triage_invoked_above_threshold(self):
+        steward = _make_steward()
+        suggestions = _make_suggestions(15)
+
+        triage_output = {
+            'accepted': [
+                {'index': i, 'suggestion': f'case {i}', 'reason': 'merit',
+                 'files': [f'src/mod{i}.py'], 'proposed_task_title': f'Fix {i}'}
+                for i in range(10)
+            ],
+            'skipped': [
+                {'index': i, 'suggestion': f'case {i}', 'reason': 'noise'}
+                for i in range(10, 15)
+            ],
+            'proposed_task_groups': [
+                {'title': 'Add tests', 'description': 'Add missing tests',
+                 'accepted_indices': list(range(10))},
+            ],
+        }
+
+        esc = _make_escalation(detail=json.dumps(suggestions))
+
+        with patch('orchestrator.steward.invoke_agent',
+                   return_value=_fake_agent_result(structured_output=triage_output)):
+            result = await steward._pre_triage_suggestions(esc)
+
+        assert '## Pre-Triaged Results' in result.detail
+        assert '10 accepted' in result.summary
+        assert '5 skipped' in result.summary
+
+    @pytest.mark.asyncio
+    async def test_pre_triage_not_invoked_below_threshold(self):
+        """Small suggestion sets should skip pre-triage in _handle_escalation."""
+        steward = _make_steward()
+        suggestions = _make_suggestions(5)
+        esc = _make_escalation(detail=json.dumps(suggestions))
+
+        # Steward session mock — returns resolved escalation
+        steward_result = _fake_agent_result(cost=2.0)
+        steward.escalation_queue.get.return_value = MagicMock(status='resolved')
+
+        with patch('orchestrator.steward.invoke_agent', return_value=steward_result) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        # Only the steward session should be called — no triage invocation
+        assert mock_invoke.call_count == 1
+        call_kwargs = mock_invoke.call_args
+        assert call_kwargs.kwargs.get('model') or 'opus' in str(call_kwargs)
+
+    @pytest.mark.asyncio
+    async def test_pre_triage_failure_falls_back(self):
+        steward = _make_steward()
+        suggestions = _make_suggestions(15)
+        esc = _make_escalation(detail=json.dumps(suggestions))
+
+        # Triage returns no structured output
+        bad_result = _fake_agent_result(structured_output=None)
+        bad_result.success = False
+
+        with patch('orchestrator.steward.invoke_agent', return_value=bad_result):
+            result = await steward._pre_triage_suggestions(esc)
+
+        # Original escalation returned unchanged
+        assert result.detail == esc.detail
+        assert result.summary == esc.summary
+
+    @pytest.mark.asyncio
+    async def test_pre_triage_cost_tracked_in_metrics(self):
+        steward = _make_steward()
+        assert steward.metrics.total_cost_usd == 0.0
+
+        suggestions = _make_suggestions(15)
+        esc = _make_escalation(detail=json.dumps(suggestions))
+
+        triage_output = {
+            'accepted': [], 'skipped': [],
+            'proposed_task_groups': [],
+        }
+        result = _fake_agent_result(cost=0.75, structured_output=triage_output)
+
+        with patch('orchestrator.steward.invoke_agent', return_value=result):
+            await steward._pre_triage_suggestions(esc)
+
+        assert steward.metrics.total_cost_usd == 0.75
+        assert steward.metrics.invocations == 1
+
+    @pytest.mark.asyncio
+    async def test_pre_triage_replaces_escalation_detail(self):
+        steward = _make_steward()
+        suggestions = _make_suggestions(12)
+        esc = _make_escalation(detail=json.dumps(suggestions))
+
+        triage_output = {
+            'accepted': [
+                {'index': 0, 'suggestion': 'case 0', 'reason': 'merit',
+                 'files': ['src/mod0.py'], 'proposed_task_title': 'Fix 0'},
+            ],
+            'skipped': [
+                {'index': i, 'suggestion': f'case {i}', 'reason': 'noise'}
+                for i in range(1, 12)
+            ],
+            'proposed_task_groups': [
+                {'title': 'Fix case 0', 'description': 'Fix it',
+                 'accepted_indices': [0]},
+            ],
+        }
+
+        with patch('orchestrator.steward.invoke_agent',
+                   return_value=_fake_agent_result(structured_output=triage_output)):
+            result = await steward._pre_triage_suggestions(esc)
+
+        # Detail is replaced with pre-triaged markdown
+        assert '## Pre-Triaged Results' in result.detail
+        assert 'Fix case 0' in result.detail
+        # Original suggestions are embedded as reference
+        assert 'Original Suggestions' in result.detail

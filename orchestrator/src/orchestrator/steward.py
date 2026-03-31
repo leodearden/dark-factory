@@ -225,6 +225,19 @@ class TaskSteward:
         else:
             cwd = self.worktree
 
+        # Pre-triage large suggestion sets before invoking the steward session
+        if escalation.category == 'review_suggestions' and escalation.detail:
+            try:
+                suggestions = json.loads(escalation.detail)
+            except (json.JSONDecodeError, TypeError):
+                suggestions = []
+            if len(suggestions) >= self.config.suggestion_triage_threshold:
+                logger.info(
+                    f'Steward for task {self.task_id}: pre-triaging '
+                    f'{len(suggestions)} suggestions'
+                )
+                escalation = await self._pre_triage_suggestions(escalation)
+
         # Prompt: initial (full briefing) vs continuation (just the escalation)
         is_initial = self._session_id is None
         if is_initial:
@@ -369,6 +382,81 @@ class TaskSteward:
 
             result.account_name = account_name
             return result
+
+    # ------------------------------------------------------------------
+    # Pre-triage for large suggestion sets
+    # ------------------------------------------------------------------
+
+    async def _pre_triage_suggestions(
+        self, escalation: Escalation,
+    ) -> Escalation:
+        """Run a lightweight triage agent on large suggestion sets.
+
+        Returns the escalation with its detail field replaced by pre-triaged
+        markdown.  If triage fails, returns the original escalation unchanged
+        so the steward falls back to inline triage.
+        """
+        from orchestrator.agents.triage import (
+            TRIAGE_OUTPUT_SCHEMA,
+            TRIAGE_SYSTEM_PROMPT,
+            build_triage_prompt,
+            format_pretriaged_detail,
+            parse_triage_result,
+        )
+
+        suggestions = json.loads(escalation.detail)
+        prompt = build_triage_prompt(suggestions, self.task)
+
+        oauth_token = None
+        if self.usage_gate:
+            oauth_token = await self.usage_gate.before_invoke()
+
+        result = await invoke_agent(
+            prompt=prompt,
+            system_prompt=TRIAGE_SYSTEM_PROMPT,
+            cwd=self.config.project_root,
+            model=self.config.models.triage,
+            max_turns=self.config.max_turns.triage,
+            max_budget_usd=self.config.budgets.triage,
+            allowed_tools=['Read', 'Glob', 'Grep'],
+            output_schema=TRIAGE_OUTPUT_SCHEMA,
+            effort=self.config.effort.triage,
+            backend=self.config.backends.triage,
+            oauth_token=oauth_token,
+        )
+
+        # Track cost against steward metrics
+        self.metrics.invocations += 1
+        self.metrics.total_cost_usd += result.cost_usd
+        self.metrics.total_duration_ms += result.duration_ms
+
+        if self.usage_gate:
+            self.usage_gate.on_agent_complete(result.cost_usd)
+
+        triage_result = parse_triage_result(result)
+        if triage_result is None:
+            logger.warning(
+                f'Steward for task {self.task_id}: pre-triage failed, '
+                f'falling back to inline triage'
+            )
+            return escalation
+
+        new_detail = format_pretriaged_detail(triage_result, suggestions)
+
+        # Return a modified copy — don't mutate the queue's version
+        from escalation.models import Escalation as EscModel
+
+        return EscModel(
+            **{
+                **escalation.to_dict(),
+                'detail': new_detail,
+                'summary': (
+                    f'{len(suggestions)} suggestions pre-triaged: '
+                    f'{len(triage_result["accepted"])} accepted, '
+                    f'{len(triage_result["skipped"])} skipped'
+                ),
+            },
+        )
 
     # ------------------------------------------------------------------
     # Auto-escalation to level-1 (human)

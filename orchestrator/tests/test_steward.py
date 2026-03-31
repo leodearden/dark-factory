@@ -43,6 +43,7 @@ def mock_config():
     config.steward_lifetime_budget = 12.0
     config.steward_max_retries = 3
     config.steward_completion_timeout = 300.0
+    config.suggestion_triage_threshold = 10
     return config
 
 

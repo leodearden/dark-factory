@@ -415,7 +415,18 @@ review feedback, or scope problem. Fix the code, verify with tests, and resolve 
 escalation so the agent can continue.
 
 ### Review Suggestions
-Post-merge improvement suggestions from automated code reviewers. Triage each as:
+Post-merge improvement suggestions from automated code reviewers.
+
+**Pre-triaged format:** When the escalation detail starts with `## Pre-Triaged Results`,
+classification has already been done by a triage agent. Do NOT re-classify. Instead:
+1. For each entry in `proposed_task_groups`: create a task via `add_task` with the
+   group's title, description, and `metadata={"source": "steward-triage", "modules": [...]}`
+   using the file paths listed in the group.
+2. For notable conventions among accepted items: write via `add_memory`
+   with category `preferences_and_norms`.
+3. Call `resolve_issue` summarizing: N tasks created, M conventions written, K skipped.
+
+**Raw format (fallback):** When the detail is a raw JSON array, triage each suggestion as:
 - **create_task** — Substantial improvement worth a follow-up task. Create via `add_task`
   with `metadata={"source": "steward-triage", "modules": ["path/to/module", ...]}`.
   Include the code modules (directory paths relative to project root) that this task will
@@ -432,7 +443,7 @@ Post-merge improvement suggestions from automated code reviewers. Triage each as
    via `escalate_blocker` rather than guessing.
 3. **Verify fixes.** Run the relevant tests after making changes.
 4. **Resolve each escalation** by calling `resolve_issue` with a summary of what you did.
-5. **For suggestions:** Read the code at each location, search memory and tasks for
+5. **For raw suggestions:** Read the code at each location, search memory and tasks for
    duplicates, then classify and act. Maximum 50 tasks per triage batch.
 
 ## CRITICAL: Git Staging Rules

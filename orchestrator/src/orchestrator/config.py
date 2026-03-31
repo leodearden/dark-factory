@@ -83,8 +83,9 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
         if self.config_path.exists():
             with open(self.config_path) as f:
                 project_config = yaml.safe_load(f) or {}
-            base = _deep_merge(base, self._expand_env_vars(project_config))
-        return base
+            base = _deep_merge(base, project_config)
+        # Expand env vars on the final merged dict (covers both defaults and overrides)
+        return self._expand_env_vars(base)
 
 
 # --- Sub-models ---
@@ -99,6 +100,7 @@ class ModelsConfig(BaseModel):
     reviewer: str = Field(default='sonnet')
     merger: str = Field(default='opus')
     steward: str = Field(default='opus')
+    triage: str = Field(default='sonnet')
     module_tagger: str = Field(default='sonnet')
     deep_reviewer: str = Field(default='opus')
 
@@ -112,6 +114,7 @@ class BudgetsConfig(BaseModel):
     reviewer: float = Field(default=2.0)
     merger: float = Field(default=5.0)
     steward: float = Field(default=5.0)
+    triage: float = Field(default=2.0)
     module_tagger: float = Field(default=2.0)
     deep_reviewer: float = Field(default=15.0)
 
@@ -125,6 +128,7 @@ class TurnsConfig(BaseModel):
     reviewer: int = Field(default=30)
     merger: int = Field(default=50)
     steward: int = Field(default=100)
+    triage: int = Field(default=25)
     module_tagger: int = Field(default=30)
     deep_reviewer: int = Field(default=100)
 
@@ -138,6 +142,7 @@ class EffortConfig(BaseModel):
     reviewer: str = Field(default='medium')
     merger: str = Field(default='high')
     steward: str = Field(default='high')
+    triage: str = Field(default='medium')
     module_tagger: str = Field(default='medium')
     deep_reviewer: str = Field(default='max')
 
@@ -151,6 +156,7 @@ class BackendsConfig(BaseModel):
     reviewer: str = Field(default='claude')
     merger: str = Field(default='claude')
     steward: str = Field(default='claude')
+    triage: str = Field(default='claude')
     module_tagger: str = Field(default='claude')
     deep_reviewer: str = Field(default='claude')
 
@@ -273,6 +279,9 @@ class OrchestratorConfig(BaseSettings):
     steward_lifetime_budget: float = Field(default=12.0)
     steward_max_retries: int = Field(default=3)
     steward_completion_timeout: float = Field(default=300.0)
+
+    # Pre-triage threshold for review suggestions
+    suggestion_triage_threshold: int = Field(default=10)
 
     # Wall-clock backstop for any single agent invocation (seconds)
     invocation_timeout: float = Field(default=1200.0)
