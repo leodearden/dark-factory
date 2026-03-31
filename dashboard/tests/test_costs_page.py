@@ -394,6 +394,81 @@ class TestCostsByRolePartial:
 
 
 # ---------------------------------------------------------------------------
+# Step-13: GET /costs/partials/trend route tests
+# ---------------------------------------------------------------------------
+
+_MOCK_TREND = {
+    'dark_factory': [
+        {'day': '2026-03-25', 'total': 2.10},
+        {'day': '2026-03-26', 'total': 3.40},
+        {'day': '2026-03-27', 'total': 1.80},
+    ],
+    'other_project': [
+        {'day': '2026-03-25', 'total': 0.50},
+        {'day': '2026-03-26', 'total': 0.70},
+        {'day': '2026-03-27', 'total': 0.30},
+    ],
+}
+
+
+def _patch_trend(return_value=_MOCK_TREND):
+    return patch(
+        'dashboard.app.get_cost_trend',
+        new_callable=AsyncMock,
+        return_value=return_value,
+    )
+
+
+class TestCostsTrendPartial:
+    """Tests for GET /costs/partials/trend."""
+
+    def test_returns_200(self, client):
+        with _patch_trend():
+            resp = client.get('/costs/partials/trend')
+        assert resp.status_code == 200
+
+    def test_content_type_html(self, client):
+        with _patch_trend():
+            resp = client.get('/costs/partials/trend')
+        assert 'text/html' in resp.headers['content-type']
+
+    def test_renders_chart_canvas(self, client):
+        """Trend partial must contain a Chart.js canvas element."""
+        with _patch_trend():
+            html = client.get('/costs/partials/trend').text
+        assert 'canvas' in html.lower()
+
+    def test_renders_line_chart(self, client):
+        """Chart type must be 'line'."""
+        with _patch_trend():
+            html = client.get('/costs/partials/trend').text
+        assert "'line'" in html or '"line"' in html
+
+    def test_renders_chart_js_config(self, client):
+        """Chart.js config with new Chart must appear."""
+        with _patch_trend():
+            html = client.get('/costs/partials/trend').text
+        assert 'new Chart' in html
+
+    def test_day_labels_present(self, client):
+        """Day strings from the data should appear in the rendered output."""
+        with _patch_trend():
+            html = client.get('/costs/partials/trend').text
+        assert '2026-03-25' in html
+
+    def test_handles_empty_data(self, client):
+        with _patch_trend(return_value={}):
+            resp = client.get('/costs/partials/trend')
+        assert resp.status_code == 200
+
+    def test_respects_window_param(self, client):
+        with _patch_trend() as mock_fn:
+            client.get('/costs/partials/trend?window=24h')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 1
+
+
+# ---------------------------------------------------------------------------
 # Step-9: GET /costs/partials/by-account route tests
 # ---------------------------------------------------------------------------
 
