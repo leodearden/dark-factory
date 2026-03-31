@@ -1,0 +1,102 @@
+{
+  "task_id": "334",
+  "title": "Add missing test coverage for cost query edge cases",
+  "files": [
+    "dashboard/tests/test_costs_data.py"
+  ],
+  "modules": [
+    "dashboard/tests"
+  ],
+  "analysis": "The existing test file (dashboard/tests/test_costs_data.py, ~1026 lines) covers 7 async query functions in dashboard/src/dashboard/data/costs.py. Three specific coverage gaps are identified:\n\n1. **days parameter parametric coverage**: The existing `test_days_window_boundary` (line 291) only tests `get_cost_summary` with days=1 and days=30. The `days` parameter is used by ALL 7 query functions via `_cutoff(days)`, but no parametric test verifies consistent filtering across functions. A `@pytest.mark.parametrize` test should insert records inside/outside the window and verify filtering works for multiple query functions.\n\n2. **NULL task_id grouping strength**: The existing `test_null_task_id` (line 908) already has 2 NULL-task_id invocations with identical model/role. This should be strengthened with 3+ invocations using DIFFERENT models/roles to verify grouping works regardless of invocation heterogeneity, and to assert individual invocation detail correctness.\n\n3. **Cap-only account with out-of-window invocations**: The existing `test_cap_only_account` (line 524) tests an account with cap events but NO invocations at all. A more realistic edge case is an account that has invocations OUTSIDE the window but cap_hit events INSIDE the window \u2014 this verifies the second-pass gap-filling in `get_cost_by_account` (line 195) works when the account exists in the system but has zero in-window activity.\n\nAll three tests exercise existing behavior \u2014 no production code changes expected. The test pattern throughout the file is: create a temp SQLite DB with COSTS_SCHEMA, populate with targeted data, open an aiosqlite connection, call the query function, and assert. All tests use `@pytest.mark.asyncio` and `pytest.approx(expected, abs=1e-6)` for float comparisons.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write parametric test `test_days_controls_lookback_window` in a new `TestDaysParameter` class. Use `@pytest.mark.parametrize` over (function, days, expected_description) tuples covering get_cost_summary, get_cost_by_project, get_cost_by_account, get_cost_by_role, and get_account_events. Setup: insert one invocation at 2h ago (inside any window) and one at 20d ago (outside days=7). For each function, call with days=1 (only recent), days=7 (only recent), and days=30 (both). Assert result shapes reflect correct filtering (e.g., total_spend for summary, model counts for by_project, invocation counts for by_account). Also insert a cap_hit at 2h ago and one at 20d ago for account_events coverage.",
+      "status": "done",
+      "commit": "1602d9f6"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Run the parametric days test to verify all existing query functions correctly filter by the `days` window. All should pass since every function uses `_cutoff(days)`. If any fail, investigate whether the function's SQL WHERE clause correctly applies the cutoff.",
+      "status": "done",
+      "commit": "1602d9f6"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Strengthen `test_null_task_id` in TestRunCostBreakdown: add a third NULL-task_id invocation with a DIFFERENT model (claude-opus-4-5) and role (debugger) alongside the existing two (claude-sonnet-4-5/orchestrator). Assert: still exactly 1 task entry with task_id=None, title=None; cost accumulates all 3 invocations; invocations list has length 3; each invocation's model/role/cost_usd fields are individually correct (verify heterogeneous invocations don't break grouping).",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Run the strengthened null task_id test. Should pass \u2014 the grouping logic in get_run_cost_breakdown uses `task_id not in run['tasks']` which handles None as a dict key correctly, and invocations are appended regardless of model/role. If it fails, fix the grouping logic.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Add `test_cap_only_account_with_out_of_window_invocations` to TestCostByAccount. Setup: insert 2 invocations for 'max-ghost' at 20d ago (outside days=7 window), plus 1 cap_hit event at 2h ago (inside window). Call get_cost_by_account(conn, days=7). Assert: 'max-ghost' IS present in result (second-pass gap-fill), spend=0.0, invocations=0, cap_events=1, status='capped', last_cap matches the cap_hit timestamp. This documents that the second pass correctly surfaces accounts whose invocations aged out of the window but still have active cap events.",
+      "status": "pending",
+      "commit": null
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Run the cap-only-with-out-of-window-invocations test. Should pass \u2014 the inv_rows query filters by completed_at >= cutoff (excluding old invocations), while evt_rows independently finds in-window cap events, and the second pass at line 195 adds accounts in caps but not in result. If it fails, the second-pass logic needs adjustment.",
+      "status": "pending",
+      "commit": null
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use @pytest.mark.parametrize for days parameter test rather than separate test functions per query",
+      "rationale": "A parametric test with a shared DB setup avoids duplicating the insert-inside-and-outside-window pattern 5+ times. It makes coverage gaps for individual functions immediately visible as a single failing parameter combination rather than a missing test method."
+    },
+    {
+      "decision": "Test 5 of 7 query functions in the parametric days test (exclude get_cost_trend and get_run_cost_breakdown)",
+      "rationale": "get_cost_trend already has dedicated alignment tests (test_trend_days_align_with_cutoff). get_run_cost_breakdown filtering is implicitly covered by the existing test_populated which uses the shared fixture. The remaining 5 functions (summary, by_project, by_account, by_role, account_events) share the same _cutoff(days) pattern and benefit most from parametric coverage."
+    },
+    {
+      "decision": "Strengthen null task_id test with heterogeneous invocations (different model/role) rather than just adding more identical rows",
+      "rationale": "Identical NULL-task_id invocations already collapse trivially. The real grouping risk is that different model/role values might accidentally cause separate task entries. Testing with mixed attributes is a stronger verification of the None-keyed dict grouping."
+    },
+    {
+      "decision": "Separate 'cap-only with out-of-window invocations' from existing test_cap_only_account",
+      "rationale": "The existing test covers the case of zero invocations ever. The new test covers the more realistic production scenario where invocations exist but aged out of the window. These are distinct edge cases: one tests absence of data, the other tests correct time-windowed filtering combined with the second-pass gap-fill."
+    },
+    {
+      "decision": "Place parametric days test in its own TestDaysParameter class",
+      "rationale": "The parametric test exercises multiple query functions, so it doesn't belong in any single function's test class. A dedicated class keeps the file organized and makes it clear this is cross-cutting coverage."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "COSTS_SCHEMA constant",
+      "where": "dashboard/tests/test_costs_data.py line 15",
+      "how": "All new tests reuse the existing schema DDL to create temporary SQLite databases, matching the pattern used by all existing edge-case tests."
+    },
+    {
+      "what": "Inline tmp_path DB creation pattern",
+      "where": "dashboard/tests/test_costs_data.py lines 298-321 (test_days_window_boundary)",
+      "how": "New tests follow the same pattern: sqlite3.connect(tmp_path / name), executescript(COSTS_SCHEMA), populate, close, then aiosqlite.connect + row_factory for async queries."
+    },
+    {
+      "what": "pytest.approx(expected, abs=1e-6) for float comparison",
+      "where": "Used throughout the test file (e.g., lines 251, 330, 382)",
+      "how": "All cost assertions use this exact tolerance to avoid floating-point comparison issues."
+    },
+    {
+      "what": "datetime.now(UTC) - timedelta(...) timestamp generation",
+      "where": "Used in all existing edge-case tests for creating in-window and out-of-window records",
+      "how": "New tests use the same approach: `now = datetime.now(UTC)`, then subtract timedelta for inside/outside window placement."
+    }
+  ],
+  "_session_id": "334-210e9c26",
+  "_created_at": "2026-03-31T14:48:54.165189+00:00"
+}
