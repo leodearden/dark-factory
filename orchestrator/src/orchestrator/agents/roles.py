@@ -157,9 +157,31 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 
 1. **Follow the plan exactly.** Do not deviate from the plan structure. Do not add steps or skip steps.
 2. **TDD discipline.** For `test` steps: write the test, run it, confirm it fails. For `impl` steps: write implementation, run tests, confirm they pass.
-3. **Commit each step.** After completing a step, stage and commit with a descriptive message. Update `.task/plan.json` to set the step's `status` to `"done"` and `commit` to the sha.
+3. **Commit each step.** After completing a step, stage ONLY your code changes (not `.task/` files) and commit. Then update `.task/plan.json` status locally — it will NOT be committed.
 4. **Stop at logical boundaries.** Don't exhaust your context trying to complete everything. Complete a logical chunk of steps, commit, update plan status, and stop. The next iteration will continue from where you left off.
 5. **Only modify status/commit fields** in plan.json. Never change the plan structure, descriptions, or add new steps.
+
+## CRITICAL: Git Staging Rules
+
+The `.task/` directory is local scratch space and must NEVER be committed.
+When staging changes, ALWAYS exclude `.task/`:
+
+```bash
+# CORRECT — stage by specific files or with exclusion:
+git add src/module/file.py tests/test_file.py
+git add -- . ':!.task'
+
+# WRONG — these will stage .task/ files:
+# git add .
+# git add -A
+# git add .task/plan.json
+```
+
+The workflow for each step is:
+1. Write code (implementation or tests)
+2. Run tests to verify
+3. Stage and commit ONLY the code: `git add -- . ':!.task'`
+4. Update `.task/plan.json` status fields (this stays local, never committed)
 
 ## Scope Boundary
 
@@ -202,6 +224,22 @@ You will be given:
 2. **Minimal targeted fixes.** Fix only what's broken. Don't refactor or "improve" surrounding code.
 3. **Don't change test expectations** unless the test itself is wrong (testing the wrong behavior, not just failing).
 4. **Commit your fixes** with a descriptive message like "fix: resolve type error in X" or "fix: correct test assertion for Y".
+
+## CRITICAL: Git Staging Rules
+
+The `.task/` directory is local scratch space and must NEVER be committed.
+When staging changes, ALWAYS exclude `.task/`:
+
+```bash
+# CORRECT:
+git add src/module/file.py tests/test_file.py
+git add -- . ':!.task'
+
+# WRONG — these will stage .task/ files:
+# git add .
+# git add -A
+# git add .task/plan.json
+```
 
 ## Scope Boundary
 
@@ -330,6 +368,15 @@ You will be given:
 3. **Run tests after resolving.** Verify the resolution doesn't break anything.
 4. **Commit the resolution** with a message like "resolve: merge conflicts for task/X".
 
+## CRITICAL: Git Staging Rules
+
+The `.task/` directory is local scratch space and must NEVER be committed.
+When staging changes, ALWAYS exclude `.task/`:
+
+```bash
+git add -- . ':!.task'
+```
+
 ## Important
 
 - Read both sides of every conflict carefully.
@@ -387,6 +434,15 @@ Post-merge improvement suggestions from automated code reviewers. Triage each as
 4. **Resolve each escalation** by calling `resolve_issue` with a summary of what you did.
 5. **For suggestions:** Read the code at each location, search memory and tasks for
    duplicates, then classify and act. Maximum 50 tasks per triage batch.
+
+## CRITICAL: Git Staging Rules
+
+The `.task/` directory is local scratch space and must NEVER be committed.
+When staging changes, ALWAYS exclude `.task/`:
+
+```bash
+git add -- . ':!.task'
+```
 
 ## Session Continuity
 

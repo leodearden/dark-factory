@@ -116,6 +116,22 @@ async def _scrub_task_dir_from_tree(cwd: Path, context: str, *, amend: bool = Tr
     return True
 
 
+def _ensure_task_gitignore(worktree: Path) -> None:
+    """Create .task/.gitignore with '*' if it doesn't exist.
+
+    This is a defense-in-depth measure.  When an agent does ``git add .``
+    or ``git add -A``, the nested .gitignore prevents .task/ contents from
+    being staged — UNLESS files were previously explicitly added (tracked
+    files override .gitignore).  The pre-commit hook is the primary guard;
+    this is supplementary.
+    """
+    task_dir = worktree / '.task'
+    task_dir.mkdir(exist_ok=True)
+    gi = task_dir / '.gitignore'
+    if not gi.exists():
+        gi.write_text('# Auto-generated — prevents .task/ from being staged.\n*\n')
+
+
 async def _assert_no_task_dir(sha: str, cwd: Path, context: str) -> None:
     """Raise RuntimeError if the given commit SHA contains any .task/ entries.
 
@@ -185,6 +201,16 @@ class GitOps:
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
         full_branch = f'{self.config.branch_prefix}{branch_name}'
 
+        # ── Ensure core.hooksPath is set ──────────────────────────────
+        # The pre-commit hook in hooks/pre-commit strips .task/ from the
+        # staging area on ALL branches.  core.hooksPath must point to
+        # hooks/ (relative) so worktrees find the hook via their own
+        # working tree.  This is idempotent — safe to run every time.
+        await _run(
+            ['git', 'config', 'core.hooksPath', 'hooks'],
+            cwd=self.project_root,
+        )
+
         # Capture main's current SHA before creating worktree
         _, base_sha, _ = await _run(
             ['git', 'rev-parse', self.config.main_branch],
@@ -194,6 +220,7 @@ class GitOps:
         # If worktree already exists, reuse it (common after requeue)
         if worktree_path.exists():
             logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
+            _ensure_task_gitignore(worktree_path)
             return worktree_path, base_sha
 
         # If branch exists but worktree doesn't (stale from a previous run), clean up
@@ -214,6 +241,12 @@ class GitOps:
             raise RuntimeError(f'Failed to create worktree: {err}')
 
         logger.info(f'Created worktree at {worktree_path} on branch {full_branch} (base={base_sha[:8]})')
+
+        # ── .task/.gitignore defense layer ────────────────────────────
+        # Create .task/.gitignore with "*" so that broad "git add ."
+        # commands in the worktree don't pick up .task/ contents.  This
+        # is defense-in-depth — the pre-commit hook is the primary guard.
+        _ensure_task_gitignore(worktree_path)
 
         # ── .task/ contamination guard ────────────────────────────────
         # If main is contaminated (has .task/ tracked), this worktree
