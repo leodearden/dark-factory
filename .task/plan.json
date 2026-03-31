@@ -48,15 +48,15 @@
       "id": "step-5",
       "type": "test",
       "description": "Write failing tests for open(): creates connection, WAL mode is set, busy_timeout matches configured value, schema tables exist, parent dirs created; double-open raises RuntimeError('{ClassName} already opened'); no resource leak if schema executescript fails (conn closed, _conn stays None)",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "71459e64"
     },
     {
       "id": "step-6",
       "type": "impl",
       "description": "Implement open(): mkdir parents, aiosqlite.connect, call apply_wal_pragmas, executescript(self._schema), set self._conn. Include double-open guard (raise if _conn not None) and try/except to close conn on schema failure",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "pending"
     },
     {
       "id": "step-7",
