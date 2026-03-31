@@ -597,6 +597,77 @@ class TestCostByAccount:
         assert mz['last_cap'] is None
         assert mz['status'] == 'active'
 
+    @pytest.mark.asyncio
+    async def test_cap_only_account_with_out_of_window_invocations(self, tmp_path):
+        """Account with in-window cap event but only out-of-window invocations appears in result.
+
+        This is a more realistic production edge case than test_cap_only_account:
+        the account ('max-ghost') has invocations that aged out of the look-back
+        window, so inv_rows yields zero rows for it. However, it still has a
+        cap_hit event inside the window. The second-pass gap-fill (costs.py line 195)
+        must surface this account with spend=0.0 and invocations=0.
+
+        Setup:
+          - 2 invocations for 'max-ghost' at 20d ago (outside days=7)
+          - 1 cap_hit event for 'max-ghost' at 2h ago (inside days=7)
+
+        Expected result for 'max-ghost':
+          spend=0.0, invocations=0, cap_events=1, status='capped',
+          last_cap == cap_hit timestamp
+        """
+        db_path = tmp_path / 'ghost_cap.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+
+        cap_ts = (now - timedelta(hours=2)).isoformat()
+
+        # Two invocations at 20d ago — outside days=7 window
+        conn.executemany(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [
+                ('r1', 't1', 'proj', 'max-ghost', 'claude-opus-4-5', 'implementer',
+                 1.00, 0,
+                 (now - timedelta(days=20, hours=1)).isoformat(),
+                 (now - timedelta(days=20)).isoformat()),
+                ('r1', 't2', 'proj', 'max-ghost', 'claude-sonnet-4-5', 'reviewer',
+                 0.50, 0,
+                 (now - timedelta(days=20, hours=2)).isoformat(),
+                 (now - timedelta(days=20, hours=1)).isoformat()),
+            ],
+        )
+        # One cap_hit event at 2h ago — inside days=7 window
+        conn.execute(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            ('max-ghost', 'cap_hit', 'proj', 'r1', None, cap_ts),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn, days=7)
+
+        # 'max-ghost' must appear via the second-pass gap-fill even though it
+        # has no in-window invocations.
+        assert 'max-ghost' in result, (
+            "account with out-of-window invocations but in-window cap event "
+            "must appear in get_cost_by_account result via second-pass gap-fill"
+        )
+        mg = result['max-ghost']
+        assert mg['spend'] == pytest.approx(0.0, abs=1e-6)
+        assert mg['invocations'] == 0
+        assert mg['cap_events'] == 1
+        assert mg['status'] == 'capped'
+        assert mg['last_cap'] == cap_ts, (
+            f"expected last_cap={cap_ts!r}, got {mg['last_cap']!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: get_cost_by_role
@@ -908,9 +979,13 @@ class TestRunCostBreakdown:
     async def test_null_task_id(self, tmp_path):
         """Multiple NULL-task_id invocations are grouped into a single task entry.
 
-        Two orchestrator invocations with task_id=NULL (run-level billing) must
-        collapse into one task dict (task_id=None), with costs accumulated and
-        both invocation rows preserved in the detail list.
+        Three invocations with task_id=NULL but DIFFERENT model/role values
+        (claude-sonnet-4-5/orchestrator × 2, claude-opus-4-5/debugger × 1)
+        must all collapse into one task dict (task_id=None), with costs
+        accumulated and all three invocation rows preserved in the detail list.
+
+        This tests that heterogeneous model/role attributes don't accidentally
+        produce separate task entries — the grouping key is task_id only.
         """
         db_path = tmp_path / 'null_task.db'
         conn = __import__('sqlite3').connect(str(db_path))
@@ -923,7 +998,10 @@ class TestRunCostBreakdown:
             'VALUES (?, ?, ?, ?)',
             ('r1', 'proj', (now - timedelta(hours=1)).isoformat(), now.isoformat()),
         )
-        # Insert TWO invocations with NULL task_id (run-level billing)
+        # Insert THREE invocations with NULL task_id (run-level billing):
+        #   inv-1: sonnet / orchestrator  → 0.25
+        #   inv-2: sonnet / orchestrator  → 0.15
+        #   inv-3: opus   / debugger      → 0.10  (different model AND role)
         conn.executemany(
             'INSERT INTO invocations '
             '(run_id, task_id, project_id, account_name, model, role, '
@@ -932,11 +1010,15 @@ class TestRunCostBreakdown:
             [
                 ('r1', None, 'proj', 'acc', 'claude-sonnet-4-5', 'orchestrator',
                  0.25, 0,
-                 (now - timedelta(minutes=40)).isoformat(),
-                 (now - timedelta(minutes=30)).isoformat()),
+                 (now - timedelta(minutes=50)).isoformat(),
+                 (now - timedelta(minutes=40)).isoformat()),
                 ('r1', None, 'proj', 'acc', 'claude-sonnet-4-5', 'orchestrator',
                  0.15, 0,
-                 (now - timedelta(minutes=20)).isoformat(),
+                 (now - timedelta(minutes=30)).isoformat(),
+                 (now - timedelta(minutes=20)).isoformat()),
+                ('r1', None, 'proj', 'acc', 'claude-opus-4-5', 'debugger',
+                 0.10, 0,
+                 (now - timedelta(minutes=15)).isoformat(),
                  (now - timedelta(minutes=10)).isoformat()),
             ],
         )
@@ -950,16 +1032,147 @@ class TestRunCostBreakdown:
         assert len(result) == 1
         run = result[0]
         assert run['run_id'] == 'r1'
-        assert run['total_cost'] == pytest.approx(0.40, abs=1e-6)
+        assert run['total_cost'] == pytest.approx(0.50, abs=1e-6)
 
-        # Both NULLs must be grouped into exactly ONE task entry
+        # All three NULLs must be grouped into exactly ONE task entry
         assert len(run['tasks']) == 1
         t = run['tasks'][0]
         assert t['task_id'] is None
         assert t['title'] is None
-        assert t['cost'] == pytest.approx(0.40, abs=1e-6)
-        # Both invocation rows must be preserved in the detail list
-        assert len(t['invocations']) == 2
+        assert t['cost'] == pytest.approx(0.50, abs=1e-6)
+        # All three invocation rows must be preserved in the detail list
+        assert len(t['invocations']) == 3
+
+        # Verify each invocation's model/role/cost_usd are individually correct.
+        # Sort by cost_usd descending: 0.25, 0.15, 0.10.
+        invs = sorted(t['invocations'], key=lambda x: x['cost_usd'], reverse=True)
+        assert invs[0]['cost_usd'] == pytest.approx(0.25, abs=1e-6)
+        assert invs[0]['model'] == 'claude-sonnet-4-5'
+        assert invs[0]['role'] == 'orchestrator'
+        assert invs[1]['cost_usd'] == pytest.approx(0.15, abs=1e-6)
+        assert invs[1]['model'] == 'claude-sonnet-4-5'
+        assert invs[1]['role'] == 'orchestrator'
+        assert invs[2]['cost_usd'] == pytest.approx(0.10, abs=1e-6)
+        assert invs[2]['model'] == 'claude-opus-4-5'
+        assert invs[2]['role'] == 'debugger'
+
+
+# ---------------------------------------------------------------------------
+# Tests: days parameter filtering (cross-function parametric)
+# ---------------------------------------------------------------------------
+
+class TestDaysParameter:
+    """Parametric coverage of the _cutoff(days) window filter across query functions.
+
+    Each test case exercises a different query function with days=1, days=7, and
+    days=30 to verify that the window correctly excludes/includes a 20-day-old
+    invocation that falls outside the narrow window but inside the wide window.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fn_name", [
+        "summary",
+        "by_project",
+        "by_account",
+        "by_role",
+        "account_events",
+    ])
+    async def test_days_controls_lookback_window(self, tmp_path, fn_name):
+        """days parameter controls look-back for each query function.
+
+        DB setup: one invocation at 2h ago (cost=0.50) and one at 20d ago
+        (cost=1.50), plus one cap_hit event at each offset.
+
+        - days=1 and days=7 see only the 2h-ago record (narrow window).
+        - days=30 sees both records (wide window).
+        """
+        db_path = tmp_path / f'days_{fn_name}.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+        recent_ts = (now - timedelta(hours=2)).isoformat()
+        old_ts = (now - timedelta(days=20)).isoformat()
+
+        conn.executemany(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [
+                ('r1', 't1', 'proj', 'acc', 'claude-opus-4-5', 'implementer',
+                 0.50, 0,
+                 (now - timedelta(hours=2, minutes=5)).isoformat(),
+                 recent_ts),
+                ('r2', 't2', 'proj', 'acc', 'claude-opus-4-5', 'implementer',
+                 1.50, 0,
+                 (now - timedelta(days=20, hours=1)).isoformat(),
+                 old_ts),
+            ],
+        )
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                ('acc', 'cap_hit', 'proj', 'r1', None, recent_ts),
+                ('acc', 'cap_hit', 'proj', 'r2', None, old_ts),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        fn_map = {
+            'summary': get_cost_summary,
+            'by_project': get_cost_by_project,
+            'by_account': get_cost_by_account,
+            'by_role': get_cost_by_role,
+            'account_events': get_account_events,
+        }
+        fn = fn_map[fn_name]
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            narrow1 = await fn(aconn, days=1)
+            narrow7 = await fn(aconn, days=7)
+            wide30 = await fn(aconn, days=30)
+
+        def _metric(result, name):
+            """Extract the key numeric metric for each function's result."""
+            if name == 'summary':
+                return result.get('proj', {}).get('total_spend', 0.0)
+            if name == 'by_project':
+                return sum(e['total'] for e in result.get('proj', []))
+            if name == 'by_account':
+                return result.get('acc', {}).get('invocations', 0)
+            if name == 'by_role':
+                proj = result.get('proj', {})
+                return sum(
+                    v for role_data in proj.values() for v in role_data.values()
+                )
+            if name == 'account_events':
+                return len(result)
+            return 0
+
+        # Integer metrics (invocation/event counts)
+        if fn_name in ('by_account', 'account_events'):
+            narrow_expected: int | float = 1
+            wide_expected: int | float = 2
+        else:
+            narrow_expected = 0.50
+            wide_expected = 2.00
+
+        assert _metric(narrow1, fn_name) == pytest.approx(narrow_expected, abs=1e-6), (
+            f"{fn_name}: days=1 narrow expected {narrow_expected}, "
+            f"got {_metric(narrow1, fn_name)}"
+        )
+        assert _metric(narrow7, fn_name) == pytest.approx(narrow_expected, abs=1e-6), (
+            f"{fn_name}: days=7 narrow expected {narrow_expected}, "
+            f"got {_metric(narrow7, fn_name)}"
+        )
+        assert _metric(wide30, fn_name) == pytest.approx(wide_expected, abs=1e-6), (
+            f"{fn_name}: days=30 wide expected {wide_expected}, "
+            f"got {_metric(wide30, fn_name)}"
+        )
 
 
 # ---------------------------------------------------------------------------
