@@ -258,6 +258,23 @@ class TestCostSummary:
         assert r['cap_events'] == 0         # no cap events for reify
 
     @pytest.mark.asyncio
+    async def test_task_count_present(self, costs_conn):
+        """task_count must be present in each project dict and equal distinct task IDs."""
+        result = await get_cost_summary(costs_conn)
+
+        # dark_factory has 3 distinct task IDs: 101, 102, 103
+        assert 'dark_factory' in result
+        df = result['dark_factory']
+        assert 'task_count' in df, "task_count key missing from dark_factory summary"
+        assert df['task_count'] == 3
+
+        # reify has 1 distinct task ID: 201
+        assert 'reify' in result
+        r = result['reify']
+        assert 'task_count' in r, "task_count key missing from reify summary"
+        assert r['task_count'] == 1
+
+    @pytest.mark.asyncio
     async def test_none_db(self):
         result = await get_cost_summary(None)
         assert result == {}
