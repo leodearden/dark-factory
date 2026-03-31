@@ -692,6 +692,82 @@ class TestCostTrend:
         assert len(df) == 7
         assert len(zero_days) > 0
 
+    @pytest.mark.asyncio
+    async def test_trend_days_align_with_cutoff(self, tmp_path):
+        """First and last day in the trend must derive from the same `now`.
+
+        Regression guard for the clock-skew race: _cutoff(days) calls
+        datetime.now(UTC) internally, then get_cost_trend calls datetime.now(UTC)
+        again to build all_days. If these two calls straddle UTC midnight the
+        day list and the SQL cutoff window are misaligned (off-by-one).
+
+        The fix captures `now` once and derives both `since` and `all_days` from
+        it. This test validates the invariant: with days=5, the result must
+        cover exactly 5 days; the first day must be
+        `(now - timedelta(days=4)).strftime('%Y-%m-%d')` and the last must be
+        today; and an invocation inserted at exactly the first-day boundary must
+        appear in the output.
+        """
+        db_path = tmp_path / 'trend_align.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+
+        days = 5
+        # Place an invocation exactly at the start of the first day in the window
+        # (days-1 days before today's midnight equivalent).
+        first_day = (now - timedelta(days=days - 1)).strftime('%Y-%m-%d')
+        last_day = now.strftime('%Y-%m-%d')
+        # Use noon of the first day to avoid midnight ambiguity
+        boundary_ts = (
+            datetime.now(UTC).replace(
+                hour=12, minute=0, second=0, microsecond=0
+            ) - timedelta(days=days - 1)
+        ).isoformat()
+
+        conn.execute(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('r1', 't1', 'proj', 'acc', 'claude-sonnet-4-5', 'implementer',
+             0.75, 0, boundary_ts, boundary_ts),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_trend(aconn, days=days)
+
+        assert 'proj' in result
+        proj_days = result['proj']
+
+        # Exactly `days` entries
+        assert len(proj_days) == days, (
+            f"expected {days} day entries, got {len(proj_days)}: "
+            f"{[e['day'] for e in proj_days]}"
+        )
+
+        # Chronologically ordered
+        day_strs = [e['day'] for e in proj_days]
+        assert day_strs == sorted(day_strs)
+
+        # First day aligns with (now - timedelta(days=days-1))
+        assert day_strs[0] == first_day, (
+            f"expected first day={first_day!r}, got {day_strs[0]!r}"
+        )
+        # Last day is today
+        assert day_strs[-1] == last_day, (
+            f"expected last day={last_day!r}, got {day_strs[-1]!r}"
+        )
+
+        # The boundary invocation must appear in the correct day slot
+        day_totals = {e['day']: e['total'] for e in proj_days}
+        assert day_totals[first_day] == pytest.approx(0.75, abs=1e-6), (
+            f"boundary invocation missing from first day {first_day!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: get_account_events
