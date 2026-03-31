@@ -6127,10 +6127,11 @@
         "description": "Three reviewers flagged that the test_fills_gaps assertion in test_costs_data.py (line 674-676) was weakened from a precise mathematical invariant to a near-vacuous check.\n\nThe current code:\n```python\nzero_days = [e for e in df if e['total'] == 0.0]\nassert len(df) == 7\nassert len(zero_days) > 0\n```\n\nThe `len(zero_days) > 0` check passes even if gap-filling skips several days. Restore the stronger invariant that verifies the zero/non-zero split is exact:\n```python\nnon_zero_count = sum(1 for e in df if e['total'] > 0)\nassert len(zero_days) == 7 - non_zero_count\n```\n\nThis is self-contained and mathematically precise — it guarantees every day in the 7-day window is represented exactly once. The `len(df) == 7` check (added by task 318) is good and should stay.\n\nFile: dashboard/tests/test_costs_data.py, around line 673-676.\n\nmemory_hints: search \"test_fills_gaps gap-filling assertion\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-31T09:39:04.310Z"
       },
       {
         "id": "331",
@@ -6301,9 +6302,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T09:38:19.453Z",
+      "lastModified": "2026-03-31T09:39:04.311Z",
       "taskCount": 324,
-      "completedCount": 279,
+      "completedCount": 280,
       "tags": [
         "master"
       ]
