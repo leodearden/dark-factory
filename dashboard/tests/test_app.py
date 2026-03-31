@@ -613,6 +613,11 @@ class TestMemoryGraphsPartialIntegration:
             assert 'memoryTimeseriesChart' in html
             assert 'memoryOpsChart' in html
             assert 'memoryAgentChart' in html
+            # Verify that empty arrays are embedded in the serialized JSON, proving
+            # the template received and rendered the empty payload (not just that the
+            # canvas elements are unconditionally present regardless of data).
+            assert '"reads": []' in html
+            assert '"writes": []' in html
 
     def test_memory_graphs_backend_error_degrades_gracefully(self, client):
         with _patch_memory_graphs_integration(), patch(
