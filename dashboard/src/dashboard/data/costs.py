@@ -243,8 +243,8 @@ async def get_cost_trend(
     Entries cover every calendar day in the window (gaps filled with 0.0),
     ordered chronologically.
     """
-    since = _cutoff(days)
     now = datetime.now(UTC)
+    since = (now - timedelta(days=days)).isoformat()
 
     # Pre-fill all days in the window (today included)
     all_days: list[str] = []
