@@ -267,3 +267,81 @@ class TestAsyncSqliteBaseOpen:
 
         assert store._conn is None
         mock_conn.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Step-7: AsyncSqliteBase.close()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAsyncSqliteBaseClose:
+    """Tests for AsyncSqliteBase.close()."""
+
+    async def test_close_sets_conn_to_none(self, tmp_path: Path) -> None:
+        """After close(), _conn is None."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        store = _Store(tmp_path / 'store.db')
+        await store.open()
+        assert store._conn is not None
+        await store.close()
+        assert store._conn is None
+
+    async def test_close_is_idempotent(self, tmp_path: Path) -> None:
+        """Double-close does not raise."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        store = _Store(tmp_path / 'store.db')
+        await store.open()
+        await store.close()
+        # Second close should not raise
+        await store.close()
+        assert store._conn is None
+
+    async def test_close_never_opened_is_safe(self, tmp_path: Path) -> None:
+        """close() on a store that was never opened is a no-op."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        store = _Store(tmp_path / 'store.db')
+        # Never opened — close() must not raise
+        await store.close()
+        assert store._conn is None
+
+    async def test_data_persists_across_close_reopen(self, tmp_path: Path) -> None:
+        """Data written before close() is readable after reopen."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        db_path = tmp_path / 'store.db'
+
+        # Write a row
+        async with _Store(db_path) as store:
+            await store._conn.execute("INSERT INTO items (name) VALUES ('hello')")  # type: ignore[union-attr]
+            await store._conn.commit()  # type: ignore[union-attr]
+
+        # Reopen and verify the row is still there
+        async with _Store(db_path) as store:
+            async with store._conn.execute("SELECT name FROM items WHERE name='hello'") as cur:  # type: ignore[union-attr]
+                row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 'hello'

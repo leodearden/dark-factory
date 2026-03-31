@@ -56,21 +56,21 @@
       "type": "impl",
       "description": "Implement open(): mkdir parents, aiosqlite.connect, call apply_wal_pragmas, executescript(self._schema), set self._conn. Include double-open guard (raise if _conn not None) and try/except to close conn on schema failure",
       "status": "done",
-      "commit": "pending"
+      "commit": "b635acee"
     },
     {
       "id": "step-7",
       "type": "test",
       "description": "Write failing tests for close(): sets _conn to None after open, idempotent (double-close safe), data persists across close/reopen cycle",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "pending"
     },
     {
       "id": "step-8",
       "type": "impl",
       "description": "Implement close(): if _conn not None, await _conn.close(), set _conn = None",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "b635acee"
     },
     {
       "id": "step-9",
