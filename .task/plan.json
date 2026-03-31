@@ -87,7 +87,7 @@
       "id": "step-10",
       "type": "impl",
       "description": "Verify step-9 passes: summary.html aggregates total_spend across projects and formats as $17.34",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
