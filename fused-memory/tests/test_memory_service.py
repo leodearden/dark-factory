@@ -2000,3 +2000,31 @@ class TestInitializeLifecycleConflict:
         )
         # PlannedEpisodeRegistry constructor must NOT have been called
         MockRegistryCls.assert_not_called()
+
+
+class TestSearchGraphitiInvalidatedFiltering:
+    """Task 312: _search_graphiti filters out edges where invalid_at is not None."""
+
+    # step-1: edge with invalid_at set is excluded
+    @pytest.mark.asyncio
+    async def test_edge_with_invalid_at_excluded(self, service):
+        """Edge with non-null invalid_at is excluded from _search_graphiti results."""
+        from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
+
+        dt_invalid = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Service B deprecated',
+                uuid='edge-invalidated-1',
+                valid_at=None,
+                invalid_at=dt_invalid,
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('Service B', scope, 10)
+
+        assert len(results) == 0, (
+            'Edge with non-null invalid_at must be excluded from search results'
+        )
