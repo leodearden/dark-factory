@@ -24,6 +24,10 @@
     '#fb923c','#38bdf8','#4ade80','#e879f9','#94a3b8'
   ];
 
+  function cssId(s) {
+    return s.replace(/[^a-zA-Z0-9_]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '') || 'unknown';
+  }
+
   function getOrDestroyChart(canvasId) {
     var el = document.getElementById(canvasId);
     if (!el) return null;
@@ -34,8 +38,8 @@
 
   function renderCharts() {
     var projectIds = Object.keys(byRole);
-    projectIds.forEach(function(projectId, projIdx) {
-      var canvasId = 'costByRoleChart_' + (projIdx + 1);
+    projectIds.forEach(function(projectId) {
+      var canvasId = 'costByRoleChart_' + cssId(projectId);
       var el = getOrDestroyChart(canvasId);
       if (!el) return;
 
