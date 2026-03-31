@@ -736,6 +736,62 @@ class TestWindowSelectorIntegration:
 
 
 # ---------------------------------------------------------------------------
+# Step-21: Partial failure resilience tests
+# ---------------------------------------------------------------------------
+
+
+def _patch_raises(target: str):
+    """Patch a data function to raise RuntimeError."""
+    return patch(target, new_callable=AsyncMock, side_effect=RuntimeError('db unavailable'))
+
+
+class TestPartialFailureResilience:
+    """Test that partial routes return 200 even when data functions raise."""
+
+    def test_summary_returns_200_on_data_error(self, client):
+        with _patch_raises('dashboard.app.get_cost_summary'):
+            resp = client.get('/costs/partials/summary')
+        assert resp.status_code == 200
+
+    def test_summary_shows_fallback_content_on_error(self, client):
+        """On error, summary should render with empty data (no crash)."""
+        with _patch_raises('dashboard.app.get_cost_summary'):
+            html = client.get('/costs/partials/summary').text
+        # Should render the template — any valid HTML, not a 500 traceback
+        assert '<' in html
+
+    def test_by_project_returns_200_on_data_error(self, client):
+        with _patch_raises('dashboard.app.get_cost_by_project'):
+            resp = client.get('/costs/partials/by-project')
+        assert resp.status_code == 200
+
+    def test_by_account_returns_200_on_data_error(self, client):
+        with _patch_raises('dashboard.app.get_cost_by_account'):
+            resp = client.get('/costs/partials/by-account')
+        assert resp.status_code == 200
+
+    def test_by_role_returns_200_on_data_error(self, client):
+        with _patch_raises('dashboard.app.get_cost_by_role'):
+            resp = client.get('/costs/partials/by-role')
+        assert resp.status_code == 200
+
+    def test_trend_returns_200_on_data_error(self, client):
+        with _patch_raises('dashboard.app.get_cost_trend'):
+            resp = client.get('/costs/partials/trend')
+        assert resp.status_code == 200
+
+    def test_events_returns_200_on_data_error(self, client):
+        with _patch_raises('dashboard.app.get_account_events'):
+            resp = client.get('/costs/partials/events')
+        assert resp.status_code == 200
+
+    def test_runs_returns_200_on_data_error(self, client):
+        with _patch_raises('dashboard.app.get_run_cost_breakdown'):
+            resp = client.get('/costs/partials/runs')
+        assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # Step-9: GET /costs/partials/by-account route tests
 # ---------------------------------------------------------------------------
 
