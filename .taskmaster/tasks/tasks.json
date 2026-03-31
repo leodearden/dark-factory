@@ -6193,10 +6193,11 @@
         "description": "Two areas in shared/src/shared/usage_gate.py:\n\n**before_invoke race + latency (lines 178-187):**\n- Move `_last_account_name` assignment before `await _write_cost_event` to prevent concurrent callers seeing stale state\n- Switch failover branch from `await _write_cost_event` to fire-and-forget `_fire_cost_event` to unblock token return\n\n**_fire_cost_event hardening (lines 316-332):**\n- Store `loop.create_task()` references in a set to prevent GC collection before completion\n- Narrow `except RuntimeError: pass` to only catch `get_running_loop()` failure, not all RuntimeErrors\n- Add warning log on caught errors instead of silent discard\n- Guard `json.dumps` calls behind `if self._cost_store` in `_handle_cap_detected` (line 264) and `_account_resume_probe_loop` (line 410)\n\nFiles: shared/src/shared/usage_gate.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-31T09:35:27.652Z"
       },
       {
         "id": "337",
@@ -6300,7 +6301,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T09:35:27.577Z",
+      "lastModified": "2026-03-31T09:35:27.652Z",
       "taskCount": 324,
       "completedCount": 278,
       "tags": [
