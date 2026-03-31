@@ -7,7 +7,7 @@
         <h4 class="text-xs text-gray-400 uppercase mb-2">{{ project_id | project_name }}</h4>
       {% endif %}
       <div class="bg-gray-800 rounded-lg p-4 mb-4" style="height: 220px; position: relative">
-        <canvas id="costByRoleChart_{{ loop.index }}"></canvas>
+        <canvas id="costByRoleChart_{{ project_id | css_id }}_{{ loop.index0 }}" data-project-id="{{ project_id }}"></canvas>
       </div>
     {% endfor %}
   {% else %}
@@ -24,8 +24,15 @@
     '#fb923c','#38bdf8','#4ade80','#e879f9','#94a3b8'
   ];
 
-  function getOrDestroyChart(canvasId) {
-    var el = document.getElementById(canvasId);
+  function findProjectCanvas(projectId) {
+    var canvases = document.querySelectorAll('canvas[data-project-id]');
+    for (var i = 0; i < canvases.length; i++) {
+      if (canvases[i].getAttribute('data-project-id') === projectId) return canvases[i];
+    }
+    return null;
+  }
+
+  function getOrDestroyChart(el) {
     if (!el) return null;
     var existing = Chart.getChart(el);
     if (existing) existing.destroy();
@@ -34,9 +41,8 @@
 
   function renderCharts() {
     var projectIds = Object.keys(byRole);
-    projectIds.forEach(function(projectId, projIdx) {
-      var canvasId = 'costByRoleChart_' + (projIdx + 1);
-      var el = getOrDestroyChart(canvasId);
+    projectIds.forEach(function(projectId) {
+      var el = getOrDestroyChart(findProjectCanvas(projectId));
       if (!el) return;
 
       var rolesData = byRole[projectId];

@@ -663,10 +663,12 @@ class TestChartCanvases:
         assert 'new Chart' in html
 
     def test_by_role_canvas_id_prefix(self, client):
-        """by-role partial uses per-project canvas IDs like costByRoleChart_1."""
+        """by-role partial uses project-key-derived canvas IDs like costByRoleChart_dark_factory."""
         with _patch_cost_data():
             html = client.get('/costs/partials/by-role').text
         assert 'costByRoleChart_' in html
+        # IDs must be derived from the project key, not a positional index
+        assert 'costByRoleChart_dark_factory' in html
 
     def test_by_role_new_chart(self, client):
         with _patch_cost_data():

@@ -939,3 +939,198 @@ class TestAlpineV3StorePattern:
         html = client.get('/costs').text
         # The store init should embed the window value; default is 7d
         assert "'7d'" in html or '"7d"' in html
+
+
+# ---------------------------------------------------------------------------
+# Task-343 step-1: hx-sync on cost sections
+# ---------------------------------------------------------------------------
+
+
+class TestHxSyncOnSections:
+    """All 7 cost sections must carry hx-sync="this:abort" to abort stale in-flight requests."""
+
+    def test_all_sections_have_hx_sync(self, client):
+        """The rendered /costs page must contain hx-sync on all 7 data-cost-section elements."""
+        html = client.get('/costs').text
+        assert html.count('hx-sync=') == 7
+
+    def test_hx_sync_uses_abort_strategy(self, client):
+        """All hx-sync attributes must use the this:abort strategy."""
+        html = client.get('/costs').text
+        assert 'hx-sync="this:abort"' in html or "hx-sync='this:abort'" in html
+
+    def test_hx_sync_count_equals_seven(self, client):
+        """Exact count of hx-sync attributes equals 7 (one per section)."""
+        html = client.get('/costs').text
+        assert html.count('hx-sync="this:abort"') == 7
+
+    def test_hx_sync_on_each_section(self, client):
+        """Each individual section (by data-cost-section value) must have hx-sync."""
+        html = client.get('/costs').text
+        sections = ['summary', 'by-project', 'by-account', 'by-role', 'trend', 'events', 'runs']
+        for section in sections:
+            # Find the section marker and verify hx-sync appears nearby
+            # We check by counting that hx-sync appears once per section block
+            marker = f'data-cost-section="{section}"'
+            assert marker in html, f'Section {section!r} not found in page'
+        # Verify the total count of hx-sync attributes equals number of sections
+        assert html.count('hx-sync="this:abort"') == len(sections)
+
+
+# ---------------------------------------------------------------------------
+# Task-343 step-5: css_id Jinja2 filter unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestCssIdFilter:
+    """Unit tests for the css_id Jinja2 filter registered in app.py."""
+
+    def _css_id(self, value):
+        from dashboard.app import css_id
+        return css_id(value)
+
+    def test_simple_string_passthrough(self):
+        """A clean identifier passes through unchanged."""
+        assert self._css_id('dark_factory') == 'dark_factory'
+
+    def test_path_string_sanitized(self):
+        """A filesystem path has slashes replaced with underscores."""
+        result = self._css_id('/home/leo/src/dark-factory')
+        assert result == 'home_leo_src_dark_factory'
+
+    def test_none_returns_unknown(self):
+        """None input falls back to 'unknown'."""
+        assert self._css_id(None) == 'unknown'
+
+    def test_empty_string_returns_unknown(self):
+        """Empty string falls back to 'unknown'."""
+        assert self._css_id('') == 'unknown'
+
+    def test_already_clean_string(self):
+        """A string with only alphanumeric and underscores passes through unchanged."""
+        assert self._css_id('my_project_123') == 'my_project_123'
+
+    def test_special_characters_replaced(self):
+        """Special characters (hyphens, dots, spaces) are replaced with underscores."""
+        result = self._css_id('my-project.name here')
+        assert result == 'my_project_name_here'
+
+    def test_multiple_consecutive_separators_collapsed(self):
+        """Multiple consecutive non-alphanum chars collapse to a single underscore."""
+        result = self._css_id('a---b')
+        assert result == 'a_b'
+
+    def test_leading_trailing_underscores_stripped(self):
+        """Leading and trailing underscores are stripped."""
+        result = self._css_id('/leading/trailing/')
+        # /leading/trailing/ → _leading_trailing_ → leading_trailing
+        assert not result.startswith('_')
+        assert not result.endswith('_')
+
+    def test_no_leading_digit_issue(self):
+        """Numeric-only input becomes a valid CSS ID (falls back to 'unknown' if empty after strip)."""
+        # purely underscores after replacement would collapse to '' → 'unknown'
+        result = self._css_id('---')
+        assert result == 'unknown'
+
+    def test_registered_as_jinja2_filter(self):
+        """css_id must be registered as a Jinja2 filter on the templates env."""
+        from dashboard.app import templates
+        assert 'css_id' in templates.env.filters
+
+
+# ---------------------------------------------------------------------------
+# Task-343 step-7: by_role canvas IDs derived from project key
+# ---------------------------------------------------------------------------
+
+_MOCK_BY_ROLE_TWO_PROJECTS = {
+    'dark_factory': {
+        'implementer': {'claude-sonnet': 5.20, 'claude-opus': 1.50},
+        'reviewer': {'claude-opus': 3.10},
+    },
+    'other_project': {
+        'implementer': {'claude-haiku': 0.80},
+    },
+}
+
+
+class TestByRoleCanvasIds:
+    """by_role partial must derive canvas IDs from project key strings, not positional index."""
+
+    def test_by_role_canvas_ids_use_project_key(self, client):
+        """Canvas IDs must be derived from project key: costByRoleChart_dark_factory etc."""
+        with patch(
+            'dashboard.app.get_cost_by_role',
+            new_callable=AsyncMock,
+            return_value=_MOCK_BY_ROLE_TWO_PROJECTS,
+        ):
+            html = client.get('/costs/partials/by-role').text
+        assert 'costByRoleChart_dark_factory' in html
+        assert 'costByRoleChart_other_project' in html
+
+    def test_by_role_canvas_ids_no_positional_index(self, client):
+        """Canvas IDs must NOT use positional index (costByRoleChart_1 etc.)."""
+        with patch(
+            'dashboard.app.get_cost_by_role',
+            new_callable=AsyncMock,
+            return_value=_MOCK_BY_ROLE_TWO_PROJECTS,
+        ):
+            html = client.get('/costs/partials/by-role').text
+        assert 'costByRoleChart_1' not in html
+        assert 'costByRoleChart_2' not in html
+
+
+# ---------------------------------------------------------------------------
+# Task-343 step-9: by_role JS uses project key not positional index
+# ---------------------------------------------------------------------------
+
+
+class TestByRoleJsUsesProjectKey:
+    """by_role partial JS must derive canvas IDs from project key via cssId() helper."""
+
+    def test_by_role_js_uses_data_attribute_not_index(self, client):
+        """The rendered by-role partial JS must use data-project-id lookup, not positional index."""
+        with patch(
+            'dashboard.app.get_cost_by_role',
+            new_callable=AsyncMock,
+            return_value=_MOCK_BY_ROLE_TWO_PROJECTS,
+        ):
+            html = client.get('/costs/partials/by-role').text
+        # Old positional pattern must NOT appear
+        assert 'projIdx + 1' not in html
+        # Canvas elements must have data-project-id attributes
+        assert 'data-project-id="dark_factory"' in html
+        assert 'data-project-id="other_project"' in html
+
+    def test_by_role_js_has_find_project_canvas(self, client):
+        """The rendered by-role partial JS must define a findProjectCanvas() helper."""
+        with patch(
+            'dashboard.app.get_cost_by_role',
+            new_callable=AsyncMock,
+            return_value=_MOCK_BY_ROLE_TWO_PROJECTS,
+        ):
+            html = client.get('/costs/partials/by-role').text
+        assert 'function findProjectCanvas' in html
+
+    def test_by_role_canvas_ids_unique_on_collision(self, client):
+        """When two project IDs normalize to the same css_id, canvas HTML IDs stay unique."""
+        colliding_data = {
+            'dark-factory': {
+                'implementer': {'claude-sonnet': 1.0},
+            },
+            'dark_factory': {
+                'implementer': {'claude-opus': 2.0},
+            },
+        }
+        with patch(
+            'dashboard.app.get_cost_by_role',
+            new_callable=AsyncMock,
+            return_value=colliding_data,
+        ):
+            html = client.get('/costs/partials/by-role').text
+        # Both canvases must have unique IDs via loop.index0 suffix
+        assert 'costByRoleChart_dark_factory_0' in html
+        assert 'costByRoleChart_dark_factory_1' in html
+        # Both must carry distinct data-project-id attributes for JS lookup
+        assert 'data-project-id="dark-factory"' in html
+        assert 'data-project-id="dark_factory"' in html
