@@ -6268,6 +6268,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 344,
+        "title": "AsyncSqliteBase: serialize close() with lifecycle lock",
+        "description": "Two concurrent close() calls can both pass the `if self._conn is not None` guard before either sets `_conn = None`, double-closing the aiosqlite connection. Similarly, close() racing with open() after the lock releases can invalidate a freshly-opened connection.\n\nFix:\n1. Rename `_open_lock` to `_lifecycle_lock` (or `_conn_lock`) since it now guards more than just open().\n2. Wrap `close()` body in `async with self._lifecycle_lock:` to serialize with open().\n3. Add a concurrent-close test in `test_async_sqlite_base.py` (similar pattern to the concurrent-open test in test_cost_store.py).\n4. Add an open-vs-close race test.\n\nThis was a pre-existing issue made more visible by the lock added in task 319.\n\nmemory_hints:\n- search: \"AsyncSqliteBase close race condition lifecycle lock\"\n- search: \"CostStore asyncio.Lock race condition open guard\"\n- entity: \"AsyncSqliteBase\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6280,7 +6291,7 @@
       ],
       "created": "2026-03-31T09:25:44.356Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T09:26:36.451Z"
+      "updated": "2026-03-31T09:31:39.350Z"
     }
   }
 }
