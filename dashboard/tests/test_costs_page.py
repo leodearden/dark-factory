@@ -150,9 +150,9 @@ class TestCostsPage:
         assert 'all' in html.lower()
 
     def test_sections_use_morph_swap(self, client):
-        """All HTMX polling sections must use morph:innerHTML for DOM diffing."""
+        """All 7 HTMX polling sections must use morph:innerHTML for DOM diffing."""
         html = client.get('/costs').text
-        assert 'morph:innerHTML' in html
+        assert html.count('morph:innerHTML') == 7
 
     def test_nav_costs_link_is_active(self, client):
         """The 'Costs' nav link should have the active class on the /costs page."""
@@ -163,9 +163,8 @@ class TestCostsPage:
     def test_default_window_7d_marked_active(self, client):
         """Without ?window=, the 7d button should be visually active."""
         html = client.get('/costs').text
-        # The page must indicate 7d is the default/active window
-        # We check that 7d appears as the default in Alpine state or aria-pressed
-        assert '7d' in html
+        # The page must indicate 7d is the default/active window via Alpine.store init
+        assert "Alpine.store('costs', { window: \"7d\" })" in html
 
 
 # ---------------------------------------------------------------------------
@@ -214,8 +213,8 @@ class TestCostsSummaryPartial:
     def test_renders_total_spend(self, client):
         with _patch_summary():
             html = client.get('/costs/partials/summary').text
-        # Should show a dollar amount for combined spend (12.34 + 5.00 = 17.34 or per-project)
-        assert '$' in html
+        # Should show combined spend: dark_factory 12.34 + other_project 5.00 = 17.34
+        assert '$17.34' in html
 
     def test_renders_active_accounts(self, client):
         with _patch_summary():
@@ -375,6 +374,7 @@ class TestCostsByRolePartial:
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
         assert 'implementer' in html
+        assert 'reviewer' in html
 
     def test_handles_empty_data(self, client):
         with _patch_by_role(return_value={}):
@@ -638,10 +638,15 @@ class TestCostsRunsPartial:
         assert 'capped' in html.lower()
 
     def test_handles_null_task_id(self, client):
-        """Runs with null task_id should still render without errors."""
+        """Runs with null task_id should render em-dash and 'unassigned' placeholders."""
         with _patch_runs():
             resp = client.get('/costs/partials/runs')
+            html = resp.text
         assert resp.status_code == 200
+        # null task_id renders as em-dash placeholder
+        assert '—' in html
+        # null title renders as 'unassigned'
+        assert 'unassigned' in html
 
     def test_handles_empty_list(self, client):
         with _patch_runs(return_value=[]):
@@ -749,11 +754,10 @@ class TestPartialFailureResilience:
         assert resp.status_code == 200
 
     def test_summary_shows_fallback_content_on_error(self, client):
-        """On error, summary should render with empty data (no crash)."""
+        """On error, summary should render the empty-data fallback message."""
         with _patch_raises('dashboard.app.get_cost_summary'):
             html = client.get('/costs/partials/summary').text
-        # Should render the template — any valid HTML, not a 500 traceback
-        assert '<' in html
+        assert 'No cost data available for this window.' in html
 
     def test_by_project_returns_200_on_data_error(self, client):
         with _patch_raises('dashboard.app.get_cost_by_project'):
@@ -851,6 +855,13 @@ class TestCostsByAccountPartial:
             html = client.get('/costs/partials/by-account').text
         assert 'green' in html.lower()
 
+    def test_renders_spend_values(self, client):
+        """Spend values from mock data should appear formatted in the output."""
+        with _patch_by_account():
+            html = client.get('/costs/partials/by-account').text
+        assert '$9.50' in html
+        assert '$3.20' in html
+
     def test_handles_empty_data(self, client):
         with _patch_by_account(return_value={}):
             resp = client.get('/costs/partials/by-account')
@@ -898,6 +909,9 @@ class TestAlpineV3StorePattern:
         # Old pattern used getElementById + __x; new pattern uses Alpine.store
         old_pattern_count = html.count('__x.$data.currentWindow')
         assert old_pattern_count == 0
+        # All 7 sections should have Alpine.store("costs").window in hx-vals
+        new_pattern_count = html.count('Alpine.store("costs").window')
+        assert new_pattern_count == 7
 
     def test_button_click_writes_to_store(self, client):
         """@click handlers on window selector buttons must write to Alpine.store('costs').window."""
