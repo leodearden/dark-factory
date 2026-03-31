@@ -211,7 +211,7 @@ class TestConnectionReuse:
             connect_call_count += 1
             return await real_connect(path)
 
-        with patch('shared.cost_store.aiosqlite.connect', side_effect=counting_connect):
+        with patch('shared.async_sqlite_base.aiosqlite.connect', side_effect=counting_connect):
             async with CostStore(db_path) as store:
                 for i in range(3):
                     await store.save_invocation(
@@ -401,7 +401,7 @@ class TestCostStoreOpenClose:
             conn.executescript = failing_executescript
             return conn
 
-        with patch('shared.cost_store.aiosqlite.connect', side_effect=fake_connect), pytest.raises(RuntimeError, match='schema failure'):
+        with patch('shared.async_sqlite_base.aiosqlite.connect', side_effect=fake_connect), pytest.raises(RuntimeError, match='schema failure'):
             await store.open()
 
         assert store._conn is None, '_conn should remain None on setup failure'

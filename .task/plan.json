@@ -105,14 +105,14 @@
       "type": "test",
       "description": "Add test to test_cost_store.py: CostStore is a subclass of AsyncSqliteBase, CostStore._schema returns the expected DDL string, CostStore.__init__ passes busy_timeout_ms=30000 to base",
       "status": "done",
-      "commit": "pending"
+      "commit": "b24debe3"
     },
     {
       "id": "step-14",
       "type": "impl",
       "description": "Refactor CostStore to subclass AsyncSqliteBase: remove duplicated __init__/open/close/__aenter__/__aexit__/_require_conn, add _schema property returning _SCHEMA constant, __init__ calls super().__init__(db_path, busy_timeout_ms=30000). Keep _execute and public API methods unchanged. Run existing test_cost_store.py to verify backward compat.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "pending"
     },
     {
       "id": "step-15",
