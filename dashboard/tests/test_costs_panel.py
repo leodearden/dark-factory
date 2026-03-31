@@ -739,8 +739,11 @@ class TestSummaryCards:
         }
         with _patch_cost_data(summary=single_project_summary):
             html = client.get('/costs/partials/summary').text
-        # Per-project breakdown table columns should not appear for single project
-        assert 'solo_project' not in html or 'Avg/Task' not in html
+        # Per-project breakdown table columns should not appear for single project.
+        # Both conditions must hold simultaneously: the project name must not
+        # appear AND the column header must not appear.
+        assert 'solo_project' not in html
+        assert 'Avg/Task' not in html
 
 
 # ---------------------------------------------------------------------------
@@ -842,10 +845,18 @@ class TestRunsTable:
         assert 'Implement feature X' in html
 
     def test_cost_values_present(self, client):
-        """Dollar cost values appear in the rendered HTML."""
+        """Specific dollar cost values from mock data appear in the rendered HTML.
+
+        The runs.html template uses '%.4f' format, so total_cost=4.20 renders
+        as '$4.2000' and task cost=3.50 renders as '$3.5000'.  Asserting the
+        exact formatted values rather than a bare '$' ensures the template
+        actually renders cost data and is not satisfied by stray '$' characters
+        in CSS or JavaScript embedded in the page.
+        """
         with _patch_cost_data():
             html = client.get('/costs/partials/runs').text
-        assert '$' in html
+        assert '$4.2000' in html  # run total_cost = 4.20
+        assert '$3.5000' in html  # task cost = 3.50
 
     def test_capped_badge_present(self, client):
         """Invocations with capped=True render a 'capped' badge."""
