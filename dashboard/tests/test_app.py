@@ -548,11 +548,43 @@ class TestPerformancePartialIntegration:
                 assert 'one-pass' in html
                 assert 'Steward' in html
 
+    def test_performance_escalations_no_interactive_count(self, client):
+        """Escalations with interactive_count=0 should render Steward rates
+        but NOT the 'Human attention' section (tests {% if esc.interactive_count > 0 %} path)."""
+        esc_no_interactive = {
+            'dark_factory': {
+                'total_tasks': 20,
+                'steward_count': 3,
+                'interactive_count': 0,
+                'steward_rate': 15.0,
+                'interactive_rate': 0.0,
+                'human_attention': {'zero': 0, 'minimal': 0, 'significant': 0},
+            },
+        }
+        with _patch_perf_integration(escalations=esc_no_interactive):
+            resp = client.get('/partials/performance')
+            assert resp.status_code == 200
+            html = resp.text
+            assert 'Steward' in html
+            assert '15.0' in html          # steward_rate appears in the Escalation Rates section
+            assert 'Human attention' not in html  # interactive_count=0 hides this block
+
+    def test_performance_escalations_empty_for_project(self, client):
+        """When escalations dict has no entry for a project that has paths data,
+        the template should render 'No data' in the Escalation Rates section
+        (tests the {% else %} branch of {% if escalations.get(project_id) %})."""
+        with _patch_perf_integration(escalations={}):
+            resp = client.get('/partials/performance')
+            assert resp.status_code == 200
+            html = resp.text
+            assert 'No data' in html       # else branch renders "No data" placeholder
+            assert 'one-pass' in html      # paths data still renders normally
+
 
 _MG_TIMESERIES = {
     'labels': [f'{h:02d}:00' for h in range(24)],
-    'reads': [0] * 24,
-    'writes': [0] * 24,
+    'reads': [0] * 12 + [5] + [0] * 11,   # reads[12]=5 for noon data point
+    'writes': [0] * 12 + [3] + [0] * 11,  # writes[12]=3 for noon data point
 }
 _MG_OPERATIONS = {'labels': ['search', 'add_memory'], 'values': [100, 50]}
 _MG_AGENTS = {'labels': ['claude-interactive', 'recon-consolidator'], 'values': [80, 70]}
@@ -600,6 +632,16 @@ class TestMemoryGraphsPartialIntegration:
             assert 'By operation' in html
             assert 'By agent' in html
             assert 'new Chart' in html
+            # Verify mock data VALUES appear in the rendered HTML via {{ operations | tojson }}
+            # and {{ agents | tojson }}, proving the template context variables are wired up.
+            assert '"search"' in html
+            assert '"add_memory"' in html
+            assert '"claude-interactive"' in html
+            assert '"recon-consolidator"' in html
+            # Verify non-zero timeseries values appear via {{ timeseries | tojson }},
+            # proving the reads/writes arrays are correctly embedded (not just all zeros).
+            assert ', 5, ' in html   # reads[12]=5 appears in JSON array
+            assert ', 3, ' in html   # writes[12]=3 appears in JSON array
 
     def test_memory_graphs_empty(self, client):
         with _patch_memory_graphs_integration(
@@ -613,6 +655,11 @@ class TestMemoryGraphsPartialIntegration:
             assert 'memoryTimeseriesChart' in html
             assert 'memoryOpsChart' in html
             assert 'memoryAgentChart' in html
+            # Verify that empty arrays are embedded in the serialized JSON, proving
+            # the template received and rendered the empty payload (not just that the
+            # canvas elements are unconditionally present regardless of data).
+            assert '"reads": []' in html
+            assert '"writes": []' in html
 
     def test_memory_graphs_backend_error_degrades_gracefully(self, client):
         with _patch_memory_graphs_integration(), patch(
