@@ -37,6 +37,18 @@ class TestParseGeminiNullStats:
         assert agent_result.cost_usd == 0.0
 
 
+class TestParseGeminiAbsentStats:
+
+    def test_absent_stats_key_does_not_raise(self):
+        """_parse_gemini_output does not raise when the 'stats' key is absent (not null)."""
+        payload = json.dumps({'response': 'world'})  # no 'stats' key
+        result = _make_subprocess_result(stdout=payload)
+        agent_result = _parse_gemini_output(result, 'gemini-3-flash')
+        assert agent_result.success is True
+        assert agent_result.output == 'world'
+        assert agent_result.cost_usd == 0.0
+
+
 class TestParseGeminiValidStats:
 
     def test_valid_stats_computes_nonzero_cost(self):
