@@ -202,7 +202,7 @@
       "type": "impl",
       "description": "Fix any integration issues found in step-23. Ensure the full pipeline works end-to-end: planning episode \u2192 registry \u2192 search exclusion \u2192 promotion \u2192 search inclusion.",
       "status": "done",
-      "commit": null
+      "commit": "666d89c2"
     }
   ],
   "design_decisions": [
