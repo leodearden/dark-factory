@@ -6898,6 +6898,28 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 377,
+        "title": "Add type annotations to verify.py list variables to fix pyright errors",
+        "description": "verify.py VerifyResult.failure_report() and _aggregate_results() use untyped list literals (sections = [], parts = []) which cascade into reportUnknownMemberType errors across the file. Fix: add explicit type annotations - e.g., `sections: list[str] = []` at lines 168, 234, 266. This contributes to the 3069 pyright errors reported in phase 1.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": 378,
+        "title": "Harden UsageGate shutdown() background-task drain loop",
+        "description": "Four related improvements to the shutdown() background-task drain loop in shared/src/shared/usage_gate.py (lines 443-446), identified during task-355 review:\n\n1. **Use asyncio.gather for concurrent cancellation** — Replace sequential cancel+await loop with bulk cancel then `await asyncio.gather(*tasks, return_exceptions=True)`. O(1) event-loop round-trips instead of O(N).\n\n2. **Suppress BaseException, not just CancelledError** — _write_cost_event catches `except Exception`, so BaseException subclasses (KeyboardInterrupt, SystemExit) could propagate as the task exception. Use `return_exceptions=True` in gather (which absorbs all exceptions) or `suppress(BaseException)`.\n\n3. **Add explicit self._background_tasks.clear() after drain** — Post-drain emptiness currently relies on done-callback scheduling order (implementation detail). Explicit clear makes the postcondition unconditional.\n\n4. **Add comment or guard for consistency** — The resume-task loop checks `not task.done()` before cancel; the background-task loop does not. Either add the guard for consistency or add a comment explaining why it's unnecessary (done callbacks remove completed tasks).\n\nmemory_hints: search \"UsageGate shutdown background_tasks drain\" and \"fire-and-forget task drain convention\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6910,7 +6932,7 @@
       ],
       "created": "2026-03-31T15:37:38.941Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T15:37:43.184Z"
+      "updated": "2026-03-31T15:37:52.537Z"
     }
   }
 }
