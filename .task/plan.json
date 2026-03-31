@@ -94,7 +94,7 @@
       "id": "step-11",
       "type": "test",
       "description": "Tighten test_handles_null_task_id: add content assertions beyond status_code \u2014 fetch HTML and assert the em-dash placeholder appears for null task_id (the template renders '\u2014' when task.task_id is None) and assert 'unassigned' appears for null title",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {

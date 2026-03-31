@@ -637,10 +637,15 @@ class TestCostsRunsPartial:
         assert 'capped' in html.lower()
 
     def test_handles_null_task_id(self, client):
-        """Runs with null task_id should still render without errors."""
+        """Runs with null task_id should render em-dash and 'unassigned' placeholders."""
         with _patch_runs():
             resp = client.get('/costs/partials/runs')
+            html = resp.text
         assert resp.status_code == 200
+        # null task_id renders as em-dash placeholder
+        assert '—' in html
+        # null title renders as 'unassigned'
+        assert 'unassigned' in html
 
     def test_handles_empty_list(self, client):
         with _patch_runs(return_value=[]):
