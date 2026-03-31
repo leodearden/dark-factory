@@ -761,7 +761,12 @@ class TestRunCostBreakdown:
 
     @pytest.mark.asyncio
     async def test_null_task_id(self, tmp_path):
-        """Invocations with task_id=NULL are grouped under task_id=None."""
+        """Multiple NULL-task_id invocations are grouped into a single task entry.
+
+        Two orchestrator invocations with task_id=NULL (run-level billing) must
+        collapse into one task dict (task_id=None), with costs accumulated and
+        both invocation rows preserved in the detail list.
+        """
         db_path = tmp_path / 'null_task.db'
         conn = __import__('sqlite3').connect(str(db_path))
         conn.executescript(COSTS_SCHEMA)
@@ -773,14 +778,22 @@ class TestRunCostBreakdown:
             'VALUES (?, ?, ?, ?)',
             ('r1', 'proj', (now - timedelta(hours=1)).isoformat(), now.isoformat()),
         )
-        # Insert invocation with NULL task_id (run-level billing)
-        conn.execute(
+        # Insert TWO invocations with NULL task_id (run-level billing)
+        conn.executemany(
             'INSERT INTO invocations '
             '(run_id, task_id, project_id, account_name, model, role, '
             ' cost_usd, capped, started_at, completed_at) '
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            ('r1', None, 'proj', 'acc', 'claude-sonnet-4-5', 'orchestrator',
-             0.25, 0, (now - timedelta(minutes=30)).isoformat(), now.isoformat()),
+            [
+                ('r1', None, 'proj', 'acc', 'claude-sonnet-4-5', 'orchestrator',
+                 0.25, 0,
+                 (now - timedelta(minutes=40)).isoformat(),
+                 (now - timedelta(minutes=30)).isoformat()),
+                ('r1', None, 'proj', 'acc', 'claude-sonnet-4-5', 'orchestrator',
+                 0.15, 0,
+                 (now - timedelta(minutes=20)).isoformat(),
+                 (now - timedelta(minutes=10)).isoformat()),
+            ],
         )
         conn.commit()
         conn.close()
@@ -792,11 +805,13 @@ class TestRunCostBreakdown:
         assert len(result) == 1
         run = result[0]
         assert run['run_id'] == 'r1'
-        assert run['total_cost'] == pytest.approx(0.25, abs=1e-6)
+        assert run['total_cost'] == pytest.approx(0.40, abs=1e-6)
 
-        # Should have one task entry with task_id=None
+        # Both NULLs must be grouped into exactly ONE task entry
         assert len(run['tasks']) == 1
         t = run['tasks'][0]
         assert t['task_id'] is None
         assert t['title'] is None
-        assert t['cost'] == pytest.approx(0.25, abs=1e-6)
+        assert t['cost'] == pytest.approx(0.40, abs=1e-6)
+        # Both invocation rows must be preserved in the detail list
+        assert len(t['invocations']) == 2
