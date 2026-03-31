@@ -502,6 +502,34 @@ class GraphitiBackend:
             'inter_node_deleted': inter_node_deleted,
         }
 
+    async def delete_entity_node(self, uuid: str) -> None:
+        """Delete an Entity node and all remaining relationships.
+
+        Validates that the node exists first, then issues DETACH DELETE.
+
+        Args:
+            uuid: UUID of the Entity node to delete.
+
+        Raises:
+            NodeNotFoundError: if no node with that UUID exists.
+            RuntimeError: if the backend is not initialized.
+        """
+        client = self._require_client()
+        driver = cast(Any, client.driver)
+        graph = driver._get_graph(None)
+        # Pre-check: verify node exists before deleting
+        check_result = await graph.query(
+            'MATCH (n:Entity {uuid: $uuid}) RETURN n.name, n.summary',
+            {'uuid': uuid},
+        )
+        if not check_result.result_set:
+            raise NodeNotFoundError(f'Entity node not found: {uuid}')
+        await graph.query(
+            'MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n',
+            {'uuid': uuid},
+        )
+        logger.info('delete_entity_node: deleted node=%s', uuid)
+
     async def get_node_text(self, uuid: str) -> tuple[str, str]:
         """Return (name, summary) for the Entity node with the given UUID.
 
