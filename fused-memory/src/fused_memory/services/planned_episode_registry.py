@@ -57,7 +57,12 @@ class PlannedEpisodeRegistry:
     # ------------------------------------------------------------------
 
     async def initialize(self) -> None:
-        """Create the SQLite database and tables."""
+        """Create the SQLite database and tables.
+
+        Idempotent — safe to call multiple times; subsequent calls are no-ops.
+        """
+        if self._db is not None:
+            return
         self._data_dir.mkdir(parents=True, exist_ok=True)
         db_path = self._data_dir / 'planned_episodes.db'
         self._db = await aiosqlite.connect(str(db_path))
