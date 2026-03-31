@@ -18,11 +18,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
+_MAX_CAP_COOLDOWN_SECS = 300.0
 
 __all__ = [
     'AgentResult',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
+    '_CAP_HIT_COOLDOWN_SECS',
+    '_MAX_CAP_COOLDOWN_SECS',
 ]
 
 
@@ -106,11 +109,18 @@ async def invoke_with_cap_retry(
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
 
+    Uses exponential backoff: the first pass through all accounts uses the
+    base cooldown (5 s).  After each full cycle through every account, the
+    cooldown doubles, capped at ``_MAX_CAP_COOLDOWN_SECS`` (300 s).
+
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
 
     All keyword arguments are forwarded to ``invoke_claude_agent()``.
     """
+    consecutive_cap_hits = 0
+    num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
+
     while True:
         oauth_token = None
         account_name = ''
@@ -123,18 +133,25 @@ async def invoke_with_cap_retry(
         if usage_gate and usage_gate.detect_cap_hit(
             result.stderr, result.output, 'claude', oauth_token=oauth_token,
         ):
+            consecutive_cap_hits += 1
+            full_cycles = (consecutive_cap_hits - 1) // num_accounts
+            cooldown = min(
+                _CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles),
+                _MAX_CAP_COOLDOWN_SECS,
+            )
+
             acct_name = usage_gate.active_account_name
             if acct_name:
                 logger.warning(
-                    f'{label}: cap hit, sleeping {_CAP_HIT_COOLDOWN_SECS}s '
-                    f'then switching to account {acct_name}',
+                    f'{label}: cap hit ({consecutive_cap_hits} consecutive), '
+                    f'sleeping {cooldown:.0f}s then switching to account {acct_name}',
                 )
             else:
                 logger.warning(
-                    f'{label}: cap hit on all accounts, sleeping '
-                    f'{_CAP_HIT_COOLDOWN_SECS}s then waiting for reset',
+                    f'{label}: cap hit on all accounts ({consecutive_cap_hits} consecutive), '
+                    f'sleeping {cooldown:.0f}s then waiting for reset',
                 )
-            await asyncio.sleep(_CAP_HIT_COOLDOWN_SECS)
+            await asyncio.sleep(cooldown)
             continue
 
         if usage_gate:

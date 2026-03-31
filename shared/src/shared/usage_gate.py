@@ -441,6 +441,11 @@ class UsageGate:
         return self._total_pause_secs
 
     @property
+    def account_count(self) -> int:
+        """Number of configured accounts."""
+        return len(self._accounts)
+
+    @property
     def active_account_name(self) -> str | None:
         """Name of the first non-capped account, or None."""
         for acct in self._accounts:

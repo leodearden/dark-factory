@@ -8,6 +8,7 @@ import pytest
 
 from shared.cli_invoke import (
     _CAP_HIT_COOLDOWN_SECS,
+    _MAX_CAP_COOLDOWN_SECS,
     AgentResult,
     _to_token_count,
     invoke_with_cap_retry,
@@ -49,6 +50,7 @@ class TestAccountNameThreading:
     async def test_account_name_set_from_usage_gate(self):
         """account_name is stamped from usage_gate.active_account_name on success."""
         gate = MagicMock()
+        gate.account_count = 2
         gate.before_invoke = AsyncMock(return_value='token-a')
         gate.detect_cap_hit = MagicMock(return_value=False)
         gate.active_account_name = 'acct-a'
@@ -68,6 +70,7 @@ class TestAccountNameThreading:
     async def test_account_name_none_coerced_to_empty(self):
         """When active_account_name is None, result.account_name is ''."""
         gate = MagicMock()
+        gate.account_count = 2
         gate.before_invoke = AsyncMock(return_value='token-a')
         gate.detect_cap_hit = MagicMock(return_value=False)
         gate.active_account_name = None
@@ -89,6 +92,7 @@ class TestAccountNameThreading:
         from unittest.mock import PropertyMock
 
         gate = MagicMock()
+        gate.account_count = 2
         gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
         gate.detect_cap_hit = MagicMock(side_effect=[True, False])
         # active_account_name is read 3 times:
@@ -137,6 +141,7 @@ class TestCapHitBackoff:
     async def test_sleeps_before_retry_on_cap_hit(self):
         """invoke_with_cap_retry sleeps _CAP_HIT_COOLDOWN_SECS on cap hit."""
         gate = MagicMock()
+        gate.account_count = 2
         gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
         gate.detect_cap_hit = MagicMock(side_effect=[True, False])
         gate.active_account_name = 'acct-b'
@@ -162,6 +167,7 @@ class TestCapHitBackoff:
     async def test_no_sleep_when_no_cap_hit(self):
         """No sleep when invocation succeeds on first try."""
         gate = MagicMock()
+        gate.account_count = 2
         gate.before_invoke = AsyncMock(return_value='token-a')
         gate.detect_cap_hit = MagicMock(return_value=False)
         gate.on_agent_complete = MagicMock()
@@ -182,9 +188,10 @@ class TestCapHitBackoff:
             mock_asyncio.sleep.assert_not_called()
             assert got.success is True
 
-    async def test_multiple_cap_hits_sleep_each_time(self):
-        """Each cap hit triggers a separate sleep."""
+    async def test_multiple_cap_hits_within_first_cycle_use_base_cooldown(self):
+        """Cap hits within the first cycle through accounts use base cooldown."""
         gate = MagicMock()
+        gate.account_count = 3  # 3 accounts → first 3 hits are cycle 0
         gate.before_invoke = AsyncMock(
             side_effect=['token-a', 'token-b', 'token-c'],
         )
@@ -208,3 +215,66 @@ class TestCapHitBackoff:
             assert mock_asyncio.sleep.call_count == 2
             for call in mock_asyncio.sleep.call_args_list:
                 assert call.args == (_CAP_HIT_COOLDOWN_SECS,)
+
+    async def test_backoff_escalates_after_full_account_cycle(self):
+        """Cooldown doubles after cycling through all accounts once."""
+        gate = MagicMock()
+        gate.account_count = 2  # 2 accounts → cycle boundary at hit 2
+        gate.before_invoke = AsyncMock(
+            side_effect=['token-a', 'token-b', 'token-a', 'token-b'],
+        )
+        # 3 cap hits then success: hits 1-2 are cycle 0 (5s), hit 3 is cycle 1 (10s)
+        gate.detect_cap_hit = MagicMock(side_effect=[True, True, True, False])
+        gate.active_account_name = 'next-acct'
+        gate.on_agent_complete = MagicMock()
+
+        result = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                return_value=result,
+            ),
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            await invoke_with_cap_retry(gate, 'test-label', prompt='hi')
+
+            assert mock_asyncio.sleep.call_count == 3
+            sleeps = [call.args[0] for call in mock_asyncio.sleep.call_args_list]
+            # Hits 1,2 → cycle 0 → 5s; hit 3 → cycle 1 → 10s
+            assert sleeps == [5.0, 5.0, 10.0]
+
+    async def test_backoff_caps_at_max(self):
+        """Cooldown never exceeds _MAX_CAP_COOLDOWN_SECS."""
+        gate = MagicMock()
+        gate.account_count = 1  # 1 account → every hit starts a new cycle
+        # Need enough hits to exceed max: 5 * 2^6 = 320 > 300
+        num_hits = 8
+        gate.before_invoke = AsyncMock(
+            side_effect=['token-a'] * (num_hits + 1),
+        )
+        gate.detect_cap_hit = MagicMock(
+            side_effect=[True] * num_hits + [False],
+        )
+        gate.active_account_name = 'acct-a'
+        gate.on_agent_complete = MagicMock()
+
+        result = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                return_value=result,
+            ),
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            await invoke_with_cap_retry(gate, 'test-label', prompt='hi')
+
+            sleeps = [call.args[0] for call in mock_asyncio.sleep.call_args_list]
+            assert all(s <= _MAX_CAP_COOLDOWN_SECS for s in sleeps)
+            # Last few should be capped at 300
+            assert sleeps[-1] == _MAX_CAP_COOLDOWN_SECS
