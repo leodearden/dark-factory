@@ -551,8 +551,8 @@ class TestPerformancePartialIntegration:
 
 _MG_TIMESERIES = {
     'labels': [f'{h:02d}:00' for h in range(24)],
-    'reads': [0] * 24,
-    'writes': [0] * 24,
+    'reads': [0] * 12 + [5] + [0] * 11,   # reads[12]=5 for noon data point
+    'writes': [0] * 12 + [3] + [0] * 11,  # writes[12]=3 for noon data point
 }
 _MG_OPERATIONS = {'labels': ['search', 'add_memory'], 'values': [100, 50]}
 _MG_AGENTS = {'labels': ['claude-interactive', 'recon-consolidator'], 'values': [80, 70]}
@@ -606,6 +606,10 @@ class TestMemoryGraphsPartialIntegration:
             assert '"add_memory"' in html
             assert '"claude-interactive"' in html
             assert '"recon-consolidator"' in html
+            # Verify non-zero timeseries values appear via {{ timeseries | tojson }},
+            # proving the reads/writes arrays are correctly embedded (not just all zeros).
+            assert ', 5, ' in html   # reads[12]=5 appears in JSON array
+            assert ', 3, ' in html   # writes[12]=3 appears in JSON array
 
     def test_memory_graphs_empty(self, client):
         with _patch_memory_graphs_integration(
