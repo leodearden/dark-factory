@@ -61,6 +61,7 @@ class AsyncSqliteBase(abc.ABC):
         self.db_path = db_path
         self.busy_timeout_ms = busy_timeout_ms
         self._conn: aiosqlite.Connection | None = None
+        # Serializes open() and close(); subclasses must not bypass for lifecycle mutations.
         self._lifecycle_lock = asyncio.Lock()
 
     @property

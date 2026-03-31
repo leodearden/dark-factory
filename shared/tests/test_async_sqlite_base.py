@@ -409,26 +409,32 @@ class TestAsyncSqliteBaseConcurrentClose:
     async def test_open_close_race_does_not_invalidate_connection(
         self, tmp_path: Path
     ) -> None:
-        """close() racing with open() must not close a freshly-opened connection.
+        """close() racing with open() must not corrupt internal state.
 
-        Scenario: store is open → close() acquires lock, closes conn, sets _conn=None,
-        releases lock → open() acquires lock, opens new conn. Without the lock on close(),
-        a late close() could clear _conn after open() sets it.
+        With the lifecycle lock, close() and open() are serialized even when
+        launched concurrently.  The final state must be consistent regardless
+        of which operation acquires the lock first.
         """
         store = _SimpleStore(tmp_path / 'store.db')
         await store.open()
 
-        # Close then immediately re-open — both serialized by _lifecycle_lock
-        await asyncio.gather(store.close(), return_exceptions=True)
-        await store.open()
+        # Launch close and open concurrently — the lock serializes them
+        results = await asyncio.gather(
+            store.close(), store.open(), return_exceptions=True
+        )
 
-        # Connection should be alive and usable
-        assert store._conn is not None
-        async with store._conn.execute('SELECT 1') as cur:
-            row = await cur.fetchone()
-        assert row is not None and row[0] == 1
+        errors = [r for r in results if isinstance(r, BaseException)]
 
-        await store.close()
+        if store._conn is not None:
+            # close() won the lock → open() succeeded after → store is open & usable
+            async with store._conn.execute('SELECT 1') as cur:
+                row = await cur.fetchone()
+            assert row is not None and row[0] == 1
+            await store.close()
+        else:
+            # open() won first → raised RuntimeError("already opened"), then close() ran
+            assert len(errors) == 1
+            assert isinstance(errors[0], RuntimeError)
 
     async def test_close_open_interleaving(self, tmp_path: Path) -> None:
         """Rapid close→open→close→open cycles must leave the store in a consistent state.
@@ -499,5 +505,10 @@ class TestAsyncSqliteBaseCloseExceptionSafety:
         # After the failed close, open() must succeed — not raise RuntimeError
         await store.open()
         assert store._conn is not None
+
+        # Verify the new connection is actually functional
+        async with store._conn.execute('SELECT 1') as cur:
+            row = await cur.fetchone()
+        assert row is not None and row[0] == 1
 
         await store.close()
