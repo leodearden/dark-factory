@@ -77,7 +77,9 @@ class TestBeforeInvokeRaceCondition:
         After the fix, _last_account_name is set to acct.name BEFORE
         _fire_cost_event is called.
         """
-        gate = make_gate(['acct-A', 'acct-B'])
+        # cost_store must be set so the `if self._cost_store:` guard in before_invoke
+        # allows _fire_cost_event to be called (task-355 step-8 guard).
+        gate = make_gate(['acct-A', 'acct-B'], cost_store=make_mock_cost_store())
 
         # Simulate acct-A already used, now capped
         gate._accounts[0].capped = True
@@ -110,7 +112,8 @@ class TestBeforeInvokeRaceCondition:
         blocks the critical-path return of the OAuth token.  After the fix it
         must call `self._fire_cost_event(...)` (non-blocking) instead.
         """
-        gate = make_gate(['acct-A', 'acct-B'])
+        # cost_store must be set so the `if self._cost_store:` guard allows the event.
+        gate = make_gate(['acct-A', 'acct-B'], cost_store=make_mock_cost_store())
 
         gate._accounts[0].capped = True
         gate._last_account_name = 'acct-A'
@@ -274,6 +277,49 @@ class TestFireCostEventRuntimeErrorHandling:
 
 
 # ---------------------------------------------------------------------------
+# task-355 step-1: coroutine leak — production code must close the coro when
+#                  loop.create_task raises RuntimeError.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFireCostEventCoroutineLeak:
+    """task-355 step-1: _fire_cost_event must close coroutine when create_task raises."""
+
+    async def test_coroutine_closed_on_create_task_failure(self):
+        """Production code must close the coroutine when loop.create_task raises RuntimeError.
+
+        Unlike test_create_task_error_is_non_fatal (which has the mock close the
+        coro before raising), this mock does NOT close the coro.  The test then
+        checks that production code has closed it by asserting coro.cr_frame is
+        None — a coroutine's frame pointer is set to None only after .close() or
+        after the coroutine runs to completion.
+        """
+        gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
+
+        mock_loop = MagicMock()
+        captured_coro: list = []
+
+        def raising_create_task(coro, **kwargs):
+            # Do NOT close the coro here — let production code do it.
+            captured_coro.append(coro)
+            raise RuntimeError('event loop is closed')
+
+        mock_loop.create_task.side_effect = raising_create_task
+
+        with patch('shared.usage_gate.asyncio.get_running_loop', return_value=mock_loop):
+            gate._fire_cost_event('acct-A', 'cap_hit', '{}')
+
+        assert len(captured_coro) == 1, 'create_task should have been called once'
+        coro = captured_coro[0]
+        # Production code must have called coro.close(); after close(), cr_frame is None.
+        assert coro.cr_frame is None, (
+            'coro.cr_frame is not None — production code did not call coro.close() '
+            'when loop.create_task raised RuntimeError (coroutine leak)'
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-7: json.dumps guard in _handle_cap_detected when cost_store is None.
 # ---------------------------------------------------------------------------
 
@@ -336,3 +382,128 @@ class TestAccountResumeProbLoopJsonDumpsGuard:
             await gate._account_resume_probe_loop(acct)
 
         mock_write.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# task-355 step-3 & step-4: shutdown() must drain _background_tasks.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestShutdownBackgroundTasks:
+    """task-355 steps 3+4: shutdown() must cancel and await in-flight background tasks."""
+
+    async def test_shutdown_cancels_and_awaits_background_tasks(self):
+        """shutdown() must cancel in-flight cost-event tasks and drain _background_tasks.
+
+        Currently shutdown() only cancels per-account resume probe tasks and
+        ignores _background_tasks.  In-flight tasks remain pending after shutdown,
+        producing 'Task was destroyed but it is pending' warnings.
+
+        After the fix, shutdown() iterates _background_tasks, cancels each, and
+        awaits them (suppressing CancelledError), leaving _background_tasks empty.
+        """
+        gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
+
+        # Make the cost-store block so tasks stay in-flight when shutdown() is called.
+        block_event = asyncio.Event()
+
+        async def blocking_save(*args, **kwargs):
+            await block_event.wait()
+
+        gate._cost_store.save_account_event.side_effect = blocking_save
+
+        # Fire two events — creates two tasks in _background_tasks.
+        gate._fire_cost_event('acct-A', 'cap_hit', '{}')
+        gate._fire_cost_event('acct-A', 'cap_hit', '{}')
+
+        # Yield to the event loop so the tasks start running and block on blocking_save.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert len(gate._background_tasks) == 2, (
+            f'Expected 2 in-flight tasks, got {len(gate._background_tasks)}'
+        )
+
+        # shutdown() must cancel and drain the in-flight tasks.
+        await gate.shutdown()
+
+        assert len(gate._background_tasks) == 0, (
+            f'Expected empty _background_tasks after shutdown(), '
+            f'got {len(gate._background_tasks)} remaining — '
+            'shutdown() is not draining _background_tasks'
+        )
+
+    async def test_shutdown_with_empty_background_tasks(self):
+        """shutdown() must succeed without error when _background_tasks is empty.
+
+        Regression guard: the new draining loop must handle the empty-set case
+        gracefully (iterating over an empty set is a no-op).
+        """
+        gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
+
+        # No events fired → set is empty.
+        assert len(gate._background_tasks) == 0
+
+        # Must not raise.
+        await gate.shutdown()
+
+        assert len(gate._background_tasks) == 0
+
+
+# ---------------------------------------------------------------------------
+# task-355 step-6 & step-7: before_invoke() must guard the failover event
+#                            with `if self._cost_store:`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBeforeInvokeGuardConsistency:
+    """task-355 steps 6+7: failover event in before_invoke() must respect cost_store guard."""
+
+    async def test_before_invoke_failover_no_json_dumps_without_cost_store(self):
+        """json.dumps and _fire_cost_event must NOT be called when cost_store=None.
+
+        Currently lines 187-191 call json.dumps({'from': ..., 'to': ...}) as an
+        argument to _fire_cost_event unconditionally, even when cost_store=None.
+        _fire_cost_event would early-return, but json.dumps is still evaluated.
+
+        After the fix, the entire block is wrapped in `if self._cost_store:`,
+        matching the pattern in _handle_cap_detected and _account_resume_probe_loop.
+        """
+        gate = make_gate(['acct-A', 'acct-B'], cost_store=None)
+
+        # Simulate acct-A already used, now capped — triggers failover to acct-B.
+        gate._accounts[0].capped = True
+        gate._last_account_name = 'acct-A'
+
+        with (
+            patch('shared.usage_gate.json.dumps') as mock_dumps,
+            patch.object(gate, '_fire_cost_event') as mock_fire,
+        ):
+            token = await gate.before_invoke()
+
+        assert token == 'fake-token-acct-B'
+        mock_dumps.assert_not_called()
+        mock_fire.assert_not_called()
+
+    async def test_before_invoke_failover_fires_event_with_cost_store(self):
+        """_fire_cost_event MUST be called during failover when cost_store is set.
+
+        Positive control for the guard: when cost_store is not None, the failover
+        event must still fire.
+        """
+        gate = make_gate(['acct-A', 'acct-B'], cost_store=make_mock_cost_store())
+
+        # Simulate acct-A already used, now capped — triggers failover to acct-B.
+        gate._accounts[0].capped = True
+        gate._last_account_name = 'acct-A'
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            token = await gate.before_invoke()
+
+        assert token == 'fake-token-acct-B'
+        mock_fire.assert_called_once()
+        call_args = mock_fire.call_args
+        assert call_args[0][0] == 'acct-B'   # account_name
+        assert call_args[0][1] == 'failover'  # event_type
