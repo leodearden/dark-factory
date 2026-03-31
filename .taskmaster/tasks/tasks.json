@@ -6434,7 +6434,7 @@
         "description": "Fix 8 weak/misleading assertions in dashboard/tests/test_costs_page.py:\n1. test_default_window_7d_marked_active: assert Alpine store contains '7d' default (not just string '7d' anywhere)\n2. test_summary_shows_fallback_content_on_error: assert specific fallback text, not `'<' in html`\n3. test_hx_vals_count: assert Alpine.store pattern count == 7 (currently only asserts old pattern == 0)\n4. test_sections_use_morph_swap: assert morph:innerHTML count == 7 (currently asserts presence once)\n5. test_renders_total_spend: assert computed value '$17.34' not just '$'\n6. test_handles_null_task_id: add content assertions beyond status_code\n7. TestCostsByAccountPartial: add assertions for spend values from mock data\n8. test_role_names_appear_in_output: assert all mock roles, not just 'implementer'\n\nFiles: dashboard/tests/test_costs_page.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -6445,7 +6445,8 @@
           "modules": [
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-31T14:09:55.092Z"
       },
       {
         "id": "343",
@@ -6521,7 +6522,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T14:09:54.986Z",
+      "lastModified": "2026-03-31T14:09:55.092Z",
       "taskCount": 325,
       "completedCount": 281,
       "tags": [
