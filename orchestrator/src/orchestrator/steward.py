@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
     from orchestrator.mcp_lifecycle import McpLifecycle
     from orchestrator.usage_gate import UsageGate
+    from shared.cost_store import CostStore
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,9 @@ class TaskSteward:
         escalation_queue: EscalationQueue,
         briefing: BriefingAssembler,
         usage_gate: UsageGate | None = None,
+        cost_store: CostStore | None = None,
+        run_id: str = '',
+        project_id: str = '',
     ):
         self.task_id = task_id
         self.task = task
@@ -71,6 +75,11 @@ class TaskSteward:
         self.escalation_queue = escalation_queue
         self.briefing = briefing
         self.usage_gate = usage_gate
+
+        # Cost tracking — optional; when None, cost recording is silently skipped
+        self._cost_store = cost_store
+        self._run_id = run_id
+        self._project_id = project_id
 
         self._session_id: str | None = None
         self._stopped = False

@@ -613,3 +613,57 @@ class TestNextEscalation:
             assert '--level' in cmd
             level_idx = cmd.index('--level')
             assert cmd[level_idx + 1] == '0'
+
+
+# ---------------------------------------------------------------------------
+# Tests: CostStore constructor params
+# ---------------------------------------------------------------------------
+
+
+class TestStewardCostStoreConstructor:
+    """TaskSteward accepts cost_store, run_id, and project_id as optional params."""
+
+    def test_defaults_to_none_when_not_provided(
+        self, worktree, mock_config, mock_queue, mock_mcp, mock_briefing
+    ):
+        """cost_store, run_id, project_id are None/'' by default."""
+        s = TaskSteward(
+            task_id='42',
+            task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
+            worktree=worktree,
+            config=mock_config,
+            mcp=mock_mcp,
+            escalation_queue=mock_queue,
+            briefing=mock_briefing,
+        )
+        assert s._cost_store is None
+        assert s._run_id == ''
+        assert s._project_id == ''
+
+    def test_stores_cost_store_as_attribute(
+        self, worktree, mock_config, mock_queue, mock_mcp, mock_briefing
+    ):
+        """When cost_store is provided it is accessible as self._cost_store."""
+        from unittest.mock import MagicMock
+        mock_cost_store = MagicMock()
+        s = TaskSteward(
+            task_id='42',
+            task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
+            worktree=worktree,
+            config=mock_config,
+            mcp=mock_mcp,
+            escalation_queue=mock_queue,
+            briefing=mock_briefing,
+            cost_store=mock_cost_store,
+            run_id='run-steward12345',
+            project_id='dark_factory',
+        )
+        assert s._cost_store is mock_cost_store
+        assert s._run_id == 'run-steward12345'
+        assert s._project_id == 'dark_factory'
+
+    def test_existing_steward_fixture_still_works(self, steward):
+        """steward fixture (no cost_store args) still constructs correctly."""
+        assert steward._cost_store is None
+        assert steward._run_id == ''
+        assert steward._project_id == ''
