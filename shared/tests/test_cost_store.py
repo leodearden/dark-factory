@@ -560,6 +560,43 @@ class TestPersistAcrossReopen:
         assert row[1] == 'task-1'
         assert abs(row[2] - 0.05) < 1e-9
 
+    async def test_account_event_persists_across_reopen(self, tmp_path: Path):
+        """save_account_event() -> close() -> reopen() -> SELECT verifies row exists."""
+        db_path = tmp_path / 'costs.db'
+
+        # First session: write a row
+        store = CostStore(db_path)
+        await store.open()
+        await store.save_account_event(
+            account_name='max-d',
+            event_type='cap_hit',
+            project_id='dark_factory',
+            run_id='run-persist',
+            details='{"reset_at": "2024-01-01T05:00:00"}',
+            created_at='2024-06-01T10:00:00',
+        )
+        await store.close()
+
+        # Second session: reopen and verify row is still there
+        store2 = CostStore(db_path)
+        await store2.open()
+        try:
+            async with store2._conn.execute(
+                'SELECT account_name, event_type, project_id, run_id, details, created_at'
+                ' FROM account_events'
+            ) as cur:
+                row = await cur.fetchone()
+        finally:
+            await store2.close()
+
+        assert row is not None, 'Row must survive close/reopen cycle'
+        assert row[0] == 'max-d'
+        assert row[1] == 'cap_hit'
+        assert row[2] == 'dark_factory'
+        assert row[3] == 'run-persist'
+        assert row[4] == '{"reset_at": "2024-01-01T05:00:00"}'
+        assert row[5] == '2024-06-01T10:00:00'
+
 
 # ---------------------------------------------------------------------------
 # step-13: CostStore subclasses AsyncSqliteBase
