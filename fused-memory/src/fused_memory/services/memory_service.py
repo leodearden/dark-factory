@@ -864,6 +864,13 @@ class MemoryService:
             fact = getattr(edge, 'fact', str(edge))
             valid_at = getattr(edge, 'valid_at', None)
             invalid_at = getattr(edge, 'invalid_at', None)
+
+            # Skip superseded edges (invalid_at set means the fact has been
+            # replaced by a newer edge).  Check this before anything else to
+            # avoid unnecessary work on edges that will be discarded.
+            if invalid_at is not None:
+                continue
+
             temporal = _serialize_temporal(valid_at, invalid_at)
 
             # Extract entity names from source/target nodes
