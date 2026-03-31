@@ -175,12 +175,14 @@ class TestCostsPage:
 _MOCK_SUMMARY = {
     'dark_factory': {
         'total_spend': 12.34,
+        'task_count': 22,
         'avg_cost_per_task': 0.56,
         'active_accounts': 3,
         'cap_events': 2,
     },
     'other_project': {
         'total_spend': 5.00,
+        'task_count': 20,
         'avg_cost_per_task': 0.25,
         'active_accounts': 1,
         'cap_events': 0,
