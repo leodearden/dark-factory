@@ -207,20 +207,22 @@ class TargetedReconciler:
                     causation_id=run_id,
                     include_planned=True,
                 )
-                promoted: list[str] = []
-                for r in planned_related:
-                    if r.metadata.get('planned'):
-                        for ep_uuid in r.provenance:
-                            await self.planned_episode_registry.promote(ep_uuid)
-                            promoted.append(ep_uuid)
-                if promoted:
+                ep_uuids = {
+                    ep
+                    for r in planned_related
+                    if r.metadata.get('planned')
+                    for ep in r.provenance
+                }
+                for ep_uuid in ep_uuids:
+                    await self.planned_episode_registry.promote(ep_uuid)
+                if ep_uuids:
                     result['actions'].append({
                         'type': 'planned_episodes_promoted',
-                        'count': len(promoted),
+                        'count': len(ep_uuids),
                     })
                     await self.journal.add_run_action(
                         run_id, 'write', 'registry', 'promote',
-                        {'task_id': task_id, 'promoted_count': len(promoted)},
+                        {'task_id': task_id, 'promoted_count': len(ep_uuids)},
                         causation_id=run_id,
                     )
             except Exception as e:
