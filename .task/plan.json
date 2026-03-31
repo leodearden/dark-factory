@@ -183,6 +183,20 @@
       "description": "Ensure all partial route handlers wrap data function calls with try/except or use _safe_gather_result pattern, returning sensible defaults ({} or []) on failure. Templates handle empty data with 'No data available' messages.",
       "status": "done",
       "commit": "51e63fe6"
+    },
+    {
+      "id": "step-23",
+      "type": "test",
+      "description": "Write failing tests verifying Alpine v3 store pattern in costs.html. Tests: (1) GET /costs response HTML contains Alpine.store('costs' registration script (not __x.$data), (2) all 7 hx-vals attributes use Alpine.store(\"costs\").window instead of __x.$data.currentWindow, (3) response does NOT contain '__x.$data' or '__x &&' anywhere, (4) window selector button @click handlers write to Alpine.store('costs').window, (5) button :class bindings read from $store.costs.window. These are template-level assertions on the rendered HTML string from GET /costs.",
+      "status": "done",
+      "commit": "9b38b7ec"
+    },
+    {
+      "id": "step-24",
+      "type": "impl",
+      "description": "Fix Alpine v2 API usage in costs.html to use Alpine v3 store pattern. Changes: (1) Add <script> block before the content div that registers Alpine.store('costs', { window: '{{ window | default(\"7d\") }}' }) via alpine:init event listener \u2014 mirrors the existing Alpine.store('panels', {}) pattern in base.html. (2) Simplify the #costs-window-selector div: remove x-data=\"{ currentWindow: ... }\" since state now lives in the global store. (3) Update button @click to: Alpine.store('costs').window = '{{ win }}'; plus the existing htmx.trigger dispatch. (4) Update button :class binding from currentWindow === '{{ win }}' to $store.costs.window === '{{ win }}'. (5) Replace all 7 hx-vals attributes from the broken __x.$data.currentWindow expression to hx-vals='js:{window: Alpine.store(\"costs\").window}'. This fixes the silent functional failure where window selection had no effect on HTMX requests.",
+      "status": "done",
+      "commit": "2dd574d5"
     }
   ],
   "design_decisions": [
@@ -213,6 +227,10 @@
     {
       "decision": "Poll intervals: summary 30s, by-project 60s, by-account 60s, by-role 60s, trend 60s, events 30s, runs 60s",
       "rationale": "Per task specification: summary and events at 30s (more dynamic data), all chart and table sections at 60s (less volatile, more expensive to render). Matches the dashboard's existing tiered polling pattern."
+    },
+    {
+      "decision": "Use Alpine.store('costs') global store instead of component-local x-data for window state (fix for Alpine v3 compatibility)",
+      "rationale": "The original implementation used element.__x.$data.currentWindow in hx-vals expressions to read the window selector's Alpine component state. This is Alpine v2's private internal API; Alpine v3.15.8 (used in this project) removed __x entirely. The && null-guard caused silent fallback to '7d' on every request, making the window selector non-functional. The fix uses Alpine.store('costs', {window: '7d'}) \u2014 the canonical Alpine v3 cross-component state sharing mechanism. This is consistent with the existing Alpine.store('panels', {}) pattern in base.html. The store is registered via an alpine:init listener in costs.html (page-specific, not polluting base.html). hx-vals expressions read Alpine.store('costs').window directly, which is a stable public API."
     }
   ],
   "reuse": [
@@ -270,8 +288,13 @@
       "what": "DbPool and with_db database access pattern",
       "where": "dashboard/src/dashboard/data/db.py",
       "how": "Partial route handlers access the runs.db via request.app.state.db pool, same as performance partial. The costs.py functions internally use with_db for null-safe database access."
+    },
+    {
+      "what": "Alpine.store('panels', {}) pattern in base.html",
+      "where": "dashboard/src/dashboard/templates/base.html line 21-23",
+      "how": "The existing alpine:init listener in base.html registers a 'panels' store. The costs page follows the same pattern \u2014 registering Alpine.store('costs', {window: '7d'}) via its own alpine:init listener in costs.html. This is the canonical Alpine v3 cross-component state sharing mechanism."
     }
   ],
   "_session_id": "302-4c783f6c",
-  "_created_at": "2026-03-31T03:27:25.069075+00:00"
+  "_created_at": "2026-03-31T08:26:56.345549+00:00"
 }
