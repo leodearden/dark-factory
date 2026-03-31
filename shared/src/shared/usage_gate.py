@@ -336,10 +336,16 @@ class UsageGate:
                 'No running event loop for cost event %s/%s', event_type, account_name
             )
             return
-        task = loop.create_task(
-            self._write_cost_event(account_name, event_type, details),
-            name=f'cost-event-{event_type}-{account_name}',
-        )
+        try:
+            task = loop.create_task(
+                self._write_cost_event(account_name, event_type, details),
+                name=f'cost-event-{event_type}-{account_name}',
+            )
+        except RuntimeError as exc:
+            logger.warning(
+                'Failed to schedule cost event %s/%s: %s', event_type, account_name, exc
+            )
+            return
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
