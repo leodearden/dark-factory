@@ -5950,13 +5950,13 @@
         "description": "Three targeted fixes in dashboard/src/dashboard/data/costs.py identified during review of task 298:\n\n1. **Clock skew race in get_cost_trend** (lines 245-246): `_cutoff(days)` and `datetime.now(UTC)` are called separately. If they straddle a UTC midnight boundary, `since` covers an earlier day than `all_days`, silently dropping a day's spending or showing a zero-day. Fix: capture `now = datetime.now(UTC)` once at the top and derive `since` from it.\n\n2. **Silent omission of cap-only accounts in get_cost_by_account** (lines 155-190): Result dict is built by iterating `inv_rows` (accounts with invocations). An account that has cap_hit events but zero completed invocations in the window is present in `caps` but never emitted in `result`. Fix: after the inv_rows loop, add a second pass over `caps.keys()` to emit accounts absent from result with spend=0.0, invocations=0.\n\n3. **Missing completed_at index on invocations table**: Every query in costs.py filters `WHERE completed_at >= ?` but there is no index on this column. Add `CREATE INDEX IF NOT EXISTS idx_inv_completed_at ON invocations(completed_at);` to the CostStore schema (and test schema constant in test_costs_data.py).\n\nmemory_hints: search \"clock skew race costs.py\", search \"CostStore schema invocations table\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "298"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-31T13:54:34.803Z",
+        "updatedAt": "2026-03-31T14:21:26.468Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data",
@@ -6610,7 +6610,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T14:21:26.188Z",
+      "lastModified": "2026-03-31T14:21:26.468Z",
       "taskCount": 333,
       "completedCount": 283,
       "tags": [
