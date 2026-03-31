@@ -31,7 +31,7 @@
       "id": "step-2",
       "type": "impl",
       "description": "Verify step-1 passes: the costs.html template renders `Alpine.store('costs', { window: \"7d\" })` when no ?window= param is provided",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
