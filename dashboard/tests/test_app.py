@@ -548,6 +548,38 @@ class TestPerformancePartialIntegration:
                 assert 'one-pass' in html
                 assert 'Steward' in html
 
+    def test_performance_escalations_no_interactive_count(self, client):
+        """Escalations with interactive_count=0 should render Steward rates
+        but NOT the 'Human attention' section (tests {% if esc.interactive_count > 0 %} path)."""
+        esc_no_interactive = {
+            'dark_factory': {
+                'total_tasks': 20,
+                'steward_count': 3,
+                'interactive_count': 0,
+                'steward_rate': 15.0,
+                'interactive_rate': 0.0,
+                'human_attention': {'zero': 0, 'minimal': 0, 'significant': 0},
+            },
+        }
+        with _patch_perf_integration(escalations=esc_no_interactive):
+            resp = client.get('/partials/performance')
+            assert resp.status_code == 200
+            html = resp.text
+            assert 'Steward' in html
+            assert '15.0' in html          # steward_rate appears in the Escalation Rates section
+            assert 'Human attention' not in html  # interactive_count=0 hides this block
+
+    def test_performance_escalations_empty_for_project(self, client):
+        """When escalations dict has no entry for a project that has paths data,
+        the template should render 'No data' in the Escalation Rates section
+        (tests the {% else %} branch of {% if escalations.get(project_id) %})."""
+        with _patch_perf_integration(escalations={}):
+            resp = client.get('/partials/performance')
+            assert resp.status_code == 200
+            html = resp.text
+            assert 'No data' in html       # else branch renders "No data" placeholder
+            assert 'one-pass' in html      # paths data still renders normally
+
 
 _MG_TIMESERIES = {
     'labels': [f'{h:02d}:00' for h in range(24)],
