@@ -281,6 +281,14 @@ class TestAsyncSqliteBaseContextManager:
                 raise ValueError('boom')
         assert store._conn is None
 
+    def test_aenter_return_annotation_is_self(self) -> None:
+        """__aenter__ must be annotated with typing.Self so subclass context managers
+        preserve the concrete type for static type checkers."""
+        import typing
+
+        hints = typing.get_type_hints(AsyncSqliteBase.__aenter__)
+        assert hints['return'] is typing.Self
+
 
 # ---------------------------------------------------------------------------
 # Step-11: AsyncSqliteBase._require_conn()
