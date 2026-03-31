@@ -6582,11 +6582,18 @@
         "description": "All core PlannedEpisodeRegistry methods (register, is_planned, get_planned_uuids, promote, are_all_planned) use `assert self._db is not None` to guard against use before initialization. Python's -O flag silently disables assert statements, turning these into no-ops that produce cryptic AttributeError on None.\n\nAdditionally, in MemoryService.initialize(), if PlannedEpisodeRegistry.initialize() raises (e.g., disk full), self.planned_episode_registry is left pointing to a broken instance (_db=None). Retry calls skip re-creation because the guard sees non-None.\n\nFixes:\n1. Replace each `assert self._db is not None` with `if self._db is None: raise RuntimeError('PlannedEpisodeRegistry not initialized')`\n2. In MemoryService.initialize(), wrap registry creation in try/except and reset to None on failure: `try: ...; except Exception: self.planned_episode_registry = None; raise`\n\nmemory_hints: search for \"PlannedEpisodeRegistry\" and \"assert guard robustness\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-31T15:22:13.520Z"
+        "updatedAt": "2026-03-31T15:24:26.646Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/services",
+            "fused-memory/tests/test_memory_service.py",
+            "fused-memory/tests/test_planned_episode_registry.py"
+          ]
+        }
       },
       {
         "id": "352",
@@ -6831,7 +6838,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T15:22:17.218Z",
+      "lastModified": "2026-03-31T15:24:26.646Z",
       "taskCount": 351,
       "completedCount": 292,
       "tags": [
