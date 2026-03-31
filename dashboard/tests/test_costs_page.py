@@ -1037,3 +1037,44 @@ class TestCssIdFilter:
         """css_id must be registered as a Jinja2 filter on the templates env."""
         from dashboard.app import templates
         assert 'css_id' in templates.env.filters
+
+
+# ---------------------------------------------------------------------------
+# Task-343 step-7: by_role canvas IDs derived from project key
+# ---------------------------------------------------------------------------
+
+_MOCK_BY_ROLE_TWO_PROJECTS = {
+    'dark_factory': {
+        'implementer': {'claude-sonnet': 5.20, 'claude-opus': 1.50},
+        'reviewer': {'claude-opus': 3.10},
+    },
+    'other_project': {
+        'implementer': {'claude-haiku': 0.80},
+    },
+}
+
+
+class TestByRoleCanvasIds:
+    """by_role partial must derive canvas IDs from project key strings, not positional index."""
+
+    def test_by_role_canvas_ids_use_project_key(self, client):
+        """Canvas IDs must be derived from project key: costByRoleChart_dark_factory etc."""
+        with patch(
+            'dashboard.app.get_cost_by_role',
+            new_callable=AsyncMock,
+            return_value=_MOCK_BY_ROLE_TWO_PROJECTS,
+        ):
+            html = client.get('/costs/partials/by-role').text
+        assert 'costByRoleChart_dark_factory' in html
+        assert 'costByRoleChart_other_project' in html
+
+    def test_by_role_canvas_ids_no_positional_index(self, client):
+        """Canvas IDs must NOT use positional index (costByRoleChart_1 etc.)."""
+        with patch(
+            'dashboard.app.get_cost_by_role',
+            new_callable=AsyncMock,
+            return_value=_MOCK_BY_ROLE_TWO_PROJECTS,
+        ):
+            html = client.get('/costs/partials/by-role').text
+        assert 'costByRoleChart_1' not in html
+        assert 'costByRoleChart_2' not in html
