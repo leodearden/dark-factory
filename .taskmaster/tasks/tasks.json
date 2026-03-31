@@ -6137,7 +6137,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "shared/tests/test_async_sqlite_base.py"
+          ],
+          "modules": [
+            "shared/tests"
+          ]
+        }
       },
       {
         "id": 328,
@@ -6148,7 +6156,18 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_costs_panel.py",
+            "dashboard/tests/test_costs_page.py",
+            "dashboard/tests/costs_fixtures.py",
+            "dashboard/tests/conftest.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 329,
@@ -6159,7 +6178,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_costs_panel.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 330,
