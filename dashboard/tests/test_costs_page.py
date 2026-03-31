@@ -322,6 +322,78 @@ class TestCostsByProjectPartial:
 
 
 # ---------------------------------------------------------------------------
+# Step-11: GET /costs/partials/by-role route tests
+# ---------------------------------------------------------------------------
+
+_MOCK_BY_ROLE = {
+    'dark_factory': {
+        'implementer': {'claude-sonnet': 5.20, 'claude-opus': 1.50},
+        'reviewer': {'claude-opus': 3.10},
+    },
+    'other_project': {
+        'implementer': {'claude-haiku': 0.80},
+    },
+}
+
+
+def _patch_by_role(return_value=_MOCK_BY_ROLE):
+    return patch(
+        'dashboard.app.get_cost_by_role',
+        new_callable=AsyncMock,
+        return_value=return_value,
+    )
+
+
+class TestCostsByRolePartial:
+    """Tests for GET /costs/partials/by-role."""
+
+    def test_returns_200(self, client):
+        with _patch_by_role():
+            resp = client.get('/costs/partials/by-role')
+        assert resp.status_code == 200
+
+    def test_content_type_html(self, client):
+        with _patch_by_role():
+            resp = client.get('/costs/partials/by-role')
+        assert 'text/html' in resp.headers['content-type']
+
+    def test_renders_chart_canvas(self, client):
+        """By-role partial must contain a Chart.js canvas element."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert 'canvas' in html.lower()
+
+    def test_renders_chart_js_config(self, client):
+        """Chart.js dataset config must appear in the rendered script."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert 'new Chart' in html
+
+    def test_uses_color_palette(self, client):
+        """Must use the standard 10-color palette."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert '#60a5fa' in html  # first color from palette
+
+    def test_role_names_appear_in_output(self, client):
+        """Role names from the data should appear in the rendered HTML."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert 'implementer' in html
+
+    def test_handles_empty_data(self, client):
+        with _patch_by_role(return_value={}):
+            resp = client.get('/costs/partials/by-role')
+        assert resp.status_code == 200
+
+    def test_respects_window_param(self, client):
+        with _patch_by_role() as mock_fn:
+            client.get('/costs/partials/by-role?window=30d')
+        _, kwargs = mock_fn.call_args
+        assert kwargs.get('days') == 30
+
+
+# ---------------------------------------------------------------------------
 # Step-9: GET /costs/partials/by-account route tests
 # ---------------------------------------------------------------------------
 
