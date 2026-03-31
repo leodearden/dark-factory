@@ -1,0 +1,161 @@
+{
+  "task_id": "343",
+  "title": "Add hx-sync and fix canvas ID coupling in cost templates",
+  "files": [
+    "dashboard/src/dashboard/templates/costs.html",
+    "dashboard/src/dashboard/templates/partials/costs/by_role.html",
+    "dashboard/src/dashboard/app.py",
+    "dashboard/tests/test_costs_page.py",
+    "dashboard/tests/test_costs_panel.py"
+  ],
+  "modules": [
+    "dashboard/src/dashboard/templates",
+    "dashboard/src/dashboard",
+    "dashboard/tests"
+  ],
+  "analysis": "Two independent template bugs in the costs dashboard:\n\n1. **hx-sync missing on cost sections**: costs.html has 7 `<section data-cost-section>` elements, each with `hx-trigger=\"load, every Ns, costs-window-changed\"`. When the user clicks a window selector button, the @click handler fires `costs-window-changed` on all 7 sections simultaneously, producing 7 parallel HTMX requests. If the user clicks a different window before all complete, a second wave of 7 requests fires. Without `hx-sync`, the old in-flight requests aren't aborted, and their stale responses can arrive after the new ones, causing out-of-order DOM updates with stale data. Fix: add `hx-sync=\"this:abort\"` to each section so that when a new request starts, any previous in-flight request on that same element is aborted.\n\n2. **Canvas ID positional coupling in by_role.html**: The template uses `loop.index` (Jinja2 1-based) to generate canvas IDs: `costByRoleChart_1`, `costByRoleChart_2`, etc. The JS uses `Object.keys(byRole).forEach(fn, projIdx)` with `projIdx + 1` to reconstruct the same IDs. This works only because Python dict order == JSON key order == JS Object.keys() order. This is a fragile implicit contract. Fix: derive canvas IDs from the project key string itself (e.g., `costByRoleChart_dark_factory`) so both template and JS produce the same ID from the same key, eliminating positional coupling. A `css_id` Jinja2 filter (and matching JS function) sanitizes the key to be safe for HTML IDs.\n\nExisting test infrastructure uses Starlette TestClient with mock patching of async data functions. Tests check rendered HTML for specific strings, attribute values, and counts. The `test_costs_page.py` and `test_costs_panel.py` files both test cost templates from different angles (unit vs deep integration).",
+  "prerequisites": [
+    {
+      "id": "pre-1",
+      "description": "Add `css_id` Jinja2 filter to app.py: replaces non-alphanumeric/underscore characters with underscores, collapses runs, strips leading/trailing underscores. Register it alongside the existing `project_name` filter. This is needed before by_role template changes.",
+      "status": "done",
+      "commit": "2ad929e3",
+      "tests": [
+        "step-5",
+        "step-6"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write failing test in test_costs_page.py: `test_all_sections_have_hx_sync` \u2014 assert that the rendered /costs page contains `hx-sync` on all 7 `data-cost-section` elements. Use `html.count('hx-sync=')` to verify exactly 7 occurrences. Also add `test_hx_sync_uses_abort_strategy` to verify the abort strategy string is present.",
+      "status": "done",
+      "commit": "1d7a0469"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Add `hx-sync=\"this:abort\"` attribute to all 7 `<section data-cost-section>` elements in costs.html (summary, by-project, by-account, by-role, trend, events, runs). Place the attribute after `hx-trigger` for consistency.",
+      "status": "done",
+      "commit": "e1469c28"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write failing test in test_costs_page.py: `test_hx_sync_on_each_section` \u2014 parse the HTML and verify each individual section (by data-cost-section value) has hx-sync. This ensures no section is accidentally missed.",
+      "status": "done",
+      "commit": "5e507279"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Verify step-2 implementation passes step-3 tests (both hx-sync tests should pass together).",
+      "status": "done",
+      "commit": "5e507279"
+    },
+    {
+      "id": "step-5",
+      "type": "test",
+      "description": "Write failing tests for the `css_id` Jinja2 filter in test_costs_page.py: `TestCssIdFilter` class with cases \u2014 simple string ('dark_factory' \u2192 'dark_factory'), path string ('/home/leo/src/dark-factory' \u2192 'home_leo_src_dark_factory'), empty/None \u2192 'unknown', already-clean string passes through unchanged, special characters replaced.",
+      "status": "done",
+      "commit": "58cdf1ed"
+    },
+    {
+      "id": "step-6",
+      "type": "impl",
+      "description": "Implement `css_id` filter in app.py: `def css_id(value: str | None) -> str` using `re.sub(r'[^a-zA-Z0-9_]', '_', value or '')` then collapse multiple underscores, strip leading/trailing underscores, fallback to 'unknown'. Register as `templates.env.filters['css_id'] = css_id`.",
+      "status": "done",
+      "commit": "2ad929e3"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write failing test in test_costs_page.py: `test_by_role_canvas_ids_use_project_key` \u2014 render the by-role partial with mock data containing two projects ('dark_factory' and 'other_project'), assert canvas IDs `costByRoleChart_dark_factory` and `costByRoleChart_other_project` appear in the HTML, and assert `costByRoleChart_1` and `costByRoleChart_2` do NOT appear.",
+      "status": "done",
+      "commit": "ad9b8f33"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Update by_role.html template: change `<canvas id=\"costByRoleChart_{{ loop.index }}\">` to `<canvas id=\"costByRoleChart_{{ project_id | css_id }}\">`. This derives the canvas ID from the project key string instead of positional loop index.",
+      "status": "done",
+      "commit": "86ecf2c8"
+    },
+    {
+      "id": "step-9",
+      "type": "test",
+      "description": "Write failing test in test_costs_page.py: `test_by_role_js_uses_project_key_not_index` \u2014 assert the rendered by-role partial JS does NOT contain `projIdx + 1` (the old positional pattern) and DOES contain a project-key-based ID construction pattern (the `cssId` JS function call).",
+      "status": "done",
+      "commit": "a676ed46"
+    },
+    {
+      "id": "step-10",
+      "type": "impl",
+      "description": "Update by_role.html JS: (1) Add `function cssId(s) { return s.replace(/[^a-zA-Z0-9_]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '') || 'unknown'; }` helper. (2) Change `var canvasId = 'costByRoleChart_' + (projIdx + 1)` to `var canvasId = 'costByRoleChart_' + cssId(projectId)`. (3) Remove unused `projIdx` parameter from forEach callback.",
+      "status": "done",
+      "commit": "712348d4"
+    },
+    {
+      "id": "step-11",
+      "type": "test",
+      "description": "Update `test_by_role_canvas_id_prefix` in test_costs_panel.py: change the assertion from checking `costByRoleChart_` prefix only, to also verifying `costByRoleChart_dark_factory` appears (project-key-based ID). Update docstring to reflect the new behavior.",
+      "status": "done",
+      "commit": "258c5108"
+    },
+    {
+      "id": "step-12",
+      "type": "impl",
+      "description": "Run full test suite for costs tests (test_costs_page.py and test_costs_panel.py) to verify all tests pass, including both new and existing tests. Fix any regressions.",
+      "status": "done",
+      "commit": "258c5108"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Use `hx-sync=\"this:abort\"` (explicit self-reference) rather than the shorthand `hx-sync=\"abort\"`",
+      "rationale": "The `this:abort` form is the most widely documented and unambiguous syntax. While HTMX allows omitting the selector when the sync element is the request element itself, `this:` makes the intent clear to future maintainers and avoids any ambiguity about which element is the sync target."
+    },
+    {
+      "decision": "Add a `css_id` Jinja2 filter rather than using inline `| replace(...)` chains in the template",
+      "rationale": "A proper filter is more maintainable, testable, and reusable. Inline replace chains are fragile (must anticipate every special character) and create visual noise. The filter handles the full sanitization in one call and can be unit-tested independently."
+    },
+    {
+      "decision": "Mirror the `css_id` logic as a JS `cssId()` function in the by_role.html script block rather than embedding IDs via data attributes",
+      "rationale": "Keeps the same derivation logic on both sides (Jinja2 filter + JS function) so canvas IDs always match. Data attributes would require iterating DOM nodes, which is a bigger refactor. The regex replacement `[^a-zA-Z0-9_]` \u2192 `_` is trivially identical in Python and JS."
+    },
+    {
+      "decision": "Derive canvas IDs from project key string instead of positional index",
+      "rationale": "Positional coupling relies on implicit ordering guarantees across Python dict iteration \u2192 JSON serialization \u2192 JS Object.keys(). While this works in practice (all preserve insertion order), it's a fragile contract. Key-based IDs are self-documenting and immune to ordering assumptions."
+    },
+    {
+      "decision": "Place hx-sync tests in test_costs_page.py alongside existing template tests",
+      "rationale": "test_costs_page.py already tests the costs.html template structure (section count, attribute patterns, Alpine store). hx-sync is a template-level attribute, so it belongs with these structural tests."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "Starlette TestClient + mock patching pattern",
+      "where": "dashboard/tests/test_costs_page.py",
+      "how": "Reuse existing `client` fixture from conftest.py and `_patch_by_role()` helper for rendering by-role partial with mock data. Follow the same assertion-on-rendered-HTML pattern used throughout test_costs_page.py."
+    },
+    {
+      "what": "ExitStack combined patching via `_patch_cost_data()`",
+      "where": "dashboard/tests/test_costs_panel.py",
+      "how": "Reuse the `_patch_cost_data()` helper that patches all 7 data functions at once, for updating the TestChartCanvases tests."
+    },
+    {
+      "what": "Jinja2 filter registration pattern",
+      "where": "dashboard/src/dashboard/app.py lines 195-218",
+      "how": "Follow the existing pattern of defining a plain function (like `project_name`, `format_duration`) and registering it via `templates.env.filters['css_id'] = css_id`. Place it near the `project_name` filter since both operate on project identifier strings."
+    },
+    {
+      "what": "`getOrDestroyChart()` helper in by_role.html JS",
+      "where": "dashboard/src/dashboard/templates/partials/costs/by_role.html line 27",
+      "how": "Keep the existing Chart.js lifecycle helper; only change how the `canvasId` argument is derived (from project key instead of index)."
+    }
+  ],
+  "_session_id": "343-58ecde8f",
+  "_created_at": "2026-03-31T14:36:59.316593+00:00"
+}
