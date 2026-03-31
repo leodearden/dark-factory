@@ -96,3 +96,52 @@ class TestRegisterAndCheck:
     async def test_get_planned_uuids_empty_project(self, registry):
         result = await registry.get_planned_uuids('proj-empty')
         assert result == set()
+
+
+class TestIdempotentInitialize:
+    """step-25/26: initialize() must be idempotent — safe to call twice."""
+
+    @pytest.mark.asyncio
+    async def test_double_initialize_preserves_connection_identity(self, tmp_path):
+        """Second call to initialize() must return early, keeping original connection.
+
+        Currently FAILS because initialize() unconditionally overwrites self._db.
+        """
+        reg = PlannedEpisodeRegistry(data_dir=tmp_path / 'registry')
+        await reg.initialize()
+
+        # Register data so we can verify it's still accessible afterwards
+        await reg.register('uuid-before', 'proj-1')
+
+        # Capture the original connection object
+        original_db = reg._db
+
+        # Second call — must be a no-op (early return)
+        await reg.initialize()
+
+        # Connection identity must be preserved (no new connection opened)
+        assert reg._db is original_db, (
+            'Second initialize() must not open a new connection (would leak the old one)'
+        )
+
+        # Data registered before the second call must still be accessible
+        assert await reg.is_planned('uuid-before') is True
+
+        await reg.close()
+
+    @pytest.mark.asyncio
+    async def test_double_initialize_data_still_accessible(self, tmp_path):
+        """Data registered before the second initialize() is still retrievable after."""
+        reg = PlannedEpisodeRegistry(data_dir=tmp_path / 'registry')
+        await reg.initialize()
+        await reg.register('uuid-X', 'proj-1')
+        await reg.register('uuid-Y', 'proj-1')
+
+        # Second call
+        await reg.initialize()
+
+        # All registered data remains accessible
+        uuids = await reg.get_planned_uuids('proj-1')
+        assert uuids == {'uuid-X', 'uuid-Y'}
+
+        await reg.close()
