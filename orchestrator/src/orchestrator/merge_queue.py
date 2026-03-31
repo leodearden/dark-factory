@@ -58,12 +58,16 @@ class MergeWorker:
     ``TaskWorkflow``.
     """
 
+    MAX_CAS_RETRIES = 5
+
     def __init__(self, git_ops: GitOps, queue: asyncio.Queue[MergeRequest]):
         self._git_ops = git_ops
         self._queue = queue
         # Front-of-queue buffer for CAS-failure re-enqueue (processed first)
         self._urgent: collections.deque[MergeRequest] = collections.deque()
         self._running = True
+        # Per-task CAS re-enqueue counter — prevents infinite loops
+        self._cas_retries: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -190,7 +194,7 @@ class MergeWorker:
 
         # 5. CAS advance_main
         assert merge_result.merge_commit is not None
-        advanced = await self._git_ops.advance_main(
+        result = await self._git_ops.advance_main(
             merge_result.merge_commit,
             merge_wt,
             branch=req.branch,
@@ -199,14 +203,39 @@ class MergeWorker:
         )
         await self._git_ops.cleanup_merge_worktree(merge_wt)
 
-        if not advanced:
-            # CAS failed — external actor moved main.
-            # Front-of-queue re-enqueue for lower conflict risk.
-            logger.info(
-                f'Task {req.task_id}: CAS failed, re-enqueueing at front'
-            )
-            self._urgent.append(req)
-            return None  # don't resolve Future — will be reprocessed
+        if result == 'advanced':
+            self._cas_retries.pop(req.task_id, None)
+            logger.info(f'Task {req.task_id}: merged to main successfully')
+            return MergeOutcome('done')
 
-        logger.info(f'Task {req.task_id}: merged to main successfully')
-        return MergeOutcome('done')
+        if result in ('not_descendant', 'contaminated'):
+            # Permanent failure — do NOT re-enqueue
+            self._cas_retries.pop(req.task_id, None)
+            return MergeOutcome(
+                'blocked',
+                reason=f'advance_main failed ({result}) for task {req.task_id}',
+            )
+
+        # result == 'cas_failed' — transient, re-enqueue with limit
+        retries = self._cas_retries.get(req.task_id, 0) + 1
+        self._cas_retries[req.task_id] = retries
+        if retries > self.MAX_CAS_RETRIES:
+            self._cas_retries.pop(req.task_id, None)
+            logger.warning(
+                f'Task {req.task_id}: CAS retry limit exhausted '
+                f'({self.MAX_CAS_RETRIES} attempts)'
+            )
+            return MergeOutcome(
+                'blocked',
+                reason=(
+                    f'CAS retry limit exhausted after '
+                    f'{self.MAX_CAS_RETRIES} attempts for task {req.task_id}'
+                ),
+            )
+
+        logger.info(
+            f'Task {req.task_id}: CAS failed (attempt {retries}/'
+            f'{self.MAX_CAS_RETRIES}), re-enqueueing at front'
+        )
+        self._urgent.append(req)
+        return None  # don't resolve Future — will be reprocessed

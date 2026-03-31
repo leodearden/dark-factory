@@ -121,7 +121,7 @@ class TestWorktreeLifecycle:
         assert not (git_ops.project_root / 'merged.py').exists()
 
         # Advance main and verify
-        assert await git_ops.advance_main(result.merge_commit)
+        assert await git_ops.advance_main(result.merge_commit) == 'advanced'
         _, content, _ = await _run(
             ['git', 'show', 'main:merged.py'], cwd=git_ops.project_root,
         )
@@ -152,7 +152,7 @@ class TestWorktreeLifecycle:
         _, orphan_sha, _ = await _run(
             ['git', 'rev-parse', 'HEAD'], cwd=worktree,
         )
-        assert not await git_ops.advance_main(orphan_sha)
+        assert await git_ops.advance_main(orphan_sha) == 'not_descendant'
 
     async def test_get_current_branch(self, git_ops: GitOps):
         worktree, _ = await git_ops.create_worktree('feature-7')

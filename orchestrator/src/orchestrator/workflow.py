@@ -260,92 +260,121 @@ class TaskWorkflow:
                 if plan_outcome == WorkflowOutcome.BLOCKED:
                     return await self._mark_blocked('Planning failed')
 
-            # EXECUTE + VERIFY + REVIEW loop (with escalation retry)
-            while True:
-                outcome = await self._execute_verify_review_loop()
-                if outcome == WorkflowOutcome.ESCALATED:
-                    self.state = WorkflowState.ESCALATED
-                    await self._ensure_steward_started()
-                    logger.info(f'Task {self.task_id}: waiting for escalation resolution')
-                    try:
-                        resolution = await self._wait_for_resolution()
-                    except _StewardReescalated:
-                        return await self._mark_blocked(
-                            'Steward re-escalated to human',
-                            skip_escalation=True,
-                        )
-                    # Resume with resolution context
-                    logger.info(f'Task {self.task_id}: resuming after escalation resolution')
-                    resume_prompt = await self.briefing.build_resume_prompt(
-                        self.task, self.plan,
-                        '\n'.join(e.summary for e in self._check_escalations()),
-                        resolution, self.worktree,
-                    )
-                    await self._invoke(IMPLEMENTER, resume_prompt, self.worktree)
-                    continue
-                if outcome != WorkflowOutcome.DONE:
-                    return outcome
-                break
-
-            # MERGE (skip for eval mode — no merge into main)
-            if not self._worktree_external:
-                self.state = WorkflowState.MERGE
-
-                # Ghost-loop early exit: if branch is already on main,
-                # skip the entire merge phase (prevents infinite retry
-                # when code was merged by an external actor).
-                _, branch_head, _ = await _run(
-                    ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
+            # ── Ghost-loop early exit (before EXECUTE) ─────────────
+            # If the worktree HEAD is already an ancestor of main AND
+            # the branch has diverged (HEAD != main), the task's code
+            # was merged in a prior run that never reached DONE status
+            # (e.g. post-merge memory write failed).  Skip the entire
+            # execute/review/merge cycle to avoid the implementer
+            # making redundant commits that defeat the merge-phase
+            # ancestor check.
+            #
+            # When HEAD == main, the worktree is fresh (no work done
+            # yet) — don't skip.
+            wt_head = await self._get_head_commit()
+            current_main = await self.git_ops.get_main_sha()
+            already_on_main = (
+                wt_head != current_main
+                and await self.git_ops.is_ancestor(wt_head, current_main)
+            )
+            if already_on_main and not self._worktree_external:
+                logger.info(
+                    f'Task {self.task_id}: worktree HEAD {wt_head[:8]} '
+                    f'already on main — skipping to DONE (prior merge survived)'
                 )
-                main_sha = await self.git_ops.get_main_sha()
-                already_merged = await self.git_ops.is_ancestor(
-                    branch_head.strip(), main_sha,
-                )
-
-                if not already_merged:
-                    # Phase 1: pre-merge rebase (no lock, no queue slot)
-                    # Rebase the task branch onto current main and re-verify
-                    # so the queued merge phase is fast/trivial.
-                    pre_rebased = False
-                    for _attempt in range(self.config.max_pre_merge_retries):
-                        main_before = await self.git_ops.get_main_sha()
-                        if not await self.git_ops.rebase_onto_main(self.worktree):
-                            break  # true conflict — queue will detect it
-                        verify = await run_scoped_verification(
-                            self.worktree, self.config, self._module_configs,
-                            task_files=self._task_files,
-                        )
-                        if not verify.passed:
-                            logger.warning(
-                                f'Task {self.task_id}: post-rebase verification '
-                                f'failed: {verify.summary}'
+            else:
+                # Normal path: EXECUTE + VERIFY + REVIEW loop (with escalation retry)
+                while True:
+                    outcome = await self._execute_verify_review_loop()
+                    if outcome == WorkflowOutcome.ESCALATED:
+                        self.state = WorkflowState.ESCALATED
+                        await self._ensure_steward_started()
+                        logger.info(f'Task {self.task_id}: waiting for escalation resolution')
+                        try:
+                            resolution = await self._wait_for_resolution()
+                        except _StewardReescalated:
+                            return await self._mark_blocked(
+                                'Steward re-escalated to human',
+                                skip_escalation=True,
                             )
-                            break
-                        main_after = await self.git_ops.get_main_sha()
-                        if main_before == main_after:
-                            pre_rebased = True
-                            self.metrics.pre_merge_rebase_ok += 1
-                            break
-                        self.metrics.pre_merge_rebase_attempts += 1
+                        # Resume with resolution context
+                        logger.info(f'Task {self.task_id}: resuming after escalation resolution')
+                        resume_prompt = await self.briefing.build_resume_prompt(
+                            self.task, self.plan,
+                            '\n'.join(e.summary for e in self._check_escalations()),
+                            resolution, self.worktree,
+                        )
+                        await self._invoke(IMPLEMENTER, resume_prompt, self.worktree)
+                        continue
+                    if outcome != WorkflowOutcome.DONE:
+                        return outcome
+                    break
+
+                # MERGE (skip for eval mode — no merge into main)
+                if not self._worktree_external:
+                    self.state = WorkflowState.MERGE
+
+                    # Ghost-loop early exit: if branch is already on main,
+                    # skip the entire merge phase (prevents infinite retry
+                    # when code was merged by an external actor).
+                    _, branch_head, _ = await _run(
+                        ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
+                    )
+                    main_sha = await self.git_ops.get_main_sha()
+                    already_merged = await self.git_ops.is_ancestor(
+                        branch_head.strip(), main_sha,
+                    )
+
+                    if not already_merged:
+                        # Phase 1: pre-merge rebase (no lock, no queue slot)
+                        # Rebase the task branch onto current main and re-verify
+                        # so the queued merge phase is fast/trivial.
+                        pre_rebased = False
+                        for _attempt in range(self.config.max_pre_merge_retries):
+                            main_before = await self.git_ops.get_main_sha()
+                            if not await self.git_ops.rebase_onto_main(self.worktree):
+                                break  # true conflict — queue will detect it
+                            verify = await run_scoped_verification(
+                                self.worktree, self.config, self._module_configs,
+                                task_files=self._task_files,
+                            )
+                            if not verify.passed:
+                                logger.warning(
+                                    f'Task {self.task_id}: post-rebase verification '
+                                    f'failed: {verify.summary}'
+                                )
+                                break
+                            main_after = await self.git_ops.get_main_sha()
+                            if main_before == main_after:
+                                pre_rebased = True
+                                self.metrics.pre_merge_rebase_ok += 1
+                                break
+                            self.metrics.pre_merge_rebase_attempts += 1
+                            logger.info(
+                                f'Task {self.task_id}: main moved during pre-merge '
+                                f'rebase, retrying'
+                            )
+
+                        # Phase 2: submit to merge queue (replaces _merge_lock)
+                        merge_outcome = await self._submit_to_merge_queue(
+                            branch_name, pre_rebased=pre_rebased,
+                        )
+                        if merge_outcome != WorkflowOutcome.DONE:
+                            return merge_outcome
+                    else:
                         logger.info(
-                            f'Task {self.task_id}: main moved during pre-merge '
-                            f'rebase, retrying'
+                            f'Task {self.task_id}: branch already on main '
+                            f'— skipping merge'
                         )
 
-                    # Phase 2: submit to merge queue (replaces _merge_lock)
-                    merge_outcome = await self._submit_to_merge_queue(
-                        branch_name, pre_rebased=pre_rebased,
-                    )
-                    if merge_outcome != WorkflowOutcome.DONE:
-                        return merge_outcome
-                else:
-                    logger.info(
-                        f'Task {self.task_id}: branch already on main '
-                        f'— skipping merge'
-                    )
-
-            # SUCCESS — write completion knowledge before status change (ordering guarantee)
-            await self._write_completion_to_memory()
+            # SUCCESS — write completion knowledge (best-effort after merge)
+            try:
+                await self._write_completion_to_memory()
+            except Exception as e:
+                logger.warning(
+                    f'Task {self.task_id}: completion memory write failed '
+                    f'(non-fatal): {e}'
+                )
             # Wait for steward to finish any pending work (suggestion triage, etc.)
             await self._ensure_steward_started()
             await self._await_steward_completion()

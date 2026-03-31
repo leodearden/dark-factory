@@ -29,10 +29,15 @@ import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from orchestrator.config import GitConfig
 
 logger = logging.getLogger(__name__)
+
+# Return type for advance_main — lets callers distinguish transient
+# (CAS) failures from permanent ones (not-a-descendant, contamination).
+AdvanceResult = Literal['advanced', 'cas_failed', 'not_descendant', 'contaminated']
 
 
 # ---------------------------------------------------------------------------
@@ -518,12 +523,20 @@ class GitOps:
         branch: str | None = None,
         max_attempts: int = 3,
         expected_main: str | None = None,
-    ) -> bool:
+    ) -> AdvanceResult:
         """Advance main branch ref to *merge_sha* atomically.
 
         Uses ``update-ref`` so the project_root working tree is never touched.
-        Returns False if main has moved past the merge base and all retry
-        attempts are exhausted (caller should mark the task as blocked).
+
+        Returns an :data:`AdvanceResult` literal:
+
+        * ``'advanced'`` — success.
+        * ``'cas_failed'`` — CAS ``update-ref`` failed (transient; caller
+          can re-enqueue).
+        * ``'not_descendant'`` — merge commit couldn't become a descendant
+          of main after *max_attempts* (permanent; stop retrying).
+        * ``'contaminated'`` — ``.task/`` contamination gate failed
+          (permanent; stop retrying).
 
         When *branch* is provided and a rebase fails, the method will abort
         the rebase, reset to current main, and re-merge *branch* before
@@ -532,8 +545,7 @@ class GitOps:
         When *expected_main* is provided, the final ``update-ref`` uses a
         compare-and-swap: ``git update-ref refs/heads/main <new> <old>``.
         If main has moved (external actor), update-ref fails atomically
-        and this method returns False.  Callers (e.g. the merge queue
-        worker) can re-enqueue on CAS failure.
+        and this method returns ``'cas_failed'``.
 
         IMPORTANT: This method is the LAST checkpoint before code reaches
         main.  update-ref bypasses ALL git hooks (including pre-commit),
@@ -550,7 +562,7 @@ class GitOps:
                 )
             except RuntimeError as e:
                 logger.error(str(e))
-                return False
+                return 'contaminated'
 
             rc, _, _ = await _run(
                 ['git', 'merge-base', '--is-ancestor',
@@ -565,7 +577,7 @@ class GitOps:
                     f'Cannot fast-forward: {merge_sha[:8]} is not a descendant '
                     f'of {self.config.main_branch} (no merge worktree for retry)'
                 )
-                return False
+                return 'not_descendant'
 
             logger.info(
                 f'advance_main attempt {attempt + 1}/{max_attempts}: '
@@ -610,7 +622,7 @@ class GitOps:
                 logger.warning(
                     f'Re-merge failed (true conflict): {merge_out}\n{merge_err}'
                 )
-                return False
+                return 'not_descendant'
 
             await _scrub_task_dir_from_tree(
                 merge_worktree, f'advance_main-retry({attempt + 1})',
@@ -627,7 +639,7 @@ class GitOps:
                 f'{merge_sha[:8]} is not a descendant of '
                 f'{self.config.main_branch}'
             )
-            return False
+            return 'not_descendant'
 
         # All checks passed — advance the ref (CAS when expected_main provided)
         update_cmd = [
@@ -644,7 +656,7 @@ class GitOps:
                 )
             else:
                 logger.error(f'update-ref failed: {err}')
-            return False
+            return 'cas_failed'
 
         logger.info(f'Advanced {self.config.main_branch} to {merge_sha[:8]}')
 
@@ -660,7 +672,7 @@ class GitOps:
             cwd=self.project_root,
         )
 
-        return True
+        return 'advanced'
 
     async def get_conflict_details(self, cwd: Path) -> str:
         """Parse conflict markers and return structured description."""

@@ -105,12 +105,18 @@ class TestCasUpdateRef:
             result.merge_commit,
             expected_main=main_sha,
         )
-        assert advanced
+        assert advanced == 'advanced'
 
         await git_ops.cleanup_merge_worktree(result.merge_worktree)
 
     async def test_advance_main_cas_mismatch(self, git_ops: GitOps):
-        """CAS fails when expected_main is stale (external actor moved main)."""
+        """Main moved past merge commit with no worktree for retry → not_descendant.
+
+        Note: the CAS check (update-ref expected_main) only runs AFTER the
+        descendant check passes.  Without a merge_worktree to rebase onto
+        the new main, advance_main cannot make the commit a descendant, so
+        it returns 'not_descendant' before reaching the CAS step.
+        """
         worktree, _ = await git_ops.create_worktree('cas-fail')
         (worktree / 'file.py').write_text('x = 1\n')
         await git_ops.commit(worktree, 'Add file')
@@ -125,12 +131,13 @@ class TestCasUpdateRef:
         await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
         await _run(['git', 'commit', '-m', 'External commit'], cwd=git_ops.project_root)
 
-        # CAS should fail — expected_main is stale
+        # Merge commit is no longer a descendant of (new) main and no
+        # merge_worktree was passed for retry → not_descendant
         advanced = await git_ops.advance_main(
             result.merge_commit,
             expected_main=stale_sha,
         )
-        assert not advanced
+        assert advanced == 'not_descendant'
 
         await git_ops.cleanup_merge_worktree(result.merge_worktree)
 
@@ -145,7 +152,7 @@ class TestCasUpdateRef:
 
         # No expected_main — should work as before
         advanced = await git_ops.advance_main(result.merge_commit)
-        assert advanced
+        assert advanced == 'advanced'
 
         if result.merge_worktree:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
@@ -274,7 +281,7 @@ class TestMergeWorker:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return False  # simulate CAS failure
+                return 'cas_failed'  # simulate CAS failure
             return await original(*args, **kwargs)
 
         with (
@@ -337,6 +344,75 @@ class TestMergeWorker:
 
         assert outcome.status == 'blocked'
         assert 'verification failed' in outcome.reason.lower()
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_cas_retry_limit_exhausted(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """CAS failures beyond MAX_CAS_RETRIES resolve as blocked."""
+        worktree, _ = await git_ops.create_worktree('cas-limit')
+        (worktree / 'limit.py').write_text('limit = True\n')
+        await git_ops.commit(worktree, 'Add limit file')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # advance_main always returns cas_failed
+        async def _always_cas_fail(*args, **kwargs):
+            return 'cas_failed'
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_always_cas_fail),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('7', 'cas-limit', worktree, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked'
+        assert 'cas retry limit' in outcome.reason.lower()
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_not_descendant_returns_blocked_immediately(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Permanent not_descendant failure blocks without re-enqueue."""
+        worktree, _ = await git_ops.create_worktree('perm-fail')
+        (worktree / 'perm.py').write_text('perm = True\n')
+        await git_ops.commit(worktree, 'Add perm file')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        call_count = 0
+
+        async def _not_descendant(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 'not_descendant'
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_not_descendant),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('8', 'perm-fail', worktree, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=10)
+
+        assert outcome.status == 'blocked'
+        assert 'not_descendant' in outcome.reason
+        # Should only be called once — no re-enqueue for permanent failures
+        assert call_count == 1
 
         await worker.stop()
         worker_task.cancel()
