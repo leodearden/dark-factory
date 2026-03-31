@@ -13,7 +13,7 @@ from fused_memory.services.write_journal import WriteJournal
 @pytest_asyncio.fixture
 async def write_journal(tmp_path):
     j = WriteJournal(tmp_path / 'wj_integration')
-    await j.initialize()
+    await j.open()
     yield j
     await j.close()
 

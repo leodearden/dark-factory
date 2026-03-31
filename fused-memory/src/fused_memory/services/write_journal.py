@@ -10,6 +10,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from shared.async_sqlite_base import AsyncSqliteBase
+
 logger = logging.getLogger(__name__)
 
 SCHEMA_SQL = """
@@ -51,36 +53,25 @@ CREATE INDEX IF NOT EXISTS idx_bo_created ON backend_ops(created_at);
 """
 
 
-class WriteJournal:
+class WriteJournal(AsyncSqliteBase):
     """Two-layer write journal backed by SQLite (WAL mode)."""
 
     def __init__(self, data_dir: Path | str):
-        self.data_dir = Path(data_dir)
-        self._db: aiosqlite.Connection | None = None
+        super().__init__(Path(data_dir) / 'write_journal.db')
 
-    async def initialize(self) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        db_path = self.data_dir / 'write_journal.db'
-        self._db = await aiosqlite.connect(str(db_path))
-        self._db.row_factory = aiosqlite.Row
-        await self._db.execute('PRAGMA journal_mode=WAL')
-        await self._db.executescript(SCHEMA_SQL)
-        await self._db.commit()
+    @property
+    def _schema(self) -> str:
+        return SCHEMA_SQL
+
+    async def open(self) -> None:
+        await super().open()
+        self._require_conn().row_factory = aiosqlite.Row
         await self._migrate()
-        logger.info(f'Write journal initialized at {db_path}')
-
-    async def close(self) -> None:
-        if self._db:
-            await self._db.close()
-
-    def _require_db(self) -> aiosqlite.Connection:
-        if self._db is None:
-            raise RuntimeError('WriteJournal not initialized — call initialize() first')
-        return self._db
+        logger.info('Write journal initialized at %s', self.db_path)
 
     async def _migrate(self) -> None:
         """Add columns introduced after initial schema (idempotent)."""
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute('PRAGMA table_info(write_ops)') as cursor:
             existing = {row[1] for row in await cursor.fetchall()}
 
@@ -125,7 +116,7 @@ class WriteJournal:
     ) -> None:
         """Log a Layer 1 operation. Fire-and-forget — never raises."""
         try:
-            db = self._require_db()
+            db = self._require_conn()
             await db.execute(
                 """INSERT INTO write_ops
                    (id, causation_id, source, provenance, operation,
@@ -167,7 +158,7 @@ class WriteJournal:
     ) -> None:
         """Log a Layer 2 backend dispatch. Fire-and-forget — never raises."""
         try:
-            db = self._require_db()
+            db = self._require_conn()
             await db.execute(
                 """INSERT INTO backend_ops
                    (id, write_op_id, causation_id, backend, operation,
@@ -192,7 +183,7 @@ class WriteJournal:
 
     async def get_ops_by_causation(self, causation_id: str) -> list[dict]:
         """Return all write_ops and backend_ops for a causation_id."""
-        db = self._require_db()
+        db = self._require_conn()
         results: list[dict] = []
 
         async with db.execute(
@@ -216,7 +207,7 @@ class WriteJournal:
         self, since: str, limit: int = 100, kind: str | None = None
     ) -> list[dict]:
         """Return write_ops since a timestamp, optionally filtered by kind."""
-        db = self._require_db()
+        db = self._require_conn()
         if kind:
             sql = 'SELECT * FROM write_ops WHERE created_at >= ? AND kind = ? ORDER BY created_at LIMIT ?'
             params = (since, kind, limit)
@@ -228,7 +219,7 @@ class WriteJournal:
 
     async def get_backend_ops_for_write_op(self, write_op_id: str) -> list[dict]:
         """Return all backend_ops linked to a write_op."""
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute(
             'SELECT * FROM backend_ops WHERE write_op_id = ? ORDER BY created_at',
             (write_op_id,),
@@ -242,7 +233,7 @@ class WriteJournal:
 
         Returns {reads, writes, by_operation, by_agent}.
         """
-        db = self._require_db()
+        db = self._require_conn()
         where = 'WHERE created_at >= ?'
         params: list = [since]
         if project_id:
@@ -285,7 +276,7 @@ class WriteJournal:
         self, agent_id: str, since: str | None = None, limit: int = 100
     ) -> list[dict]:
         """Return ops for a specific agent, most recent first."""
-        db = self._require_db()
+        db = self._require_conn()
         if since:
             sql = (
                 'SELECT * FROM write_ops WHERE agent_id = ? AND created_at >= ? '

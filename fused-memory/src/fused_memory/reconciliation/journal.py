@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 
 import aiosqlite
 
+from shared.async_sqlite_base import AsyncSqliteBase
+
 from fused_memory.models.reconciliation import (
     JournalEntry,
     JudgeVerdict,
@@ -163,48 +165,40 @@ def _extract_target(op: dict) -> str:
     return '?'
 
 
-class ReconciliationJournal:
+class ReconciliationJournal(AsyncSqliteBase):
     """Persistent journal backed by SQLite — one database per project directory."""
 
     def __init__(self, data_dir: Path):
-        self.data_dir = data_dir
-        self._db: aiosqlite.Connection | None = None
+        super().__init__(data_dir / 'reconciliation.db')
         self._write_journal: WriteJournal | None = None
+
+    @property
+    def _schema(self) -> str:
+        return SCHEMA_SQL
 
     def set_write_journal(self, write_journal: WriteJournal) -> None:
         """Store reference for cross-queries (combined run actions)."""
         self._write_journal = write_journal
 
-    async def initialize(self) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        db_path = self.data_dir / 'reconciliation.db'
-        self._db = await aiosqlite.connect(str(db_path))
-        self._db.row_factory = aiosqlite.Row
-        await self._db.executescript(SCHEMA_SQL)
-        await self._db.commit()
+    async def open(self) -> None:
+        await super().open()
+        self._require_conn().row_factory = aiosqlite.Row
 
         # Safe migration: add triggered_by column to existing DBs
         try:
-            await self._db.execute('ALTER TABLE runs ADD COLUMN triggered_by TEXT')
-            await self._db.commit()
+            await self._require_conn().execute(
+                'ALTER TABLE runs ADD COLUMN triggered_by TEXT'
+            )
+            await self._require_conn().commit()
         except Exception:
             pass  # Column already exists
 
-        logger.info(f'Reconciliation journal initialized at {db_path}')
-
-    async def close(self) -> None:
-        if self._db:
-            await self._db.close()
-
-    def _require_db(self) -> aiosqlite.Connection:
-        if self._db is None:
-            raise RuntimeError('Journal not initialized — call initialize() first')
-        return self._db
+        logger.info('Reconciliation journal initialized at %s', self.db_path)
 
     # ── Watermark ──────────────────────────────────────────────────────
 
     async def get_watermark(self, project_id: str) -> Watermark:
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute(
             'SELECT * FROM watermarks WHERE project_id = ?', (project_id,)
         ) as cursor:
@@ -221,7 +215,7 @@ class ReconciliationJournal:
         )
 
     async def update_watermark(self, watermark: Watermark) -> None:
-        db = self._require_db()
+        db = self._require_conn()
         await db.execute(
             """INSERT INTO watermarks
                (project_id, last_full_run_id, last_full_run_completed,
@@ -248,7 +242,7 @@ class ReconciliationJournal:
     # ── Runs ───────────────────────────────────────────────────────────
 
     async def start_run(self, run: ReconciliationRun) -> None:
-        db = self._require_db()
+        db = self._require_conn()
         await db.execute(
             """INSERT INTO runs
                (id, project_id, run_type, trigger_reason, started_at,
@@ -269,7 +263,7 @@ class ReconciliationJournal:
         await db.commit()
 
     async def complete_run(self, run_id: str, status: str) -> None:
-        db = self._require_db()
+        db = self._require_conn()
         await db.execute(
             'UPDATE runs SET status = ?, completed_at = ? WHERE id = ?',
             (status, datetime.now(UTC).isoformat(), run_id),
@@ -279,7 +273,7 @@ class ReconciliationJournal:
     async def update_run_stage_reports(
         self, run_id: str, stage_reports: dict[str, StageReport | dict]
     ) -> None:
-        db = self._require_db()
+        db = self._require_conn()
         serialized = {}
         for k, v in stage_reports.items():
             serialized[k] = v.model_dump(mode='json') if isinstance(v, StageReport) else v
@@ -290,7 +284,7 @@ class ReconciliationJournal:
         await db.commit()
 
     async def get_run(self, run_id: str) -> ReconciliationRun | None:
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute('SELECT * FROM runs WHERE id = ?', (run_id,)) as cursor:
             row = await cursor.fetchone()
         if row is None:
@@ -318,7 +312,7 @@ class ReconciliationJournal:
     async def get_recent_runs(
         self, project_id: str, limit: int = 10
     ) -> list[ReconciliationRun]:
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute(
             'SELECT * FROM runs WHERE project_id = ? ORDER BY started_at DESC LIMIT ?',
             (project_id, limit),
@@ -350,7 +344,7 @@ class ReconciliationJournal:
         return runs
 
     async def is_run_active(self, project_id: str) -> bool:
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute(
             "SELECT 1 FROM runs WHERE project_id = ? AND status = 'running' LIMIT 1",
             (project_id,),
@@ -360,7 +354,7 @@ class ReconciliationJournal:
     # ── Journal entries ────────────────────────────────────────────────
 
     async def add_entry(self, entry: JournalEntry) -> None:
-        db = self._require_db()
+        db = self._require_conn()
         await db.execute(
             """INSERT INTO journal_entries
                (id, run_id, stage, timestamp, operation, target_system,
@@ -382,7 +376,7 @@ class ReconciliationJournal:
         await db.commit()
 
     async def get_entries(self, run_id: str) -> list[JournalEntry]:
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute(
             'SELECT * FROM journal_entries WHERE run_id = ? ORDER BY timestamp',
             (run_id,),
@@ -413,7 +407,7 @@ class ReconciliationJournal:
     # ── Judge verdicts ─────────────────────────────────────────────────
 
     async def add_verdict(self, verdict: JudgeVerdict) -> None:
-        db = self._require_db()
+        db = self._require_conn()
         await db.execute(
             """INSERT INTO judge_verdicts
                (run_id, reviewed_at, severity, findings, action_taken)
@@ -431,7 +425,7 @@ class ReconciliationJournal:
     async def get_recent_verdicts(
         self, project_id: str, limit: int = 10
     ) -> list[JudgeVerdict]:
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute(
             """SELECT jv.* FROM judge_verdicts jv
                JOIN runs r ON jv.run_id = r.id
@@ -455,7 +449,7 @@ class ReconciliationJournal:
 
     async def get_stale_runs(self, cutoff_seconds: float) -> list[ReconciliationRun]:
         """Return runs still marked 'running' whose started_at is older than cutoff."""
-        db = self._require_db()
+        db = self._require_conn()
         cutoff_dt = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - cutoff_seconds,
             tz=UTC,
@@ -500,7 +494,7 @@ class ReconciliationJournal:
         run_id: str | None = None,
     ) -> None:
         """Record a backlog chunk processing boundary."""
-        db = self._require_db()
+        db = self._require_conn()
         await db.execute(
             """INSERT INTO chunk_boundaries
                (id, project_id, run_id, events_count, status, created_at)
@@ -517,7 +511,7 @@ class ReconciliationJournal:
 
     async def get_last_completed_chunk(self, project_id: str) -> dict | None:
         """Get the most recently completed chunk for resume-on-failure."""
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute(
             """SELECT * FROM chunk_boundaries
                WHERE project_id = ? AND status = 'completed'
@@ -548,7 +542,7 @@ class ReconciliationJournal:
     ) -> None:
         """Record an action performed during a reconciliation run."""
         try:
-            db = self._require_db()
+            db = self._require_conn()
             await db.execute(
                 """INSERT INTO run_actions
                    (id, run_id, action_type, target, operation, detail, causation_id, created_at)
@@ -570,7 +564,7 @@ class ReconciliationJournal:
 
     async def get_run_actions(self, run_id: str) -> list[dict]:
         """Get all run_actions for a reconciliation run."""
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute(
             'SELECT * FROM run_actions WHERE run_id = ? ORDER BY created_at',
             (run_id,),
@@ -614,7 +608,7 @@ class ReconciliationJournal:
     # ── Dashboard stats ────────────────────────────────────────────────
 
     async def get_stats(self, project_id: str, since: datetime) -> dict:
-        db = self._require_db()
+        db = self._require_conn()
         since_str = since.isoformat()
 
         async with db.execute(
