@@ -6569,10 +6569,11 @@
         "description": "In targeted.py `_on_task_done`, the promotion loop iterates over all planned search results and promotes each `ep_uuid` in every result's provenance list. Multiple results can share provenance episode UUIDs (one planning episode commonly produces many edges). This causes: (1) redundant DELETE + COMMIT calls to SQLite, (2) inflated `promoted_count` in journal actions, misleading for auditing.\n\nFix: Collect unique UUIDs into a set before iterating: `ep_uuids_to_promote = {ep for r in planned_related if r.metadata.get('planned') for ep in r.provenance}`. Then iterate the set to call promote() once per distinct UUID. Use `len(ep_uuids_to_promote)` for promoted_count.\n\nmemory_hints: search for \"planned episode promotion\" and \"targeted reconciliation _on_task_done\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-03-31T15:13:17.328Z"
       },
       {
         "id": "351",
@@ -6794,7 +6795,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T15:13:17.160Z",
+      "lastModified": "2026-03-31T15:13:17.328Z",
       "taskCount": 348,
       "completedCount": 289,
       "tags": [
