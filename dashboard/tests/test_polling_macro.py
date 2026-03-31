@@ -28,14 +28,14 @@ def render_polling_section(
     env: jinja2.Environment,
     name: str,
     hx_get: str,
-    hx_trigger: str,
+    poll_base: int,
     hx_request_timeout: int,
     caller_content: str = '<p>skeleton content</p>',
 ) -> str:
     """Render the polling_section macro with a caller block and return HTML."""
     source = (
         "{% from 'macros/polling_section.html' import polling_section %}"
-        "{% call polling_section(name, hx_get, hx_trigger, hx_request_timeout) %}"
+        "{% call polling_section(name, hx_get, poll_base, hx_request_timeout) %}"
         + caller_content
         + "{% endcall %}"
     )
@@ -43,7 +43,7 @@ def render_polling_section(
     return tmpl.render(
         name=name,
         hx_get=hx_get,
-        hx_trigger=hx_trigger,
+        poll_base=poll_base,
         hx_request_timeout=hx_request_timeout,
     )
 
@@ -56,7 +56,7 @@ class TestPollingSectionAttributes:
             jinja_env,
             name='orchestrators',
             hx_get='/partials/orchestrators',
-            hx_trigger='load, every 10s',
+            poll_base=10,
             hx_request_timeout=8000,
         )
         assert 'data-section="orchestrators"' in html
@@ -66,27 +66,37 @@ class TestPollingSectionAttributes:
             jinja_env,
             name='performance',
             hx_get='/partials/performance',
-            hx_trigger='load, every 30s',
+            poll_base=30,
             hx_request_timeout=12000,
         )
         assert 'hx-get="/partials/performance"' in html
 
-    def test_section_has_hx_trigger_attribute(self, jinja_env):
+    def test_section_has_hx_trigger_load_poll(self, jinja_env):
         html = render_polling_section(
             jinja_env,
             name='memory',
             hx_get='/partials/memory',
-            hx_trigger='load, every 10s',
+            poll_base=10,
             hx_request_timeout=8000,
         )
-        assert 'hx-trigger="load, every 10s"' in html
+        assert 'hx-trigger="load, poll"' in html
+
+    def test_section_has_data_poll_base_attribute(self, jinja_env):
+        html = render_polling_section(
+            jinja_env,
+            name='memory',
+            hx_get='/partials/memory',
+            poll_base=10,
+            hx_request_timeout=8000,
+        )
+        assert 'data-poll-base="10"' in html
 
     def test_section_has_hx_request_with_timeout_json(self, jinja_env):
         html = render_polling_section(
             jinja_env,
             name='memory-graphs',
             hx_get='/partials/memory-graphs',
-            hx_trigger='load, every 60s',
+            poll_base=60,
             hx_request_timeout=10000,
         )
         assert '10000' in html
@@ -97,7 +107,7 @@ class TestPollingSectionAttributes:
             jinja_env,
             name='recon',
             hx_get='/partials/recon',
-            hx_trigger='load, every 15s',
+            poll_base=15,
             hx_request_timeout=12000,
         )
         assert 'hx-swap="morph:innerHTML"' in html
@@ -107,7 +117,7 @@ class TestPollingSectionAttributes:
             jinja_env,
             name='orchestrators',
             hx_get='/partials/orchestrators',
-            hx_trigger='load, every 10s',
+            poll_base=10,
             hx_request_timeout=8000,
         )
         assert 'aria-live="polite"' in html
@@ -121,7 +131,7 @@ class TestPollingSectionUpdatedForDiv:
             jinja_env,
             name='orchestrators',
             hx_get='/partials/orchestrators',
-            hx_trigger='load, every 10s',
+            poll_base=10,
             hx_request_timeout=8000,
         )
         assert 'data-updated-for="orchestrators"' in html
@@ -131,7 +141,7 @@ class TestPollingSectionUpdatedForDiv:
             jinja_env,
             name='recon',
             hx_get='/partials/recon',
-            hx_trigger='load, every 15s',
+            poll_base=15,
             hx_request_timeout=12000,
         )
         assert 'data-section="recon"' in html
@@ -142,7 +152,7 @@ class TestPollingSectionUpdatedForDiv:
             jinja_env,
             name='memory',
             hx_get='/partials/memory',
-            hx_trigger='load, every 10s',
+            poll_base=10,
             hx_request_timeout=8000,
         )
         assert 'aria-hidden="true"' in html
@@ -152,7 +162,7 @@ class TestPollingSectionUpdatedForDiv:
             jinja_env,
             name='performance',
             hx_get='/partials/performance',
-            hx_trigger='load, every 30s',
+            poll_base=30,
             hx_request_timeout=12000,
         )
         assert 'text-xs' in html
@@ -162,7 +172,7 @@ class TestPollingSectionUpdatedForDiv:
             jinja_env,
             name='performance',
             hx_get='/partials/performance',
-            hx_trigger='load, every 30s',
+            poll_base=30,
             hx_request_timeout=12000,
         )
         assert 'text-gray-500' in html
@@ -172,7 +182,7 @@ class TestPollingSectionUpdatedForDiv:
             jinja_env,
             name='recon',
             hx_get='/partials/recon',
-            hx_trigger='load, every 15s',
+            poll_base=15,
             hx_request_timeout=12000,
         )
         assert 'mt-1' in html
@@ -182,7 +192,7 @@ class TestPollingSectionUpdatedForDiv:
             jinja_env,
             name='orchestrators',
             hx_get='/partials/orchestrators',
-            hx_trigger='load, every 10s',
+            poll_base=10,
             hx_request_timeout=8000,
         )
         assert 'h-4' in html
@@ -196,7 +206,7 @@ class TestPollingSectionStructure:
             jinja_env,
             name='orchestrators',
             hx_get='/partials/orchestrators',
-            hx_trigger='load, every 10s',
+            poll_base=10,
             hx_request_timeout=8000,
         )
         assert '<div>' in html or '<div ' in html
@@ -206,7 +216,7 @@ class TestPollingSectionStructure:
             jinja_env,
             name='orchestrators',
             hx_get='/partials/orchestrators',
-            hx_trigger='load, every 10s',
+            poll_base=10,
             hx_request_timeout=8000,
             caller_content='<p class="unique-skeleton-content">unique text</p>',
         )
@@ -218,7 +228,7 @@ class TestPollingSectionStructure:
             jinja_env,
             name='orchestrators',
             hx_get='/partials/orchestrators',
-            hx_trigger='load, every 10s',
+            poll_base=10,
             hx_request_timeout=8000,
             caller_content='<p class="skeleton-marker">loading</p>',
         )
@@ -233,7 +243,7 @@ class TestPollingSectionStructure:
             jinja_env,
             name='memory',
             hx_get='/partials/memory',
-            hx_trigger='load, every 10s',
+            poll_base=10,
             hx_request_timeout=8000,
         )
         assert '<section' in html
@@ -285,21 +295,24 @@ class TestIndexHtmlUsesMacro:
         content = self._index_content()
         assert '/partials/orchestrators' in content
 
-    def test_orchestrators_call_passes_correct_trigger(self):
+    def test_orchestrators_call_passes_correct_poll_base(self):
         content = self._index_content()
-        assert 'every 10s' in content
+        # Orchestrators poll every 10s
+        assert "polling_section('orchestrators', '/partials/orchestrators', 10," in content
 
     def test_performance_call_passes_correct_timeout(self):
         content = self._index_content()
         assert '12000' in content
 
-    def test_memory_graphs_call_passes_correct_trigger(self):
+    def test_memory_graphs_call_passes_correct_poll_base(self):
         content = self._index_content()
-        assert 'every 60s' in content
+        # Memory graphs poll every 60s
+        assert "polling_section('memory-graphs', '/partials/memory-graphs', 60," in content
 
-    def test_recon_call_passes_correct_trigger(self):
+    def test_recon_call_passes_correct_poll_base(self):
         content = self._index_content()
-        assert 'every 15s' in content
+        # Recon polls every 15s
+        assert "polling_section('recon', '/partials/recon', 15," in content
 
 
 class TestEquivalenceJsCouplingAttributes:
@@ -315,31 +328,31 @@ class TestEquivalenceJsCouplingAttributes:
         {
             'name': 'orchestrators',
             'hx_get': '/partials/orchestrators',
-            'hx_trigger': 'load, every 10s',
+            'poll_base': 10,
             'timeout': 8000,
         },
         {
             'name': 'performance',
             'hx_get': '/partials/performance',
-            'hx_trigger': 'load, every 30s',
+            'poll_base': 30,
             'timeout': 12000,
         },
         {
             'name': 'memory',
             'hx_get': '/partials/memory',
-            'hx_trigger': 'load, every 10s',
+            'poll_base': 10,
             'timeout': 8000,
         },
         {
             'name': 'memory-graphs',
             'hx_get': '/partials/memory-graphs',
-            'hx_trigger': 'load, every 60s',
+            'poll_base': 60,
             'timeout': 10000,
         },
         {
             'name': 'recon',
             'hx_get': '/partials/recon',
-            'hx_trigger': 'load, every 15s',
+            'poll_base': 15,
             'timeout': 12000,
         },
     ]
@@ -351,7 +364,7 @@ class TestEquivalenceJsCouplingAttributes:
             jinja_env,
             name=section['name'],
             hx_get=section['hx_get'],
-            hx_trigger=section['hx_trigger'],
+            poll_base=section['poll_base'],
             hx_request_timeout=section['timeout'],
         )
         assert f'data-section="{section["name"]}"' in html
@@ -364,7 +377,7 @@ class TestEquivalenceJsCouplingAttributes:
             jinja_env,
             name=section['name'],
             hx_get=section['hx_get'],
-            hx_trigger=section['hx_trigger'],
+            poll_base=section['poll_base'],
             hx_request_timeout=section['timeout'],
         )
         assert f'hx-get="{section["hx_get"]}"' in html
@@ -376,7 +389,7 @@ class TestEquivalenceJsCouplingAttributes:
             jinja_env,
             name=section['name'],
             hx_get=section['hx_get'],
-            hx_trigger=section['hx_trigger'],
+            poll_base=section['poll_base'],
             hx_request_timeout=section['timeout'],
         )
         assert str(section['timeout']) in html
@@ -389,7 +402,7 @@ class TestEquivalenceJsCouplingAttributes:
             jinja_env,
             name=section['name'],
             hx_get=section['hx_get'],
-            hx_trigger=section['hx_trigger'],
+            poll_base=section['poll_base'],
             hx_request_timeout=section['timeout'],
         )
         assert 'hx-swap="morph:innerHTML"' in html
