@@ -274,6 +274,49 @@ class TestFireCostEventRuntimeErrorHandling:
 
 
 # ---------------------------------------------------------------------------
+# task-355 step-1: coroutine leak — production code must close the coro when
+#                  loop.create_task raises RuntimeError.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFireCostEventCoroutineLeak:
+    """task-355 step-1: _fire_cost_event must close coroutine when create_task raises."""
+
+    async def test_coroutine_closed_on_create_task_failure(self):
+        """Production code must close the coroutine when loop.create_task raises RuntimeError.
+
+        Unlike test_create_task_error_is_non_fatal (which has the mock close the
+        coro before raising), this mock does NOT close the coro.  The test then
+        checks that production code has closed it by asserting coro.cr_frame is
+        None — a coroutine's frame pointer is set to None only after .close() or
+        after the coroutine runs to completion.
+        """
+        gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
+
+        mock_loop = MagicMock()
+        captured_coro: list = []
+
+        def raising_create_task(coro, **kwargs):
+            # Do NOT close the coro here — let production code do it.
+            captured_coro.append(coro)
+            raise RuntimeError('event loop is closed')
+
+        mock_loop.create_task.side_effect = raising_create_task
+
+        with patch('shared.usage_gate.asyncio.get_running_loop', return_value=mock_loop):
+            gate._fire_cost_event('acct-A', 'cap_hit', '{}')
+
+        assert len(captured_coro) == 1, 'create_task should have been called once'
+        coro = captured_coro[0]
+        # Production code must have called coro.close(); after close(), cr_frame is None.
+        assert coro.cr_frame is None, (
+            'coro.cr_frame is not None — production code did not call coro.close() '
+            'when loop.create_task raised RuntimeError (coroutine leak)'
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-7: json.dumps guard in _handle_cap_detected when cost_store is None.
 # ---------------------------------------------------------------------------
 
