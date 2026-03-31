@@ -231,3 +231,39 @@ class TestFireCostEventRuntimeErrorHandling:
             pytest.raises(RuntimeError, match='scheduler is shutting down'),
         ):
             gate._fire_cost_event('acct-A', 'cap_hit', '{}')
+
+
+# ---------------------------------------------------------------------------
+# step-7: json.dumps guard in _handle_cap_detected when cost_store is None.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHandleCapDetectedJsonDumpsGuard:
+    """step-7: json.dumps and _fire_cost_event not called when cost_store is None."""
+
+    async def test_json_dumps_not_called_without_cost_store(self):
+        """json.dumps must not be called for the cap_hit event when cost_store=None.
+
+        Currently line 264 unconditionally calls json.dumps({'reason': reason})
+        as an argument to _fire_cost_event, even though _fire_cost_event would
+        return immediately (cost_store is None).  After the fix, the entire
+        _fire_cost_event call is wrapped in `if self._cost_store:`.
+        """
+        gate = make_gate(['acct-A'], cost_store=None)
+        token = gate._accounts[0].token  # use valid token for _find_account_by_token
+
+        with patch('shared.usage_gate.json.dumps') as mock_dumps:
+            gate._handle_cap_detected('usage limit hit', None, token)
+
+        mock_dumps.assert_not_called()
+
+    async def test_fire_cost_event_not_called_without_cost_store(self):
+        """_fire_cost_event must not be called when cost_store=None."""
+        gate = make_gate(['acct-A'], cost_store=None)
+        token = gate._accounts[0].token
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._handle_cap_detected('usage limit hit', None, token)
+
+        mock_fire.assert_not_called()
