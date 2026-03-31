@@ -63,3 +63,78 @@ class TestApplyWalPragmas:
             async with conn.execute('PRAGMA busy_timeout') as cur:
                 row = await cur.fetchone()
         assert row[0] == 5000
+
+
+# ---------------------------------------------------------------------------
+# Concrete test subclass used for AsyncSqliteBase tests
+# ---------------------------------------------------------------------------
+
+_SIMPLE_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS items (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL
+);
+"""
+
+
+# ---------------------------------------------------------------------------
+# Step-3: AsyncSqliteBase.__init__
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncSqliteBaseInit:
+    """AsyncSqliteBase.__init__ stores db_path, sets _conn to None, stores busy_timeout_ms."""
+
+    def test_init_stores_db_path(self, tmp_path: Path):
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        db_path = tmp_path / 'store.db'
+        store = _Store(db_path)
+        assert store.db_path == db_path
+
+    def test_init_conn_is_none(self, tmp_path: Path):
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        store = _Store(tmp_path / 'store.db')
+        assert store._conn is None
+
+    def test_init_default_busy_timeout(self, tmp_path: Path):
+        """Default busy_timeout_ms is 5000."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        store = _Store(tmp_path / 'store.db')
+        assert store.busy_timeout_ms == 5000
+
+    def test_init_custom_busy_timeout(self, tmp_path: Path):
+        """busy_timeout_ms can be overridden at construction."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        class _Store(AsyncSqliteBase):
+            @property
+            def _schema(self) -> str:
+                return _SIMPLE_SCHEMA
+
+        store = _Store(tmp_path / 'store.db', busy_timeout_ms=30000)
+        assert store.busy_timeout_ms == 30000
+
+    def test_cannot_instantiate_without_schema(self, tmp_path: Path):
+        """AsyncSqliteBase is abstract; instantiating without _schema raises TypeError."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        with pytest.raises(TypeError):
+            AsyncSqliteBase(tmp_path / 'store.db')  # type: ignore[abstract]
