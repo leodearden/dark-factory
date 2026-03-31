@@ -6279,6 +6279,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 345,
+        "title": "CostStore tests: extract fixture helpers to reduce duplication",
+        "description": "test_cost_store.py has significant duplication that makes schema changes expensive:\n\n1. **`_minimal_invocation(**overrides)` helper**: The 15-parameter `save_invocation()` call is copy-pasted in at least 5 test sites (TestSaveInvocation, TestCostStoreNotOpenedGuard, TestPostCloseGuard, TestConnectionReuse, test_double_open_raises). Extract a module-level helper that returns a dict with sensible defaults, so each call site becomes `await store.save_invocation(**_minimal_invocation(run_id='r-foo'))`.\n\n2. **Persist-across-reopen helper**: `test_invocation_persists_across_reopen` and `test_account_event_persists_across_reopen` are structurally identical (open→write→close→reopen→SELECT→assert). Extract a shared async helper `_assert_persists(db_path, write_coro_factory, read_query, assert_fn)` or parametrize the test.\n\nmemory_hints:\n- search: \"CostStore test helper fixture factory save_invocation boilerplate\"\n- entity: \"CostStore\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6291,7 +6302,7 @@
       ],
       "created": "2026-03-31T09:25:44.356Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T09:31:39.350Z"
+      "updated": "2026-03-31T09:31:47.476Z"
     }
   }
 }
