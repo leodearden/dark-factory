@@ -1,5 +1,5 @@
 {# Cost by role partial — horizontal stacked bar chart (cost by model per role) #}
-<div>
+<div data-by-role-container>
   <h3 class="text-sm font-semibold text-gray-300 mb-4">Cost by Role</h3>
   {% if by_role %}
     {% for project_id, roles in by_role.items() %}
@@ -13,10 +13,10 @@
   {% else %}
     <div class="text-gray-500 text-sm py-8 text-center">No role data available for this window.</div>
   {% endif %}
-</div>
 
-<script>
+  <script>
 (function() {
+  var container = document.currentScript.closest('[data-by-role-container]');
   var byRole = {{ by_role | tojson }};
 
   var palette = [
@@ -25,7 +25,7 @@
   ];
 
   function findProjectCanvas(projectId) {
-    var canvases = document.querySelectorAll('canvas[data-project-id]');
+    var canvases = container.querySelectorAll('canvas[data-project-id]');
     for (var i = 0; i < canvases.length; i++) {
       if (canvases[i].getAttribute('data-project-id') === projectId) return canvases[i];
     }
@@ -100,3 +100,4 @@
   }
 })();
 </script>
+</div>
