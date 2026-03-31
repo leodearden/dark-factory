@@ -959,6 +959,11 @@ class TestHxSyncOnSections:
         html = client.get('/costs').text
         assert 'hx-sync="this:abort"' in html or "hx-sync='this:abort'" in html
 
+    def test_hx_sync_count_equals_seven(self, client):
+        """Exact count of hx-sync attributes equals 7 (one per section)."""
+        html = client.get('/costs').text
+        assert html.count('hx-sync="this:abort"') == 7
+
     def test_hx_sync_on_each_section(self, client):
         """Each individual section (by data-cost-section value) must have hx-sync."""
         html = client.get('/costs').text
@@ -970,3 +975,65 @@ class TestHxSyncOnSections:
             assert marker in html, f'Section {section!r} not found in page'
         # Verify the total count of hx-sync attributes equals number of sections
         assert html.count('hx-sync="this:abort"') == len(sections)
+
+
+# ---------------------------------------------------------------------------
+# Task-343 step-5: css_id Jinja2 filter unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestCssIdFilter:
+    """Unit tests for the css_id Jinja2 filter registered in app.py."""
+
+    def _css_id(self, value):
+        from dashboard.app import css_id
+        return css_id(value)
+
+    def test_simple_string_passthrough(self):
+        """A clean identifier passes through unchanged."""
+        assert self._css_id('dark_factory') == 'dark_factory'
+
+    def test_path_string_sanitized(self):
+        """A filesystem path has slashes replaced with underscores."""
+        result = self._css_id('/home/leo/src/dark-factory')
+        assert result == 'home_leo_src_dark_factory'
+
+    def test_none_returns_unknown(self):
+        """None input falls back to 'unknown'."""
+        assert self._css_id(None) == 'unknown'
+
+    def test_empty_string_returns_unknown(self):
+        """Empty string falls back to 'unknown'."""
+        assert self._css_id('') == 'unknown'
+
+    def test_already_clean_string(self):
+        """A string with only alphanumeric and underscores passes through unchanged."""
+        assert self._css_id('my_project_123') == 'my_project_123'
+
+    def test_special_characters_replaced(self):
+        """Special characters (hyphens, dots, spaces) are replaced with underscores."""
+        result = self._css_id('my-project.name here')
+        assert result == 'my_project_name_here'
+
+    def test_multiple_consecutive_separators_collapsed(self):
+        """Multiple consecutive non-alphanum chars collapse to a single underscore."""
+        result = self._css_id('a---b')
+        assert result == 'a_b'
+
+    def test_leading_trailing_underscores_stripped(self):
+        """Leading and trailing underscores are stripped."""
+        result = self._css_id('/leading/trailing/')
+        # /leading/trailing/ → _leading_trailing_ → leading_trailing
+        assert not result.startswith('_')
+        assert not result.endswith('_')
+
+    def test_no_leading_digit_issue(self):
+        """Numeric-only input becomes a valid CSS ID (falls back to 'unknown' if empty after strip)."""
+        # purely underscores after replacement would collapse to '' → 'unknown'
+        result = self._css_id('---')
+        assert result == 'unknown'
+
+    def test_registered_as_jinja2_filter(self):
+        """css_id must be registered as a Jinja2 filter on the templates env."""
+        from dashboard.app import templates
+        assert 'css_id' in templates.env.filters
