@@ -174,17 +174,22 @@ class UsageGate:
             for acct in self._accounts:
                 if not acct.capped:
                     logger.debug(f'Using account {acct.name}')
-                    # Failover detection: emit event if account changed
+                    # Failover detection: emit event if account changed.
+                    # Update _last_account_name FIRST to close the race window,
+                    # then fire the event non-blocking (fire-and-forget).
                     if (
                         self._last_account_name is not None
                         and self._last_account_name != acct.name
                     ):
-                        await self._write_cost_event(
+                        old_name = self._last_account_name
+                        self._last_account_name = acct.name
+                        self._fire_cost_event(
                             acct.name,
                             'failover',
-                            json.dumps({'from': self._last_account_name, 'to': acct.name}),
+                            json.dumps({'from': old_name, 'to': acct.name}),
                         )
-                    self._last_account_name = acct.name
+                    else:
+                        self._last_account_name = acct.name
                     return acct.token
 
             # All capped — check if any reset times have passed before blocking.
