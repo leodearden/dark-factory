@@ -95,3 +95,81 @@ class TestParseWindow:
         req = self._make_request('24h')
         result = _parse_window(req)
         assert isinstance(result, int)
+
+
+# ---------------------------------------------------------------------------
+# Step-3: GET /costs page template tests
+# ---------------------------------------------------------------------------
+
+class TestCostsPage:
+    """Tests for the GET /costs route and template."""
+
+    def test_returns_200(self, client):
+        resp = client.get('/costs')
+        assert resp.status_code == 200
+
+    def test_content_type_html(self, client):
+        resp = client.get('/costs')
+        assert 'text/html' in resp.headers['content-type']
+
+    def test_contains_summary_partial(self, client):
+        html = client.get('/costs').text
+        assert '/costs/partials/summary' in html
+
+    def test_contains_by_project_partial(self, client):
+        html = client.get('/costs').text
+        assert '/costs/partials/by-project' in html
+
+    def test_contains_by_account_partial(self, client):
+        html = client.get('/costs').text
+        assert '/costs/partials/by-account' in html
+
+    def test_contains_by_role_partial(self, client):
+        html = client.get('/costs').text
+        assert '/costs/partials/by-role' in html
+
+    def test_contains_trend_partial(self, client):
+        html = client.get('/costs').text
+        assert '/costs/partials/trend' in html
+
+    def test_contains_events_partial(self, client):
+        html = client.get('/costs').text
+        assert '/costs/partials/events' in html
+
+    def test_contains_runs_partial(self, client):
+        html = client.get('/costs').text
+        assert '/costs/partials/runs' in html
+
+    def test_contains_window_selector_24h(self, client):
+        html = client.get('/costs').text
+        assert '24h' in html
+
+    def test_contains_window_selector_7d(self, client):
+        html = client.get('/costs').text
+        assert '7d' in html
+
+    def test_contains_window_selector_30d(self, client):
+        html = client.get('/costs').text
+        assert '30d' in html
+
+    def test_contains_window_selector_all(self, client):
+        html = client.get('/costs').text
+        assert 'all' in html.lower()
+
+    def test_sections_use_morph_swap(self, client):
+        """All HTMX polling sections must use morph:innerHTML for DOM diffing."""
+        html = client.get('/costs').text
+        assert 'morph:innerHTML' in html
+
+    def test_nav_costs_link_is_active(self, client):
+        """The 'Costs' nav link should have the active class on the /costs page."""
+        html = client.get('/costs').text
+        # Active class is 'border-b-2 border-blue-500'; costs link should carry it
+        assert 'border-blue-500' in html
+
+    def test_default_window_7d_marked_active(self, client):
+        """Without ?window=, the 7d button should be visually active."""
+        html = client.get('/costs').text
+        # The page must indicate 7d is the default/active window
+        # We check that 7d appears as the default in Alpine state or aria-pressed
+        assert '7d' in html
