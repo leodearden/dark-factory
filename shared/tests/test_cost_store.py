@@ -497,3 +497,30 @@ class TestPersistAcrossReopen:
         assert row[0] == 'run-persist'
         assert row[1] == 'task-1'
         assert abs(row[2] - 0.05) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# step-13: CostStore subclasses AsyncSqliteBase
+# ---------------------------------------------------------------------------
+
+
+class TestCostStoreInheritsAsyncSqliteBase:
+    """step-13: CostStore is a subclass of AsyncSqliteBase with correct _schema and busy_timeout."""
+
+    def test_coststore_is_subclass_of_async_sqlite_base(self) -> None:
+        """CostStore must be a subclass of AsyncSqliteBase."""
+        from shared.async_sqlite_base import AsyncSqliteBase
+
+        assert issubclass(CostStore, AsyncSqliteBase)
+
+    def test_coststore_schema_property_returns_ddl(self, tmp_path: Path) -> None:
+        """CostStore._schema returns the _SCHEMA DDL string."""
+        from shared.cost_store import _SCHEMA
+
+        store = CostStore(tmp_path / 'costs.db')
+        assert store._schema == _SCHEMA
+
+    def test_coststore_busy_timeout_is_30000(self, tmp_path: Path) -> None:
+        """CostStore sets busy_timeout_ms=30000 on the base class."""
+        store = CostStore(tmp_path / 'costs.db')
+        assert store.busy_timeout_ms == 30000

@@ -98,14 +98,14 @@
       "type": "impl",
       "description": "Implement _require_conn(): if _conn is None raise RuntimeError(f'{type(self).__name__} not opened'), else return _conn",
       "status": "done",
-      "commit": "pending"
+      "commit": "96462136"
     },
     {
       "id": "step-13",
       "type": "test",
       "description": "Add test to test_cost_store.py: CostStore is a subclass of AsyncSqliteBase, CostStore._schema returns the expected DDL string, CostStore.__init__ passes busy_timeout_ms=30000 to base",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "pending"
     },
     {
       "id": "step-14",
