@@ -377,6 +377,7 @@ class TestExecuteMem0ClassifyAndAddPlanningMetadata:
         """Specifically test a fact that should route to Mem0 gets planned=True."""
         # Preferences/norms always route to Mem0; patch classifier to force it
         from unittest.mock import AsyncMock, MagicMock
+
         from fused_memory.models.enums import MemoryCategory
         mock_classification = MagicMock()
         mock_classification.primary = MemoryCategory.preferences_and_norms
@@ -1586,8 +1587,8 @@ class TestSearchGraphitiFiltering:
         self, service_with_registry
     ):
         """Edge whose ALL episode UUIDs are in the planned registry is excluded by default."""
-        from tests.conftest import MockEdge, MockNode
         from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
 
         ep1, ep2 = 'plan-ep-1', 'plan-ep-2'
         service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
@@ -1613,8 +1614,8 @@ class TestSearchGraphitiFiltering:
         self, service_with_registry
     ):
         """Edge with mixed episodes (some planned, some not) is NOT excluded."""
-        from tests.conftest import MockEdge
         from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
 
         ep_planned = 'plan-ep-1'
         ep_real = 'real-ep-2'
@@ -1641,8 +1642,8 @@ class TestSearchGraphitiFiltering:
         self, service_with_registry
     ):
         """Edge with no episode provenance is NOT excluded (not a planned edge)."""
-        from tests.conftest import MockEdge
         from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
 
         service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
             return_value={'plan-ep-1'}
@@ -1665,8 +1666,8 @@ class TestSearchGraphitiFiltering:
         self, service_with_registry
     ):
         """Edge with all non-planned episodes is NOT excluded."""
-        from tests.conftest import MockEdge
         from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
 
         service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
             return_value={'plan-ep-1'}
@@ -1687,8 +1688,8 @@ class TestSearchGraphitiFiltering:
     @pytest.mark.asyncio
     async def test_no_registry_does_not_filter(self, service):
         """When planned_episode_registry is None, no filtering occurs."""
-        from tests.conftest import MockEdge
         from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
 
         service.planned_episode_registry = None
         service.graphiti.search = AsyncMock(return_value=[
@@ -1718,8 +1719,8 @@ class TestSearchGraphitiIncludePlanned:
         self, service_with_registry
     ):
         """With include_planned=True, edges that would normally be filtered are included."""
-        from tests.conftest import MockEdge
         from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
 
         ep1, ep2 = 'plan-ep-1', 'plan-ep-2'
         service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
@@ -1747,8 +1748,8 @@ class TestSearchGraphitiIncludePlanned:
         self, service_with_registry
     ):
         """With include_planned=True, planned edges have metadata['planned'] = True."""
-        from tests.conftest import MockEdge
         from fused_memory.models.scope import Scope
+        from tests.conftest import MockEdge
 
         ep1 = 'plan-ep-1'
         service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
@@ -1850,7 +1851,7 @@ class TestSearchIncludePlannedPassthrough:
     @pytest.mark.asyncio
     async def test_include_planned_true_passes_through_to_graphiti(self, service):
         """search(include_planned=True) passes the flag to _search_graphiti."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         captured_kwargs = {}
 
@@ -1871,7 +1872,7 @@ class TestSearchIncludePlannedPassthrough:
     @pytest.mark.asyncio
     async def test_include_planned_false_passes_through_to_mem0(self, service):
         """search(include_planned=False) [default] passes False to _search_mem0."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         captured_kwargs = {}
 
@@ -1891,7 +1892,7 @@ class TestSearchIncludePlannedPassthrough:
     @pytest.mark.asyncio
     async def test_include_planned_true_passes_through_to_mem0(self, service):
         """search(include_planned=True) passes True to _search_mem0."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         captured_kwargs = {}
 

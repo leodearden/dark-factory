@@ -593,8 +593,8 @@ class TestPlannedEpisodePromotion:
     ):
         """When _on_task_done fires, planned edges from search results have their
         episode UUIDs promoted via planned_episode_registry.promote()."""
-        from fused_memory.models.memory import MemoryResult
         from fused_memory.models.enums import SourceStore
+        from fused_memory.models.memory import MemoryResult
 
         # First search call (normal, exclude planned) returns empty.
         # Second search call (include_planned=True) returns a planned edge.
@@ -637,8 +637,8 @@ class TestPlannedEpisodePromotion:
     ):
         """When no planned edges are found (include_planned search returns non-planned
         results), promote() is not called."""
-        from fused_memory.models.memory import MemoryResult
         from fused_memory.models.enums import SourceStore
+        from fused_memory.models.memory import MemoryResult
 
         non_planned_result = MemoryResult(
             id='edge-real-1',
