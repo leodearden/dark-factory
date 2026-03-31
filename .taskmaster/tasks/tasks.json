@@ -5521,7 +5521,7 @@
         "description": "In orchestrator/src/orchestrator/harness.py, create CostStore at harness startup with db_path = config.project_root / 'data' / 'orchestrator' / 'runs.db' (same file as RunStore). Set usage_gate.project_id and usage_gate.run_id so cap events get attributed. Pass cost_store to each TaskWorkflow constructor. In workflow.py, pass cost_store plus run_id, task_id, project_id, and role name to every invoke_with_cap_retry call. The role name comes from the workflow stage — 'architect', 'implementer', 'debugger', 'reviewer', 'merger'. In steward.py, accept cost_store and pass it through the steward's invocation path (its own invoke_agent calls should also write invocation records with role='steward'). Ensure CostStore connection is closed in harness teardown (finally block, alongside RunStore). Update harness/workflow/steward tests to verify CostStore is threaded and called.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "299",
           "300"
@@ -5556,7 +5556,8 @@
               "RunStore database path and WAL mode configuration"
             ]
           }
-        }
+        },
+        "updatedAt": "2026-03-31T13:54:35.076Z"
       },
       {
         "id": "302",
@@ -6508,7 +6509,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T13:54:35.037Z",
+      "lastModified": "2026-03-31T13:54:35.076Z",
       "taskCount": 324,
       "completedCount": 280,
       "tags": [
