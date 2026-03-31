@@ -129,7 +129,7 @@
       "id": "step-16",
       "type": "impl",
       "description": "Verify step-15 passes: by_role.html embeds by_role via tojson which includes both 'implementer' and 'reviewer' keys, and Chart.js labels include roleNames from Object.keys()",
-      "status": "pending",
+      "status": "done",
       "commit": null
     }
   ],
