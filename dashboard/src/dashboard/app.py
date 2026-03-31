@@ -241,7 +241,8 @@ async def index(request: Request):
 
 @app.get('/costs')
 async def costs(request: Request):
-    window = request.query_params.get('window', '7d')
+    window_raw = request.query_params.get('window', '7d')
+    window = window_raw if window_raw in _WINDOW_DAYS else '7d'
     return templates.TemplateResponse(request, 'costs.html', context={'window': window})
 
 

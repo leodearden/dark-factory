@@ -5,7 +5,7 @@
 {% block content %}
 <script>
   document.addEventListener('alpine:init', () => {
-    Alpine.store('costs', { window: '{{ window | default("7d") }}' });
+    Alpine.store('costs', { window: {{ window | default("7d") | tojson }} });
   });
 </script>
 <div class="space-y-8 max-w-7xl mx-auto p-6">
