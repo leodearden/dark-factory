@@ -1,0 +1,114 @@
+{
+  "task_id": "355",
+  "title": "Fix UsageGate coroutine leak in _fire_cost_event and shutdown lifecycle gap",
+  "files": [
+    "shared/src/shared/usage_gate.py",
+    "shared/tests/test_usage_gate.py"
+  ],
+  "modules": [
+    "shared/src/shared",
+    "shared/tests"
+  ],
+  "analysis": "Three bugs in shared/src/shared/usage_gate.py need fixing:\n\n1. **Coroutine leak (lines 339-348):** In `_fire_cost_event`, the coroutine `self._write_cost_event(...)` is created inline inside `loop.create_task()`. If `create_task()` raises RuntimeError (e.g. 'Event loop is closed' during shutdown), the coroutine object is never `.close()`d. Python will emit 'RuntimeWarning: coroutine was never awaited' at GC time. Fix: extract the coroutine into a local variable before `create_task`, then call `coro.close()` in the except block.\n\n2. **shutdown() lifecycle gap (lines 431-438):** `_background_tasks` (set of fire-and-forget asyncio.Task objects) was introduced to prevent GC of cost event tasks, but `shutdown()` only cancels per-account resume probe tasks \u2014 it ignores `_background_tasks`. In-flight cost event coroutines will be abandoned, producing 'Task was destroyed but it is pending' warnings. Fix: after cancelling resume tasks, iterate `_background_tasks`, cancel each, and await with CancelledError suppression.\n\n3. **before_invoke guard inconsistency (lines 187-191):** The failover branch in `before_invoke()` calls `json.dumps(...)` and `_fire_cost_event(...)` unconditionally, while `_handle_cap_detected` (line 270) and `_account_resume_probe_loop` (line 428) both guard with `if self._cost_store:`. Fix: add the same `if self._cost_store:` guard around the failover event in `before_invoke()`.\n\nExisting test file `shared/tests/test_usage_gate.py` has good coverage of the task-336 changes including fire-cost-event behavior and guard patterns. The `make_gate()` and `make_mock_cost_store()` helpers are reusable. Tests use pytest-asyncio with `@pytest.mark.asyncio` class decorators. The existing `test_create_task_error_is_non_fatal` test has the mock itself closing the coroutine \u2014 we need a new test that verifies the *production code* closes it (mock must NOT close).",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Write test_coroutine_closed_on_create_task_failure: mock loop.create_task to raise RuntimeError WITHOUT closing the coro; after _fire_cost_event returns, assert coro.cr_frame is None (proving production code called coro.close()). Add to new TestFireCostEventCoroutineLeak class.",
+      "status": "done",
+      "commit": "4d1c4081"
+    },
+    {
+      "id": "step-2",
+      "type": "impl",
+      "description": "Fix _fire_cost_event coroutine leak: extract `coro = self._write_cost_event(account_name, event_type, details)` before try block, pass `coro` to `loop.create_task(coro, name=...)`, and add `coro.close()` in the except RuntimeError block before the warning log.",
+      "status": "done",
+      "commit": "f01ec5b5"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Write test_shutdown_cancels_and_awaits_background_tasks: create gate with mock cost_store, fire multiple cost events to populate _background_tasks, call shutdown(), assert _background_tasks is empty and all tasks are done. Add to new TestShutdownBackgroundTasks class.",
+      "status": "done",
+      "commit": "fc08a9ba"
+    },
+    {
+      "id": "step-4",
+      "type": "test",
+      "description": "Write test_shutdown_with_empty_background_tasks: call shutdown() when _background_tasks is empty, verify no errors (regression guard for the new draining code).",
+      "status": "done",
+      "commit": "fc08a9ba"
+    },
+    {
+      "id": "step-5",
+      "type": "impl",
+      "description": "Fix shutdown() to drain _background_tasks: after the existing resume-task cancellation loop, add `for task in list(self._background_tasks): task.cancel()` with `contextlib.suppress(asyncio.CancelledError): await task`. Update docstring to mention background task draining.",
+      "status": "done",
+      "commit": "34640873"
+    },
+    {
+      "id": "step-6",
+      "type": "test",
+      "description": "Write test_before_invoke_failover_no_json_dumps_without_cost_store: create gate with cost_store=None, trigger failover (cap acct-A, _last_account_name='acct-A'), patch json.dumps and _fire_cost_event, assert neither is called. Add to new TestBeforeInvokeGuardConsistency class.",
+      "status": "done",
+      "commit": "f3928834"
+    },
+    {
+      "id": "step-7",
+      "type": "test",
+      "description": "Write test_before_invoke_failover_fires_event_with_cost_store: create gate WITH cost_store, trigger failover, assert _fire_cost_event IS called (positive control for the guard).",
+      "status": "done",
+      "commit": "f3928834"
+    },
+    {
+      "id": "step-8",
+      "type": "impl",
+      "description": "Fix before_invoke() guard: wrap lines 187-191 (the _fire_cost_event call with json.dumps) in `if self._cost_store:` to match the pattern used in _handle_cap_detected (line 270) and _account_resume_probe_loop (line 428).",
+      "status": "done",
+      "commit": "ebd2eaf9"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Test coroutine closure via cr_frame inspection rather than warning capture",
+      "rationale": "RuntimeWarning for unawaited coroutines fires during GC which is non-deterministic. Checking `coro.cr_frame is None` after _fire_cost_event returns is a deterministic proof that .close() was called. An un-started coroutine has cr_frame set; after .close(), cr_frame becomes None."
+    },
+    {
+      "decision": "New test for coro leak does NOT close the coro in the mock (unlike existing test_create_task_error_is_non_fatal)",
+      "rationale": "The existing test has the mock calling coro.close() before raising, which masks the production bug. The new test omits mock-side cleanup so we can verify production code performs the cleanup. The existing test continues to pass (double-close is a no-op)."
+    },
+    {
+      "decision": "shutdown() drains _background_tasks after resume probe tasks, not before",
+      "rationale": "Resume probe tasks are the primary lifecycle concern (they hold references to AccountState). Background cost-event tasks are lightweight telemetry. Draining them second follows the existing pattern and is less likely to interfere with probe cancellation."
+    },
+    {
+      "decision": "Guard uses `if self._cost_store:` wrapping the entire _fire_cost_event call (not just json.dumps)",
+      "rationale": "Matches the pattern at lines 270 and 428. While _fire_cost_event itself early-returns when cost_store is None, guarding the call site avoids the unnecessary json.dumps serialization and makes the intent explicit at the call site."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "make_gate() helper",
+      "where": "shared/tests/test_usage_gate.py:21-49",
+      "how": "Reuse for all new tests. Supports cost_store parameter, wait_for_reset, and session_budget_usd."
+    },
+    {
+      "what": "make_mock_cost_store() helper",
+      "where": "shared/tests/test_usage_gate.py:52-56",
+      "how": "Reuse for tests that need a non-None CostStore (coroutine leak test, shutdown draining test, positive-control guard test)."
+    },
+    {
+      "what": "Existing mock pattern for loop.create_task",
+      "where": "shared/tests/test_usage_gate.py:224-238 (TestFireCostEventRuntimeErrorHandling)",
+      "how": "Adapt the MagicMock loop + patch('shared.usage_gate.asyncio.get_running_loop') pattern for the coroutine leak test, but WITHOUT calling coro.close() in the mock."
+    },
+    {
+      "what": "Existing guard test pattern",
+      "where": "shared/tests/test_usage_gate.py:286-309 (TestHandleCapDetectedJsonDumpsGuard)",
+      "how": "Mirror the json.dumps + _fire_cost_event assertion pattern for the before_invoke guard consistency tests."
+    }
+  ],
+  "_session_id": "355-ebcf0664",
+  "_created_at": "2026-03-31T15:25:27.383865+00:00"
+}
