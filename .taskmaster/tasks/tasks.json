@@ -3196,11 +3196,11 @@
         "description": "All dashboard sections poll at fixed intervals (10s, 15s, 30s, 60s) with no randomization. Multiple browser tabs or dashboard instances will hit the backend simultaneously. Add random jitter to polling intervals.",
         "details": "File: dashboard/src/dashboard/templates/index.html (lines 8, 22, 36, 50, 60).\n\nHTMX doesn't natively support jitter, but workaround: use hx-trigger=\"load, every 10s\" with a small JS script that randomizes the initial delay per section, or use htmx:configRequest to add small random delays. Alternative: use a single polling heartbeat that triggers all sections with staggered offsets.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-31T08:54:23.568Z",
+        "updatedAt": "2026-03-31T13:54:34.715Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/recon.html",
@@ -5712,7 +5712,7 @@
         "description": "PRD and task-creation episodes (via parse_prd/expand_task) generate Graphiti edges that describe planned work as current fact. This creates contamination where aspirational state appears as implemented reality in the knowledge graph. For example, reconciliation run 248aca6b found and deleted edges claiming 'CostStore extends AgentResult' (factually wrong) and 'invoke_with_cap_retry is instrumented with CostStore' (task 301 still pending).\n\nSolution: Add a temporal qualifier to edges extracted from PRD/planning episodes. Options include:\n1. Tag PRD-sourced edges with a 'planned' or 'aspirational' qualifier in metadata\n2. Defer edge creation until the corresponding task is marked done\n3. Add a valid_at constraint tied to task completion\n4. Filter PRD-sourced edges from search results unless explicitly requested\n\nThis should be implemented in the add_episode pipeline or the reconciliation post-processing layer.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -5744,7 +5744,7 @@
             "fused-memory/tests"
           ]
         },
-        "updatedAt": "2026-03-30T22:05:47.849Z"
+        "updatedAt": "2026-03-31T13:54:34.749Z"
       },
       {
         "id": "309",
@@ -6508,7 +6508,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T13:54:34.687Z",
+      "lastModified": "2026-03-31T13:54:34.749Z",
       "taskCount": 324,
       "completedCount": 280,
       "tags": [
