@@ -1236,3 +1236,192 @@ class TestSchema:
         assert 'idx_inv_completed_at' in index_names, (
             f"idx_inv_completed_at missing from cost_store._SCHEMA indexes: {index_names}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: get_account_events limit parameter
+# ---------------------------------------------------------------------------
+
+class TestAccountEventsLimit:
+    @pytest.mark.asyncio
+    async def test_limit_restricts_results(self, tmp_path):
+        """limit=3 returns only the 3 most-recent events (DESC order preserved).
+
+        Insert 10 account events with known timestamps, call get_account_events
+        with limit=3, assert exactly 3 rows returned and they are the 3 most
+        recent (highest created_at values).
+        """
+        db_path = tmp_path / 'ae_limit.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+
+        # Insert 10 events at 10 different timestamps (10m ago, 9m ago, ... 1m ago)
+        events = [
+            ('acc', 'cap_hit', 'proj', 'r1', None,
+             (now - timedelta(minutes=10 - i)).isoformat())
+            for i in range(10)
+        ]
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            events,
+        )
+        conn.commit()
+        conn.close()
+
+        # Expected: the 3 most recent = minutes 0, 1, 2 ago (DESC)
+        expected_ts = sorted(
+            [(now - timedelta(minutes=10 - i)).isoformat() for i in range(10)],
+            reverse=True,
+        )[:3]
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_account_events(aconn, limit=3)
+
+        assert len(result) == 3, f"expected 3 rows, got {len(result)}"
+        result_ts = [e['created_at'] for e in result]
+        # Verify DESC order is preserved
+        assert result_ts == sorted(result_ts, reverse=True)
+        # Verify these are the 3 most recent
+        assert result_ts == expected_ts
+
+    @pytest.mark.asyncio
+    async def test_default_limit_returns_all_when_under_threshold(self, tmp_path):
+        """Default limit (200) returns all rows when count < 200.
+
+        Insert 5 events, call without explicit limit, assert all 5 returned.
+        """
+        db_path = tmp_path / 'ae_default_limit.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+
+        events = [
+            ('acc', 'cap_hit', 'proj', 'r1', None,
+             (now - timedelta(minutes=i)).isoformat())
+            for i in range(5)
+        ]
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            events,
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_account_events(aconn)
+
+        assert len(result) == 5, f"expected 5 rows with default limit, got {len(result)}"
+
+
+# ---------------------------------------------------------------------------
+# Tests: get_run_cost_breakdown limit parameter
+# ---------------------------------------------------------------------------
+
+class TestRunCostBreakdownLimit:
+    @pytest.mark.asyncio
+    async def test_limit_restricts_invocation_rows(self, tmp_path):
+        """limit=3 caps invocation rows at the SQL level to at most 3.
+
+        Insert 6 invocations across 2 runs/tasks, call get_run_cost_breakdown
+        with limit=3, assert the assembled result reflects at most 3 invocation
+        rows total (which may result in fewer runs/tasks assembled).
+        """
+        db_path = tmp_path / 'rcb_limit.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+
+        conn.execute(
+            'INSERT INTO runs (run_id, project_id, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?)',
+            ('r1', 'proj', (now - timedelta(hours=2)).isoformat(), now.isoformat()),
+        )
+        conn.execute(
+            'INSERT INTO task_results (run_id, task_id, project_id, title, outcome, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            ('r1', 't1', 'proj', 'Task One', 'done', now.isoformat()),
+        )
+        # Insert 6 invocations for the same run/task
+        invocations = [
+            ('r1', 't1', 'proj', 'acc', 'claude-opus-4-5', 'implementer',
+             0.10, 0,
+             (now - timedelta(minutes=6 - i)).isoformat(),
+             (now - timedelta(minutes=5 - i)).isoformat())
+            for i in range(6)
+        ]
+        conn.executemany(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            invocations,
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_run_cost_breakdown(aconn, limit=3)
+
+        # Total invocations across all tasks in all runs must be <= 3
+        total_invocations = sum(
+            len(task['invocations'])
+            for run in result
+            for task in run['tasks']
+        )
+        assert total_invocations <= 3, (
+            f"expected <= 3 invocation rows with limit=3, got {total_invocations}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_limit_returns_all_when_under_threshold(self, tmp_path):
+        """Default limit (500) returns all rows when count < 500.
+
+        Insert 4 invocations, call without explicit limit, assert all 4 returned.
+        """
+        db_path = tmp_path / 'rcb_default_limit.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+
+        conn.execute(
+            'INSERT INTO runs (run_id, project_id, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?)',
+            ('r1', 'proj', (now - timedelta(hours=1)).isoformat(), now.isoformat()),
+        )
+        invocations = [
+            ('r1', f't{i}', 'proj', 'acc', 'claude-opus-4-5', 'implementer',
+             0.10, 0,
+             (now - timedelta(minutes=i + 1)).isoformat(),
+             (now - timedelta(minutes=i)).isoformat())
+            for i in range(4)
+        ]
+        conn.executemany(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            invocations,
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_run_cost_breakdown(aconn)
+
+        total_invocations = sum(
+            len(task['invocations'])
+            for run in result
+            for task in run['tasks']
+        )
+        assert total_invocations == 4, (
+            f"expected 4 invocations with default limit, got {total_invocations}"
+        )
