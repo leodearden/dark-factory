@@ -61,10 +61,18 @@ class TestRedirectNodeEdges:
         first_call = graph.query.call_args_list[0]
         args = first_call[0]
         params = args[1] if len(args) > 1 else {}
-        # Both UUIDs should appear in params
+        # Both UUIDs should appear in params (inter-node edges are BETWEEN both nodes)
         assert dep_uuid in params.values() or any(
             dep_uuid in str(v) for v in params.values()
         )
+        assert sur_uuid in params.values() or any(
+            sur_uuid in str(v) for v in params.values()
+        )
+        # Second query (index 1) is the inter-node DELETE
+        second_call = graph.query.call_args_list[1]
+        second_args = second_call[0]
+        second_cypher = second_args[0] if second_args else ''
+        assert 'DELETE' in second_cypher
 
     @pytest.mark.asyncio
     async def test_returns_count_dict(self, mock_config, make_backend, make_graph_mock):
