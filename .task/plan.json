@@ -28,29 +28,29 @@
       "id": "step-3",
       "type": "test",
       "description": "Strengthen `test_null_task_id` in TestRunCostBreakdown: add a third NULL-task_id invocation with a DIFFERENT model (claude-opus-4-5) and role (debugger) alongside the existing two (claude-sonnet-4-5/orchestrator). Assert: still exactly 1 task entry with task_id=None, title=None; cost accumulates all 3 invocations; invocations list has length 3; each invocation's model/role/cost_usd fields are individually correct (verify heterogeneous invocations don't break grouping).",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "8bec16b2"
     },
     {
       "id": "step-4",
       "type": "impl",
       "description": "Run the strengthened null task_id test. Should pass \u2014 the grouping logic in get_run_cost_breakdown uses `task_id not in run['tasks']` which handles None as a dict key correctly, and invocations are appended regardless of model/role. If it fails, fix the grouping logic.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "8bec16b2"
     },
     {
       "id": "step-5",
       "type": "test",
       "description": "Add `test_cap_only_account_with_out_of_window_invocations` to TestCostByAccount. Setup: insert 2 invocations for 'max-ghost' at 20d ago (outside days=7 window), plus 1 cap_hit event at 2h ago (inside window). Call get_cost_by_account(conn, days=7). Assert: 'max-ghost' IS present in result (second-pass gap-fill), spend=0.0, invocations=0, cap_events=1, status='capped', last_cap matches the cap_hit timestamp. This documents that the second pass correctly surfaces accounts whose invocations aged out of the window but still have active cap events.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "43d4339e"
     },
     {
       "id": "step-6",
       "type": "impl",
       "description": "Run the cap-only-with-out-of-window-invocations test. Should pass \u2014 the inv_rows query filters by completed_at >= cutoff (excluding old invocations), while evt_rows independently finds in-window cap events, and the second pass at line 195 adds accounts in caps but not in result. If it fails, the second-pass logic needs adjustment.",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "43d4339e"
     }
   ],
   "design_decisions": [
