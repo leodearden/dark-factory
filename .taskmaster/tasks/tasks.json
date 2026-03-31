@@ -6454,7 +6454,16 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/costs.html",
+            "dashboard/src/dashboard/templates/partials/costs/by_role.html"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates"
+          ]
+        }
       },
       {
         "id": 344,
@@ -6465,7 +6474,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "shared/src/shared/async_sqlite_base.py",
+            "shared/tests/test_async_sqlite_base.py"
+          ],
+          "modules": [
+            "shared/src/shared",
+            "shared/tests"
+          ]
+        }
       },
       {
         "id": 345,
