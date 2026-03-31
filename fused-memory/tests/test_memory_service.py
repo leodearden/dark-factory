@@ -2081,3 +2081,23 @@ class TestSearchGraphitiInvalidatedFiltering:
         )
         assert 'edge-valid-a' in result_ids
         assert 'edge-valid-c' in result_ids
+
+    # step-7: _search_graphiti over-fetches from Graphiti to compensate for filtered edges
+    @pytest.mark.asyncio
+    async def test_overfetch_compensates_for_filtered_edges(self, service):
+        """_search_graphiti calls graphiti.search with num_results=int(limit*1.5)+1."""
+        from fused_memory.models.scope import Scope
+
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        scope = Scope(project_id='test')
+        await service._search_graphiti('query', scope, limit=10)
+
+        service.graphiti.search.assert_called_once()
+        call_kwargs = service.graphiti.search.call_args
+        actual_num_results = call_kwargs.kwargs.get('num_results', call_kwargs.args[2] if len(call_kwargs.args) > 2 else None)
+        expected_num_results = int(10 * 1.5) + 1  # = 16
+        assert actual_num_results == expected_num_results, (
+            f'graphiti.search must be called with num_results={expected_num_results} '
+            f'(int(limit * 1.5) + 1 for limit=10), got {actual_num_results}'
+        )
