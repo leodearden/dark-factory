@@ -18,6 +18,7 @@
 (function() {
   var container = document.currentScript.closest('[data-by-role-container]');
   var byRole = {{ by_role | tojson }};
+  var rendered = false;
 
   var palette = [
     '#60a5fa','#34d399','#fbbf24','#f87171','#a78bfa',
@@ -40,6 +41,8 @@
   }
 
   function renderCharts() {
+    if (rendered) return;
+    rendered = true;
     var projectIds = Object.keys(byRole);
     projectIds.forEach(function(projectId) {
       var el = getOrDestroyChart(findProjectCanvas(projectId));
