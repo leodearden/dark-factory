@@ -101,7 +101,7 @@
       "id": "step-12",
       "type": "impl",
       "description": "Verify step-11 passes: runs.html renders '\u2014' for null task_id and '<em class=\"text-gray-500\">unassigned</em>' for null title",
-      "status": "pending",
+      "status": "done",
       "commit": null
     },
     {
