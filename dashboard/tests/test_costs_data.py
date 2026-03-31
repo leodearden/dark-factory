@@ -501,6 +501,45 @@ class TestCostByAccount:
         assert ay['last_cap'] == acct_y_cap_ts
 
     @pytest.mark.asyncio
+    async def test_cap_only_account(self, tmp_path):
+        """Account with cap_hit events but zero invocations is absent from results.
+
+        get_cost_by_account iterates over the invocations query (inv_rows) to
+        build its result dict. Accounts that only have account_events entries
+        (e.g., a capped account that never ran a task in the window) are
+        excluded because the outer loop never visits them.
+
+        This is intentional: the cost-by-account view is spend-oriented. An
+        account with no spend doesn't appear, even if it has hit its cap.
+        """
+        db_path = tmp_path / 'cap_only.db'
+        conn = __import__('sqlite3').connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+        now = datetime.now(UTC)
+
+        # Insert cap_hit events only — no corresponding invocations
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                ('max-cap-only', 'cap_hit', 'proj', 'r1', None,
+                 (now - timedelta(hours=3)).isoformat()),
+                ('max-cap-only', 'cap_hit', 'proj', 'r2', None,
+                 (now - timedelta(hours=1)).isoformat()),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn)
+
+        # Account with only cap events and no invocations is absent — by design.
+        assert 'max-cap-only' not in result
+
+    @pytest.mark.asyncio
     async def test_account_with_no_caps(self, tmp_path):
         """Account that has invocations but no cap events has cap_events=0, last_cap=None."""
         db_path = tmp_path / 'nocap.db'
