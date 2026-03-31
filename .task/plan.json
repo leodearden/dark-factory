@@ -91,14 +91,14 @@
       "type": "test",
       "description": "Write failing tests for _require_conn(): returns connection when open, raises RuntimeError('{ClassName} not opened') when not open, raises after close",
       "status": "done",
-      "commit": "pending"
+      "commit": "35fe0b20"
     },
     {
       "id": "step-12",
       "type": "impl",
       "description": "Implement _require_conn(): if _conn is None raise RuntimeError(f'{type(self).__name__} not opened'), else return _conn",
-      "status": "pending",
-      "commit": null
+      "status": "done",
+      "commit": "pending"
     },
     {
       "id": "step-13",

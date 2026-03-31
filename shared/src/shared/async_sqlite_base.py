@@ -93,4 +93,6 @@ class AsyncSqliteBase(abc.ABC):
 
     def _require_conn(self) -> aiosqlite.Connection:
         """Return the open connection or raise RuntimeError."""
-        raise NotImplementedError
+        if self._conn is None:
+            raise RuntimeError(f'{type(self).__name__} not opened')
+        return self._conn
