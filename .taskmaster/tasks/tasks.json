@@ -6158,6 +6158,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 334,
+        "title": "Add missing test coverage for cost query edge cases",
+        "description": "Add tests to dashboard/tests/test_costs_data.py covering gaps:\n- Add parametric test verifying `days` parameter controls look-back window (insert records inside and outside window, assert filtering)\n- Strengthen `test_null_task_id` with 2+ NULL-task_id invocations to verify grouping logic\n- Add test for account with cap_hit events but zero invocations in window (documents expected behavior)\n\nFiles: dashboard/tests/test_costs_data.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -6170,7 +6181,7 @@
       ],
       "created": "2026-03-31T09:25:44.356Z",
       "description": "Tasks for master context",
-      "updated": "2026-03-31T09:25:44.360Z"
+      "updated": "2026-03-31T09:25:48.465Z"
     }
   }
 }
