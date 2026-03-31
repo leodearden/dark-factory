@@ -73,6 +73,24 @@ class TestParseCodexNullUsage:
         assert agent_result.turns == 1
 
 
+class TestParseCodexAbsentUsage:
+
+    def test_absent_usage_key_does_not_raise(self):
+        """_parse_codex_output does not raise when the 'usage' key is absent (not null)."""
+        events = [
+            {'type': 'thread.started', 'thread_id': 'tid-3'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'hello'}},
+            {'type': 'turn.completed'},  # no 'usage' key
+        ]
+        payload = '\n'.join(json.dumps(e) for e in events)
+        result = _make_subprocess_result(stdout=payload)
+        agent_result = _parse_codex_output(result, 'o4-mini')
+        assert agent_result.success is True
+        assert agent_result.output == 'hello'
+        assert agent_result.cost_usd == 0.0
+        assert agent_result.turns == 1
+
+
 class TestParseCodexValidUsage:
 
     def test_valid_usage_computes_nonzero_cost_and_turns(self):
