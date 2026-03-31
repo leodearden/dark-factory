@@ -51,6 +51,13 @@
       "description": "Run the cap-only-with-out-of-window-invocations test. Should pass \u2014 the inv_rows query filters by completed_at >= cutoff (excluding old invocations), while evt_rows independently finds in-window cap events, and the second pass at line 195 adds accounts in caps but not in result. If it fails, the second-pass logic needs adjustment.",
       "status": "done",
       "commit": "43d4339e"
+    },
+    {
+      "id": "step-7",
+      "type": "impl",
+      "description": "Remove .task/plan.json from git index to prevent repository contamination. Run `git rm --cached .task/plan.json` to untrack the file without deleting the working copy. The file is already in .gitignore but was force-added or added before the rule existed, so git continues tracking it. After removal from the index, .gitignore will prevent future re-addition. Commit this change. Verify with `git ls-files .task/` that no .task/ files remain tracked.",
+      "status": "done",
+      "commit": null
     }
   ],
   "design_decisions": [
@@ -73,6 +80,10 @@
     {
       "decision": "Place parametric days test in its own TestDaysParameter class",
       "rationale": "The parametric test exercises multiple query functions, so it doesn't belong in any single function's test class. A dedicated class keeps the file organized and makes it clear this is cross-cutting coverage."
+    },
+    {
+      "decision": "Remove .task/plan.json from git index as a dedicated step rather than rewriting history",
+      "rationale": "Rewriting history (interactive rebase to strip .task/ from prior commits) risks force-push complications and breaks commit SHAs referenced by completed steps. A forward-fix via `git rm --cached` is safer \u2014 it removes the file from future commits while preserving the existing commit chain. The merge-to-main scrub in git_ops should also catch this, but the explicit untrack ensures the branch itself is clean."
     }
   ],
   "reuse": [
@@ -98,5 +109,5 @@
     }
   ],
   "_session_id": "334-210e9c26",
-  "_created_at": "2026-03-31T14:48:54.165189+00:00"
+  "_created_at": "2026-03-31T15:00:24.576077+00:00"
 }
