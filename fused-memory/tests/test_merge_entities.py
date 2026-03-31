@@ -163,3 +163,120 @@ class TestDeleteEntityNode:
         backend = GraphitiBackend(mock_config)  # client is None
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.delete_entity_node('node-uuid-1')
+
+
+# ---------------------------------------------------------------------------
+# step-5: GraphitiBackend.merge_entities
+# ---------------------------------------------------------------------------
+
+class TestMergeEntities:
+    """GraphitiBackend.merge_entities(deprecated_uuid, surviving_uuid) merges two nodes."""
+
+    @pytest.fixture
+    def backend_with_mocks(self, mock_config, make_backend):
+        """GraphitiBackend with sub-methods mocked for orchestration testing."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(side_effect=[
+            ('DeprecatedName', 'old dep summary'),   # first call: deprecated node
+            ('SurvivingName', 'old sur summary'),     # second call: surviving node
+        ])
+        backend.redirect_node_edges = AsyncMock(return_value={
+            'outgoing_redirected': 2,
+            'incoming_redirected': 1,
+            'inter_node_deleted': 0,
+        })
+        backend.delete_entity_node = AsyncMock()
+        backend.refresh_entity_summary = AsyncMock(return_value={
+            'uuid': 'sur-uuid',
+            'name': 'SurvivingName',
+            'old_summary': 'old sur summary',
+            'new_summary': 'SurvivingName knows Foo\nDeprecatedName knows Bar',
+            'edge_count': 3,
+        })
+        return backend
+
+    @pytest.mark.asyncio
+    async def test_validates_both_nodes_exist(self, backend_with_mocks):
+        """Calls get_node_text for both UUIDs to validate existence."""
+        backend = backend_with_mocks
+        await backend.merge_entities('dep-uuid', 'sur-uuid')
+        assert backend.get_node_text.await_count == 2
+        calls = [c[0][0] for c in backend.get_node_text.call_args_list]
+        assert 'dep-uuid' in calls
+        assert 'sur-uuid' in calls
+
+    @pytest.mark.asyncio
+    async def test_raises_node_not_found_for_deprecated(self, mock_config, make_backend):
+        """Raises NodeNotFoundError when deprecated node doesn't exist."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(side_effect=NodeNotFoundError('not found'))
+        with pytest.raises(NodeNotFoundError):
+            await backend.merge_entities('missing-dep', 'sur-uuid')
+
+    @pytest.mark.asyncio
+    async def test_raises_node_not_found_for_surviving(self, mock_config, make_backend):
+        """Raises NodeNotFoundError when surviving node doesn't exist."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(side_effect=[
+            ('DepName', ''),           # deprecated exists
+            NodeNotFoundError('not found'),  # surviving missing
+        ])
+        with pytest.raises(NodeNotFoundError):
+            await backend.merge_entities('dep-uuid', 'missing-sur')
+
+    @pytest.mark.asyncio
+    async def test_calls_in_correct_order(self, backend_with_mocks):
+        """Calls redirect_node_edges, then delete_entity_node, then refresh_entity_summary."""
+        backend = backend_with_mocks
+        call_order = []
+        backend.redirect_node_edges = AsyncMock(
+            side_effect=lambda *a, **kw: call_order.append('redirect') or {
+                'outgoing_redirected': 0, 'incoming_redirected': 0, 'inter_node_deleted': 0
+            }
+        )
+        backend.delete_entity_node = AsyncMock(
+            side_effect=lambda *a, **kw: call_order.append('delete')
+        )
+        backend.refresh_entity_summary = AsyncMock(
+            side_effect=lambda *a, **kw: call_order.append('refresh') or {
+                'uuid': 'sur-uuid', 'name': 'S', 'old_summary': '', 'new_summary': '', 'edge_count': 0
+            }
+        )
+        await backend.merge_entities('dep-uuid', 'sur-uuid')
+        assert call_order == ['redirect', 'delete', 'refresh']
+
+    @pytest.mark.asyncio
+    async def test_returns_audit_dict(self, backend_with_mocks):
+        """Returns audit dict with expected keys."""
+        backend = backend_with_mocks
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid')
+        assert result['surviving_uuid'] == 'sur-uuid'
+        assert result['deprecated_uuid'] == 'dep-uuid'
+        assert result['surviving_name'] == 'SurvivingName'
+        assert result['deprecated_name'] == 'DeprecatedName'
+        assert 'edges_redirected' in result
+        assert isinstance(result['edges_redirected'], dict)
+        assert 'surviving_summary' in result
+
+    @pytest.mark.asyncio
+    async def test_merge_with_zero_edges_succeeds(self, mock_config, make_backend):
+        """When deprecated node has zero edges, merge still succeeds."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(side_effect=[
+            ('DepName', ''),
+            ('SurName', 'existing summary'),
+        ])
+        backend.redirect_node_edges = AsyncMock(return_value={
+            'outgoing_redirected': 0,
+            'incoming_redirected': 0,
+            'inter_node_deleted': 0,
+        })
+        backend.delete_entity_node = AsyncMock()
+        backend.refresh_entity_summary = AsyncMock(return_value={
+            'uuid': 'sur-uuid', 'name': 'SurName',
+            'old_summary': 'existing summary', 'new_summary': 'existing summary', 'edge_count': 1,
+        })
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid')
+        backend.delete_entity_node.assert_awaited_once_with('dep-uuid')
+        backend.refresh_entity_summary.assert_awaited_once_with('sur-uuid')
+        assert result['surviving_uuid'] == 'sur-uuid'
