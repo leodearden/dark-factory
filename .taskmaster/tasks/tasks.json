@@ -6265,7 +6265,7 @@
         "description": "Add tests to dashboard/tests/test_costs_data.py covering gaps:\n- Add parametric test verifying `days` parameter controls look-back window (insert records inside and outside window, assert filtering)\n- Strengthen `test_null_task_id` with 2+ NULL-task_id invocations to verify grouping logic\n- Add test for account with cap_hit events but zero invocations in window (documents expected behavior)\n\nFiles: dashboard/tests/test_costs_data.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -6276,7 +6276,8 @@
           "modules": [
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-03-31T14:45:22.205Z"
       },
       {
         "id": "335",
@@ -6715,7 +6716,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-03-31T14:45:22.152Z",
+      "lastModified": "2026-03-31T14:45:22.205Z",
       "taskCount": 341,
       "completedCount": 286,
       "tags": [
