@@ -1,0 +1,90 @@
+{
+  "task_id": "316",
+  "title": "Clean up _to_token_count API surface and strengthen parser tests",
+  "files": [
+    "orchestrator/tests/test_invoke_parsers.py",
+    "orchestrator/src/orchestrator/agents/invoke.py",
+    "shared/src/shared/cli_invoke.py"
+  ],
+  "modules": [
+    "orchestrator/tests",
+    "orchestrator/src/orchestrator/agents",
+    "shared/src/shared"
+  ],
+  "analysis": "Task 316 addresses three interrelated issues from the task 306 review, all centered on `_to_token_count` in shared/cli_invoke.py and its usage in orchestrator/agents/invoke.py.\n\n1. **Documentation misplacement**: The AgentResult docstring (cli_invoke.py:31-38) explains the token-count convention and references `_to_token_count`, but AgentResult has no token fields \u2014 only `cost_usd`. The docstring belongs on the helper itself.\n\n2. **Cross-package private import**: `_to_token_count` is underscore-prefixed (private) and not in `__all__`, yet orchestrator/agents/invoke.py imports it at line 25. The function is trivial (`return v or None`) and adds no value at arithmetic call sites where `or 0` immediately follows.\n\n3. **No-op roundtrip at 4 call sites**: `_to_token_count(usage.get('input_tokens', 0)) or 0` is logically equivalent to `usage.get('input_tokens', 0)` \u2014 the helper converts 0\u2192None, then `or 0` converts None\u21920. The fix: drop both the helper and the `.get()` default, use `usage.get('input_tokens') or 0`.\n\n4. **Weak test assertions**: `TestParseCodexNullUsage.test_null_usage_does_not_raise` only checks `success is True`, missing output/cost_usd/turns. Absent-key tests (vs null-value) are missing for both parsers.\n\nApproach: Option (b) \u2014 inline at orchestrator call sites, remove cross-package import. Keep `_to_token_count` in shared as a private utility (it's still tested and may be useful for None-semantics elsewhere). TDD order: strengthen/add tests first to lock down behavior, then refactor call sites, then fix docs.",
+  "prerequisites": [],
+  "steps": [
+    {
+      "id": "step-1",
+      "type": "test",
+      "description": "Strengthen TestParseCodexNullUsage.test_null_usage_does_not_raise: add assertions for output == 'hello', cost_usd == 0.0, turns == 1. These lock down existing behavior before refactoring. File: orchestrator/tests/test_invoke_parsers.py, within the existing test method at line 59.",
+      "status": "done",
+      "commit": "c9c58525"
+    },
+    {
+      "id": "step-2",
+      "type": "test",
+      "description": "Add TestParseCodexAbsentUsage.test_absent_usage_key_does_not_raise: codex parser with turn.completed event that has NO 'usage' key at all (not null \u2014 absent). Assert success, output, cost_usd == 0.0, turns == 1. This covers the `event.get('usage') or {}` guard for the absent-key branch. File: orchestrator/tests/test_invoke_parsers.py, new class after TestParseCodexNullUsage.",
+      "status": "done",
+      "commit": "049cafe6"
+    },
+    {
+      "id": "step-3",
+      "type": "test",
+      "description": "Add TestParseGeminiAbsentStats.test_absent_stats_key_does_not_raise: gemini parser with payload that has NO 'stats' key (not null \u2014 absent). Assert success, output, cost_usd == 0.0. This covers the `data.get('stats') or {}` guard for the absent-key branch. File: orchestrator/tests/test_invoke_parsers.py, new class after TestParseGeminiNullStats.",
+      "status": "done",
+      "commit": "034a2241"
+    },
+    {
+      "id": "step-4",
+      "type": "impl",
+      "description": "Fix call-site pattern and remove cross-package import in orchestrator/agents/invoke.py:\n(a) Lines 363-364: replace `_to_token_count(usage.get('input_tokens', 0)) or 0` with `usage.get('input_tokens') or 0` (same for output_tokens).\n(b) Lines 480-481: same replacement for stats.get('input_tokens') and stats.get('output_tokens').\n(c) Line 25: remove `_to_token_count` from the `from shared.cli_invoke import (...)` block.\nAll existing + new tests must still pass \u2014 the behavior is identical.",
+      "status": "done",
+      "commit": "77a49e26"
+    },
+    {
+      "id": "step-5",
+      "type": "impl",
+      "description": "Documentation fix in shared/src/shared/cli_invoke.py:\n(a) Move the token-count convention docstring from AgentResult (lines 33-37) to `_to_token_count` (line 53), expanding it to explain the convention, why 0\u2192None, and usage guidance.\n(b) Replace AgentResult's docstring with a focused description of what the dataclass represents (structured result from CLI agent invocation, listing the fields' purposes).",
+      "status": "done",
+      "commit": "b3f7ba08"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "Option (b): inline at orchestrator call sites rather than rename/export _to_token_count",
+      "rationale": "At arithmetic sites the pattern `_to_token_count(x) or 0` is a no-op roundtrip \u2014 the helper's None semantics are immediately discarded. `usage.get('input_tokens') or 0` is clearer, more idiomatic, and eliminates the cross-package import of a private symbol. The helper remains in shared for any future code that needs Optional[int] semantics."
+    },
+    {
+      "decision": "Keep _to_token_count in shared/cli_invoke.py (don't delete it)",
+      "rationale": "It has its own unit tests in shared/tests/test_cli_invoke.py, documents a real convention (0 means unreported), and may be useful if AgentResult ever gains optional token fields. Deleting it would also require removing its tests, which is unnecessary churn."
+    },
+    {
+      "decision": "Use `usage.get('input_tokens') or 0` (no default in .get) rather than `usage.get('input_tokens', 0)`",
+      "rationale": "Both are equivalent when followed by `or 0`, but omitting the default makes the intent clearer: 'get the value or treat missing/falsy as 0'. The `or 0` handles both None (absent key) and 0 (explicit zero) uniformly."
+    },
+    {
+      "decision": "Separate absent-key tests from null-value tests rather than parameterizing",
+      "rationale": "Absent key and explicit null exercise different code paths in the `or {}` guard (dict.get() returning None vs explicit None in the dict). Separate test classes make failures more diagnostic and match the existing test organization pattern in the file."
+    }
+  ],
+  "reuse": [
+    {
+      "what": "_make_subprocess_result helper",
+      "where": "orchestrator/tests/test_invoke_parsers.py lines 12-24",
+      "how": "Use for constructing _SubprocessResult in all new test cases, same as existing tests"
+    },
+    {
+      "what": "Existing test class structure (TestParseGeminiNullStats, TestParseCodexNullUsage)",
+      "where": "orchestrator/tests/test_invoke_parsers.py",
+      "how": "Follow the same pattern: class per scenario, descriptive docstrings, json.dumps for payload construction"
+    },
+    {
+      "what": "Existing `or {}` guard pattern",
+      "where": "orchestrator/agents/invoke.py lines 362 and 479",
+      "how": "The `event.get('usage') or {}` and `data.get('stats') or {}` guards already handle both absent and null keys \u2014 no changes needed to these lines"
+    }
+  ],
+  "_session_id": "316-af9fd407",
+  "_created_at": "2026-03-31T08:25:09.515581+00:00"
+}
