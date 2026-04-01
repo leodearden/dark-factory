@@ -27,7 +27,12 @@ class NodeNotFoundError(Exception):
 
 
 class GraphitiBackend:
-    """Owns the Graphiti client lifecycle."""
+    """Owns the Graphiti client lifecycle.
+
+    FalkorDB is multi-tenant: each project's data lives in its own graph
+    (named after the project_id / group_id).  The driver is cloned per-request
+    so every operation targets the correct graph.
+    """
 
     def __init__(self, config: FusedMemoryConfig):
         self.config = config
@@ -35,6 +40,37 @@ class GraphitiBackend:
         self._driver: FalkorDriver | None = None
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
+        self._indexed_graphs: set[str] = set()
+
+    # --- Per-request driver routing ---
+
+    def _driver_for(self, group_id: str) -> FalkorDriver:
+        """Return a driver clone targeting the FalkorDB graph for *group_id*.
+
+        Lazily ensures indices exist on the target graph (tracked in
+        ``_indexed_graphs`` to avoid redundant CREATE INDEX calls).
+        """
+        driver = self._require_driver()
+        return driver.clone(database=group_id)
+
+    def _graph_for(self, group_id: str) -> Any:
+        """Return the FalkorGraph object for *group_id* (for direct Cypher)."""
+        driver = self._require_driver()
+        return driver._get_graph(group_id)
+
+    def _require_driver(self) -> FalkorDriver:
+        if self._driver is None:
+            raise RuntimeError('GraphitiBackend not initialized — call initialize() first')
+        return self._driver
+
+    async def _ensure_indices(self, group_id: str) -> None:
+        """Build indices on *group_id*'s graph if not already done this session."""
+        if group_id in self._indexed_graphs:
+            return
+        driver = self._driver_for(group_id)
+        await driver.build_indices_and_constraints()
+        self._indexed_graphs.add(group_id)
+        logger.debug('Ensured indices on graph %r', group_id)
 
     async def initialize(self) -> None:
         """Create FalkorDriver + Graphiti client from unified config."""
@@ -86,7 +122,15 @@ class GraphitiBackend:
                 logger.info(f'Graphiti embedder: {cfg.embedder.provider}/{cfg.embedder.model}')
 
         # --- FalkorDB driver ---
+        # The driver is created with a placeholder database.  Actual graph
+        # selection happens per-request via _driver_for() / _graph_for().
         falkor_cfg = cfg.graphiti.falkordb
+        if falkor_cfg.database is not None:
+            logger.warning(
+                'graphiti.falkordb.database=%r is ignored — graph name is '
+                'derived from group_id at request time',
+                falkor_cfg.database,
+            )
         parsed = urlparse(falkor_cfg.uri)
         host = parsed.hostname or 'localhost'
         port = parsed.port or 6379
@@ -95,7 +139,7 @@ class GraphitiBackend:
             host=host,
             port=port,
             password=falkor_cfg.password,
-            database=falkor_cfg.database,
+            database='__placeholder__',
         )
 
         self.client = Graphiti(
@@ -105,7 +149,15 @@ class GraphitiBackend:
             max_coroutines=cfg.queue.graphiti_max_coroutines,
         )
 
-        await self.client.build_indices_and_constraints()
+        # Build indices on all existing project graphs (lazy set avoids repeats).
+        try:
+            existing = await cast(Any, self._driver).client.list_graphs()
+            for graph_name in existing:
+                if graph_name != 'default_db' and not graph_name.endswith('_db'):
+                    await self._ensure_indices(graph_name)
+        except Exception:
+            logger.warning('Could not enumerate existing graphs for index setup', exc_info=True)
+
         logger.info(f'GraphitiBackend initialized (FalkorDB {host}:{port})')
 
     def _require_client(self) -> Graphiti:
@@ -153,13 +205,16 @@ class GraphitiBackend:
     ) -> list[Any]:
         """Search for entity edges (facts)."""
         client = self._require_client()
+        gids = group_ids or []
+        driver = self._driver_for(gids[0]) if gids else None
         try:
             return await asyncio.wait_for(
                 client.search(
                     query=query,
-                    group_ids=group_ids or [],
+                    group_ids=gids,
                     num_results=num_results,
                     center_node_uuid=center_node_uuid,
+                    driver=driver,
                 ),
                 timeout=self._read_timeout,
             )
@@ -177,12 +232,15 @@ class GraphitiBackend:
         client = self._require_client()
         from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
 
+        gids = group_ids or []
+        driver = self._driver_for(gids[0]) if gids else None
         try:
             results = await asyncio.wait_for(
                 client.search_(
                     query=query,
                     config=NODE_HYBRID_SEARCH_RRF,
-                    group_ids=group_ids or [],
+                    group_ids=gids,
+                    driver=driver,
                 ),
                 timeout=self._read_timeout,
             )
@@ -198,11 +256,11 @@ class GraphitiBackend:
         reference_time: datetime | None = None,
     ) -> list[Any]:
         """Retrieve recent episodes by group."""
-        client = self._require_client()
+        driver = self._driver_for(group_ids[0]) if group_ids else self._require_driver()
         try:
             episodes = await asyncio.wait_for(
                 EpisodicNode.get_by_group_ids(
-                    client.driver, group_ids, limit=last_n
+                    driver, group_ids, limit=last_n
                 ),
                 timeout=self._read_timeout,
             )
@@ -211,25 +269,25 @@ class GraphitiBackend:
             logger.warning(f'Graphiti retrieve_episodes timed out after {self._read_timeout}s')
             return []
 
-    async def remove_episode(self, episode_uuid: str) -> None:
+    async def remove_episode(self, episode_uuid: str, *, group_id: str) -> None:
         """Delete an episode by UUID."""
-        client = self._require_client()
-        node = await EpisodicNode.get_by_uuid(client.driver, episode_uuid)
+        driver = self._driver_for(group_id)
+        node = await EpisodicNode.get_by_uuid(driver, episode_uuid)
         await asyncio.wait_for(
-            node.delete(client.driver),
+            node.delete(driver),
             timeout=self._write_timeout,
         )
 
-    async def remove_edge(self, edge_uuid: str) -> None:
+    async def remove_edge(self, edge_uuid: str, *, group_id: str) -> None:
         """Delete an entity edge (fact) by UUID. Idempotent — missing edges are ignored."""
-        client = self._require_client()
+        driver = self._driver_for(group_id)
         try:
-            edge = await EntityEdge.get_by_uuid(client.driver, edge_uuid)
+            edge = await EntityEdge.get_by_uuid(driver, edge_uuid)
         except EdgeNotFoundError:
             logger.info(f'Edge {edge_uuid} not found (already deleted or episode-cascaded)')
             return
         await asyncio.wait_for(
-            edge.delete(client.driver),
+            edge.delete(driver),
             timeout=self._write_timeout,
         )
 
@@ -242,7 +300,7 @@ class GraphitiBackend:
         )
 
     async def query_stale_node_embeddings(
-        self, expected_dim: int
+        self, expected_dim: int, *, group_id: str
     ) -> list[tuple[str, str, int]]:
         """Return (uuid, name, dim) for Entity nodes whose embedding dim != expected_dim.
 
@@ -250,9 +308,7 @@ class GraphitiBackend:
         return all nodes with embeddings and filter client-side by parsing the
         raw vector text representation (``<v1, v2, ...>``).
         """
-        client = self._require_client()
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
+        graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity) '
             'WHERE n.name_embedding IS NOT NULL '
@@ -270,15 +326,13 @@ class GraphitiBackend:
         return stale
 
     async def query_stale_edge_embeddings(
-        self, expected_dim: int
+        self, expected_dim: int, *, group_id: str
     ) -> list[tuple[str, str, int]]:
         """Return (uuid, name, dim) for RELATES_TO edges whose embedding dim != expected_dim.
 
         See ``query_stale_node_embeddings`` for why client-side filtering is needed.
         """
-        client = self._require_client()
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
+        graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n)-[e:RELATES_TO]->(m) '
             'WHERE e.fact_embedding IS NOT NULL '
@@ -296,20 +350,19 @@ class GraphitiBackend:
         return stale
 
     async def query_edges_by_time_range(
-        self, start: str, end: str
+        self, start: str, end: str, *, group_id: str
     ) -> list[dict]:
         """Return edges whose valid_at falls within [start, end] (ISO 8601 strings).
 
         Args:
             start: ISO 8601 string for the lower bound (inclusive).
             end: ISO 8601 string for the upper bound (inclusive).
+            group_id: Project graph to query.
 
         Returns:
             List of dicts with keys: uuid, fact, name, valid_at, invalid_at.
         """
-        client = self._require_client()
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
+        graph = self._graph_for(group_id)
         cypher = (
             'MATCH ()-[e:RELATES_TO]->() '
             'WHERE e.valid_at >= $start AND e.valid_at <= $end '
@@ -327,7 +380,7 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
-    async def get_valid_edges_for_node(self, node_uuid: str) -> list[dict]:
+    async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[dict]:
         """Return all currently-valid RELATES_TO edges for an Entity node.
 
         Matches the node as either source or target (undirected) and filters
@@ -335,13 +388,12 @@ class GraphitiBackend:
 
         Args:
             node_uuid: UUID of the Entity node.
+            group_id: Project graph to query.
 
         Returns:
             List of dicts with keys: uuid, fact, name.
         """
-        client = self._require_client()
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
+        graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() '
             'WHERE e.invalid_at IS NULL '
@@ -357,7 +409,7 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
-    async def bulk_remove_edges(self, uuids: list[str]) -> int:
+    async def bulk_remove_edges(self, uuids: list[str], *, group_id: str) -> int:
         """Delete RELATES_TO edges by UUID list. Returns count of actually matched edges.
 
         Uses a pre-count MATCH query before deletion to return the true number of
@@ -366,17 +418,16 @@ class GraphitiBackend:
 
         Args:
             uuids: List of edge UUIDs to delete.
+            group_id: Project graph to query.
 
         Returns:
             Number of edges that matched (and were deleted). 0 for empty list.
         """
         if not uuids:
             return 0
-        client = self._require_client()
         logger.info('Deleting %d edge(s)', len(uuids))
         logger.debug('Edge UUIDs to delete: %s', uuids)
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
+        graph = self._graph_for(group_id)
         # Pre-count: how many of the requested UUIDs actually exist as edges
         count_cypher = (
             'MATCH ()-[e:RELATES_TO]->() '
@@ -395,7 +446,7 @@ class GraphitiBackend:
         return found
 
     async def redirect_node_edges(
-        self, deprecated_uuid: str, surviving_uuid: str
+        self, deprecated_uuid: str, surviving_uuid: str, *, group_id: str
     ) -> dict:
         """Redirect all RELATES_TO edges from deprecated node to surviving node.
 
@@ -416,9 +467,7 @@ class GraphitiBackend:
             Dict with keys: outgoing_redirected, incoming_redirected,
             inter_node_deleted.
         """
-        client = self._require_client()
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
+        graph = self._graph_for(group_id)
 
         # Phase 1: Delete inter-node edges (edges between the two merging nodes)
         count_inter = await graph.query(
@@ -503,7 +552,7 @@ class GraphitiBackend:
         }
 
     async def merge_entities(
-        self, deprecated_uuid: str, surviving_uuid: str
+        self, deprecated_uuid: str, surviving_uuid: str, *, group_id: str
     ) -> dict:
         """Merge two entity nodes by redirecting edges and deleting the deprecated node.
 
@@ -529,17 +578,19 @@ class GraphitiBackend:
             RuntimeError: if the backend is not initialized.
         """
         # Validate both nodes exist and capture their names
-        dep_name, _ = await self.get_node_text(deprecated_uuid)
-        sur_name, _ = await self.get_node_text(surviving_uuid)
+        dep_name, _ = await self.get_node_text(deprecated_uuid, group_id=group_id)
+        sur_name, _ = await self.get_node_text(surviving_uuid, group_id=group_id)
 
         # Redirect edges
-        edges_redirected = await self.redirect_node_edges(deprecated_uuid, surviving_uuid)
+        edges_redirected = await self.redirect_node_edges(
+            deprecated_uuid, surviving_uuid, group_id=group_id,
+        )
 
         # Delete the deprecated node
-        await self.delete_entity_node(deprecated_uuid)
+        await self.delete_entity_node(deprecated_uuid, group_id=group_id)
 
         # Rebuild the surviving node's summary
-        refresh_result = await self.refresh_entity_summary(surviving_uuid)
+        refresh_result = await self.refresh_entity_summary(surviving_uuid, group_id=group_id)
 
         logger.info(
             'merge_entities: dep=%s (%r) sur=%s (%r) redirected=%s',
@@ -558,21 +609,20 @@ class GraphitiBackend:
             },
         }
 
-    async def delete_entity_node(self, uuid: str) -> None:
+    async def delete_entity_node(self, uuid: str, *, group_id: str) -> None:
         """Delete an Entity node and all remaining relationships.
 
         Validates that the node exists first, then issues DETACH DELETE.
 
         Args:
             uuid: UUID of the Entity node to delete.
+            group_id: Project graph to query.
 
         Raises:
             NodeNotFoundError: if no node with that UUID exists.
             RuntimeError: if the backend is not initialized.
         """
-        client = self._require_client()
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
+        graph = self._graph_for(group_id)
         # Pre-check: verify node exists before deleting
         check_result = await graph.query(
             'MATCH (n:Entity {uuid: $uuid}) RETURN n.name, n.summary',
@@ -586,15 +636,13 @@ class GraphitiBackend:
         )
         logger.info('delete_entity_node: deleted node=%s', uuid)
 
-    async def get_node_text(self, uuid: str) -> tuple[str, str]:
+    async def get_node_text(self, uuid: str, *, group_id: str) -> tuple[str, str]:
         """Return (name, summary) for the Entity node with the given UUID.
 
         Raises:
             NodeNotFoundError: if no node with that UUID exists.
         """
-        client = self._require_client()
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
+        graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid}) '
             'RETURN n.name, n.summary'
@@ -605,7 +653,7 @@ class GraphitiBackend:
         row = result.result_set[0]
         return (row[0], row[1] or '')
 
-    async def refresh_entity_summary(self, node_uuid: str) -> dict:
+    async def refresh_entity_summary(self, node_uuid: str, *, group_id: str) -> dict:
         """Regenerate an Entity node's summary from its currently-valid edges.
 
         Fetches the node's current name and summary, queries all valid
@@ -622,12 +670,12 @@ class GraphitiBackend:
         Returns:
             Dict with keys: uuid, name, old_summary, new_summary, edge_count.
         """
-        name, old_summary = await self.get_node_text(node_uuid)
-        edges = await self.get_valid_edges_for_node(node_uuid)
+        name, old_summary = await self.get_node_text(node_uuid, group_id=group_id)
+        edges = await self.get_valid_edges_for_node(node_uuid, group_id=group_id)
         # Deduplicate facts while preserving insertion order
         facts = list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
         new_summary = '\n'.join(facts)
-        await self.update_node_summary(node_uuid, new_summary)
+        await self.update_node_summary(node_uuid, new_summary, group_id=group_id)
         logger.info(
             'refresh_entity_summary: node=%s name=%r edges=%d old_len=%d new_len=%d',
             node_uuid, name, len(edges), len(old_summary), len(new_summary),
@@ -640,31 +688,28 @@ class GraphitiBackend:
             'edge_count': len(edges),
         }
 
-    async def update_node_summary(self, uuid: str, summary: str) -> None:
+    async def update_node_summary(self, uuid: str, summary: str, *, group_id: str) -> None:
         """Update the summary text property on an Entity node.
 
         Args:
             uuid: UUID of the Entity node to update.
             summary: New summary text (may be empty string to clear).
+            group_id: Project graph to query.
         """
-        client = self._require_client()
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
+        graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid}) '
             'SET n.summary = $summary'
         )
         await graph.query(cypher, {'uuid': uuid, 'summary': summary})
 
-    async def get_edge_text(self, uuid: str) -> tuple[str, str]:
+    async def get_edge_text(self, uuid: str, *, group_id: str) -> tuple[str, str]:
         """Return (name, fact) for the RELATES_TO edge with the given UUID.
 
         Raises:
             EdgeNotFoundError: if no edge with that UUID exists.
         """
-        client = self._require_client()
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
+        graph = self._graph_for(group_id)
         cypher = (
             'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
             'RETURN e.name, e.fact'
@@ -675,36 +720,30 @@ class GraphitiBackend:
         row = result.result_set[0]
         return (row[0] or '', row[1] or '')
 
-    async def update_node_embedding(self, uuid: str, embedding: list[float]) -> None:
+    async def update_node_embedding(self, uuid: str, embedding: list[float], *, group_id: str) -> None:
         """Update the name_embedding vector for an Entity node using vecf32()."""
-        client = self._require_client()
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
+        graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid}) '
             'SET n.name_embedding = vecf32($embedding)'
         )
         await graph.query(cypher, {'uuid': uuid, 'embedding': embedding})
 
-    async def update_edge_embedding(self, uuid: str, embedding: list[float]) -> None:
+    async def update_edge_embedding(self, uuid: str, embedding: list[float], *, group_id: str) -> None:
         """Update the fact_embedding vector for a RELATES_TO edge using vecf32()."""
-        client = self._require_client()
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
+        graph = self._graph_for(group_id)
         cypher = (
             'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
             'SET e.fact_embedding = vecf32($embedding)'
         )
         await graph.query(cypher, {'uuid': uuid, 'embedding': embedding})
 
-    async def list_indices(self) -> list[dict]:
+    async def list_indices(self, *, group_id: str) -> list[dict]:
         """Return parsed index records from the graph.
 
         Each record is a dict with keys: label, field, type, entity_type.
         """
-        client = self._require_client()
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
+        graph = self._graph_for(group_id)
         result = await graph.query('CALL db.indexes()')
         indices = []
         for row in (result.result_set or []):
@@ -716,26 +755,24 @@ class GraphitiBackend:
             })
         return indices
 
-    async def drop_index(self, label: str, field: str) -> None:
+    async def drop_index(self, label: str, field: str, *, group_id: str) -> None:
         """Drop an index on the given label and field (FalkorDB syntax)."""
-        client = self._require_client()
-        driver = cast(Any, client.driver)
-        graph = driver._get_graph(None)
+        graph = self._graph_for(group_id)
         cypher = f'DROP INDEX ON :{label}({field})'
         await graph.query(cypher)
 
-    async def drop_vector_indices(self) -> list[dict]:
+    async def drop_vector_indices(self, *, group_id: str) -> list[dict]:
         """Drop all VECTOR-type indices in the graph.
 
         Calls list_indices() to find indices with type == 'VECTOR', then calls
         drop_index() for each.  Returns a list of {'label': ..., 'field': ...}
         dicts for each dropped index.
         """
-        indices = await self.list_indices()
+        indices = await self.list_indices(group_id=group_id)
         dropped: list[dict] = []
         for entry in indices:
             if entry.get('type') == 'VECTOR':
-                await self.drop_index(entry['label'], entry['field'])
+                await self.drop_index(entry['label'], entry['field'], group_id=group_id)
                 dropped.append({'label': entry['label'], 'field': entry['field']})
         logger.info(f'Dropped {len(dropped)} VECTOR index(es)')
         return dropped

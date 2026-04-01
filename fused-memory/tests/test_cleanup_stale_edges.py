@@ -23,13 +23,12 @@ class TestQueryEdgesByTimeRange:
             ['uuid-2', 'Bob knows Carol', 'knows', '2026-03-22T18:00:00', None],
         ]
         graph = make_graph_mock(rows)
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            result = await backend.query_edges_by_time_range(
-                start='2026-03-22T17:50:00',
-                end='2026-03-22T18:15:00',
-            )
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.query_edges_by_time_range(
+            start='2026-03-22T17:50:00',
+            end='2026-03-22T18:15:00',
+            group_id='test',
+        )
         assert len(result) == 2
         assert result[0]['uuid'] == 'uuid-1'
         assert result[0]['fact'] == 'Alice is related to Bob'
@@ -42,13 +41,12 @@ class TestQueryEdgesByTimeRange:
     async def test_returns_empty_when_no_matches(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            result = await backend.query_edges_by_time_range(
-                start='2026-03-22T17:50:00',
-                end='2026-03-22T18:15:00',
-            )
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.query_edges_by_time_range(
+            start='2026-03-22T17:50:00',
+            end='2026-03-22T18:15:00',
+            group_id='test',
+        )
         assert result == []
 
     @pytest.mark.asyncio
@@ -58,18 +56,17 @@ class TestQueryEdgesByTimeRange:
             await backend.query_edges_by_time_range(
                 start='2026-03-22T17:50:00',
                 end='2026-03-22T18:15:00',
+                group_id='test',
             )
 
     @pytest.mark.asyncio
     async def test_passes_time_params_to_query(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
+        backend._driver._get_graph = MagicMock(return_value=graph)
         start = '2026-03-22T17:50:00'
         end = '2026-03-22T18:15:00'
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.query_edges_by_time_range(start=start, end=end)
+        await backend.query_edges_by_time_range(start=start, end=end, group_id='test')
         call_args = graph.query.call_args
         assert call_args is not None
         args, kwargs = call_args
@@ -95,11 +92,9 @@ class TestBulkRemoveEdges:
         delete_result.result_set = []
         graph_mock = MagicMock()
         graph_mock.query = AsyncMock(side_effect=[pre_count_result, delete_result])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph_mock)
+        backend._driver._get_graph = MagicMock(return_value=graph_mock)
         uuids = ['uuid-1', 'uuid-2', 'uuid-3']
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            count = await backend.bulk_remove_edges(uuids)
+        count = await backend.bulk_remove_edges(uuids, group_id='test')
         assert count == 3
         assert graph_mock.query.await_count == 2
 
@@ -107,10 +102,8 @@ class TestBulkRemoveEdges:
     async def test_handles_empty_uuid_list(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            count = await backend.bulk_remove_edges([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        count = await backend.bulk_remove_edges([], group_id='test')
         assert count == 0
         # Should not query at all for empty list
         graph.query.assert_not_called()
@@ -119,7 +112,7 @@ class TestBulkRemoveEdges:
     async def test_raises_when_not_initialized(self, mock_config):
         backend = GraphitiBackend(mock_config)  # client is None
         with pytest.raises(RuntimeError, match='not initialized'):
-            await backend.bulk_remove_edges(['uuid-1'])
+            await backend.bulk_remove_edges(['uuid-1'], group_id='test')
 
     @pytest.mark.asyncio
     async def test_passes_uuid_list_to_query(self, mock_config, make_backend):
@@ -131,11 +124,9 @@ class TestBulkRemoveEdges:
         delete_result.result_set = []
         graph_mock = MagicMock()
         graph_mock.query = AsyncMock(side_effect=[pre_count_result, delete_result])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph_mock)
+        backend._driver._get_graph = MagicMock(return_value=graph_mock)
         uuids = ['uuid-a', 'uuid-b']
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.bulk_remove_edges(uuids)
+        await backend.bulk_remove_edges(uuids, group_id='test')
         # Verify the DELETE call (second call) passes uuids as params
         all_calls = graph_mock.query.call_args_list
         assert len(all_calls) == 2
@@ -152,7 +143,6 @@ class TestBulkRemoveEdges:
         The return value must be 2, not 3.
         """
         backend = make_backend(mock_config)
-        cast_target = MagicMock()
 
         # Pre-count result: 2 of 3 UUIDs exist as edges
         pre_count_result = MagicMock()
@@ -164,11 +154,10 @@ class TestBulkRemoveEdges:
 
         graph_mock = MagicMock()
         graph_mock.query = AsyncMock(side_effect=[pre_count_result, delete_result])
-        cast_target._get_graph = MagicMock(return_value=graph_mock)
+        backend._driver._get_graph = MagicMock(return_value=graph_mock)
 
         uuids = ['uuid-1', 'uuid-2', 'uuid-3']
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            count = await backend.bulk_remove_edges(uuids)
+        count = await backend.bulk_remove_edges(uuids, group_id='test')
 
         # Must return 2 (actual matched count), not 3 (input length)
         assert count == 2
@@ -189,12 +178,13 @@ class TestCleanupManager:
         backend.query_edges_by_time_range = AsyncMock(return_value=[
             {'uuid': 'u1', 'fact': 'f1', 'name': 'n1', 'valid_at': '2026-03-22T17:51:00', 'invalid_at': None},
         ])
-        manager = CleanupManager(backend)
+        manager = CleanupManager(backend, group_id='test')
         result = await manager.find_stale_edges(
             start='2026-03-22T17:50:00', end='2026-03-22T18:15:00'
         )
         backend.query_edges_by_time_range.assert_awaited_once_with(
-            start='2026-03-22T17:50:00', end='2026-03-22T18:15:00'
+            start='2026-03-22T17:50:00', end='2026-03-22T18:15:00',
+            group_id='test',
         )
         assert len(result) == 1
         assert result[0]['uuid'] == 'u1'
@@ -209,14 +199,14 @@ class TestCleanupManager:
         backend = make_backend(mock_config)
         backend.query_edges_by_time_range = AsyncMock(return_value=edge_details)
         backend.bulk_remove_edges = AsyncMock(return_value=2)
-        manager = CleanupManager(backend)
+        manager = CleanupManager(backend, group_id='test')
         result = await manager.cleanup(
             start='2026-03-22T17:50:00', end='2026-03-22T18:15:00'
         )
         assert isinstance(result, CleanupResult)
         assert result.edges_found == 2
         assert result.edges_deleted == 2
-        backend.bulk_remove_edges.assert_awaited_once_with(['u1', 'u2'])
+        backend.bulk_remove_edges.assert_awaited_once_with(['u1', 'u2'], group_id='test')
 
     @pytest.mark.asyncio
     async def test_dry_run_queries_but_does_not_delete(self, mock_config, make_backend):
@@ -227,7 +217,7 @@ class TestCleanupManager:
         backend = make_backend(mock_config)
         backend.query_edges_by_time_range = AsyncMock(return_value=edge_details)
         backend.bulk_remove_edges = AsyncMock(return_value=0)
-        manager = CleanupManager(backend)
+        manager = CleanupManager(backend, group_id='test')
         result = await manager.cleanup(
             start='2026-03-22T17:50:00', end='2026-03-22T18:15:00', dry_run=True
         )
@@ -242,7 +232,7 @@ class TestCleanupManager:
         backend = make_backend(mock_config)
         backend.query_edges_by_time_range = AsyncMock(return_value=[])
         backend.bulk_remove_edges = AsyncMock(return_value=0)
-        manager = CleanupManager(backend)
+        manager = CleanupManager(backend, group_id='test')
         result = await manager.cleanup(
             start='2026-03-22T17:50:00', end='2026-03-22T18:15:00'
         )

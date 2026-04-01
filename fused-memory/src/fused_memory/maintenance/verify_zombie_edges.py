@@ -52,8 +52,9 @@ class ZombieEdgeVerifier:
         backend: A GraphitiBackend instance (must be initialized before use).
     """
 
-    def __init__(self, backend) -> None:
+    def __init__(self, backend, group_id: str = 'dark_factory') -> None:
         self.backend = backend
+        self.group_id = group_id
 
     async def verify(self, uuids: list[str]) -> VerifyResult:
         """Check which UUIDs exist as edges in FalkorDB (read-only).
@@ -103,7 +104,7 @@ class ZombieEdgeVerifier:
             logger.info('No zombie edges found in FalkorDB; nothing to delete.')
             return result
 
-        deleted = await self.backend.bulk_remove_edges(result.found)
+        deleted = await self.backend.bulk_remove_edges(result.found, group_id=self.group_id)
         result.deleted = deleted
         logger.info('Deleted %d zombie edge(s)', deleted)
         if deleted < len(result.found):

@@ -10,7 +10,7 @@ Covers:
 """
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -30,10 +30,8 @@ class TestRedirectNodeEdges:
         # Simulate query calls: first (inter-node delete) returns empty,
         # second (outgoing redirect) returns empty, third (incoming) returns empty
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            result = await backend.redirect_node_edges('dep-uuid', 'sur-uuid')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.redirect_node_edges('dep-uuid', 'sur-uuid', group_id='test')
         # Should have called graph.query at least 3 times (inter-node, outgoing, incoming)
         assert graph.query.await_count >= 3
         assert 'outgoing_redirected' in result
@@ -45,12 +43,10 @@ class TestRedirectNodeEdges:
         """Edges between deprecated and surviving nodes are removed before redirect."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
+        backend._driver._get_graph = MagicMock(return_value=graph)
         dep_uuid = 'dep-abc'
         sur_uuid = 'sur-xyz'
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.redirect_node_edges(dep_uuid, sur_uuid)
+        await backend.redirect_node_edges(dep_uuid, sur_uuid, group_id='test')
         # First query call should target inter-node edges
         first_call = graph.query.call_args_list[0]
         args = first_call[0]
@@ -65,10 +61,8 @@ class TestRedirectNodeEdges:
         """Returns dict with outgoing_redirected, incoming_redirected, inter_node_deleted counts."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            result = await backend.redirect_node_edges('dep-uuid', 'sur-uuid')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.redirect_node_edges('dep-uuid', 'sur-uuid', group_id='test')
         assert isinstance(result['outgoing_redirected'], int)
         assert isinstance(result['incoming_redirected'], int)
         assert isinstance(result['inter_node_deleted'], int)
@@ -78,17 +72,15 @@ class TestRedirectNodeEdges:
         """Raises RuntimeError when client is not initialized."""
         backend = GraphitiBackend(mock_config)  # client is None
         with pytest.raises(RuntimeError, match='not initialized'):
-            await backend.redirect_node_edges('dep-uuid', 'sur-uuid')
+            await backend.redirect_node_edges('dep-uuid', 'sur-uuid', group_id='test')
 
     @pytest.mark.asyncio
     async def test_handles_empty_edge_sets(self, mock_config, make_backend, make_graph_mock):
         """When no edges exist, returns zeros for all counts."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            result = await backend.redirect_node_edges('dep-uuid', 'sur-uuid')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.redirect_node_edges('dep-uuid', 'sur-uuid', group_id='test')
         assert result['outgoing_redirected'] == 0
         assert result['incoming_redirected'] == 0
         assert result['inter_node_deleted'] == 0
@@ -112,10 +104,8 @@ class TestDeleteEntityNode:
             MagicMock(result_set=check_row),  # pre-check: node exists
             MagicMock(result_set=[]),           # detach delete
         ])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.delete_entity_node('node-uuid-1')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.delete_entity_node('node-uuid-1', group_id='test')
         assert graph.query.await_count == 2
         # Second call should contain DETACH DELETE
         second_call = graph.query.call_args_list[1]
@@ -133,10 +123,8 @@ class TestDeleteEntityNode:
             MagicMock(result_set=[['Name', '']]),  # pre-check
             MagicMock(result_set=[]),               # delete
         ])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.delete_entity_node(node_uuid)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.delete_entity_node(node_uuid, group_id='test')
         # Both calls should pass uuid param
         for call in graph.query.call_args_list:
             args = call[0]
@@ -149,17 +137,16 @@ class TestDeleteEntityNode:
         backend = make_backend(mock_config)
         graph = MagicMock()
         graph.query = AsyncMock(return_value=MagicMock(result_set=[]))
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target), pytest.raises(NodeNotFoundError):
-            await backend.delete_entity_node('missing-uuid')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        with pytest.raises(NodeNotFoundError):
+            await backend.delete_entity_node('missing-uuid', group_id='test')
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
         """Raises RuntimeError when client is not initialized."""
         backend = GraphitiBackend(mock_config)  # client is None
         with pytest.raises(RuntimeError, match='not initialized'):
-            await backend.delete_entity_node('node-uuid-1')
+            await backend.delete_entity_node('node-uuid-1', group_id='test')
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +183,7 @@ class TestMergeEntities:
     async def test_validates_both_nodes_exist(self, backend_with_mocks):
         """Calls get_node_text for both UUIDs to validate existence."""
         backend = backend_with_mocks
-        await backend.merge_entities('dep-uuid', 'sur-uuid')
+        await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
         assert backend.get_node_text.await_count == 2
         calls = [c[0][0] for c in backend.get_node_text.call_args_list]
         assert 'dep-uuid' in calls
@@ -208,7 +195,7 @@ class TestMergeEntities:
         backend = make_backend(mock_config)
         backend.get_node_text = AsyncMock(side_effect=NodeNotFoundError('not found'))
         with pytest.raises(NodeNotFoundError):
-            await backend.merge_entities('missing-dep', 'sur-uuid')
+            await backend.merge_entities('missing-dep', 'sur-uuid', group_id='test')
 
     @pytest.mark.asyncio
     async def test_raises_node_not_found_for_surviving(self, mock_config, make_backend):
@@ -219,7 +206,7 @@ class TestMergeEntities:
             NodeNotFoundError('not found'),  # surviving missing
         ])
         with pytest.raises(NodeNotFoundError):
-            await backend.merge_entities('dep-uuid', 'missing-sur')
+            await backend.merge_entities('dep-uuid', 'missing-sur', group_id='test')
 
     @pytest.mark.asyncio
     async def test_calls_in_correct_order(self, backend_with_mocks):
@@ -239,14 +226,14 @@ class TestMergeEntities:
                 'uuid': 'sur-uuid', 'name': 'S', 'old_summary': '', 'new_summary': '', 'edge_count': 0
             }
         )
-        await backend.merge_entities('dep-uuid', 'sur-uuid')
+        await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
         assert call_order == ['redirect', 'delete', 'refresh']
 
     @pytest.mark.asyncio
     async def test_returns_audit_dict(self, backend_with_mocks):
         """Returns audit dict with expected keys."""
         backend = backend_with_mocks
-        result = await backend.merge_entities('dep-uuid', 'sur-uuid')
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
         assert result['surviving_uuid'] == 'sur-uuid'
         assert result['deprecated_uuid'] == 'dep-uuid'
         assert result['surviving_name'] == 'SurvivingName'
@@ -273,9 +260,9 @@ class TestMergeEntities:
             'uuid': 'sur-uuid', 'name': 'SurName',
             'old_summary': 'existing summary', 'new_summary': 'existing summary', 'edge_count': 1,
         })
-        result = await backend.merge_entities('dep-uuid', 'sur-uuid')
-        backend.delete_entity_node.assert_awaited_once_with('dep-uuid')
-        backend.refresh_entity_summary.assert_awaited_once_with('sur-uuid')
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        backend.delete_entity_node.assert_awaited_once_with('dep-uuid', group_id='test')
+        backend.refresh_entity_summary.assert_awaited_once_with('sur-uuid', group_id='test')
         assert result['surviving_uuid'] == 'sur-uuid'
 
 
@@ -313,7 +300,7 @@ class TestMemoryServiceMergeEntities:
             surviving_uuid='sur-uuid',
             project_id='dark_factory',
         )
-        service.graphiti.merge_entities.assert_awaited_once_with('dep-uuid', 'sur-uuid')
+        service.graphiti.merge_entities.assert_awaited_once_with('dep-uuid', 'sur-uuid', group_id='dark_factory')
         assert result['surviving_uuid'] == 'sur-uuid'
 
     @pytest.mark.asyncio

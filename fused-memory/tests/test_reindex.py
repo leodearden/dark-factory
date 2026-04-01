@@ -29,10 +29,8 @@ class TestQueryStaleNodeEmbeddings:
             ['uuid-2', 'Node B', vec_5],
         ]
         graph = make_graph_mock(rows)
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            result = await backend.query_stale_node_embeddings(expected_dim=1536)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.query_stale_node_embeddings(expected_dim=1536, group_id='test')
         assert len(result) == 2
         assert result[0] == ('uuid-1', 'Node A', 3)
         assert result[1] == ('uuid-2', 'Node B', 5)
@@ -41,26 +39,22 @@ class TestQueryStaleNodeEmbeddings:
     async def test_returns_empty_when_all_match(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            result = await backend.query_stale_node_embeddings(expected_dim=1536)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.query_stale_node_embeddings(expected_dim=1536, group_id='test')
         assert result == []
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
         backend = GraphitiBackend(mock_config)  # client is None
         with pytest.raises(RuntimeError, match='not initialized'):
-            await backend.query_stale_node_embeddings(expected_dim=1536)
+            await backend.query_stale_node_embeddings(expected_dim=1536, group_id='test')
 
     @pytest.mark.asyncio
     async def test_calls_ro_query(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.query_stale_node_embeddings(expected_dim=768)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.query_stale_node_embeddings(expected_dim=768, group_id='test')
         graph.ro_query.assert_called_once()
         cypher = graph.ro_query.call_args[0][0]
         assert 'Entity' in cypher
@@ -78,10 +72,8 @@ class TestQueryStaleEdgeEmbeddings:
             ['edge-uuid-1', 'edge name', vec_4],
         ]
         graph = make_graph_mock(rows)
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            result = await backend.query_stale_edge_embeddings(expected_dim=1536)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.query_stale_edge_embeddings(expected_dim=1536, group_id='test')
         assert len(result) == 1
         assert result[0] == ('edge-uuid-1', 'edge name', 4)
 
@@ -89,26 +81,22 @@ class TestQueryStaleEdgeEmbeddings:
     async def test_returns_empty_when_all_match(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            result = await backend.query_stale_edge_embeddings(expected_dim=1536)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.query_stale_edge_embeddings(expected_dim=1536, group_id='test')
         assert result == []
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
-            await backend.query_stale_edge_embeddings(expected_dim=1536)
+            await backend.query_stale_edge_embeddings(expected_dim=1536, group_id='test')
 
     @pytest.mark.asyncio
     async def test_calls_ro_query(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.query_stale_edge_embeddings(expected_dim=768)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.query_stale_edge_embeddings(expected_dim=768, group_id='test')
         graph.ro_query.assert_called_once()
         cypher = graph.ro_query.call_args[0][0]
         assert 'RELATES_TO' in cypher
@@ -126,10 +114,8 @@ class TestGetNodeText:
     async def test_returns_name_and_summary(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([['Alice', 'Alice is a person']])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            name, summary = await backend.get_node_text('uuid-1')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        name, summary = await backend.get_node_text('uuid-1', group_id='test')
         assert name == 'Alice'
         assert summary == 'Alice is a person'
 
@@ -137,28 +123,22 @@ class TestGetNodeText:
     async def test_raises_node_not_found(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])  # empty result
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with (
-            patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target),
-            pytest.raises(NodeNotFoundError),
-        ):
-            await backend.get_node_text('missing-uuid')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        with pytest.raises(NodeNotFoundError):
+            await backend.get_node_text('missing-uuid', group_id='test')
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
-            await backend.get_node_text('uuid-1')
+            await backend.get_node_text('uuid-1', group_id='test')
 
     @pytest.mark.asyncio
     async def test_passes_uuid_to_query(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([['Node', 'Summary']])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.get_node_text('specific-uuid')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_node_text('specific-uuid', group_id='test')
         call_kwargs = graph.query.call_args
         args, kwargs = call_kwargs
         params = args[1] if len(args) > 1 else kwargs.get('params', {})
@@ -172,10 +152,8 @@ class TestGetEdgeText:
     async def test_returns_name_and_fact(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([['edge-name', 'Some fact about the edge']])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            name, fact = await backend.get_edge_text('edge-uuid-1')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        name, fact = await backend.get_edge_text('edge-uuid-1', group_id='test')
         assert name == 'edge-name'
         assert fact == 'Some fact about the edge'
 
@@ -183,28 +161,22 @@ class TestGetEdgeText:
     async def test_raises_edge_not_found(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with (
-            patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target),
-            pytest.raises(EdgeNotFoundError),
-        ):
-            await backend.get_edge_text('missing-edge-uuid')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        with pytest.raises(EdgeNotFoundError):
+            await backend.get_edge_text('missing-edge-uuid', group_id='test')
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
-            await backend.get_edge_text('edge-uuid-1')
+            await backend.get_edge_text('edge-uuid-1', group_id='test')
 
     @pytest.mark.asyncio
     async def test_passes_uuid_to_query(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([['name', 'fact']])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.get_edge_text('specific-edge-uuid')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_edge_text('specific-edge-uuid', group_id='test')
         call_kwargs = graph.query.call_args
         args, kwargs = call_kwargs
         params = args[1] if len(args) > 1 else kwargs.get('params', {})
@@ -222,22 +194,18 @@ class TestUpdateNodeEmbedding:
     async def test_calls_set_with_embedding(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
+        backend._driver._get_graph = MagicMock(return_value=graph)
         embedding = [0.1] * 1536
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.update_node_embedding('uuid-1', embedding)
+        await backend.update_node_embedding('uuid-1', embedding, group_id='test')
         assert graph.query.called
 
     @pytest.mark.asyncio
     async def test_passes_uuid_and_embedding_to_query(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
+        backend._driver._get_graph = MagicMock(return_value=graph)
         embedding = [0.5] * 128
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.update_node_embedding('my-uuid', embedding)
+        await backend.update_node_embedding('my-uuid', embedding, group_id='test')
         call_args = graph.query.call_args
         args, kwargs = call_args
         params = args[1] if len(args) > 1 else kwargs.get('params', {})
@@ -248,7 +216,7 @@ class TestUpdateNodeEmbedding:
     async def test_raises_when_not_initialized(self, mock_config):
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
-            await backend.update_node_embedding('uuid-1', [0.1] * 10)
+            await backend.update_node_embedding('uuid-1', [0.1] * 10, group_id='test')
 
 
 class TestUpdateEdgeEmbedding:
@@ -258,22 +226,18 @@ class TestUpdateEdgeEmbedding:
     async def test_calls_set_with_embedding(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
+        backend._driver._get_graph = MagicMock(return_value=graph)
         embedding = [0.2] * 1536
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.update_edge_embedding('edge-uuid', embedding)
+        await backend.update_edge_embedding('edge-uuid', embedding, group_id='test')
         assert graph.query.called
 
     @pytest.mark.asyncio
     async def test_passes_uuid_and_embedding_to_query(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
+        backend._driver._get_graph = MagicMock(return_value=graph)
         embedding = [0.7] * 64
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.update_edge_embedding('edge-uuid-99', embedding)
+        await backend.update_edge_embedding('edge-uuid-99', embedding, group_id='test')
         call_args = graph.query.call_args
         args, kwargs = call_args
         params = args[1] if len(args) > 1 else kwargs.get('params', {})
@@ -284,7 +248,7 @@ class TestUpdateEdgeEmbedding:
     async def test_raises_when_not_initialized(self, mock_config):
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
-            await backend.update_edge_embedding('edge-uuid', [0.1] * 10)
+            await backend.update_edge_embedding('edge-uuid', [0.1] * 10, group_id='test')
 
 
 # ---------------------------------------------------------------------------
@@ -303,10 +267,8 @@ class TestListIndices:
             ['Entity', 'name', 'FULLTEXT', 'NODE'],
         ]
         graph = make_graph_mock(rows)
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            result = await backend.list_indices()
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.list_indices(group_id='test')
         assert len(result) == 2
         assert result[0]['label'] == 'Entity'
         assert result[0]['field'] == 'name_embedding'
@@ -317,17 +279,15 @@ class TestListIndices:
     async def test_returns_empty_when_no_indices(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            result = await backend.list_indices()
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.list_indices(group_id='test')
         assert result == []
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
-            await backend.list_indices()
+            await backend.list_indices(group_id='test')
 
 
 class TestDropIndex:
@@ -337,20 +297,16 @@ class TestDropIndex:
     async def test_drop_index_calls_query(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.drop_index('Entity', 'name_embedding')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.drop_index('Entity', 'name_embedding', group_id='test')
         assert graph.query.called
 
     @pytest.mark.asyncio
     async def test_drop_index_cypher_contains_label_and_field(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.drop_index('MyLabel', 'my_field')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.drop_index('MyLabel', 'my_field', group_id='test')
         call_args = graph.query.call_args
         cypher = call_args[0][0]
         assert 'MyLabel' in cypher
@@ -360,7 +316,7 @@ class TestDropIndex:
     async def test_raises_when_not_initialized(self, mock_config):
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
-            await backend.drop_index('Entity', 'name_embedding')
+            await backend.drop_index('Entity', 'name_embedding', group_id='test')
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +339,7 @@ class TestDropVectorIndices:
         backend.list_indices = AsyncMock(return_value=indices)
         backend.drop_index = AsyncMock()
 
-        await backend.drop_vector_indices()
+        await backend.drop_vector_indices(group_id='test')
 
         assert backend.drop_index.call_count == 2
         calls = backend.drop_index.call_args_list
@@ -403,7 +359,7 @@ class TestDropVectorIndices:
         backend.list_indices = AsyncMock(return_value=indices)
         backend.drop_index = AsyncMock()
 
-        result = await backend.drop_vector_indices()
+        result = await backend.drop_vector_indices(group_id='test')
 
         assert len(result) == 1
         assert result[0] == {'label': 'Entity', 'field': 'name_embedding'}
@@ -420,7 +376,7 @@ class TestDropVectorIndices:
         backend.list_indices = AsyncMock(return_value=indices)
         backend.drop_index = AsyncMock()
 
-        result = await backend.drop_vector_indices()
+        result = await backend.drop_vector_indices(group_id='test')
 
         backend.drop_index.assert_not_called()
         assert result == []
@@ -498,11 +454,11 @@ class TestReindexManager:
         backend.query_stale_edge_embeddings = AsyncMock(return_value=[])
         embedder = MagicMock()
 
-        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=768)
+        manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=768, group_id='test')
         await manager.reindex()
 
-        backend.query_stale_node_embeddings.assert_called_once_with(expected_dim=768)
-        backend.query_stale_edge_embeddings.assert_called_once_with(expected_dim=768)
+        backend.query_stale_node_embeddings.assert_called_once_with(expected_dim=768, group_id='test')
+        backend.query_stale_edge_embeddings.assert_called_once_with(expected_dim=768, group_id='test')
 
     @pytest.mark.asyncio
     async def test_reindex_node_text_combined_for_embedding(self):
@@ -648,7 +604,7 @@ class TestReindexAndReplay:
 
         manager = ReindexManager(backend=backend, embedder=embedder, expected_dim=1536)
 
-        async def fake_drop():
+        async def fake_drop(group_id=None):
             call_order.append('drop')
             return [{'label': 'Entity', 'field': 'name_embedding'}]
 

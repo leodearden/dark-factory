@@ -11,7 +11,7 @@ Covers:
 """
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -33,10 +33,8 @@ class TestGetValidEdgesForNode:
             ['edge-2', 'Alice works at Acme', 'works_at'],
         ]
         graph = make_graph_mock(rows)
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            result = await backend.get_valid_edges_for_node('node-uuid-1')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
         assert len(result) == 2
         assert result[0]['uuid'] == 'edge-1'
         assert result[0]['fact'] == 'Alice knows Bob'
@@ -50,10 +48,8 @@ class TestGetValidEdgesForNode:
         """Returns empty list when no valid edges remain."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            result = await backend.get_valid_edges_for_node('node-uuid-1')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
         assert result == []
 
     @pytest.mark.asyncio
@@ -61,18 +57,16 @@ class TestGetValidEdgesForNode:
         """Raises RuntimeError when client is not initialized."""
         backend = GraphitiBackend(mock_config)  # client is None
         with pytest.raises(RuntimeError, match='not initialized'):
-            await backend.get_valid_edges_for_node('node-uuid-1')
+            await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
 
     @pytest.mark.asyncio
     async def test_passes_uuid_to_query(self, mock_config, make_backend, make_graph_mock):
         """Passes node UUID as parameter to the Cypher query."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
+        backend._driver._get_graph = MagicMock(return_value=graph)
         node_uuid = 'my-node-uuid'
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.get_valid_edges_for_node(node_uuid)
+        await backend.get_valid_edges_for_node(node_uuid, group_id='test')
         call_args = graph.query.call_args
         assert call_args is not None
         args, kwargs = call_args
@@ -84,10 +78,8 @@ class TestGetValidEdgesForNode:
         """Query uses WHERE e.invalid_at IS NULL to filter active edges only."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.get_valid_edges_for_node('node-uuid-1')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
         call_args = graph.query.call_args
         args, kwargs = call_args
         cypher = args[0] if args else kwargs.get('query', '')
@@ -106,10 +98,8 @@ class TestUpdateNodeSummary:
         """Issues Cypher SET n.summary = $summary for the given Entity node UUID."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.update_node_summary('node-uuid-1', 'Alice knows Bob.\nAlice works at Acme.')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.update_node_summary('node-uuid-1', 'Alice knows Bob.\nAlice works at Acme.', group_id='test')
         graph.query.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -117,12 +107,10 @@ class TestUpdateNodeSummary:
         """Query receives uuid and summary as Cypher parameters."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
+        backend._driver._get_graph = MagicMock(return_value=graph)
         node_uuid = 'my-node-uuid'
         summary = 'Alice knows Bob.'
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.update_node_summary(node_uuid, summary)
+        await backend.update_node_summary(node_uuid, summary, group_id='test')
         call_args = graph.query.call_args
         args, kwargs = call_args
         cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
@@ -134,10 +122,8 @@ class TestUpdateNodeSummary:
         """Cypher query contains SET n.summary = $summary."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        cast_target = MagicMock()
-        cast_target._get_graph = MagicMock(return_value=graph)
-        with patch('fused_memory.backends.graphiti_client.cast', return_value=cast_target):
-            await backend.update_node_summary('node-uuid-1', 'some summary')
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.update_node_summary('node-uuid-1', 'some summary', group_id='test')
         call_args = graph.query.call_args
         args, kwargs = call_args
         cypher = args[0] if args else kwargs.get('query', '')
@@ -148,7 +134,7 @@ class TestUpdateNodeSummary:
         """Raises RuntimeError when client is not initialized."""
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
-            await backend.update_node_summary('node-uuid-1', 'summary text')
+            await backend.update_node_summary('node-uuid-1', 'summary text', group_id='test')
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +153,7 @@ class TestRefreshEntitySummary:
             {'uuid': 'e1', 'fact': 'Alice knows Bob', 'name': 'knows'},
         ])
         backend.update_node_summary = AsyncMock()
-        result = await backend.refresh_entity_summary('node-uuid-1')
+        result = await backend.refresh_entity_summary('node-uuid-1', group_id='test')
         assert result['uuid'] == 'node-uuid-1'
         assert result['name'] == 'Alice'
         assert result['old_summary'] == 'old summary'
@@ -186,7 +172,7 @@ class TestRefreshEntitySummary:
             {'uuid': 'e3', 'fact': 'Alice works at Acme', 'name': 'works_at'},
         ])
         backend.update_node_summary = AsyncMock()
-        result = await backend.refresh_entity_summary('node-uuid-1')
+        result = await backend.refresh_entity_summary('node-uuid-1', group_id='test')
         # 'Alice knows Bob' should appear exactly once
         assert result['new_summary'].count('Alice knows Bob') == 1
         assert 'Alice works at Acme' in result['new_summary']
@@ -200,8 +186,8 @@ class TestRefreshEntitySummary:
             {'uuid': 'e1', 'fact': 'Alice knows Bob', 'name': 'knows'},
         ])
         backend.update_node_summary = AsyncMock()
-        result = await backend.refresh_entity_summary('node-uuid-1')
-        backend.update_node_summary.assert_awaited_once_with('node-uuid-1', result['new_summary'])
+        result = await backend.refresh_entity_summary('node-uuid-1', group_id='test')
+        backend.update_node_summary.assert_awaited_once_with('node-uuid-1', result['new_summary'], group_id='test')
 
     @pytest.mark.asyncio
     async def test_empty_edges_produces_empty_summary(self, mock_config, make_backend):
@@ -210,10 +196,10 @@ class TestRefreshEntitySummary:
         backend.get_node_text = AsyncMock(return_value=('Alice', 'old summary'))
         backend.get_valid_edges_for_node = AsyncMock(return_value=[])
         backend.update_node_summary = AsyncMock()
-        result = await backend.refresh_entity_summary('node-uuid-1')
+        result = await backend.refresh_entity_summary('node-uuid-1', group_id='test')
         assert result['new_summary'] == ''
         assert result['edge_count'] == 0
-        backend.update_node_summary.assert_awaited_once_with('node-uuid-1', '')
+        backend.update_node_summary.assert_awaited_once_with('node-uuid-1', '', group_id='test')
 
     @pytest.mark.asyncio
     async def test_old_summary_returned_in_result(self, mock_config, make_backend):
@@ -224,7 +210,7 @@ class TestRefreshEntitySummary:
             {'uuid': 'e1', 'fact': 'Bob lives in London', 'name': 'lives_in'},
         ])
         backend.update_node_summary = AsyncMock()
-        result = await backend.refresh_entity_summary('node-uuid-2')
+        result = await backend.refresh_entity_summary('node-uuid-2', group_id='test')
         assert result['old_summary'] == 'prior summary text'
 
 
@@ -260,7 +246,7 @@ class TestMemoryServiceRefreshEntitySummary:
             entity_uuid='node-1',
             project_id='dark_factory',
         )
-        service.graphiti.refresh_entity_summary.assert_awaited_once_with('node-1')
+        service.graphiti.refresh_entity_summary.assert_awaited_once_with('node-1', group_id='dark_factory')
         assert result['uuid'] == 'node-1'
         assert result['edge_count'] == 1
 

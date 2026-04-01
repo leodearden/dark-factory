@@ -213,7 +213,7 @@ class MemoryService:
         """
         return re.sub(r'\s+', ' ', text.lower()).strip()
 
-    async def _dedup_episode_edges(self, result: Any) -> int:
+    async def _dedup_episode_edges(self, result: Any, *, group_id: str) -> int:
         """Remove duplicate edges produced by a single add_episode call.
 
         Graphiti's LLM extraction pipeline can emit multiple edges that
@@ -258,7 +258,7 @@ class MemoryService:
             return 0
 
         logger.info('Deduplicating %d edge(s) after add_episode', len(duplicates))
-        return await self.graphiti.bulk_remove_edges(duplicates)
+        return await self.graphiti.bulk_remove_edges(duplicates, group_id=group_id)
 
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
@@ -292,7 +292,7 @@ class MemoryService:
             ),
         )
         # Post-write dedup: remove duplicate edges created within this episode
-        await self._dedup_episode_edges(result)
+        await self._dedup_episode_edges(result, group_id=payload['group_id'])
 
         # Register planning episodes so they can be filtered from search results
         if temporal_context == 'planning' and self.planned_episode_registry is not None:
@@ -1077,7 +1077,7 @@ class MemoryService:
                 backend='graphiti',
                 operation='remove_edge',
                 payload={'memory_id': memory_id},
-                coro=self.graphiti.remove_edge(memory_id),
+                coro=self.graphiti.remove_edge(memory_id, group_id=project_id),
             )
             result = {'status': 'deleted', 'store': 'graphiti', 'id': memory_id}
         else:
@@ -1135,7 +1135,7 @@ class MemoryService:
             backend='graphiti',
             operation='remove_episode',
             payload={'episode_id': episode_id},
-            coro=self.graphiti.remove_episode(episode_id),
+            coro=self.graphiti.remove_episode(episode_id, group_id=project_id),
         )
 
         if self._write_journal:
@@ -1185,7 +1185,7 @@ class MemoryService:
         error_msg = None
         result: dict = {}
         try:
-            result = await self.graphiti.refresh_entity_summary(entity_uuid)
+            result = await self.graphiti.refresh_entity_summary(entity_uuid, group_id=project_id)
         except Exception as e:
             success = False
             error_msg = str(e)
@@ -1249,7 +1249,7 @@ class MemoryService:
         error_msg = None
         result: dict = {}
         try:
-            result = await self.graphiti.merge_entities(deprecated_uuid, surviving_uuid)
+            result = await self.graphiti.merge_entities(deprecated_uuid, surviving_uuid, group_id=project_id)
         except Exception as e:
             success = False
             error_msg = str(e)

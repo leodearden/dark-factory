@@ -134,7 +134,9 @@ class EmbedderConfig(BaseModel):
 class FalkorDBProviderConfig(BaseModel):
     uri: str = 'redis://localhost:6379'
     password: str | None = None
-    database: str = 'default_db'
+    # database is ignored in shared-server mode — graph name is derived from
+    # group_id at request time.  Kept for backward-compat with existing configs.
+    database: str | None = None
 
 
 class GraphitiBackendConfig(BaseModel):

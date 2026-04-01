@@ -669,7 +669,7 @@ class TestDeleteMemory:
         await service.delete_memory(
             memory_id='edge-uuid-123', store='graphiti', project_id='test'
         )
-        service.graphiti.remove_edge.assert_called_once_with('edge-uuid-123')
+        service.graphiti.remove_edge.assert_called_once_with('edge-uuid-123', group_id='test')
         service.graphiti.remove_episode.assert_not_called()
 
 
@@ -708,7 +708,7 @@ class TestSearchDeleteRoundtrip:
         assert result['store'] == 'graphiti'
 
         # Verify remove_edge was called with the correct edge UUID
-        service.graphiti.remove_edge.assert_called_once_with(edge_uuid)
+        service.graphiti.remove_edge.assert_called_once_with(edge_uuid, group_id='test')
         # Verify remove_episode was NOT called (edge != episode)
         service.graphiti.remove_episode.assert_not_called()
 
@@ -719,7 +719,7 @@ class TestDeleteEpisode:
         """Regression guard: delete_episode must continue to call remove_episode
         (not the new remove_edge), since episodes are EpisodicNodes."""
         await service.delete_episode(episode_id='ep-uuid-123', project_id='test')
-        service.graphiti.remove_episode.assert_called_once_with('ep-uuid-123')
+        service.graphiti.remove_episode.assert_called_once_with('ep-uuid-123', group_id='test')
         service.graphiti.remove_edge.assert_not_called()
 
 
@@ -758,9 +758,12 @@ class TestGraphitiBackendRemoveEdge:
         from fused_memory.backends.graphiti_client import GraphitiBackend
 
         backend = GraphitiBackend(mock_config)
-        # Provide a mock client so _require_client succeeds
-        mock_client = MagicMock()
-        backend.client = mock_client
+        # Provide a mock driver so _require_driver succeeds
+        mock_driver = MagicMock()
+        mock_cloned_driver = MagicMock()
+        mock_driver.clone = MagicMock(return_value=mock_cloned_driver)
+        backend._driver = mock_driver
+        backend.client = MagicMock()
 
         mock_edge = AsyncMock()
         mock_edge.delete = AsyncMock()
@@ -769,12 +772,12 @@ class TestGraphitiBackendRemoveEdge:
             'fused_memory.backends.graphiti_client.EntityEdge'
         ) as MockEntityEdge:
             MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.remove_edge('test-edge-uuid')
+            await backend.remove_edge('test-edge-uuid', group_id='test')
 
             MockEntityEdge.get_by_uuid.assert_called_once_with(
-                mock_client.driver, 'test-edge-uuid'
+                mock_cloned_driver, 'test-edge-uuid'
             )
-            mock_edge.delete.assert_called_once_with(mock_client.driver)
+            mock_edge.delete.assert_called_once_with(mock_cloned_driver)
 
 
 class TestMem0BackendClose:
@@ -1263,7 +1266,7 @@ class TestDedupEpisodeEdges:
         # Clear the entity_edges mirror so we test the 'edges' path directly
         result.entity_edges = []
 
-        removed = await service._dedup_episode_edges(result)
+        removed = await service._dedup_episode_edges(result, group_id='test')
 
         assert removed == 2
         service.graphiti.bulk_remove_edges.assert_called_once()
@@ -1302,7 +1305,7 @@ class TestDedupEpisodeEdges:
         result = MockAddEpisodeResult(edges=edges)
         result.entity_edges = []
 
-        removed = await service._dedup_episode_edges(result)
+        removed = await service._dedup_episode_edges(result, group_id='test')
 
         assert removed == 0
         service.graphiti.bulk_remove_edges.assert_not_called()
@@ -1314,7 +1317,7 @@ class TestDedupEpisodeEdges:
 
         service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
 
-        removed = await service._dedup_episode_edges(None)
+        removed = await service._dedup_episode_edges(None, group_id='test')
 
         assert removed == 0
         service.graphiti.bulk_remove_edges.assert_not_called()
@@ -1331,7 +1334,7 @@ class TestDedupEpisodeEdges:
         result = MockAddEpisodeResult(edges=[])
         result.entity_edges = []
 
-        removed = await service._dedup_episode_edges(result)
+        removed = await service._dedup_episode_edges(result, group_id='test')
 
         assert removed == 0
         service.graphiti.bulk_remove_edges.assert_not_called()
@@ -1362,7 +1365,7 @@ class TestDedupEpisodeEdges:
         result = MockAddEpisodeResult(edges=edges)
         result.entity_edges = []
 
-        removed = await service._dedup_episode_edges(result)
+        removed = await service._dedup_episode_edges(result, group_id='test')
 
         assert removed == 1
         service.graphiti.bulk_remove_edges.assert_called_once()
@@ -1401,7 +1404,7 @@ class TestDedupEpisodeEdges:
         result = MockAddEpisodeResult(edges=edges)
         result.entity_edges = []
 
-        removed = await service._dedup_episode_edges(result)
+        removed = await service._dedup_episode_edges(result, group_id='test')
 
         assert removed == 0
         service.graphiti.bulk_remove_edges.assert_not_called()

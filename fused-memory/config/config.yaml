@@ -37,7 +37,7 @@ graphiti:
   falkordb:
     uri: ${FALKORDB_URI:redis://localhost:6379}
     password: ${FALKORDB_PASSWORD:}
-    database: ${FALKORDB_DATABASE:default_db}
+    # database is derived per-request from group_id (= project_id)
 
 mem0:
   qdrant_url: ${QDRANT_URL:http://localhost:6333}

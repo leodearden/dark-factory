@@ -112,6 +112,7 @@ def make_backend():
     def _factory(config) -> GraphitiBackend:
         backend = GraphitiBackend(config)
         backend.client = MagicMock()
+        backend._driver = MagicMock()
         return backend
 
     return _factory

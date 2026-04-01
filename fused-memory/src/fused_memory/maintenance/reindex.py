@@ -35,10 +35,11 @@ class ReindexManager:
         expected_dim: The target embedding dimension (from config, typically 1536).
     """
 
-    def __init__(self, backend, embedder, expected_dim: int) -> None:
+    def __init__(self, backend, embedder, expected_dim: int, group_id: str = 'dark_factory') -> None:
         self.backend = backend
         self.embedder = embedder
         self.expected_dim = expected_dim
+        self.group_id = group_id
 
     async def reindex(self) -> ReindexResult:
         """Find all stale-dimension embeddings, re-embed them, and update FalkorDB.
@@ -50,15 +51,15 @@ class ReindexManager:
 
         # --- Re-index stale Entity nodes ---
         stale_nodes = await self.backend.query_stale_node_embeddings(
-            expected_dim=self.expected_dim
+            expected_dim=self.expected_dim, group_id=self.group_id,
         )
         logger.info(f'Found {len(stale_nodes)} stale node embeddings to reindex')
         for uuid, name, current_dim in stale_nodes:
             try:
-                node_name, summary = await self.backend.get_node_text(uuid)
+                node_name, summary = await self.backend.get_node_text(uuid, group_id=self.group_id)
                 text = f'{node_name} {summary}'
                 embedding = await self.embedder.create(text)
-                await self.backend.update_node_embedding(uuid, embedding)
+                await self.backend.update_node_embedding(uuid, embedding, group_id=self.group_id)
                 result.nodes_updated += 1
                 logger.debug(f'Reindexed node {uuid!r} ({name!r}): {current_dim}→{self.expected_dim}')
             except Exception as exc:
@@ -67,15 +68,15 @@ class ReindexManager:
 
         # --- Re-index stale RELATES_TO edges ---
         stale_edges = await self.backend.query_stale_edge_embeddings(
-            expected_dim=self.expected_dim
+            expected_dim=self.expected_dim, group_id=self.group_id,
         )
         logger.info(f'Found {len(stale_edges)} stale edge embeddings to reindex')
         for uuid, name, current_dim in stale_edges:
             try:
-                edge_name, fact = await self.backend.get_edge_text(uuid)
+                edge_name, fact = await self.backend.get_edge_text(uuid, group_id=self.group_id)
                 text = f'{edge_name} {fact}'
                 embedding = await self.embedder.create(text)
-                await self.backend.update_edge_embedding(uuid, embedding)
+                await self.backend.update_edge_embedding(uuid, embedding, group_id=self.group_id)
                 result.edges_updated += 1
                 logger.debug(f'Reindexed edge {uuid!r} ({name!r}): {current_dim}→{self.expected_dim}')
             except Exception as exc:
@@ -111,7 +112,7 @@ class ReindexManager:
         indices_dropped: list[dict] = []
         if drop_indices:
             logger.info('Dropping stale VECTOR indices before reindex')
-            indices_dropped = await self.backend.drop_vector_indices()
+            indices_dropped = await self.backend.drop_vector_indices(group_id=self.group_id)
             logger.info(f'Dropped {len(indices_dropped)} VECTOR index(es)')
 
         reindex_result = await self.reindex()

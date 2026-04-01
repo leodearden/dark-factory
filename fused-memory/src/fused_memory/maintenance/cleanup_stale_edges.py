@@ -30,8 +30,9 @@ class CleanupManager:
         backend: A GraphitiBackend instance (must be initialized before use).
     """
 
-    def __init__(self, backend) -> None:
+    def __init__(self, backend, group_id: str = 'dark_factory') -> None:
         self.backend = backend
+        self.group_id = group_id
 
     async def find_stale_edges(self, start: str, end: str) -> list[dict]:
         """Return edges whose valid_at falls within [start, end].
@@ -43,7 +44,7 @@ class CleanupManager:
         Returns:
             List of edge dicts (uuid, fact, name, valid_at, invalid_at).
         """
-        edges = await self.backend.query_edges_by_time_range(start=start, end=end)
+        edges = await self.backend.query_edges_by_time_range(start=start, end=end, group_id=self.group_id)
         logger.info(f'Found {len(edges)} edge(s) in range [{start}, {end}]')
         return edges
 
@@ -81,7 +82,7 @@ class CleanupManager:
             return result
 
         uuids = [e['uuid'] for e in edges]
-        deleted = await self.backend.bulk_remove_edges(uuids)
+        deleted = await self.backend.bulk_remove_edges(uuids, group_id=self.group_id)
         result.edges_deleted = deleted
         logger.info(f'Deleted {deleted} edge(s)')
         return result
