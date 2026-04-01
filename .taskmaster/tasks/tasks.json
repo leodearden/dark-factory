@@ -6972,7 +6972,15 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-31T15:55:22.958Z"
+        "updatedAt": "2026-03-31T15:55:22.958Z",
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_costs_data.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 369,
@@ -6983,7 +6991,16 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_costs_data.py",
+            "dashboard/tests/conftest.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 370,
