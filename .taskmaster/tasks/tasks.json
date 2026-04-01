@@ -7112,7 +7112,7 @@
         "description": "The review pipeline is repeatedly invoked against empty pytest temporary directories instead of the actual project root. This has been escalated 10+ times by prior review agents (see data/escalations/ directory). The root cause: when tests create Harness instances with tmp_path as project_root, the review checkpoint inherits that path and passes it to the deep reviewer agent. The ReviewCheckpoint._run_review() at review_checkpoint.py:108 uses self.config.project_root for both verification and the agent prompt. Fix approach: (1) Add a guard in ReviewCheckpoint to validate that project_root contains actual source code before running, (2) Tests that create Harness with tmp_path should disable review checkpoints (config.review.enabled=False), (3) Consider adding a sanity check in the review skill that the provided project_root contains a pyproject.toml or .git directory.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
@@ -7128,7 +7128,8 @@
             "orchestrator/tests",
             "skills"
           ]
-        }
+        },
+        "updatedAt": "2026-04-01T13:42:04.073Z"
       },
       {
         "id": "376",
@@ -7236,7 +7237,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-01T13:42:03.798Z",
+      "lastModified": "2026-04-01T13:42:04.073Z",
       "taskCount": 359,
       "completedCount": 301,
       "tags": [
