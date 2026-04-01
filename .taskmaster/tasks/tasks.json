@@ -7115,7 +7115,20 @@
         "status": "pending",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "orchestrator/src/orchestrator/review_checkpoint.py",
+            "orchestrator/src/orchestrator/harness.py",
+            "orchestrator/tests/conftest.py",
+            "skills/review.md"
+          ],
+          "modules": [
+            "orchestrator/src/orchestrator",
+            "orchestrator/tests",
+            "skills"
+          ]
+        }
       },
       {
         "id": 376,
@@ -7126,7 +7139,19 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "orchestrator/src/orchestrator/verify.py",
+            "orchestrator/src/orchestrator/config.py",
+            "orchestrator/tests/test_verify.py",
+            "orchestrator/tests/test_config.py"
+          ],
+          "modules": [
+            "orchestrator/src/orchestrator",
+            "orchestrator/tests"
+          ]
+        }
       },
       {
         "id": 377,
