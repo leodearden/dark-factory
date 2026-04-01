@@ -7423,18 +7423,18 @@
           "get_tasks_chars_this_run": null,
           "stage2_received_zero_tasks": null,
           "workaround_used": null,
-          "_causation_id": "7ae91368-dce7-46e5-a4b3-61fbffd9ae2e",
+          "_causation_id": "d9639606-aeee-4281-9fd9-e1ef1c3bf975",
           "continued_manifestation_run_64839bc3": null,
           "get_tasks_chars_run_64839bc3": null,
           "stage2_received_zero_tasks_run_64839bc3": null,
-          "consecutive_blind_cycles": 10,
+          "consecutive_blind_cycles": 11,
           "workaround_used_this_cycle": null,
           "systemic_impact": "Stage 1 cannot audit task tree, Stage 2 cannot proactively sample tasks. Both stages blind to all but individually-fetched tasks. Growing worse as task count increases monotonically.",
           "continued_manifestation_run_e11c70c0": null,
           "get_tasks_chars_run_e11c70c0": null,
           "stage2_received_zero_tasks_run_e11c70c0": null,
           "priority_escalation": "critical",
-          "escalation_reason": "7+ consecutive blind reconciliation cycles — both Stage 1 and Stage 2 completely blind to task tree",
+          "escalation_reason": "11+ consecutive blind reconciliation cycles — both Stage 1 and Stage 2 completely blind to task tree",
           "escalation_by": "recon-stage-task_knowledge_sync",
           "escalation_date": "2026-04-01",
           "continued_manifestation_run_16e3dd18": null,
@@ -7445,7 +7445,9 @@
           "stage2_received_zero_tasks_run_07d74244": null,
           "workaround_used_this_cycle_07d74244": null,
           "metadata_cleaned_by": "recon-stage-task_knowledge_sync",
-          "metadata_cleaned_run": "7ae91368-dce7-46e5-a4b3-61fbffd9ae2e"
+          "metadata_cleaned_run": "7ae91368-dce7-46e5-a4b3-61fbffd9ae2e",
+          "last_manifestation_run": "d9639606-aeee-4281-9fd9-e1ef1c3bf975",
+          "get_tasks_chars_latest": 607954
         }
       },
       {
