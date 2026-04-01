@@ -30,7 +30,7 @@ async def queue(tmp_path, mock_execute):
         retry_base_seconds=0.05,
         write_timeout_seconds=2.0,
     )
-    await q.initialize()
+    await q.open()
     yield q
     await q.close()
 
@@ -109,7 +109,7 @@ class TestRetry:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
         )
-        await q.initialize()
+        await q.open()
 
         await q.enqueue(
             group_id='proj1', operation='add_episode',
@@ -145,7 +145,7 @@ class TestTimeout:
             retry_base_seconds=0.01,
             write_timeout_seconds=0.1,  # very short timeout
         )
-        await q.initialize()
+        await q.open()
 
         await q.enqueue(
             group_id='proj1', operation='add_episode',
@@ -172,7 +172,7 @@ class TestDeadLetter:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
         )
-        await q.initialize()
+        await q.open()
 
         await q.enqueue(
             group_id='proj1', operation='add_episode',
@@ -208,7 +208,7 @@ class TestReplayDead:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
         )
-        await q.initialize()
+        await q.open()
 
         await q.enqueue(
             group_id='proj1', operation='add_episode',
@@ -260,7 +260,7 @@ class TestConcurrency:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
         )
-        await q.initialize()
+        await q.open()
 
         # Enqueue 10 items
         for i in range(10):
@@ -290,12 +290,12 @@ class TestRecovery:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
         )
-        await q.initialize()
+        await q.open()
 
         # Manually insert an in_flight item (simulating crash)
         import time
-        assert q._db is not None
-        await q._db.execute(
+        assert q._conn is not None
+        await q._conn.execute(
             'INSERT INTO write_queue '
             '(group_id, operation, payload, status, attempts, max_attempts, '
             ' next_retry_at, created_at) '
@@ -303,7 +303,7 @@ class TestRecovery:
             ('proj1', 'add_episode', '{"content":"crashed","group_id":"proj1","name":"ep"}',
              time.time()),
         )
-        await q._db.commit()
+        await q._conn.commit()
         await q.close()
 
         # Re-open — should recover
@@ -316,7 +316,7 @@ class TestRecovery:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
         )
-        await q2.initialize()
+        await q2.open()
         await asyncio.sleep(0.5)
 
         # The recovered item should have been processed
@@ -348,7 +348,7 @@ class TestMultipleGroups:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
         )
-        await q.initialize()
+        await q.open()
 
         for group in ['alpha', 'beta', 'gamma']:
             for i in range(3):
@@ -387,8 +387,8 @@ class TestEnqueueBatchRollback:
             await queue.enqueue_batch(items)
 
         # Verify rollback: no items should have been persisted
-        assert queue._db is not None
-        cursor = await queue._db.execute(
+        assert queue._conn is not None
+        cursor = await queue._conn.execute(
             "SELECT COUNT(*) FROM write_queue WHERE status='pending'"
         )
         row = await cursor.fetchone()
@@ -449,7 +449,7 @@ class TestShutdown:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
         )
-        await q.initialize()
+        await q.open()
 
         await q.enqueue(
             group_id='proj1', operation='add_episode',
@@ -462,7 +462,7 @@ class TestShutdown:
 
         # Workers should be cleaned up
         assert len(q._worker_tasks) == 0
-        assert q._db is None
+        assert q._conn is None
 
 
 class TestStats:
@@ -486,7 +486,7 @@ class TestStats:
             retry_base_seconds=0.01,
             write_timeout_seconds=2.0,
         )
-        await q.initialize()
+        await q.open()
 
         # 2 will succeed, 1 will dead-letter
         await q.enqueue(

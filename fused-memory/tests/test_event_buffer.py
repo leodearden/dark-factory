@@ -38,7 +38,7 @@ async def buf(tmp_path):
         buffer_size_threshold=5,
         max_staleness_seconds=300,
     )
-    await b.initialize()
+    await b.open()
     yield b
     await b.close()
 
@@ -58,7 +58,7 @@ async def test_push_and_stats(buf):
 @pytest.mark.asyncio
 async def test_should_trigger_buffer_size(tmp_path):
     buf = EventBuffer(db_path=tmp_path / 'trigger.db', buffer_size_threshold=3, max_staleness_seconds=3600)
-    await buf.initialize()
+    await buf.open()
     try:
         for _ in range(3):
             await buf.push(_make_event())
@@ -72,7 +72,7 @@ async def test_should_trigger_buffer_size(tmp_path):
 @pytest.mark.asyncio
 async def test_should_trigger_staleness(tmp_path):
     buf = EventBuffer(db_path=tmp_path / 'stale.db', buffer_size_threshold=100, max_staleness_seconds=1)
-    await buf.initialize()
+    await buf.open()
     try:
         old_time = datetime.now(UTC) - timedelta(seconds=5)
         await buf.push(_make_event(timestamp=old_time))
@@ -93,7 +93,7 @@ async def test_no_trigger_when_empty(buf):
 @pytest.mark.asyncio
 async def test_no_trigger_when_active_run(tmp_path):
     buf = EventBuffer(db_path=tmp_path / 'locked.db', buffer_size_threshold=1)
-    await buf.initialize()
+    await buf.open()
     try:
         await buf.push(_make_event())
         await buf.mark_run_active('test-project')
@@ -132,7 +132,7 @@ async def test_mark_run_complete_allows_new_run(buf):
 @pytest.mark.asyncio
 async def test_separate_project_buffers(tmp_path):
     buf = EventBuffer(db_path=tmp_path / 'sep.db', buffer_size_threshold=2, conditional_trigger_ratio=0.0)
-    await buf.initialize()
+    await buf.open()
     try:
         await buf.push(_make_event(project_id='project-a'))
         await buf.push(_make_event(project_id='project-b'))
@@ -169,8 +169,8 @@ async def test_cross_instance_visibility(tmp_path):
     db_path = tmp_path / 'shared.db'
     buf_a = EventBuffer(db_path=db_path, buffer_size_threshold=5)
     buf_b = EventBuffer(db_path=db_path, buffer_size_threshold=5)
-    await buf_a.initialize()
-    await buf_b.initialize()
+    await buf_a.open()
+    await buf_b.open()
     try:
         await buf_a.push(_make_event())
         await buf_b.push(_make_event())
@@ -191,13 +191,13 @@ async def test_burst_detection_enters_bursting(tmp_path):
         db_path=tmp_path / 'burst.db',
         burst_window_seconds=30.0,
     )
-    await buf.initialize()
+    await buf.open()
     try:
         now = datetime.now(UTC)
         await buf.push(_make_event(agent_id='agent-1', timestamp=now))
         await buf.push(_make_event(agent_id='agent-1', timestamp=now + timedelta(seconds=5)))
 
-        db = buf._require_db()
+        db = buf._require_conn()
         async with db.execute(
             "SELECT state FROM burst_state WHERE agent_id = 'agent-1'"
         ) as cursor:
@@ -217,7 +217,7 @@ async def test_burst_cooldown_exits_bursting(tmp_path):
         burst_cooldown_seconds=150.0,
         buffer_size_threshold=1000,
     )
-    await buf.initialize()
+    await buf.open()
     try:
         # Create a burst state with old last_write_at
         old_time = datetime.now(UTC) - timedelta(seconds=200)
@@ -229,7 +229,7 @@ async def test_burst_cooldown_exits_bursting(tmp_path):
         assert result is True
 
         # Verify state was updated
-        db = buf._require_db()
+        db = buf._require_conn()
         async with db.execute(
             "SELECT state FROM burst_state WHERE agent_id = 'agent-1'"
         ) as cursor:
@@ -250,7 +250,7 @@ async def test_quiescent_trigger_at_33_percent(tmp_path):
         burst_window_seconds=30.0,
         burst_cooldown_seconds=150.0,
     )
-    await buf.initialize()
+    await buf.open()
     try:
         for _ in range(165):
             await buf.push(_make_event())
@@ -272,7 +272,7 @@ async def test_not_quiescent_when_bursting(tmp_path):
         burst_window_seconds=30.0,
         burst_cooldown_seconds=150.0,
     )
-    await buf.initialize()
+    await buf.open()
     try:
         now = datetime.now(UTC)
         # Push events without agent_id (no burst tracking)
@@ -300,7 +300,7 @@ async def test_not_quiescent_when_queue_active(tmp_path):
         conditional_trigger_ratio=0.33,
         queue_stats_fn=mock_queue_stats,
     )
-    await buf.initialize()
+    await buf.open()
     try:
         for _ in range(165):
             await buf.push(_make_event())
@@ -323,7 +323,7 @@ async def test_not_quiescent_when_queue_has_in_flight(tmp_path):
         conditional_trigger_ratio=0.33,
         queue_stats_fn=mock_queue_stats,
     )
-    await buf.initialize()
+    await buf.open()
     try:
         for _ in range(165):
             await buf.push(_make_event())
@@ -346,7 +346,7 @@ async def test_not_quiescent_when_queue_has_retries(tmp_path):
         conditional_trigger_ratio=0.33,
         queue_stats_fn=mock_queue_stats,
     )
-    await buf.initialize()
+    await buf.open()
     try:
         for _ in range(165):
             await buf.push(_make_event())
@@ -369,7 +369,7 @@ async def test_quiescent_when_queue_truly_empty(tmp_path):
         conditional_trigger_ratio=0.33,
         queue_stats_fn=mock_queue_stats,
     )
-    await buf.initialize()
+    await buf.open()
     try:
         for _ in range(165):
             await buf.push(_make_event())
@@ -393,7 +393,7 @@ async def test_quiescent_when_queue_all_completed(tmp_path):
         conditional_trigger_ratio=0.33,
         queue_stats_fn=mock_queue_stats,
     )
-    await buf.initialize()
+    await buf.open()
     try:
         for _ in range(165):
             await buf.push(_make_event())
@@ -411,8 +411,8 @@ async def test_cross_instance_lock(tmp_path):
     db_path = tmp_path / 'lock.db'
     buf_a = EventBuffer(db_path=db_path, instance_id='instance-a')
     buf_b = EventBuffer(db_path=db_path, instance_id='instance-b')
-    await buf_a.initialize()
-    await buf_b.initialize()
+    await buf_a.open()
+    await buf_b.open()
     try:
         assert await buf_a.mark_run_active('test-project') is True
         assert await buf_b.mark_run_active('test-project') is False
@@ -430,13 +430,13 @@ async def test_stale_lock_recovery(tmp_path):
     db_path = tmp_path / 'stale_lock.db'
     buf_a = EventBuffer(db_path=db_path, instance_id='instance-a', stale_lock_seconds=1)
     buf_b = EventBuffer(db_path=db_path, instance_id='instance-b', stale_lock_seconds=1)
-    await buf_a.initialize()
-    await buf_b.initialize()
+    await buf_a.open()
+    await buf_b.open()
     try:
         assert await buf_a.mark_run_active('test-project') is True
 
         # Simulate old heartbeat
-        db = buf_a._require_db()
+        db = buf_a._require_conn()
         old = (datetime.now(UTC) - timedelta(seconds=10)).isoformat()
         await db.execute(
             'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
@@ -455,12 +455,12 @@ async def test_stale_lock_recovery(tmp_path):
 async def test_agent_id_none_excluded_from_burst(tmp_path):
     """Events without agent_id don't create burst state entries."""
     buf = EventBuffer(db_path=tmp_path / 'no_agent.db')
-    await buf.initialize()
+    await buf.open()
     try:
         await buf.push(_make_event())  # agent_id=None
         await buf.push(_make_event())
 
-        db = buf._require_db()
+        db = buf._require_conn()
         async with db.execute('SELECT COUNT(*) as cnt FROM burst_state') as cursor:
             row = await cursor.fetchone()
         assert row is not None
@@ -494,7 +494,7 @@ async def test_restore_drained_returns_zero_when_empty(buf):
 async def test_restore_drained_only_affects_target_project(tmp_path):
     """Multi-project isolation — restore only affects the specified project."""
     buf = EventBuffer(db_path=tmp_path / 'multi.db', buffer_size_threshold=5)
-    await buf.initialize()
+    await buf.open()
     try:
         await buf.push(_make_event(project_id='project-a'))
         await buf.push(_make_event(project_id='project-b'))
@@ -518,7 +518,7 @@ async def test_expire_stale_bursts_transitions_old_agents(tmp_path):
         burst_window_seconds=30.0,
         burst_cooldown_seconds=150.0,
     )
-    await buf.initialize()
+    await buf.open()
     try:
         old_time = datetime.now(UTC) - timedelta(seconds=200)
         await buf.push(_make_event(agent_id='agent-1', timestamp=old_time))
@@ -527,7 +527,7 @@ async def test_expire_stale_bursts_transitions_old_agents(tmp_path):
         expired = await buf.expire_stale_bursts()
         assert expired == 1
 
-        db = buf._require_db()
+        db = buf._require_conn()
         async with db.execute(
             "SELECT state FROM burst_state WHERE agent_id = 'agent-1'"
         ) as cursor:
@@ -546,7 +546,7 @@ async def test_expire_stale_bursts_preserves_recent_bursts(tmp_path):
         burst_window_seconds=30.0,
         burst_cooldown_seconds=150.0,
     )
-    await buf.initialize()
+    await buf.open()
     try:
         now = datetime.now(UTC)
         await buf.push(_make_event(agent_id='agent-1', timestamp=now))
@@ -555,7 +555,7 @@ async def test_expire_stale_bursts_preserves_recent_bursts(tmp_path):
         expired = await buf.expire_stale_bursts()
         assert expired == 0
 
-        db = buf._require_db()
+        db = buf._require_conn()
         async with db.execute(
             "SELECT state FROM burst_state WHERE agent_id = 'agent-1'"
         ) as cursor:
@@ -573,11 +573,11 @@ async def test_should_trigger_expires_bursts_when_buffer_empty(tmp_path):
         db_path=tmp_path / 'empty_expire.db',
         burst_cooldown_seconds=150.0,
     )
-    await buf.initialize()
+    await buf.open()
     try:
         # Create a stale burst state directly
         old_time = datetime.now(UTC) - timedelta(seconds=200)
-        db = buf._require_db()
+        db = buf._require_conn()
         await db.execute(
             """INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)
                VALUES (?, 'bursting', ?, ?)""",
@@ -604,7 +604,7 @@ async def test_should_trigger_expires_bursts_when_buffer_empty(tmp_path):
 async def test_cleanup_drained(tmp_path):
     """Drained events older than cutoff get cleaned up."""
     buf = EventBuffer(db_path=tmp_path / 'cleanup.db')
-    await buf.initialize()
+    await buf.open()
     try:
         old_time = datetime.now(UTC) - timedelta(hours=2)
         await buf.push(_make_event(timestamp=old_time))
@@ -618,7 +618,7 @@ async def test_cleanup_drained(tmp_path):
         assert deleted == 1
 
         # Recent drained event should still be there
-        db = buf._require_db()
+        db = buf._require_conn()
         async with db.execute(
             "SELECT COUNT(*) as cnt FROM event_buffer WHERE status = 'drained'"
         ) as cursor:

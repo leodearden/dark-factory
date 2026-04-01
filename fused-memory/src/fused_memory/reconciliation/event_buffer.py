@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 import aiosqlite
+from shared.async_sqlite_base import AsyncSqliteBase
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -61,7 +62,7 @@ CREATE INDEX IF NOT EXISTS idx_dw_project ON deferred_writes(project_id);
 """
 
 
-class EventBuffer:
+class EventBuffer(AsyncSqliteBase):
     """SQLite-backed event buffer with cross-instance visibility and burst detection.
 
     Replaces the per-instance in-memory buffer with a shared SQLite store so that
@@ -83,7 +84,8 @@ class EventBuffer:
         queue_stats_fn: Callable[[], Any] | None = None,
         instance_id: str | None = None,
     ):
-        self._db_path = str(db_path) if db_path else ':memory:'
+        effective_path = Path(db_path) if db_path else Path(':memory:')
+        super().__init__(effective_path, busy_timeout_ms=5000)
         self.buffer_size_threshold = buffer_size_threshold
         self.max_staleness_seconds = max_staleness_seconds
         self.conditional_trigger_ratio = conditional_trigger_ratio
@@ -92,29 +94,36 @@ class EventBuffer:
         self.stale_lock_seconds = stale_lock_seconds
         self._queue_stats_fn = queue_stats_fn
         self.instance_id = instance_id or str(uuid4())
-        self._db: aiosqlite.Connection | None = None
         self._manual_triggers: set[str] = set()
 
-    async def initialize(self) -> None:
-        """Open SQLite connection and ensure schema exists."""
-        self._db = await aiosqlite.connect(self._db_path)
-        self._db.row_factory = aiosqlite.Row
-        await self._db.execute('PRAGMA journal_mode=WAL')
-        await self._db.execute('PRAGMA busy_timeout=5000')
-        await self._db.executescript(_BUFFER_SCHEMA_SQL)
-        await self._db.commit()
-        logger.info(f'EventBuffer initialized (db={self._db_path}, instance={self.instance_id})')
+    @property
+    def _schema(self) -> str:
+        return _BUFFER_SCHEMA_SQL
 
-    def _require_db(self) -> aiosqlite.Connection:
-        if self._db is None:
-            raise RuntimeError('EventBuffer not initialized — call initialize() first')
-        return self._db
+    async def open(self) -> None:
+        if str(self.db_path) == ':memory:':
+            # WAL mode is unsupported for in-memory databases.  Bypass the
+            # base-class open() and connect directly without WAL pragmas.
+            async with self._lifecycle_lock:
+                if self._conn is not None:
+                    raise RuntimeError(f'{type(self).__name__} already opened')
+                conn = await aiosqlite.connect(':memory:')
+                try:
+                    await conn.executescript(self._schema)
+                except BaseException:
+                    await conn.close()
+                    raise
+                self._conn = conn
+        else:
+            await super().open()
+        self._require_conn().row_factory = aiosqlite.Row
+        logger.info('EventBuffer initialized (db=%s, instance=%s)', self.db_path, self.instance_id)
 
     # ── Push ───────────────────────────────────────────────────────────
 
     async def push(self, event: ReconciliationEvent) -> None:
         """Insert event into the shared buffer."""
-        db = self._require_db()
+        db = self._require_conn()
         await db.execute(
             """INSERT INTO event_buffer
                (id, project_id, event_type, event_source, agent_id, timestamp, payload, status)
@@ -147,7 +156,7 @@ class EventBuffer:
 
     async def _update_burst_state(self, agent_id: str, timestamp: datetime) -> None:
         """Track per-agent write bursts.  2+ writes within burst_window → bursting."""
-        db = self._require_db()
+        db = self._require_conn()
         ts_iso = timestamp.isoformat()
         cutoff = (timestamp.timestamp() - self.burst_window_seconds)
         cutoff_iso = datetime.fromtimestamp(cutoff, tz=UTC).isoformat()
@@ -187,7 +196,7 @@ class EventBuffer:
 
         Returns (should_trigger, reason).
         """
-        db = self._require_db()
+        db = self._require_conn()
 
         # Check run lock
         if await self._is_run_locked(project_id):
@@ -236,7 +245,7 @@ class EventBuffer:
 
     async def _is_run_locked(self, project_id: str) -> bool:
         """Check if another instance holds the reconciliation lock."""
-        db = self._require_db()
+        db = self._require_conn()
         # Expire stale locks first
         cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - self.stale_lock_seconds,
@@ -256,7 +265,7 @@ class EventBuffer:
 
     async def expire_stale_bursts(self) -> int:
         """Transition 'bursting' agents to 'idle' when cooldown has elapsed."""
-        db = self._require_db()
+        db = self._require_conn()
         cooldown_cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - self.burst_cooldown_seconds,
             tz=UTC,
@@ -271,7 +280,7 @@ class EventBuffer:
 
     async def _is_quiescent(self) -> bool:
         """System is quiescent when no agent is bursting and durable queue is idle."""
-        db = self._require_db()
+        db = self._require_conn()
 
         await self.expire_stale_bursts()
 
@@ -302,7 +311,7 @@ class EventBuffer:
 
     async def drain(self, project_id: str) -> list[ReconciliationEvent]:
         """Atomically drain buffered events for a project."""
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute(
             """SELECT * FROM event_buffer
                WHERE project_id = ? AND status = 'buffered'
@@ -339,7 +348,7 @@ class EventBuffer:
         self, project_id: str, limit: int,
     ) -> list[ReconciliationEvent]:
         """Drain the oldest `limit` buffered events for a project."""
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute(
             """SELECT * FROM event_buffer
                WHERE project_id = ? AND status = 'buffered'
@@ -375,7 +384,7 @@ class EventBuffer:
 
     async def restore_drained(self, project_id: str) -> int:
         """Restore drained events to 'buffered' after a failed run."""
-        db = self._require_db()
+        db = self._require_conn()
         cursor = await db.execute(
             "UPDATE event_buffer SET status = 'buffered' "
             "WHERE project_id = ? AND status = 'drained'",
@@ -389,7 +398,7 @@ class EventBuffer:
 
     async def count_buffered(self, project_id: str) -> int:
         """Return count of buffered events for a project."""
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute(
             "SELECT COUNT(*) as cnt FROM event_buffer WHERE project_id = ? AND status = 'buffered'",
             (project_id,),
@@ -401,7 +410,7 @@ class EventBuffer:
 
     async def mark_run_active(self, project_id: str) -> bool:
         """Acquire cross-instance lock. Returns False if already held."""
-        db = self._require_db()
+        db = self._require_conn()
         # Expire stale locks
         cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - self.stale_lock_seconds,
@@ -429,7 +438,7 @@ class EventBuffer:
 
     async def mark_run_complete(self, project_id: str) -> None:
         """Release the reconciliation lock."""
-        db = self._require_db()
+        db = self._require_conn()
         await db.execute(
             'DELETE FROM reconciliation_locks WHERE project_id = ?',
             (project_id,),
@@ -438,7 +447,7 @@ class EventBuffer:
 
     async def heartbeat(self, project_id: str) -> None:
         """Update lock heartbeat to prevent stale-lock recovery."""
-        db = self._require_db()
+        db = self._require_conn()
         now = datetime.now(UTC).isoformat()
         await db.execute(
             'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ? AND instance_id = ?',
@@ -461,7 +470,7 @@ class EventBuffer:
         agent_id: str | None = None,
     ) -> str:
         """Queue a memory write for replay after the current full cycle completes."""
-        db = self._require_db()
+        db = self._require_conn()
         write_id = str(uuid4())
         await db.execute(
             """INSERT INTO deferred_writes
@@ -489,7 +498,7 @@ class EventBuffer:
 
         Returns list of ``{content, category, metadata, agent_id}`` dicts.
         """
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute(
             'SELECT * FROM deferred_writes WHERE project_id = ? ORDER BY created_at',
             (project_id,),
@@ -521,7 +530,7 @@ class EventBuffer:
 
     async def get_active_projects(self) -> list[str]:
         """Return project IDs that have buffered events."""
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute(
             "SELECT DISTINCT project_id FROM event_buffer WHERE status = 'buffered'"
         ) as cursor:
@@ -530,7 +539,7 @@ class EventBuffer:
 
     async def get_buffer_stats(self, project_id: str) -> dict:
         """Buffer size and oldest event age for a project."""
-        db = self._require_db()
+        db = self._require_conn()
         async with db.execute(
             """SELECT COUNT(*) as cnt, MIN(timestamp) as oldest
                FROM event_buffer
@@ -555,7 +564,7 @@ class EventBuffer:
 
     async def cleanup_drained(self, max_age_seconds: float = 3600.0) -> int:
         """Delete drained events older than cutoff, skipping locked projects."""
-        db = self._require_db()
+        db = self._require_conn()
         cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - max_age_seconds,
             tz=UTC,
@@ -599,9 +608,3 @@ class EventBuffer:
             self._manual_triggers.discard(project_id)
             return True
         return False
-
-    async def close(self) -> None:
-        """Close the database connection."""
-        if self._db:
-            await self._db.close()
-            self._db = None

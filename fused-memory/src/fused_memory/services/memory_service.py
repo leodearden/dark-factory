@@ -122,7 +122,7 @@ class MemoryService:
         self.durable_queue.register_callback(
             'dual_write_episode', self._dual_write_callback
         )
-        await self.durable_queue.initialize()
+        await self.durable_queue.open()
 
         logger.info('MemoryService initialized')
 

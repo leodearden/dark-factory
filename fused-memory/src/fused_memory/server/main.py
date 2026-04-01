@@ -104,7 +104,7 @@ async def run_server():
 
     wj_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
     write_journal = WriteJournal(wj_data_dir)
-    await write_journal.initialize()
+    await write_journal.open()
     memory_service.set_write_journal(write_journal)
 
     # Initialize Taskmaster backend
@@ -133,7 +133,7 @@ async def run_server():
         from fused_memory.reconciliation.targeted import TargetedReconciler
 
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
-        await recon_journal.initialize()
+        await recon_journal.open()
         recon_journal.set_write_journal(write_journal)
 
         db_path = Path(config.reconciliation.data_dir) / 'reconciliation.db'
@@ -148,7 +148,7 @@ async def run_server():
             stale_lock_seconds=config.reconciliation.stale_lock_seconds,
             queue_stats_fn=memory_service.durable_queue.get_stats if memory_service.durable_queue else None,
         )
-        await event_buffer.initialize()
+        await event_buffer.open()
 
         # Wire event emission into memory_service
         memory_service.set_event_buffer(event_buffer)
@@ -181,7 +181,7 @@ async def run_server():
         from fused_memory.reconciliation.event_buffer import EventBuffer
 
         event_buffer = EventBuffer(db_path=None)
-        await event_buffer.initialize()
+        await event_buffer.open()
         task_committer = TaskFileCommitter()
         task_interceptor = TaskInterceptor(taskmaster, None, event_buffer, task_committer)
 

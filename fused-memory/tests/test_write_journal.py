@@ -12,7 +12,7 @@ from fused_memory.services.write_journal import WriteJournal
 @pytest_asyncio.fixture
 async def journal(tmp_path):
     j = WriteJournal(tmp_path / 'test_wj')
-    await j.initialize()
+    await j.open()
     yield j
     await j.close()
 
@@ -20,7 +20,7 @@ async def journal(tmp_path):
 @pytest.mark.asyncio
 async def test_initialize_creates_db(tmp_path):
     j = WriteJournal(tmp_path / 'init_test')
-    await j.initialize()
+    await j.open()
     assert (tmp_path / 'init_test' / 'write_journal.db').exists()
     await j.close()
 
@@ -145,7 +145,7 @@ async def test_log_write_op_never_raises(journal):
     """Journaling failures should be swallowed, not propagated."""
     # Close the DB to force an error
     await journal.close()
-    journal._db = None
+    journal._conn = None
     # Should not raise
     await journal.log_write_op(
         write_op_id=str(uuid.uuid4()),
@@ -156,7 +156,7 @@ async def test_log_write_op_never_raises(journal):
 @pytest.mark.asyncio
 async def test_log_backend_op_never_raises(journal):
     await journal.close()
-    journal._db = None
+    journal._conn = None
     await journal.log_backend_op(
         backend='mem0',
         operation='add',
@@ -304,10 +304,10 @@ async def test_migration_adds_columns(tmp_path):
 
     # Now initialize WriteJournal — should migrate
     j = WriteJournal(db_dir)
-    await j.initialize()
+    await j.open()
 
     # Check columns exist
-    db = j._require_db()
+    db = j._require_conn()
     async with db.execute('PRAGMA table_info(write_ops)') as cursor:
         cols = {row[1] for row in await cursor.fetchall()}
     assert 'session_id' in cols
