@@ -171,3 +171,59 @@ class TestByRoleCurrentScriptNullGuard:
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
         assert 'if (!container) return' in html
+
+
+# ---------------------------------------------------------------------------
+# Step-9: Render error recovery tests (TestByRoleRenderErrorRecovery)
+# ---------------------------------------------------------------------------
+
+
+class TestByRoleRenderErrorRecovery:
+    """Tests that by_role.html recovers from render-time exceptions without permanent lockout."""
+
+    def test_foreach_loop_wrapped_in_try_block(self, client):
+        """The projectIds.forEach loop must be wrapped in a try block."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        try_pos = html.find('try {')
+        foreach_pos = html.find('.forEach(')
+        assert try_pos != -1, "'try {' not found in script"
+        assert foreach_pos != -1, "'.forEach(' not found in script"
+        assert try_pos < foreach_pos, (
+            "'try {' must appear before '.forEach(' in the script"
+        )
+
+    def test_rendered_true_set_after_foreach_loop(self, client):
+        """rendered = true must be set AFTER the forEach loop (inside the try block), not before it."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        foreach_pos = html.find('.forEach(')
+        rendered_true_pos = html.find('rendered = true')
+        assert foreach_pos != -1, "'.forEach(' not found in script"
+        assert rendered_true_pos != -1, "'rendered = true' not found in script"
+        assert rendered_true_pos > foreach_pos, (
+            "'rendered = true' must appear AFTER '.forEach(' — it should only latch after successful loop completion"
+        )
+
+    def test_catch_block_resets_rendered_false(self, client):
+        """A catch block must exist and reset rendered = false to allow retry."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        catch_pos = html.find('catch')
+        rendered_false_pos = html.find('rendered = false')
+        assert catch_pos != -1, "'catch' not found in script"
+        assert rendered_false_pos != -1, "'rendered = false' not found in script"
+        assert rendered_false_pos > catch_pos, (
+            "'rendered = false' must appear inside the catch block (after 'catch')"
+        )
+
+    def test_catch_block_rethrows_error(self, client):
+        """The catch block must re-throw the error so it is not silently swallowed."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        catch_pos = html.find('catch')
+        throw_pos = html.find('throw', catch_pos)
+        assert catch_pos != -1, "'catch' not found in script"
+        assert throw_pos != -1, (
+            "'throw' not found after 'catch' — catch block must re-throw the error"
+        )
