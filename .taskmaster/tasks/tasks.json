@@ -7405,7 +7405,12 @@
               "get_tasks context window overflow 596K",
               "task 122 fix false-empty-tree"
             ]
-          }
+          },
+          "continued_manifestation_run_8610d943": true,
+          "get_tasks_chars_this_run": 601644,
+          "stage2_received_zero_tasks": true,
+          "workaround_used": "individual get_task calls for flagged tasks",
+          "_causation_id": "8610d943-9548-4031-a4be-d6890cbadeff"
         }
       }
     ],
