@@ -2656,11 +2656,28 @@
             "queries": [
               "entity summary accumulation stale duplicate lines",
               "Graphiti entity summary rebuild deduplication mechanism",
-              "CostStore entity summary contradictions extends AgentResult",
-              "UsageGate duplicate entity nodes fragmented knowledge"
+              "stale count data entity summaries task 187",
+              "11 entities retain stale count data ae174332 0d096eab c618eb5d"
             ]
           },
-          "_causation_id": "e0fce9c1-100f-4f35-a062-c2847200f7e6"
+          "_causation_id": "efbe832b-ea9e-48b1-9ef5-2670a5b0141b",
+          "stale_count_entities": [
+            "ae174332",
+            "0d096eab",
+            "c618eb5d",
+            "4931ffbf",
+            "65b3db28",
+            "48fd2a98",
+            "8693932c",
+            "fe4a7314",
+            "9daca3e0",
+            "ce4fa3fd",
+            "4d20f360"
+          ],
+          "related_tasks": [
+            382,
+            187
+          ]
         }
       },
       {
