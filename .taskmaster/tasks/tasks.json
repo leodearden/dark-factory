@@ -6028,11 +6028,11 @@
         "description": "Task 315 extracted AsyncSqliteBase but only migrated CostStore (in shared/). Four fused-memory stores still duplicate the identical open/WAL-pragma/executescript/close lifecycle:\n\n- DurableWriteQueue (fused-memory/src/fused_memory/services/durable_queue.py)\n- WriteJournal (fused-memory/src/fused_memory/services/write_journal.py)\n- EventBuffer (fused-memory/src/fused_memory/reconciliation/event_buffer.py)\n- ReconciliationJournal (fused-memory/src/fused_memory/reconciliation/journal.py)\n\nEach has 30-50 lines of boilerplate that AsyncSqliteBase eliminates. They differ only in schema DDL and busy_timeout_ms — both already parameterized by the base class.\n\nMigration pattern per store:\n- Replace initialize()/open() with AsyncSqliteBase.open()\n- Drop _db/_require_db boilerplate (use _require_conn())\n- Implement _schema as a property\n- Pass busy_timeout_ms to super().__init__()\n- For stores using `row_factory = aiosqlite.Row`: override open(), call super().open(), then set row_factory\n\nDepends on task 315 being merged to main.\n\nmemory_hints:\n- search: \"AsyncSqliteBase base class sqlite lifecycle dedup\"\n- entity: \"DurableWriteQueue\"\n- entity: \"WriteJournal\"\n- entity: \"EventBuffer\"\n- entity: \"ReconciliationJournal\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-31T15:31:53.880Z",
+        "updatedAt": "2026-04-01T13:23:54.728Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
@@ -6788,13 +6788,13 @@
         "description": "In costs.py, get_cost_trend correctly captures `now = datetime.now(UTC)` once to avoid clock skew, but inlines `(now - timedelta(days=days)).isoformat()` rather than using the `_cutoff` helper. This creates two patterns for the same computation. The five other callers of `_cutoff` (lines 43, 99, 137, 221, 312, 358) still independently sample the clock inside `_cutoff`, meaning they each have the same theoretical clock-skew race.\n\nFix: Change `_cutoff` signature to `def _cutoff(days: int, *, now: datetime | None = None) -> str:` computing `(now or datetime.now(UTC)) - timedelta(days=days)`. In `get_cost_trend`, call `since = _cutoff(days, now=now)`. Other callers continue to work unchanged but can opt in to the single-clock pattern if needed.\n\nmemory_hints: search \"clock skew race costs.py\", search \"_cutoff helper\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [
           "317"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-31T15:36:01.068Z",
+        "updatedAt": "2026-04-01T13:23:54.760Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data",
@@ -7234,7 +7234,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-01T13:23:54.693Z",
+      "lastModified": "2026-04-01T13:23:54.760Z",
       "taskCount": 359,
       "completedCount": 295,
       "tags": [
