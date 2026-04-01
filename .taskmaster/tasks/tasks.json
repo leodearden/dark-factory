@@ -2664,7 +2664,7 @@
               "Graphiti search broken empty results task 382"
             ]
           },
-          "_causation_id": "64839bc3-339b-43a1-8aa2-18612d8f7678",
+          "_causation_id": "cfe9d73c-5e37-4cbd-a8a6-0de13463b928",
           "stale_count_entities": [
             "ae174332",
             "0d096eab",
@@ -2718,7 +2718,14 @@
           "priority_aligned_by": "recon-stage-task_knowledge_sync",
           "priority_note": "Actual priority field should be high per metadata priority_override. update_task with prompt failed (no Perplexity key). Priority override remains in metadata.",
           "priority_alignment_note": "priority field still 'medium' despite priority_override='high'. update_task with prompt cannot change priority without Perplexity key. Metadata tracks the override; priority_override_resolved was incorrectly set to true in a prior cycle.",
-          "stage1_finding_64839bc3": "Stage 1 confirmed valid-but-obsolete edge accumulation: Orchestrator 18 edges, fused-memory 17 edges. CostStore 23 near-duplicate summary lines, UsageGate 14. refresh_entity_summary only deduplicates exact text matches — insufficient for paraphrased duplicates. Edge obsolescence mechanism needed: time-decay scoring, temporal supersession, content similarity deduplication."
+          "stage1_finding_64839bc3": "Stage 1 confirmed valid-but-obsolete edge accumulation: Orchestrator 18 edges, fused-memory 17 edges. CostStore 23 near-duplicate summary lines, UsageGate 14. refresh_entity_summary only deduplicates exact text matches — insufficient for paraphrased duplicates. Edge obsolescence mechanism needed: time-decay scoring, temporal supersession, content similarity deduplication.",
+          "stage1_finding_cfe9d73c": "CostStore 21→20 lines, UsageGate 14→13 lines. Exact-text dedup insufficient for paraphrased duplicates. Semantic dedup mechanism still needed.",
+          "latest_cycle_evidence": {
+            "coststore_lines": 20,
+            "usagegate_lines": 13,
+            "dedup_method": "exact_text_only",
+            "semantic_dedup_needed": true
+          }
         }
       },
       {
