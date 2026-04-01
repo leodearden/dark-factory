@@ -7221,7 +7221,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "fused-memory/tests/test_merge_entities.py"
+          ],
+          "modules": [
+            "fused-memory/tests"
+          ]
+        }
       }
     ],
     "metadata": {
