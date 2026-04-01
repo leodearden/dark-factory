@@ -6931,7 +6931,15 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-31T15:38:12.271Z"
+        "updatedAt": "2026-03-31T15:38:12.271Z",
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/partials/costs/by_role.html"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates/partials/costs"
+          ]
+        }
       },
       {
         "id": 367,
@@ -6942,7 +6950,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/app.py",
+            "dashboard/tests/test_costs_page.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard",
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 368,
