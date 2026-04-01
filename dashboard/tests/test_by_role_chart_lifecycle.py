@@ -144,3 +144,30 @@ class TestByRoleChartCleanup:
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
         assert 'function getOrDestroyChart' not in html
+
+
+# ---------------------------------------------------------------------------
+# Step-7: document.currentScript null guard tests (TestByRoleCurrentScriptNullGuard)
+# ---------------------------------------------------------------------------
+
+
+class TestByRoleCurrentScriptNullGuard:
+    """Tests that by_role.html guards against document.currentScript being null."""
+
+    def test_container_assignment_checks_current_script_null(self, client):
+        """Container assignment must null-check document.currentScript before .closest()."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert 'document.currentScript &&' in html
+
+    def test_container_assignment_has_document_query_fallback(self, client):
+        """Container assignment must fall back to document.querySelector when currentScript is null."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert "document.querySelector('[data-by-role-container]')" in html
+
+    def test_early_exit_guard_after_container_assignment(self, client):
+        """Script must have an early-exit guard immediately after container assignment."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        assert 'if (!container) return' in html
