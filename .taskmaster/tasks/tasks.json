@@ -6874,11 +6874,11 @@
         "description": "The merge_entities MCP tool in tools.py uses .strip() for validation comparisons but passes the original (potentially whitespace-padded) UUIDs to memory_service.merge_entities(). A caller passing ' uuid-a ' would pass validation but cause a NodeNotFoundError at the backend where a ValidationError would be more appropriate.\n\nFix: Strip both UUID values early and use the stripped versions throughout — `deprecated_uuid = deprecated_uuid.strip()` and `surviving_uuid = surviving_uuid.strip()` before validation checks and before forwarding to the service.\n\nMemory hints:\n- Search: 'merge_entities MCP tool input validation'\n- Entities: merge_entities",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-01T13:26:10.637Z",
+        "updatedAt": "2026-04-01T13:28:46.707Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/server",
@@ -7234,9 +7234,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-01T13:26:10.637Z",
+      "lastModified": "2026-04-01T13:28:46.707Z",
       "taskCount": 359,
-      "completedCount": 296,
+      "completedCount": 297,
       "tags": [
         "master"
       ]
