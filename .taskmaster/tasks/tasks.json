@@ -2669,7 +2669,10 @@
           "related_tasks": [
             382,
             187
-          ]
+          ],
+          "blocked_reason": "Depends on task 382 (Graphiti search returns zero results). Entity summary rebuild/dedup requires functional Graphiti search. Graphiti search has been non-functional for 3+ reconciliation cycles. Root cause is NOT dimension mismatch (task 88 confirmed fix). Investigate: OpenAI embedding API connectivity, project_id metadata mismatch, edge invalidation state, Mem0→Graphiti replay metadata.",
+          "blocked_by_task": 382,
+          "status_change_causation": "1a2c1382-21ef-4e28-95a6-f81973c03a57"
         }
       },
       {
