@@ -7244,6 +7244,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 382,
+        "title": "Bug: Graphiti search returns zero results despite 2958 nodes in store",
+        "description": "Critical: Graphiti semantic search returns empty for ALL queries across all categories, entity lookups, and temporal fact searches. The knowledge graph is effectively non-functional for retrieval despite having 2958 nodes. This blocks all reconciliation operations that depend on Graphiti search.",
+        "details": "Stage 1 reconciliation (run efbe832b) confirmed this across 20 search attempts. Possible causes:\n1. OpenAI embedding API connectivity/authentication failure\n2. FalkorDB vector index dimension mismatch (memory c1e28a77: \"items will always fail until the Graphiti index is recreated with 1536 dimensions\")\n3. project_id metadata mismatch between stored nodes and search filter\n4. All edges invalidated leaving orphaned entity nodes\n\nInvestigation steps:\n1. Check OpenAI embedding API connectivity from fused-memory server\n2. Query FalkorDB directly to verify edges exist and check their embedding dimensions\n3. Verify project_id metadata on stored nodes vs search filter expectations\n4. If dimension mismatch confirmed, recreate the FalkorDB vector index with correct dimensions\n5. Consider full reindex if embeddings are stale\n\nRelated completed tasks: 57 (dimension mismatch investigation), 112 (stale edge cleanup), 126 (entity summary refresh), 312 (filter invalidated edges)\n\nmemory_hints:\n- search: \"dimension mismatch FalkorDB vector index 1536\"\n- search: \"Graphiti search broken empty results\"\n- search: \"_search_graphiti fix is not None guards\"\n- entity: \"FalkorDB\"\n- entity: \"Graphiti\"",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -7256,7 +7267,7 @@
       ],
       "created": "2026-04-01T16:08:34.457Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-01T16:08:34.460Z"
+      "updated": "2026-04-01T16:08:44.227Z"
     }
   }
 }
