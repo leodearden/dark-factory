@@ -36,13 +36,17 @@ def main(verbose: bool):
 @click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
               default=None, help='Path to config YAML')
 @click.option('--dry-run', is_flag=True, help='Populate tasks only, do not execute')
-def run(prd: Path | None, config_path: Path | None, dry_run: bool):
+@click.option('--delay', default=None,
+              help='Delay before executing tasks (e.g. 4h, 30m, 90s). '
+                   'Escalation server starts immediately.')
+def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | None):
     """Run the orchestrator against a PRD, or execute existing tasks if no PRD given."""
     from orchestrator.harness import Harness
 
+    delay_secs = _parse_duration(delay) if delay else 0
     config = load_config(config_path)
     harness = Harness(config)
-    report = asyncio.run(harness.run(prd, dry_run=dry_run))
+    report = asyncio.run(harness.run(prd, dry_run=dry_run, delay_secs=delay_secs))
 
     click.echo(report.summary())
 
@@ -329,6 +333,18 @@ def _run_plan_only(task_path: Path | None, base_config):
                 await cleanup_eval_worktree(project_root, worktree)
 
     asyncio.run(_run())
+
+
+def _parse_duration(s: str) -> int:
+    """Parse a duration string like '4h', '30m', '90s', or bare seconds."""
+    s = s.strip().lower()
+    if s.endswith('h'):
+        return int(s[:-1]) * 3600
+    if s.endswith('m'):
+        return int(s[:-1]) * 60
+    if s.endswith('s'):
+        return int(s[:-1])
+    return int(s)
 
 
 if __name__ == '__main__':
