@@ -134,10 +134,17 @@ class Harness:
         self._merge_worker: object | None = None  # MergeWorker (lazy import)
         self._merge_worker_task: asyncio.Task | None = None
 
-    async def run(self, prd_path: Path | None = None, dry_run: bool = False) -> HarnessReport:
+    async def run(
+        self,
+        prd_path: Path | None = None,
+        dry_run: bool = False,
+        delay_secs: int = 0,
+    ) -> HarnessReport:
         """Execute the full orchestration pipeline.
 
         If *prd_path* is ``None``, skip PRD parsing and run existing tasks.
+        If *delay_secs* > 0, sleep that many seconds after startup (escalation
+        server runs immediately) before executing tasks.
         """
         self.report.started_at = datetime.now(UTC).isoformat()
 
@@ -157,6 +164,25 @@ class Harness:
                 await self._dismiss_stale_escalations()
             except Exception as e:
                 logger.warning(f'Failed to dismiss stale escalations: {e}')
+
+            # 1c2. Delay before task execution (escalation server already running)
+            if delay_secs > 0:
+                hours, rem = divmod(delay_secs, 3600)
+                mins, secs = divmod(rem, 60)
+                parts = []
+                if hours:
+                    parts.append(f'{hours}h')
+                if mins:
+                    parts.append(f'{mins}m')
+                if secs:
+                    parts.append(f'{secs}s')
+                human = ' '.join(parts)
+                logger.info(
+                    f'Delaying task execution by {human} — '
+                    f'escalation server is live on port {self.config.escalation.port}'
+                )
+                await asyncio.sleep(delay_secs)
+                logger.info('Delay complete — resuming task execution')
 
             # 1d. Usage cap startup check
             if self.usage_gate:
