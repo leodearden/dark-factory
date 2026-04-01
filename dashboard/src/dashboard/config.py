@@ -52,6 +52,10 @@ class DashboardConfig:
     def escalations_dir(self) -> Path:
         return self.project_root / 'data' / 'escalations'
 
+    @property
+    def burndown_db(self) -> Path:
+        return self.project_root / 'data' / 'burndown' / 'burndown.db'
+
     @classmethod
     def from_env(cls) -> DashboardConfig:
         """Create config with DASHBOARD_-prefixed env var overrides."""

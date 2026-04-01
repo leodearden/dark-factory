@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import threading
@@ -12,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
+import aiosqlite
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -20,6 +22,13 @@ from fastapi.templating import Jinja2Templates
 
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
+from dashboard.data.burndown import (
+    BURNDOWN_SCHEMA,
+    collect_snapshot,
+    downsample,
+    get_burndown_projects,
+    get_burndown_series,
+)
 from dashboard.data.chart_utils import ChartData, group_top_n
 from dashboard.data.costs import (
     get_account_events,
@@ -62,6 +71,13 @@ _WINDOW_DAYS: dict[str, int] = {
     '7d': 7,
     '30d': 30,
     'all': 3650,
+}
+
+_BURNDOWN_WINDOWS: dict[str, int] = {
+    '24h': 1,
+    '7d': 7,
+    '30d': 30,
+    '90d': 90,
 }
 
 
@@ -247,6 +263,28 @@ def css_id(value: str | None) -> str:
 templates.env.filters['css_id'] = css_id
 
 
+async def _burndown_loop(
+    conn: aiosqlite.Connection,
+    config: DashboardConfig,
+) -> None:
+    """Periodically snapshot task status counts into the burndown DB."""
+    try:
+        await collect_snapshot(conn, config)
+    except Exception:
+        logger.warning('Initial burndown snapshot failed', exc_info=True)
+    last_downsample = 0.0
+    while True:
+        await asyncio.sleep(600)  # 10 minutes
+        try:
+            await collect_snapshot(conn, config)
+            now = time.monotonic()
+            if now - last_downsample > 3600:
+                await downsample(conn)
+                last_downsample = now
+        except Exception:
+            logger.warning('Burndown snapshot error', exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage shared resources: HTTP client, DB connection pool."""
@@ -254,7 +292,22 @@ async def lifespan(app: FastAPI):
     app.state.config = DashboardConfig.from_env()
     app.state.db = DbPool()
     app.state.start_time = time.monotonic()
+
+    # Burndown snapshot collector (writable connection, WAL mode).
+    burndown_path = app.state.config.burndown_db
+    burndown_path.parent.mkdir(parents=True, exist_ok=True)
+    burndown_conn = await aiosqlite.connect(str(burndown_path))
+    await burndown_conn.execute('PRAGMA journal_mode=WAL')
+    await burndown_conn.executescript(BURNDOWN_SCHEMA)
+    await burndown_conn.commit()
+    collector_task = asyncio.create_task(_burndown_loop(burndown_conn, app.state.config))
+
     yield
+
+    collector_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await collector_task
+    await burndown_conn.close()
     await app.state.db.close_all()
     await app.state.http_client.aclose()
 
@@ -273,6 +326,13 @@ async def costs(request: Request):
     window_raw = request.query_params.get('window', '7d')
     window = window_raw if window_raw in _WINDOW_DAYS else '7d'
     return templates.TemplateResponse(request, 'costs.html', context={'window': window})
+
+
+@app.get('/burndown')
+async def burndown(request: Request):
+    window_raw = request.query_params.get('window', '7d')
+    window = window_raw if window_raw in _BURNDOWN_WINDOWS else '7d'
+    return templates.TemplateResponse(request, 'burndown.html', context={'window': window})
 
 
 @app.get('/api/health')
@@ -600,4 +660,31 @@ async def costs_partials_runs(request: Request):
     return templates.TemplateResponse(
         request, 'partials/costs/runs.html',
         context={'runs': runs},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Burndown partials
+# ---------------------------------------------------------------------------
+
+
+@app.get('/burndown/partials/charts')
+async def burndown_partials_charts(request: Request):
+    """Burndown charts: stacked area chart per project."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    db = await pool.get(config.burndown_db)
+    window_raw = request.query_params.get('window', '7d')
+    days = _BURNDOWN_WINDOWS.get(window_raw, 7)
+    try:
+        projects = await get_burndown_projects(db)
+        series: dict = {}
+        for pid in projects:
+            series[pid] = await get_burndown_series(db, pid, days=days)
+    except Exception:
+        logger.warning('Error fetching burndown data', exc_info=True)
+        series = {}
+    return templates.TemplateResponse(
+        request, 'partials/burndown/charts.html',
+        context={'series': series},
     )

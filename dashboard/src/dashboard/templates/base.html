@@ -31,6 +31,7 @@
         <nav class="flex items-center gap-6">
             <a href="/" class="{{ active_cls if request.url.path == '/' else inactive_cls }}">Dashboard</a>
             <a href="/costs" class="{{ active_cls if request.url.path.startswith('/costs') else inactive_cls }}">Costs</a>
+            <a href="/burndown" class="{{ active_cls if request.url.path.startswith('/burndown') else inactive_cls }}">Burndown</a>
         </nav>
     </header>
     <main class="container mx-auto px-6 py-8">
