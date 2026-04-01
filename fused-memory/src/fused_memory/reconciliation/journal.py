@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aiosqlite
-
 from shared.async_sqlite_base import AsyncSqliteBase
 
 from fused_memory.models.reconciliation import (

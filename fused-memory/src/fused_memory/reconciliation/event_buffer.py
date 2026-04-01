@@ -9,7 +9,6 @@ from typing import Any
 from uuid import uuid4
 
 import aiosqlite
-
 from shared.async_sqlite_base import AsyncSqliteBase
 
 from fused_memory.models.reconciliation import (
