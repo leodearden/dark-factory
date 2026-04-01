@@ -7415,7 +7415,13 @@
           "get_tasks_chars_this_run": 601644,
           "stage2_received_zero_tasks": true,
           "workaround_used": "individual get_task calls for flagged tasks",
-          "_causation_id": "8610d943-9548-4031-a4be-d6890cbadeff"
+          "_causation_id": "64839bc3-339b-43a1-8aa2-18612d8f7678",
+          "continued_manifestation_run_64839bc3": true,
+          "get_tasks_chars_run_64839bc3": "602K+",
+          "stage2_received_zero_tasks_run_64839bc3": true,
+          "consecutive_blind_cycles": "5+",
+          "workaround_used_this_cycle": "individual get_task calls for flagged task IDs (158, 383, 302, 339, 317, 382, 125, 174, 175, 366, 368, 375, 377)",
+          "systemic_impact": "Stage 1 cannot audit task tree, Stage 2 cannot proactively sample tasks. Both stages blind to all but individually-fetched tasks. Growing worse as task count increases monotonically."
         }
       }
     ],
