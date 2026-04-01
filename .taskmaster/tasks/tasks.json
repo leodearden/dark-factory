@@ -6772,7 +6772,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_costs_page.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 359,
@@ -6824,7 +6832,18 @@
           "317"
         ],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_costs_data.py",
+            "shared/tests/test_cost_store.py",
+            "dashboard/pyproject.toml"
+          ],
+          "modules": [
+            "dashboard/tests",
+            "shared/tests"
+          ]
+        }
       },
       {
         "id": 362,
