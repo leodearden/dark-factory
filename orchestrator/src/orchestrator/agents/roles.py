@@ -17,6 +17,9 @@ class AgentRole:
 # --- Read-only tools for analysis roles ---
 _READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
 
+# --- jCodeMunch tools for structured code retrieval ---
+_JCODEMUNCH_TOOLS = ['mcp__jcodemunch__*']
+
 # --- Escalation tools available to roles that can escalate ---
 _ESCALATION_TOOLS = [
     'mcp__escalation__escalate_info',
@@ -133,7 +136,7 @@ You MUST produce a JSON plan written to the path specified in the prompt's Actio
 - Write the plan to the path specified in the prompt using the Write tool. You MUST use the Write tool — do not just describe the plan in your response.
 - If the task requires touching modules beyond what was originally specified, list ALL needed modules in the `modules` field.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', 'Write', *_ESCALATION_TOOLS, *_MEMORY_TOOLS],
+    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', 'Write', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS],
     disallowed_tools=['Edit'],
     default_model='opus',
     default_budget=5.0,
@@ -199,7 +202,7 @@ expansion rather than trying to work around the restriction.
 - If you encounter an unexpected issue that the plan doesn't account for, note it and stop. Do NOT modify the plan.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS],
     default_model='opus',
     default_budget=10.0,
     default_max_turns=80,
@@ -256,7 +259,7 @@ expansion rather than trying to work around the restriction.
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS],
     default_model='opus',
     default_budget=5.0,
     default_max_turns=50,
@@ -310,7 +313,7 @@ You MUST output ONLY valid JSON matching this schema:
 
 ## Your Specialization: {specialization}
 """,
-        allowed_tools=[*_READ_ONLY_TOOLS],
+        allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS],
         disallowed_tools=['Edit', 'Write'],
         default_model='sonnet',
         default_budget=2.0,
@@ -382,7 +385,7 @@ git add -- . ':!.task'
 - Read both sides of every conflict carefully.
 - If the conflict involves architectural changes where both sides restructured the same code differently, mark as BLOCKED — don't attempt a creative merge.
 """ + _ESCALATION_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_JCODEMUNCH_TOOLS],
     default_model='opus',
     default_budget=5.0,
     default_max_turns=50,
@@ -469,6 +472,7 @@ Use this accumulated context when handling new escalations.
         'mcp__escalation__get_pending_escalations',
         'mcp__escalation__merge_request',
         *_STEWARD_MEMORY_TOOLS,
+        *_JCODEMUNCH_TOOLS,
     ],
     default_model='opus',
     default_budget=5.0,
@@ -571,6 +575,7 @@ Use the `escalate_info` MCP tool for findings that need human judgment:
         'Read', 'Glob', 'Grep', 'Bash',
         *_DEEP_REVIEW_TOOLS,
         'mcp__escalation__escalate_info',
+        *_JCODEMUNCH_TOOLS,
     ],
     disallowed_tools=['Edit', 'Write'],
     default_model='opus',
