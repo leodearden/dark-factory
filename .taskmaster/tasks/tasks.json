@@ -6968,11 +6968,11 @@
         "description": "TestDaysParameter in dashboard/tests/test_costs_data.py claims cross-function parametric coverage of the _cutoff(days) window filter, but omits get_cost_trend and get_run_cost_breakdown — both accept a days parameter and use _cutoff(days) internally.\n\nChanges needed:\n1. Add 'trend' and 'run_breakdown' to the @pytest.mark.parametrize fn_name list\n2. Extend fn_map with the two new functions\n3. Add corresponding branches to the _metric helper (trend: sum totals; run_breakdown: count runs or total_cost)\n4. For by_account branch, also assert spend (not just invocations count) to verify windowing of the spend field independently\n5. Replace the trailing `return 0` fallthrough in _metric with `raise ValueError(f'unknown fn_name: {name!r}')` to fail loudly on unmatched names\n6. Insert minimal runs rows for all run_ids referenced by invocations in the test fixture (both 'r1' and 'r2') to make the fixture resilient to future JOIN changes\n\nmemory_hints: search \"cost query functions days parameter _cutoff\" for context on which functions use the windowing pattern",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-03-31T15:55:22.958Z",
+        "updatedAt": "2026-04-01T13:23:54.900Z",
         "metadata": {
           "files": [
             "dashboard/tests/test_costs_data.py"
@@ -7234,7 +7234,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-01T13:23:54.827Z",
+      "lastModified": "2026-04-01T13:23:54.900Z",
       "taskCount": 359,
       "completedCount": 295,
       "tags": [
