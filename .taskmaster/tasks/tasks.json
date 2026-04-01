@@ -2664,7 +2664,7 @@
               "Graphiti search broken empty results task 382"
             ]
           },
-          "_causation_id": "f774834c-dab8-4728-b07c-3d7cd8e0390b",
+          "_causation_id": "26b180fa-b11a-48a0-9508-6990b843209d",
           "stale_count_entities": [
             "ae174332",
             "0d096eab",
@@ -2702,7 +2702,17 @@
             "Batch multiple invalidations per entity",
             "Opt-out flag for bulk operations (Stage 1 already handles refreshes)",
             "Validate stale summary reduction across cycles"
-          ]
+          ],
+          "stage1_finding_26b180fa": "Stale summaries have two root causes: (1) invalidated edges (handled by refresh_entity_summary), (2) valid-but-obsolete historical edges that were never invalidated but contain superseded content. Vector 2 is the harder problem and was the actual root cause in Stage 1 findings.",
+          "remaining_scope_v2": [
+            "Hook edge invalidation path to auto-trigger summary rebuild",
+            "NEW: Detect valid-but-obsolete edges via temporal supersession (newer edges on same entity/relation supersede older ones)",
+            "NEW: Consider edge age + content similarity heuristics or explicit supersession marking during add_episode",
+            "Batch multiple invalidations per entity",
+            "Opt-out flag for bulk operations",
+            "Validate stale summary reduction from BOTH vectors across cycles"
+          ],
+          "scope_update_run": "26b180fa-b11a-48a0-9508-6990b843209d"
         }
       },
       {
