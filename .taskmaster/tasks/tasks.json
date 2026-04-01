@@ -7241,7 +7241,16 @@
           ],
           "modules": [
             "orchestrator/src/orchestrator"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "verify.py"
+            ],
+            "queries": [
+              "pyright type annotation errors verify.py list variables",
+              "3069 pyright errors phase 1 type annotation campaign"
+            ]
+          }
         },
         "updatedAt": "2026-04-01T13:42:03.626Z"
       },
