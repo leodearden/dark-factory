@@ -6965,7 +6965,18 @@
           ],
           "modules": [
             "dashboard/src/dashboard/templates/partials/costs"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "Chart.js",
+              "Idiomorph"
+            ],
+            "queries": [
+              "htmx:afterSettle fix pattern Chart.js Idiomorph DOM replacement",
+              "chart rendering timing bug htmx morph canvas",
+              "Alpine state HTMX morph preservation"
+            ]
+          }
         }
       },
       {
