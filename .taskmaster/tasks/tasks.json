@@ -7307,7 +7307,34 @@
         "status": "pending",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "root_cause_confirmed": "context_window_overflow",
+          "evidence_run_3f78642e": {
+            "get_tasks_chars": 596878,
+            "total_tasks": 370,
+            "done_tasks": 301,
+            "pending_tasks": 48,
+            "in_progress_tasks": 8,
+            "blocked_tasks": 1,
+            "cancelled_tasks": 12
+          },
+          "done_cancelled_pct": "85% of tasks are done/cancelled — bulk of the payload",
+          "fix_approaches": [
+            "summary/stats endpoint returning counts+IDs only",
+            "filter get_tasks to exclude done/cancelled for Stage 1",
+            "paginate task tree response",
+            "pre-process task tree in harness, inject summary into Stage 1 prompt"
+          ],
+          "worsening_trend": "Task count grows monotonically; problem will only get worse",
+          "memory_hints": {
+            "queries": [
+              "false-empty task tree Stage 1 recurring bug",
+              "get_tasks context window overflow 596K",
+              "task 122 fix false-empty-tree"
+            ]
+          }
+        }
       }
     ],
     "metadata": {
