@@ -7273,7 +7273,22 @@
         "status": "pending",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "_causation_id": "bef35e10-1071-486f-bc62-db25dd2be9a1",
+          "memory_hints": {
+            "entities": [
+              "FalkorDB",
+              "Graphiti"
+            ],
+            "queries": [
+              "Graphiti search broken empty results",
+              "embedding dimensions 1024 FalkorDB vector index",
+              "OpenAI embedding model dimensions"
+            ]
+          },
+          "stale_reference_correction": "Details reference deleted memory c1e28a77 and incorrect '1536 dimensions'. Correct fact: memory dcbc0014 confirms current model produces 1024-dim embeddings. Investigate FalkorDB index dimension mismatch against 1024-dim vectors."
+        }
       },
       {
         "id": 383,
