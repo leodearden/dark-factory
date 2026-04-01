@@ -11,10 +11,7 @@ Task 322.  Each store must:
 """
 
 import pytest
-import pytest_asyncio
-
 from shared.async_sqlite_base import AsyncSqliteBase
-
 
 # ---------------------------------------------------------------------------
 # Step-1 / Step-2: EventBuffer migration tests
@@ -119,8 +116,9 @@ class TestReconciliationJournalMigration:
 
     def test_reconciliation_journal_has_schema_property(self):
         """_schema property must exist and return a non-empty DDL string."""
-        from fused_memory.reconciliation.journal import ReconciliationJournal
         from pathlib import Path
+
+        from fused_memory.reconciliation.journal import ReconciliationJournal
 
         journal = ReconciliationJournal(data_dir=Path('/tmp'))
         schema = journal._schema
@@ -165,6 +163,7 @@ class TestReconciliationJournalMigration:
     async def test_triggered_by_column_migration(self, tmp_path):
         """open() must add triggered_by column to pre-existing DBs (idempotent)."""
         import aiosqlite
+
         from fused_memory.reconciliation.journal import ReconciliationJournal
 
         db_path = tmp_path / 'reconciliation.db'
@@ -215,9 +214,6 @@ class TestReconciliationJournalMigration:
 # ---------------------------------------------------------------------------
 # Step-12: Final verification tests — all 4 stores share the same contract
 # ---------------------------------------------------------------------------
-
-
-import pytest
 
 
 @pytest.mark.parametrize('store_class,kwargs', [
