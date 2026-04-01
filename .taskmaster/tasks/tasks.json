@@ -7447,7 +7447,38 @@
         "status": "pending",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "_causation_id": "cfe9d73c-5e37-4cbd-a8a6-0de13463b928",
+          "source": "reconciliation-stage2",
+          "related_tasks": [
+            302,
+            339,
+            317,
+            298,
+            368
+          ],
+          "related_memories": [
+            "904ff300-ed7d-4ee8-9701-09d0e4d5aa88",
+            "fffb5500-9e40-477e-82a2-164bafe29902"
+          ],
+          "needs_human_verification": true,
+          "modules": [
+            "dashboard/src/dashboard/data/costs.py",
+            "shared/src/shared/cost_store.py",
+            "dashboard/src/dashboard/app.py"
+          ],
+          "memory_hints": {
+            "entities": [
+              "CostStore"
+            ],
+            "queries": [
+              "costs page empty data unresolved",
+              "CostStore schema invocations table",
+              "burndown page WAL-mode writer"
+            ]
+          }
+        }
       }
     ],
     "metadata": {
