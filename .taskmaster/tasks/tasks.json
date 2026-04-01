@@ -7445,9 +7445,10 @@
           "stage2_received_zero_tasks_run_07d74244": null,
           "workaround_used_this_cycle_07d74244": null,
           "metadata_cleaned_by": "recon-stage-task_knowledge_sync",
-          "metadata_cleaned_run": "7ae91368-dce7-46e5-a4b3-61fbffd9ae2e",
+          "metadata_cleaned_run": "26055539-91ff-4afd-9451-ce58d706f4a7",
           "last_manifestation_run": "d9639606-aeee-4281-9fd9-e1ef1c3bf975",
-          "get_tasks_chars_latest": 607954
+          "get_tasks_chars_latest": 607954,
+          "metadata_cleanup_note": "Removed 17 null per-run keys to reduce get_tasks payload bloat"
         }
       },
       {
