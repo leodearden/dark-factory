@@ -7056,7 +7056,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "fused-memory/tests/test_targeted.py"
+          ],
+          "modules": [
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 373,
@@ -7067,7 +7075,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/data/costs.py",
+            "dashboard/tests/test_costs_data.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/data",
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 374,
