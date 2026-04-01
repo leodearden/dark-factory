@@ -2625,7 +2625,9 @@
         "details": "",
         "testStrategy": "",
         "status": "in-progress",
-        "dependencies": [],
+        "dependencies": [
+          "382"
+        ],
         "priority": "medium",
         "subtasks": [],
         "updatedAt": "2026-04-01T13:23:55.267Z",
