@@ -16,7 +16,8 @@
 
   <script>
 (function() {
-  var container = document.currentScript.closest('[data-by-role-container]');
+  var container = (document.currentScript && document.currentScript.closest('[data-by-role-container]')) || document.querySelector('[data-by-role-container]');
+  if (!container) return;
   var byRole = {{ by_role | tojson }};
   var rendered = false;
   var chartInstances = [];
