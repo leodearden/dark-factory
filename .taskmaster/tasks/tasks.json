@@ -7017,7 +7017,13 @@
           ],
           "modules": [
             "dashboard/tests"
-          ]
+          ],
+          "memory_hints": {
+            "queries": [
+              "cost query functions days parameter _cutoff windowing",
+              "TestDaysParameter parametric coverage dashboard tests"
+            ]
+          }
         }
       },
       {
