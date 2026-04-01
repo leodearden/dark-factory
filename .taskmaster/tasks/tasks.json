@@ -7426,6 +7426,17 @@
           "get_tasks_chars_run_e11c70c0": "603K+",
           "stage2_received_zero_tasks_run_e11c70c0": true
         }
+      },
+      {
+        "id": 384,
+        "title": "Investigate: Costs page shows empty data despite all feature tasks done",
+        "description": "All costs page feature tasks are completed (302: template/routes, 339: weighted average fix, 317: clock skew/silent omission fixes, 298: CostStore/data layer) but the /costs page shows empty data across all panels and time windows as of 2026-04-01.\n\nThree possible root causes documented in memory:\n1. Data pipeline not connected — CostStore may not be receiving invocation/event data from the orchestrator\n2. Page renders correctly but no cost data exists in the SQLite database — verify CostStore has data\n3. Issue may already be resolved but MEMORY.md not updated — verify current state\n\nInvestigation steps:\n1. Check if the CostStore SQLite database exists and has data (invocations table, events table)\n2. Verify the orchestrator/agents write cost data to CostStore during runs\n3. If DB is empty, trace the data pipeline from orchestrator → CostStore → dashboard queries\n4. If DB has data, check dashboard route handlers and template rendering\n\nmemory_hints:\n- entity: CostStore\n- search: \"costs page empty data unresolved\"\n- search: \"CostStore schema invocations table\"\n- search: \"burndown page WAL-mode writer\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -7437,7 +7448,8 @@
         "master"
       ],
       "created": "2026-04-01T19:42:26.204Z",
-      "description": "Tasks for master context"
+      "description": "Tasks for master context",
+      "updated": "2026-04-01T22:35:19.539Z"
     }
   }
 }
