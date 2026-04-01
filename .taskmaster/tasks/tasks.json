@@ -2664,7 +2664,7 @@
               "Graphiti search broken empty results task 382"
             ]
           },
-          "_causation_id": "efbe832b-ea9e-48b1-9ef5-2670a5b0141b",
+          "_causation_id": "5a40be6b-4dc1-4f0a-b7a0-99706190994f",
           "stale_count_entities": [
             "ae174332",
             "0d096eab",
@@ -2684,7 +2684,10 @@
           ],
           "blocked_reason": "Depends on task 382 (Graphiti search returns zero results). Entity summary rebuild/dedup requires functional Graphiti search. Graphiti search has been non-functional for 3+ reconciliation cycles. Root cause is NOT dimension mismatch (task 88 confirmed fix). Investigate: OpenAI embedding API connectivity, project_id metadata mismatch, edge invalidation state, Mem0→Graphiti replay metadata.",
           "blocked_by_task": 382,
-          "status_change_causation": "1a2c1382-21ef-4e28-95a6-f81973c03a57"
+          "status_change_causation": "1a2c1382-21ef-4e28-95a6-f81973c03a57",
+          "unblock_context": "Task 382 (Graphiti search zero results) is done — search is operational. refresh_entity_summary MCP tool already exists and Stage 1 used it successfully (6 refreshes in latest cycle). Task 126 (entity summary refresh after bulk invalidation) is also done. Verify existing capabilities before implementing new ones.",
+          "unblocked_by": "recon-stage-task_knowledge_sync",
+          "unblocked_at": "2026-04-01"
         }
       },
       {
