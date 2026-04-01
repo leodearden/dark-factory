@@ -2664,7 +2664,7 @@
               "Graphiti search broken empty results task 382"
             ]
           },
-          "_causation_id": "5a40be6b-4dc1-4f0a-b7a0-99706190994f",
+          "_causation_id": "f774834c-dab8-4728-b07c-3d7cd8e0390b",
           "stale_count_entities": [
             "ae174332",
             "0d096eab",
@@ -2687,7 +2687,22 @@
           "status_change_causation": "1a2c1382-21ef-4e28-95a6-f81973c03a57",
           "unblock_context": "Task 382 (Graphiti search zero results) is done — search is operational. refresh_entity_summary MCP tool already exists and Stage 1 used it successfully (6 refreshes in latest cycle). Task 126 (entity summary refresh after bulk invalidation) is also done. Verify existing capabilities before implementing new ones.",
           "unblocked_by": "recon-stage-task_knowledge_sync",
-          "unblocked_at": "2026-04-01"
+          "unblocked_at": "2026-04-01",
+          "rescoped_by": "recon-stage-task_knowledge_sync",
+          "rescoped_at": "2026-04-01",
+          "rescope_reason": "Manual tools exist (Tasks 126, 187 done). Remaining work: automatic summary rebuild on edge invalidation.",
+          "priority_override": "high",
+          "existing_tools": [
+            "refresh_entity_summary MCP tool",
+            "SummaryRebuilder class in rebuild_entity_summaries.py",
+            "build_communities() per-entity"
+          ],
+          "remaining_scope": [
+            "Hook edge invalidation path to auto-trigger summary rebuild",
+            "Batch multiple invalidations per entity",
+            "Opt-out flag for bulk operations (Stage 1 already handles refreshes)",
+            "Validate stale summary reduction across cycles"
+          ]
         }
       },
       {
