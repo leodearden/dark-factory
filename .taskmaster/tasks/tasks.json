@@ -7284,10 +7284,18 @@
             "queries": [
               "Graphiti search broken empty results",
               "embedding dimensions 1024 FalkorDB vector index",
-              "OpenAI embedding model dimensions"
+              "OpenAI embedding model dimensions",
+              "Mem0 to Graphiti replay dead letters dimension mismatch"
             ]
           },
-          "stale_reference_correction": "Details reference deleted memory c1e28a77 and incorrect '1536 dimensions'. Correct fact: memory dcbc0014 confirms current model produces 1024-dim embeddings. Investigate FalkorDB index dimension mismatch against 1024-dim vectors."
+          "stale_reference_correction": "Details reference deleted memory c1e28a77 and incorrect '1536 dimensions'. Correct fact: memory dcbc0014 confirms current model produces 1024-dim embeddings. Investigate FalkorDB index dimension mismatch against 1024-dim vectors.",
+          "stale_reference_correction_applied": true,
+          "correct_embedding_dims": 1024,
+          "deleted_memory_c1e28a77": "STALE - deleted. Referenced 1536 dims which is wrong.",
+          "correct_memory_ref": "dcbc0014-d370-46e0-a294-8c18e45c07d2 (1024-dim confirmed)",
+          "dim_rebuild_completed": "Task 88 already rebuilt FalkorDB index from 1536→1024. Memory 6d45a435 confirms no dimension mismatch exists.",
+          "investigation_focus": "Root cause is NOT dimension mismatch. Investigate: (1) OpenAI embedding API connectivity, (2) project_id metadata mismatch in stored nodes vs search filters, (3) all edges invalidated leaving orphaned nodes, (4) Mem0→Graphiti replay (813 items) created edges with different metadata than search expects",
+          "third_consecutive_failure_cycle": "run_3f78642e"
         }
       },
       {
