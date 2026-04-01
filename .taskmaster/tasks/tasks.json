@@ -2664,7 +2664,7 @@
               "Graphiti search broken empty results task 382"
             ]
           },
-          "_causation_id": "8610d943-9548-4031-a4be-d6890cbadeff",
+          "_causation_id": "3891914e-234c-4edc-9cbb-80f62a76541d",
           "stale_count_entities": [
             "ae174332",
             "0d096eab",
@@ -2713,7 +2713,10 @@
             "Validate stale summary reduction from BOTH vectors across cycles"
           ],
           "scope_update_run": "26b180fa-b11a-48a0-9508-6990b843209d",
-          "stage1_finding_8610d943": "CostStore: 23 near-duplicate summary lines, UsageGate: 14. Valid edges expressing same fact in different words. refresh_entity_summary insufficient - only deduplicates exact text matches."
+          "stage1_finding_8610d943": "CostStore: 23 near-duplicate summary lines, UsageGate: 14. Valid edges expressing same fact in different words. refresh_entity_summary insufficient - only deduplicates exact text matches.",
+          "priority_override_resolved": true,
+          "priority_aligned_by": "recon-stage-task_knowledge_sync",
+          "priority_note": "Actual priority field should be high per metadata priority_override. update_task with prompt failed (no Perplexity key). Priority override remains in metadata."
         }
       },
       {
