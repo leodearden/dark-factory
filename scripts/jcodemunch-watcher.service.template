@@ -1,0 +1,21 @@
+[Unit]
+Description=jCodeMunch watch-claude (auto-index worktrees)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=__UV_PATH__x --with "jcodemunch-mcp[watch]" \
+  jcodemunch-mcp watch-claude \
+  --repos __REPO_ROOT__
+
+# Restart policy: always restart on failure, back off up to 60s
+Restart=on-failure
+RestartSec=5
+RestartMaxDelaySec=60
+
+# Logging goes to journalctl --user -u jcodemunch-watcher
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

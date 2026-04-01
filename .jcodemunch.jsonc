@@ -1,0 +1,17 @@
+{
+  // dark-factory: Python monorepo (fused-memory, orchestrator, escalation, shared)
+  "languages": ["python"],
+  "max_folder_files": 5000,
+  "extra_ignore_patterns": [
+    "data/",
+    ".worktrees/",
+    ".eval-worktrees/",
+    ".claude/worktrees/",
+    ".taskmaster/",
+    ".playwright-mcp/",
+    "*.png",
+    "uv.lock"
+  ],
+  "disabled_tools": ["search_columns"],
+  "staleness_days": 3
+}

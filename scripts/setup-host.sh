@@ -149,7 +149,85 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Skim — context compression for coding agents
+# 6. jCodeMunch — structured code retrieval for coding agents
+# ---------------------------------------------------------------------------
+info "Installing jCodeMunch (AST-based code indexing)"
+
+# Global config (ignore patterns shared across all projects)
+CODE_INDEX_DIR="$HOME/.code-index"
+mkdir -p "$CODE_INDEX_DIR"
+
+if [ ! -f "$CODE_INDEX_DIR/config.jsonc" ]; then
+  cat > "$CODE_INDEX_DIR/config.jsonc" << 'JCEOF'
+{
+  "max_folder_files": 10000,
+  "extra_ignore_patterns": [
+    ".worktrees/",
+    ".eval-worktrees/",
+    ".claude/worktrees/",
+    ".taskmaster/",
+    ".playwright-mcp/",
+    "node_modules/",
+    "target/",
+    "__pycache__/",
+    ".venv/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    ".pytest_cache/",
+    "*.png",
+    "uv.lock",
+    "Cargo.lock",
+    "pnpm-lock.yaml",
+    "package-lock.json"
+  ],
+  "staleness_days": 3
+}
+JCEOF
+  ok "Global config written to $CODE_INDEX_DIR/config.jsonc"
+else
+  ok "Global config already exists"
+fi
+
+# Project-level config
+if [ ! -f "$REPO_ROOT/.jcodemunch.jsonc" ]; then
+  cat > "$REPO_ROOT/.jcodemunch.jsonc" << 'JCEOF'
+{
+  // dark-factory: Python monorepo (fused-memory, orchestrator, escalation, shared)
+  "languages": ["python"],
+  "max_folder_files": 5000,
+  "disabled_tools": ["search_columns"],
+  "staleness_days": 3
+}
+JCEOF
+  ok "Project config written"
+else
+  ok "Project config already exists"
+fi
+
+# Add jcodemunch MCP to user-level Claude config (idempotent)
+if command -v claude &>/dev/null; then
+  if claude mcp list --scope user 2>/dev/null | grep -q jcodemunch; then
+    ok "jcodemunch MCP already in user config"
+  else
+    claude mcp add --scope user jcodemunch uvx jcodemunch-mcp
+    ok "jcodemunch MCP added to user config"
+  fi
+fi
+
+# Systemd watcher unit
+sed \
+  -e "s|__REPO_ROOT__|$REPO_ROOT|g" \
+  -e "s|__UV_PATH__|$UV_PATH|g" \
+  "$REPO_ROOT/scripts/jcodemunch-watcher.service.template" \
+  > "$UNIT_DIR/jcodemunch-watcher.service"
+
+systemctl --user daemon-reload
+systemctl --user enable jcodemunch-watcher
+systemctl --user restart jcodemunch-watcher
+ok "jcodemunch-watcher unit installed and started"
+
+# ---------------------------------------------------------------------------
+# 7. Skim — context compression for coding agents
 # ---------------------------------------------------------------------------
 info "Installing skim (context compression)"
 
@@ -175,7 +253,7 @@ if command -v skim &>/dev/null && command -v claude &>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Claude Code skill symlinks
+# 8. Claude Code skill symlinks
 # ---------------------------------------------------------------------------
 info "Creating Claude Code skill symlinks"
 
@@ -202,7 +280,7 @@ for name in "${!SKILLS[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# 8. Git hooks
+# 9. Git hooks
 # ---------------------------------------------------------------------------
 info "Setting up git hooks"
 
@@ -214,7 +292,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 9. Manual steps reminder
+# 10. Manual steps reminder
 # ---------------------------------------------------------------------------
 info "Manual steps (if migrating from another host)"
 echo ""
@@ -233,7 +311,7 @@ echo "     bash $REPO_ROOT/scripts/import-data.sh <export-dir>"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 10. Health checks
+# 11. Health checks
 # ---------------------------------------------------------------------------
 info "Health checks"
 
@@ -259,6 +337,13 @@ elif systemctl --user is-active fused-memory &>/dev/null; then
   warn "Fused-memory: unit active but health check failed (may still be starting)"
 else
   warn "Fused-memory: not running (check: journalctl --user -u fused-memory)"
+fi
+
+# jCodeMunch watcher
+if systemctl --user is-active jcodemunch-watcher &>/dev/null; then
+  ok "jCodeMunch watcher: running"
+else
+  warn "jCodeMunch watcher: not running (check: journalctl --user -u jcodemunch-watcher)"
 fi
 
 echo ""
