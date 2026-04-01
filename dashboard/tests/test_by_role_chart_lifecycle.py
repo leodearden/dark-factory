@@ -185,45 +185,52 @@ class TestByRoleRenderErrorRecovery:
         """The projectIds.forEach loop must be wrapped in a try block."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
+        # Search for 'try {' that appears before 'projectIds.forEach(' (not cleanupCharts's internal try)
         try_pos = html.find('try {')
-        foreach_pos = html.find('.forEach(')
+        foreach_pos = html.find('projectIds.forEach(')
         assert try_pos != -1, "'try {' not found in script"
-        assert foreach_pos != -1, "'.forEach(' not found in script"
+        assert foreach_pos != -1, "'projectIds.forEach(' not found in script"
         assert try_pos < foreach_pos, (
-            "'try {' must appear before '.forEach(' in the script"
+            "'try {' must appear before 'projectIds.forEach(' in the script"
         )
 
     def test_rendered_true_set_after_foreach_loop(self, client):
-        """rendered = true must be set AFTER the forEach loop (inside the try block), not before it."""
+        """rendered = true must be set AFTER the projectIds.forEach loop (inside the try block), not before it."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
-        foreach_pos = html.find('.forEach(')
+        foreach_pos = html.find('projectIds.forEach(')
         rendered_true_pos = html.find('rendered = true')
-        assert foreach_pos != -1, "'.forEach(' not found in script"
+        assert foreach_pos != -1, "'projectIds.forEach(' not found in script"
         assert rendered_true_pos != -1, "'rendered = true' not found in script"
         assert rendered_true_pos > foreach_pos, (
-            "'rendered = true' must appear AFTER '.forEach(' — it should only latch after successful loop completion"
+            "'rendered = true' must appear AFTER 'projectIds.forEach(' — it should only latch after successful loop completion"
         )
 
     def test_catch_block_resets_rendered_false(self, client):
         """A catch block must exist and reset rendered = false to allow retry."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
-        catch_pos = html.find('catch')
-        rendered_false_pos = html.find('rendered = false')
-        assert catch_pos != -1, "'catch' not found in script"
-        assert rendered_false_pos != -1, "'rendered = false' not found in script"
-        assert rendered_false_pos > catch_pos, (
-            "'rendered = false' must appear inside the catch block (after 'catch')"
+        # Find the catch block that wraps projectIds.forEach (not cleanupCharts's internal catch)
+        foreach_pos = html.find('projectIds.forEach(')
+        # Search for 'catch' after projectIds.forEach to find the outer try/catch
+        catch_pos = html.find('catch', foreach_pos)
+        rendered_false_pos = html.find('rendered = false', catch_pos)
+        assert foreach_pos != -1, "'projectIds.forEach(' not found in script"
+        assert catch_pos != -1, "'catch' not found after 'projectIds.forEach('"
+        assert rendered_false_pos != -1, (
+            "'rendered = false' not found after the catch block"
         )
 
     def test_catch_block_rethrows_error(self, client):
         """The catch block must re-throw the error so it is not silently swallowed."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
-        catch_pos = html.find('catch')
+        # Find the outer catch (after projectIds.forEach), then look for throw inside it
+        foreach_pos = html.find('projectIds.forEach(')
+        catch_pos = html.find('catch', foreach_pos)
         throw_pos = html.find('throw', catch_pos)
-        assert catch_pos != -1, "'catch' not found in script"
+        assert foreach_pos != -1, "'projectIds.forEach(' not found in script"
+        assert catch_pos != -1, "'catch' not found after 'projectIds.forEach('"
         assert throw_pos != -1, (
-            "'throw' not found after 'catch' — catch block must re-throw the error"
+            "'throw' not found after the outer catch block — catch must re-throw the error"
         )
