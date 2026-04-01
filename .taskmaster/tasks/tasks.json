@@ -2647,9 +2647,21 @@
             "fused-memory/tests"
           ],
           "memory_hints": {
-            "entities": [],
+            "entities": [
+              "M5",
+              "M5 decomposition",
+              "M5 types",
+              "Graphiti",
+              "CostStore",
+              "UsageGate",
+              "FalkorDB"
+            ],
             "queries": [
-              "resolution for: Implement Graphiti entity summary rebuild/deduplication mechanism"
+              "entity summary accumulation stale duplicate lines",
+              "Graphiti entity summary rebuild deduplication mechanism",
+              "stale count data entity summaries task 187",
+              "11 entities retain stale count data ae174332 0d096eab c618eb5d",
+              "Graphiti search broken empty results task 382"
             ]
           },
           "_causation_id": "efbe832b-ea9e-48b1-9ef5-2670a5b0141b",
