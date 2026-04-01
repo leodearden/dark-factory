@@ -20,6 +20,7 @@ import contextlib
 import json
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -29,6 +30,7 @@ from orchestrator.agents.roles import STEWARD
 if TYPE_CHECKING:
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
+    from shared.cost_store import CostStore
 
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.config import OrchestratorConfig
@@ -62,6 +64,9 @@ class TaskSteward:
         escalation_queue: EscalationQueue,
         briefing: BriefingAssembler,
         usage_gate: UsageGate | None = None,
+        cost_store: CostStore | None = None,
+        run_id: str = '',
+        project_id: str = '',
     ):
         self.task_id = task_id
         self.task = task
@@ -71,6 +76,11 @@ class TaskSteward:
         self.escalation_queue = escalation_queue
         self.briefing = briefing
         self.usage_gate = usage_gate
+
+        # Cost tracking — optional; when None, cost recording is silently skipped
+        self._cost_store = cost_store
+        self._run_id = run_id
+        self._project_id = project_id
 
         self._session_id: str | None = None
         self._stopped = False
@@ -346,7 +356,9 @@ class TaskSteward:
             if self._session_id is not None:
                 kwargs['resume_session_id'] = self._session_id
 
+            started_at = datetime.now(UTC).isoformat()
             result: AgentResult = await invoke_agent(**kwargs)
+            completed_at = datetime.now(UTC).isoformat()
 
             # Cap-hit: sleep, then reset session (can't resume across account switch)
             if self.usage_gate and self.usage_gate.detect_cap_hit(
@@ -381,6 +393,30 @@ class TaskSteward:
                 self._session_id = result.session_id
 
             result.account_name = account_name
+
+            # Record cost to CostStore if available
+            if self._cost_store is not None:
+                try:
+                    await self._cost_store.save_invocation(
+                        run_id=self._run_id,
+                        task_id=self.task_id,
+                        project_id=self._project_id,
+                        account_name=account_name,
+                        model=self.config.models.steward,
+                        role='steward',
+                        cost_usd=result.cost_usd,
+                        input_tokens=result.input_tokens,
+                        output_tokens=result.output_tokens,
+                        cache_read_tokens=result.cache_read_tokens,
+                        cache_create_tokens=result.cache_create_tokens,
+                        duration_ms=result.duration_ms,
+                        capped=False,
+                        started_at=started_at,
+                        completed_at=completed_at,
+                    )
+                except Exception:
+                    logger.warning('Failed to save steward invocation cost', exc_info=True)
+
             return result
 
     # ------------------------------------------------------------------

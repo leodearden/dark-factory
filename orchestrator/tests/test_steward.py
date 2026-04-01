@@ -613,3 +613,200 @@ class TestNextEscalation:
             assert '--level' in cmd
             level_idx = cmd.index('--level')
             assert cmd[level_idx + 1] == '0'
+
+
+# ---------------------------------------------------------------------------
+# Tests: CostStore constructor params
+# ---------------------------------------------------------------------------
+
+
+class TestStewardCostStoreConstructor:
+    """TaskSteward accepts cost_store, run_id, and project_id as optional params."""
+
+    def test_defaults_to_none_when_not_provided(
+        self, worktree, mock_config, mock_queue, mock_mcp, mock_briefing
+    ):
+        """cost_store, run_id, project_id are None/'' by default."""
+        s = TaskSteward(
+            task_id='42',
+            task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
+            worktree=worktree,
+            config=mock_config,
+            mcp=mock_mcp,
+            escalation_queue=mock_queue,
+            briefing=mock_briefing,
+        )
+        assert s._cost_store is None
+        assert s._run_id == ''
+        assert s._project_id == ''
+
+    def test_stores_cost_store_as_attribute(
+        self, worktree, mock_config, mock_queue, mock_mcp, mock_briefing
+    ):
+        """When cost_store is provided it is accessible as self._cost_store."""
+        from unittest.mock import MagicMock
+        mock_cost_store = MagicMock()
+        s = TaskSteward(
+            task_id='42',
+            task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
+            worktree=worktree,
+            config=mock_config,
+            mcp=mock_mcp,
+            escalation_queue=mock_queue,
+            briefing=mock_briefing,
+            cost_store=mock_cost_store,
+            run_id='run-steward12345',
+            project_id='dark_factory',
+        )
+        assert s._cost_store is mock_cost_store
+        assert s._run_id == 'run-steward12345'
+        assert s._project_id == 'dark_factory'
+
+    def test_existing_steward_fixture_still_works(self, steward):
+        """steward fixture (no cost_store args) still constructs correctly."""
+        assert steward._cost_store is None
+        assert steward._run_id == ''
+        assert steward._project_id == ''
+
+
+# ---------------------------------------------------------------------------
+# Tests: CostStore save_invocation called after successful invocation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardSaveInvocation:
+    """_invoke_with_session() records invocation to cost_store on success."""
+
+    async def test_saves_invocation_after_success(
+        self, worktree, mock_config, mock_queue, mock_mcp, mock_briefing
+    ):
+        """save_invocation is called after a successful invoke_agent call."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        mock_cost_store = MagicMock()
+        mock_cost_store.save_invocation = AsyncMock()
+
+        s = TaskSteward(
+            task_id='42',
+            task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
+            worktree=worktree,
+            config=mock_config,
+            mcp=mock_mcp,
+            escalation_queue=mock_queue,
+            briefing=mock_briefing,
+            cost_store=mock_cost_store,
+            run_id='run-steward99',
+            project_id='dark_factory',
+        )
+
+        esc = _make_escalation()
+        from shared.cli_invoke import AgentResult as _AR
+        invoke_result = _AR(
+            success=True, output='done',
+            cost_usd=0.75, duration_ms=3000, session_id='sess-x',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = invoke_result
+            await s._invoke_with_session(
+                prompt='Handle this',
+                cwd=worktree,
+                mcp_config={'mcpServers': {}},
+                per_invocation_budget=5.0,
+                escalation=esc,
+            )
+
+        mock_cost_store.save_invocation.assert_awaited_once()
+        call_kwargs = mock_cost_store.save_invocation.call_args.kwargs
+        assert call_kwargs['run_id'] == 'run-steward99'
+        assert call_kwargs['task_id'] == '42'
+        assert call_kwargs['project_id'] == 'dark_factory'
+        assert call_kwargs['role'] == 'steward'
+        assert call_kwargs['cost_usd'] == pytest.approx(0.75)
+        assert call_kwargs['duration_ms'] == 3000
+        assert call_kwargs['capped'] is False
+        assert 'started_at' in call_kwargs
+        assert 'completed_at' in call_kwargs
+        assert 'model' in call_kwargs
+
+    async def test_does_not_save_on_cap_hit_retry(
+        self, worktree, mock_config, mock_queue, mock_mcp, mock_briefing
+    ):
+        """save_invocation is NOT called when a cap-hit triggers retry."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        mock_cost_store = MagicMock()
+        mock_cost_store.save_invocation = AsyncMock()
+        mock_usage_gate = MagicMock()
+        mock_usage_gate.before_invoke = AsyncMock(return_value='tok')
+        mock_usage_gate.active_account_name = 'acct-A'
+        # First call: cap hit; second call: success
+        mock_usage_gate.detect_cap_hit = MagicMock(side_effect=[True, False])
+        mock_usage_gate.on_agent_complete = MagicMock()
+
+        s = TaskSteward(
+            task_id='42',
+            task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
+            worktree=worktree,
+            config=mock_config,
+            mcp=mock_mcp,
+            escalation_queue=mock_queue,
+            briefing=mock_briefing,
+            usage_gate=mock_usage_gate,
+            cost_store=mock_cost_store,
+            run_id='run-captest',
+            project_id='dark_factory',
+        )
+
+        esc = _make_escalation()
+        cap_result = _make_result(cost=0.0, session_id='')
+        success_result = _make_result(cost=1.0, session_id='sess-after-cap')
+
+        with (
+            patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_invoke.side_effect = [cap_result, success_result]
+            await s._invoke_with_session(
+                prompt='Handle',
+                cwd=worktree,
+                mcp_config={'mcpServers': {}},
+                per_invocation_budget=5.0,
+                escalation=esc,
+            )
+
+        # save_invocation called exactly once (after success, not on cap-hit)
+        mock_cost_store.save_invocation.assert_awaited_once()
+
+    async def test_no_save_when_cost_store_is_none(
+        self, worktree, mock_config, mock_queue, mock_mcp, mock_briefing
+    ):
+        """When cost_store is None, invocation recording is silently skipped."""
+        from unittest.mock import AsyncMock, patch
+
+        s = TaskSteward(
+            task_id='42',
+            task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
+            worktree=worktree,
+            config=mock_config,
+            mcp=mock_mcp,
+            escalation_queue=mock_queue,
+            briefing=mock_briefing,
+            cost_store=None,
+        )
+
+        esc = _make_escalation()
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result()
+            # Should not raise even with no cost_store
+            result = await s._invoke_with_session(
+                prompt='Handle',
+                cwd=worktree,
+                mcp_config={'mcpServers': {}},
+                per_invocation_budget=5.0,
+                escalation=esc,
+            )
+
+        assert result is not None

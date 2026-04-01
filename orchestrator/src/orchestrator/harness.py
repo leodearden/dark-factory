@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +33,8 @@ try:
     HAS_STEWARD = True
 except ImportError:
     HAS_STEWARD = False
+
+from shared.cost_store import CostStore
 
 logger = logging.getLogger(__name__)
 
@@ -134,12 +137,31 @@ class Harness:
         self._merge_worker: object | None = None  # MergeWorker (lazy import)
         self._merge_worker_task: asyncio.Task | None = None
 
+        # Run identity and cost tracking — set in run()
+        self._run_id: str = ''
+        self._cost_store: CostStore | None = None
+
     async def run(self, prd_path: Path | None = None, dry_run: bool = False) -> HarnessReport:
         """Execute the full orchestration pipeline.
 
         If *prd_path* is ``None``, skip PRD parsing and run existing tasks.
         """
         self.report.started_at = datetime.now(UTC).isoformat()
+
+        # 0. Generate run identity and open CostStore
+        self._run_id = f'run-{uuid.uuid4().hex[:12]}'
+        db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
+        try:
+            self._cost_store = CostStore(db_path)
+            await self._cost_store.open()
+        except Exception as e:
+            logger.warning(f'CostStore unavailable, cost tracking disabled: {e}')
+            self._cost_store = None
+
+        # Attach run context to usage gate so cap-hit events can be correlated
+        if self.usage_gate:
+            self.usage_gate.project_id = self.config.fused_memory.project_id
+            self.usage_gate.run_id = self._run_id
 
         # 1. Start fused-memory HTTP server
         logger.info('Starting fused-memory HTTP server...')
@@ -298,6 +320,13 @@ class Harness:
             # 4. Shutdown
             self.report.completed_at = datetime.now(UTC).isoformat()
 
+            # Close CostStore before RunStore (WAL mode: safe to close first)
+            try:
+                if self._cost_store is not None:
+                    await self._cost_store.close()
+            except Exception as e:
+                logger.warning(f'Failed to close CostStore: {e}')
+
             # Persist run metrics to SQLite
             try:
                 from orchestrator.run_store import RunStore
@@ -308,6 +337,7 @@ class Harness:
                     self.report,
                     self.config.fused_memory.project_id,
                     str(prd_path) if prd_path else '',
+                    run_id=self._run_id or None,
                 )
             except Exception as e:
                 logger.warning(f'Failed to persist run metrics: {e}')
@@ -632,8 +662,10 @@ Output JSON matching the schema. Every task must appear in the output.
             if HAS_STEWARD and self._escalation_queue:
                 esc_q = self._escalation_queue  # capture for closure (narrows type)
 
-                def _make_steward(worktree: Path, *, _assign=assignment) -> TaskSteward:  # type: ignore[name-defined]
-                    return TaskSteward(
+                def _make_steward(
+                    worktree: Path, *, _assign=assignment,
+                ) -> TaskSteward:  # type: ignore[name-defined]
+                    return TaskSteward(  # type: ignore[possibly-unbound]
                         task_id=_assign.task_id,
                         task=_assign.task,
                         worktree=worktree,
@@ -642,6 +674,9 @@ Output JSON matching the schema. Every task must appear in the output.
                         escalation_queue=esc_q,
                         briefing=self.briefing,
                         usage_gate=self.usage_gate,
+                        cost_store=self._cost_store,
+                        run_id=self._run_id,
+                        project_id=self.config.fused_memory.project_id,
                     )
                 steward_factory = _make_steward
 
@@ -658,6 +693,9 @@ Output JSON matching the schema. Every task must appear in the output.
                 initial_plan=recovered_plan,
                 steward_factory=steward_factory,
                 merge_queue=self._merge_queue,
+                cost_store=self._cost_store,
+                run_id=self._run_id,
+                project_id=self.config.fused_memory.project_id,
             )
             outcome = await workflow.run()
 
@@ -827,7 +865,7 @@ Output JSON matching the schema. Every task must appear in the output.
     async def _stop_merge_worker(self) -> None:
         """Stop the merge worker gracefully."""
         if self._merge_worker_task is not None and self._merge_worker is not None:
-            await self._merge_worker.stop()
+            await self._merge_worker.stop()  # type: ignore[attr-defined]
             self._merge_worker_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._merge_worker_task

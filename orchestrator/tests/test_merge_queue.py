@@ -100,6 +100,7 @@ class TestCasUpdateRef:
         assert result.success
         assert result.merge_worktree is not None
 
+        assert result.merge_commit is not None
         main_sha = await git_ops.get_main_sha()
         advanced = await git_ops.advance_main(
             result.merge_commit,
@@ -133,6 +134,7 @@ class TestCasUpdateRef:
 
         # Merge commit is no longer a descendant of (new) main and no
         # merge_worktree was passed for retry → not_descendant
+        assert result.merge_commit is not None
         advanced = await git_ops.advance_main(
             result.merge_commit,
             expected_main=stale_sha,
@@ -151,6 +153,7 @@ class TestCasUpdateRef:
         assert result.success
 
         # No expected_main — should work as before
+        assert result.merge_commit is not None
         advanced = await git_ops.advance_main(result.merge_commit)
         assert advanced == 'advanced'
 
@@ -206,6 +209,7 @@ class TestMergeWorker:
         # Merge manually first
         result = await git_ops.merge_to_main(worktree, 'already-merged')
         assert result.success
+        assert result.merge_commit is not None
         await git_ops.advance_main(result.merge_commit)
         if result.merge_worktree:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
