@@ -18,13 +18,11 @@ from typing import Any
 
 import aiosqlite
 
-from shared.async_sqlite_base import AsyncSqliteBase
-
 logger = logging.getLogger(__name__)
 
 # -- Schema ------------------------------------------------------------------
 
-_SCHEMA = """\
+_CREATE_TABLE = """\
 CREATE TABLE IF NOT EXISTS write_queue (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id    TEXT    NOT NULL,
@@ -39,6 +37,9 @@ CREATE TABLE IF NOT EXISTS write_queue (
     completed_at REAL,
     error       TEXT
 );
+"""
+
+_CREATE_INDEX = """\
 CREATE INDEX IF NOT EXISTS idx_wq_status_group
     ON write_queue (status, group_id, next_retry_at);
 """
@@ -71,7 +72,7 @@ class QueueItem:
 CallbackFn = Callable[[str, Any, dict[str, Any]], Coroutine[Any, Any, None]]
 
 
-class DurableWriteQueue(AsyncSqliteBase):
+class DurableWriteQueue:
     """SQLite WAL-backed write queue with per-group workers and global semaphore."""
 
     def __init__(
@@ -86,7 +87,7 @@ class DurableWriteQueue(AsyncSqliteBase):
         retry_max_delay_seconds: float = 300.0,
         write_timeout_seconds: float = 120.0,
     ):
-        super().__init__(Path(data_dir) / 'write_queue.db', busy_timeout_ms=5000)
+        self._data_dir = Path(data_dir)
         self._execute_write = execute_write
         self._workers_per_group = workers_per_group
         self._max_attempts = max_attempts
@@ -95,26 +96,30 @@ class DurableWriteQueue(AsyncSqliteBase):
         self._write_timeout_seconds = write_timeout_seconds
 
         self._semaphore = asyncio.Semaphore(semaphore_limit)
+        self._db: aiosqlite.Connection | None = None
         self._callbacks: dict[str, CallbackFn] = {}
         self._group_events: dict[str, asyncio.Event] = {}
         self._group_locks: dict[str, asyncio.Lock] = {}
         self._worker_tasks: dict[str, list[asyncio.Task]] = {}
         self._closed = False
 
-    @property
-    def _schema(self) -> str:
-        return _SCHEMA
-
     # -- lifecycle ------------------------------------------------------------
 
-    async def open(self) -> None:
-        await super().open()
-        self._require_conn().row_factory = aiosqlite.Row
+    async def initialize(self) -> None:
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        db_path = self._data_dir / 'write_queue.db'
+        self._db = await aiosqlite.connect(str(db_path))
+        self._db.row_factory = aiosqlite.Row
+        await self._db.execute('PRAGMA journal_mode=WAL')
+        await self._db.execute('PRAGMA busy_timeout=5000')
+        await self._db.execute(_CREATE_TABLE)
+        await self._db.execute(_CREATE_INDEX)
+        await self._db.commit()
         # Recover any items left in_flight from a previous crash
         await self._recover_in_flight()
         # Spin up workers for groups that have pending work
         await self._start_workers_for_pending_groups()
-        logger.info('DurableWriteQueue initialized at %s', self.db_path)
+        logger.info('DurableWriteQueue initialized at %s', db_path)
 
     async def close(self) -> None:
         self._closed = True
@@ -127,7 +132,9 @@ class DurableWriteQueue(AsyncSqliteBase):
         if all_tasks:
             await asyncio.gather(*all_tasks, return_exceptions=True)
         self._worker_tasks.clear()
-        await super().close()
+        if self._db:
+            await self._db.close()
+            self._db = None
         logger.info('DurableWriteQueue closed')
 
     # -- callbacks ------------------------------------------------------------
@@ -145,9 +152,9 @@ class DurableWriteQueue(AsyncSqliteBase):
         callback_type: str | None = None,
     ) -> int:
         """Persist a write item and signal workers. Returns item id."""
-        db = self._require_conn()
+        assert self._db is not None
         now = time.time()
-        cursor = await db.execute(
+        cursor = await self._db.execute(
             'INSERT INTO write_queue '
             '(group_id, operation, payload, callback_type, status, attempts, '
             ' max_attempts, next_retry_at, created_at) '
@@ -155,7 +162,7 @@ class DurableWriteQueue(AsyncSqliteBase):
             (group_id, operation, json.dumps(payload), callback_type,
              'pending', self._max_attempts, now),
         )
-        await db.commit()
+        await self._db.commit()
         item_id = cursor.lastrowid
         self._ensure_workers(group_id)
         self._signal_group(group_id)
@@ -166,14 +173,14 @@ class DurableWriteQueue(AsyncSqliteBase):
     ) -> list[int]:
         """Bulk insert in a single transaction. Each dict needs group_id,
         operation, payload, and optionally callback_type."""
-        db = self._require_conn()
+        assert self._db is not None
         now = time.time()
         ids: list[int] = []
         groups_seen: set[str] = set()
-        await db.execute('BEGIN')
+        await self._db.execute('BEGIN')
         try:
             for item in items:
-                cursor = await db.execute(
+                cursor = await self._db.execute(
                     'INSERT INTO write_queue '
                     '(group_id, operation, payload, callback_type, status, attempts, '
                     ' max_attempts, next_retry_at, created_at) '
@@ -185,9 +192,9 @@ class DurableWriteQueue(AsyncSqliteBase):
                 )
                 ids.append(cursor.lastrowid)  # type: ignore[arg-type]
                 groups_seen.add(item['group_id'])
-            await db.commit()
+            await self._db.commit()
         except Exception:
-            await db.rollback()
+            await self._db.rollback()
             raise
         for g in groups_seen:
             self._ensure_workers(g)
@@ -237,11 +244,11 @@ class DurableWriteQueue(AsyncSqliteBase):
 
         Uses a per-group asyncio.Lock so only one worker claims at a time.
         """
-        db = self._require_conn()
+        assert self._db is not None
         lock = self._group_locks[group_id]
         async with lock:
             now = time.time()
-            cursor = await db.execute(
+            cursor = await self._db.execute(
                 "SELECT * FROM write_queue "
                 "WHERE group_id = ? AND status IN ('pending', 'retry') "
                 "  AND next_retry_at <= ? "
@@ -252,11 +259,11 @@ class DurableWriteQueue(AsyncSqliteBase):
             if row is None:
                 return None
             item = QueueItem(tuple(row))
-            await db.execute(
+            await self._db.execute(
                 "UPDATE write_queue SET status = 'in_flight' WHERE id = ?",
                 (item.id,),
             )
-            await db.commit()
+            await self._db.commit()
             return item
 
     async def _process_item(self, item: QueueItem) -> None:
@@ -281,20 +288,20 @@ class DurableWriteQueue(AsyncSqliteBase):
                 await self._handle_failure(item, exc)
 
     async def _mark_completed(self, item: QueueItem) -> None:
-        db = self._require_conn()
-        await db.execute(
+        assert self._db is not None
+        await self._db.execute(
             "UPDATE write_queue SET status = 'completed', completed_at = ?, "
             "attempts = attempts + 1 WHERE id = ?",
             (time.time(), item.id),
         )
-        await db.commit()
+        await self._db.commit()
 
     async def _handle_failure(self, item: QueueItem, exc: Exception) -> None:
-        db = self._require_conn()
+        assert self._db is not None
         new_attempts = item.attempts + 1
         error_msg = f'{type(exc).__name__}: {exc}'
         if new_attempts >= item.max_attempts:
-            await db.execute(
+            await self._db.execute(
                 "UPDATE write_queue SET status = 'dead', attempts = ?, error = ? "
                 "WHERE id = ?",
                 (new_attempts, error_msg, item.id),
@@ -310,7 +317,7 @@ class DurableWriteQueue(AsyncSqliteBase):
                 self._retry_max_delay_seconds,
             )
             next_retry = time.time() + delay
-            await db.execute(
+            await self._db.execute(
                 "UPDATE write_queue SET status = 'retry', attempts = ?, "
                 "next_retry_at = ?, error = ? WHERE id = ?",
                 (new_attempts, next_retry, error_msg, item.id),
@@ -319,24 +326,24 @@ class DurableWriteQueue(AsyncSqliteBase):
                 'Item %d retry %d/%d in %.1fs: %s',
                 item.id, new_attempts, item.max_attempts, delay, error_msg,
             )
-        await db.commit()
+        await self._db.commit()
 
     # -- recovery -------------------------------------------------------------
 
     async def _recover_in_flight(self) -> None:
         """Reset items left in_flight (crashed mid-write) back to pending."""
-        db = self._require_conn()
-        cursor = await db.execute(
+        assert self._db is not None
+        cursor = await self._db.execute(
             "UPDATE write_queue SET status = 'pending' WHERE status = 'in_flight'"
         )
-        await db.commit()
+        await self._db.commit()
         if cursor.rowcount:
             logger.info('Recovered %d in-flight items to pending', cursor.rowcount)
 
     async def _start_workers_for_pending_groups(self) -> None:
         """Start workers for any groups that have pending/retry items."""
-        db = self._require_conn()
-        cursor = await db.execute(
+        assert self._db is not None
+        cursor = await self._db.execute(
             "SELECT DISTINCT group_id FROM write_queue "
             "WHERE status IN ('pending', 'retry')"
         )
@@ -350,21 +357,21 @@ class DurableWriteQueue(AsyncSqliteBase):
 
     async def replay_dead(self, group_id: str | None = None) -> int:
         """Reset dead items to pending for retry. Returns count reset."""
-        db = self._require_conn()
+        assert self._db is not None
         if group_id:
-            cursor = await db.execute(
+            cursor = await self._db.execute(
                 "UPDATE write_queue SET status = 'pending', attempts = 0, "
                 "next_retry_at = 0, error = NULL "
                 "WHERE status = 'dead' AND group_id = ?",
                 (group_id,),
             )
         else:
-            cursor = await db.execute(
+            cursor = await self._db.execute(
                 "UPDATE write_queue SET status = 'pending', attempts = 0, "
                 "next_retry_at = 0, error = NULL "
                 "WHERE status = 'dead'",
             )
-        await db.commit()
+        await self._db.commit()
         count = cursor.rowcount or 0
         if count:
             if group_id:
@@ -376,8 +383,8 @@ class DurableWriteQueue(AsyncSqliteBase):
 
     async def get_stats(self) -> dict[str, Any]:
         """Return counts by status and oldest pending age."""
-        db = self._require_conn()
-        cursor = await db.execute(
+        assert self._db is not None
+        cursor = await self._db.execute(
             'SELECT status, COUNT(*) as cnt FROM write_queue GROUP BY status'
         )
         rows = await cursor.fetchall()
@@ -388,7 +395,7 @@ class DurableWriteQueue(AsyncSqliteBase):
         }
 
         oldest_pending_age = None
-        cursor = await db.execute(
+        cursor = await self._db.execute(
             "SELECT MIN(created_at) FROM write_queue "
             "WHERE status IN ('pending', 'retry')"
         )
@@ -405,14 +412,14 @@ class DurableWriteQueue(AsyncSqliteBase):
 
     async def get_dead_items(self, group_id: str | None = None) -> list[dict[str, Any]]:
         """Return dead-lettered items."""
-        db = self._require_conn()
+        assert self._db is not None
         if group_id:
-            cursor = await db.execute(
+            cursor = await self._db.execute(
                 "SELECT * FROM write_queue WHERE status = 'dead' AND group_id = ?",
                 (group_id,),
             )
         else:
-            cursor = await db.execute(
+            cursor = await self._db.execute(
                 "SELECT * FROM write_queue WHERE status = 'dead'"
             )
         rows = await cursor.fetchall()

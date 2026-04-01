@@ -313,6 +313,10 @@ class McpLifecycle:
                     'type': 'http',
                     'url': f'{self.config.url}/mcp',
                 },
+                'jcodemunch': {
+                    'command': 'uvx',
+                    'args': ['jcodemunch-mcp'],
+                },
             },
         }
         if escalation_url:

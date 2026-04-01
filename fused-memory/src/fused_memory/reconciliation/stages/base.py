@@ -201,7 +201,13 @@ class BaseStage:
                 'env': fm_env,
             }
 
-        servers: dict = {'fused-memory': fm_entry}
+        servers: dict = {
+            'fused-memory': fm_entry,
+            'jcodemunch': {
+                'command': 'uvx',
+                'args': ['jcodemunch-mcp'],
+            },
+        }
 
         # Add escalation server if URL is available
         if self._escalation_url:

@@ -72,17 +72,12 @@ class RunStore:
         report: HarnessReport,
         project_id: str,
         prd_path: str | None = None,
-        run_id: str | None = None,
     ) -> str:
         """Persist a HarnessReport and its TaskReports to SQLite.
 
-        When *run_id* is provided it is used directly; otherwise a new
-        ``run-{uuid12}`` identifier is generated.
-
-        Returns the run_id used.
+        Returns the generated run_id.
         """
-        if run_id is None:
-            run_id = f'run-{uuid.uuid4().hex[:12]}'
+        run_id = f'run-{uuid.uuid4().hex[:12]}'
         conn = sqlite3.connect(str(self.db_path))
         try:
             conn.execute(

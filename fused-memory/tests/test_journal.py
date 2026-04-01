@@ -24,7 +24,7 @@ from fused_memory.reconciliation.journal import ReconciliationJournal
 @pytest_asyncio.fixture
 async def journal(tmp_path):
     j = ReconciliationJournal(tmp_path / 'test_recon')
-    await j.open()
+    await j.initialize()
     yield j
     await j.close()
 
@@ -253,7 +253,7 @@ async def test_get_run_actions_combined_with_write_journal(journal, tmp_path):
     from fused_memory.services.write_journal import WriteJournal
 
     wj = WriteJournal(tmp_path / 'combined_wj')
-    await wj.open()
+    await wj.initialize()
     journal.set_write_journal(wj)
 
     run_id = str(uuid.uuid4())
@@ -280,7 +280,7 @@ async def test_combined_extracts_target_from_write_journal(journal, tmp_path):
     from fused_memory.services.write_journal import WriteJournal
 
     wj = WriteJournal(tmp_path / 'target_wj')
-    await wj.open()
+    await wj.initialize()
     journal.set_write_journal(wj)
 
     run_id = str(uuid.uuid4())

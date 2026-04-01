@@ -17,7 +17,7 @@ from fused_memory.reconciliation.targeted import TargetedReconciler
 @pytest_asyncio.fixture
 async def journal(tmp_path):
     j = ReconciliationJournal(tmp_path / 'targeted_test')
-    await j.open()
+    await j.initialize()
     yield j
     await j.close()
 

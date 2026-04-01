@@ -24,7 +24,7 @@ from fused_memory.reconciliation.journal import ReconciliationJournal
 @pytest_asyncio.fixture
 async def journal(tmp_path):
     j = ReconciliationJournal(tmp_path / 'harness_test')
-    await j.open()
+    await j.initialize()
     yield j
     await j.close()
 
@@ -32,7 +32,7 @@ async def journal(tmp_path):
 @pytest_asyncio.fixture
 async def event_buffer(tmp_path):
     buf = EventBuffer(db_path=tmp_path / 'harness_eb.db', buffer_size_threshold=2, max_staleness_seconds=3600)
-    await buf.open()
+    await buf.initialize()
     yield buf
     await buf.close()
 

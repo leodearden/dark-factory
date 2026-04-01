@@ -38,7 +38,7 @@ def reconciler():
 @pytest_asyncio.fixture
 async def event_buffer(tmp_path):
     buf = EventBuffer(db_path=tmp_path / 'interceptor_eb.db', buffer_size_threshold=100)
-    await buf.open()
+    await buf.initialize()
     yield buf
     await buf.close()
 
