@@ -6788,13 +6788,13 @@
         "description": "In costs.py, get_cost_trend correctly captures `now = datetime.now(UTC)` once to avoid clock skew, but inlines `(now - timedelta(days=days)).isoformat()` rather than using the `_cutoff` helper. This creates two patterns for the same computation. The five other callers of `_cutoff` (lines 43, 99, 137, 221, 312, 358) still independently sample the clock inside `_cutoff`, meaning they each have the same theoretical clock-skew race.\n\nFix: Change `_cutoff` signature to `def _cutoff(days: int, *, now: datetime | None = None) -> str:` computing `(now or datetime.now(UTC)) - timedelta(days=days)`. In `get_cost_trend`, call `since = _cutoff(days, now=now)`. Other callers continue to work unchanged but can opt in to the single-clock pattern if needed.\n\nmemory_hints: search \"clock skew race costs.py\", search \"_cutoff helper\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [
           "317"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-01T13:23:55.338Z",
+        "updatedAt": "2026-04-01T13:26:10.444Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data",
@@ -7234,9 +7234,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-01T13:23:55.555Z",
+      "lastModified": "2026-04-01T13:26:10.444Z",
       "taskCount": 359,
-      "completedCount": 295,
+      "completedCount": 296,
       "tags": [
         "master"
       ]
