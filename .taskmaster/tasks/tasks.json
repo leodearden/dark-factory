@@ -7011,7 +7011,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "fused-memory/src/fused_memory/services/memory_service.py",
+            "fused-memory/tests/test_memory_service.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/services",
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 371,
@@ -7022,7 +7032,20 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "fused-memory/src/fused_memory/services/planned_episode_registry.py",
+            "fused-memory/src/fused_memory/reconciliation/targeted.py",
+            "fused-memory/tests/test_planned_episode_registry.py",
+            "fused-memory/tests/test_targeted.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/services",
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 372,
