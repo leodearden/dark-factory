@@ -7162,7 +7162,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "orchestrator/src/orchestrator/verify.py"
+          ],
+          "modules": [
+            "orchestrator/src/orchestrator"
+          ]
+        }
       },
       {
         "id": 378,
@@ -7173,7 +7181,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "shared/src/shared/usage_gate.py",
+            "shared/tests/test_usage_gate.py"
+          ],
+          "modules": [
+            "shared/src/shared",
+            "shared/tests"
+          ]
+        }
       },
       {
         "id": 379,
@@ -7184,7 +7202,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "orchestrator/src/orchestrator/mcp_lifecycle.py"
+          ],
+          "modules": [
+            "orchestrator/src/orchestrator"
+          ]
+        }
       },
       {
         "id": 380,
