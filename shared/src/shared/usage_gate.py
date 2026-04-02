@@ -398,7 +398,7 @@ class UsageGate:
         self._cumulative_cost += cost
 
     async def _account_resume_probe_loop(self, acct: AccountState) -> None:
-        """Sleep for a probe interval, then test the account with a real invocation.
+        """Repeatedly probe an account until it uncaps.
 
         Uses exponential backoff: ``probe_interval_secs * 2^probe_count``,
         capped at ``max_probe_interval_secs``.  The sleep duration is also
@@ -407,61 +407,62 @@ class UsageGate:
         Fires a minimal Claude invocation (haiku, 1 turn) to verify the
         account actually has capacity.  Only uncaps the account on success.
         """
-        target = acct.resets_at
-        if target is None:
-            target = datetime.now(UTC) + timedelta(hours=1)
-            logger.warning(f'Account {acct.name}: no resets_at — defaulting to 1h')
+        while acct.capped:
+            target = acct.resets_at
+            if target is None:
+                target = datetime.now(UTC) + timedelta(hours=1)
+                logger.warning(f'Account {acct.name}: no resets_at — defaulting to 1h')
 
-        base = self._config.probe_interval_secs
-        ceiling = self._config.max_probe_interval_secs
-        interval = min(base * (2 ** acct.probe_count), ceiling)
+            base = self._config.probe_interval_secs
+            ceiling = self._config.max_probe_interval_secs
+            interval = min(base * (2 ** acct.probe_count), ceiling)
 
-        remaining = max(0, (target - datetime.now(UTC)).total_seconds())
-        sleep_for = min(interval, remaining) if remaining > 0 else 0
+            remaining = max(0, (target - datetime.now(UTC)).total_seconds())
+            sleep_for = min(interval, remaining) if remaining > 0 else 0
 
-        if sleep_for > 0:
-            logger.info(
-                f'Account {acct.name}: sleeping {sleep_for:.0f}s '
-                f'(probe #{acct.probe_count + 1}, resets in {remaining:.0f}s)',
-            )
-            try:
-                await asyncio.sleep(sleep_for)
-            except asyncio.CancelledError:
+            if sleep_for > 0:
+                logger.info(
+                    f'Account {acct.name}: sleeping {sleep_for:.0f}s '
+                    f'(probe #{acct.probe_count + 1}, resets in {remaining:.0f}s)',
+                )
+                try:
+                    await asyncio.sleep(sleep_for)
+                except asyncio.CancelledError:
+                    return
+
+            # _refresh_capped_accounts may have already uncapped this account
+            if not acct.capped:
                 return
 
-        # _refresh_capped_accounts may have already uncapped this account
-        if not acct.capped:
-            return
-
-        acct.probe_count += 1
-        logger.info(
-            f'Account {acct.name}: firing probe #{acct.probe_count}',
-        )
-
-        ok = await self._run_probe(acct)
-
-        if ok:
-            acct.capped = False
-            acct.probing = True  # gate: let one real task confirm first
-            acct.probe_count = 0
-            if acct.pause_started_at:
-                self._total_pause_secs += (
-                    datetime.now(UTC) - acct.pause_started_at
-                ).total_seconds()
-            acct.pause_started_at = None
-            logger.info(f'Account {acct.name} RESUMED (probe confirmed)')
-            self._open.set()
-            if self._cost_store:
-                await self._write_cost_event(
-                    acct.name, 'resumed',
-                    json.dumps({'label': f'probe #{acct.probe_count} confirmed'}),
-                )
-        else:
+            acct.probe_count += 1
             logger.info(
-                f'Account {acct.name}: probe #{acct.probe_count} failed — '
-                f'scheduling next probe',
+                f'Account {acct.name}: firing probe #{acct.probe_count}',
             )
-            self._start_account_resume_probe(acct)
+
+            ok = await self._run_probe(acct)
+
+            if ok:
+                acct.capped = False
+                acct.probing = True  # gate: let one real task confirm first
+                acct.probe_count = 0
+                if acct.pause_started_at:
+                    self._total_pause_secs += (
+                        datetime.now(UTC) - acct.pause_started_at
+                    ).total_seconds()
+                acct.pause_started_at = None
+                logger.info(f'Account {acct.name} RESUMED (probe confirmed)')
+                self._open.set()
+                if self._cost_store:
+                    await self._write_cost_event(
+                        acct.name, 'resumed',
+                        json.dumps({'label': f'probe #{acct.probe_count} confirmed'}),
+                    )
+                return
+            else:
+                logger.info(
+                    f'Account {acct.name}: probe #{acct.probe_count} failed — '
+                    f'retrying after backoff',
+                )
 
     async def _run_probe(self, acct: AccountState) -> bool:
         """Fire a minimal Claude invocation to test if *acct* has capacity.

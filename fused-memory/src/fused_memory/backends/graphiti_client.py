@@ -27,6 +27,30 @@ class NodeNotFoundError(Exception):
     """Raised when a node UUID is not found in FalkorDB."""
 
 
+class _MultiTenantFalkorDriver(FalkorDriver):
+    """FalkorDriver that suppresses auto-indexing.
+
+    Upstream ``__init__`` schedules ``build_indices_and_constraints()``
+    against ``_database`` as a fire-and-forget task.  In multi-tenant
+    mode indices are built explicitly via ``_ensure_indices()`` — the
+    fire-and-forget path is suppressed here to prevent redundant
+    CREATE INDEX commands from saturating FalkorDB's single-threaded
+    execution.
+
+    ``clone()`` is overridden to return another ``_MultiTenantFalkorDriver``
+    so cloned per-graph drivers also suppress auto-indexing.
+    """
+
+    async def build_indices_and_constraints(self, delete_existing=False):
+        pass
+
+    def clone(self, database: str) -> 'GraphDriver':
+        if database == self._database:
+            return self
+        cloned = _MultiTenantFalkorDriver(falkor_db=self.client, database=database)
+        return cloned
+
+
 class GraphitiBackend:
     """Owns the Graphiti client lifecycle.
 
@@ -42,17 +66,22 @@ class GraphitiBackend:
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
         self._indexed_graphs: set[str] = set()
+        self._cloned_drivers: dict[str, GraphDriver] = {}
 
     # --- Per-request driver routing ---
 
     def _driver_for(self, group_id: str) -> GraphDriver:
-        """Return a driver clone targeting the FalkorDB graph for *group_id*.
+        """Return a cached driver clone targeting the FalkorDB graph for *group_id*.
 
-        Lazily ensures indices exist on the target graph (tracked in
-        ``_indexed_graphs`` to avoid redundant CREATE INDEX calls).
+        Caches cloned drivers to avoid creating new connections per request.
         """
+        cached = self._cloned_drivers.get(group_id)
+        if cached is not None:
+            return cached
         driver = self._require_driver()
-        return driver.clone(database=group_id)
+        cloned = driver.clone(database=group_id)
+        self._cloned_drivers[group_id] = cloned
+        return cloned
 
     def _graph_for(self, group_id: str) -> Any:
         """Return the FalkorGraph object for *group_id* (for direct Cypher)."""
@@ -136,11 +165,10 @@ class GraphitiBackend:
         host = parsed.hostname or 'localhost'
         port = parsed.port or 6379
 
-        self._driver = FalkorDriver(
+        self._driver = _MultiTenantFalkorDriver(
             host=host,
             port=port,
             password=falkor_cfg.password,
-            database='__placeholder__',
         )
 
         self.client = Graphiti(

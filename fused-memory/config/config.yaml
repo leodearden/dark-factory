@@ -58,7 +58,7 @@ queue:
   write_timeout_seconds: ${QUEUE_WRITE_TIMEOUT:120}
   backend_read_timeout_seconds: ${BACKEND_READ_TIMEOUT:30}
   backend_write_timeout_seconds: ${BACKEND_WRITE_TIMEOUT:120}
-  search_timeout_seconds: ${SEARCH_TIMEOUT:15}
+  search_timeout_seconds: ${SEARCH_TIMEOUT:30}
   data_dir: "${QUEUE_DATA_DIR:./data/queue}"
 
 taskmaster:
