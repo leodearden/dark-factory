@@ -7671,11 +7671,11 @@
         "description": "In by_role.html the fallback `document.querySelector('[data-by-role-container]')` (used when document.currentScript is null) picks the first matching element in document order, risking attachment to a stale HTMX copy during overlapping swaps. Fix: either (a) drop the fallback entirely and add a console.error since document.currentScript is always non-null for synchronous inline scripts, or (b) render a unique data-by-role-instance=\"{{ uuid }}\" attribute from the template and target that in the fallback. Apply the same fix to by_account.html, by_project.html, and trend.html.\n\nMemory hints: search \"DOM scoping container fallback cost partials\", search \"chart lifecycle pattern\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-02T12:42:21.294Z",
+        "updatedAt": "2026-04-02T12:47:46.822Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/templates",
@@ -7947,17 +7947,9 @@
           "regression_number": 2,
           "_causation_id": "54c04f01-fb8e-4cba-baf3-5f866068829b",
           "memory_hints": {
-            "entities": [
-              "Mem0",
-              "mem0_client.py",
-              "Qdrant",
-              "DurableWriteQueue",
-              "Mem0 search/write regression"
-            ],
+            "entities": [],
             "queries": [
-              "Mem0 search regression broken zero results",
-              "dead letter queue DLQ growth Mem0 write failures",
-              "Task 98 Mem0 search fix agent_id run_id filter"
+              "resolution for: Fix Mem0 search regression — second occurrence, all queries return 0 results despite 3024 memories"
             ]
           },
           "files": [
@@ -7975,9 +7967,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T12:43:20.712Z",
+      "lastModified": "2026-04-02T12:47:46.822Z",
       "taskCount": 380,
-      "completedCount": 357,
+      "completedCount": 358,
       "tags": [
         "master"
       ]
