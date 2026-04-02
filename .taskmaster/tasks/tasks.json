@@ -6920,7 +6920,7 @@
         "description": "test_cost_store_schema_has_completed_at_index (test_costs_data.py:991-1025) crosses the dashboard/shared module boundary by manipulating sys.path with hard-coded relative path arithmetic (Path(__file__).resolve().parents[2] / 'shared' / 'src'). Issues:\n\n1. The depth `parents[2]` encodes a worktree directory structure assumption that breaks in non-worktree checkouts.\n2. sys.path.insert/remove is not thread-safe under pytest-xdist.\n3. The imported module remains cached in sys.modules after path removal.\n4. The coupling is invisible to the build system.\n\nPreferred fix: Move `test_cost_store_schema_has_completed_at_index` to `shared/tests/test_cost_store.py` where it belongs (the test validates shared's schema, not dashboard's). If the test must stay in dashboard, add `shared` as a test dependency in `dashboard/pyproject.toml` via `[tool.uv.sources]` editable path.\n\nmemory_hints: search \"per-worktree venv isolation\", search \"cross-module test\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [
           "317"
         ],
@@ -6937,7 +6937,7 @@
             "shared/tests"
           ]
         },
-        "updatedAt": "2026-04-02T02:19:51.007Z"
+        "updatedAt": "2026-04-02T02:23:15.778Z"
       },
       {
         "id": "362",
@@ -7765,9 +7765,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:23:02.342Z",
+      "lastModified": "2026-04-02T02:23:15.779Z",
       "taskCount": 374,
-      "completedCount": 336,
+      "completedCount": 337,
       "tags": [
         "master"
       ]
