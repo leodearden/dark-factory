@@ -7675,6 +7675,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 393,
+        "title": "Add TestByRoleEmptyState test class",
+        "description": "In test_by_role_chart_lifecycle.py add a new test class TestByRoleEmptyState that patches get_by_role to return {} (and separately None/exception). Assertions: (1) 'No role data available for this window.' appears in rendered HTML; (2) 'var byRole = {}' renders without JS error markers; (3) no `data-project-id` canvas elements appear; (4) no `new Chart(` call appears. This covers the silent exception-swallowing path in app.py and the template's else branch.\n\nMemory hints: search \"by_role empty state template branch\", search \"test conventions\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -7687,7 +7698,7 @@
       ],
       "created": "2026-04-02T01:41:39.856Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-02T01:42:10.399Z"
+      "updated": "2026-04-02T01:42:15.824Z"
     }
   }
 }
