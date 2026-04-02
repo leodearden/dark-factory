@@ -7740,15 +7740,16 @@
         "description": "The update_task tool uses merge semantics for metadata — keys can be added or overwritten but never deleted. Setting a key to null does not remove it (it persists in the output). This means bloated task metadata (e.g., per-cycle keys from reconciliation) cannot be cleaned up programmatically.\n\nAcceptance criteria:\n1. Implement one of: (a) a delete_metadata_keys operation, (b) a replace-metadata mode on update_task that replaces instead of merging, or (c) explicit null-means-delete semantics\n2. Validate that removed keys do not reappear in subsequent get_task calls\n3. Document the chosen approach\n\nmemory_hints:\n- search queries: [\"update_task merge semantics metadata key deletion\", \"metadata bloat reconciliation consolidated key pattern\"]\n- related memories: [\"dcabfa99 - tooling gap observation\", \"effd9f42 - consolidated metadata norm\"]\n- related tasks: [158, 383]",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-02T02:08:15.212Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:08:10.445Z",
+      "lastModified": "2026-04-02T02:08:15.214Z",
       "taskCount": 374,
       "completedCount": 330,
       "tags": [
