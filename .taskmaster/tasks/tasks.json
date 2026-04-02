@@ -6788,7 +6788,7 @@
         "description": "PlannedEpisodeRegistry.are_all_planned() is defined, tested, and has correct semantics — but it is never called from any production code path. The _search_graphiti method instead calls get_planned_uuids() once and inlines the `all(ep in planned_uuids for ep in provenance)` check directly (a more efficient bulk-fetch approach).\n\nThe method is dead code with 5 dedicated test cases. Additionally, it lacks project_id scoping (queries globally), which is inconsistent with get_planned_uuids() that properly scopes by project_id.\n\nFix: Remove are_all_planned() and its test cases, since the production code has chosen the bulk-fetch strategy. This removes duplicated logic and shrinks the API surface.\n\nmemory_hints: search for \"are_all_planned\" and \"PlannedEpisodeRegistry dead code\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6801,7 +6801,8 @@
             "fused-memory/src/fused_memory/services",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T02:31:15.333Z"
       },
       {
         "id": "355",
@@ -7768,7 +7769,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:31:14.530Z",
+      "lastModified": "2026-04-02T02:31:15.334Z",
       "taskCount": 374,
       "completedCount": 340,
       "tags": [
