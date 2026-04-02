@@ -7418,7 +7418,7 @@
         "description": "Task 122 (\"Fix: Stage 1 reconciliation agent repeatedly reports 0 total tasks\") was completed, but the bug has recurred. Run efbe832b Stage 1 again reported \"Active Task Tree (0 active, 0 done, 0 total)\" despite the actual tree having 367 tasks (301 done, 45 pending, 8 in-progress, 1 blocked, 12 cancelled). The fix from task 122 did not hold.",
         "details": "This is at minimum the second recurrence since task 122 was completed (memory a88b411f documents a prior recurrence in cycle d357c956).\n\nThe false-empty report cascades: Stage 2 receives no tasks to reconcile, so completed-task knowledge capture, memory hint updates, and blocked-task unblocking all get skipped.\n\nInvestigation: review the task 122 fix to understand why it didn't persist. Possible causes:\n- The guard was added to the wrong layer (Stage 1 prompt vs MCP tool response)\n- The get_tasks tool response is being truncated/dropped before reaching the Stage 1 agent\n- Claude agent context window overflow causing the task list to be dropped\n\nmemory_hints:\n- search: \"false-empty task tree Stage 1 recurring bug\"\n- search: \"task 122 fix Stage 1 reports 0 tasks\"",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
@@ -7493,7 +7493,8 @@
             "fused-memory/src/fused_memory/reconciliation",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T01:20:55.493Z"
       },
       {
         "id": "384",
@@ -7600,7 +7601,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:20:54.965Z",
+      "lastModified": "2026-04-02T01:20:55.493Z",
       "taskCount": 365,
       "completedCount": 302,
       "tags": [
