@@ -6990,7 +6990,7 @@
         "description": "MemoryService.merge_entities() and refresh_entity_summary() share ~30 lines of identical journal-logging boilerplate: write_op_id generation, success/error_msg scaffolding, try/except/finally with suppressed journal errors, and logger.warning on journal failure. Any future write-journaled method will copy it again.\n\nExtract a private helper such as `_with_journal(self, operation, params, coro, ...)` or an async context manager that handles the write_op_id generation, try/except/finally journaling, and warning suppression. Both methods would shrink to a few lines each.\n\nMemory hints:\n- Search: 'write journal boilerplate MemoryService'\n- Entities: MemoryService, WriteJournal",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -7005,7 +7005,8 @@
             "fused-memory/src/fused_memory/services",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T02:36:31.726Z"
       },
       {
         "id": "365",
@@ -7799,7 +7800,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:34:31.476Z",
+      "lastModified": "2026-04-02T02:36:31.726Z",
       "taskCount": 375,
       "completedCount": 343,
       "tags": [
