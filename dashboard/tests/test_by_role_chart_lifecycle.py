@@ -182,16 +182,20 @@ class TestByRoleRenderErrorRecovery:
     """Tests that by_role.html recovers from render-time exceptions without permanent lockout."""
 
     def test_foreach_loop_wrapped_in_try_block(self, client):
-        """The projectIds.forEach loop must be wrapped in a try block."""
+        """The projectIds.forEach loop must be wrapped in a try block inside renderCharts."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
-        # Search for 'try {' that appears before 'projectIds.forEach(' (not cleanupCharts's internal try)
-        try_pos = html.find('try {')
-        foreach_pos = html.find('projectIds.forEach(')
-        assert try_pos != -1, "'try {' not found in script"
-        assert foreach_pos != -1, "'projectIds.forEach(' not found in script"
+        # Anchor to 'function renderCharts' to skip cleanupCharts's internal
+        # 'try { chart.destroy(); }' which always precedes projectIds.forEach
+        # and would make this test a permanent false-positive if not anchored.
+        render_charts_pos = html.find('function renderCharts')
+        assert render_charts_pos != -1, "'function renderCharts' not found in script"
+        try_pos = html.find('try {', render_charts_pos)
+        foreach_pos = html.find('projectIds.forEach(', render_charts_pos)
+        assert try_pos != -1, "'try {' not found inside function renderCharts"
+        assert foreach_pos != -1, "'projectIds.forEach(' not found inside function renderCharts"
         assert try_pos < foreach_pos, (
-            "'try {' must appear before 'projectIds.forEach(' in the script"
+            "'try {' must appear before 'projectIds.forEach(' inside function renderCharts"
         )
 
     def test_rendered_true_set_after_foreach_loop(self, client):
@@ -233,4 +237,58 @@ class TestByRoleRenderErrorRecovery:
         assert catch_pos != -1, "'catch' not found after 'projectIds.forEach('"
         assert throw_pos != -1, (
             "'throw' not found after the outer catch block — catch must re-throw the error"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-11: Null-dereference guard tests (TestByRoleNullDereferenceGuard)
+# ---------------------------------------------------------------------------
+
+
+class TestByRoleNullDereferenceGuard:
+    """Tests that by_role.html guards against null byRole and keeps cleanupCharts /
+    Object.keys inside the try block so a null server value exits cleanly."""
+
+    def test_byrole_null_guard_in_render_charts(self, client):
+        """renderCharts must guard against null/non-object byRole before rendering."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        render_charts_pos = html.find('function renderCharts')
+        assert render_charts_pos != -1, "'function renderCharts' not found in script"
+        null_guard_pos = html.find('!byRole', render_charts_pos)
+        assert null_guard_pos != -1, (
+            "'!byRole' guard not found inside function renderCharts — "
+            "renderCharts must guard against null/non-object byRole before rendering"
+        )
+
+    def test_cleanup_charts_inside_try_block(self, client):
+        """cleanupCharts() call must be inside the try block in renderCharts, not before it."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        render_charts_pos = html.find('function renderCharts')
+        assert render_charts_pos != -1, "'function renderCharts' not found in script"
+        # Find the outer try { inside renderCharts (skips cleanupCharts's internal try)
+        try_pos = html.find('try {', render_charts_pos)
+        assert try_pos != -1, "'try {' not found inside function renderCharts"
+        # cleanupCharts() call must appear AFTER the outer try {
+        cleanup_call_pos = html.find('cleanupCharts()', try_pos)
+        assert cleanup_call_pos != -1, (
+            "'cleanupCharts()' call not found after 'try {' inside renderCharts — "
+            "cleanupCharts() must be inside the try block, not before it"
+        )
+
+    def test_object_keys_inside_try_block(self, client):
+        """Object.keys(byRole) must be inside the try block in renderCharts, not before it."""
+        with _patch_by_role():
+            html = client.get('/costs/partials/by-role').text
+        render_charts_pos = html.find('function renderCharts')
+        assert render_charts_pos != -1, "'function renderCharts' not found in script"
+        # Find the outer try { inside renderCharts
+        try_pos = html.find('try {', render_charts_pos)
+        assert try_pos != -1, "'try {' not found inside function renderCharts"
+        # Object.keys(byRole) must appear AFTER the outer try {
+        object_keys_pos = html.find('Object.keys(byRole)', try_pos)
+        assert object_keys_pos != -1, (
+            "'Object.keys(byRole)' not found after 'try {' inside renderCharts — "
+            "Object.keys(byRole) must be inside the try block to avoid uncaught TypeError on null byRole"
         )
