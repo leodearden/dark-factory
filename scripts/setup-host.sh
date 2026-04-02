@@ -250,6 +250,59 @@ if command -v skim &>/dev/null && command -v claude &>/dev/null; then
     skim init --yes
     ok "skim hook installed for Claude Code"
   fi
+
+  # The hook rewrites commands to bare `skim`, which must be on PATH for all
+  # shell types (login, interactive, non-interactive bash -c).  ~/.cargo/bin
+  # is only added by profile/bashrc sourcing — symlink into /usr/local/bin
+  # so it's on the base OS PATH unconditionally.
+  SKIM_BIN="$HOME/.cargo/bin/skim"
+  if [ ! -e /usr/local/bin/skim ]; then
+    if [ -x "$SKIM_BIN" ]; then
+      sudo ln -s "$SKIM_BIN" /usr/local/bin/skim
+      ok "symlinked skim → /usr/local/bin/skim"
+    fi
+  else
+    ok "skim already on system PATH (/usr/local/bin/skim)"
+  fi
+fi
+
+# Verify skim is on PATH for all shell types an agent session might use.
+# The hook rewrites commands to bare `skim`, so it must be findable without
+# inheriting a profile-enhanced PATH.  Non-login, non-interactive shells
+# (gnome-terminal -- bash -c '...', systemd ExecStart=, asyncio subprocesses)
+# only get the base OS PATH unless ~/.cargo/env is sourced outside an
+# interactivity guard.
+if command -v skim &>/dev/null; then
+  info "Checking skim PATH visibility across shell types"
+
+  BASE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+  # Login shell (sources ~/.profile → ~/.cargo/env)
+  if env -i HOME="$HOME" TERM="$TERM" bash --login -c 'command -v skim' &>/dev/null; then
+    ok "skim on PATH: login shell"
+  else
+    fail "skim NOT on PATH: login shell"
+  fi
+
+  # Interactive shell (sources ~/.bashrc — needs to pass interactivity guard)
+  # stderr suppressed: bash -ic warns about missing terminal/job-control
+  if env -i HOME="$HOME" TERM="$TERM" bash -ic 'command -v skim' >/dev/null 2>&1; then
+    ok "skim on PATH: interactive shell"
+  else
+    fail "skim NOT on PATH: interactive shell"
+  fi
+
+  # Non-interactive, non-login shell with base OS PATH only.
+  # This simulates: gnome-terminal -- bash -c '...' when the parent env
+  # was not profile-initialised, or asyncio.create_subprocess_exec with a
+  # stripped env, or a systemd unit without Environment=PATH additions.
+  if env -i HOME="$HOME" PATH="$BASE_PATH" bash -c 'command -v skim' &>/dev/null; then
+    ok "skim on PATH: non-login non-interactive shell (base PATH)"
+  else
+    fail "skim NOT on PATH: non-login non-interactive shell (base PATH)"
+    warn "  Agents spawned without profile init will fail on skim-rewritten commands"
+    warn "  Fix: sudo ln -s $HOME/.cargo/bin/skim /usr/local/bin/skim"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
