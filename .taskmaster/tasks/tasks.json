@@ -7149,7 +7149,7 @@
         "description": "PlannedEpisodeRegistry.promote() is called in a loop by the reconciler, which means: (1) callers must deduplicate UUIDs themselves to keep journal counts accurate, (2) partial failures leave K-1 UUIDs committed but no journal entry written. Add a `promote_many(uuids: Iterable[str]) -> int` method that owns deduplication internally and executes all DELETEs in a single transaction with one commit, returning the actual promoted count. Update _on_task_done in targeted.py to call promote_many() with the raw flat provenance list instead of pre-deduplicating into a set. This also makes the `if ep` guard against None/empty provenance values a registry responsibility.\n\nmemory_hints: search for \"planned episode promotion\" and \"PlannedEpisodeRegistry promote\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -7165,7 +7165,8 @@
             "fused-memory/src/fused_memory/reconciliation",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T04:06:00.703Z"
       },
       {
         "id": "372",
@@ -7804,7 +7805,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T04:06:00.249Z",
+      "lastModified": "2026-04-02T04:06:00.703Z",
       "taskCount": 375,
       "completedCount": 348,
       "tags": [
