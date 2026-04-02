@@ -7671,11 +7671,11 @@
         "description": "In by_role.html the fallback `document.querySelector('[data-by-role-container]')` (used when document.currentScript is null) picks the first matching element in document order, risking attachment to a stale HTMX copy during overlapping swaps. Fix: either (a) drop the fallback entirely and add a console.error since document.currentScript is always non-null for synchronous inline scripts, or (b) render a unique data-by-role-instance=\"{{ uuid }}\" attribute from the template and target that in the fallback. Apply the same fix to by_account.html, by_project.html, and trend.html.\n\nMemory hints: search \"DOM scoping container fallback cost partials\", search \"chart lifecycle pattern\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-02T12:40:45.798Z",
+        "updatedAt": "2026-04-02T12:42:20.009Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/templates",
@@ -7975,7 +7975,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T12:42:19.945Z",
+      "lastModified": "2026-04-02T12:42:20.009Z",
       "taskCount": 380,
       "completedCount": 357,
       "tags": [
