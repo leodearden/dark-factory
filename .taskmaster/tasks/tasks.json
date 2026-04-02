@@ -8078,7 +8078,15 @@
               "_wait_for_resolution polling loop orchestrator"
             ]
           },
-          "_causation_id": "dffd2365-0cf3-407b-8634-8fef6a6dc16a"
+          "_causation_id": "dffd2365-0cf3-407b-8634-8fef6a6dc16a",
+          "files": [
+            "orchestrator/src/orchestrator/workflow.py",
+            "orchestrator/tests/test_workflow_e2e.py"
+          ],
+          "modules": [
+            "orchestrator/src/orchestrator",
+            "orchestrator/tests"
+          ]
         }
       },
       {
@@ -8104,7 +8112,16 @@
               "steward lifecycle termination stale escalation"
             ]
           },
-          "_causation_id": "dffd2365-0cf3-407b-8634-8fef6a6dc16a"
+          "_causation_id": "dffd2365-0cf3-407b-8634-8fef6a6dc16a",
+          "files": [
+            "orchestrator/src/orchestrator/steward.py",
+            "orchestrator/src/orchestrator/git_ops.py",
+            "orchestrator/tests/test_steward.py"
+          ],
+          "modules": [
+            "orchestrator/src/orchestrator",
+            "orchestrator/tests"
+          ]
         }
       }
     ],
