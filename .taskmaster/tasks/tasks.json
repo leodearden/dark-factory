@@ -8062,7 +8062,7 @@
         "description": "Root-cause fix for stale steward race condition. When /unblock resets a task to pending and deletes its worktree, the workflow's _wait_for_resolution loop doesn't notice — it only polls escalation queue status. The steward keeps running, tries to use the deleted worktree, and creates spurious escalations. Worst case: task gets re-scheduled before the stale workflow exits, causing two workflows fighting over the same task.",
         "details": "**Problem**: workflow.py:_wait_for_resolution (lines 1155-1188) only checks L0/L1 escalation status. It has no awareness of external task state changes (e.g. /unblock setting task to pending).\n\n**Fix**:\n1. Add a new exception `_TaskExternallyReset` in workflow.py\n2. In `_wait_for_resolution`'s while loop (line 1167), after each wake from `_escalation_event.wait()`, check the current task status via `self.scheduler.get_task_status(self.task_id)` (or equivalent)\n3. If task is no longer `in-progress` (e.g. pending, cancelled, deferred), raise `_TaskExternallyReset`\n4. Catch `_TaskExternallyReset` at the call site (line 294) — dismiss straggler escalations, log clearly, return a clean workflow outcome (not BLOCKED — the task was intentionally reset, not failed)\n5. The existing `finally` block (line 398-401) handles steward.stop()\n\n**Scope**: States that should trigger abort: `pending`, `cancelled`, `deferred`. NOT `blocked` (that's set by the workflow itself). NOT `done` (could be a parallel merge).\n\n**Key files**:\n- orchestrator/src/orchestrator/workflow.py — _wait_for_resolution, run(), _mark_blocked\n- orchestrator/src/orchestrator/steward.py — benefits from clean shutdown via finally block\n\n**memory_hints**: search \"steward lifecycle termination stale escalation\" in fused-memory; get_entity \"TaskSteward\"; get_entity \"TaskWorkflow\"",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
@@ -8087,7 +8087,8 @@
             "orchestrator/src/orchestrator",
             "orchestrator/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T22:08:37.406Z"
       },
       {
         "id": "405",
@@ -8127,7 +8128,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T22:08:37.358Z",
+      "lastModified": "2026-04-02T22:08:37.406Z",
       "taskCount": 384,
       "completedCount": 360,
       "tags": [
