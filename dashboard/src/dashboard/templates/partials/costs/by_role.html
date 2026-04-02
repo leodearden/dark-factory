@@ -1,5 +1,5 @@
 {# Cost by role partial — horizontal stacked bar chart (cost by model per role) #}
-<div>
+<div data-by-role-container>
   <h3 class="text-sm font-semibold text-gray-300 mb-4">Cost by Role</h3>
   {% if by_role %}
     {% for project_id, roles in by_role.items() %}
@@ -13,11 +13,14 @@
   {% else %}
     <div class="text-gray-500 text-sm py-8 text-center">No role data available for this window.</div>
   {% endif %}
-</div>
 
-<script>
+  <script>
 (function() {
+  var container = (document.currentScript && document.currentScript.closest('[data-by-role-container]')) || document.querySelector('[data-by-role-container]');
+  if (!container) return;
   var byRole = {{ by_role | tojson }};
+  var rendered = false;
+  var chartInstances = [];
 
   var palette = [
     '#60a5fa','#34d399','#fbbf24','#f87171','#a78bfa',
@@ -25,73 +28,85 @@
   ];
 
   function findProjectCanvas(projectId) {
-    var canvases = document.querySelectorAll('canvas[data-project-id]');
+    var canvases = container.querySelectorAll('canvas[data-project-id]');
     for (var i = 0; i < canvases.length; i++) {
       if (canvases[i].getAttribute('data-project-id') === projectId) return canvases[i];
     }
     return null;
   }
 
-  function getOrDestroyChart(el) {
-    if (!el) return null;
-    var existing = Chart.getChart(el);
-    if (existing) existing.destroy();
-    return el;
+  function cleanupCharts() {
+    chartInstances.forEach(function(chart) {
+      try { chart.destroy(); } catch (e) {}
+    });
+    chartInstances = [];
   }
 
   function renderCharts() {
-    var projectIds = Object.keys(byRole);
-    projectIds.forEach(function(projectId) {
-      var el = getOrDestroyChart(findProjectCanvas(projectId));
-      if (!el) return;
+    if (rendered) return;
+    if (!byRole || typeof byRole !== 'object') return;
+    try {
+      cleanupCharts();
+      var projectIds = Object.keys(byRole);
+      projectIds.forEach(function(projectId) {
+        var el = findProjectCanvas(projectId);
+        if (!el) return;
+        var existing = Chart.getChart(el);
+        if (existing) existing.destroy();
 
-      var rolesData = byRole[projectId];
-      var roleNames = Object.keys(rolesData);
+        var rolesData = byRole[projectId];
+        var roleNames = Object.keys(rolesData);
 
-      // Collect all unique models across all roles for this project
-      var allModels = [];
-      roleNames.forEach(function(role) {
-        Object.keys(rolesData[role]).forEach(function(model) {
-          if (allModels.indexOf(model) === -1) allModels.push(model);
+        // Collect all unique models across all roles for this project
+        var allModels = [];
+        roleNames.forEach(function(role) {
+          Object.keys(rolesData[role]).forEach(function(model) {
+            if (allModels.indexOf(model) === -1) allModels.push(model);
+          });
         });
-      });
 
-      // Build datasets: one per model, data = cost per role
-      var datasets = allModels.map(function(model, idx) {
-        return {
-          label: model,
-          data: roleNames.map(function(role) {
-            return rolesData[role][model] || 0;
-          }),
-          backgroundColor: palette[idx % palette.length],
-        };
-      });
+        // Build datasets: one per model, data = cost per role
+        var datasets = allModels.map(function(model, idx) {
+          return {
+            label: model,
+            data: roleNames.map(function(role) {
+              return rolesData[role][model] || 0;
+            }),
+            backgroundColor: palette[idx % palette.length],
+          };
+        });
 
-      new Chart(el, {
-        type: 'bar',
-        data: { labels: roleNames, datasets: datasets },
-        options: {
-          indexAxis: 'y',
-          responsive: true,
-          maintainAspectRatio: false,
-          plugins: {
-            legend: { labels: { color: '#9ca3af', font: { size: 11 } } },
-          },
-          scales: {
-            x: {
-              stacked: true,
-              ticks: { color: '#9ca3af', callback: function(v) { return '$' + v.toFixed(2); } },
-              grid: { color: 'rgba(75,85,99,0.3)' },
+        var chart = new Chart(el, {
+          type: 'bar',
+          data: { labels: roleNames, datasets: datasets },
+          options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: { labels: { color: '#9ca3af', font: { size: 11 } } },
             },
-            y: {
-              stacked: true,
-              ticks: { color: '#9ca3af' },
-              grid: { display: false },
+            scales: {
+              x: {
+                stacked: true,
+                ticks: { color: '#9ca3af', callback: function(v) { return '$' + v.toFixed(2); } },
+                grid: { color: 'rgba(75,85,99,0.3)' },
+              },
+              y: {
+                stacked: true,
+                ticks: { color: '#9ca3af' },
+                grid: { display: false },
+              },
             },
           },
-        },
+        });
+        chartInstances.push(chart);
       });
-    });
+      rendered = true;
+    } catch(e) {
+      rendered = false;
+      throw e;
+    }
   }
 
   document.addEventListener('htmx:afterSettle', renderCharts, { once: true });
@@ -100,3 +115,4 @@
   }
 })();
 </script>
+</div>
