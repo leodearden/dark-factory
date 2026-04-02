@@ -355,16 +355,61 @@ class TaskInterceptor:
     # ── Pure reads (direct pass-through) ───────────────────────────────
 
     async def get_tasks(
-        self, project_root: str, tag: str | None = None
+        self,
+        project_root: str,
+        tag: str | None = None,
+        status: list[str] | None = None,
     ) -> dict:
+        """Get tasks, optionally filtered by status.
+
+        Args:
+            project_root: Absolute path to project root.
+            tag: Tag context (optional).
+            status: If provided, only return tasks whose status is in this list.
+                    Subtasks are filtered recursively.
+        """
         tm = await self._ensure_taskmaster()
-        return await tm.get_tasks(project_root, tag)
+        result = await tm.get_tasks(project_root, tag)
+        if status and isinstance(result, dict):
+            tasks = result.get('tasks', [])
+            if isinstance(tasks, list):
+                result = {**result, 'tasks': _filter_tasks_by_status(tasks, status)}
+        return result
 
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict:
         tm = await self._ensure_taskmaster()
         return await tm.get_task(task_id, project_root, tag)
+
+
+def _filter_tasks_by_status(tasks: list, statuses: list[str]) -> list:
+    """Filter a task list (with subtasks) to only include tasks matching statuses.
+
+    Recursively filters subtasks as well.  A parent task is kept if it matches
+    *or* if any of its subtasks match (to preserve the tree structure).
+    """
+    status_set = set(statuses)
+    filtered: list = []
+    for t in tasks:
+        if not isinstance(t, dict):
+            continue
+        task_status = t.get('status', 'unknown')
+        subtasks = t.get('subtasks', [])
+
+        # Recursively filter subtasks
+        if isinstance(subtasks, list) and subtasks:
+            filtered_subtasks = _filter_tasks_by_status(subtasks, statuses)
+        else:
+            filtered_subtasks = []
+
+        if task_status in status_set:
+            # Include this task; attach filtered subtasks
+            filtered.append({**t, 'subtasks': filtered_subtasks})
+        elif filtered_subtasks:
+            # Parent doesn't match but has matching subtasks — keep parent for tree context
+            filtered.append({**t, 'subtasks': filtered_subtasks})
+    return filtered
 
 
 def _extract_status(task_data: dict) -> str:

@@ -868,17 +868,35 @@ def create_mcp_server(
     async def get_tasks(
         project_root: str,
         tag: str | None = None,
+        status: str | None = None,
     ) -> dict[str, Any]:
         """List all tasks in the project.
 
         Args:
             project_root: Absolute path to project root
             tag: Tag context (optional)
+            status: Comma-separated status filter (e.g. "pending,in-progress,blocked").
+                    Only tasks matching one of these statuses will be returned.
+                    Valid values: pending, done, in-progress, review, deferred, cancelled, blocked.
+                    If omitted, all tasks are returned.
         """
         if err := validate_project_root(project_root):
             return err
+        # Parse and validate status filter
+        status_list: list[str] | None = None
+        if status:
+            status_list = [s.strip() for s in status.split(',') if s.strip()]
+            invalid = [s for s in status_list if s not in _VALID_TASK_STATUSES]
+            if invalid:
+                return {
+                    'error': f'Invalid status value(s): {", ".join(invalid)}. '
+                             f'Valid: {", ".join(sorted(_VALID_TASK_STATUSES))}',
+                    'error_type': 'ValidationError',
+                }
         try:
-            return await task_interceptor.get_tasks(project_root=project_root, tag=tag)
+            return await task_interceptor.get_tasks(
+                project_root=project_root, tag=tag, status=status_list,
+            )
         except Exception as e:
             logger.error(f'get_tasks error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}

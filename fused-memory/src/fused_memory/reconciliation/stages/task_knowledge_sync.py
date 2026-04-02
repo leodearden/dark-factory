@@ -46,25 +46,30 @@ class TaskKnowledgeSync(BaseStage):
     ) -> str:
         stage1_report = prior_reports[0] if prior_reports else None
 
-        # Get task tree
-        tasks_data: dict = {}
+        # Get task tree — use status filter to avoid context-window overflow
+        active_tasks: list = []
+        done_tasks: list = []
         if self.taskmaster:
             try:
-                tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
+                active_data = await self.taskmaster.get_tasks(
+                    project_root=self.project_root,
+                    status=['pending', 'in-progress', 'review', 'blocked'],
+                )
+                active_tasks = active_data.get('tasks', [])
+                if not isinstance(active_tasks, list):
+                    active_tasks = []
             except Exception:
-                tasks_data = {}
-
-        all_tasks = tasks_data.get('tasks', [])
-        if not isinstance(all_tasks, list):
-            all_tasks = []
-
-        active_tasks = [
-            t for t in all_tasks
-            if isinstance(t, dict) and t.get('status') in ('pending', 'in-progress', 'review')
-        ]
-        done_tasks = [
-            t for t in all_tasks if isinstance(t, dict) and t.get('status') == 'done'
-        ]
+                active_tasks = []
+            try:
+                done_data = await self.taskmaster.get_tasks(
+                    project_root=self.project_root,
+                    status=['done'],
+                )
+                done_tasks = done_data.get('tasks', [])
+                if not isinstance(done_tasks, list):
+                    done_tasks = []
+            except Exception:
+                done_tasks = []
 
         remediation_note = ''
         if self.remediation_mode:
@@ -73,6 +78,9 @@ class TaskKnowledgeSync(BaseStage):
                 'This is a focused remediation run. Address remaining task-level issues '
                 'from Stage 1. Do not perform general task-knowledge sync.\n\n'
             )
+
+        # Combine for proactive sample and total count
+        all_tasks = active_tasks + done_tasks
 
         proactive_sample_section = ''
         if not self.remediation_mode:

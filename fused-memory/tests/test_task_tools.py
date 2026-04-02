@@ -313,3 +313,77 @@ async def test_set_task_status_all_trigger_statuses_pass_through(
     assert 'error' not in result, (
         f"STATUS_TRIGGERS value {status!r} should be accepted, got: {result}"
     )
+
+
+# ------------------------------------------------------------------
+# get_tasks status filter
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_passes_to_interceptor(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_tasks with status parameter passes parsed list to interceptor."""
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project', 'status': 'pending,in-progress'},
+    )
+    task_interceptor.get_tasks.assert_called_once()
+    _, kwargs = task_interceptor.get_tasks.call_args
+    assert kwargs['status'] == ['pending', 'in-progress']
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_rejects_invalid(mcp_server_with_tasks):
+    """get_tasks with invalid status value returns validation error."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project', 'status': 'bogus'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert 'bogus' in result['error']
+    assert result.get('error_type') == 'ValidationError'
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_rejects_partial_invalid(mcp_server_with_tasks):
+    """get_tasks rejects if any status value is invalid."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project', 'status': 'pending,invalid_status'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert 'invalid_status' in result['error']
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_no_status_filter_passes_none(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_tasks without status parameter passes None to interceptor."""
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project'},
+    )
+    task_interceptor.get_tasks.assert_called_once()
+    _, kwargs = task_interceptor.get_tasks.call_args
+    assert kwargs['status'] is None
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_whitespace_handling(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_tasks strips whitespace from comma-separated status values."""
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project', 'status': ' pending , blocked '},
+    )
+    _, kwargs = task_interceptor.get_tasks.call_args
+    assert kwargs['status'] == ['pending', 'blocked']

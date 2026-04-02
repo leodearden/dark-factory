@@ -607,3 +607,109 @@ async def test_drain_awaits_pending_commits(taskmaster, event_buffer):
     # drain should await them all
     await interceptor.drain()
     assert len(interceptor._background_tasks) == 0
+
+
+# ── Tests for get_tasks status filter ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_no_filter_returns_all(interceptor, taskmaster):
+    """Without status filter, get_tasks returns all tasks."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {'id': '1', 'status': 'pending', 'title': 'A'},
+        {'id': '2', 'status': 'done', 'title': 'B'},
+        {'id': '3', 'status': 'cancelled', 'title': 'C'},
+    ]})
+    result = await interceptor.get_tasks('/project')
+    assert len(result['tasks']) == 3
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_single(interceptor, taskmaster):
+    """Status filter with one value returns only matching tasks."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {'id': '1', 'status': 'pending', 'title': 'A'},
+        {'id': '2', 'status': 'done', 'title': 'B'},
+        {'id': '3', 'status': 'in-progress', 'title': 'C'},
+    ]})
+    result = await interceptor.get_tasks('/project', status=['pending'])
+    assert len(result['tasks']) == 1
+    assert result['tasks'][0]['id'] == '1'
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_multiple(interceptor, taskmaster):
+    """Status filter with multiple values returns matching tasks."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {'id': '1', 'status': 'pending', 'title': 'A'},
+        {'id': '2', 'status': 'done', 'title': 'B'},
+        {'id': '3', 'status': 'in-progress', 'title': 'C'},
+        {'id': '4', 'status': 'cancelled', 'title': 'D'},
+        {'id': '5', 'status': 'blocked', 'title': 'E'},
+    ]})
+    result = await interceptor.get_tasks(
+        '/project', status=['pending', 'in-progress', 'blocked'],
+    )
+    assert len(result['tasks']) == 3
+    ids = {t['id'] for t in result['tasks']}
+    assert ids == {'1', '3', '5'}
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_subtasks(interceptor, taskmaster):
+    """Status filter recursively filters subtasks."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'pending', 'title': 'A',
+            'subtasks': [
+                {'id': '1.1', 'status': 'done', 'title': 'A.1', 'subtasks': []},
+                {'id': '1.2', 'status': 'pending', 'title': 'A.2', 'subtasks': []},
+            ],
+        },
+        {'id': '2', 'status': 'done', 'title': 'B', 'subtasks': []},
+    ]})
+    result = await interceptor.get_tasks('/project', status=['pending'])
+    assert len(result['tasks']) == 1
+    parent = result['tasks'][0]
+    assert parent['id'] == '1'
+    # Only the pending subtask should remain
+    assert len(parent['subtasks']) == 1
+    assert parent['subtasks'][0]['id'] == '1.2'
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_keeps_parent_with_matching_subtask(
+    interceptor, taskmaster,
+):
+    """Parent with non-matching status is kept if it has matching subtasks."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'done', 'title': 'A',
+            'subtasks': [
+                {'id': '1.1', 'status': 'pending', 'title': 'A.1', 'subtasks': []},
+            ],
+        },
+    ]})
+    result = await interceptor.get_tasks('/project', status=['pending'])
+    # Parent 'done' is kept because subtask '1.1' is pending
+    assert len(result['tasks']) == 1
+    assert result['tasks'][0]['id'] == '1'
+    assert len(result['tasks'][0]['subtasks']) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_preserves_other_fields(interceptor, taskmaster):
+    """Status filter preserves non-task fields in the response dict."""
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {'id': '1', 'status': 'pending', 'title': 'A'},
+            {'id': '2', 'status': 'done', 'title': 'B'},
+        ],
+        'total': 2,
+        'projectRoot': '/project',
+    })
+    result = await interceptor.get_tasks('/project', status=['pending'])
+    assert len(result['tasks']) == 1
+    # Other fields preserved
+    assert result['total'] == 2
+    assert result['projectRoot'] == '/project'

@@ -160,10 +160,24 @@ class TaskmasterBackend:
         return args
 
     async def get_tasks(
-        self, project_root: str, tag: str | None = None
+        self,
+        project_root: str,
+        tag: str | None = None,
+        status: list[str] | None = None,
     ) -> dict:
+        """Get tasks, optionally filtered by status.
+
+        Filtering is applied locally after fetching the full task list from
+        Taskmaster, since the upstream MCP tool does not support status filters.
+        """
         args = self._base_args(project_root, tag)
-        return await self.call_tool('get_tasks', args)
+        result = await self.call_tool('get_tasks', args)
+        if status and isinstance(result, dict):
+            from fused_memory.middleware.task_interceptor import _filter_tasks_by_status
+            tasks = result.get('tasks', [])
+            if isinstance(tasks, list):
+                result = {**result, 'tasks': _filter_tasks_by_status(tasks, status)}
+        return result
 
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None

@@ -346,9 +346,11 @@ class TestTaskKnowledgeSyncPayload:
 
         await stage.assemble_payload([], watermark, [])
 
-        mock_deps['taskmaster'].get_tasks.assert_called_once_with(
-            project_root='/home/leo/src/reify'
-        )
+        # Stage 2 now makes two filtered calls (active + done) instead of one
+        calls = mock_deps['taskmaster'].get_tasks.call_args_list
+        assert len(calls) == 2
+        for call in calls:
+            assert call.kwargs['project_root'] == '/home/leo/src/reify'
 
     @pytest.mark.asyncio
     async def test_payload_uses_dynamic_project_root_in_instructions(self, mock_deps, watermark):
