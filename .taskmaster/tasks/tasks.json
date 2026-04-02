@@ -6256,7 +6256,7 @@
         "description": "Two assertions in test_costs_panel.py are logically broken or trivially passing:\n\n1. test_no_table_for_single_project (line ~743): Uses `assert 'solo_project' not in html or 'Avg/Task' not in html`. The OR means this passes trivially whenever 'Avg/Task' is absent for any reason. Should be AND semantics or assert absence of a specific table wrapper element.\n\n2. test_cost_values_present (line ~848): Asserts only `'$' in html`, which passes for any page with CSS/JS containing dollar signs. Should assert a specific dollar-formatted value from the mock data (e.g., `'$4.20' in html` or `'$3.50' in html`).\n\nBoth are quick fixes — change the OR to AND in #1, and assert specific mock values in #2.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "blocked",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6268,7 +6268,7 @@
             "dashboard/tests"
           ]
         },
-        "updatedAt": "2026-04-02T01:58:19.816Z"
+        "updatedAt": "2026-04-02T02:01:02.195Z"
       },
       {
         "id": "330",
@@ -7728,7 +7728,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:59:04.151Z",
+      "lastModified": "2026-04-02T02:01:02.198Z",
       "taskCount": 373,
       "completedCount": 325,
       "tags": [
