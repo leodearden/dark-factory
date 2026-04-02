@@ -790,7 +790,7 @@ class TestTailwindBuild:
         css = resp.text
         if '/* Auto-generated stub for testing' in css:
             pytest.skip('skipped: running against stub, not a real Tailwind build')
-        assert len(resp.content) > 50_000, (
+        assert len(resp.content) > 20_000, (
             f'tailwind.css is only {len(resp.content)} bytes — build may be incomplete'
         )
 

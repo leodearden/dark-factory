@@ -76,7 +76,7 @@ class Mem0Backend:
         if project_id not in self._instances:
             collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
             config_dict = self._build_config_dict(collection_name)
-            instance = await AsyncMemory.from_config(config_dict)
+            instance = AsyncMemory.from_config(config_dict)
             self._instances[project_id] = instance
             logger.info(f'Mem0 instance created for project {project_id} (collection: {collection_name})')
         return self._instances[project_id]
@@ -185,11 +185,11 @@ class Mem0Backend:
 
     async def count(self, scope: Scope) -> int:
         """Count memories using native async Qdrant count API."""
-        instance = await self._get_instance(scope)
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
         result = await asyncio.wait_for(
             client.count(
-                collection_name=instance.collection_name,
+                collection_name=collection_name,
                 exact=True,
             ),
             timeout=self._read_timeout,

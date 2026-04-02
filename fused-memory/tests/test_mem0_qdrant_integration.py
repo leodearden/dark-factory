@@ -10,6 +10,7 @@ Skip automatically when Qdrant is not reachable.
 from __future__ import annotations
 
 import contextlib
+from typing import cast
 
 import pytest
 from qdrant_client import QdrantClient
@@ -70,6 +71,7 @@ class TestPointStructCompat:
 
         result = qdrant.retrieve(TEST_COLLECTION, ids=[1], with_payload=True)
         assert len(result) == 1
+        assert result[0].payload is not None
         assert result[0].payload['text'] == 'hello'
 
     def test_set_payload_without_vector(self, qdrant: QdrantClient):
@@ -93,9 +95,11 @@ class TestPointStructCompat:
         )
 
         result = qdrant.retrieve(TEST_COLLECTION, ids=[1], with_payload=True, with_vectors=True)
+        assert result[0].payload is not None
         assert result[0].payload['v'] == '2'
         assert result[0].payload['agent_id'] == 'new-agent'
         # Vector unchanged
+        assert result[0].vector is not None
         assert len(result[0].vector) == VECTOR_DIM
 
 
@@ -127,9 +131,11 @@ class TestMem0VectorStoreUpdate:
         )
 
         # This is the exact call that crashed with mem0ai <1.0.10 + qdrant-client >=1.17
-        store.update(vector_id=42, vector=None, payload={'text': 'original', 'agent_id': 'new'})
+        # cast: mem0's update() signature declares vector: list but accepts None at runtime
+        store.update(vector_id=42, vector=cast(list, None), payload={'text': 'original', 'agent_id': 'new'})
 
         result = qdrant.retrieve(TEST_COLLECTION, ids=[42], with_payload=True, with_vectors=True)
+        assert result[0].payload is not None
         assert result[0].payload['agent_id'] == 'new'
         assert result[0].payload['text'] == 'original'
         # Embedding preserved (Qdrant normalizes cosine vectors, so check non-None + length)
@@ -156,11 +162,13 @@ class TestMem0VectorStoreUpdate:
         )
 
         new_vec = [0.9] * VECTOR_DIM
-        store.update(vector_id=43, vector=new_vec, payload=None)
+        # cast: mem0's update() signature declares payload: dict but accepts None at runtime
+        store.update(vector_id=43, vector=new_vec, payload=cast(dict, None))
 
         result = qdrant.retrieve(TEST_COLLECTION, ids=[43], with_payload=True, with_vectors=True)
         assert result[0].vector is not None
         assert len(result[0].vector) == VECTOR_DIM
+        assert result[0].payload is not None
         assert result[0].payload['text'] == 'keep me'
 
     def test_update_both(self, qdrant: QdrantClient):
@@ -183,4 +191,5 @@ class TestMem0VectorStoreUpdate:
         result = qdrant.retrieve(TEST_COLLECTION, ids=[44], with_payload=True, with_vectors=True)
         assert result[0].vector is not None
         assert len(result[0].vector) == VECTOR_DIM
+        assert result[0].payload is not None
         assert result[0].payload['v'] == '2'
