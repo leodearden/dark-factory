@@ -6334,7 +6334,7 @@
         "description": "Address test file hygiene issues in dashboard/tests/test_costs_data.py:\n- Move `from dashboard.data.costs import ...` from line ~280 to top of file, remove `# noqa: E402`\n- Replace all 6 occurrences of `__import__('sqlite3').connect(...)` with `sqlite3.connect(...)` (already imported at module level)\n- Remove unused `empty_costs_conn` fixture parameter from `test_single_role`\n- Fix misleading docstring in `test_last_cap_is_cap_hit_timestamp` (says MAX(created_at) is wrong but actual impl correctly uses MAX(CASE WHEN event_type='cap_hit' ...))\n- Fix tautological assertion in `test_fills_gaps` — `len(zero_days) == 7 - len(non_zero_days)` is always true; assert actual gap-fill behavior instead",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6345,7 +6345,8 @@
           "modules": [
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T02:04:42.555Z"
       },
       {
         "id": "334",
@@ -7734,7 +7735,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:04:40.257Z",
+      "lastModified": "2026-04-02T02:04:42.558Z",
       "taskCount": 373,
       "completedCount": 327,
       "tags": [
