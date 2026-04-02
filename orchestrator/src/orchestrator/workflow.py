@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from shared.config_dir import TaskConfigDir
+
 from orchestrator.agents.invoke import AgentResult, invoke_with_cap_retry
 from orchestrator.agents.roles import (
     ALL_REVIEWERS,
@@ -170,6 +172,7 @@ class TaskWorkflow:
 
         self._steward_factory = steward_factory
         self._steward: Any | None = None
+        self._config_dir: TaskConfigDir | None = None
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -198,6 +201,9 @@ class TaskWorkflow:
                 )
                 stdout, _ = await proc.communicate()
                 base_commit = stdout.decode().strip()
+            # Per-task config dir for credential isolation
+            self._config_dir = TaskConfigDir(self.task_id)
+
             # Sync per-worktree venvs so imports resolve from worktree source
             if not self._worktree_external:
                 await self._sync_worktree_venvs()
@@ -403,6 +409,9 @@ class TaskWorkflow:
             # Skip cleanup for externally-managed worktrees (eval mode)
             if self.state == WorkflowState.DONE and self.worktree and not self._worktree_external:
                 await self.git_ops.cleanup_worktree(self.worktree, branch_name)
+            # Cleanup per-task config dir
+            if self._config_dir:
+                self._config_dir.cleanup()
 
     def _resolve_module_configs(self) -> list[ModuleConfig]:
         """Collect ModuleConfigs for this task's modules.
@@ -1120,6 +1129,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         result = await invoke_with_cap_retry(
             usage_gate=self.usage_gate,
             label=f'Task {self.task_id} [{role.name}]',
+            config_dir=self._config_dir,
             prompt=prompt,
             system_prompt=role.system_prompt,
             cwd=cwd,
@@ -1519,7 +1529,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             if not pending:
                 return
-        steward = self._steward_factory(self.worktree)
+        steward = self._steward_factory(self.worktree, self._config_dir)
         self._steward = steward
         await steward.start()
 

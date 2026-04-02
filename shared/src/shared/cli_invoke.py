@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from shared.config_dir import TaskConfigDir
     from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
@@ -110,6 +111,7 @@ async def invoke_claude_agent(
     oauth_token: str | None = None,
     timeout_seconds: float | None = None,
     resume_session_id: str | None = None,
+    config_dir: Path | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
@@ -127,7 +129,7 @@ async def invoke_claude_agent(
         mcp_config=mcp_config, output_schema=output_schema,
         permission_mode=permission_mode, effort=effort,
         oauth_token=oauth_token, timeout_seconds=timeout_seconds,
-        resume_session_id=resume_session_id,
+        resume_session_id=resume_session_id, config_dir=config_dir,
     )
 
 
@@ -135,6 +137,7 @@ async def invoke_with_cap_retry(
     usage_gate: UsageGate | None,
     label: str,
     *,
+    config_dir: TaskConfigDir | None = None,
     cost_store: CostStore | None = None,
     run_id: str = '',
     task_id: str = '',
@@ -173,8 +176,15 @@ async def invoke_with_cap_retry(
             oauth_token = await usage_gate.before_invoke()
             account_name = usage_gate.active_account_name or ''
 
+        if config_dir and oauth_token:
+            config_dir.write_credentials(oauth_token)
+
         started_at = datetime.now(UTC).isoformat()
-        result = await invoke_claude_agent(**invoke_kwargs, oauth_token=oauth_token)
+        result = await invoke_claude_agent(
+            **invoke_kwargs,
+            oauth_token=oauth_token,
+            config_dir=config_dir.path if config_dir else None,
+        )
         completed_at = datetime.now(UTC).isoformat()
 
         if usage_gate and usage_gate.detect_cap_hit(
@@ -235,6 +245,7 @@ async def invoke_with_cap_retry(
             continue
 
         if usage_gate:
+            usage_gate.confirm_account_ok(oauth_token)
             usage_gate.on_agent_complete(result.cost_usd)
         break
 
@@ -279,6 +290,7 @@ async def _invoke_claude(
     oauth_token: str | None = None,
     timeout_seconds: float | None = None,
     resume_session_id: str | None = None,
+    config_dir: Path | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     cmd = ['claude', '--print', '--output-format', 'json']
@@ -320,6 +332,9 @@ async def _invoke_claude(
     # Multi-account failover: inject per-invocation OAuth token
     if oauth_token:
         env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
+    # Per-task config dir: credential file + session isolation
+    if config_dir:
+        env['CLAUDE_CONFIG_DIR'] = str(config_dir)
 
     try:
         result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds)

@@ -27,6 +27,7 @@ from shared.cli_invoke import (  # noqa: F401
 )
 
 if TYPE_CHECKING:
+    from shared.config_dir import TaskConfigDir
     from shared.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,8 @@ _MODEL_COSTS: dict[str, dict[str, float]] = {
 async def invoke_with_cap_retry(
     usage_gate: UsageGate | None,
     label: str,
+    *,
+    config_dir: TaskConfigDir | None = None,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke a multi-backend agent, retrying on usage-cap hits with account failover.
@@ -55,6 +58,9 @@ async def invoke_with_cap_retry(
     account via ``--resume`` when a ``session_id`` is available, preserving
     all agent progress.  Non-Claude backends always restart fresh (they
     don't support ``--resume``).
+
+    *config_dir*, when set, writes the current account's credentials before
+    each invocation so that ``--resume`` reads the correct credential file.
 
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
@@ -71,7 +77,14 @@ async def invoke_with_cap_retry(
             oauth_token = await usage_gate.before_invoke()
             account_name = usage_gate.active_account_name or ''
 
-        result = await invoke_agent(**invoke_kwargs, oauth_token=oauth_token)
+        if config_dir and oauth_token:
+            config_dir.write_credentials(oauth_token)
+
+        result = await invoke_agent(
+            **invoke_kwargs,
+            oauth_token=oauth_token,
+            config_dir=config_dir.path if config_dir else None,
+        )
 
         if usage_gate and usage_gate.detect_cap_hit(
             result.stderr, result.output, backend, oauth_token=oauth_token,
@@ -111,6 +124,7 @@ async def invoke_with_cap_retry(
             continue
 
         if usage_gate:
+            usage_gate.confirm_account_ok(oauth_token)
             usage_gate.on_agent_complete(result.cost_usd)
         break
 
@@ -136,6 +150,7 @@ async def invoke_agent(
     oauth_token: str | None = None,
     resume_session_id: str | None = None,
     timeout_seconds: float | None = None,
+    config_dir: Path | None = None,
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
 
@@ -155,6 +170,7 @@ async def invoke_agent(
             effort=effort, oauth_token=oauth_token,
             resume_session_id=resume_session_id,
             timeout_seconds=timeout_seconds,
+            config_dir=config_dir,
         )
     elif backend == 'codex':
         return await _invoke_codex(
@@ -195,6 +211,7 @@ async def _invoke_claude_with_sandbox(
     oauth_token: str | None = None,
     resume_session_id: str | None = None,
     timeout_seconds: float | None = None,
+    config_dir: Path | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI with optional bwrap sandboxing.
 
@@ -240,6 +257,8 @@ async def _invoke_claude_with_sandbox(
             env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
             if oauth_token:
                 env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
+            if config_dir:
+                env['CLAUDE_CONFIG_DIR'] = str(config_dir)
 
             try:
                 result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds)
@@ -258,7 +277,7 @@ async def _invoke_claude_with_sandbox(
         mcp_config=mcp_config, output_schema=output_schema,
         permission_mode=permission_mode, effort=effort,
         oauth_token=oauth_token, resume_session_id=resume_session_id,
-        timeout_seconds=timeout_seconds,
+        timeout_seconds=timeout_seconds, config_dir=config_dir,
     )
 
 

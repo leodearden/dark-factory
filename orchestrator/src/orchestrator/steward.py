@@ -29,6 +29,7 @@ from orchestrator.agents.roles import STEWARD
 if TYPE_CHECKING:
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
+    from shared.config_dir import TaskConfigDir
 
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.config import OrchestratorConfig
@@ -62,6 +63,7 @@ class TaskSteward:
         escalation_queue: EscalationQueue,
         briefing: BriefingAssembler,
         usage_gate: UsageGate | None = None,
+        config_dir: TaskConfigDir | None = None,
     ):
         self.task_id = task_id
         self.task = task
@@ -71,6 +73,7 @@ class TaskSteward:
         self.escalation_queue = escalation_queue
         self.briefing = briefing
         self.usage_gate = usage_gate
+        self._config_dir = config_dir
 
         self._session_id: str | None = None
         self._stopped = False
@@ -329,6 +332,9 @@ class TaskSteward:
                 oauth_token = await self.usage_gate.before_invoke()
                 account_name = self.usage_gate.active_account_name or ''
 
+            if self._config_dir and oauth_token:
+                self._config_dir.write_credentials(oauth_token)
+
             kwargs: dict = dict(
                 prompt=prompt,
                 system_prompt=STEWARD.system_prompt,
@@ -341,6 +347,7 @@ class TaskSteward:
                 effort=self.config.effort.steward,
                 backend=self.config.backends.steward,
                 oauth_token=oauth_token,
+                config_dir=self._config_dir.path if self._config_dir else None,
             )
 
             if self._session_id is not None:
@@ -386,6 +393,7 @@ class TaskSteward:
                 continue
 
             if self.usage_gate:
+                self.usage_gate.confirm_account_ok(oauth_token)
                 self.usage_gate.on_agent_complete(result.cost_usd)
 
             # Capture session ID for subsequent --resume calls

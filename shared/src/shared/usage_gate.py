@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from shared.config_dir import TaskConfigDir
 from shared.config_models import UsageCapConfig
 
 if TYPE_CHECKING:
@@ -75,6 +76,11 @@ class AccountState:
     pause_started_at: datetime | None = None
     resume_task: asyncio.Task | None = field(default=None, repr=False)
     probe_count: int = 0
+    # Probe lifecycle:
+    #   probing=True  → freshly uncapped by probe, first task should claim it
+    #   probe_in_flight=True → one task is testing, others must wait
+    probing: bool = False
+    probe_in_flight: bool = False
 
 
 class SessionBudgetExhausted(Exception):
@@ -108,6 +114,7 @@ class UsageGate:
         self._last_account_name: str | None = None
         self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
 
+        self._probe_config_dir = TaskConfigDir('usage-gate-probe')
         self._accounts: list[AccountState] = self._init_accounts()
 
     def _init_accounts(self) -> list[AccountState]:
@@ -172,8 +179,20 @@ class UsageGate:
 
         # Find first non-capped account (works with 1 or N)
         while True:
-            for acct in self._accounts:
-                if not acct.capped:
+            async with self._lock:
+                for acct in self._accounts:
+                    if acct.capped or acct.probe_in_flight:
+                        continue
+                    if acct.probing:
+                        # First task claims the probe slot — others block
+                        # until confirm_account_ok() or _handle_cap_detected().
+                        acct.probing = False
+                        acct.probe_in_flight = True
+                        self._open.clear()
+                        logger.info(
+                            f'Account {acct.name}: probe slot claimed — '
+                            f'single task testing',
+                        )
                     logger.debug(f'Using account {acct.name}')
                     # Failover detection: emit event if account changed.
                     # Update _last_account_name FIRST to close the race window,
@@ -264,6 +283,8 @@ class UsageGate:
             return
 
         acct.capped = True
+        acct.probing = False
+        acct.probe_in_flight = False
         acct.resets_at = resets_at
         if acct.pause_started_at is None:
             acct.pause_started_at = datetime.now(UTC)
@@ -360,8 +381,9 @@ class UsageGate:
             if not acct.capped:
                 continue
             if acct.resets_at is not None and now >= acct.resets_at:
-                logger.info(f'Account {acct.name}: reset time passed — uncapping')
+                logger.info(f'Account {acct.name}: reset time passed — uncapping (probing)')
                 acct.capped = False
+                acct.probing = True  # gate: one task confirms before opening to all
                 if acct.pause_started_at:
                     self._total_pause_secs += (now - acct.pause_started_at).total_seconds()
                 acct.pause_started_at = None
@@ -376,15 +398,14 @@ class UsageGate:
         self._cumulative_cost += cost
 
     async def _account_resume_probe_loop(self, acct: AccountState) -> None:
-        """Sleep for a probe interval, then optimistically uncap the account.
+        """Sleep for a probe interval, then test the account with a real invocation.
 
         Uses exponential backoff: ``probe_interval_secs * 2^probe_count``,
         capped at ``max_probe_interval_secs``.  The sleep duration is also
         bounded by the time remaining until ``resets_at``.
 
-        If the uncap is premature, ``invoke_with_cap_retry`` will re-detect
-        the cap on the next invocation and ``_handle_cap_detected`` will
-        start a new probe with an incremented ``probe_count``.
+        Fires a minimal Claude invocation (haiku, 1 turn) to verify the
+        account actually has capacity.  Only uncaps the account on success.
         """
         target = acct.resets_at
         if target is None:
@@ -412,24 +433,98 @@ class UsageGate:
         if not acct.capped:
             return
 
-        past_reset = datetime.now(UTC) >= target
-        if past_reset:
+        acct.probe_count += 1
+        logger.info(
+            f'Account {acct.name}: firing probe #{acct.probe_count}',
+        )
+
+        ok = await self._run_probe(acct)
+
+        if ok:
+            acct.capped = False
+            acct.probing = True  # gate: let one real task confirm first
             acct.probe_count = 0
+            if acct.pause_started_at:
+                self._total_pause_secs += (
+                    datetime.now(UTC) - acct.pause_started_at
+                ).total_seconds()
+            acct.pause_started_at = None
+            logger.info(f'Account {acct.name} RESUMED (probe confirmed)')
+            self._open.set()
+            if self._cost_store:
+                await self._write_cost_event(
+                    acct.name, 'resumed',
+                    json.dumps({'label': f'probe #{acct.probe_count} confirmed'}),
+                )
         else:
-            acct.probe_count += 1
+            logger.info(
+                f'Account {acct.name}: probe #{acct.probe_count} failed — '
+                f'scheduling next probe',
+            )
+            self._start_account_resume_probe(acct)
 
-        acct.capped = False
-        if acct.pause_started_at:
-            self._total_pause_secs += (
-                datetime.now(UTC) - acct.pause_started_at
-            ).total_seconds()
-        acct.pause_started_at = None
+    async def _run_probe(self, acct: AccountState) -> bool:
+        """Fire a minimal Claude invocation to test if *acct* has capacity.
 
-        label = 'reset time passed' if past_reset else f'optimistic probe #{acct.probe_count}'
-        logger.info(f'Account {acct.name} RESUMED ({label})')
-        self._open.set()
-        if self._cost_store:
-            await self._write_cost_event(acct.name, 'resumed', json.dumps({'label': label}))
+        Returns ``True`` if the invocation succeeded (no cap hit), ``False``
+        otherwise.  Uses haiku to minimise cost (~$0.001 per probe).
+        """
+        _PROBE_TIMEOUT = 30
+
+        self._probe_config_dir.write_credentials(acct.token)
+
+        cmd = [
+            'claude', '--print', '--output-format', 'json',
+            '--model', 'haiku',
+            '--max-turns', '1',
+            '--max-budget-usd', '0.01',
+            '--permission-mode', 'bypassPermissions',
+            '--', 'Say ok',
+        ]
+
+        env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+        env['CLAUDE_CODE_OAUTH_TOKEN'] = acct.token
+        env['CLAUDE_CONFIG_DIR'] = str(self._probe_config_dir.path)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=_PROBE_TIMEOUT,
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            logger.warning(f'Account {acct.name}: probe timed out / cancelled')
+            return False
+        except Exception as exc:
+            logger.warning(f'Account {acct.name}: probe error: {exc}')
+            return False
+
+        combined = (
+            (stderr_bytes.decode(errors='replace') if stderr_bytes else '')
+            + '\n'
+            + (stdout_bytes.decode(errors='replace') if stdout_bytes else '')
+        )
+
+        for prefixes in (CAP_HIT_PREFIXES, NEAR_CAP_PREFIXES):
+            for prefix in prefixes:
+                if prefix.lower() in combined.lower():
+                    logger.info(
+                        f'Account {acct.name}: probe got cap message: {prefix}',
+                    )
+                    return False
+
+        if proc.returncode != 0:
+            logger.warning(
+                f'Account {acct.name}: probe exited {proc.returncode}',
+            )
+            return False
+
+        logger.info(f'Account {acct.name}: probe succeeded')
+        return True
 
     async def shutdown(self) -> None:
         """Cancel all resume probe tasks and drain in-flight background cost-event tasks."""
@@ -444,6 +539,8 @@ class UsageGate:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+
+        self._probe_config_dir.cleanup()
 
     @property
     def is_paused(self) -> bool:
@@ -479,6 +576,19 @@ class UsageGate:
             if not acct.capped:
                 return acct.name
         return None
+
+    def confirm_account_ok(self, oauth_token: str | None) -> None:
+        """Clear the probing gate after a successful invocation.
+
+        Called by ``invoke_with_cap_retry`` when an invocation succeeds
+        (no cap detected). Allows other tasks to use this account.
+        """
+        acct = self._find_account_by_token(oauth_token) if oauth_token else None
+        if acct and acct.probe_in_flight:
+            acct.probe_in_flight = False
+            acct.probe_count = 0
+            logger.info(f'Account {acct.name}: probe confirmed OK — opening to all tasks')
+            self._open.set()
 
     @property
     def project_id(self) -> str | None:

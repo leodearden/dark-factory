@@ -662,7 +662,7 @@ Output JSON matching the schema. Every task must appear in the output.
             if HAS_STEWARD and self._escalation_queue:
                 esc_q = self._escalation_queue  # capture for closure (narrows type)
 
-                def _make_steward(worktree: Path, *, _assign=assignment) -> TaskSteward:  # type: ignore[name-defined]
+                def _make_steward(worktree: Path, config_dir=None, *, _assign=assignment) -> TaskSteward:  # type: ignore[name-defined]
                     return TaskSteward(
                         task_id=_assign.task_id,
                         task=_assign.task,
@@ -672,6 +672,7 @@ Output JSON matching the schema. Every task must appear in the output.
                         escalation_queue=esc_q,
                         briefing=self.briefing,
                         usage_gate=self.usage_gate,
+                        config_dir=config_dir,
                     )
                 steward_factory = _make_steward
 
