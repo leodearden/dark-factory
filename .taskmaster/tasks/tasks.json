@@ -7686,15 +7686,16 @@
         "description": "In test_by_role_chart_lifecycle.py add a new test class TestByRoleEmptyState that patches get_by_role to return {} (and separately None/exception). Assertions: (1) 'No role data available for this window.' appears in rendered HTML; (2) 'var byRole = {}' renders without JS error markers; (3) no `data-project-id` canvas elements appear; (4) no `new Chart(` call appears. This covers the silent exception-swallowing path in app.py and the template's else branch.\n\nMemory hints: search \"by_role empty state template branch\", search \"test conventions\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-02T01:46:48.820Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:46:48.746Z",
+      "lastModified": "2026-04-02T01:46:48.820Z",
       "taskCount": 372,
       "completedCount": 319,
       "tags": [
