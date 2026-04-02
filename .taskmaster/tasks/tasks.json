@@ -6481,7 +6481,7 @@
         "description": "DRY issues in dashboard/src/dashboard/app.py:\n1. Fix _parse_window type annotation: `request: Any` → `request: Request` (import already present)\n2. Add `_parse_window_str(request) -> str` helper for the /costs page route (currently inlines its own validation)\n3. Extract `_get_costs_db(request) -> (db, days)` helper — all 7 cost partial handlers repeat the same 4-line DB setup\n4. Align error fallback defaults with data function return types (some use {} others [])\n\nFiles: dashboard/src/dashboard/app.py",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6493,7 +6493,7 @@
             "dashboard/src/dashboard"
           ]
         },
-        "updatedAt": "2026-04-02T01:59:04.151Z"
+        "updatedAt": "2026-04-02T02:04:40.116Z"
       },
       {
         "id": "341",
@@ -7734,9 +7734,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:02:41.928Z",
+      "lastModified": "2026-04-02T02:04:40.257Z",
       "taskCount": 373,
-      "completedCount": 326,
+      "completedCount": 327,
       "tags": [
         "master"
       ]
