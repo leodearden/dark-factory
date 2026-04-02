@@ -198,12 +198,11 @@ class TestFireCostEventRuntimeErrorHandling:
             gate._fire_cost_event('acct-A', 'cap_hit', '{}')
 
         assert any(
-            'no running event loop' in record.message.lower()
-            or 'cap_hit' in record.message
-            or 'acct-A' in record.message
+            'no running event loop for cost event' in record.message.lower()
             for record in caplog.records
         ), (
-            f'Expected a warning log for missing event loop, got: {[r.message for r in caplog.records]}'
+            f'Expected a warning log containing "no running event loop for cost event", '
+            f'got: {[r.message for r in caplog.records]}'
         )
 
     async def test_create_task_error_is_non_fatal(self, caplog):
