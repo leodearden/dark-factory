@@ -6662,7 +6662,7 @@
         "description": "Both test_costs_page.py and test_costs_panel.py define identical `_MOCK_SUMMARY` dicts that must be kept in sync manually. Extract into a shared location (tests/conftest.py fixture or tests/fixtures.py constant) and import in both files. This prevents future field additions from requiring parallel edits.\n\nMemory hints: search(\"dashboard cost test fixtures mock summary\", project_id=\"dark_factory\")",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6675,7 +6675,8 @@
           "modules": [
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T02:08:55.666Z"
       },
       {
         "id": "349",
@@ -7750,7 +7751,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:08:54.255Z",
+      "lastModified": "2026-04-02T02:08:55.666Z",
       "taskCount": 374,
       "completedCount": 332,
       "tags": [
