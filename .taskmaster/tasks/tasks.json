@@ -7157,7 +7157,7 @@
         "description": "The LIMIT parameter in get_run_cost_breakdown applies to raw invocation rows, not complete runs. When the limit fires mid-run, run['total_cost'] and task['cost'] are silently understated — the caller receives plausible-looking but incorrect data with no truncation signal.\n\nFix: Apply LIMIT at the run level. Use a CTE to select the top-N distinct run_ids (e.g. ordered by MAX(completed_at) DESC), then JOIN against invocations so every fetched row belongs to a complete run. Rename the parameter from `limit` to `max_runs` (default 100) to clarify the unit.\n\nUpdate existing tests in TestRunCostBreakdownLimit to test run-level limiting.\n\nmemory_hints:\n- search: \"get_run_cost_breakdown limit truncation costs.py\"\n- entity: costs.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -7170,7 +7170,8 @@
             "dashboard/src/dashboard/data",
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T01:29:57.396Z"
       },
       {
         "id": "374",
@@ -7603,7 +7604,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:29:57.172Z",
+      "lastModified": "2026-04-02T01:29:57.396Z",
       "taskCount": 365,
       "completedCount": 307,
       "tags": [
