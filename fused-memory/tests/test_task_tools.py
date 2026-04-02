@@ -387,3 +387,63 @@ async def test_get_tasks_status_filter_whitespace_handling(
     )
     _, kwargs = task_interceptor.get_tasks.call_args
     assert kwargs['status'] == ['pending', 'blocked']
+
+
+# ------------------------------------------------------------------
+# get_tasks compact parameter (step-5)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_compact_true_passes_to_interceptor(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_tasks with compact=true passes compact=True to interceptor."""
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project', 'compact': True},
+    )
+    task_interceptor.get_tasks.assert_called_once()
+    _, kwargs = task_interceptor.get_tasks.call_args
+    assert kwargs['compact'] is True
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_compact_not_provided_defaults_false(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_tasks without compact parameter passes compact=False to interceptor."""
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project'},
+    )
+    task_interceptor.get_tasks.assert_called_once()
+    _, kwargs = task_interceptor.get_tasks.call_args
+    assert kwargs.get('compact', False) is False
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_compact_with_status_filter(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_tasks with both compact=true and status filter passes both to interceptor."""
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project', 'status': 'pending,blocked', 'compact': True},
+    )
+    task_interceptor.get_tasks.assert_called_once()
+    _, kwargs = task_interceptor.get_tasks.call_args
+    assert kwargs['status'] == ['pending', 'blocked']
+    assert kwargs['compact'] is True
+
+
+def test_get_tasks_tool_docstring_mentions_compact(mcp_server_with_tasks):
+    """compact parameter should be documented in the get_tasks tool."""
+    tools = mcp_server_with_tasks._tool_manager.list_tools()
+    get_tasks_tool = next(t for t in tools if t.name == 'get_tasks')
+    # The description/docstring should mention compact mode
+    description = get_tasks_tool.description or ''
+    assert 'compact' in description.lower()
