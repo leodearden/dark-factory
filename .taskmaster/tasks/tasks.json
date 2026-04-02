@@ -6233,7 +6233,7 @@
         "description": "Seven mock data constants (_MOCK_SUMMARY, _MOCK_BY_PROJECT, _MOCK_BY_ACCOUNT, _MOCK_BY_ROLE, _MOCK_TREND, _MOCK_EVENTS, _MOCK_RUNS) are duplicated verbatim between test_costs_panel.py and test_costs_page.py (~130 lines each). Any schema change to the costs data layer requires lockstep edits in both files.\n\nExtract the shared constants into a dedicated module (e.g., dashboard/tests/costs_fixtures.py or as fixtures in conftest.py) and import from both test files. Also consider moving the _UNSET sentinel and _patch_cost_data() helper to the shared location if both files use the same pattern.\n\nmemory_hints: search \"dashboard test shared fixtures\" for prior deferred work on this topic.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6248,7 +6248,7 @@
             "dashboard/tests"
           ]
         },
-        "updatedAt": "2026-04-02T01:48:30.579Z"
+        "updatedAt": "2026-04-02T01:52:54.377Z"
       },
       {
         "id": "329",
@@ -7725,9 +7725,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:52:45.862Z",
+      "lastModified": "2026-04-02T01:52:54.377Z",
       "taskCount": 373,
-      "completedCount": 322,
+      "completedCount": 323,
       "tags": [
         "master"
       ]
