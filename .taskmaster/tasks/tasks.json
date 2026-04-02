@@ -8000,7 +8000,21 @@
         "status": "pending",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "memory_hints": {
+            "entities": [
+              "TaskWorkflow",
+              "TaskSteward"
+            ],
+            "queries": [
+              "steward lifecycle termination stale escalation",
+              "worktree deletion race condition unblock",
+              "_wait_for_resolution polling loop orchestrator"
+            ]
+          },
+          "_causation_id": "dffd2365-0cf3-407b-8634-8fef6a6dc16a"
+        }
       },
       {
         "id": 405,
@@ -8013,7 +8027,20 @@
           "404"
         ],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "memory_hints": {
+            "entities": [
+              "TaskSteward"
+            ],
+            "queries": [
+              "steward worktree cleanup",
+              "worktree-existence guard steward _run_loop",
+              "steward lifecycle termination stale escalation"
+            ]
+          },
+          "_causation_id": "dffd2365-0cf3-407b-8634-8fef6a6dc16a"
+        }
       }
     ],
     "metadata": {
