@@ -6843,7 +6843,7 @@
         "description": "The literal `7` (number of HTMX polling sections on the costs page) is hardcoded in two independent test assertions across different test classes:\n- `TestCostsPage.test_sections_use_morph_swap`: `html.count('morph:innerHTML') == 7`\n- `TestAlpineV3StorePattern.test_hx_vals_count`: `new_pattern_count == 7`\n\nBoth assert the same structural invariant (7 polling sections) from different angles. If sections are added or removed, both fail with cryptic count mismatches and must be found independently.\n\nFix: Define `_POLLING_SECTION_COUNT = 7` as a module-level constant near the top of test_costs_page.py, with a comment listing the 7 sections. Reference it in both assertions and their docstrings.\n\nmemory_hints:\n- search: \"costs page HTMX polling sections count\"\n- search: \"test_costs_page magic number constant\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6855,7 +6855,7 @@
             "dashboard/tests"
           ]
         },
-        "updatedAt": "2026-04-02T02:23:02.341Z"
+        "updatedAt": "2026-04-02T02:26:22.551Z"
       },
       {
         "id": "358",
@@ -7766,9 +7766,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:23:18.187Z",
+      "lastModified": "2026-04-02T02:26:22.551Z",
       "taskCount": 374,
-      "completedCount": 337,
+      "completedCount": 338,
       "tags": [
         "master"
       ]
