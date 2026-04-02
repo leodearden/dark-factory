@@ -7730,11 +7730,11 @@
         "description": "Multiple improvements to test_by_role_chart_lifecycle.py: (1) Rename Step-1/Step-3/… test classes to descriptive names so there are no implied gaps; (2) Add a class-scoped or module-scoped pytest fixture that fetches and caches the HTML string once per class to eliminate ~20 redundant ASGI round-trips; (3) Move the `_patch_by_role()` helper to conftest.py and share it with test_costs_panel.py / test_costs_page.py; (4) Replace string-presence checks for implementation details (variable names, function names) with behavioral assertions where possible.\n\nMemory hints: search \"test conventions top-level imports\", search \"by_role test structure\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-04-02T04:10:26.217Z"
+        "updatedAt": "2026-04-02T04:21:45.248Z"
       },
       {
         "id": "392",
@@ -7838,9 +7838,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T04:17:36.316Z",
+      "lastModified": "2026-04-02T04:21:45.248Z",
       "taskCount": 375,
-      "completedCount": 353,
+      "completedCount": 354,
       "tags": [
         "master"
       ]
