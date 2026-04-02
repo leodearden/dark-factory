@@ -7977,7 +7977,22 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "memory_hints": {
+            "entities": [
+              "Mem0",
+              "Qdrant",
+              "DurableWriteQueue"
+            ],
+            "queries": [
+              "Mem0 search regression broken zero results",
+              "Task 98 Mem0 search fix agent_id run_id filter",
+              "Mem0 search empty project_id returns empty results"
+            ]
+          },
+          "_causation_id": "dffd2365-0cf3-407b-8634-8fef6a6dc16a"
+        }
       },
       {
         "id": 403,
