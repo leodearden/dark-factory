@@ -6618,7 +6618,7 @@
         "description": "Align the orchestrator's invoke_with_cap_retry implementation and tests with the canonical shared/cli_invoke.py patterns:\n\n1. **Move `account_name = ''` inside the `while True:` loop** (invoke.py:59→61) to match shared/cli_invoke.py:152 loop-scoped initialization. Current placement before the loop is a maintenance hazard: a future `continue` path that skips the `if usage_gate:` block would stamp a stale account_name.\n\n2. **Align `_make_result()` helper** (test_invoke.py:12-19) to use the `**overrides` dict-update pattern matching shared/tests/test_cli_invoke.py:33-36 for flexible field overriding.\n\n3. **Add missing assertions to failover test** (test_invoke.py:65-93):\n   - Assert `mock_asyncio.sleep.assert_called_once_with(_CAP_HIT_COOLDOWN_SECS)` to verify cooldown was exercised\n   - Assert `mock_invoke.await_count == 2` to verify retry loop executed\n\nMemory hints: search for \"account_name AgentResult\" and \"_make_result overrides helper pattern\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6631,7 +6631,8 @@
             "orchestrator/src/orchestrator/agents",
             "orchestrator/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T02:06:20.444Z"
       },
       {
         "id": "347",
@@ -7747,7 +7748,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:06:17.678Z",
+      "lastModified": "2026-04-02T02:06:20.445Z",
       "taskCount": 374,
       "completedCount": 328,
       "tags": [
