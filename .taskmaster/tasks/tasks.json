@@ -6513,7 +6513,7 @@
         "description": "Three related DRY issues in dashboard templates:\n1. Move getOrDestroyChart() and 10-color palette into base.html or a shared include — currently copy-pasted in 6 templates (by_account, by_project, by_role, trend, memory_graphs, performance)\n2. Extract shared `initChart(renderFn)` utility for the two-line htmx:afterSettle + readyState guard pattern duplicated in 4 chart partials\n3. Remove redundant double-render: each chart registers htmx:afterSettle AND calls renderChart immediately — one path should go\n4. Extract Jinja2 macro for the repeated HTMX cost section markup in costs.html (7 sections with identical structure, only name/URL/skeleton vary)\n\nFiles: dashboard/src/dashboard/templates/partials/costs/*.html, dashboard/src/dashboard/templates/costs.html, dashboard/src/dashboard/templates/base.html",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6533,7 +6533,7 @@
             "dashboard/src/dashboard/templates"
           ]
         },
-        "updatedAt": "2026-04-02T04:40:15.614Z"
+        "updatedAt": "2026-04-02T04:45:23.585Z"
       },
       {
         "id": "342",
@@ -7840,9 +7840,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T04:40:15.614Z",
+      "lastModified": "2026-04-02T04:45:23.585Z",
       "taskCount": 375,
-      "completedCount": 355,
+      "completedCount": 356,
       "tags": [
         "master"
       ]
