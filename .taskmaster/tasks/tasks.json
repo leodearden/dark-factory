@@ -6863,7 +6863,7 @@
         "description": "In test_costs_page.py, `test_default_window_7d_marked_active` asserts the exact JS string:\n```python\nassert \"Alpine.store('costs', { window: \\\"7d\\\" })\" in html\n```\n\nThis is sensitive to: (1) whitespace around braces, (2) quote style, (3) any new property added to the store initializer. A trivially equivalent template change breaks the test with no real behavioral regression.\n\nFix: Split into two independent semantic checks:\n- `assert \"Alpine.store('costs'\" in html` (store registration exists)\n- `assert 'window' in html and '\"7d\"' in html` or use a regex like `re.search(r\"Alpine\\.store\\(['\\\"]costs['\\\"].*window.*7d\", html)` that is tolerant of whitespace/quote variation.\n\nmemory_hints:\n- search: \"Alpine.store costs assertion style test_costs_page\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6875,7 +6875,7 @@
             "dashboard/tests"
           ]
         },
-        "updatedAt": "2026-04-02T02:28:05.919Z"
+        "updatedAt": "2026-04-02T02:31:14.530Z"
       },
       {
         "id": "359",
@@ -7768,9 +7768,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:28:05.919Z",
+      "lastModified": "2026-04-02T02:31:14.530Z",
       "taskCount": 374,
-      "completedCount": 339,
+      "completedCount": 340,
       "tags": [
         "master"
       ]
