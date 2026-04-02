@@ -179,7 +179,7 @@ class TestFireCostEventTaskStorage:
 
 @pytest.mark.asyncio
 class TestFireCostEventRuntimeErrorHandling:
-    """Only 'no running event loop' RuntimeError is caught; create_task errors are handled non-fatally."""
+    """Only 'no running event loop' RuntimeError is caught; create_task errors are caught and logged (non-fatal)."""
 
     async def test_no_running_loop_logs_warning(self, caplog):
         """RuntimeError from get_running_loop() is caught and a warning is logged.
