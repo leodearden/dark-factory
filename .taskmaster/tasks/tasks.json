@@ -7779,7 +7779,20 @@
           383
         ],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "memory_hints": {
+            "entities": [
+              "TaskInterceptor",
+              "reconciliation"
+            ],
+            "queries": [
+              "get_tasks context window overflow 613K reconciliation blind",
+              "false-empty task tree Stage 1 recurring bug task 383",
+              "fix approaches summary stats endpoint filter paginate harness"
+            ]
+          }
+        }
       }
     ],
     "metadata": {
