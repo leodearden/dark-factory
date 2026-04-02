@@ -7436,7 +7436,7 @@
           "get_tasks_chars_run_e11c70c0": null,
           "stage2_received_zero_tasks_run_e11c70c0": null,
           "priority_escalation": "critical",
-          "escalation_reason": "11+ consecutive blind reconciliation cycles — both Stage 1 and Stage 2 completely blind to task tree",
+          "escalation_reason": "12 consecutive blind reconciliation cycles — both Stage 1 and Stage 2 completely blind to task tree",
           "escalation_by": "recon-stage-task_knowledge_sync",
           "escalation_date": "2026-04-01",
           "continued_manifestation_run_16e3dd18": null,
