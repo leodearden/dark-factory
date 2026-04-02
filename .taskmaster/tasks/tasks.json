@@ -7853,7 +7853,7 @@
         "description": "Refactor test_usage_gate.py to use the _fire_with_failing_create_task helper consistently and remove dead test infrastructure.",
         "details": "File: shared/tests/test_usage_gate.py\n\n1. Use _fire_with_failing_create_task(gate, 'event loop is closed', close_coro=False) in TestFireCostEventCoroutineLeak.test_coroutine_closed_on_create_task_failure instead of duplicating the boilerplate (lines 300-331).\n2. Remove unused caplog.at_level() setup from test_create_task_error_is_non_fatal (line 261) — the warning-logging contract is already covered by test_create_task_error_logs_warning.\n3. Add docstring note to _fire_with_failing_create_task that close_coro=False should only be used in tests that explicitly assert coro.cr_frame is None, to avoid ResourceWarning leaking into unrelated test output.\n\nSource: review suggestions from task 356 (escalation esc-356-10).",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -7866,7 +7866,8 @@
             "shared/tests",
             "orchestrator/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T12:47:47.028Z"
       },
       {
         "id": "398",
@@ -7967,7 +7968,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T12:47:46.822Z",
+      "lastModified": "2026-04-02T12:47:47.028Z",
       "taskCount": 380,
       "completedCount": 358,
       "tags": [
