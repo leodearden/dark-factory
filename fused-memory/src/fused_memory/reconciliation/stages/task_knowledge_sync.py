@@ -4,6 +4,9 @@ Stage 3: Cross-System Integrity Check — read-only verification."""
 from __future__ import annotations
 
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -58,7 +61,10 @@ class TaskKnowledgeSync(BaseStage):
                 active_tasks = active_data.get('tasks', [])
                 if not isinstance(active_tasks, list):
                     active_tasks = []
-            except Exception:
+            except Exception as e:
+                logger.warning(
+                    'Stage 2: failed to fetch active tasks from taskmaster: %s', e
+                )
                 active_tasks = []
             try:
                 done_data = await self.taskmaster.get_tasks(
@@ -68,7 +74,10 @@ class TaskKnowledgeSync(BaseStage):
                 done_tasks = done_data.get('tasks', [])
                 if not isinstance(done_tasks, list):
                     done_tasks = []
-            except Exception:
+            except Exception as e:
+                logger.warning(
+                    'Stage 2: failed to fetch done tasks from taskmaster: %s', e
+                )
                 done_tasks = []
 
         remediation_note = ''
