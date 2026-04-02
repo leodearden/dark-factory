@@ -7715,7 +7715,20 @@
             "dashboard/tests/test_by_account_chart_lifecycle.py",
             "dashboard/tests/test_by_project_chart_lifecycle.py",
             "dashboard/tests/test_trend_chart_lifecycle.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "by_role.html",
+              "CostStore",
+              "costs_page"
+            ],
+            "queries": [
+              "chart lifecycle pattern by_role DOM scoping data-container",
+              "cost partials querySelector container fallback task 387",
+              "fragile DOM scoping cost partials dashboard"
+            ]
+          },
+          "_causation_id": "2dcd0661-165d-40f7-9935-a3b1817a00a5"
         }
       },
       {
