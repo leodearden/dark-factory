@@ -859,3 +859,75 @@ def test_compact_tasks_skips_non_dict_elements():
     assert 'description' not in results[0]
     assert results[1] == "not a dict"
     assert results[2] is None
+
+
+# ── Tests for get_tasks(compact=True) (step-3) ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_compact_false_returns_full_dicts(interceptor, taskmaster):
+    """compact=False (default) returns full task dicts unchanged."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'pending', 'title': 'Task A',
+            'description': 'Full description', 'details': 'Full details',
+        },
+    ]})
+    result = await interceptor.get_tasks('/project', compact=False)
+    assert result['tasks'][0]['description'] == 'Full description'
+    assert result['tasks'][0]['details'] == 'Full details'
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_compact_default_is_false(interceptor, taskmaster):
+    """compact defaults to False — full task dicts returned when not specified."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'pending', 'title': 'Task A',
+            'description': 'Full description',
+        },
+    ]})
+    result = await interceptor.get_tasks('/project')
+    assert result['tasks'][0]['description'] == 'Full description'
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_compact_true_strips_verbose_fields(interceptor, taskmaster):
+    """compact=True strips description and details from returned task dicts."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'pending', 'title': 'Task A',
+            'description': 'A long description',
+            'details': 'Verbose implementation details',
+            'dependencies': [],
+        },
+    ]})
+    result = await interceptor.get_tasks('/project', compact=True)
+    task = result['tasks'][0]
+    assert 'description' not in task
+    assert 'details' not in task
+    assert task['id'] == '1'
+    assert task['title'] == 'Task A'
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_compact_true_with_status_filter(interceptor, taskmaster):
+    """compact=True combined with status filter: filter applied before compaction."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'pending', 'title': 'Task A',
+            'description': 'Desc A', 'details': 'Details A',
+        },
+        {
+            'id': '2', 'status': 'done', 'title': 'Task B',
+            'description': 'Desc B', 'details': 'Details B',
+        },
+    ]})
+    result = await interceptor.get_tasks('/project', status=['pending'], compact=True)
+    # Only pending task returned
+    assert len(result['tasks']) == 1
+    task = result['tasks'][0]
+    assert task['id'] == '1'
+    # And description/details stripped
+    assert 'description' not in task
+    assert 'details' not in task
