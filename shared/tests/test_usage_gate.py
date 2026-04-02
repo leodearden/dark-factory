@@ -509,3 +509,49 @@ class TestBeforeInvokeGuardConsistency:
         call_args = mock_fire.call_args
         assert call_args[0][0] == 'acct-B'   # account_name
         assert call_args[0][1] == 'failover'  # event_type
+
+
+# ---------------------------------------------------------------------------
+# before_invoke() else-branch: first call and same-account repeated calls.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBeforeInvokeAccountTracking:
+    """before_invoke() else-branch: sets _last_account_name without firing a failover event."""
+
+    async def test_first_call_sets_last_account_name(self):
+        """First call to before_invoke() sets _last_account_name; no failover event fires.
+
+        Covers the else branch where _last_account_name is None:
+        _last_account_name must be set to the selected account's name and
+        _fire_cost_event must not be called (there is no previous account to
+        transition from).
+        """
+        gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
+
+        assert gate._last_account_name is None
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            token = await gate.before_invoke()
+
+        assert token == 'fake-token-acct-A'
+        assert gate._last_account_name == 'acct-A'
+        mock_fire.assert_not_called()
+
+    async def test_repeated_same_account_no_failover_event(self):
+        """Repeated before_invoke() with the same account does not fire a failover event.
+
+        Covers the else branch where _last_account_name == acct.name:
+        when the same (uncapped) account is returned on successive calls,
+        _fire_cost_event must not be called and _last_account_name remains
+        unchanged.
+        """
+        gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            await gate.before_invoke()  # first call: sets _last_account_name = 'acct-A'
+            await gate.before_invoke()  # second call: same account → else branch
+
+        assert gate._last_account_name == 'acct-A'
+        mock_fire.assert_not_called()
