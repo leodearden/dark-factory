@@ -12,7 +12,7 @@ description = "Fused Memory MCP Server — unified Graphiti + Mem0 memory system
 requires-python = ">=3.11,<4"
 dependencies = [
     "graphiti-core[falkordb]>=0.28.1",
-    "mem0ai>=1.0.5",
+    "mem0ai>=1.0.10",
     "mcp>=1.9.4",
     "pydantic>=2.7",
     "pydantic-settings>=2.0",
