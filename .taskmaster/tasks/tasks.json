@@ -7361,7 +7361,20 @@
               "cap failover multi-account AllAccountsCappedException"
             ]
           },
-          "_causation_id": "ded577de-14d4-4903-a599-d93cb76764ab"
+          "_causation_id": "ded577de-14d4-4903-a599-d93cb76764ab",
+          "files": [
+            "shared/src/shared/cli_invoke.py",
+            "shared/src/shared/usage_gate.py",
+            "orchestrator/src/orchestrator/agents/invoke.py",
+            "shared/tests/test_cli_invoke.py",
+            "orchestrator/tests/test_usage_gate.py"
+          ],
+          "modules": [
+            "shared/src/shared",
+            "orchestrator/src/orchestrator/agents",
+            "shared/tests",
+            "orchestrator/tests"
+          ]
         }
       },
       {
@@ -7468,7 +7481,18 @@
           "stage2_received_zero_tasks_run_9548741b": true,
           "off_by_one_fix_note": "Stage 1 flagged count as 11 when it should be 12. Fixed: count now reflects actual cycle count including current run. Root cause: prior cycles incremented BEFORE writing, so the written value was always 1 behind actual.",
           "stage2_received_zero_tasks_run_81ed620d": true,
-          "stage2_received_zero_tasks_run_ded577de": true
+          "stage2_received_zero_tasks_run_ded577de": true,
+          "files": [
+            "fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py",
+            "fused-memory/src/fused_memory/reconciliation/harness.py",
+            "fused-memory/tests/test_stages.py",
+            "fused-memory/tests/test_harness.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation/stages",
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests"
+          ]
         }
       },
       {
