@@ -6684,7 +6684,7 @@
         "description": "Two gaps in test coverage for the weighted average computation in the cost summary partial:\n\n1. **Non-zero spend with zero tasks:** Test with `total_spend > 0` and `task_count = 0` (data inconsistency where cost records exist but task attribution is missing). The template guard `{% if task_count_sum.value > 0 %}` should prevent division by zero — verify it renders `$0.0000` and returns 200.\n\n2. **Missing task_count key fallback:** Test with a mock summary dict that omits `task_count` from one project entry. The template uses `(data.task_count | default(0))` — verify the fallback works correctly and the displayed average only reflects projects with known task counts.\n\nMemory hints: search(\"task 339 weighted average cost summary fix\", project_id=\"dark_factory\")",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6695,7 +6695,8 @@
           "modules": [
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T02:15:39.040Z"
       },
       {
         "id": "350",
@@ -7752,7 +7753,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:15:38.219Z",
+      "lastModified": "2026-04-02T02:15:39.041Z",
       "taskCount": 374,
       "completedCount": 334,
       "tags": [
