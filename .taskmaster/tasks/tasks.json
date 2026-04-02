@@ -7890,7 +7890,7 @@
         "description": "Fix incomplete assertions in test_usage_gate.py that don't fully verify what their docstrings claim.",
         "details": "File: shared/tests/test_usage_gate.py\n\n1. In test_create_task_error_logs_warning (lines 268-287): add assertion that 'event loop is closed' appears in record.message, to verify the original exception text is included per the docstring's stated format 'Failed to schedule cost event %s/%s: %s'.\n2. In the test that calls asyncio.gather(*list(gate._background_tasks)) (line 204-208): add return_exceptions=True so unexpected task exceptions don't mask the real assertion failure.\n\nSource: review suggestions from task 356 (escalation esc-356-10).",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -7904,7 +7904,7 @@
             "orchestrator/tests"
           ]
         },
-        "updatedAt": "2026-04-02T12:53:04.725Z"
+        "updatedAt": "2026-04-02T22:08:37.152Z"
       },
       {
         "id": "399",
@@ -8040,11 +8040,11 @@
         "description": "Add metrics collection to the MergeWorker in orchestrator/src/orchestrator/merge_queue.py to track queue depth and merge cycle time. This data is needed to evaluate whether speculative merging (task 293) is justified.",
         "details": "Implementation:\n1. Add timestamps to MergeRequest: enqueue_time, processing_start_time, completion_time\n2. Sample queue depth at enqueue time (queue.qsize() + len(_urgent))\n3. Compute and log cycle time (enqueue → completion) and processing time (start → completion)\n4. Persist metrics — either to the existing dashboard runs.db (new merge_metrics table) or a dedicated SQLite at data/orchestrator/merge_metrics.db\n5. Expose a summary method on MergeWorker for dashboard consumption (avg cycle time, p95, max queue depth over window)\n\nColumns to track per merge:\n- task_id, enqueue_time, start_time, end_time\n- queue_depth_at_enqueue, urgent_count_at_enqueue\n- outcome (success | conflict | cas_failure | verification_failure)\n- cas_retries\n\nmemory_hints:\n  entities: [MergeQueue, MergeWorker, MergeRequest, MERGER]\n  queries: [\"merge queue implementation details\", \"dashboard data persistence patterns\"]",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-02T12:58:44.642Z",
+        "updatedAt": "2026-04-02T22:08:37.191Z",
         "metadata": {
           "files": [
             "orchestrator/src/orchestrator/merge_queue.py",
@@ -8127,7 +8127,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T22:08:37.116Z",
+      "lastModified": "2026-04-02T22:08:37.191Z",
       "taskCount": 384,
       "completedCount": 360,
       "tags": [
