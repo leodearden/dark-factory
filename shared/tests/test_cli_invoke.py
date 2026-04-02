@@ -9,8 +9,8 @@ import pytest
 
 from shared.cli_invoke import (
     _CAP_HIT_COOLDOWN_SECS,
-    CAP_HIT_RESUME_PROMPT,
     _MAX_CAP_COOLDOWN_SECS,
+    CAP_HIT_RESUME_PROMPT,
     AgentResult,
     _to_token_count,
     invoke_with_cap_retry,

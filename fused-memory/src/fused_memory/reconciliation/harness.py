@@ -732,7 +732,13 @@ class BacklogIterator:
         return count > threshold
 
     async def run(self, project_id: str) -> None:
-        """Process backlog in chunks, oldest-first, then consolidate."""
+        """Process backlog in chunks, oldest-first, then consolidate.
+
+        Only drains events buffered before this method was called.  Events
+        that arrive *during* processing are left for the next trigger cycle,
+        preventing the loop from running indefinitely when events arrive
+        faster than chunks are processed.
+        """
         chunk_size = self.config.buffer_size_threshold
         opus_tier = TierConfig(
             model=self.config.opus_model,
@@ -740,9 +746,14 @@ class BacklogIterator:
             memory_limit=self.config.opus_memory_limit,
         )
 
+        # Snapshot: only process events that existed when we started.
+        cutoff = datetime.now(UTC)
+
         chunk_num = 0
         while True:
-            chunk = await self.buffer.drain_oldest_chunk(project_id, chunk_size)
+            chunk = await self.buffer.drain_oldest_chunk(
+                project_id, chunk_size, before=cutoff,
+            )
             if not chunk:
                 break
 

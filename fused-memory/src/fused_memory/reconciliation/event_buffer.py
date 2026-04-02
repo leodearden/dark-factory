@@ -337,16 +337,30 @@ class EventBuffer:
 
     async def drain_oldest_chunk(
         self, project_id: str, limit: int,
+        before: datetime | None = None,
     ) -> list[ReconciliationEvent]:
-        """Drain the oldest `limit` buffered events for a project."""
+        """Drain the oldest `limit` buffered events for a project.
+
+        Args:
+            before: If set, only drain events with timestamp < this value.
+                    Used by BacklogIterator to ignore events that arrived
+                    after the backlog snapshot was taken.
+        """
         db = self._require_db()
-        async with db.execute(
-            """SELECT * FROM event_buffer
-               WHERE project_id = ? AND status = 'buffered'
-               ORDER BY timestamp ASC
-               LIMIT ?""",
-            (project_id, limit),
-        ) as cursor:
+        if before is not None:
+            query = """SELECT * FROM event_buffer
+                       WHERE project_id = ? AND status = 'buffered'
+                         AND timestamp < ?
+                       ORDER BY timestamp ASC
+                       LIMIT ?"""
+            params: tuple = (project_id, before.isoformat(), limit)
+        else:
+            query = """SELECT * FROM event_buffer
+                       WHERE project_id = ? AND status = 'buffered'
+                       ORDER BY timestamp ASC
+                       LIMIT ?"""
+            params = (project_id, limit)
+        async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
 
         if not rows:
