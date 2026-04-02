@@ -7127,7 +7127,7 @@
         "description": "Three small improvements to _search_graphiti in memory_service.py identified during Task 312 review:\n\n1. **Extract overfetch constant**: The magic number `1.5` in `int(limit * 1.5) + 1` should be a module-level constant `_GRAPHITI_OVERFETCH_FACTOR = 1.5` with a comment explaining the rationale. The same formula is duplicated in the test (test_memory_service.py:2104) — the test should import/reference the constant instead of re-stating the formula.\n\n2. **Add limit validation**: `results[:limit]` is unsafe when limit is negative — `results[:-1]` silently drops the last element. Add a guard: `if limit <= 0: return []` at the top of `_search_graphiti`.\n\n## Files\n- fused-memory/src/fused_memory/services/memory_service.py (extract constant, add guard)\n- fused-memory/tests/test_memory_service.py (reference constant instead of duplicating formula)\n\n## Memory hints\n- search: \"task 312 graphiti invalidated edge filtering\" — parent task context",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -7140,7 +7140,8 @@
             "fused-memory/src/fused_memory/services",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T04:01:56.116Z"
       },
       {
         "id": "371",
@@ -7802,7 +7803,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T04:01:55.875Z",
+      "lastModified": "2026-04-02T04:01:56.116Z",
       "taskCount": 375,
       "completedCount": 346,
       "tags": [
