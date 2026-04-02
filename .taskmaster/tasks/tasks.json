@@ -7307,7 +7307,7 @@
         "description": "McpSession._raw_call() and _raw_notify() in mcp_lifecycle.py each create a new httpx.AsyncClient per call via `async with httpx.AsyncClient() as client:`. This means every MCP call opens and closes a TCP connection. During orchestration, the scheduler calls get_tasks, set_task_status, and update_task frequently. Fix: create a single httpx.AsyncClient in McpSession.__init__ (or lazily on first call) and reuse it across all calls, closing it in McpLifecycle.stop(). This will improve performance through HTTP connection reuse.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -7318,7 +7318,8 @@
           "modules": [
             "orchestrator/src/orchestrator"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T01:29:44.244Z"
       },
       {
         "id": "380",
@@ -7602,7 +7603,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:29:44.085Z",
+      "lastModified": "2026-04-02T01:29:44.244Z",
       "taskCount": 365,
       "completedCount": 306,
       "tags": [
