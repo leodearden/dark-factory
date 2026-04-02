@@ -869,6 +869,7 @@ def create_mcp_server(
         project_root: str,
         tag: str | None = None,
         status: str | None = None,
+        compact: bool = False,
     ) -> dict[str, Any]:
         """List all tasks in the project.
 
@@ -879,6 +880,9 @@ def create_mcp_server(
                     Only tasks matching one of these statuses will be returned.
                     Valid values: pending, done, in-progress, review, deferred, cancelled, blocked.
                     If omitted, all tasks are returned.
+            compact: If true, strip verbose fields (description, details) from each task
+                     dict to reduce payload size. Useful for reconciliation agents where
+                     context window space is limited. Defaults to false (full task dicts).
         """
         if err := validate_project_root(project_root):
             return err
@@ -895,7 +899,7 @@ def create_mcp_server(
                 }
         try:
             return await task_interceptor.get_tasks(
-                project_root=project_root, tag=tag, status=status_list,
+                project_root=project_root, tag=tag, status=status_list, compact=compact,
             )
         except Exception as e:
             logger.error(f'get_tasks error: {e}')
