@@ -390,6 +390,55 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
         return await tm.get_task(task_id, project_root, tag)
 
+    async def get_task_summary(
+        self, project_root: str, tag: str | None = None
+    ) -> dict:
+        """Return a lightweight summary of the task tree.
+
+        Returns:
+            {
+                "counts": {"pending": N, "done": N, ...},
+                "tasks": [{"id": ..., "status": ..., "title": ...}, ...]
+            }
+
+        The counts include all tasks (top-level + subtasks, recursively).
+        The tasks list is flat (not hierarchical) and contains only
+        id/status/title for each task/subtask.
+        """
+        result = await self.get_tasks(project_root, tag=tag)
+        tasks = result.get('tasks', []) if isinstance(result, dict) else []
+        all_tasks = _collect_all_tasks(tasks)
+
+        counts: dict[str, int] = {}
+        compact_list = []
+        for t in all_tasks:
+            status = t.get('status', 'unknown')
+            counts[status] = counts.get(status, 0) + 1
+            compact_list.append({
+                'id': t.get('id'),
+                'status': status,
+                'title': t.get('title', ''),
+            })
+
+        return {'counts': counts, 'tasks': compact_list}
+
+
+def _collect_all_tasks(tasks: list) -> list:
+    """Recursively flatten a task tree into a flat list of task dicts.
+
+    Includes top-level tasks and all subtasks at every nesting level.
+    Non-dict elements are ignored.
+    """
+    flat: list = []
+    for t in tasks:
+        if not isinstance(t, dict):
+            continue
+        flat.append(t)
+        subtasks = t.get('subtasks', [])
+        if isinstance(subtasks, list) and subtasks:
+            flat.extend(_collect_all_tasks(subtasks))
+    return flat
+
 
 def _compact_task(task: object) -> object:
     """Return a compact version of a task dict with verbose fields stripped.
