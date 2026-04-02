@@ -7369,7 +7369,7 @@
         "description": "Refactor TestRedirectNodeEdges in test_merge_entities.py to eliminate brittle positional-index assertions and reduce setup duplication.\n\nThree changes:\n\n1. **Content-based call matching** — Replace `call_args_list[3]`, `[1]`, `[5]` with content scanning: `next(c for c in graph.query.call_args_list if 'source_node_uuid' in c.args[0])`. This decouples tests from internal phase ordering and makes IndexError impossible. Affects test_redirects_outgoing_edges, test_redirects_incoming_edges_cypher, test_deletes_inter_node_edges.\n\n2. **Extract shared fixture** — The 4-line setup block (make_backend, cast_target, _get_graph, patch cast) is duplicated in 5 of 6 tests. Extract a `redirected_backend` pytest fixture mirroring the existing `backend_with_mocks` pattern in TestMergeEntities.\n\n3. **Add missing assertions** — (a) Verify params dict (`dep_uuid`/`sur_uuid`) on Phase 2 and Phase 3 Cypher calls, not just query string content. (b) Add `assert graph.query.await_count == 6` to test_returns_nonzero_counts for contract completeness.\n\nMemory hints:\n- Search: 'merge_entities redirect_node_edges test fixture'\n- Entities: redirect_node_edges, TestRedirectNodeEdges",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -7381,7 +7381,7 @@
             "fused-memory/tests"
           ]
         },
-        "updatedAt": "2026-04-02T04:07:07.743Z"
+        "updatedAt": "2026-04-02T04:11:46.309Z"
       },
       {
         "id": "381",
@@ -7826,9 +7826,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T04:11:44.729Z",
+      "lastModified": "2026-04-02T04:11:46.309Z",
       "taskCount": 375,
-      "completedCount": 352,
+      "completedCount": 353,
       "tags": [
         "master"
       ]
