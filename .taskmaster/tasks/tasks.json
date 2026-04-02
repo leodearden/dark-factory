@@ -7914,7 +7914,19 @@
           "335"
         ],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/data/costs.py",
+            "dashboard/src/dashboard/data/db.py",
+            "dashboard/src/dashboard/data/burndown.py",
+            "dashboard/src/dashboard/app.py"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/data",
+            "dashboard/src/dashboard"
+          ]
+        }
       },
       {
         "id": 401,
