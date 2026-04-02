@@ -7348,7 +7348,21 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "memory_hints": {
+            "entities": [
+              "UsageGate",
+              "invoke_with_cap_retry"
+            ],
+            "queries": [
+              "invoke_with_cap_retry all accounts capped indefinite loop",
+              "UsageGate cap detection backoff",
+              "cap failover multi-account AllAccountsCappedException"
+            ]
+          },
+          "_causation_id": "ded577de-14d4-4903-a599-d93cb76764ab"
+        }
       },
       {
         "id": 382,
