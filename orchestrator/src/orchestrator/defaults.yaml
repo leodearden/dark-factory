@@ -22,13 +22,26 @@ inter_iteration_rebase: true
 # Steward lifecycle
 steward_lifetime_budget: 12.0
 steward_max_retries: 3
-steward_completion_timeout: 300.0
+steward_completion_timeout: 900.0
 
 # Pre-triage threshold for review suggestions (count)
 suggestion_triage_threshold: 10
 
-# Wall-clock backstop for any single agent invocation (seconds)
+# Wall-clock backstop for any single agent invocation (seconds).
+# Legacy scalar — per-role timeouts below take precedence.
 invocation_timeout: 7200.0
+
+# Per-role wall-clock timeout (seconds)
+timeouts:
+  architect: 2400
+  implementer: 1200
+  debugger: 1200
+  reviewer: 600
+  merger: 600
+  steward: 900
+  triage: 300
+  module_tagger: 300
+  deep_reviewer: 2400
 
 # Models per role
 models:

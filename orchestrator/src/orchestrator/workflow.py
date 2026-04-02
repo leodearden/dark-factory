@@ -1081,6 +1081,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         budgets = self.config.budgets
         turns = self.config.max_turns
         effort_cfg = self.config.effort
+        timeouts_cfg = self.config.timeouts
         backends_cfg = self.config.backends
 
         role_key = role.name.split('_')[0]
@@ -1090,6 +1091,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         budget = getattr(budgets, role_key, role.default_budget)
         max_turns_val = getattr(turns, role_key, role.default_max_turns)
         effort_val = getattr(effort_cfg, role_key, 'high')
+        timeout_val = getattr(timeouts_cfg, role_key, self.config.invocation_timeout)
         backend_val = getattr(backends_cfg, role_key, 'claude')
 
         # Use reviewer config for all reviewer variants
@@ -1098,6 +1100,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             budget = budgets.reviewer
             max_turns_val = turns.reviewer
             effort_val = effort_cfg.reviewer
+            timeout_val = timeouts_cfg.reviewer
             backend_val = backends_cfg.reviewer
 
         # Determine sandbox modules based on role
@@ -1130,7 +1133,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             sandbox_modules=sandbox_modules,
             effort=effort_val,
             backend=backend_val,
-            timeout_seconds=self.config.invocation_timeout,
+            timeout_seconds=timeout_val,
         )
 
         # Track metrics
@@ -1141,7 +1144,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         logger.info(
             f'Task {self.task_id} [{role.name}]: '
             f'success={result.success} cost=${result.cost_usd:.2f} '
-            f'turns={result.turns}'
+            f'turns={result.turns} timeout={timeout_val:.0f}s'
         )
 
         return result

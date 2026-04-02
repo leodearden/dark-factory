@@ -147,6 +147,20 @@ class EffortConfig(BaseModel):
     deep_reviewer: str = Field(default='max')
 
 
+class TimeoutsConfig(BaseModel):
+    """Wall-clock timeout (seconds) per agent role."""
+
+    architect: float = Field(default=2400.0)
+    implementer: float = Field(default=1200.0)
+    debugger: float = Field(default=1200.0)
+    reviewer: float = Field(default=600.0)
+    merger: float = Field(default=600.0)
+    steward: float = Field(default=900.0)
+    triage: float = Field(default=300.0)
+    module_tagger: float = Field(default=300.0)
+    deep_reviewer: float = Field(default=2400.0)
+
+
 class BackendsConfig(BaseModel):
     """Backend CLI selection per agent role. Values: 'claude', 'codex', 'gemini'."""
 
@@ -278,19 +292,21 @@ class OrchestratorConfig(BaseSettings):
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)
     steward_max_retries: int = Field(default=3)
-    steward_completion_timeout: float = Field(default=300.0)
+    steward_completion_timeout: float = Field(default=900.0)
 
     # Pre-triage threshold for review suggestions
     suggestion_triage_threshold: int = Field(default=10)
 
-    # Wall-clock backstop for any single agent invocation (seconds)
+    # Legacy scalar — ignored if `timeouts` section is present in config.
+    # Kept for backwards-compat with config files that haven't migrated.
     invocation_timeout: float = Field(default=1200.0)
 
-    # Models, budgets, turns per role
+    # Models, budgets, turns, timeouts per role
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     budgets: BudgetsConfig = Field(default_factory=BudgetsConfig)
     max_turns: TurnsConfig = Field(default_factory=TurnsConfig)
     effort: EffortConfig = Field(default_factory=EffortConfig)
+    timeouts: TimeoutsConfig = Field(default_factory=TimeoutsConfig)
     backends: BackendsConfig = Field(default_factory=BackendsConfig)
 
     # Verification commands

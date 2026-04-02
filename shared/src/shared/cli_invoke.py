@@ -420,13 +420,39 @@ async def _run_subprocess(
             timeout=timeout_seconds,
         )
     except TimeoutError:
-        proc.kill()
-        await proc.wait()
+        # Graceful shutdown: SIGTERM first, then SIGKILL after grace period.
+        # SIGTERM lets the Claude CLI flush its final JSON output to stdout
+        # (including session_id and token counts) before exiting.
+        _SIGTERM_GRACE_SECS = 5
+        proc.terminate()  # SIGTERM
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=_SIGTERM_GRACE_SECS,
+            )
+        except TimeoutError:
+            # Still alive after grace period — force kill
+            proc.kill()
+            await proc.wait()
+            stdout_text = ''
+            stderr_text = f'Process killed after {timeout_seconds}s timeout (SIGTERM+SIGKILL)'
+        else:
+            stdout_text = stdout.decode() if stdout else ''
+            stderr_text = stderr.decode()[-2000:] if stderr else ''
+            if stdout_text:
+                logger.info(
+                    f'Agent produced {len(stdout_text)} bytes after SIGTERM '
+                    f'(first 500): {stdout_text[:500]}'
+                )
+            stderr_text = (
+                f'Process terminated after {timeout_seconds}s timeout (SIGTERM); '
+                + stderr_text
+            )
         duration_ms = int(time.monotonic() * 1000) - start_ms
         return _SubprocessResult(
-            stdout='',
-            stderr=f'Process killed after {timeout_seconds}s timeout',
-            returncode=1,
+            stdout=stdout_text,
+            stderr=stderr_text,
+            returncode=proc.returncode if proc.returncode is not None else 1,
             duration_ms=duration_ms,
         )
 
