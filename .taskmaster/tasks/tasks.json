@@ -6213,7 +6213,7 @@
         "description": "The `open()` method's `except BaseException: await conn.close(); raise` cleanup path is only tested via schema failure (test_open_no_resource_leak_on_schema_failure). There is no test exercising this path when `apply_wal_pragmas` itself raises RuntimeError (WAL failure).\n\nAdd `test_open_no_resource_leak_on_wal_failure` that:\n1. Patches `apply_wal_pragmas` to raise RuntimeError\n2. Verifies `open()` re-raises the RuntimeError\n3. Asserts `store._conn is None` afterward\n4. Asserts the mock connection's `close()` was called\n\nThis mirrors the existing schema-failure test but exercises the WAL-failure cleanup path.\n\nmemory_hints:\n- search: \"AsyncSqliteBase open cleanup test resource leak\"\n- entity: \"AsyncSqliteBase\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6224,7 +6224,8 @@
           "modules": [
             "shared/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T01:42:28.149Z"
       },
       {
         "id": "328",
@@ -7690,7 +7691,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:42:27.967Z",
+      "lastModified": "2026-04-02T01:42:28.149Z",
       "taskCount": 372,
       "completedCount": 315,
       "tags": [
