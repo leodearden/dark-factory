@@ -7936,7 +7936,7 @@
         "description": "Mem0 search is completely broken again as of 2026-04-02. All queries return 0 results despite 3024 reported memories. This is the second regression — Task 98 fixed the first occurrence (agent_id/run_id filter issue in mem0_client.py) but the problem has recurred.\n\nKnown facts from knowledge graph:\n- Mem0 search was operational as of 2026-03-23 (returning results from 1481+ memories)\n- It became broken again by 2026-04-02 (0 results for all queries)\n- DLQ grew from 6 to 37 dead letters, potentially correlated with the regression\n- Mem0 writes through DurableWriteQueue may be failing and dead-lettering\n- Task 98's fix (removing agent_id/run_id from search filters in mem0_client.py) did not persist or a new root cause appeared\n- Dead letters should be replayed after this fix is confirmed\n\n## Investigation steps\n1. Check if the Task 98 fix (agent_id/run_id filter removal in mem0_client.py) reverted — diff against the known fix\n2. Check Qdrant collection health: GET /collections — verify vector count vs payload count\n3. Test a direct Qdrant search with a known embedding to see if vector similarity returns results\n4. Check embedding dimension consistency (was previously an issue — see Task 88)\n5. Inspect DLQ contents for patterns — are failures search-related or write-related?\n6. Check fused-memory server logs for Mem0-specific errors\n7. Verify Qdrant process is running and accepting connections (services run natively, not Docker)\n\n## After fix confirmed\n- Replay dead letters via replay_dead_letters\n- Verify search returns results across all categories\n- Monitor for re-regression in next reconciliation cycle\n\n## memory_hints\n- entity: \"Mem0\" — full entity context including regression history\n- entity: \"mem0_client.py\" — where the first fix was applied\n- entity: \"Qdrant\" — backing vector store details\n- entity: \"DurableWriteQueue\" — write queue that may be dead-lettering\n- search: \"Mem0 search regression broken zero results\"\n- search: \"dead letter queue DLQ growth Mem0 write failures\"\n- search: \"Task 98 Mem0 search fix agent_id run_id filter\"",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [
           "98"
         ],
@@ -7963,12 +7963,12 @@
             "fused-memory/src/fused_memory/routing"
           ]
         },
-        "updatedAt": "2026-04-02T12:43:20.712Z"
+        "updatedAt": "2026-04-02T12:48:20.805Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T12:47:47.028Z",
+      "lastModified": "2026-04-02T12:48:20.805Z",
       "taskCount": 380,
       "completedCount": 358,
       "tags": [
