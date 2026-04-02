@@ -6432,7 +6432,7 @@
         "description": "Test quality and coverage in orchestrator/tests/test_usage_gate.py:\n\n**Assertion cleanup:**\n- Replace fragile `call_kwargs.args[0]` fallback patterns with direct kwargs access (production code uses kwargs only)\n- Extract repeated `call.kwargs.get('event_type') or call.args[1]` into a test helper\n- Strengthen weak `'dark_factory' in all_args` to check specific kwargs\n- Remove duplicate `import json as _json` from 3 test method bodies (use module-level import)\n\n**Missing coverage:**\n- Add test: raising CostStore.save_account_event doesn't crash the gate (_write_cost_event swallows exceptions)\n- Add test: _fire_cost_event when no event loop is running (except RuntimeError: pass branch)\n\nFiles: orchestrator/tests/test_usage_gate.py",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6444,7 +6444,7 @@
             "orchestrator/tests"
           ]
         },
-        "updatedAt": "2026-04-02T01:52:09.879Z"
+        "updatedAt": "2026-04-02T01:58:16.976Z"
       },
       {
         "id": "339",
@@ -7726,9 +7726,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:52:54.610Z",
+      "lastModified": "2026-04-02T01:58:16.976Z",
       "taskCount": 373,
-      "completedCount": 323,
+      "completedCount": 324,
       "tags": [
         "master"
       ]
