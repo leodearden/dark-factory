@@ -57,6 +57,39 @@ def make_mock_cost_store() -> AsyncMock:
     return store
 
 
+def _fire_with_failing_create_task(
+    gate: UsageGate,
+    error_msg: str,
+    *,
+    close_coro: bool = True,
+) -> tuple[MagicMock, list]:
+    """Invoke gate._fire_cost_event with a mock loop whose create_task raises RuntimeError.
+
+    Sets up a MagicMock loop whose create_task side_effect raises
+    RuntimeError(error_msg), patches asyncio.get_running_loop to return
+    that loop, then calls _fire_cost_event('acct-A', 'cap_hit', '{}').
+
+    Returns (mock_loop, captured_coro) so callers can make specific assertions.
+    When close_coro=True (default), the side_effect closes the coroutine before
+    raising to suppress ResourceWarning about unawaited coroutines.
+    """
+    mock_loop = MagicMock()
+    captured_coro: list = []
+
+    def raising_create_task(coro, **kwargs):
+        captured_coro.append(coro)
+        if close_coro:
+            coro.close()
+        raise RuntimeError(error_msg)
+
+    mock_loop.create_task.side_effect = raising_create_task
+
+    with patch('shared.usage_gate.asyncio.get_running_loop', return_value=mock_loop):
+        gate._fire_cost_event('acct-A', 'cap_hit', '{}')
+
+    return mock_loop, captured_coro
+
+
 # ---------------------------------------------------------------------------
 # before_invoke race condition — _last_account_name updated before
 #         the failover cost event fires; event uses _fire_cost_event not
@@ -224,24 +257,11 @@ class TestFireCostEventRuntimeErrorHandling:
         """
         gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
 
-        mock_loop = MagicMock()
-
-        captured_coro: list = []
-
-        def raising_create_task(coro, **kwargs):
-            # Close the coroutine to avoid ResourceWarning about unawaited coro
-            captured_coro.append(coro)
-            coro.close()
-            raise RuntimeError('scheduler is shutting down')
-
-        mock_loop.create_task.side_effect = raising_create_task
-
         # Must NOT raise — create_task error is non-fatal
-        with (
-            patch('shared.usage_gate.asyncio.get_running_loop', return_value=mock_loop),
-            caplog.at_level(logging.WARNING, logger='shared.usage_gate'),
-        ):
-            gate._fire_cost_event('acct-A', 'cap_hit', '{}')  # no exception raised
+        with caplog.at_level(logging.WARNING, logger='shared.usage_gate'):
+            _mock_loop, captured_coro = _fire_with_failing_create_task(
+                gate, 'scheduler is shutting down'
+            )
 
         assert len(captured_coro) == 1, 'create_task should have been called once'
 
@@ -253,19 +273,8 @@ class TestFireCostEventRuntimeErrorHandling:
         """
         gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
 
-        mock_loop = MagicMock()
-
-        def raising_create_task(coro, **kwargs):
-            coro.close()
-            raise RuntimeError('event loop is closed')
-
-        mock_loop.create_task.side_effect = raising_create_task
-
-        with (
-            patch('shared.usage_gate.asyncio.get_running_loop', return_value=mock_loop),
-            caplog.at_level(logging.WARNING, logger='shared.usage_gate'),
-        ):
-            gate._fire_cost_event('acct-A', 'cap_hit', '{}')
+        with caplog.at_level(logging.WARNING, logger='shared.usage_gate'):
+            _fire_with_failing_create_task(gate, 'event loop is closed')
 
         assert any(
             'Failed to schedule cost event' in record.message
