@@ -7620,6 +7620,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 388,
+        "title": "Clarify or fix asymmetric retry semantics in by_role.html error handler",
+        "description": "In by_role.html lines ~106-115: the catch block resets `rendered = false` and rethrows, implying retry — but the htmx:afterSettle listener was registered with `{ once: true }` and is already consumed. The reset only has effect across a full HTMX re-injection. Fix options: (a) re-register the htmx listener inside the catch block to make retry genuine, or (b) remove `rendered = false` from catch and add a comment that failure requires a full reload. Either way, add a code comment explaining the cross-injection semantics.\n\nMemory hints: search \"chart lifecycle error recovery by_role\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -7632,7 +7643,7 @@
       ],
       "created": "2026-04-02T01:41:39.856Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-02T01:41:39.863Z"
+      "updated": "2026-04-02T01:41:45.747Z"
     }
   }
 }
