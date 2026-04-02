@@ -6287,7 +6287,7 @@
         "description": "Two gaps identified by reviewers in test_days_window_boundary (dashboard/tests/test_costs_data.py ~line 270):\n\n1. **Missing exact-boundary case**: Current test places invocations at -2h and -20d but never at the exact cutoff (`now - timedelta(days=1)`). Add a third invocation at the precise boundary to pin down inclusive/exclusive semantics of the cutoff filter and prevent silent regressions if the comparison operator changes from `>=` to `>`.\n\n2. **Incomplete field coverage**: Test only asserts `total_spend`. The `get_cost_summary` result also contains `avg_cost_per_task`, `active_accounts`, and `cap_events`. Insert at least one `account_events` row (cap_hit) inside and one outside the window, then assert that `narrow['proj']['cap_events']` reflects only the in-window event. This exercises the full filtering path, not just spend aggregation.\n\nFile: dashboard/tests/test_costs_data.py, TestCostSummary.test_days_window_boundary\n\nmemory_hints: search \"test_days_window_boundary costs cutoff filter\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6298,7 +6298,8 @@
           "modules": [
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T01:48:31.674Z"
       },
       {
         "id": "332",
@@ -7711,7 +7712,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:48:31.604Z",
+      "lastModified": "2026-04-02T01:48:31.674Z",
       "taskCount": 372,
       "completedCount": 320,
       "tags": [
