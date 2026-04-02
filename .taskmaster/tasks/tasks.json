@@ -8035,11 +8035,11 @@
         "description": "Add metrics collection to the MergeWorker in orchestrator/src/orchestrator/merge_queue.py to track queue depth and merge cycle time. This data is needed to evaluate whether speculative merging (task 293) is justified.",
         "details": "Implementation:\n1. Add timestamps to MergeRequest: enqueue_time, processing_start_time, completion_time\n2. Sample queue depth at enqueue time (queue.qsize() + len(_urgent))\n3. Compute and log cycle time (enqueue → completion) and processing time (start → completion)\n4. Persist metrics — either to the existing dashboard runs.db (new merge_metrics table) or a dedicated SQLite at data/orchestrator/merge_metrics.db\n5. Expose a summary method on MergeWorker for dashboard consumption (avg cycle time, p95, max queue depth over window)\n\nColumns to track per merge:\n- task_id, enqueue_time, start_time, end_time\n- queue_depth_at_enqueue, urgent_count_at_enqueue\n- outcome (success | conflict | cas_failure | verification_failure)\n- cas_retries\n\nmemory_hints:\n  entities: [MergeQueue, MergeWorker, MergeRequest, MERGER]\n  queries: [\"merge queue implementation details\", \"dashboard data persistence patterns\"]",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-02T22:08:37.358Z",
+        "updatedAt": "2026-04-02T22:19:01.801Z",
         "metadata": {
           "files": [
             "orchestrator/src/orchestrator/merge_queue.py",
@@ -8124,9 +8124,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T22:16:56.981Z",
+      "lastModified": "2026-04-02T22:19:01.801Z",
       "taskCount": 384,
-      "completedCount": 361,
+      "completedCount": 362,
       "tags": [
         "master"
       ]
