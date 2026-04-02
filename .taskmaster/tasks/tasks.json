@@ -3264,11 +3264,11 @@
         "description": "All dashboard sections poll at fixed intervals (10s, 15s, 30s, 60s) with no randomization. Multiple browser tabs or dashboard instances will hit the backend simultaneously. Add random jitter to polling intervals.",
         "details": "File: dashboard/src/dashboard/templates/index.html (lines 8, 22, 36, 50, 60).\n\nHTMX doesn't natively support jitter, but workaround: use hx-trigger=\"load, every 10s\" with a small JS script that randomizes the initial delay per section, or use htmx:configRequest to add small random delays. Alternative: use a single polling heartbeat that triggers all sections with staggered offsets.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-03-31T13:54:34.715Z",
+        "updatedAt": "2026-04-02T01:47:58.171Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/recon.html",
@@ -7695,7 +7695,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:47:57.885Z",
+      "lastModified": "2026-04-02T01:47:58.171Z",
       "taskCount": 372,
       "completedCount": 320,
       "tags": [
