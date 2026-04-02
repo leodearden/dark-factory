@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,7 +15,9 @@ from shared.cli_invoke import (
     _MAX_CAP_COOLDOWN_SECS,
     CAP_HIT_RESUME_PROMPT,
     AgentResult,
+    _SubprocessResult,
     _to_token_count,
+    invoke_claude_agent,
     invoke_with_cap_retry,
 )
 
@@ -609,3 +614,201 @@ class TestCapHitResume:
             # Third call: resume sess-2
             assert mock_invoke.call_args_list[2].kwargs.get('resume_session_id') == 'sess-2'
             assert mock_invoke.call_args_list[2].kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
+
+
+# ── ARG_MAX protection ─────────────────────────────────────────────────
+
+
+def _make_subprocess_result(stdout='', stderr='', returncode=0, duration_ms=100):
+    return _SubprocessResult(
+        stdout=stdout, stderr=stderr,
+        returncode=returncode, duration_ms=duration_ms,
+    )
+
+
+def _successful_json_output(**overrides):
+    data = {
+        'result': 'ok',
+        'subtype': 'success',
+        'cost_usd': 0.01,
+        'duration_ms': 100,
+        'num_turns': 1,
+        'session_id': 'sess-test',
+    }
+    data.update(overrides)
+    return json.dumps(data)
+
+
+@pytest.mark.asyncio
+class TestLargePayloadHandling:
+    """Verify system prompt and user prompt bypass CLI args to avoid ARG_MAX."""
+
+    async def test_system_prompt_uses_temp_file(self, tmp_path):
+        """System prompt is written to a temp file via --system-prompt-file, not inline."""
+        captured_cmd = []
+
+        async def fake_exec(*args, **kwargs):
+            captured_cmd.extend(args)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='You are a test assistant.',
+                cwd=tmp_path,
+            )
+
+        # --system-prompt-file should appear, --system-prompt (with inline value) should not
+        assert '--system-prompt-file' in captured_cmd
+        assert '--system-prompt' not in captured_cmd
+
+        # The file path argument should follow --system-prompt-file
+        idx = captured_cmd.index('--system-prompt-file')
+        file_path = captured_cmd[idx + 1]
+        # File should be cleaned up after invocation
+        assert not Path(file_path).exists(), 'Temp system prompt file was not cleaned up'
+
+    async def test_prompt_sent_via_stdin_not_args(self, tmp_path):
+        """User prompt is piped via stdin, not passed as a CLI argument."""
+        captured_cmd = []
+        captured_kwargs = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_cmd.extend(args)
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        prompt_text = 'This is the user prompt for testing'
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt=prompt_text,
+                system_prompt='sys',
+                cwd=tmp_path,
+            )
+
+        # Prompt text must NOT appear in any command argument
+        for arg in captured_cmd:
+            assert prompt_text not in str(arg), (
+                f'Prompt text found in cmd arg: {arg!r}'
+            )
+
+        # stdin must be PIPE (for piping prompt data)
+        assert captured_kwargs.get('stdin') == asyncio.subprocess.PIPE
+
+    async def test_temp_files_cleaned_up_on_error(self, tmp_path):
+        """Temp files are cleaned up even when subprocess raises."""
+        created_files = []
+        original_mkstemp = __import__('tempfile').mkstemp
+
+        def tracking_mkstemp(**kwargs):
+            fd, path = original_mkstemp(**kwargs)
+            created_files.append(path)
+            return fd, path
+
+        async def failing_exec(*args, **kwargs):
+            raise RuntimeError('Simulated subprocess failure')
+
+        with (
+            patch('shared.cli_invoke.tempfile.mkstemp', side_effect=tracking_mkstemp),
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=failing_exec),
+            pytest.raises(RuntimeError, match='Simulated subprocess failure'),
+        ):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+            )
+
+        # All temp files should be cleaned up
+        assert len(created_files) >= 1, 'Expected at least 1 temp file (system prompt)'
+        for f in created_files:
+            assert not Path(f).exists(), f'Temp file not cleaned up: {f}'
+
+    async def test_large_payload_no_arg_exceeds_max_strlen(self, tmp_path):
+        """260KB system prompt + 260KB user prompt: no CLI arg exceeds MAX_ARG_STRLEN."""
+        MAX_ARG_STRLEN = 131072  # 128KB, Linux per-argument limit
+
+        captured_cmd = []
+        captured_communicate_input = []
+
+        async def fake_exec(*args, **kwargs):
+            captured_cmd.extend(args)
+            proc = MagicMock()
+
+            async def fake_communicate(input=None):
+                captured_communicate_input.append(input)
+                return (_successful_json_output().encode(), b'')
+
+            proc.communicate = fake_communicate
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        large_system = 'S' * 260_000
+        large_prompt = 'P' * 260_000
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt=large_prompt,
+                system_prompt=large_system,
+                cwd=tmp_path,
+            )
+
+        # No individual CLI argument should exceed MAX_ARG_STRLEN
+        for arg in captured_cmd:
+            assert len(str(arg).encode()) <= MAX_ARG_STRLEN, (
+                f'CLI arg exceeds MAX_ARG_STRLEN ({len(str(arg).encode())} bytes): {str(arg)[:100]}...'
+            )
+
+        # The large prompt should arrive via stdin, not args
+        assert len(captured_communicate_input) == 1
+        assert captured_communicate_input[0] == large_prompt.encode()
+
+    async def test_resume_skips_system_prompt_file(self, tmp_path):
+        """When resuming a session, --system-prompt-file is not used."""
+        captured_cmd = []
+
+        async def fake_exec(*args, **kwargs):
+            captured_cmd.extend(args)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt='continue',
+                system_prompt='ignored on resume',
+                cwd=tmp_path,
+                resume_session_id='sess-abc',
+            )
+
+        assert '--resume' in captured_cmd
+        assert '--system-prompt-file' not in captured_cmd
+        assert '--system-prompt' not in captured_cmd

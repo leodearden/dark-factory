@@ -298,11 +298,18 @@ async def _invoke_claude(
     cmd.extend(['--model', model])
     cmd.extend(['--max-budget-usd', str(max_budget_usd)])
 
+    temp_files: list[str] = []
+
     if resume_session_id:
         # Resume an existing session — skip --system-prompt (incompatible)
         cmd.extend(['--resume', resume_session_id])
     else:
-        cmd.extend(['--system-prompt', system_prompt])
+        # Write system prompt to temp file to avoid ARG_MAX on large payloads
+        fd, sysprompt_path = tempfile.mkstemp(suffix='.txt', prefix='sysprompt_')
+        with open(fd, 'w') as f:
+            f.write(system_prompt)
+        temp_files.append(sysprompt_path)
+        cmd.extend(['--system-prompt-file', sysprompt_path])
 
     cmd.extend(['--permission-mode', permission_mode])
     cmd.extend(['--max-turns', str(max_turns)])
@@ -315,17 +322,18 @@ async def _invoke_claude(
     if disallowed_tools:
         cmd.extend(['--disallowed-tools', *disallowed_tools])
 
-    mcp_config_path = None
     if mcp_config:
         fd, mcp_config_path = tempfile.mkstemp(suffix='.json', prefix='mcp_')
         with open(fd, 'w') as f:
             json.dump(mcp_config, f)
+        temp_files.append(mcp_config_path)
         cmd.extend(['--mcp-config', mcp_config_path])
 
     if output_schema:
         cmd.extend(['--json-schema', json.dumps(output_schema)])
 
-    cmd.extend(['--', prompt])
+    # User prompt is piped via stdin to avoid ARG_MAX on large payloads
+    stdin_data = prompt.encode()
 
     # Strip ANTHROPIC_API_KEY so `claude` falls back to OAuth
     env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
@@ -337,11 +345,11 @@ async def _invoke_claude(
         env['CLAUDE_CONFIG_DIR'] = str(config_dir)
 
     try:
-        result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds)
+        result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data)
         return _parse_claude_output(result)
     finally:
-        if mcp_config_path:
-            Path(mcp_config_path).unlink(missing_ok=True)
+        for path in temp_files:
+            Path(path).unlink(missing_ok=True)
 
 
 def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
@@ -414,8 +422,13 @@ async def _run_subprocess(
     env: dict[str, str],
     model: str,
     timeout_seconds: float | None = None,
+    stdin_data: bytes | None = None,
 ) -> _SubprocessResult:
-    """Run a subprocess, log output."""
+    """Run a subprocess, log output.
+
+    *stdin_data*, when set, is piped to the process's stdin.  This avoids
+    passing large payloads as command-line arguments (which hit ARG_MAX).
+    """
     logger.info(f'Invoking claude agent: model={model} cwd={cwd}')
     logger.info(f'Command: {" ".join(cmd[:15])}...')
 
@@ -425,13 +438,14 @@ async def _run_subprocess(
         *cmd,
         cwd=str(cwd),
         env=env,
+        stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
 
     try:
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(),
+            proc.communicate(input=stdin_data),
             timeout=timeout_seconds,
         )
     except TimeoutError:

@@ -228,10 +228,17 @@ async def _invoke_claude_with_sandbox(
             cmd.extend(['--model', model])
             cmd.extend(['--max-budget-usd', str(max_budget_usd)])
 
+            temp_files: list[str] = []
+
             if resume_session_id:
                 cmd.extend(['--resume', resume_session_id])
             else:
-                cmd.extend(['--system-prompt', system_prompt])
+                # Write system prompt to temp file to avoid ARG_MAX
+                fd, sysprompt_path = tempfile.mkstemp(suffix='.txt', prefix='sysprompt_')
+                with open(fd, 'w') as f:
+                    f.write(system_prompt)
+                temp_files.append(sysprompt_path)
+                cmd.extend(['--system-prompt-file', sysprompt_path])
 
             cmd.extend(['--permission-mode', permission_mode])
             cmd.extend(['--max-turns', str(max_turns)])
@@ -242,15 +249,17 @@ async def _invoke_claude_with_sandbox(
             if disallowed_tools:
                 cmd.extend(['--disallowed-tools', *disallowed_tools])
 
-            mcp_config_path = None
             if mcp_config:
                 fd, mcp_config_path = tempfile.mkstemp(suffix='.json', prefix='mcp_')
                 with open(fd, 'w') as f:
                     json.dump(mcp_config, f)
+                temp_files.append(mcp_config_path)
                 cmd.extend(['--mcp-config', mcp_config_path])
             if output_schema:
                 cmd.extend(['--json-schema', json.dumps(output_schema)])
-            cmd.extend(['--', prompt])
+
+            # User prompt piped via stdin to avoid ARG_MAX
+            stdin_data = prompt.encode()
 
             cmd = build_bwrap_command(cmd, cwd, sandbox_modules)
 
@@ -261,11 +270,11 @@ async def _invoke_claude_with_sandbox(
                 env['CLAUDE_CONFIG_DIR'] = str(config_dir)
 
             try:
-                result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds)
+                result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data)
                 return _parse_claude_output(result)
             finally:
-                if mcp_config_path:
-                    Path(mcp_config_path).unlink(missing_ok=True)
+                for path in temp_files:
+                    Path(path).unlink(missing_ok=True)
         else:
             logger.warning('Sandbox requested but bwrap unavailable — running unsandboxed')
 
