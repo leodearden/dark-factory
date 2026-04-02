@@ -356,7 +356,7 @@ class TestHandleCapDetectedJsonDumpsGuard:
 
 
 @pytest.mark.asyncio
-class TestAccountResumeProbLoopJsonDumpsGuard:
+class TestAccountResumeProbeLoopJsonDumpsGuard:
     """step-9: _write_cost_event must not be called in probe loop when cost_store=None."""
 
     async def test_write_cost_event_not_called_without_cost_store(self):
