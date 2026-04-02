@@ -6150,7 +6150,7 @@
         "description": "The getOrDestroyChart function and 10-color CHART_PALETTE array are copy-pasted verbatim into 5 chart partials (by_project.html, by_account.html, by_role.html, trend.html, plus pre-existing memory_graphs.html). Extract both into a shared Jinja2 include or small static JS file.\n\nWhile extracting, also fix the dual-rendering issue: each chart partial registers both an htmx:afterSettle listener AND an immediate renderChart() call, causing double-renders on morph cycles. Consolidate to a single code path.\n\nmemory_hints:\n- search: \"Idiomorph DOM morphing Chart.js canvas lifecycle\"\n- search: \"color-mapping logic partial templates\"",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6175,7 +6175,7 @@
             ]
           }
         },
-        "updatedAt": "2026-04-02T04:12:36.012Z"
+        "updatedAt": "2026-04-02T04:17:36.160Z"
       },
       {
         "id": "325",
@@ -7838,7 +7838,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T04:14:23.635Z",
+      "lastModified": "2026-04-02T04:17:36.161Z",
       "taskCount": 375,
       "completedCount": 353,
       "tags": [
