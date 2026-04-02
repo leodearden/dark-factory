@@ -7425,11 +7425,11 @@
           "get_tasks_chars_this_run": null,
           "stage2_received_zero_tasks": null,
           "workaround_used": null,
-          "_causation_id": "9548741b-4cdf-4161-982d-420aec027ef5",
+          "_causation_id": "ded577de-14d4-4903-a599-d93cb76764ab",
           "continued_manifestation_run_64839bc3": null,
           "get_tasks_chars_run_64839bc3": null,
           "stage2_received_zero_tasks_run_64839bc3": null,
-          "consecutive_blind_cycles": 13,
+          "consecutive_blind_cycles": 14,
           "workaround_used_this_cycle": null,
           "systemic_impact": "Stage 1 cannot audit task tree, Stage 2 cannot proactively sample tasks. Both stages blind to all but individually-fetched tasks. Growing worse as task count increases monotonically.",
           "continued_manifestation_run_e11c70c0": null,
@@ -7448,12 +7448,13 @@
           "workaround_used_this_cycle_07d74244": null,
           "metadata_cleaned_by": "recon-stage-task_knowledge_sync",
           "metadata_cleaned_run": "26055539-91ff-4afd-9451-ce58d706f4a7",
-          "last_manifestation_run": "81ed620d-e669-43f8-938a-0c716430c843",
+          "last_manifestation_run": "ded577de-14d4-4903-a599-d93cb76764ab",
           "get_tasks_chars_latest": 608140,
           "metadata_cleanup_note": "CORRECTION: Prior note claimed '17 null per-run keys removed' — this is inaccurate. update_task metadata merge treats null as 'preserve existing value', not 'delete key'. The 17 null keys were SET but persist in the output. Key deletion requires direct tasks.json manipulation or new tooling. Payload reduction via metadata cleanup is NOT possible with current tools.",
           "stage2_received_zero_tasks_run_9548741b": true,
           "off_by_one_fix_note": "Stage 1 flagged count as 11 when it should be 12. Fixed: count now reflects actual cycle count including current run. Root cause: prior cycles incremented BEFORE writing, so the written value was always 1 behind actual.",
-          "stage2_received_zero_tasks_run_81ed620d": true
+          "stage2_received_zero_tasks_run_81ed620d": true,
+          "stage2_received_zero_tasks_run_ded577de": true
         }
       },
       {
