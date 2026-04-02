@@ -7910,7 +7910,7 @@
         "description": "Task 335 (Harden costs.py query robustness) was completed, fixing clock skew, tuple unpacking, silent data omission, and adding query limits. However, the dashboard costs page still shows empty data across all panels and time windows (reported in MEMORY.md as unresolved since 2026-04-01).\n\nThe query robustness fixes may have been necessary but insufficient — the root cause of empty data is likely upstream: either no cost data is being written to the database, or the data modules are swallowing errors that mask the actual failure.\n\nInvestigation steps:\n1. Add logging/error surfacing to dashboard data modules (costs.py query functions) — currently errors may be silently caught and return empty results\n2. Check if the invocations/cost database actually contains data (direct SQLite query)\n3. Check if the cost writer (burndown snapshot writer or equivalent) is running and populating data\n4. Verify the schema matches what queries expect (column names, table names)\n\nmemory_hints:\n- search: \"dashboard costs page empty data\"\n- search: \"cost tracking database schema invocations\"\n- search: \"burndown snapshot writer dashboard\"\n- entity: costs_page",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [
           "335"
         ],
@@ -7928,7 +7928,7 @@
             "dashboard/src/dashboard"
           ]
         },
-        "updatedAt": "2026-04-02T12:42:21.431Z"
+        "updatedAt": "2026-04-02T12:50:39.665Z"
       },
       {
         "id": "401",
@@ -7968,9 +7968,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T12:48:20.873Z",
+      "lastModified": "2026-04-02T12:50:39.665Z",
       "taskCount": 380,
-      "completedCount": 358,
+      "completedCount": 359,
       "tags": [
         "master"
       ]
