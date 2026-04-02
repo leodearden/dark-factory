@@ -6167,7 +6167,13 @@
           "modules": [
             "dashboard/src/dashboard/templates",
             "dashboard/src/dashboard/static"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Extract shared Chart.js utilities (getOrDestroyChart + palette)"
+            ]
+          }
         },
         "updatedAt": "2026-04-02T04:12:36.012Z"
       },
@@ -7736,11 +7742,17 @@
         "description": "Fill specific assertion gaps in test_by_role_chart_lifecycle.py: (1) test_script_inside_container_div — also assert that `</script>` appears before the container's closing `</div>`; (2) test_htmx_after_settle_listener_present — add assert `'{ once: true }' in html` for the htmx listener; (3) Tighten the querySelectorAll negative assertion to allow exactly one `document.querySelector(` occurrence (the container fallback) and assert it only references `[data-by-role-container]`; (4) Add a test that verifies serialized mock data appears in the rendered HTML (e.g. assert known cost value in `tojson` output), and a test that the DOMContentLoaded listener has `{ once: true }`.\n\nMemory hints: search \"by_role test assertions chart lifecycle\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-04-02T04:10:30.524Z"
+        "updatedAt": "2026-04-02T04:14:23.635Z",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard/templates",
+            "dashboard/tests/test_by_role_chart_lifecycle.py"
+          ]
+        }
       },
       {
         "id": "393",
@@ -7826,7 +7838,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T04:12:36.012Z",
+      "lastModified": "2026-04-02T04:14:23.635Z",
       "taskCount": 375,
       "completedCount": 353,
       "tags": [
