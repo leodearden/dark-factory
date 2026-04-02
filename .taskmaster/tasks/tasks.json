@@ -7856,7 +7856,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "shared/tests/test_usage_gate.py",
+            "orchestrator/tests/test_usage_gate.py"
+          ],
+          "modules": [
+            "shared/tests",
+            "orchestrator/tests"
+          ]
+        }
       },
       {
         "id": 398,
@@ -7867,7 +7877,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "shared/tests/test_usage_gate.py",
+            "orchestrator/tests/test_usage_gate.py"
+          ],
+          "modules": [
+            "shared/tests",
+            "orchestrator/tests"
+          ]
+        }
       },
       {
         "id": 399,
