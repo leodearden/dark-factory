@@ -383,6 +383,33 @@ class TaskInterceptor:
         return await tm.get_task(task_id, project_root, tag)
 
 
+def _compact_task(task: object) -> object:
+    """Return a compact version of a task dict with verbose fields stripped.
+
+    Keeps: id, status, title, dependencies, priority.
+    Strips: description, details, and any other unlisted verbose fields.
+    Subtasks are recursively compacted.
+
+    Non-dict inputs are returned unchanged.
+    """
+    if not isinstance(task, dict):
+        return task
+
+    _VERBOSE_FIELDS = {'description', 'details'}
+    result = {k: v for k, v in task.items() if k not in _VERBOSE_FIELDS}
+
+    # Recursively compact subtasks
+    if 'subtasks' in result and isinstance(result['subtasks'], list):
+        result['subtasks'] = [_compact_task(st) for st in result['subtasks']]
+
+    return result
+
+
+def _compact_tasks(tasks: list) -> list:
+    """Apply _compact_task to each element in a list."""
+    return [_compact_task(t) for t in tasks]
+
+
 def _filter_tasks_by_status(tasks: list, statuses: list[str]) -> list:
     """Filter a task list (with subtasks) to only include tasks matching statuses.
 
