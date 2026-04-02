@@ -7508,7 +7508,21 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "memory_hints": {
+            "entities": [
+              "add_episode",
+              "graphiti_client"
+            ],
+            "queries": [
+              "episode ingestion noise edges file change patterns",
+              "status echo prevention task status ingestion",
+              "extraction filters deny-list low-value edge patterns"
+            ]
+          },
+          "_causation_id": "ded577de-14d4-4903-a599-d93cb76764ab"
+        }
       }
     ],
     "metadata": {
