@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
-from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.middleware.task_interceptor import (
+    TaskInterceptor,
+    _compact_task,
+    _compact_tasks,
+)
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 
@@ -713,3 +717,145 @@ async def test_get_tasks_status_filter_preserves_other_fields(interceptor, taskm
     # Other fields preserved
     assert result['total'] == 2
     assert result['projectRoot'] == '/project'
+
+
+# ── Tests for _compact_task() and _compact_tasks() (step-1) ───────────────
+
+
+def test_compact_task_strips_description_and_details():
+    """_compact_task removes 'description' and 'details' fields."""
+    task = {
+        'id': '1',
+        'status': 'pending',
+        'title': 'Test Task',
+        'description': 'A long description that takes up lots of space.',
+        'details': 'Implementation details that are very verbose.',
+        'dependencies': ['2'],
+        'priority': 'high',
+    }
+    result = _compact_task(task)
+    assert 'description' not in result
+    assert 'details' not in result
+
+
+def test_compact_task_preserves_key_fields():
+    """_compact_task preserves id, status, title, dependencies, priority."""
+    task = {
+        'id': '1',
+        'status': 'pending',
+        'title': 'Test Task',
+        'description': 'Verbose description.',
+        'details': 'Verbose details.',
+        'dependencies': ['2', '3'],
+        'priority': 'high',
+    }
+    result = _compact_task(task)
+    assert result['id'] == '1'
+    assert result['status'] == 'pending'
+    assert result['title'] == 'Test Task'
+    assert result['dependencies'] == ['2', '3']
+    assert result['priority'] == 'high'
+
+
+def test_compact_task_compacts_subtasks_recursively():
+    """_compact_task recursively compacts subtasks to id/status/title."""
+    task = {
+        'id': '1',
+        'status': 'pending',
+        'title': 'Parent',
+        'subtasks': [
+            {
+                'id': '1.1',
+                'status': 'done',
+                'title': 'Child',
+                'description': 'Child description',
+                'details': 'Child details',
+                'dependencies': [],
+                'subtasks': [],
+            },
+        ],
+    }
+    result = _compact_task(task)
+    assert len(result['subtasks']) == 1
+    child = result['subtasks'][0]
+    assert child['id'] == '1.1'
+    assert child['status'] == 'done'
+    assert child['title'] == 'Child'
+    assert 'description' not in child
+    assert 'details' not in child
+
+
+def test_compact_task_handles_missing_optional_fields():
+    """_compact_task works when optional fields (dependencies, priority) are absent."""
+    task = {'id': '2', 'status': 'in-progress', 'title': 'Minimal Task'}
+    result = _compact_task(task)
+    assert result['id'] == '2'
+    assert result['status'] == 'in-progress'
+    assert result['title'] == 'Minimal Task'
+    # No KeyError for missing optional fields
+    assert 'description' not in result
+    assert 'details' not in result
+
+
+def test_compact_task_handles_non_dict_input():
+    """_compact_task returns the input unchanged if it is not a dict."""
+    assert _compact_task("not a dict") == "not a dict"
+    assert _compact_task(None) is None
+    assert _compact_task(42) == 42
+
+
+def test_compact_task_empty_subtasks_list():
+    """_compact_task with empty subtasks list returns empty list."""
+    task = {
+        'id': '1',
+        'status': 'pending',
+        'title': 'Task',
+        'description': 'desc',
+        'subtasks': [],
+    }
+    result = _compact_task(task)
+    assert result['subtasks'] == []
+
+
+def test_compact_tasks_applies_to_list():
+    """_compact_tasks applies _compact_task to every element in a list."""
+    tasks = [
+        {
+            'id': '1',
+            'status': 'pending',
+            'title': 'Task A',
+            'description': 'Long description A',
+            'details': 'Details A',
+        },
+        {
+            'id': '2',
+            'status': 'done',
+            'title': 'Task B',
+            'description': 'Long description B',
+        },
+    ]
+    results = _compact_tasks(tasks)
+    assert len(results) == 2
+    for r in results:
+        assert 'description' not in r
+        assert 'details' not in r
+
+
+def test_compact_tasks_empty_list():
+    """_compact_tasks on empty list returns empty list."""
+    assert _compact_tasks([]) == []
+
+
+def test_compact_tasks_skips_non_dict_elements():
+    """_compact_tasks handles a list with non-dict elements gracefully."""
+    tasks = [
+        {'id': '1', 'status': 'pending', 'title': 'Task', 'description': 'desc'},
+        "not a dict",
+        None,
+    ]
+    results = _compact_tasks(tasks)
+    # Non-dict elements passed through unchanged; dict elements compacted
+    assert len(results) == 3
+    assert 'description' not in results[0]
+    assert results[1] == "not a dict"
+    assert results[2] is None
