@@ -7581,7 +7581,7 @@
         "description": "update_task metadata merge treats null values as \"preserve existing\", making it impossible to delete metadata keys. This causes a self-reinforcing bloat cycle: reconciliation adds per-cycle metadata keys → bloats tasks.json → worsens get_tasks overflow (task 383) → triggers more metadata. Tasks 158 and 383 are the worst-affected, with 30+ accumulated keys each.\n\nFix approaches (pick one or combine):\n1. Implement null-means-delete semantics in update_task metadata merge (breaking change — audit callers)\n2. Add an explicit `delete_metadata_keys` parameter to update_task\n3. Implement a periodic metadata compaction pass that consolidates per-cycle keys into summary keys\n4. Add a `compact_task_metadata` management tool that merges/removes specified keys\n\nAcceptance criteria:\n- Reconciliation stages can remove stale per-cycle metadata keys\n- Tasks 158 and 383 metadata can be compacted to essential keys only\n- No regression in existing metadata merge behavior for non-null values\n\nmemory_hints:\n- search: \"metadata bloat update_task null preserve delete key\"\n- search: \"task 383 get_tasks overflow 610K context window\"\n- entities: [update_task, TaskInterceptor]",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "383"
         ],
@@ -7599,12 +7599,13 @@
             "fused-memory/src/fused_memory/middleware",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T01:31:03.390Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:31:03.185Z",
+      "lastModified": "2026-04-02T01:31:03.390Z",
       "taskCount": 365,
       "completedCount": 308,
       "tags": [
