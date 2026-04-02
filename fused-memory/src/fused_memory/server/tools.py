@@ -906,6 +906,39 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    async def get_task_summary(
+        project_root: str,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        """Get a lightweight summary of the task tree.
+
+        Returns status counts and a flat list of tasks (id, status, title only).
+        Much smaller payload than get_tasks — ideal for reconciliation agents
+        that need a quick overview without verbose description/details fields.
+
+        Response format:
+            {
+                "counts": {"pending": N, "done": N, "in-progress": N, ...},
+                "tasks": [{"id": "1", "status": "pending", "title": "..."}, ...]
+            }
+
+        The counts and tasks list include all tasks (top-level + subtasks, recursively).
+
+        Args:
+            project_root: Absolute path to project root
+            tag: Tag context (optional)
+        """
+        if err := validate_project_root(project_root):
+            return err
+        try:
+            return await task_interceptor.get_task_summary(
+                project_root=project_root, tag=tag,
+            )
+        except Exception as e:
+            logger.error(f'get_task_summary error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
     async def get_task(
         id: str,
         project_root: str,
