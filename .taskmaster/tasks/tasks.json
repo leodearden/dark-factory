@@ -7705,10 +7705,11 @@
         "description": "Three small improvements to by_role.html: (1) Lines 53-55 — replace Array.indexOf deduplication with a plain-object set for O(1) lookup; (2) Near the htmx:afterSettle registration — add a one-line comment clarifying that `rendered` guards the readyState early-fire path, not the htmx path, to prevent a future developer from removing it as redundant; (3) In cleanupCharts catch block — replace empty catch with `console.warn('chart cleanup error:', e)`.\n\nMemory hints: search \"by_role chart lifecycle\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-02T04:08:21.781Z"
       },
       {
         "id": "391",
@@ -7816,7 +7817,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T04:08:21.729Z",
+      "lastModified": "2026-04-02T04:08:21.781Z",
       "taskCount": 375,
       "completedCount": 350,
       "tags": [
