@@ -7815,7 +7815,7 @@
         "description": "The get_tasks response is 613K+ characters (370+ tasks, 85% done/cancelled), which overflows the context window of reconciliation agents. This causes Stage 1 and Stage 2 to receive 0 tasks, making both stages completely blind to the task tree. This has persisted for 14+ consecutive reconciliation cycles since task 383 diagnosed the root cause.\n\nImplement one or more of these documented fix approaches:\n1. **Status-filtered get_tasks** — Add a `status` filter parameter to get_tasks so reconciliation can request only pending/in-progress/blocked tasks (reduces payload by ~85%)\n2. **Summary/stats endpoint** — Return task counts by status + IDs only, without full task details\n3. **Paginated get_tasks** — Add offset/limit parameters for incremental fetching\n4. **Pre-process in harness** — Have the reconciliation harness filter the task tree before injecting into agent prompts\n\nApproach #1 (status filtering) is recommended as the simplest high-impact fix. The TaskInterceptor already proxies get_tasks; adding a status filter there is straightforward.\n\nAcceptance criteria:\n- Reconciliation agents can retrieve active tasks (pending/in-progress/blocked) without context overflow\n- Stage 1 and Stage 2 receive actual task data instead of 0 tasks\n- Full get_tasks (unfiltered) still works for other callers\n- Task tree with 370+ tasks can be queried by reconciliation without exceeding ~100K chars\n\nmemory_hints:\n- search: \"get_tasks context window overflow 613K reconciliation blind\"\n- search: \"false-empty task tree Stage 1 recurring bug task 383\"\n- entities: [TaskInterceptor, reconciliation]",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [
           "383"
         ],
@@ -7845,7 +7845,7 @@
           "duplicate_cancelled": "Task 399 cancelled as duplicate — same scope (get_tasks context window overflow). Duplication itself evidences the systemic blindness this task fixes.",
           "_causation_id": "54c04f01-fb8e-4cba-baf3-5f866068829b"
         },
-        "updatedAt": "2026-04-02T12:40:45.605Z"
+        "updatedAt": "2026-04-02T12:42:20.176Z"
       },
       {
         "id": "397",
@@ -7975,7 +7975,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T12:42:20.009Z",
+      "lastModified": "2026-04-02T12:42:20.185Z",
       "taskCount": 380,
       "completedCount": 357,
       "tags": [
