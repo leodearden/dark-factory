@@ -2664,7 +2664,7 @@
               "Graphiti search broken empty results task 382"
             ]
           },
-          "_causation_id": "04835270-89af-4008-8c3e-7858d1eb2ff7",
+          "_causation_id": "6ca0b048-53a7-4fbc-aa16-4ed7e70e3248",
           "stale_count_entities": [
             "ae174332",
             "0d096eab",
@@ -2726,7 +2726,9 @@
             "dedup_method": "exact_text_only",
             "semantic_dedup_needed": true
           },
-          "priority_alignment_run": "04835270-89af-4008-8c3e-7858d1eb2ff7"
+          "priority_alignment_run": "04835270-89af-4008-8c3e-7858d1eb2ff7",
+          "stage1_findings_consolidated": "Across cycles 26b180fa through cfe9d73c: Two root causes identified — (1) invalidated edges leaving stale summary lines (handled by existing refresh_entity_summary), (2) valid-but-obsolete edges expressing same facts in different words (CostStore 20 lines, UsageGate 13 lines). Exact-text dedup insufficient for paraphrased duplicates. Remaining scope: auto-trigger summary rebuild on edge invalidation, temporal supersession for valid-but-obsolete edges, content similarity heuristics, batch invalidation support, opt-out flag for bulk ops.",
+          "metadata_bloat_note": "This task has accumulated 4 per-cycle stage1_finding_* keys and 2 remaining_scope versions. Cannot be cleaned up — update_task does not support key deletion. Future cycles should NOT add new per-cycle keys; update stage1_findings_consolidated instead."
         }
       },
       {
