@@ -4280,7 +4280,7 @@
         "description": "The polling jitter tests added in task-185 (TestPollingJitter, TestPollingJitterScript, TestPollingErrorRecovery) have significant copy-paste duplication and weak assertions. Refactor for maintainability and precision.",
         "details": "File: dashboard/tests/test_app.py (lines ~415-580).\n\nSpecific changes:\n1. Extract `_section_html(html, partial, pre=200, post=500)` helper — the section-locating two-liner is copied 10+ times. Share with existing TestHtmxTimeout too.\n2. Replace 10 individual TestPollingJitter methods with @pytest.mark.parametrize over (partial, base, trigger) tuples — 5 sections × 2 attributes.\n3. Add class-scoped or session-scoped fixture for page HTML — 20 independent client.get('/') calls render the same static page.\n4. Scope TestPollingJitterScript assertions to the script block (extract IIFE substring), not full page HTML.\n5. Remove vacuous `assert 'data-poll-base' in html` from test_script_reads_data_poll_base (always true from template attrs).\n6. Strengthen TestPollingErrorRecovery: assert scheduleNext/recoverPoll appears alongside error event strings, not just count >= 2.\n7. Add test for afterSettle guard: assert `if (el.dataset.pollBase)` or equivalent conditional pattern exists in script.\n8. Fix test_memory_has_poll_base_10 overlap risk — the html.index() for /partials/memory may match /partials/memory-graphs prefix.\n\nmemory_hints: search \"task 185 jitter tests\" for original test structure.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "185"
         ],
@@ -4293,7 +4293,8 @@
           "modules": [
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T02:08:40.036Z"
       },
       {
         "id": "242",
@@ -7749,7 +7750,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:08:38.488Z",
+      "lastModified": "2026-04-02T02:08:40.036Z",
       "taskCount": 374,
       "completedCount": 331,
       "tags": [
