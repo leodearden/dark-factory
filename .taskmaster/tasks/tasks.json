@@ -7352,7 +7352,7 @@
         "description": "Design gap: invoke_with_cap_retry has no fail-fast mechanism when every configured account is simultaneously capped. It loops indefinitely, which previously caused a reconciliation jam. Need to add a bounded retry / fail-fast path that surfaces the all-capped condition to the caller instead of blocking forever.",
         "details": "Evidence from memory: memories 35226466 and cb65531a document this design gap. Memory 5e201c87 describes an actual incident where backlog_chunk reify reconciliation entered a failure loop due to all configured accounts being capped.\n\nAcceptance criteria:\n1. invoke_with_cap_retry raises a clear exception (e.g. AllAccountsCappedException) after exhausting all accounts rather than looping indefinitely\n2. Callers (orchestrator, reconciliation) handle the exception with appropriate backoff/reporting\n3. Unit test covering the all-accounts-capped scenario\n\nmemory_hints:\n- search: \"invoke_with_cap_retry all accounts capped indefinite loop\"\n- search: \"UsageGate cap detection backoff\"\n- search: \"cap failover multi-account\"",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -7383,7 +7383,7 @@
             "orchestrator/tests"
           ]
         },
-        "updatedAt": "2026-04-02T01:38:34.946Z"
+        "updatedAt": "2026-04-02T01:42:35.066Z"
       },
       {
         "id": "382",
@@ -7691,9 +7691,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:42:28.149Z",
+      "lastModified": "2026-04-02T01:42:35.066Z",
       "taskCount": 372,
-      "completedCount": 315,
+      "completedCount": 316,
       "tags": [
         "master"
       ]
