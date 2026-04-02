@@ -171,9 +171,8 @@ class TestFireCostEventTaskStorage:
 
         gate._fire_cost_event('acct-A', 'cap_hit', '{"reason": "test"}')
 
-        # Give the event loop a chance to run the coroutine to completion
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)  # two yields to ensure done-callback fires
+        # Deterministically drain all in-flight tasks to completion.
+        await asyncio.gather(*list(gate._background_tasks))
 
         assert len(gate._background_tasks) == 0, (
             f'Expected empty set after completion, but {len(gate._background_tasks)} task(s) remain — '
