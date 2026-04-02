@@ -7716,15 +7716,16 @@
         "description": "The get_tasks response is 619K+ characters (370+ tasks, 85% done/cancelled), overflowing the Claude context window. This causes reconciliation Stage 1 and Stage 2 to receive a false-empty task tree (0 tasks), making both stages completely blind to the task tree for 14+ consecutive cycles.\n\nRoot cause identified in task 383: monotonically growing task count means the response only gets larger. Fix approaches (from task 383 metadata):\n1. **Filter done/cancelled tasks** — reconciliation harness pre-filters the get_tasks response to exclude done/cancelled tasks before injecting into agent prompts. Most cost-effective fix.\n2. **Summary/stats endpoint** — new get_task_stats tool returning counts and status distribution without full task payloads.\n3. **Paginate** — add status filter parameter to get_tasks (e.g. status=pending,in-progress,blocked).\n4. **Pre-process in harness** — harness reads full response, extracts summary stats + active tasks, injects condensed version into prompts.\n\nRecommended approach: Option 1 or 4 — modify the reconciliation harness (harness.py) to filter the get_tasks response before injecting into Stage 1/Stage 2 prompts. Keep done/cancelled task IDs available as a list but strip their full descriptions/details/metadata.\n\nmemory_hints:\n- search: \"false-empty task tree Stage 1 recurring bug\"\n- search: \"get_tasks context window overflow 600K\"\n- search: \"reconciliation harness task tree injection\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-02T01:52:45.862Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:52:45.632Z",
+      "lastModified": "2026-04-02T01:52:45.862Z",
       "taskCount": 373,
       "completedCount": 322,
       "tags": [
