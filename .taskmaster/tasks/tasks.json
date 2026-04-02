@@ -6067,11 +6067,11 @@
         "description": "Several dashboard partial integration test assertions (added in task 260) are fragile or risk false positives:\n\n1. **Timeseries numeric assertions depend on tojson whitespace** (test_app.py:643-644): `assert ', 5, ' in html` and `assert ', 3, ' in html` break if Flask's tojson filter ever uses compact separators (`,` without spaces). Fix: use unique 3-digit marker values (e.g., 517, 389) that match unambiguously in both `', 517, '` and `,517,` form, or parse the embedded JSON structurally.\n\n2. **Empty-array assertions depend on colon spacing** (test_app.py:661-662): `assert '\"reads\": []' in html` breaks with compact JSON (`\"reads\":[]`). Fix: accept both forms, or parse the JSON blob.\n\n3. **steward_rate=15.0 false positive** (test_app.py:569): In `test_performance_escalations_no_interactive_count`, the assertion `assert '15.0' in html` passes vacuously because `_PERF_PATHS` also contains `'pct': 15.0`. Fix: use a unique steward_rate value (e.g., 17.5) that doesn't collide with any path fixture data.\n\nmemory_hints: search \"dashboard partial integration test pattern\", review test_app.py lines 584-662 for timeseries fixtures and assertions, review lines 423-428 for _PERF_PATHS fixture values",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-04-02T01:38:54.322Z",
+        "updatedAt": "2026-04-02T01:41:32.129Z",
         "metadata": {
           "modules": [
             "dashboard/tests/test_app.py"
@@ -7612,9 +7612,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:41:27.486Z",
+      "lastModified": "2026-04-02T01:41:32.129Z",
       "taskCount": 365,
-      "completedCount": 313,
+      "completedCount": 314,
       "tags": [
         "master"
       ]
