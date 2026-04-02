@@ -7855,6 +7855,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 398,
+        "title": "Strengthen test assertions in test_usage_gate.py",
+        "description": "Fix incomplete assertions in test_usage_gate.py that don't fully verify what their docstrings claim.",
+        "details": "File: shared/tests/test_usage_gate.py\n\n1. In test_create_task_error_logs_warning (lines 268-287): add assertion that 'event loop is closed' appears in record.message, to verify the original exception text is included per the docstring's stated format 'Failed to schedule cost event %s/%s: %s'.\n2. In the test that calls asyncio.gather(*list(gate._background_tasks)) (line 204-208): add return_exceptions=True so unexpected task exceptions don't mask the real assertion failure.\n\nSource: review suggestions from task 356 (escalation esc-356-10).",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -7867,7 +7878,7 @@
       ],
       "created": "2026-04-02T09:29:26.002Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-02T09:29:26.005Z"
+      "updated": "2026-04-02T09:29:29.980Z"
     }
   }
 }
