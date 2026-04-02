@@ -7866,6 +7866,19 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 399,
+        "title": "Fix: get_tasks context window overflow breaks reconciliation (14+ blind cycles)",
+        "description": "The get_tasks response (~600K+ chars) overflows Claude's context window, causing both Stage 1 and Stage 2 reconciliation to receive an empty task tree. This has persisted for 14+ consecutive cycles. Task 383 documented the root cause and fix approaches but was prematurely closed without implementation.\n\nRoot cause: get_tasks returns the full task tree (~370 tasks, 85% done/cancelled) as a single payload. At 600K+ chars it exceeds the context window and gets silently dropped.\n\nFix approaches (from task 383 analysis):\n1. **Filter get_tasks to exclude done/cancelled** — reduce payload by ~85%. Add a `status_filter` parameter or `exclude_statuses` parameter to get_tasks.\n2. **Summary/stats endpoint** — return counts + active task IDs only, no full details.\n3. **Paginate task tree response** — chunk by status or ID range.\n4. **Pre-process in harness** — filter the task JSON before injecting into the Stage 1 prompt.\n\nApproach 4 (harness pre-processing) is likely quickest: the reconciliation harness already reads tasks.json. Filter to non-done/non-cancelled tasks before passing to stage agents.\n\nmemory_hints:\n- entity: task_383_false_empty_tree\n- search: \"get_tasks context window overflow 596K\"\n- search: \"false-empty task tree Stage 1 recurring bug\"\n- search: \"reconciliation harness stage prompt injection\"",
+        "details": "Key files:\n- fused-memory/src/fused_memory/reconciliation/harness.py — where task tree is fetched and passed to stages\n- fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py — Stage 1\n- fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py — Stage 2\n\nThe harness constructs an \"Active Task Tree\" section in each stage's prompt. This is where filtering should happen — exclude done/cancelled tasks from the payload, and instead include a one-line summary like \"Active Task Tree (45 pending, 8 in-progress, 1 blocked of 370 total; 301 done and 12 cancelled excluded)\".\n\nThis is the single most impactful fix for reconciliation effectiveness.",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [
+          383
+        ],
+        "priority": "high",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -7878,7 +7891,7 @@
       ],
       "created": "2026-04-02T09:29:26.002Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-02T09:29:29.980Z"
+      "updated": "2026-04-02T10:55:19.693Z"
     }
   }
 }
