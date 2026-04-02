@@ -5760,7 +5760,7 @@
         "description": "Three small items for the new costs page:\n\n1. **costs.html** (line 6): Add `space-y-8` to the outer `<div class=\"max-w-7xl mx-auto p-6\">` to match index.html's layout pattern.\n\n2. **test_app.py**: Add a test that GET /costs returns expected body content (e.g., 'Costs' heading text, 'coming soon' placeholder).\n\n3. **app.py** (line 216-218): Add a docstring to the `costs()` route handler to match the pattern used by all other handlers.\n\nFiles: dashboard/src/dashboard/templates/costs.html, dashboard/tests/test_app.py, dashboard/src/dashboard/app.py",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -5776,7 +5776,7 @@
             "dashboard/tests"
           ]
         },
-        "updatedAt": "2026-04-02T04:08:12.029Z"
+        "updatedAt": "2026-04-02T04:11:44.105Z"
       },
       {
         "id": "308",
@@ -7825,9 +7825,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T04:10:30.524Z",
+      "lastModified": "2026-04-02T04:11:44.105Z",
       "taskCount": 375,
-      "completedCount": 351,
+      "completedCount": 352,
       "tags": [
         "master"
       ]
