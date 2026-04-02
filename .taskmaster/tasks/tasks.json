@@ -6127,7 +6127,7 @@
         "description": "Follow-up from task 316 review. Three test assertion gaps in orchestrator/tests/test_invoke_parsers.py:\n\n1. **Missing `turns` assertion in Gemini tests:** TestParseGeminiAbsentStats and TestParseGeminiNullStats should assert `agent_result.turns == 0` (symmetric with codex tests that assert `turns == 1`).\n\n2. **Weak cost assertions in valid-stats tests:** TestParseGeminiValidStats asserts `cost_usd > 0.0` instead of the exact expected value `0.0000225` (documented in test comment). TestParseCodexValidUsage asserts `cost_usd > 0.0` instead of `0.00066`. Use `abs(actual - expected) < 1e-10`.\n\n3. **Missing output assertion in codex valid usage:** TestParseCodexValidUsage should assert `agent_result.output == 'done'` (symmetric with the null-usage test that asserts `output == 'hello'`).\n\nmemory_hints: search \"parser test assertion strengthening\" and \"test_invoke_parsers\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6139,7 +6139,7 @@
             "orchestrator/tests"
           ]
         },
-        "updatedAt": "2026-04-02T01:41:27.486Z"
+        "updatedAt": "2026-04-02T01:43:15.038Z"
       },
       {
         "id": "324",
@@ -7692,9 +7692,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:42:35.273Z",
+      "lastModified": "2026-04-02T01:43:15.039Z",
       "taskCount": 372,
-      "completedCount": 316,
+      "completedCount": 317,
       "tags": [
         "master"
       ]
