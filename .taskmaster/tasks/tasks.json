@@ -6203,7 +6203,7 @@
         "description": "All 7 cost partials use hx-trigger=\"load\", firing simultaneously on page load. Since DbPool caches one aiosqlite connection per DB file and aiosqlite serializes through a single background thread, 7 concurrent awaits queue up sequentially — page load latency becomes the sum of all queries rather than the max.\n\nStagger with hx-trigger=\"load delay:Xs\" (0s, 0.1s, 0.2s, etc.) to spread queue pressure. Consider applying the same pattern to any other dashboard pages that fire many partials simultaneously (e.g. the performance page).\n\nmemory_hints:\n- search: \"CostStore aiosqlite DbPool singleton connection\"\n- search: \"HTMX polling intervals partial loads\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6216,7 +6216,7 @@
             "dashboard/src/dashboard/templates"
           ]
         },
-        "updatedAt": "2026-04-02T04:32:07.876Z"
+        "updatedAt": "2026-04-02T04:40:15.412Z"
       },
       {
         "id": "327",
@@ -7839,9 +7839,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T04:32:07.876Z",
+      "lastModified": "2026-04-02T04:40:15.412Z",
       "taskCount": 375,
-      "completedCount": 354,
+      "completedCount": 355,
       "tags": [
         "master"
       ]
