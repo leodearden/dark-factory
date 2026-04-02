@@ -44,9 +44,10 @@
 
   function renderCharts() {
     if (rendered) return;
-    cleanupCharts();
-    var projectIds = Object.keys(byRole);
+    if (!byRole || typeof byRole !== 'object') return;
     try {
+      cleanupCharts();
+      var projectIds = Object.keys(byRole);
       projectIds.forEach(function(projectId) {
         var el = findProjectCanvas(projectId);
         if (!el) return;
