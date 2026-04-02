@@ -447,3 +447,76 @@ def test_get_tasks_tool_docstring_mentions_compact(mcp_server_with_tasks):
     # The description/docstring should mention compact mode
     description = get_tasks_tool.description or ''
     assert 'compact' in description.lower()
+
+
+# ------------------------------------------------------------------
+# get_task_summary MCP tool (step-9)
+# ------------------------------------------------------------------
+
+
+def test_get_task_summary_tool_is_registered(mcp_server_with_tasks):
+    """get_task_summary tool should be registered in the MCP server."""
+    tools = mcp_server_with_tasks._tool_manager.list_tools()
+    names = [t.name for t in tools]
+    assert 'get_task_summary' in names
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_passes_project_root_to_interceptor(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_task_summary passes project_root to interceptor.get_task_summary."""
+    task_interceptor.get_task_summary = AsyncMock(
+        return_value={'counts': {}, 'tasks': []}
+    )
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_task_summary',
+        {'project_root': '/project'},
+    )
+    task_interceptor.get_task_summary.assert_called_once()
+    _, kwargs = task_interceptor.get_task_summary.call_args
+    assert kwargs.get('project_root') == '/project'
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_returns_structured_response(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_task_summary returns the structured counts/tasks response."""
+    expected = {
+        'counts': {'pending': 3, 'done': 10},
+        'tasks': [{'id': '1', 'status': 'pending', 'title': 'Task A'}],
+    }
+    task_interceptor.get_task_summary = AsyncMock(return_value=expected)
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_task_summary',
+        {'project_root': '/project'},
+    )
+    assert result == expected
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_returns_error_on_exception(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_task_summary returns error dict when interceptor raises."""
+    task_interceptor.get_task_summary = AsyncMock(
+        side_effect=RuntimeError('connection failed')
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_task_summary',
+        {'project_root': '/project'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_validates_project_root(mcp_server_with_tasks):
+    """get_task_summary returns error if project_root is invalid."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_task_summary',
+        {'project_root': 'relative/path'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
