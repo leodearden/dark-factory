@@ -99,6 +99,10 @@ reconciliation:
   sonnet_memory_limit: 250
   opus_episode_limit: 500
   opus_memory_limit: 1000
+  # Token-budget context assembly
+  token_budget: 65000
+  context_search_limit: 5
+  context_fetch_batch_size: 10
   usage_cap:
     enabled: true
     pause_threshold: 0.96

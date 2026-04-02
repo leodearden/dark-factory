@@ -18,6 +18,7 @@ from shared.usage_gate import UsageGate
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.reconciliation import (
+    AssembledPayload,
     ReconciliationEvent,
     ReconciliationRun,
     RunStatus,
@@ -355,6 +356,7 @@ class ReconciliationHarness:
         trigger_reason: str,
         tier: TierConfig | None = None,
         events: list[ReconciliationEvent] | None = None,
+        assembled_payload: AssembledPayload | None = None,
     ) -> ReconciliationRun:
         """Execute the three-stage pipeline for a project.
 
@@ -363,6 +365,9 @@ class ReconciliationHarness:
                     is skipped and these events are used directly.  This allows
                     BacklogIterator to pass already-drained chunk events without
                     a double-drain.
+            assembled_payload: Optional token-budgeted payload from ContextAssembler.
+                    When provided, Stage 1 uses this instead of generic
+                    time-windowed episode/memory fetches.
         """
         tier = tier or TierConfig()
         run_id = str(uuid4())
@@ -419,6 +424,7 @@ class ReconciliationHarness:
                     stage.memory_limit = tier.memory_limit
                     stage.prior_s3_findings = prior_s3_findings
                     stage.cycle_fence_time = cycle_start_time
+                    stage.assembled_payload = assembled_payload
 
                 report = await stage.run(
                     events, watermark, reports, run_id, model=tier.model,
@@ -710,7 +716,7 @@ class ReconciliationHarness:
 
 
 class BacklogIterator:
-    """Processes large backlogs in chunks, oldest-first, then consolidates."""
+    """Processes large backlogs in token-budgeted chunks, oldest-first."""
 
     def __init__(
         self,
@@ -732,14 +738,14 @@ class BacklogIterator:
         return count > threshold
 
     async def run(self, project_id: str) -> None:
-        """Process backlog in chunks, oldest-first, then consolidate.
+        """Process backlog in token-budgeted chunks, oldest-first.
 
-        Only drains events buffered before this method was called.  Events
-        that arrive *during* processing are left for the next trigger cycle,
-        preventing the loop from running indefinitely when events arrive
-        faster than chunks are processed.
+        Uses peek → assemble → drain: peeks at buffered events, builds a
+        token-budgeted payload via ContextAssembler, then drains only the
+        events that fit.  Stops when no events remain before the cutoff.
         """
-        chunk_size = self.config.buffer_size_threshold
+        from fused_memory.reconciliation.context_assembler import ContextAssembler
+
         opus_tier = TierConfig(
             model=self.config.opus_model,
             episode_limit=self.config.opus_episode_limit,
@@ -749,31 +755,58 @@ class BacklogIterator:
         # Snapshot: only process events that existed when we started.
         cutoff = datetime.now(UTC)
 
+        # Extract project_root from first event (for taskmaster calls)
+        peeked_first = await self.buffer.peek_buffered(project_id, limit=1, before=cutoff)
+        project_root = project_id
+        if peeked_first:
+            project_root = peeked_first[0].payload.get('_project_root', project_id)
+
+        assembler = ContextAssembler(
+            memory_service=self.harness.memory,
+            taskmaster=self.harness.taskmaster,
+            config=self.config,
+            project_root=project_root,
+        )
+
+        watermark = await self.journal.get_watermark(project_id)
+
         chunk_num = 0
         while True:
-            chunk = await self.buffer.drain_oldest_chunk(
-                project_id, chunk_size, before=cutoff,
+            # Peek at up to 1000 events (far more than a single budget can hold)
+            peeked = await self.buffer.peek_buffered(
+                project_id, limit=1000, before=cutoff,
             )
-            if not chunk:
+            if not peeked:
                 break
+
+            # Assemble token-budgeted payload
+            assembled = await assembler.assemble(peeked, watermark, project_id)
+            if not assembled.events:
+                break
+
+            # Drain exactly the events that fit the budget
+            event_ids = [e.id for e in assembled.events]
+            await self.buffer.drain_by_ids(project_id, event_ids)
 
             chunk_num += 1
             chunk_id = str(uuid4())
             await self.journal.record_chunk_boundary(
-                project_id, chunk_id, len(chunk),
+                project_id, chunk_id, len(assembled.events),
             )
 
             logger.info(
-                f'Backlog chunk {chunk_num}: processing {len(chunk)} events '
-                f'for {project_id}'
+                f'Backlog chunk {chunk_num}: processing {len(assembled.events)} events '
+                f'({assembled.total_tokens} tokens, {len(assembled.context_items)} context items, '
+                f'{assembled.events_remaining} remaining) for {project_id}'
             )
 
             try:
                 await asyncio.wait_for(
                     self.harness.run_full_cycle(
-                        project_id, f'backlog_chunk:{chunk_num}:{len(chunk)}',
+                        project_id, f'backlog_chunk:{chunk_num}:{len(assembled.events)}',
                         tier=opus_tier,
-                        events=chunk,
+                        events=assembled.events,
+                        assembled_payload=assembled,
                     ),
                     timeout=self.config.cycle_timeout_seconds,
                 )

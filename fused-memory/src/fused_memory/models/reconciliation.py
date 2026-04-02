@@ -1,5 +1,6 @@
 """Models for the sleep mode reconciliation system."""
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
@@ -50,6 +51,36 @@ class ReconciliationEvent(BaseModel):
     @classmethod
     def normalize_project_id(cls, v):
         return _normalize_project_id(v)
+
+
+@dataclass
+class ContextItem:
+    """A piece of context fetched for a specific event during payload assembly.
+
+    Used by the ContextAssembler to build event-driven payloads where each
+    event's related memories/entities/tasks are fetched and deduplicated.
+    """
+
+    id: str              # dedup key (memory ID, entity name, episode UUID)
+    source: str          # 'graphiti', 'mem0', or 'task'
+    formatted: str       # pre-formatted text for the payload
+    token_estimate: int = 0  # len(formatted) // 4, set post-init if 0
+
+    def __post_init__(self):
+        if self.token_estimate == 0:
+            self.token_estimate = len(self.formatted) // 4
+
+
+@dataclass
+class AssembledPayload:
+    """Result of the ContextAssembler — a token-budgeted chunk of events with
+    per-event context, ready for Stage 1 payload formatting."""
+
+    events: list  # list[ReconciliationEvent] — forward ref avoids circular
+    context_items: dict[str, ContextItem] = field(default_factory=dict)
+    total_tokens: int = 0
+    events_remaining: int = 0
+    effective_watermark: datetime | None = None
 
 
 class JournalEntry(BaseModel):

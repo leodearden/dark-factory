@@ -252,6 +252,11 @@ class ReconciliationConfig(BaseModel):
     opus_episode_limit: int = Field(default=500)
     opus_memory_limit: int = Field(default=1000)
 
+    # Token-budget context assembly
+    token_budget: int = Field(default=65_000)
+    context_search_limit: int = Field(default=5)
+    context_fetch_batch_size: int = Field(default=10)
+
     # Usage cap detection and multi-account failover
     usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)
 

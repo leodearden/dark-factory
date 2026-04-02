@@ -387,6 +387,67 @@ class EventBuffer:
             ))
         return events
 
+    async def peek_buffered(
+        self, project_id: str, limit: int,
+        before: datetime | None = None,
+    ) -> list[ReconciliationEvent]:
+        """Read buffered events without marking them as drained.
+
+        Same query as ``drain_oldest_chunk`` but read-only — used by the
+        ContextAssembler to determine which events fit the token budget
+        before committing to a drain.
+        """
+        db = self._require_db()
+        if before is not None:
+            query = """SELECT * FROM event_buffer
+                       WHERE project_id = ? AND status = 'buffered'
+                         AND timestamp < ?
+                       ORDER BY timestamp ASC
+                       LIMIT ?"""
+            params: tuple = (project_id, before.isoformat(), limit)
+        else:
+            query = """SELECT * FROM event_buffer
+                       WHERE project_id = ? AND status = 'buffered'
+                       ORDER BY timestamp ASC
+                       LIMIT ?"""
+            params = (project_id, limit)
+        async with db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+
+        return [
+            ReconciliationEvent(
+                id=row['id'],
+                project_id=row['project_id'],
+                type=EventType(row['event_type']),
+                source=EventSource(row['event_source']),
+                agent_id=row['agent_id'],
+                timestamp=datetime.fromisoformat(row['timestamp']),
+                payload=json.loads(row['payload']),
+            )
+            for row in rows
+        ]
+
+    async def drain_by_ids(
+        self, project_id: str, ids: list[str],
+    ) -> int:
+        """Mark specific event IDs as drained.
+
+        Used after the ContextAssembler determines which events fit the
+        token budget.  Returns the number of rows updated.
+        """
+        if not ids:
+            return 0
+        db = self._require_db()
+        placeholders = ','.join('?' for _ in ids)
+        cursor = await db.execute(
+            f"""UPDATE event_buffer SET status = 'drained'
+                WHERE project_id = ? AND id IN ({placeholders})
+                  AND status = 'buffered'""",
+            [project_id, *ids],
+        )
+        await db.commit()
+        return cursor.rowcount
+
     async def restore_drained(self, project_id: str) -> int:
         """Restore drained events to 'buffered' after a failed run."""
         db = self._require_db()

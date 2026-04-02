@@ -7,6 +7,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fused_memory.models.reconciliation import (
+    AssembledPayload,
+    ContextItem,
     ReconciliationEvent,
     StageReport,
     Watermark,
@@ -34,6 +36,10 @@ class MemoryConsolidator(BaseStage):
     # Cycle fence — set by harness to protect targeted-recon writes
     cycle_fence_time: datetime | None = None
 
+    # Token-budget assembled payload — set by harness when using ContextAssembler.
+    # When set, assemble_payload() uses this instead of the generic time-windowed fetch.
+    assembled_payload: AssembledPayload | None = None
+
     def get_system_prompt(self) -> str:
         return STAGE1_SYSTEM_PROMPT
 
@@ -46,6 +52,10 @@ class MemoryConsolidator(BaseStage):
         watermark: Watermark,
         prior_reports: list[StageReport],
     ) -> str:
+        # Token-budget assembled payload — skip generic fetch
+        if self.assembled_payload is not None:
+            return await self._format_assembled_payload(watermark)
+
         # Validate that limits were explicitly set by the harness
         if self.episode_limit is None or self.memory_limit is None:
             raise ValueError(
@@ -127,10 +137,70 @@ class MemoryConsolidator(BaseStage):
 {event_summary}
 
 ### New Episodes Since Last Reconciliation ({len(new_episodes)})
-{_format_episodes(new_episodes[:200])}
+{_format_episodes(new_episodes)}
 
 ### New Mem0 Memories Since Last Reconciliation ({len(new_memories)})
-{_format_memories(new_memories[:200])}
+{_format_memories(new_memories)}
+
+### Store Status
+{json.dumps(status, indent=2, default=str)}
+
+### Previous Reconciliation
+{_format_watermark(watermark)}
+{prior_s3_section}{cycle_fence_section}
+## Your Task
+Review the above data and perform memory consolidation:
+1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
+2. Within Graphiti: review entity consistency, superseded temporal facts.
+3. Cross-store: check for contradictions between stores. Promote solidified patterns.
+4. Flag any items that are relevant to task planning for Stage 2.
+5. When you have completed your work, produce your final structured report as your response.
+
+{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
+"""
+
+    async def _format_assembled_payload(self, watermark: Watermark) -> str:
+        """Format a payload from ContextAssembler output — event-driven context."""
+        ap = self.assembled_payload
+        assert ap is not None
+
+        event_summary = _format_events(ap.events)
+
+        # Store status (cheap fetch, always useful)
+        try:
+            status = await self.memory.get_status(project_id=self.project_id)
+        except Exception:
+            status = {}
+
+        # Prior S3 findings
+        prior_s3_section = ''
+        if self.prior_s3_findings:
+            prior_s3_section = (
+                f'\n### Prior Stage 3 Findings ({len(self.prior_s3_findings)})\n'
+                f'These issues were found in the last integrity check and should be addressed '
+                f'during this consolidation pass if possible.\n'
+                f'{_format_findings(self.prior_s3_findings)}\n'
+            )
+
+        # Cycle fence
+        cycle_fence_section = ''
+        if self.cycle_fence_time:
+            cycle_fence_section = (
+                f'\n### Cycle Fence\n'
+                f'This cycle started at {self.cycle_fence_time.isoformat()}.\n'
+                f'Do NOT delete, merge, or modify any memory whose metadata includes '
+                f'`source=targeted_reconciliation` and was created after this timestamp. '
+                f'These are recent targeted reconciliation writes that must be preserved.\n'
+            )
+
+        return f"""## Reconciliation Run — Stage 1: Memory Consolidation
+## Project: {self.project_id}
+
+### Buffered Events ({len(ap.events)})
+{event_summary}
+
+### Related Context ({len(ap.context_items)} items)
+{_format_context_items(ap.context_items)}
 
 ### Store Status
 {json.dumps(status, indent=2, default=str)}
@@ -198,6 +268,21 @@ def _format_memories(memories: list[dict]) -> str:
         cat = meta.get('category', '?')
         lines.append(f'- [{m.get("id", "?")}] ({cat}): {content}')
     return '\n'.join(lines)
+
+
+def _format_context_items(items: dict[str, ContextItem]) -> str:
+    """Format context items grouped by source."""
+    if not items:
+        return 'No related context.'
+    by_source: dict[str, list[ContextItem]] = {}
+    for item in items.values():
+        by_source.setdefault(item.source, []).append(item)
+    sections = []
+    for source, source_items in sorted(by_source.items()):
+        sections.append(f'**{source}** ({len(source_items)})')
+        for item in source_items:
+            sections.append(item.formatted)
+    return '\n'.join(sections)
 
 
 def _format_findings(findings: list[dict]) -> str:

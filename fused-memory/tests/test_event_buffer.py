@@ -713,3 +713,127 @@ async def test_deferred_writes_ordering(buf):
 
     writes = await buf.pop_deferred_writes('test-project')
     assert [w['content'] for w in writes] == ['first', 'second', 'third']
+
+
+# ── Peek and targeted drain ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_peek_buffered_does_not_drain(buf):
+    """peek_buffered returns events without changing their status."""
+    await buf.push(_make_event())
+    await buf.push(_make_event())
+
+    peeked = await buf.peek_buffered('test-project', limit=10)
+    assert len(peeked) == 2
+
+    # Events should still be buffered
+    stats = await buf.get_buffer_stats('test-project')
+    assert stats['size'] == 2
+
+    # A second peek returns the same events
+    peeked2 = await buf.peek_buffered('test-project', limit=10)
+    assert len(peeked2) == 2
+
+
+@pytest.mark.asyncio
+async def test_peek_buffered_respects_limit(buf):
+    """peek_buffered only returns up to limit events."""
+    for _ in range(5):
+        await buf.push(_make_event())
+
+    peeked = await buf.peek_buffered('test-project', limit=3)
+    assert len(peeked) == 3
+
+
+@pytest.mark.asyncio
+async def test_peek_buffered_respects_before(buf):
+    """peek_buffered with before= filters by timestamp."""
+    old = datetime.now(UTC) - timedelta(hours=2)
+    recent = datetime.now(UTC)
+    cutoff = datetime.now(UTC) - timedelta(hours=1)
+
+    await buf.push(_make_event(timestamp=old))
+    await buf.push(_make_event(timestamp=recent))
+
+    peeked = await buf.peek_buffered('test-project', limit=10, before=cutoff)
+    assert len(peeked) == 1
+    assert peeked[0].timestamp < cutoff
+
+
+@pytest.mark.asyncio
+async def test_peek_buffered_returns_oldest_first(buf):
+    """peek_buffered returns events ordered by timestamp ascending."""
+    t1 = datetime.now(UTC) - timedelta(minutes=3)
+    t2 = datetime.now(UTC) - timedelta(minutes=2)
+    t3 = datetime.now(UTC) - timedelta(minutes=1)
+
+    await buf.push(_make_event(timestamp=t3))
+    await buf.push(_make_event(timestamp=t1))
+    await buf.push(_make_event(timestamp=t2))
+
+    peeked = await buf.peek_buffered('test-project', limit=10)
+    assert [e.timestamp for e in peeked] == [t1, t2, t3]
+
+
+@pytest.mark.asyncio
+async def test_drain_by_ids_marks_specific_events(buf):
+    """drain_by_ids marks exactly the specified IDs as drained."""
+    e1 = _make_event()
+    e2 = _make_event()
+    e3 = _make_event()
+    await buf.push(e1)
+    await buf.push(e2)
+    await buf.push(e3)
+
+    count = await buf.drain_by_ids('test-project', [e1.id, e3.id])
+    assert count == 2
+
+    # e2 should still be buffered
+    stats = await buf.get_buffer_stats('test-project')
+    assert stats['size'] == 1
+
+    # Drain the remaining one
+    remaining = await buf.drain('test-project')
+    assert len(remaining) == 1
+    assert remaining[0].id == e2.id
+
+
+@pytest.mark.asyncio
+async def test_drain_by_ids_empty_list(buf):
+    """drain_by_ids with empty list is a no-op."""
+    await buf.push(_make_event())
+    count = await buf.drain_by_ids('test-project', [])
+    assert count == 0
+    assert (await buf.get_buffer_stats('test-project'))['size'] == 1
+
+
+@pytest.mark.asyncio
+async def test_drain_by_ids_ignores_wrong_project(buf):
+    """drain_by_ids only affects the specified project."""
+    e1 = _make_event(project_id='project-a')
+    e2 = _make_event(project_id='project-b')
+    await buf.push(e1)
+    await buf.push(e2)
+
+    count = await buf.drain_by_ids('project-a', [e1.id, e2.id])
+    # e2 belongs to project-b, so only e1 should be drained
+    assert count == 1
+    assert (await buf.get_buffer_stats('project-a'))['size'] == 0
+    assert (await buf.get_buffer_stats('project-b'))['size'] == 1
+
+
+@pytest.mark.asyncio
+async def test_peek_then_drain_by_ids_workflow(buf):
+    """peek_buffered → select subset → drain_by_ids is the intended workflow."""
+    for _ in range(5):
+        await buf.push(_make_event())
+
+    peeked = await buf.peek_buffered('test-project', limit=10)
+    assert len(peeked) == 5
+
+    # "Assemble" selects first 3
+    selected_ids = [e.id for e in peeked[:3]]
+    count = await buf.drain_by_ids('test-project', selected_ids)
+    assert count == 3
+    assert (await buf.get_buffer_stats('test-project'))['size'] == 2
