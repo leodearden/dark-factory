@@ -6995,11 +6995,11 @@
         "description": "Three related issues in dashboard/src/dashboard/templates/partials/costs/by_role.html:\n\n1. **Global DOM scope** (lines 27-32): findProjectCanvas queries document globally via querySelectorAll. If the partial is embedded twice (comparison view, stale HTMX copy), charts render into the wrong canvas silently. Scope the query to the enclosing container via document.currentScript.closest('div') or a data attribute.\n\n2. **Double render on HTMX refresh** (lines 97-100): Both immediate renderCharts() (readyState never 'loading' for partial update) and htmx:afterSettle fire on every poll, causing two Chart.js destroy/recreate cycles and visible flicker. Remove the immediate fallback path or guard it.\n\n3. **Orphaned Chart.js instances** (lines 35-40): If morph falls back to innerHTML swap, old canvas elements are replaced but Chart.js instances referencing them are never destroyed. Add cleanup for detached canvas instances before rendering.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-02T01:20:54.449Z",
+        "updatedAt": "2026-04-02T01:20:56.513Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/costs/by_role.html"
@@ -7602,7 +7602,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:20:56.253Z",
+      "lastModified": "2026-04-02T01:20:56.513Z",
       "taskCount": 365,
       "completedCount": 302,
       "tags": [
