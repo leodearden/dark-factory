@@ -4257,7 +4257,7 @@
         "description": "The HTMX jitter polling script in base.html has three robustness gaps identified during task-185 review. (1) parseInt(base,10) returns NaN on malformed data-poll-base values, and setTimeout(fn, NaN) fires at delay 0, creating a tight polling loop — the opposite of the thundering-herd fix. Add isNaN/<=0 guard. (2) afterSettle handler checks el.dataset.pollBase directly while recoverPoll uses closest('[data-poll-base]') — make both use closest() for consistency. (3) No timer deduplication: concurrent error+settle events can stack exponential timers. Use a WeakMap keyed by element to clearTimeout before scheduling. (4) evt.detail.target fallback in recoverPoll is unreachable in HTMX 2.x — document or remove.",
         "details": "File: dashboard/src/dashboard/templates/base.html (jitter polling IIFE, lines ~40-60).\n\nSpecific changes:\n1. After `var baseMs = parseInt(base, 10) * 1000;`, add: `if (isNaN(baseMs) || baseMs <= 0) { return; }`\n2. In afterSettle handler, replace `if (el.dataset.pollBase)` with `el = el.closest('[data-poll-base]'); if (el) { scheduleNext(el); }`\n3. Add `var _timers = new WeakMap();` at top of IIFE. In scheduleNext: `clearTimeout(_timers.get(el)); var tid = setTimeout(...); _timers.set(el, tid);`\n4. Either document the evt.detail.target fallback with a comment explaining HTMX version compatibility, or remove if confirmed dead in HTMX 2.x.\n\nmemory_hints: search \"HTMX jitter polling\" and \"task 185\" for original implementation context.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "185"
         ],
@@ -4272,7 +4272,8 @@
             "dashboard/src/dashboard/templates",
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T02:40:04.742Z"
       },
       {
         "id": "241",
@@ -7800,7 +7801,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:40:04.589Z",
+      "lastModified": "2026-04-02T02:40:04.742Z",
       "taskCount": 375,
       "completedCount": 344,
       "tags": [
