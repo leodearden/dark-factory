@@ -6759,7 +6759,7 @@
         "description": "Three classes now repeat identical SQLite initialization boilerplate: DurableWriteQueue, EventBuffer, and PlannedEpisodeRegistry. Each has the same `PRAGMA journal_mode=WAL` + `PRAGMA busy_timeout=5000` setup, the same `_db: aiosqlite.Connection | None` field, and the same initialize()/close() lifecycle shape.\n\nConsider introducing a small `AsyncSQLiteService` base class or a module-level `_open_db(path)` helper that applies the standard PRAGMAs. This would reduce three copies of identical PRAGMA setup to one and make future PRAGMA changes apply uniformly.\n\nmemory_hints: search for \"SQLite PRAGMA boilerplate\" and \"DurableWriteQueue EventBuffer PlannedEpisodeRegistry\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6779,7 +6779,8 @@
             "fused-memory/src/fused_memory/utils",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T02:23:18.187Z"
       },
       {
         "id": "354",
@@ -7765,7 +7766,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:23:16.374Z",
+      "lastModified": "2026-04-02T02:23:18.187Z",
       "taskCount": 374,
       "completedCount": 337,
       "tags": [
