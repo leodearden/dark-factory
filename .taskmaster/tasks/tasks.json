@@ -7949,11 +7949,19 @@
           "source": "reconciliation-stage2",
           "predecessor_task": 98,
           "regression_number": 2,
-          "_causation_id": "54c04f01-fb8e-4cba-baf3-5f866068829b",
+          "_causation_id": "dffd2365-0cf3-407b-8634-8fef6a6dc16a",
           "memory_hints": {
-            "entities": [],
+            "entities": [
+              "Mem0",
+              "Qdrant",
+              "DurableWriteQueue",
+              "mem0_client.py"
+            ],
             "queries": [
-              "resolution for: Fix Mem0 search regression — second occurrence, all queries return 0 results despite 3024 memories"
+              "Mem0 search regression broken zero results",
+              "dead letter queue DLQ growth Mem0 write failures",
+              "Task 98 Mem0 search fix agent_id run_id filter",
+              "Mem0 search empty project_id returns empty results"
             ]
           },
           "files": [
@@ -7964,7 +7972,8 @@
           "modules": [
             "fused-memory/src/fused_memory/backends",
             "fused-memory/src/fused_memory/routing"
-          ]
+          ],
+          "investigation_lead": "Memory f4c706fa notes that Mem0 search with empty project_id returns empty results despite 1483 memories — this may be the root cause of the second regression if project_id is not being passed correctly in some code path."
         },
         "updatedAt": "2026-04-02T12:58:44.447Z"
       },
