@@ -7172,7 +7172,7 @@
         "description": "Two test gaps in TestPlannedEpisodePromotion (test_targeted.py): (1) test_dedup_promotion_across_shared_provenance verifies promote() call count and UUID set, but does not assert the returned result dict contains the correct deduplicated count in the 'planned_episodes_promoted' action — a regression recording count=4 instead of 3 would pass undetected. Add: `assert any(a == {'type': 'planned_episodes_promoted', 'count': 3} for a in result['actions'])`. (2) test_promotion_called_for_planned_edges uses `assert_called_with(ep_uuid)` which only checks the last call, not call count — change to `assert_called_once_with(ep_uuid)`. Also clean up the 3 redundant inline imports of SourceStore/MemoryResult at lines 596-597, 640-641, 668-669 (already imported at module scope).\n\nmemory_hints: search for \"planned episode promotion tests\" and \"test_targeted TestPlannedEpisodePromotion\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -7184,7 +7184,7 @@
             "fused-memory/tests"
           ]
         },
-        "updatedAt": "2026-04-02T02:40:32.466Z"
+        "updatedAt": "2026-04-02T04:01:55.875Z"
       },
       {
         "id": "373",
@@ -7802,9 +7802,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:40:32.466Z",
+      "lastModified": "2026-04-02T04:01:55.875Z",
       "taskCount": 375,
-      "completedCount": 345,
+      "completedCount": 346,
       "tags": [
         "master"
       ]
