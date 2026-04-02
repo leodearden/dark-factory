@@ -7550,7 +7550,7 @@
         "description": "Two recurring patterns produce valueless Graphiti edges that must be cleaned up every reconciliation cycle:\n\n1. **File-change combinatorial edges**: When raw commit diffs are ingested via add_episode, the extraction pipeline produces \"Changed X and Y files\" edges for every file pair — combinatorial explosion with no semantic value. Episode 5a9834cf produced 34+ such edges (all deleted in cycle 07d74244).\n\n2. **Status echo edges**: When task status changes are ingested as episodes, bare \"Task N is now [status]\" facts get created as Graphiti edges. Episode b12b1af9 produced 6 such edges (deleted in prior cycles). The pattern recurs on every status transition ingestion.\n\nFix: Add post-extraction filtering or extraction prompt guardrails in the Graphiti ingestion pipeline to:\n- Reject edges matching \"Changed/Modified {file} and {file}\" patterns\n- Reject edges matching \"Task {N} is now {status}\" bare status echoes\n- Consider a configurable deny-list of low-value edge patterns\n\nmemory_hints:\n- search: \"episode ingestion noise edges file change patterns\"\n- search: \"status echo prevention task status ingestion\"\n- entity: \"add_episode\"\n- entity: \"graphiti_client\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -7577,7 +7577,7 @@
             "fused-memory/tests"
           ]
         },
-        "updatedAt": "2026-04-02T01:33:16.400Z"
+        "updatedAt": "2026-04-02T01:38:54.105Z"
       },
       {
         "id": "386",
@@ -7611,9 +7611,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:38:34.946Z",
+      "lastModified": "2026-04-02T01:38:54.105Z",
       "taskCount": 365,
-      "completedCount": 311,
+      "completedCount": 312,
       "tags": [
         "master"
       ]
