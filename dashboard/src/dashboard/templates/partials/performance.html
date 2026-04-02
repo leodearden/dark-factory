@@ -129,14 +129,6 @@
 
   var histColor = '#60a5fa';
 
-  function getOrDestroyChart(canvasId) {
-    var el = document.getElementById(canvasId);
-    if (!el) return null;
-    var existing = Chart.getChart(el);
-    if (existing) existing.destroy();
-    return el;
-  }
-
   function renderAll() {
     Object.keys(pathsData).forEach(function(projectId) {
       /* --- Completion paths doughnut --- */
@@ -232,7 +224,7 @@
     });
   }
 
-  document.body.addEventListener('htmx:afterSettle', renderAll, { once: true });
+  renderAll();
 })();
 </script>
 {% endif %}

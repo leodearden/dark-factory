@@ -237,11 +237,12 @@ class TestChartInitTiming:
             html = client.get('/partials/performance').text
         assert 'requestAnimationFrame' not in html
 
-    def test_htmx_after_settle_listener(self, client):
-        """htmx:afterSettle one-shot event listener must be present in rendered HTML."""
+    def test_single_render_path(self, client):
+        """Chart must render via a direct call (no htmx:afterSettle listener)."""
         with _patch_perf_data():
             html = client.get('/partials/performance').text
-        assert 'htmx:afterSettle' in html
+        assert 'htmx:afterSettle' not in html
+        assert 'renderAll()' in html
 
     def test_render_all_function_present(self, client):
         """renderAll function must still be present after the timing fix."""

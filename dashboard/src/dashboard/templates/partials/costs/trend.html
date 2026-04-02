@@ -14,19 +14,6 @@
 (function() {
   var trend = {{ trend | tojson }};
 
-  var palette = [
-    '#60a5fa','#34d399','#fbbf24','#f87171','#a78bfa',
-    '#fb923c','#38bdf8','#4ade80','#e879f9','#94a3b8'
-  ];
-
-  function getOrDestroyChart(canvasId) {
-    var el = document.getElementById(canvasId);
-    if (!el) return null;
-    var existing = Chart.getChart(el);
-    if (existing) existing.destroy();
-    return el;
-  }
-
   function renderChart() {
     var el = getOrDestroyChart('costTrendChart');
     if (!el) return;
@@ -41,8 +28,8 @@
       return {
         label: projectId,
         data: trend[projectId].map(function(d) { return d.total; }),
-        borderColor: palette[idx % palette.length],
-        backgroundColor: palette[idx % palette.length] + '33',  // 20% opacity fill
+        borderColor: CHART_PALETTE[idx % CHART_PALETTE.length],
+        backgroundColor: CHART_PALETTE[idx % CHART_PALETTE.length] + '33',  // 20% opacity fill
         borderWidth: 2,
         pointRadius: 3,
         tension: 0.3,
@@ -77,9 +64,6 @@
     });
   }
 
-  document.addEventListener('htmx:afterSettle', renderChart, { once: true });
-  if (document.readyState !== 'loading') {
-    renderChart();
-  }
+  renderChart();
 })();
 </script>

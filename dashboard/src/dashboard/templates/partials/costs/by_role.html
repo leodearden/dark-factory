@@ -19,13 +19,7 @@
   var container = (document.currentScript && document.currentScript.closest('[data-by-role-container]')) || document.querySelector('[data-by-role-container]');
   if (!container) return;
   var byRole = {{ by_role | tojson }};
-  var rendered = false;
   var chartInstances = [];
-
-  var palette = [
-    '#60a5fa','#34d399','#fbbf24','#f87171','#a78bfa',
-    '#fb923c','#38bdf8','#4ade80','#e879f9','#94a3b8'
-  ];
 
   function findProjectCanvas(projectId) {
     var canvases = container.querySelectorAll('canvas[data-project-id]');
@@ -43,76 +37,66 @@
   }
 
   function renderCharts() {
-    if (rendered) return;
     if (!byRole || typeof byRole !== 'object') return;
-    try {
-      cleanupCharts();
-      var projectIds = Object.keys(byRole);
-      projectIds.forEach(function(projectId) {
-        var el = findProjectCanvas(projectId);
-        if (!el) return;
-        var existing = Chart.getChart(el);
-        if (existing) existing.destroy();
+    cleanupCharts();
+    var projectIds = Object.keys(byRole);
+    projectIds.forEach(function(projectId) {
+      var el = findProjectCanvas(projectId);
+      if (!el) return;
+      var existing = Chart.getChart(el);
+      if (existing) existing.destroy();
 
-        var rolesData = byRole[projectId];
-        var roleNames = Object.keys(rolesData);
+      var rolesData = byRole[projectId];
+      var roleNames = Object.keys(rolesData);
 
-        // Collect all unique models across all roles for this project
-        var allModels = [];
-        roleNames.forEach(function(role) {
-          Object.keys(rolesData[role]).forEach(function(model) {
-            if (allModels.indexOf(model) === -1) allModels.push(model);
-          });
+      // Collect all unique models across all roles for this project
+      var allModels = [];
+      roleNames.forEach(function(role) {
+        Object.keys(rolesData[role]).forEach(function(model) {
+          if (allModels.indexOf(model) === -1) allModels.push(model);
         });
+      });
 
-        // Build datasets: one per model, data = cost per role
-        var datasets = allModels.map(function(model, idx) {
-          return {
-            label: model,
-            data: roleNames.map(function(role) {
-              return rolesData[role][model] || 0;
-            }),
-            backgroundColor: palette[idx % palette.length],
-          };
-        });
+      // Build datasets: one per model, data = cost per role
+      var datasets = allModels.map(function(model, idx) {
+        return {
+          label: model,
+          data: roleNames.map(function(role) {
+            return rolesData[role][model] || 0;
+          }),
+          backgroundColor: CHART_PALETTE[idx % CHART_PALETTE.length],
+        };
+      });
 
-        var chart = new Chart(el, {
-          type: 'bar',
-          data: { labels: roleNames, datasets: datasets },
-          options: {
-            indexAxis: 'y',
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-              legend: { labels: { color: '#9ca3af', font: { size: 11 } } },
+      var chart = new Chart(el, {
+        type: 'bar',
+        data: { labels: roleNames, datasets: datasets },
+        options: {
+          indexAxis: 'y',
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { labels: { color: '#9ca3af', font: { size: 11 } } },
+          },
+          scales: {
+            x: {
+              stacked: true,
+              ticks: { color: '#9ca3af', callback: function(v) { return '$' + v.toFixed(2); } },
+              grid: { color: 'rgba(75,85,99,0.3)' },
             },
-            scales: {
-              x: {
-                stacked: true,
-                ticks: { color: '#9ca3af', callback: function(v) { return '$' + v.toFixed(2); } },
-                grid: { color: 'rgba(75,85,99,0.3)' },
-              },
-              y: {
-                stacked: true,
-                ticks: { color: '#9ca3af' },
-                grid: { display: false },
-              },
+            y: {
+              stacked: true,
+              ticks: { color: '#9ca3af' },
+              grid: { display: false },
             },
           },
-        });
-        chartInstances.push(chart);
+        },
       });
-      rendered = true;
-    } catch(e) {
-      rendered = false;
-      throw e;
-    }
+      chartInstances.push(chart);
+    });
   }
 
-  document.addEventListener('htmx:afterSettle', renderCharts, { once: true });
-  if (document.readyState !== 'loading') {
-    renderCharts();
-  }
+  renderCharts();
 })();
 </script>
 </div>

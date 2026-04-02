@@ -58,19 +58,6 @@
 (function() {
   var byAccount = {{ by_account | tojson }};
 
-  var palette = [
-    '#60a5fa','#34d399','#fbbf24','#f87171','#a78bfa',
-    '#fb923c','#38bdf8','#4ade80','#e879f9','#94a3b8'
-  ];
-
-  function getOrDestroyChart(canvasId) {
-    var el = document.getElementById(canvasId);
-    if (!el) return null;
-    var existing = Chart.getChart(el);
-    if (existing) existing.destroy();
-    return el;
-  }
-
   function renderChart() {
     var el = getOrDestroyChart('costByAccountChart');
     if (!el) return;
@@ -84,7 +71,7 @@
         labels: labels,
         datasets: [{
           data: values,
-          backgroundColor: labels.map(function(_, i) { return palette[i % palette.length]; }),
+          backgroundColor: labels.map(function(_, i) { return CHART_PALETTE[i % CHART_PALETTE.length]; }),
           borderWidth: 1,
           borderColor: '#1f2937',
         }],
@@ -108,9 +95,6 @@
     });
   }
 
-  document.addEventListener('htmx:afterSettle', renderChart, { once: true });
-  if (document.readyState !== 'loading') {
-    renderChart();
-  }
+  renderChart();
 })();
 </script>

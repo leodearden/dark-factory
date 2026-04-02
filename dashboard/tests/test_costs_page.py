@@ -297,11 +297,11 @@ class TestCostsByProjectPartial:
             html = client.get('/costs/partials/by-project').text
         assert 'new Chart' in html
 
-    def test_uses_color_palette(self, client):
-        """Must use the standard 10-color palette."""
+    def test_uses_shared_chart_palette(self, client):
+        """Must reference the shared CHART_PALETTE (loaded from chart-utils.js)."""
         with _patch_by_project():
             html = client.get('/costs/partials/by-project').text
-        assert '#60a5fa' in html  # first color from palette
+        assert 'CHART_PALETTE' in html
 
     def test_handles_empty_data(self, client):
         with _patch_by_project(return_value={}):
@@ -363,11 +363,11 @@ class TestCostsByRolePartial:
             html = client.get('/costs/partials/by-role').text
         assert 'new Chart' in html
 
-    def test_uses_color_palette(self, client):
-        """Must use the standard 10-color palette."""
+    def test_uses_shared_chart_palette(self, client):
+        """Must reference the shared CHART_PALETTE (loaded from chart-utils.js)."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
-        assert '#60a5fa' in html  # first color from palette
+        assert 'CHART_PALETTE' in html
 
     def test_role_names_appear_in_output(self, client):
         """Role names from the data should appear in the rendered HTML."""

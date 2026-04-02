@@ -72,32 +72,34 @@ class TestByRoleDomScoping:
 # ---------------------------------------------------------------------------
 
 
-class TestByRoleRenderGuard:
-    """Tests that by_role.html prevents double-render via a rendered boolean guard."""
+class TestByRoleSingleRenderPath:
+    """Tests that by_role.html uses a single render path (no dual htmx listener + immediate call)."""
 
-    def test_rendered_guard_variable_declared(self, client):
-        """Script must declare a 'rendered' boolean guard variable."""
+    def test_no_htmx_after_settle_listener(self, client):
+        """htmx:afterSettle listener must NOT be registered (single code path)."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
-        assert 'var rendered = false' in html
+        assert 'htmx:afterSettle' not in html
 
-    def test_render_charts_starts_with_guard_check(self, client):
-        """renderCharts function body must start with the guard check."""
+    def test_direct_render_call(self, client):
+        """renderCharts must be called directly (single code path)."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
-        assert 'if (rendered) return' in html
+        # renderCharts() call as a statement (not inside addEventListener)
+        assert 'renderCharts();' in html
 
-    def test_htmx_after_settle_listener_present(self, client):
-        """htmx:afterSettle listener must still be registered."""
+    def test_uses_shared_chart_palette(self, client):
+        """Must reference the shared CHART_PALETTE instead of a local palette array."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
-        assert "htmx:afterSettle" in html
+        assert 'CHART_PALETTE' in html
+        assert 'var palette' not in html
 
-    def test_rendered_set_to_true_inside_render_charts(self, client):
-        """renderCharts must set rendered = true to latch after first execution."""
+    def test_no_rendered_guard_needed(self, client):
+        """With a single render path, no 'rendered' boolean guard is needed."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
-        assert 'rendered = true' in html
+        assert 'var rendered' not in html
 
 
 # ---------------------------------------------------------------------------
@@ -178,66 +180,30 @@ class TestByRoleCurrentScriptNullGuard:
 # ---------------------------------------------------------------------------
 
 
-class TestByRoleRenderErrorRecovery:
-    """Tests that by_role.html recovers from render-time exceptions without permanent lockout."""
+class TestByRoleRenderChartStructure:
+    """Tests that by_role.html renderCharts has correct structure."""
 
-    def test_foreach_loop_wrapped_in_try_block(self, client):
-        """The projectIds.forEach loop must be wrapped in a try block inside renderCharts."""
+    def test_render_charts_function_present(self, client):
+        """renderCharts function must be defined."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
-        # Anchor to 'function renderCharts' to skip cleanupCharts's internal
-        # 'try { chart.destroy(); }' which always precedes projectIds.forEach
-        # and would make this test a permanent false-positive if not anchored.
-        render_charts_pos = html.find('function renderCharts')
-        assert render_charts_pos != -1, "'function renderCharts' not found in script"
-        try_pos = html.find('try {', render_charts_pos)
-        foreach_pos = html.find('projectIds.forEach(', render_charts_pos)
-        assert try_pos != -1, "'try {' not found inside function renderCharts"
-        assert foreach_pos != -1, "'projectIds.forEach(' not found inside function renderCharts"
-        assert try_pos < foreach_pos, (
-            "'try {' must appear before 'projectIds.forEach(' inside function renderCharts"
-        )
+        assert 'function renderCharts' in html
 
-    def test_rendered_true_set_after_foreach_loop(self, client):
-        """rendered = true must be set AFTER the projectIds.forEach loop (inside the try block), not before it."""
+    def test_foreach_iterates_project_ids(self, client):
+        """The projectIds.forEach loop must iterate over project keys."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
-        foreach_pos = html.find('projectIds.forEach(')
-        rendered_true_pos = html.find('rendered = true')
-        assert foreach_pos != -1, "'projectIds.forEach(' not found in script"
-        assert rendered_true_pos != -1, "'rendered = true' not found in script"
-        assert rendered_true_pos > foreach_pos, (
-            "'rendered = true' must appear AFTER 'projectIds.forEach(' — it should only latch after successful loop completion"
-        )
+        assert 'projectIds.forEach(' in html
 
-    def test_catch_block_resets_rendered_false(self, client):
-        """A catch block must exist and reset rendered = false to allow retry."""
+    def test_cleanup_before_new_charts(self, client):
+        """cleanupCharts() must be called before creating new Chart instances."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
-        # Find the catch block that wraps projectIds.forEach (not cleanupCharts's internal catch)
-        foreach_pos = html.find('projectIds.forEach(')
-        # Search for 'catch' after projectIds.forEach to find the outer try/catch
-        catch_pos = html.find('catch', foreach_pos)
-        rendered_false_pos = html.find('rendered = false', catch_pos)
-        assert foreach_pos != -1, "'projectIds.forEach(' not found in script"
-        assert catch_pos != -1, "'catch' not found after 'projectIds.forEach('"
-        assert rendered_false_pos != -1, (
-            "'rendered = false' not found after the catch block"
-        )
-
-    def test_catch_block_rethrows_error(self, client):
-        """The catch block must re-throw the error so it is not silently swallowed."""
-        with _patch_by_role():
-            html = client.get('/costs/partials/by-role').text
-        # Find the outer catch (after projectIds.forEach), then look for throw inside it
-        foreach_pos = html.find('projectIds.forEach(')
-        catch_pos = html.find('catch', foreach_pos)
-        throw_pos = html.find('throw', catch_pos)
-        assert foreach_pos != -1, "'projectIds.forEach(' not found in script"
-        assert catch_pos != -1, "'catch' not found after 'projectIds.forEach('"
-        assert throw_pos != -1, (
-            "'throw' not found after the outer catch block — catch must re-throw the error"
-        )
+        cleanup_pos = html.find('cleanupCharts()')
+        new_chart_pos = html.find('new Chart(')
+        assert cleanup_pos != -1, 'cleanupCharts() call not found'
+        assert new_chart_pos != -1, 'new Chart( not found'
+        assert cleanup_pos < new_chart_pos
 
 
 # ---------------------------------------------------------------------------
@@ -261,34 +227,30 @@ class TestByRoleNullDereferenceGuard:
             "renderCharts must guard against null/non-object byRole before rendering"
         )
 
-    def test_cleanup_charts_inside_try_block(self, client):
-        """cleanupCharts() call must be inside the try block in renderCharts, not before it."""
+    def test_cleanup_charts_after_null_guard(self, client):
+        """cleanupCharts() call must appear after the null guard in renderCharts."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
         render_charts_pos = html.find('function renderCharts')
         assert render_charts_pos != -1, "'function renderCharts' not found in script"
-        # Find the outer try { inside renderCharts (skips cleanupCharts's internal try)
-        try_pos = html.find('try {', render_charts_pos)
-        assert try_pos != -1, "'try {' not found inside function renderCharts"
-        # cleanupCharts() call must appear AFTER the outer try {
-        cleanup_call_pos = html.find('cleanupCharts()', try_pos)
-        assert cleanup_call_pos != -1, (
-            "'cleanupCharts()' call not found after 'try {' inside renderCharts — "
-            "cleanupCharts() must be inside the try block, not before it"
+        null_guard_pos = html.find('!byRole', render_charts_pos)
+        cleanup_call_pos = html.find('cleanupCharts()', render_charts_pos)
+        assert null_guard_pos != -1, "'!byRole' guard not found"
+        assert cleanup_call_pos != -1, "'cleanupCharts()' call not found"
+        assert null_guard_pos < cleanup_call_pos, (
+            "null guard must appear before cleanupCharts() call"
         )
 
-    def test_object_keys_inside_try_block(self, client):
-        """Object.keys(byRole) must be inside the try block in renderCharts, not before it."""
+    def test_object_keys_after_null_guard(self, client):
+        """Object.keys(byRole) must appear after the null guard in renderCharts."""
         with _patch_by_role():
             html = client.get('/costs/partials/by-role').text
         render_charts_pos = html.find('function renderCharts')
         assert render_charts_pos != -1, "'function renderCharts' not found in script"
-        # Find the outer try { inside renderCharts
-        try_pos = html.find('try {', render_charts_pos)
-        assert try_pos != -1, "'try {' not found inside function renderCharts"
-        # Object.keys(byRole) must appear AFTER the outer try {
-        object_keys_pos = html.find('Object.keys(byRole)', try_pos)
-        assert object_keys_pos != -1, (
-            "'Object.keys(byRole)' not found after 'try {' inside renderCharts — "
-            "Object.keys(byRole) must be inside the try block to avoid uncaught TypeError on null byRole"
+        null_guard_pos = html.find('!byRole', render_charts_pos)
+        object_keys_pos = html.find('Object.keys(byRole)', render_charts_pos)
+        assert null_guard_pos != -1, "'!byRole' guard not found"
+        assert object_keys_pos != -1, "'Object.keys(byRole)' not found"
+        assert null_guard_pos < object_keys_pos, (
+            "null guard must appear before Object.keys(byRole)"
         )

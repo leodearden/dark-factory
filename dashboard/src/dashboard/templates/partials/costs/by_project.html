@@ -14,19 +14,6 @@
 (function() {
   var byProject = {{ by_project | tojson }};
 
-  var palette = [
-    '#60a5fa','#34d399','#fbbf24','#f87171','#a78bfa',
-    '#fb923c','#38bdf8','#4ade80','#e879f9','#94a3b8'
-  ];
-
-  function getOrDestroyChart(canvasId) {
-    var el = document.getElementById(canvasId);
-    if (!el) return null;
-    var existing = Chart.getChart(el);
-    if (existing) existing.destroy();
-    return el;
-  }
-
   function renderChart() {
     var el = getOrDestroyChart('costByProjectChart');
     if (!el) return;
@@ -48,7 +35,7 @@
           var found = (byProject[proj] || []).find(function(m) { return m.model === model; });
           return found ? found.total : 0;
         }),
-        backgroundColor: palette[idx % palette.length],
+        backgroundColor: CHART_PALETTE[idx % CHART_PALETTE.length],
       };
     });
 
@@ -78,9 +65,6 @@
     });
   }
 
-  document.addEventListener('htmx:afterSettle', renderChart, { once: true });
-  if (document.readyState !== 'loading') {
-    renderChart();
-  }
+  renderChart();
 })();
 </script>

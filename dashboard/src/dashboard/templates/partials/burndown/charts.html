@@ -40,14 +40,6 @@
   // Bottom-to-top stacking order
   var zoneOrder = ['done', 'cancelled', 'blocked', 'deferred', 'in_progress', 'pending'];
 
-  function getOrDestroyChart(canvasId) {
-    var el = document.getElementById(canvasId);
-    if (!el) return null;
-    var existing = Chart.getChart(el);
-    if (existing) existing.destroy();
-    return el;
-  }
-
   function formatLabel(iso) {
     var d = new Date(iso);
     var month = d.toLocaleString(undefined, { month: 'short' });
@@ -124,9 +116,7 @@
     }
   }
 
-  requestAnimationFrame(function() {
-    requestAnimationFrame(renderAll);
-  });
+  renderAll();
 })();
 </script>
 
