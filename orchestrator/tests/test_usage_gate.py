@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from shared.config_models import AccountConfig, UsageCapConfig
@@ -53,6 +53,10 @@ def _make_gate(
     gate._run_id = None
     gate._last_account_name = None
     gate._background_tasks = set()
+    gate._probe_config_dir = MagicMock()
+    # Mock _run_probe so tests don't spawn real `claude` processes.
+    # Tests that need specific probe behavior can override this.
+    gate._run_probe = AsyncMock(return_value=True)
     tokens = ['token-a', 'token-b', 'token-c']
     gate._accounts = [
         AccountState(name=f'max-{chr(97+i)}', token=tokens[i])
@@ -837,8 +841,8 @@ class TestProbeInterval:
         # Should have uncapped optimistically before resets_at
         assert acct.capped is False
         assert gate._open.is_set()
-        # probe_count incremented (optimistic uncap, not past reset)
-        assert acct.probe_count == 1
+        # probe_count reset to 0 after successful probe
+        assert acct.probe_count == 0
 
     @pytest.mark.asyncio
     async def test_probe_backoff(self):

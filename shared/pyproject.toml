@@ -16,6 +16,7 @@ dependencies = ["pydantic>=2.7", "aiosqlite>=0.20", "pyyaml>=6.0"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-cov>=7.1.0",
     "ruff>=0.4",
 ]
 

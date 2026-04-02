@@ -47,6 +47,8 @@ def make_gate(
     with patch.dict(os.environ, env_vars):
         gate = UsageGate(config, cost_store=cost_store)
 
+    # Mock _run_probe to prevent real subprocess spawning in tests
+    gate._run_probe = AsyncMock(return_value=True)
     return gate
 
 
