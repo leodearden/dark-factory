@@ -8001,6 +8001,17 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 405,
+        "title": "Worktree-existence guard in steward _run_loop",
+        "description": "Safety-net for stale steward race condition. Belt-and-suspenders complement to the task-state check in _wait_for_resolution. If the worktree is deleted (by /unblock or any other actor) while the steward is running, the steward should detect this and stop immediately rather than attempting to invoke agents in a non-existent directory.",
+        "details": "**Problem**: steward.py:_run_loop (line 112) only checks `self._stopped` and escalation queue status per iteration. It never validates that the worktree still exists. If /unblock deletes the worktree mid-loop, the steward tries to invoke an agent in a missing directory, fails, and may create spurious escalations.\n\n**Fix**:\n1. At the top of `_run_loop`'s while loop (after line 112), add: `if not Path(self.worktree).exists(): break` (or set `self._stopped = True`)\n2. Before breaking, dismiss any remaining pending L0 escalations for this task with resolution: \"Auto-dismissed: worktree removed by external handler\"\n3. Log clearly: `logger.info(f'Steward for task {self.task_id}: worktree gone, stopping')`\n4. Also add the same check in `_handle_escalation` before invoking the agent (steward.py ~line 197), as the worktree could disappear between the loop check and the invocation\n\n**Key files**:\n- orchestrator/src/orchestrator/steward.py — _run_loop, _handle_escalation\n\n**memory_hints**: search \"steward worktree cleanup\" in fused-memory; search \"worktree-existence guard\" in fused-memory",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8013,7 +8024,7 @@
       ],
       "created": "2026-04-02T13:24:57.285Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-02T13:24:57.293Z"
+      "updated": "2026-04-02T13:25:05.684Z"
     }
   }
 }
