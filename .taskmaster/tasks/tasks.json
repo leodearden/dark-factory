@@ -6402,7 +6402,7 @@
         "description": "CostStore is fully wired in UsageGate but neither harness passes one — all cost event code is dead in production.\n\n1. Define a Protocol for CostStore in usage_gate.py (or shared) so type checkers catch interface drift\n2. Wire CostStore injection into orchestrator harness (harness.py:115) and reconciliation harness\n3. Address temporal coupling: project_id/run_id are set post-construction via property setters — validate or require them when cost_store is provided\n\nFiles: shared/src/shared/usage_gate.py, orchestrator/src/orchestrator/harness.py, fused-memory/src/fused_memory/reconciliation/harness.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -6417,7 +6417,8 @@
             "orchestrator/src/orchestrator",
             "fused-memory/src/fused_memory/reconciliation"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T01:32:40.558Z"
       },
       {
         "id": "338",
@@ -7605,7 +7606,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:32:40.359Z",
+      "lastModified": "2026-04-02T01:32:40.558Z",
       "taskCount": 365,
       "completedCount": 309,
       "tags": [
