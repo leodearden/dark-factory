@@ -7702,11 +7702,11 @@
         "description": "by_project.html, trend.html, and by_account.html still use the old bare pattern (global document.getElementById/querySelectorAll, getOrDestroyChart, no render guard, no instance tracking, no container scoping). Apply the same improvements introduced in by_role.html to all three: (1) data-*-container attribute + document.currentScript.closest scoping, (2) rendered boolean guard, (3) chartInstances array + cleanupCharts(), (4) try/catch error recovery. Optionally extract a Jinja2 macro to avoid the boilerplate growing again.\n\nMemory hints: search \"chart lifecycle pattern by_role\", search \"cost partials DOM scoping\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-02T12:40:45.084Z",
+        "updatedAt": "2026-04-02T12:48:20.873Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/templates",
@@ -7968,7 +7968,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T12:48:20.805Z",
+      "lastModified": "2026-04-02T12:48:20.873Z",
       "taskCount": 380,
       "completedCount": 358,
       "tags": [
