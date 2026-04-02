@@ -8013,7 +8013,25 @@
               "Mem0 search empty project_id returns empty results"
             ]
           },
-          "_causation_id": "dffd2365-0cf3-407b-8634-8fef6a6dc16a"
+          "_causation_id": "dffd2365-0cf3-407b-8634-8fef6a6dc16a",
+          "files": [
+            "fused-memory/src/fused_memory/services/memory_service.py",
+            "fused-memory/src/fused_memory/server/main.py",
+            "fused-memory/src/fused_memory/server/tools.py",
+            "fused-memory/src/fused_memory/backends/mem0_client.py",
+            "fused-memory/src/fused_memory/config/schema.py",
+            "fused-memory/config/config.yaml",
+            "fused-memory/tests/test_health_endpoint.py",
+            "fused-memory/tests/test_mem0_health_probe.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/services",
+            "fused-memory/src/fused_memory/server",
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/src/fused_memory/config",
+            "fused-memory/config",
+            "fused-memory/tests"
+          ]
         }
       },
       {
@@ -8026,7 +8044,17 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-02T12:58:44.642Z"
+        "updatedAt": "2026-04-02T12:58:44.642Z",
+        "metadata": {
+          "files": [
+            "orchestrator/src/orchestrator/merge_queue.py",
+            "orchestrator/tests/test_merge_queue.py"
+          ],
+          "modules": [
+            "orchestrator/src/orchestrator",
+            "orchestrator/tests"
+          ]
+        }
       },
       {
         "id": 404,
