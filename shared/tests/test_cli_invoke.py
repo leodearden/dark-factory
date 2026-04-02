@@ -9,6 +9,7 @@ import pytest
 
 from shared.cli_invoke import (
     _CAP_HIT_COOLDOWN_SECS,
+    CAP_HIT_RESUME_PROMPT,
     _MAX_CAP_COOLDOWN_SECS,
     AgentResult,
     _to_token_count,
@@ -480,3 +481,131 @@ class TestInvokeWithCapRetryCostStore:
             )
 
         assert cost_store.save_invocation.call_args.kwargs['capped'] is False
+
+
+@pytest.mark.asyncio
+class TestCapHitResume:
+
+    async def test_resume_session_id_passed_on_cap_hit(self):
+        """Cap hit with session_id in result → second invoke uses --resume."""
+        gate = MagicMock()
+        gate.account_count = 2
+        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
+        gate.detect_cap_hit = MagicMock(side_effect=[True, False])
+        gate.active_account_name = 'acct-b'
+        gate.on_agent_complete = MagicMock()
+
+        capped_result = _make_result(session_id='sess-123')
+        ok_result = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[capped_result, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            await invoke_with_cap_retry(gate, 'test-label', prompt='do stuff')
+
+            assert mock_invoke.call_count == 2
+            second_call = mock_invoke.call_args_list[1]
+            assert second_call.kwargs.get('resume_session_id') == 'sess-123'
+            assert second_call.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
+
+    async def test_fresh_start_when_no_session_id(self):
+        """Cap hit with empty session_id → second invoke uses original prompt."""
+        gate = MagicMock()
+        gate.account_count = 2
+        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
+        gate.detect_cap_hit = MagicMock(side_effect=[True, False])
+        gate.active_account_name = 'acct-b'
+        gate.on_agent_complete = MagicMock()
+
+        capped_result = _make_result(session_id='')
+        ok_result = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[capped_result, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            await invoke_with_cap_retry(gate, 'test-label', prompt='do stuff')
+
+            second_call = mock_invoke.call_args_list[1]
+            assert 'resume_session_id' not in second_call.kwargs
+            assert second_call.kwargs.get('prompt') == 'do stuff'
+
+    async def test_resume_failure_falls_back_to_fresh(self):
+        """Resume returns success=False (not cap hit) → retry with original prompt."""
+        gate = MagicMock()
+        gate.account_count = 2
+        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b', 'token-a'])
+        gate.detect_cap_hit = MagicMock(side_effect=[True, False, False])
+        gate.active_account_name = 'acct-b'
+        gate.on_agent_complete = MagicMock()
+
+        capped_result = _make_result(session_id='sess-123')
+        failed_resume = _make_result(success=False, output='resume error')
+        ok_result = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[capped_result, failed_resume, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            got = await invoke_with_cap_retry(gate, 'test-label', prompt='do stuff')
+
+            assert mock_invoke.call_count == 3
+            # Second call: resume attempt
+            assert mock_invoke.call_args_list[1].kwargs.get('resume_session_id') == 'sess-123'
+            # Third call: fresh fallback
+            third_call = mock_invoke.call_args_list[2]
+            assert 'resume_session_id' not in third_call.kwargs
+            assert third_call.kwargs.get('prompt') == 'do stuff'
+            assert got.success is True
+
+    async def test_original_prompt_preserved_across_multiple_retries(self):
+        """Multiple cap hits → fallback always uses original prompt, never mutated."""
+        gate = MagicMock()
+        gate.account_count = 3
+        gate.before_invoke = AsyncMock(side_effect=['t-a', 't-b', 't-c'])
+        # Two cap hits (with session), then success
+        gate.detect_cap_hit = MagicMock(side_effect=[True, True, False])
+        gate.active_account_name = 'next'
+        gate.on_agent_complete = MagicMock()
+
+        r1 = _make_result(session_id='sess-1')
+        r2 = _make_result(session_id='sess-2')
+        r3 = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[r1, r2, r3],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            await invoke_with_cap_retry(
+                gate, 'test-label', prompt='original prompt here',
+            )
+
+            # First call: original prompt
+            assert mock_invoke.call_args_list[0].kwargs.get('prompt') == 'original prompt here'
+            # Second call: resume sess-1
+            assert mock_invoke.call_args_list[1].kwargs.get('resume_session_id') == 'sess-1'
+            assert mock_invoke.call_args_list[1].kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
+            # Third call: resume sess-2
+            assert mock_invoke.call_args_list[2].kwargs.get('resume_session_id') == 'sess-2'
+            assert mock_invoke.call_args_list[2].kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT

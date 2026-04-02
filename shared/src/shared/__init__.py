@@ -1,7 +1,12 @@
 """dark-factory-shared — public API surface."""
 
 from shared.async_sqlite_base import AsyncSqliteBase, apply_wal_pragmas
-from shared.cli_invoke import AgentResult, invoke_claude_agent, invoke_with_cap_retry
+from shared.cli_invoke import (
+    CAP_HIT_RESUME_PROMPT,
+    AgentResult,
+    invoke_claude_agent,
+    invoke_with_cap_retry,
+)
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
 from shared.usage_gate import AccountState, SessionBudgetExhausted, UsageGate
@@ -11,6 +16,7 @@ __version__ = '0.1.0'
 __all__ = [
     'AsyncSqliteBase',
     'apply_wal_pragmas',
+    'CAP_HIT_RESUME_PROMPT',
     'AgentResult',
     'invoke_claude_agent',
     'invoke_with_cap_retry',

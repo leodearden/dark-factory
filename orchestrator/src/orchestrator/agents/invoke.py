@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 # Re-export shared Claude invocation primitives for backwards compatibility
 from shared.cli_invoke import (  # noqa: F401
+    CAP_HIT_RESUME_PROMPT,
     AgentResult,
     _parse_claude_output,
     _run_subprocess,
@@ -50,12 +51,18 @@ async def invoke_with_cap_retry(
 ) -> AgentResult:
     """Invoke a multi-backend agent, retrying on usage-cap hits with account failover.
 
+    On cap hit for Claude backends, resumes the capped session on the next
+    account via ``--resume`` when a ``session_id`` is available, preserving
+    all agent progress.  Non-Claude backends always restart fresh (they
+    don't support ``--resume``).
+
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
 
     All keyword arguments are forwarded to ``invoke_agent()``.
     """
     backend = invoke_kwargs.get('backend', 'claude')
+    original_prompt = invoke_kwargs.get('prompt', '')
     account_name = ''
 
     while True:
@@ -69,18 +76,38 @@ async def invoke_with_cap_retry(
         if usage_gate and usage_gate.detect_cap_hit(
             result.stderr, result.output, backend, oauth_token=oauth_token,
         ):
+            # Resume the capped session if Claude backend and session_id available
+            if backend == 'claude' and result.session_id:
+                invoke_kwargs['resume_session_id'] = result.session_id
+                invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
+                resume_or_fresh = 'resuming'
+            else:
+                invoke_kwargs.pop('resume_session_id', None)
+                invoke_kwargs['prompt'] = original_prompt
+                resume_or_fresh = 'fresh'
+
             acct_name = usage_gate.active_account_name
             if acct_name:
                 logger.warning(
                     f'{label}: cap hit, sleeping {_CAP_HIT_COOLDOWN_SECS}s '
-                    f'then switching to account {acct_name}',
+                    f'then {resume_or_fresh} on account {acct_name}',
                 )
             else:
                 logger.warning(
                     f'{label}: cap hit on all accounts, sleeping '
-                    f'{_CAP_HIT_COOLDOWN_SECS}s then waiting for reset',
+                    f'{_CAP_HIT_COOLDOWN_SECS}s then waiting for reset ({resume_or_fresh})',
                 )
             await asyncio.sleep(_CAP_HIT_COOLDOWN_SECS)
+            continue
+
+        # Non-cap-hit failure while resuming → fall back to fresh invocation
+        if not result.success and invoke_kwargs.get('resume_session_id'):
+            logger.warning(
+                f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
+                f'retrying fresh',
+            )
+            invoke_kwargs.pop('resume_session_id', None)
+            invoke_kwargs['prompt'] = original_prompt
             continue
 
         if usage_gate:

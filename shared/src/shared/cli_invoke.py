@@ -21,8 +21,13 @@ logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
+CAP_HIT_RESUME_PROMPT = (
+    'Your previous run was interrupted by a usage limit. '
+    'Continue where you left off and complete your task.'
+)
 
 __all__ = [
+    'CAP_HIT_RESUME_PROMPT',
     'AgentResult',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
@@ -143,6 +148,12 @@ async def invoke_with_cap_retry(
     base cooldown (5 s).  After each full cycle through every account, the
     cooldown doubles, capped at ``_MAX_CAP_COOLDOWN_SECS`` (300 s).
 
+    On cap hit, if the capped invocation produced a ``session_id``, the
+    retry resumes that session via ``--resume`` instead of starting fresh.
+    This preserves all agent progress (tool calls, reasoning) across
+    account switches.  If resume itself fails (non-cap-hit error), falls
+    back to a fresh invocation with the original prompt.
+
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
 
@@ -152,6 +163,7 @@ async def invoke_with_cap_retry(
     All keyword arguments are forwarded to ``invoke_claude_agent()``.
     """
     model = invoke_kwargs.get('model', 'opus')
+    original_prompt = invoke_kwargs.get('prompt', '')
     consecutive_cap_hits = 0
     num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
     while True:
@@ -188,17 +200,38 @@ async def invoke_with_cap_retry(
                     )
                 except Exception:
                     logger.warning('Failed to save cap_hit event', exc_info=True)
+
+            # Resume the capped session on the next account if possible
+            if result.session_id:
+                invoke_kwargs['resume_session_id'] = result.session_id
+                invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
+                resume_or_fresh = 'resuming'
+            else:
+                invoke_kwargs.pop('resume_session_id', None)
+                invoke_kwargs['prompt'] = original_prompt
+                resume_or_fresh = 'fresh'
+
             if acct_name:
                 logger.warning(
                     f'{label}: cap hit ({consecutive_cap_hits} consecutive), '
-                    f'sleeping {cooldown:.0f}s then switching to account {acct_name}',
+                    f'sleeping {cooldown:.0f}s then {resume_or_fresh} on account {acct_name}',
                 )
             else:
                 logger.warning(
                     f'{label}: cap hit on all accounts ({consecutive_cap_hits} consecutive), '
-                    f'sleeping {cooldown:.0f}s then waiting for reset',
+                    f'sleeping {cooldown:.0f}s then waiting for reset ({resume_or_fresh})',
                 )
             await asyncio.sleep(cooldown)
+            continue
+
+        # Non-cap-hit failure while resuming → fall back to fresh invocation
+        if not result.success and invoke_kwargs.get('resume_session_id'):
+            logger.warning(
+                f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
+                f'retrying fresh',
+            )
+            invoke_kwargs.pop('resume_session_id', None)
+            invoke_kwargs['prompt'] = original_prompt
             continue
 
         if usage_gate:

@@ -40,6 +40,7 @@ class TestModuleLevelAll:
 
         assert hasattr(cli_invoke, '__all__'), 'cli_invoke must define __all__'
         assert set(cli_invoke.__all__) == {
+            'CAP_HIT_RESUME_PROMPT',
             'AgentResult',
             'invoke_claude_agent',
             'invoke_with_cap_retry',

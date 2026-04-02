@@ -170,7 +170,7 @@ class TestStewardSessionPersistence:
 @pytest.mark.asyncio
 class TestStewardCapHitBackoff:
 
-    async def test_sleeps_before_prompt_rebuild_on_cap_hit(self, steward, mock_briefing):
+    async def test_sleeps_before_retry_on_cap_hit(self, steward, mock_briefing):
         """Steward sleeps _CAP_HIT_COOLDOWN_SECS before retrying on cap hit."""
         from orchestrator.steward import _CAP_HIT_COOLDOWN_SECS
 
@@ -201,8 +201,80 @@ class TestStewardCapHitBackoff:
 
             mock_sleep.assert_called_once_with(_CAP_HIT_COOLDOWN_SECS)
             assert mock_invoke.call_count == 2
-            # Session was reset and recaptured
             assert steward._session_id == 'sess-new'
+
+    async def test_preserves_session_on_cap_hit(self, steward, mock_briefing):
+        """Cap hit with session_id → session preserved, resume on next account."""
+        # Set an existing session so _handle_escalation takes the continuation path
+        steward._session_id = 'sess-existing'
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+
+        call_count = 0
+
+        def detect_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return call_count == 1
+
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
+        gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
+        gate.on_agent_complete = MagicMock()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
+            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_invoke.return_value = _make_result(session_id='sess-capped')
+            await steward._handle_escalation(esc)
+
+            # Second call should resume with the capped session
+            second_call = mock_invoke.call_args_list[1]
+            assert second_call.kwargs.get('resume_session_id') == 'sess-capped'
+            # Briefing should NOT have been rebuilt (was continuation, not initial)
+            mock_briefing.build_steward_initial_prompt.assert_not_called()
+
+    async def test_rebuilds_prompt_only_when_no_session(self, steward, mock_briefing):
+        """Cap hit with empty session_id → full prompt rebuild in _invoke_with_session."""
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+
+        call_count = 0
+
+        def detect_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return call_count == 1
+
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
+        gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
+        gate.on_agent_complete = MagicMock()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
+            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            # First call: cap hit with no session_id
+            mock_invoke.side_effect = [
+                _make_result(session_id=''),
+                _make_result(session_id='sess-new'),
+            ]
+            await steward._handle_escalation(esc)
+
+            # Called twice: once in _handle_escalation (initial prompt, _session_id=None)
+            # and once in _invoke_with_session (cap hit rebuild, no session to resume)
+            assert mock_briefing.build_steward_initial_prompt.call_count == 2
+            # Second invoke call should NOT have resume_session_id
+            second_call = mock_invoke.call_args_list[1]
+            assert 'resume_session_id' not in second_call.kwargs
 
     async def test_no_sleep_when_no_cap_hit(self, steward):
         """No sleep when invocation succeeds without cap hit."""
