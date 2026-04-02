@@ -5360,7 +5360,7 @@
               "MergeQueue MergeWorker resolution decision"
             ]
           },
-          "block_reason": "Merge queue (task 292) is implemented monolithically as MergeQueue+MergeWorker and stable. Real blocker: need sustained queue depth >3 and merge cycle time metrics showing merge is dominating throughput before speculative pipeline is justified.",
+          "block_reason": "Depends on task 403 (merge queue metrics instrumentation). Re-evaluate 3 days after 403 is done — need real data showing sustained queue depth >3 and merge cycle time dominating throughput before speculative pipeline is justified.",
           "_causation_id": "eaf99cc7-85f9-47d1-8bdd-81c6af26139e"
         }
       },
