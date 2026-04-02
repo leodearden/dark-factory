@@ -166,8 +166,8 @@ def create_server(
         if merge_queue is None:
             return {'error': 'Merge queue not available — orchestrator not running'}
 
-        from orchestrator.merge_queue import MergeOutcome, MergeRequest
         from orchestrator.config import OrchestratorConfig
+        from orchestrator.merge_queue import MergeOutcome, MergeRequest
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
         await merge_queue.put(MergeRequest(

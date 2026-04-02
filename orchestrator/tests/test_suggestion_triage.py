@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
 
 import pytest
@@ -241,6 +242,7 @@ class TestReviewLoopRouting:
 def _make_steward(*, config_overrides=None, suggestion_count=15):
     """Build a minimal TaskSteward with mocked dependencies."""
     from pathlib import Path
+
     from orchestrator.steward import TaskSteward
 
     config = MagicMock()
@@ -359,7 +361,7 @@ class TestPreTriageSuggestions:
 
         # Steward session mock — returns resolved escalation
         steward_result = _fake_agent_result(cost=2.0)
-        steward.escalation_queue.get.return_value = MagicMock(status='resolved')
+        cast(MagicMock, steward.escalation_queue).get.return_value = MagicMock(status='resolved')
 
         with patch('orchestrator.steward.invoke_agent', return_value=steward_result) as mock_invoke:
             await steward._handle_escalation(esc)

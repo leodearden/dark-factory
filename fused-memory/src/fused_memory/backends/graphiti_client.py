@@ -8,6 +8,7 @@ from typing import Any, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
+from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.edges import EntityEdge
 from graphiti_core.embedder import OpenAIEmbedder
@@ -44,7 +45,7 @@ class GraphitiBackend:
 
     # --- Per-request driver routing ---
 
-    def _driver_for(self, group_id: str) -> FalkorDriver:
+    def _driver_for(self, group_id: str) -> GraphDriver:
         """Return a driver clone targeting the FalkorDB graph for *group_id*.
 
         Lazily ensures indices exist on the target graph (tracked in

@@ -52,6 +52,7 @@ def _make_gate(
     gate._project_id = None
     gate._run_id = None
     gate._last_account_name = None
+    gate._background_tasks = set()
     tokens = ['token-a', 'token-b', 'token-c']
     gate._accounts = [
         AccountState(name=f'max-{chr(97+i)}', token=tokens[i])
@@ -1170,6 +1171,9 @@ class TestCostStoreFailoverEvent:
         assert token2 == 'token-b'
         assert gate._last_account_name == 'max-b'
 
+        # Let fire-and-forget cost event task run
+        await asyncio.sleep(0)
+
         mock_cs.save_account_event.assert_called_once()
         call = mock_cs.save_account_event.call_args
         event_type = call.kwargs.get('event_type') or call.args[1]
@@ -1208,6 +1212,9 @@ class TestCostStoreFailoverEvent:
         await gate.before_invoke()
         gate._accounts[0].capped = True
         await gate.before_invoke()
+
+        # Let fire-and-forget cost event task run
+        await asyncio.sleep(0)
 
         call = mock_cs.save_account_event.call_args
         all_args = list(call.args) + list(call.kwargs.values())

@@ -124,6 +124,8 @@ class TestSearchIncludePlannedMCPTool:
             },
         )
 
+        assert isinstance(result, dict), f'Expected dict result, got {type(result)}: {result!r}'
+        assert 'results' in result, f'Expected results key in response: {result!r}'
         mock_service.search.assert_called_once()
         call_kwargs = mock_service.search.call_args[1]
         assert call_kwargs.get('include_planned') is True, (
@@ -145,6 +147,8 @@ class TestSearchIncludePlannedMCPTool:
             },
         )
 
+        assert isinstance(result, dict), f'Expected dict result, got {type(result)}: {result!r}'
+        assert 'results' in result, f'Expected results key in response: {result!r}'
         mock_service.search.assert_called_once()
         call_kwargs = mock_service.search.call_args[1]
         assert call_kwargs.get('include_planned', False) is False, (
@@ -167,6 +171,8 @@ class TestSearchIncludePlannedMCPTool:
             },
         )
 
+        assert isinstance(result, dict), f'Expected dict result, got {type(result)}: {result!r}'
+        assert 'results' in result, f'Expected results key in response: {result!r}'
         mock_service.search.assert_called_once()
         call_kwargs = mock_service.search.call_args[1]
         assert call_kwargs.get('include_planned') is False, (

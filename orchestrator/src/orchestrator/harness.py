@@ -9,6 +9,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_with_cap_retry
@@ -19,6 +20,9 @@ from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.scheduler import Scheduler, files_to_modules
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+
+if TYPE_CHECKING:
+    from orchestrator.merge_queue import MergeWorker
 
 try:
     from escalation.queue import EscalationQueue
@@ -131,7 +135,7 @@ class Harness:
 
         # Merge queue — single worker owns all main-branch advancement
         self._merge_queue: asyncio.Queue = asyncio.Queue()
-        self._merge_worker: object | None = None  # MergeWorker (lazy import)
+        self._merge_worker: MergeWorker | None = None  # lazy import
         self._merge_worker_task: asyncio.Task | None = None
 
     async def run(

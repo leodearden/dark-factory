@@ -98,6 +98,7 @@ class TestCasUpdateRef:
 
         result = await git_ops.merge_to_main(worktree, 'cas-ok')
         assert result.success
+        assert result.merge_commit is not None
         assert result.merge_worktree is not None
 
         main_sha = await git_ops.get_main_sha()
@@ -123,6 +124,7 @@ class TestCasUpdateRef:
 
         result = await git_ops.merge_to_main(worktree, 'cas-fail')
         assert result.success
+        assert result.merge_commit is not None
         assert result.merge_worktree is not None
 
         # Simulate external actor advancing main
@@ -149,6 +151,7 @@ class TestCasUpdateRef:
 
         result = await git_ops.merge_to_main(worktree, 'cas-none')
         assert result.success
+        assert result.merge_commit is not None
 
         # No expected_main — should work as before
         advanced = await git_ops.advance_main(result.merge_commit)
@@ -206,6 +209,7 @@ class TestMergeWorker:
         # Merge manually first
         result = await git_ops.merge_to_main(worktree, 'already-merged')
         assert result.success
+        assert result.merge_commit is not None
         await git_ops.advance_main(result.merge_commit)
         if result.merge_worktree:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)

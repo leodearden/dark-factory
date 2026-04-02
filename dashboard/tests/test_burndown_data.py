@@ -124,7 +124,7 @@ class TestCollectSnapshot:
                 await collect_snapshot(conn, config)
 
             async with conn.execute('SELECT * FROM snapshots') as cur:
-                rows = await cur.fetchall()
+                rows = list(await cur.fetchall())
 
         assert len(rows) == 1
         row = rows[0]
@@ -157,7 +157,9 @@ class TestCollectSnapshot:
                 await collect_snapshot(conn, config)
 
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
-                count = (await cur.fetchone())[0]
+                row = await cur.fetchone()
+                assert row is not None
+                count = row[0]
 
         assert count == 1
 
@@ -185,7 +187,9 @@ class TestDownsample:
         async with aiosqlite.connect(str(db_path)) as conn:
             await downsample(conn)
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
-                count = (await cur.fetchone())[0]
+                row = await cur.fetchone()
+                assert row is not None
+                count = row[0]
 
         assert count == 6  # all preserved
 
@@ -208,7 +212,9 @@ class TestDownsample:
         async with aiosqlite.connect(str(db_path)) as conn:
             await downsample(conn)
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
-                count = (await cur.fetchone())[0]
+                row = await cur.fetchone()
+                assert row is not None
+                count = row[0]
 
         assert count == 1  # compacted to one per hour
 
@@ -228,7 +234,9 @@ class TestDownsample:
         async with aiosqlite.connect(str(db_path)) as conn:
             await downsample(conn)
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
-                count = (await cur.fetchone())[0]
+                row = await cur.fetchone()
+                assert row is not None
+                count = row[0]
 
         assert count == 1  # only the recent one
 
