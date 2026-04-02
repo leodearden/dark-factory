@@ -6652,7 +6652,7 @@
         "description": "Remove unused `weighted_avg` namespace variable from summary.html line 6 (dead code from prior refactor) and update `get_cost_summary` docstring in costs.py to include the `task_count` field in the return shape documentation.\n\nMemory hints: search(\"task 339 weighted average cost summary fix\", project_id=\"dark_factory\")",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6665,7 +6665,8 @@
             "dashboard/src/dashboard/templates/partials/costs",
             "dashboard/src/dashboard/data"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T04:45:23.859Z"
       },
       {
         "id": "348",
@@ -7840,7 +7841,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T04:45:23.585Z",
+      "lastModified": "2026-04-02T04:45:23.859Z",
       "taskCount": 375,
       "completedCount": 356,
       "tags": [
