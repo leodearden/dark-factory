@@ -6734,7 +6734,7 @@
         "description": "PlannedEpisodeRegistry has inconsistent wiring compared to the established _event_buffer/_write_journal pattern:\n\n1. `planned_episode_registry` is a public attribute while `_event_buffer` and `_write_journal` are private (underscore prefix)\n2. `set_planned_registry()` exists but is never called in main.py — production uses direct attribute access instead\n3. Registry is auto-created inside `initialize()`, whereas _event_buffer/_write_journal follow strict external-wiring (never created inside initialize())\n\nFix: Choose one pattern and apply consistently. Recommended: follow the event_buffer/write_journal pattern — rename to `_planned_episode_registry`, create externally in main.py, wire via setter, add a property accessor if needed.\n\nmemory_hints: search for \"MemoryService wiring pattern\" and \"event_buffer write_journal lifecycle\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6749,7 +6749,8 @@
             "fused-memory/src/fused_memory/server",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T02:13:35.377Z"
       },
       {
         "id": "353",
@@ -7751,7 +7752,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T02:13:35.130Z",
+      "lastModified": "2026-04-02T02:13:35.377Z",
       "taskCount": 374,
       "completedCount": 333,
       "tags": [
