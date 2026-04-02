@@ -7907,7 +7907,36 @@
           "98"
         ],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "source": "reconciliation-stage2",
+          "predecessor_task": 98,
+          "regression_number": 2,
+          "_causation_id": "54c04f01-fb8e-4cba-baf3-5f866068829b",
+          "memory_hints": {
+            "entities": [
+              "Mem0",
+              "mem0_client.py",
+              "Qdrant",
+              "DurableWriteQueue",
+              "Mem0 search/write regression"
+            ],
+            "queries": [
+              "Mem0 search regression broken zero results",
+              "dead letter queue DLQ growth Mem0 write failures",
+              "Task 98 Mem0 search fix agent_id run_id filter"
+            ]
+          },
+          "files": [
+            "fused-memory/src/fused_memory/backends/mem0_client.py",
+            "fused-memory/src/fused_memory/routing/router.py",
+            "fused-memory/src/fused_memory/backends/durable_write_queue.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/src/fused_memory/routing"
+          ]
+        }
       }
     ],
     "metadata": {
