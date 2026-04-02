@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -188,8 +189,6 @@ class TestFireCostEventRuntimeErrorHandling:
         Currently the broad except swallows it silently (no log). After the fix,
         a logger.warning is emitted with the event type and account name.
         """
-        import logging
-
         gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
 
         with (
@@ -216,8 +215,6 @@ class TestFireCostEventRuntimeErrorHandling:
         (e.g. 'Event loop is closed' during shutdown) must never crash callers.
         The method must return normally after logging a warning.
         """
-        import logging
-
         gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
 
         mock_loop = MagicMock()
@@ -247,8 +244,6 @@ class TestFireCostEventRuntimeErrorHandling:
         The log message must include the event_type, account_name, and the
         original exception: 'Failed to schedule cost event %s/%s: %s'.
         """
-        import logging
-
         gate = make_gate(['acct-A'], cost_store=make_mock_cost_store())
 
         mock_loop = MagicMock()
