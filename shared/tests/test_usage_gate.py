@@ -73,8 +73,11 @@ class TestBeforeInvokeRaceCondition:
 
         Verifies that _last_account_name is updated to acct.name BEFORE
         _fire_cost_event is called, so the event carries the new account name
-        rather than the stale previous one.
+        rather than the stale previous one.  Also verifies the details payload
+        is json.dumps({'from': 'acct-A', 'to': 'acct-B'}).
         """
+        import json
+
         # cost_store must be set so the `if self._cost_store:` guard in before_invoke
         # allows _fire_cost_event to be called.
         gate = make_gate(['acct-A', 'acct-B'], cost_store=make_mock_cost_store())
@@ -84,10 +87,12 @@ class TestBeforeInvokeRaceCondition:
         gate._last_account_name = 'acct-A'
 
         captured_name_at_call: list[str | None] = []
+        captured_details: list[str] = []
 
         def capture_name(account_name: str, event_type: str, details: str) -> None:
-            # Record gate._last_account_name at the moment the event fires
+            # Record gate._last_account_name and the details arg at the moment the event fires
             captured_name_at_call.append(gate._last_account_name)
+            captured_details.append(details)
 
         with patch.object(gate, '_fire_cost_event', side_effect=capture_name):
             token = await gate.before_invoke()
@@ -101,6 +106,11 @@ class TestBeforeInvokeRaceCondition:
         assert captured_name_at_call[0] == 'acct-B', (
             f'Expected acct-B but got {captured_name_at_call[0]!r} — '
             'race: _last_account_name not yet updated when event fired'
+        )
+        # The details payload must carry the correct from/to account names
+        assert captured_details[0] == json.dumps({'from': 'acct-A', 'to': 'acct-B'}), (
+            f'Expected details={json.dumps({"from": "acct-A", "to": "acct-B"})!r}, '
+            f'got {captured_details[0]!r}'
         )
 
     async def test_failover_uses_fire_cost_event_not_write_cost_event(self):
