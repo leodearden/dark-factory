@@ -359,14 +359,18 @@ class TaskInterceptor:
         project_root: str,
         tag: str | None = None,
         status: list[str] | None = None,
+        compact: bool = False,
     ) -> dict:
-        """Get tasks, optionally filtered by status.
+        """Get tasks, optionally filtered by status and/or compacted.
 
         Args:
             project_root: Absolute path to project root.
             tag: Tag context (optional).
             status: If provided, only return tasks whose status is in this list.
                     Subtasks are filtered recursively.
+            compact: If True, strip verbose fields (description, details) from
+                     each task dict, recursively. Reduces payload size for
+                     reconciliation agents. Defaults to False (backward compat).
         """
         tm = await self._ensure_taskmaster()
         result = await tm.get_tasks(project_root, tag)
@@ -374,6 +378,10 @@ class TaskInterceptor:
             tasks = result.get('tasks', [])
             if isinstance(tasks, list):
                 result = {**result, 'tasks': _filter_tasks_by_status(tasks, status)}
+        if compact and isinstance(result, dict):
+            tasks = result.get('tasks', [])
+            if isinstance(tasks, list):
+                result = {**result, 'tasks': _compact_tasks(tasks)}
         return result
 
     async def get_task(
