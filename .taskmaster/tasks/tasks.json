@@ -6307,7 +6307,7 @@
         "description": "Multiple reviewers flagged two related code quality issues in dashboard/tests/test_costs_data.py:\n\n1. **Replace `__import__('sqlite3')` with `sqlite3`**: There are 8 occurrences of `conn = __import__('sqlite3').connect(str(db_path))` throughout the file, but `sqlite3` is already imported at line 5. Replace all with `conn = sqlite3.connect(str(db_path))` to match the pattern used in the `costs_db` fixture (line 103). This is a one-line module-level import + mechanical find/replace.\n\n2. **Extract shared DB setup fixture**: At least 8 tests repeat the same 5-step pattern: create db_path, open sync connection, executescript(COSTS_SCHEMA), commit+close, open async with aiosqlite, set row_factory. Extract a pytest fixture or helper like:\n```python\n@pytest.fixture()\ndef empty_costs_db(tmp_path):\n    db_path = tmp_path / 'runs.db'\n    conn = sqlite3.connect(str(db_path))\n    conn.executescript(COSTS_SCHEMA)\n    conn.close()\n    return db_path\n```\nThen each test only opens the async connection and inserts its specific rows.\n\nAlso use context managers (`with sqlite3.connect(...) as conn:`) for sync connections in any remaining setup blocks.\n\nFile: dashboard/tests/test_costs_data.py\n\nmemory_hints: search \"test_costs_data.py fixture extraction __import__\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
@@ -6318,7 +6318,8 @@
           "modules": [
             "dashboard/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-02T01:52:54.610Z"
       },
       {
         "id": "333",
@@ -7725,7 +7726,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:52:54.377Z",
+      "lastModified": "2026-04-02T01:52:54.610Z",
       "taskCount": 373,
       "completedCount": 323,
       "tags": [
