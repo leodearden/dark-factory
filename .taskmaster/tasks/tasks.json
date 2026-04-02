@@ -7629,10 +7629,11 @@
         "description": "In by_role.html lines ~106-115: the catch block resets `rendered = false` and rethrows, implying retry — but the htmx:afterSettle listener was registered with `{ once: true }` and is already consumed. The reset only has effect across a full HTMX re-injection. Fix options: (a) re-register the htmx listener inside the catch block to make retry genuine, or (b) remove `rendered = false` from catch and add a comment that failure requires a full reload. Either way, add a code comment explaining the cross-injection semantics.\n\nMemory hints: search \"chart lifecycle error recovery by_role\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-02T01:43:15.251Z"
       },
       {
         "id": "389",
@@ -7692,7 +7693,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-02T01:43:15.039Z",
+      "lastModified": "2026-04-02T01:43:15.252Z",
       "taskCount": 372,
       "completedCount": 317,
       "tags": [
