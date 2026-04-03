@@ -8341,7 +8341,7 @@
         "description": "The orchestrator has its own invoke_with_cap_retry in orchestrator/agents/invoke.py that shadows the shared version in shared/src/shared/cli_invoke.py. The shared version was instrumented with CostStore (task 299), but the orchestrator's copy does not accept cost_store/run_id/task_id/project_id/role parameters. This is the identified root cause of the empty costs dashboard — orchestrator invocations (the majority of all invocations) never record costs.\n\nFix: Either make the orchestrator's invoke_with_cap_retry delegate to the shared version, or add the same CostStore parameters and recording logic. The shared version's signature and _run_slot forwarding pattern should be used as reference.\n\nmemory_hints:\n- search: \"orchestrator invoke_with_cap_retry cost_store shadowing shared version\"\n- search: \"CostStore instrumentation invoke_with_cap_retry\"\n- entity: CostStore\n- entity: invoke_with_cap_retry",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
@@ -8357,14 +8357,14 @@
             "orchestrator/tests"
           ]
         },
-        "updatedAt": "2026-04-03T12:27:25.211Z"
+        "updatedAt": "2026-04-03T12:32:04.196Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T12:30:51.889Z",
+      "lastModified": "2026-04-03T12:32:04.196Z",
       "taskCount": 396,
-      "completedCount": 382,
+      "completedCount": 383,
       "tags": [
         "master"
       ]
