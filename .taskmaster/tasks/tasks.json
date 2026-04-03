@@ -8167,11 +8167,11 @@
         "description": "Delete _compact_task/_compact_tasks/_collect_all_tasks test block (lines ~723-1058) from test_task_interceptor.py — canonical versions live in test_task_utils.py. Remove duplicate degradation test from test_stages.py (test_single_fetch_failure_payload_still_assembles).",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-04-03T10:09:56.622Z",
+        "updatedAt": "2026-04-03T10:13:45.938Z",
         "metadata": {
           "modules": [
             "fused-memory/tests/test_stages.py",
@@ -8287,9 +8287,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T10:09:56.622Z",
+      "lastModified": "2026-04-03T10:13:45.938Z",
       "taskCount": 393,
-      "completedCount": 380,
+      "completedCount": 381,
       "tags": [
         "master"
       ]
