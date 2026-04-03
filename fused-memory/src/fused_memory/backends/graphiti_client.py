@@ -815,31 +815,20 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
-    async def detect_stale_summaries(self, *, group_id: str) -> list[dict]:
-        """Identify Entity nodes whose summary is out of sync with valid edge facts.
+    async def _detect_stale_summaries_with_edges(
+        self, *, group_id: str
+    ) -> tuple[list[dict], dict[str, list[dict]]]:
+        """Internal: detect stale summaries and return (stale_list, all_edges_dict).
 
-        For each entity node, fetches its valid RELATES_TO edges and computes
-        the canonical summary (deduped facts joined with newlines).  An entity
-        is considered *stale* when:
-
-        - Its current summary is non-empty (empty summaries are skipped), AND
-        - Its current summary differs from the canonical summary.
-
-        Diagnostic fields help callers understand *why* an entity is stale:
-        - ``duplicate_count``: extra occurrences of duplicated lines (lines that
-          appear more than once in the current summary).
-        - ``stale_line_count``: lines in the current summary that are not backed
-          by any valid edge fact.
-        - ``valid_fact_count``: number of unique valid edge facts.
-        - ``summary_line_count``: number of lines in the current summary.
+        Shared by detect_stale_summaries (public API) and rebuild_entity_summaries
+        to avoid a duplicate bulk edge fetch when both are needed.
 
         Args:
             group_id: Project graph to query.
 
         Returns:
-            List of dicts (one per stale entity) with keys: uuid, name,
-            duplicate_count, stale_line_count, valid_fact_count,
-            summary_line_count.
+            Tuple of (stale_list, all_edges_dict) where all_edges_dict is keyed
+            by entity UUID.
         """
         entities = await self.list_entity_nodes(group_id=group_id)
         all_edges = await self.get_all_valid_edges(group_id=group_id)
@@ -872,7 +861,69 @@ class GraphitiBackend:
                 'valid_fact_count': len(valid_facts),
                 'summary_line_count': len(summary_lines),
             })
+        return stale, all_edges
+
+    async def detect_stale_summaries(self, *, group_id: str) -> list[dict]:
+        """Identify Entity nodes whose summary is out of sync with valid edge facts.
+
+        For each entity node, fetches its valid RELATES_TO edges and computes
+        the canonical summary (deduped facts joined with newlines).  An entity
+        is considered *stale* when:
+
+        - Its current summary is non-empty (empty summaries are skipped), AND
+        - Its current summary differs from the canonical summary.
+
+        Diagnostic fields help callers understand *why* an entity is stale:
+        - ``duplicate_count``: extra occurrences of duplicated lines (lines that
+          appear more than once in the current summary).
+        - ``stale_line_count``: lines in the current summary that are not backed
+          by any valid edge fact.
+        - ``valid_fact_count``: number of unique valid edge facts.
+        - ``summary_line_count``: number of lines in the current summary.
+
+        Args:
+            group_id: Project graph to query.
+
+        Returns:
+            List of dicts (one per stale entity) with keys: uuid, name,
+            duplicate_count, stale_line_count, valid_fact_count,
+            summary_line_count.
+        """
+        stale, _ = await self._detect_stale_summaries_with_edges(group_id=group_id)
         return stale
+
+    async def _rebuild_entity_from_edges(
+        self, uuid: str, name: str, edges: list[dict], *, group_id: str
+    ) -> dict:
+        """Rebuild one Entity node's summary from pre-fetched edges.
+
+        Accepts the edges already fetched by the bulk call, avoiding a
+        per-entity get_valid_edges_for_node round-trip.
+
+        Args:
+            uuid: Entity UUID.
+            name: Entity name (for logging / result dict).
+            edges: Pre-fetched valid edge dicts (uuid, fact, name).
+            group_id: Graph to update.
+
+        Returns:
+            Dict with keys: uuid, name, old_summary, new_summary, edge_count.
+        """
+        _, old_summary = await self.get_node_text(uuid, group_id=group_id)
+        facts = list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
+        new_summary = '\n'.join(facts)
+        await self.update_node_summary(uuid, new_summary, group_id=group_id)
+        logger.info(
+            '_rebuild_entity_from_edges: node=%s name=%r edges=%d new_len=%d',
+            uuid, name, len(edges), len(new_summary),
+        )
+        return {
+            'uuid': uuid,
+            'name': name,
+            'old_summary': old_summary,
+            'new_summary': new_summary,
+            'edge_count': len(edges),
+        }
 
     async def rebuild_entity_summaries(
         self,
@@ -906,14 +957,17 @@ class GraphitiBackend:
             - ``errors``: number of per-entity refresh failures.
             - ``details``: list of per-entity result dicts.
         """
-        all_entities = await self.list_entity_nodes(group_id=group_id)
-        total_entities = len(all_entities)
-
         if force:
+            all_entities = await self.list_entity_nodes(group_id=group_id)
+            all_edges = await self.get_all_valid_edges(group_id=group_id)
             targets = [{'uuid': e['uuid'], 'name': e['name']} for e in all_entities]
+            total_entities = len(all_entities)
         else:
-            stale = await self.detect_stale_summaries(group_id=group_id)
+            stale, all_edges = await self._detect_stale_summaries_with_edges(group_id=group_id)
+            # Need total_entities for reporting — list_entity_nodes is cheap (read-only).
+            all_entities = await self.list_entity_nodes(group_id=group_id)
             targets = [{'uuid': s['uuid'], 'name': s['name']} for s in stale]
+            total_entities = len(all_entities)
 
         stale_entities = len(targets)
         rebuilt = 0
@@ -926,29 +980,41 @@ class GraphitiBackend:
             for t in targets:
                 details.append({'uuid': t['uuid'], 'name': t['name'], 'status': 'skipped_dry_run'})
         else:
-            for t in targets:
-                try:
-                    refresh_result = await self.refresh_entity_summary(t['uuid'], group_id=group_id)
-                    rebuilt += 1
-                    details.append({
-                        'uuid': t['uuid'],
-                        'name': t['name'],
-                        'status': 'rebuilt',
-                        'old_summary': refresh_result.get('old_summary', ''),
-                        'new_summary': refresh_result.get('new_summary', ''),
-                        'edge_count': refresh_result.get('edge_count', 0),
-                    })
-                except Exception as exc:
+            sem = asyncio.Semaphore(20)
+
+            async def _rebuild_one(t: dict) -> dict:
+                async with sem:
+                    edges = all_edges.get(t['uuid'], [])
+                    return await self._rebuild_entity_from_edges(
+                        t['uuid'], t['name'], edges, group_id=group_id
+                    )
+
+            results = await asyncio.gather(
+                *(_rebuild_one(t) for t in targets), return_exceptions=True
+            )
+
+            for t, r in zip(targets, results):
+                if isinstance(r, Exception):
                     errors += 1
                     logger.error(
-                        'rebuild_entity_summaries: failed to refresh node=%s name=%r: %s',
-                        t['uuid'], t['name'], exc,
+                        'rebuild_entity_summaries: failed to rebuild node=%s name=%r: %s',
+                        t['uuid'], t['name'], r,
                     )
                     details.append({
                         'uuid': t['uuid'],
                         'name': t['name'],
                         'status': 'error',
-                        'error': str(exc),
+                        'error': str(r),
+                    })
+                else:
+                    rebuilt += 1
+                    details.append({
+                        'uuid': t['uuid'],
+                        'name': t['name'],
+                        'status': 'rebuilt',
+                        'old_summary': r.get('old_summary', ''),
+                        'new_summary': r.get('new_summary', ''),
+                        'edge_count': r.get('edge_count', 0),
                     })
 
         logger.info(
