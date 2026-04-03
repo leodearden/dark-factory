@@ -313,3 +313,210 @@ async def test_set_task_status_all_trigger_statuses_pass_through(
     assert 'error' not in result, (
         f"STATUS_TRIGGERS value {status!r} should be accepted, got: {result}"
     )
+
+
+# ------------------------------------------------------------------
+# get_tasks status filter
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_passes_to_interceptor(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_tasks with status parameter passes parsed list to interceptor."""
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project', 'status': 'pending,in-progress'},
+    )
+    task_interceptor.get_tasks.assert_called_once()
+    _, kwargs = task_interceptor.get_tasks.call_args
+    assert kwargs['status'] == ['pending', 'in-progress']
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_rejects_invalid(mcp_server_with_tasks):
+    """get_tasks with invalid status value returns validation error."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project', 'status': 'bogus'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert 'bogus' in result['error']
+    assert result.get('error_type') == 'ValidationError'
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_rejects_partial_invalid(mcp_server_with_tasks):
+    """get_tasks rejects if any status value is invalid."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project', 'status': 'pending,invalid_status'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert 'invalid_status' in result['error']
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_no_status_filter_passes_none(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_tasks without status parameter passes None to interceptor."""
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project'},
+    )
+    task_interceptor.get_tasks.assert_called_once()
+    _, kwargs = task_interceptor.get_tasks.call_args
+    assert kwargs['status'] is None
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_whitespace_handling(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_tasks strips whitespace from comma-separated status values."""
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project', 'status': ' pending , blocked '},
+    )
+    _, kwargs = task_interceptor.get_tasks.call_args
+    assert kwargs['status'] == ['pending', 'blocked']
+
+
+# ------------------------------------------------------------------
+# get_tasks compact parameter (step-5)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_compact_true_passes_to_interceptor(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_tasks with compact=true passes compact=True to interceptor."""
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project', 'compact': True},
+    )
+    task_interceptor.get_tasks.assert_called_once()
+    _, kwargs = task_interceptor.get_tasks.call_args
+    assert kwargs['compact'] is True
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_compact_not_provided_defaults_false(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_tasks without compact parameter passes compact=False to interceptor."""
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project'},
+    )
+    task_interceptor.get_tasks.assert_called_once()
+    _, kwargs = task_interceptor.get_tasks.call_args
+    assert kwargs.get('compact', False) is False
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_compact_with_status_filter(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_tasks with both compact=true and status filter passes both to interceptor."""
+    task_interceptor.get_tasks = AsyncMock(return_value={'tasks': []})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_tasks',
+        {'project_root': '/project', 'status': 'pending,blocked', 'compact': True},
+    )
+    task_interceptor.get_tasks.assert_called_once()
+    _, kwargs = task_interceptor.get_tasks.call_args
+    assert kwargs['status'] == ['pending', 'blocked']
+    assert kwargs['compact'] is True
+
+
+def test_get_tasks_tool_docstring_mentions_compact(mcp_server_with_tasks):
+    """compact parameter should be documented in the get_tasks tool."""
+    tools = mcp_server_with_tasks._tool_manager.list_tools()
+    get_tasks_tool = next(t for t in tools if t.name == 'get_tasks')
+    # The description/docstring should mention compact mode
+    description = get_tasks_tool.description or ''
+    assert 'compact' in description.lower()
+
+
+# ------------------------------------------------------------------
+# get_task_summary MCP tool (step-9)
+# ------------------------------------------------------------------
+
+
+def test_get_task_summary_tool_is_registered(mcp_server_with_tasks):
+    """get_task_summary tool should be registered in the MCP server."""
+    tools = mcp_server_with_tasks._tool_manager.list_tools()
+    names = [t.name for t in tools]
+    assert 'get_task_summary' in names
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_passes_project_root_to_interceptor(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_task_summary passes project_root to interceptor.get_task_summary."""
+    task_interceptor.get_task_summary = AsyncMock(
+        return_value={'counts': {}, 'tasks': []}
+    )
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_task_summary',
+        {'project_root': '/project'},
+    )
+    task_interceptor.get_task_summary.assert_called_once()
+    _, kwargs = task_interceptor.get_task_summary.call_args
+    assert kwargs.get('project_root') == '/project'
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_returns_structured_response(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_task_summary returns the structured counts/tasks response."""
+    expected = {
+        'counts': {'pending': 3, 'done': 10},
+        'tasks': [{'id': '1', 'status': 'pending', 'title': 'Task A'}],
+    }
+    task_interceptor.get_task_summary = AsyncMock(return_value=expected)
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_task_summary',
+        {'project_root': '/project'},
+    )
+    assert result == expected
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_returns_error_on_exception(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """get_task_summary returns error dict when interceptor raises."""
+    task_interceptor.get_task_summary = AsyncMock(
+        side_effect=RuntimeError('connection failed')
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_task_summary',
+        {'project_root': '/project'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_validates_project_root(mcp_server_with_tasks):
+    """get_task_summary returns error if project_root is invalid."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_task_summary',
+        {'project_root': 'relative/path'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result

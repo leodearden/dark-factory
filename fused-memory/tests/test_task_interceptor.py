@@ -8,6 +8,11 @@ import pytest_asyncio
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.utils.task_utils import (
+    _collect_all_tasks,
+    _compact_task,
+    _compact_tasks,
+)
 
 
 @pytest.fixture
@@ -607,3 +612,447 @@ async def test_drain_awaits_pending_commits(taskmaster, event_buffer):
     # drain should await them all
     await interceptor.drain()
     assert len(interceptor._background_tasks) == 0
+
+
+# ── Tests for get_tasks status filter ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_no_filter_returns_all(interceptor, taskmaster):
+    """Without status filter, get_tasks returns all tasks."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {'id': '1', 'status': 'pending', 'title': 'A'},
+        {'id': '2', 'status': 'done', 'title': 'B'},
+        {'id': '3', 'status': 'cancelled', 'title': 'C'},
+    ]})
+    result = await interceptor.get_tasks('/project')
+    assert len(result['tasks']) == 3
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_single(interceptor, taskmaster):
+    """Status filter with one value returns only matching tasks."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {'id': '1', 'status': 'pending', 'title': 'A'},
+        {'id': '2', 'status': 'done', 'title': 'B'},
+        {'id': '3', 'status': 'in-progress', 'title': 'C'},
+    ]})
+    result = await interceptor.get_tasks('/project', status=['pending'])
+    assert len(result['tasks']) == 1
+    assert result['tasks'][0]['id'] == '1'
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_multiple(interceptor, taskmaster):
+    """Status filter with multiple values returns matching tasks."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {'id': '1', 'status': 'pending', 'title': 'A'},
+        {'id': '2', 'status': 'done', 'title': 'B'},
+        {'id': '3', 'status': 'in-progress', 'title': 'C'},
+        {'id': '4', 'status': 'cancelled', 'title': 'D'},
+        {'id': '5', 'status': 'blocked', 'title': 'E'},
+    ]})
+    result = await interceptor.get_tasks(
+        '/project', status=['pending', 'in-progress', 'blocked'],
+    )
+    assert len(result['tasks']) == 3
+    ids = {t['id'] for t in result['tasks']}
+    assert ids == {'1', '3', '5'}
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_subtasks(interceptor, taskmaster):
+    """Status filter recursively filters subtasks."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'pending', 'title': 'A',
+            'subtasks': [
+                {'id': '1.1', 'status': 'done', 'title': 'A.1', 'subtasks': []},
+                {'id': '1.2', 'status': 'pending', 'title': 'A.2', 'subtasks': []},
+            ],
+        },
+        {'id': '2', 'status': 'done', 'title': 'B', 'subtasks': []},
+    ]})
+    result = await interceptor.get_tasks('/project', status=['pending'])
+    assert len(result['tasks']) == 1
+    parent = result['tasks'][0]
+    assert parent['id'] == '1'
+    # Only the pending subtask should remain
+    assert len(parent['subtasks']) == 1
+    assert parent['subtasks'][0]['id'] == '1.2'
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_keeps_parent_with_matching_subtask(
+    interceptor, taskmaster,
+):
+    """Parent with non-matching status is kept if it has matching subtasks."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'done', 'title': 'A',
+            'subtasks': [
+                {'id': '1.1', 'status': 'pending', 'title': 'A.1', 'subtasks': []},
+            ],
+        },
+    ]})
+    result = await interceptor.get_tasks('/project', status=['pending'])
+    # Parent 'done' is kept because subtask '1.1' is pending
+    assert len(result['tasks']) == 1
+    assert result['tasks'][0]['id'] == '1'
+    assert len(result['tasks'][0]['subtasks']) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_status_filter_preserves_other_fields(interceptor, taskmaster):
+    """Status filter preserves non-task fields in the response dict."""
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {'id': '1', 'status': 'pending', 'title': 'A'},
+            {'id': '2', 'status': 'done', 'title': 'B'},
+        ],
+        'total': 2,
+        'projectRoot': '/project',
+    })
+    result = await interceptor.get_tasks('/project', status=['pending'])
+    assert len(result['tasks']) == 1
+    # Other fields preserved
+    assert result['total'] == 2
+    assert result['projectRoot'] == '/project'
+
+
+# ── Tests for _compact_task() and _compact_tasks() (step-1) ───────────────
+
+
+def test_compact_task_strips_description_and_details():
+    """_compact_task removes 'description' and 'details' fields."""
+    task = {
+        'id': '1',
+        'status': 'pending',
+        'title': 'Test Task',
+        'description': 'A long description that takes up lots of space.',
+        'details': 'Implementation details that are very verbose.',
+        'dependencies': ['2'],
+        'priority': 'high',
+    }
+    result = _compact_task(task)
+    assert 'description' not in result
+    assert 'details' not in result
+
+
+def test_compact_task_preserves_key_fields():
+    """_compact_task preserves id, status, title, dependencies, priority."""
+    task = {
+        'id': '1',
+        'status': 'pending',
+        'title': 'Test Task',
+        'description': 'Verbose description.',
+        'details': 'Verbose details.',
+        'dependencies': ['2', '3'],
+        'priority': 'high',
+    }
+    result = _compact_task(task)
+    assert result['id'] == '1'
+    assert result['status'] == 'pending'
+    assert result['title'] == 'Test Task'
+    assert result['dependencies'] == ['2', '3']
+    assert result['priority'] == 'high'
+
+
+def test_compact_task_compacts_subtasks_recursively():
+    """_compact_task recursively compacts subtasks to id/status/title."""
+    task = {
+        'id': '1',
+        'status': 'pending',
+        'title': 'Parent',
+        'subtasks': [
+            {
+                'id': '1.1',
+                'status': 'done',
+                'title': 'Child',
+                'description': 'Child description',
+                'details': 'Child details',
+                'dependencies': [],
+                'subtasks': [],
+            },
+        ],
+    }
+    result = _compact_task(task)
+    assert len(result['subtasks']) == 1
+    child = result['subtasks'][0]
+    assert child['id'] == '1.1'
+    assert child['status'] == 'done'
+    assert child['title'] == 'Child'
+    assert 'description' not in child
+    assert 'details' not in child
+
+
+def test_compact_task_handles_missing_optional_fields():
+    """_compact_task works when optional fields (dependencies, priority) are absent."""
+    task = {'id': '2', 'status': 'in-progress', 'title': 'Minimal Task'}
+    result = _compact_task(task)
+    assert result['id'] == '2'
+    assert result['status'] == 'in-progress'
+    assert result['title'] == 'Minimal Task'
+    # No KeyError for missing optional fields
+    assert 'description' not in result
+    assert 'details' not in result
+
+
+def test_compact_task_handles_non_dict_input():
+    """_compact_task returns the input unchanged if it is not a dict."""
+    assert _compact_task("not a dict") == "not a dict"
+    assert _compact_task(None) is None
+    assert _compact_task(42) == 42
+
+
+def test_compact_task_empty_subtasks_list():
+    """_compact_task with empty subtasks list returns empty list."""
+    task = {
+        'id': '1',
+        'status': 'pending',
+        'title': 'Task',
+        'description': 'desc',
+        'subtasks': [],
+    }
+    result = _compact_task(task)
+    assert result['subtasks'] == []
+
+
+def test_compact_tasks_applies_to_list():
+    """_compact_tasks applies _compact_task to every element in a list."""
+    tasks = [
+        {
+            'id': '1',
+            'status': 'pending',
+            'title': 'Task A',
+            'description': 'Long description A',
+            'details': 'Details A',
+        },
+        {
+            'id': '2',
+            'status': 'done',
+            'title': 'Task B',
+            'description': 'Long description B',
+        },
+    ]
+    results = _compact_tasks(tasks)
+    assert len(results) == 2
+    for r in results:
+        assert 'description' not in r
+        assert 'details' not in r
+
+
+def test_compact_tasks_empty_list():
+    """_compact_tasks on empty list returns empty list."""
+    assert _compact_tasks([]) == []
+
+
+def test_compact_tasks_skips_non_dict_elements():
+    """_compact_tasks handles a list with non-dict elements gracefully."""
+    tasks = [
+        {'id': '1', 'status': 'pending', 'title': 'Task', 'description': 'desc'},
+        "not a dict",
+        None,
+    ]
+    results = _compact_tasks(tasks)
+    # Non-dict elements passed through unchanged; dict elements compacted
+    assert len(results) == 3
+    assert 'description' not in results[0]
+    assert results[1] == "not a dict"
+    assert results[2] is None
+
+
+# ── Tests for get_tasks(compact=True) (step-3) ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_compact_false_returns_full_dicts(interceptor, taskmaster):
+    """compact=False (default) returns full task dicts unchanged."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'pending', 'title': 'Task A',
+            'description': 'Full description', 'details': 'Full details',
+        },
+    ]})
+    result = await interceptor.get_tasks('/project', compact=False)
+    assert result['tasks'][0]['description'] == 'Full description'
+    assert result['tasks'][0]['details'] == 'Full details'
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_compact_default_is_false(interceptor, taskmaster):
+    """compact defaults to False — full task dicts returned when not specified."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'pending', 'title': 'Task A',
+            'description': 'Full description',
+        },
+    ]})
+    result = await interceptor.get_tasks('/project')
+    assert result['tasks'][0]['description'] == 'Full description'
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_compact_true_strips_verbose_fields(interceptor, taskmaster):
+    """compact=True strips description and details from returned task dicts."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'pending', 'title': 'Task A',
+            'description': 'A long description',
+            'details': 'Verbose implementation details',
+            'dependencies': [],
+        },
+    ]})
+    result = await interceptor.get_tasks('/project', compact=True)
+    task = result['tasks'][0]
+    assert 'description' not in task
+    assert 'details' not in task
+    assert task['id'] == '1'
+    assert task['title'] == 'Task A'
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_compact_true_with_status_filter(interceptor, taskmaster):
+    """compact=True combined with status filter: filter applied before compaction."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'pending', 'title': 'Task A',
+            'description': 'Desc A', 'details': 'Details A',
+        },
+        {
+            'id': '2', 'status': 'done', 'title': 'Task B',
+            'description': 'Desc B', 'details': 'Details B',
+        },
+    ]})
+    result = await interceptor.get_tasks('/project', status=['pending'], compact=True)
+    # Only pending task returned
+    assert len(result['tasks']) == 1
+    task = result['tasks'][0]
+    assert task['id'] == '1'
+    # And description/details stripped
+    assert 'description' not in task
+    assert 'details' not in task
+
+
+# ── Tests for get_task_summary() (step-7) ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_returns_counts_and_tasks_keys(interceptor, taskmaster):
+    """get_task_summary returns a dict with 'counts' and 'tasks' keys."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {'id': '1', 'status': 'pending', 'title': 'Task A', 'subtasks': []},
+        {'id': '2', 'status': 'done', 'title': 'Task B', 'subtasks': []},
+    ]})
+    result = await interceptor.get_task_summary('/project')
+    assert 'counts' in result
+    assert 'tasks' in result
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_counts_per_status(interceptor, taskmaster):
+    """get_task_summary counts correctly per status."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {'id': '1', 'status': 'pending', 'title': 'Task A', 'subtasks': []},
+        {'id': '2', 'status': 'done', 'title': 'Task B', 'subtasks': []},
+        {'id': '3', 'status': 'pending', 'title': 'Task C', 'subtasks': []},
+        {'id': '4', 'status': 'in-progress', 'title': 'Task D', 'subtasks': []},
+    ]})
+    result = await interceptor.get_task_summary('/project')
+    counts = result['counts']
+    assert counts['pending'] == 2
+    assert counts['done'] == 1
+    assert counts['in-progress'] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_tasks_contain_only_id_status_title(interceptor, taskmaster):
+    """get_task_summary tasks list contains only {id, status, title} per task."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'pending', 'title': 'Task A',
+            'description': 'Full description', 'details': 'Implementation details',
+            'dependencies': ['2'], 'subtasks': [],
+        },
+    ]})
+    result = await interceptor.get_task_summary('/project')
+    task_entry = result['tasks'][0]
+    assert task_entry == {'id': '1', 'status': 'pending', 'title': 'Task A'}
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_includes_subtasks_in_counts(interceptor, taskmaster):
+    """get_task_summary counts include subtask statuses, not just top-level."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'pending', 'title': 'Parent',
+            'subtasks': [
+                {'id': '1.1', 'status': 'done', 'title': 'Child A', 'subtasks': []},
+                {'id': '1.2', 'status': 'done', 'title': 'Child B', 'subtasks': []},
+            ],
+        },
+    ]})
+    result = await interceptor.get_task_summary('/project')
+    counts = result['counts']
+    # Top-level: 1 pending, subtasks: 2 done
+    assert counts['pending'] == 1
+    assert counts['done'] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_includes_subtasks_in_flat_task_list(interceptor, taskmaster):
+    """get_task_summary tasks list includes both top-level and subtask entries."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {
+            'id': '1', 'status': 'pending', 'title': 'Parent',
+            'subtasks': [
+                {'id': '1.1', 'status': 'done', 'title': 'Child', 'subtasks': []},
+            ],
+        },
+    ]})
+    result = await interceptor.get_task_summary('/project')
+    ids = [t['id'] for t in result['tasks']]
+    assert '1' in ids
+    assert '1.1' in ids
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_empty_task_list(interceptor, taskmaster):
+    """get_task_summary with no tasks returns empty counts and tasks."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+    result = await interceptor.get_task_summary('/project')
+    assert result['counts'] == {}
+    assert result['tasks'] == []
+
+
+@pytest.mark.asyncio
+async def test_get_task_summary_handles_non_dict_element(interceptor, taskmaster):
+    """get_task_summary ignores non-dict elements in task list gracefully."""
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [
+        {'id': '1', 'status': 'pending', 'title': 'Task A', 'subtasks': []},
+        'not a dict',
+    ]})
+    result = await interceptor.get_task_summary('/project')
+    # Should not raise; only dict tasks counted/listed
+    assert result['counts'].get('pending', 0) == 1
+    ids = [t['id'] for t in result['tasks']]
+    assert '1' in ids
+
+
+def test_collect_all_tasks_flattens_tree():
+    """_collect_all_tasks recursively flattens a task tree."""
+    tasks = [
+        {
+            'id': '1', 'status': 'pending', 'title': 'Parent',
+            'subtasks': [
+                {'id': '1.1', 'status': 'done', 'title': 'Child', 'subtasks': []},
+            ],
+        },
+        {'id': '2', 'status': 'in-progress', 'title': 'Task B', 'subtasks': []},
+    ]
+    flat = _collect_all_tasks(tasks)
+    ids = [t['id'] for t in flat]
+    assert '1' in ids
+    assert '1.1' in ids
+    assert '2' in ids
+    assert len(flat) == 3

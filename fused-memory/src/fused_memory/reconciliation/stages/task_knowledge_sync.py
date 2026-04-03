@@ -4,6 +4,7 @@ Stage 3: Cross-System Integrity Check — read-only verification."""
 from __future__ import annotations
 
 import json
+import logging
 
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -21,6 +22,9 @@ from fused_memory.reconciliation.prompts import (
 )
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.utils.task_utils import _filter_tasks_by_status
+
+logger = logging.getLogger(__name__)
 
 
 class TaskKnowledgeSync(BaseStage):
@@ -46,25 +50,27 @@ class TaskKnowledgeSync(BaseStage):
     ) -> str:
         stage1_report = prior_reports[0] if prior_reports else None
 
-        # Get task tree
-        tasks_data: dict = {}
+        # Fetch the task tree once and split by status in-memory.
+        # Uses a single network call to avoid doubling serialization/latency
+        # on large task trees (300+ tasks).
+        active_tasks: list = []
+        done_tasks: list = []
         if self.taskmaster:
             try:
-                tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
-            except Exception:
-                tasks_data = {}
-
-        all_tasks = tasks_data.get('tasks', [])
-        if not isinstance(all_tasks, list):
-            all_tasks = []
-
-        active_tasks = [
-            t for t in all_tasks
-            if isinstance(t, dict) and t.get('status') in ('pending', 'in-progress', 'review')
-        ]
-        done_tasks = [
-            t for t in all_tasks if isinstance(t, dict) and t.get('status') == 'done'
-        ]
+                data = await self.taskmaster.get_tasks(
+                    project_root=self.project_root,
+                )
+                all_tasks_raw = data.get('tasks', [])
+                if not isinstance(all_tasks_raw, list):
+                    all_tasks_raw = []
+                active_tasks = _filter_tasks_by_status(
+                    all_tasks_raw, ['pending', 'in-progress', 'review', 'blocked']
+                )
+                done_tasks = _filter_tasks_by_status(all_tasks_raw, ['done'])
+            except Exception as e:
+                logger.warning(
+                    'Stage 2: failed to fetch tasks from taskmaster: %s', e
+                )
 
         remediation_note = ''
         if self.remediation_mode:
@@ -73,6 +79,9 @@ class TaskKnowledgeSync(BaseStage):
                 'This is a focused remediation run. Address remaining task-level issues '
                 'from Stage 1. Do not perform general task-knowledge sync.\n\n'
             )
+
+        # Combine for proactive sample and total count
+        all_tasks = active_tasks + done_tasks
 
         proactive_sample_section = ''
         if not self.remediation_mode:
