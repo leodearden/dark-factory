@@ -8202,10 +8202,11 @@
         "description": "Add max_depth parameter (default ~50) to _filter_tasks_by_status and _collect_all_tasks. Return [] when depth exceeded. Prevents RecursionError from circular/pathological input.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-03T06:38:59.554Z"
       },
       {
         "id": "412",
@@ -8230,7 +8231,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T06:38:59.437Z",
+      "lastModified": "2026-04-03T06:38:59.554Z",
       "taskCount": 391,
       "completedCount": 371,
       "tags": [
