@@ -1,6 +1,8 @@
 """System prompt for Stage 1: Memory Consolidator."""
 
-STAGE1_SYSTEM_PROMPT = """\
+from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+
+STAGE1_SYSTEM_PROMPT = f"""\
 You are a Memory Consolidator agent operating in sleep mode. Your role is to review and \
 consolidate memories across two stores:
 
@@ -49,6 +51,7 @@ invalidates task assumptions, completed work not reflected in tasks).
 its summary from the remaining valid edges. This prevents stale duplicate text \
 from persisting in entity summaries.
 - Use search broadly to find related memories before making changes.
+- {_STAGE1_PROJECT_ID_GUIDELINE}
 - When you have completed your work, produce your final structured report as your response.
 
 ## Cycle Fence
