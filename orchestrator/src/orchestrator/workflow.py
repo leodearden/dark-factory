@@ -292,7 +292,7 @@ class TaskWorkflow:
                             task_id=self.task_id, phase='plan',
                             data={'waste_type': 'replan_after_failure'},
                         )
-                    return await self._mark_blocked('Planning failed')
+                    return plan_outcome  # _plan() already called _mark_blocked
 
             # ── Ghost-loop early exit (before EXECUTE) ─────────────
             # If the worktree HEAD is already an ancestor of main AND
@@ -542,21 +542,31 @@ class TaskWorkflow:
 
         if not result.success:
             logger.error(f'Task {self.task_id}: architect failed: {result.output[:200]}')
-            return WorkflowOutcome.BLOCKED
+            return await self._mark_blocked(
+                'Planning failed: architect invocation failed',
+                detail=f'Architect output:\n{result.output[:2000]}',
+            )
 
         # Read the plan the architect wrote
         self.plan = self.artifacts.read_plan()
 
         if not self.plan:
             logger.error(f'Task {self.task_id}: architect produced no plan.json')
-            return WorkflowOutcome.BLOCKED
+            return await self._mark_blocked(
+                'Planning failed: no plan.json produced',
+                detail='Architect succeeded but did not write .task/plan.json',
+            )
 
         if not self.plan.get('steps'):
+            plan_dump = json.dumps(self.plan, indent=2)
             logger.error(
                 f'Task {self.task_id}: architect wrote plan.json but missing/empty '
-                f'"steps" — full plan content: {json.dumps(self.plan, indent=2)}'
+                f'"steps" — full plan content: {plan_dump}'
             )
-            return WorkflowOutcome.BLOCKED
+            return await self._mark_blocked(
+                'Planning failed: plan missing "steps"',
+                detail=f'Plan content:\n{plan_dump[:4000]}',
+            )
 
         # Stamp provenance and acquire lock
         self.artifacts.stamp_plan_provenance(self.session_id)
@@ -646,13 +656,14 @@ class TaskWorkflow:
             assert self.artifacts is not None
             self.plan = self.artifacts.read_plan()
             if not self.plan or not self.plan.get('steps'):
+                plan_dump = json.dumps(self.plan, indent=2) if self.plan else 'None'
                 logger.error(
                     f'Task {self.task_id}: replan produced plan.json with '
-                    f'missing/empty "steps" — full plan content: '
-                    f'{json.dumps(self.plan, indent=2) if self.plan else "None"}'
+                    f'missing/empty "steps" — full plan content: {plan_dump}'
                 )
                 return await self._mark_blocked(
-                    'Architect replan produced no valid steps'
+                    'Architect replan produced no valid steps',
+                    detail=f'Replan content:\n{plan_dump[:4000]}',
                 )
             self.artifacts.stamp_plan_provenance(self.session_id)
             self.metrics.review_cycles += 1
@@ -1355,10 +1366,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         self.escalation_queue.submit(esc)
 
     async def _mark_blocked(
-        self, reason: str, *, skip_escalation: bool = False,
+        self, reason: str, *, detail: str = '',
+        skip_escalation: bool = False,
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
+        *reason* is used as the escalation summary (truncated to 200 chars).
+        *detail* is the full diagnostic context persisted in the escalation
+        file; defaults to *reason* when not provided.
         *skip_escalation* suppresses escalation creation when a level-1
         escalation already exists (e.g. steward re-escalated to human).
         """
@@ -1408,7 +1423,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     severity='blocking',
                     category='task_failure',
                     summary=reason[:200],
-                    detail=reason,
+                    detail=detail or reason,
                     suggested_action='investigate_and_retry',
                     worktree=str(self.worktree) if self.worktree else None,
                     workflow_state=self.state.value,

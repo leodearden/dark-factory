@@ -184,5 +184,16 @@ class EscalationQueue:
         return count
 
     def make_id(self, task_id: str) -> str:
-        """Generate a unique escalation ID."""
-        return f'esc-{task_id}-{self._next_seq()}'
+        """Generate a unique escalation ID.
+
+        Scans existing files to avoid overwriting resolved escalations
+        from prior process runs (the in-memory counter resets on restart).
+        """
+        prefix = f'esc-{task_id}-'
+        max_seq = 0
+        for path in self.queue_dir.glob(f'{prefix}*.json'):
+            suffix = path.stem[len(prefix):]
+            with contextlib.suppress(ValueError):
+                max_seq = max(max_seq, int(suffix))
+        seq = max(max_seq + 1, self._next_seq())
+        return f'{prefix}{seq}'
