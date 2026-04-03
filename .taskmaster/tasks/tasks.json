@@ -2624,13 +2624,13 @@
         "description": "Graphiti entity summaries accumulate stale and duplicated lines over time as new edges are added. This is a systemic issue (observed across reify entities for M5, M5 decomposition, M5 types, Task 139, Task 147, and others with recurrence >= 4). Entity summaries should be periodically rebuilt or deduplicated to reflect only current, non-invalidated edge facts.\n\nAcceptance criteria:\n1. Identify the Graphiti entity summary update path and understand why stale/duplicate lines persist\n2. Implement a mechanism to rebuild entity summaries from current valid edges (either on-write dedup or periodic batch rebuild)\n3. Expose this as a fused-memory management operation (e.g. rebuild_entity_summaries) \n4. Validate against known affected entities (reify project: M5, M5 decomposition, M5 types)\n\nmemory_hints:\n- entities: [\"M5\", \"M5 decomposition\", \"M5 types\", \"Task 139\"]\n- search queries: [\"entity summary accumulation stale\", \"Graphiti entity summary rebuild\"]",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "382"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-03T13:52:01.761Z",
+        "updatedAt": "2026-04-03T13:52:02.322Z",
         "metadata": {
           "files": [
             "fused-memory/src/fused_memory/backends/graphiti_client.py",
@@ -3019,11 +3019,11 @@
         "description": "The reconciliation Recent Runs table shows \"Loading...\" text between every run row. Detail rows use x-show=\"open\" with x-cloak and hx-trigger=\"revealed\", but Idiomorph morphing every 15s briefly makes hidden rows visible, triggering unnecessary HTMX fetches. The \"Loading...\" text from in-flight fetches remains visible.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 159-164).\n\nFix approach: (1) Change hx-trigger from \"revealed\" to a manual trigger fired by the Alpine @click handler (e.g. hx-trigger=\"load-detail\" and dispatch the event on click). This prevents morph-triggered fetches. (2) Use Alpine.store or id-based state preservation to maintain open/closed state across morphs.\n\nmemory_hint: search \"reconciliation detail HTMX\" for prior discussion.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-03T13:51:59.016Z",
+        "updatedAt": "2026-04-03T13:52:02.284Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/recon.html",
@@ -8362,7 +8362,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T13:52:02.174Z",
+      "lastModified": "2026-04-03T13:52:02.322Z",
       "taskCount": 396,
       "completedCount": 384,
       "tags": [
