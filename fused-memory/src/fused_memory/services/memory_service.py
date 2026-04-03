@@ -278,7 +278,7 @@ class MemoryService:
         if reference_time_iso is not None:
             try:
                 reference_time = datetime.fromisoformat(reference_time_iso)
-            except ValueError:
+            except (ValueError, TypeError):
                 logger.warning(
                     'Invalid reference_time %r in queue payload; treating as None',
                     reference_time_iso,
