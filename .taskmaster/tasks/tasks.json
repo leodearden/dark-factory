@@ -8164,6 +8164,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 410,
+        "title": "Propagate error responses through get_task_summary",
+        "description": "In task_interceptor.py, get_task_summary should check if self.get_tasks() returns an error dict (has 'error' key) and propagate it instead of silently returning {'counts': {}, 'tasks': []}.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8176,7 +8187,7 @@
       ],
       "created": "2026-04-03T06:30:22.226Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-03T06:30:28.069Z"
+      "updated": "2026-04-03T06:30:29.907Z"
     }
   }
 }
