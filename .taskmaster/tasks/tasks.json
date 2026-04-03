@@ -3019,11 +3019,11 @@
         "description": "The reconciliation Recent Runs table shows \"Loading...\" text between every run row. Detail rows use x-show=\"open\" with x-cloak and hx-trigger=\"revealed\", but Idiomorph morphing every 15s briefly makes hidden rows visible, triggering unnecessary HTMX fetches. The \"Loading...\" text from in-flight fetches remains visible.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 159-164).\n\nFix approach: (1) Change hx-trigger from \"revealed\" to a manual trigger fired by the Alpine @click handler (e.g. hx-trigger=\"load-detail\" and dispatch the event on click). This prevents morph-triggered fetches. (2) Use Alpine.store or id-based state preservation to maintain open/closed state across morphs.\n\nmemory_hint: search \"reconciliation detail HTMX\" for prior discussion.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-03T07:03:14.821Z",
+        "updatedAt": "2026-04-03T07:03:15.643Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/recon.html",
@@ -8248,7 +8248,7 @@
         "description": "MEM0_TELEMETRY is not set anywhere in the application code, .env file, or systemd unit files. The briefing documents this as a critical stability rule: mem0's capture_event() creates a new Posthog Consumer thread per API call, leaking ~8000 threads/day and causing 1400% CPU.\n\nCurrently this relies entirely on external deployment configuration (e.g., systemd Environment= or shell profile), but none of those contain it either. If the fused-memory server starts without this env var, mem0 defaults to telemetry=True and the thread leak returns.\n\n**Fix:** Add `os.environ.setdefault('MEM0_TELEMETRY', 'false')` to `fused-memory/src/fused_memory/server/main.py` early in module initialization (before line 14 where dotenv is loaded, or immediately after). This ensures the protection is always active regardless of deployment configuration.\n\n**memory_hints:** search for \"mem0 posthog thread leak\" and \"MEM0_TELEMETRY\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
@@ -8259,7 +8259,8 @@
           "modules": [
             "fused-memory/src/fused_memory/server"
           ]
-        }
+        },
+        "updatedAt": "2026-04-03T07:03:15.492Z"
       },
       {
         "id": "414",
@@ -8285,7 +8286,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T07:03:15.401Z",
+      "lastModified": "2026-04-03T07:03:15.643Z",
       "taskCount": 393,
       "completedCount": 374,
       "tags": [
