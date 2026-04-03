@@ -497,6 +497,7 @@ class TaskWorkflow:
                 f'Task {self.task_id}: plan.lock is held by session {lock_owner!r}, '
                 f'skipping architect — requeuing to avoid duplicate execution'
             )
+            await self.scheduler.set_task_status(self.task_id, 'pending')
             return WorkflowOutcome.REQUEUED
 
         prompt = await self.briefing.build_architect_prompt(self.task, worktree=self.worktree)
