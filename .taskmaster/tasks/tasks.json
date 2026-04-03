@@ -8195,15 +8195,16 @@
         "description": "In tools.py, after parsing status_list from comma-separated string, return error if list is empty (e.g. status=',' or '  '). Also document or fix the cancelled/deferred exclusion from proactive sample in task_knowledge_sync.py.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-03T06:33:15.800Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T06:33:15.745Z",
+      "lastModified": "2026-04-03T06:33:15.800Z",
       "taskCount": 391,
       "completedCount": 370,
       "tags": [
