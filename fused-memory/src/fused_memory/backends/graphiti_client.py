@@ -842,42 +842,36 @@ class GraphitiBackend:
             summary_line_count.
         """
         entities = await self.list_entity_nodes(group_id=group_id)
+        all_edges = await self.get_all_valid_edges(group_id=group_id)
         stale: list[dict] = []
         for entity in entities:
             summary = entity['summary']
             if not summary:
                 # Empty summary — not stale by definition
                 continue
-            try:
-                edges = await self.get_valid_edges_for_node(entity['uuid'], group_id=group_id)
-                # Canonical (deduped) facts
-                valid_facts = list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
-                canonical = '\n'.join(valid_facts)
-                if summary == canonical:
-                    continue  # Already up-to-date
-                # Compute diagnostic counts
-                summary_lines = summary.split('\n')
-                valid_fact_set = set(valid_facts)
-                # duplicate_count: sum of extra occurrences for each unique line that
-                # appears more than once in the current summary.
-                line_counts = Counter(summary_lines)
-                duplicate_count = sum(c - 1 for c in line_counts.values() if c > 1)
-                # stale_line_count: lines in summary not in the valid fact set
-                stale_line_count = sum(1 for line in summary_lines if line not in valid_fact_set)
-                stale.append({
-                    'uuid': entity['uuid'],
-                    'name': entity['name'],
-                    'duplicate_count': duplicate_count,
-                    'stale_line_count': stale_line_count,
-                    'valid_fact_count': len(valid_facts),
-                    'summary_line_count': len(summary_lines),
-                })
-            except Exception as exc:
-                logger.warning(
-                    'detect_stale_summaries: failed to fetch edges for %s (%s): %s',
-                    entity['uuid'], entity['name'], exc,
-                )
-                continue
+            edges = all_edges.get(entity['uuid'], [])
+            # Canonical (deduped) facts
+            valid_facts = list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
+            canonical = '\n'.join(valid_facts)
+            if summary == canonical:
+                continue  # Already up-to-date
+            # Compute diagnostic counts
+            summary_lines = summary.split('\n')
+            valid_fact_set = set(valid_facts)
+            # duplicate_count: sum of extra occurrences for each unique line that
+            # appears more than once in the current summary.
+            line_counts = Counter(summary_lines)
+            duplicate_count = sum(c - 1 for c in line_counts.values() if c > 1)
+            # stale_line_count: lines in summary not in the valid fact set
+            stale_line_count = sum(1 for line in summary_lines if line not in valid_fact_set)
+            stale.append({
+                'uuid': entity['uuid'],
+                'name': entity['name'],
+                'duplicate_count': duplicate_count,
+                'stale_line_count': stale_line_count,
+                'valid_fact_count': len(valid_facts),
+                'summary_line_count': len(summary_lines),
+            })
         return stale
 
     async def rebuild_entity_summaries(

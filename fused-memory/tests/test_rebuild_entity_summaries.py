@@ -90,9 +90,9 @@ class TestDetectStaleSummaries:
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'Alice knows Bob'},
         ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'uuid': 'e1', 'fact': 'Alice knows Bob', 'name': 'knows'},
-        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'Alice knows Bob', 'name': 'knows'}],
+        })
         result = await backend.detect_stale_summaries(group_id='test')
         assert result == []
 
@@ -104,10 +104,12 @@ class TestDetectStaleSummaries:
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA\nfactA\nfactB'},
         ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'},
-            {'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'},
-        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [
+                {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'},
+                {'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'},
+            ],
+        })
         result = await backend.detect_stale_summaries(group_id='test')
         assert len(result) == 1
         assert result[0]['uuid'] == 'uuid-1'
@@ -121,9 +123,9 @@ class TestDetectStaleSummaries:
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'current fact\nold stale fact'},
         ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'},
-        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
+        })
         result = await backend.detect_stale_summaries(group_id='test')
         assert len(result) == 1
         assert result[0]['stale_line_count'] == 1
@@ -137,9 +139,9 @@ class TestDetectStaleSummaries:
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA\nfactA\nold'},
         ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'},
-        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'}],
+        })
         result = await backend.detect_stale_summaries(group_id='test')
         assert len(result) == 1
         assert result[0]['duplicate_count'] == 1
@@ -154,17 +156,18 @@ class TestDetectStaleSummaries:
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': ''},
         ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
         result = await backend.detect_stale_summaries(group_id='test')
         assert result == []
-        # get_valid_edges_for_node should not have been called for empty-summary node
-        backend.get_valid_edges_for_node.assert_not_awaited()
+        # get_all_valid_edges still called once (before the loop), even if no edges
+        backend.get_all_valid_edges.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_no_entities_returns_empty(self, mock_config, make_backend):
         """Empty graph returns empty stale list."""
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=[])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
         result = await backend.detect_stale_summaries(group_id='test')
         assert result == []
 
@@ -175,9 +178,9 @@ class TestDetectStaleSummaries:
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'lineA\nlineB\nlineC'},
         ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'uuid': 'e1', 'fact': 'lineA', 'name': 'edge1'},
-        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'lineA', 'name': 'edge1'}],
+        })
         result = await backend.detect_stale_summaries(group_id='test')
         assert result[0]['summary_line_count'] == 3
 
@@ -274,6 +277,7 @@ class TestRebuildEntitySummaries:
         """Returns dict with total_entities, stale_entities, rebuilt, skipped, errors, details."""
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=[])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
         result = await backend.rebuild_entity_summaries(group_id='test')
         assert set(result.keys()) == {'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors', 'details'}
 
@@ -308,6 +312,7 @@ class TestRebuildEntitySummaries:
         """No entities means all counts are 0."""
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=[])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
         result = await backend.rebuild_entity_summaries(group_id='test')
         assert result['total_entities'] == 0
         assert result['stale_entities'] == 0
