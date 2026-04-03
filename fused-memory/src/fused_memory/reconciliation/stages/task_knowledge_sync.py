@@ -50,27 +50,38 @@ class TaskKnowledgeSync(BaseStage):
     ) -> str:
         stage1_report = prior_reports[0] if prior_reports else None
 
-        # Get task tree — filter locally since TaskmasterBackend is a faithful proxy
-        # (status filtering is the TaskInterceptor's responsibility; harness uses backend directly)
+        # Get task tree — two separate calls so each can fail independently.
+        # Active tasks: pending/in-progress/review/blocked.
+        # Done tasks: fetched separately to isolate failures and enable independent logging.
         active_tasks: list = []
         done_tasks: list = []
         if self.taskmaster:
             try:
-                all_data = await self.taskmaster.get_tasks(
+                active_data = await self.taskmaster.get_tasks(
                     project_root=self.project_root,
                 )
-                all_tasks = all_data.get('tasks', [])
-                if not isinstance(all_tasks, list):
-                    all_tasks = []
+                all_active = active_data.get('tasks', [])
+                if not isinstance(all_active, list):
+                    all_active = []
                 active_tasks = _filter_tasks_by_status(
-                    all_tasks, ['pending', 'in-progress', 'review', 'blocked']
+                    all_active, ['pending', 'in-progress', 'review', 'blocked']
                 )
-                done_tasks = _filter_tasks_by_status(all_tasks, ['done'])
             except Exception as e:
                 logger.warning(
-                    'Stage 2: failed to fetch tasks from taskmaster: %s', e
+                    'Stage 2: failed to fetch active tasks from taskmaster: %s', e
                 )
                 active_tasks = []
+
+            try:
+                done_data = await self.taskmaster.get_tasks(
+                    project_root=self.project_root,
+                )
+                all_done = done_data.get('tasks', [])
+                if not isinstance(all_done, list):
+                    all_done = []
+                done_tasks = _filter_tasks_by_status(all_done, ['done'])
+            except Exception as e:
+                logger.warning('Stage 2: done tasks fetch failed: %s', e)
                 done_tasks = []
 
         remediation_note = ''
