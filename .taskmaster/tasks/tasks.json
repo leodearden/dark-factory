@@ -8175,6 +8175,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 411,
+        "title": "Add recursion depth guard to task_utils recursive functions",
+        "description": "Add max_depth parameter (default ~50) to _filter_tasks_by_status and _collect_all_tasks. Return [] when depth exceeded. Prevents RecursionError from circular/pathological input.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8187,7 +8198,7 @@
       ],
       "created": "2026-04-03T06:30:22.226Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-03T06:30:29.907Z"
+      "updated": "2026-04-03T06:30:31.906Z"
     }
   }
 }
