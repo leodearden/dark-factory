@@ -8131,6 +8131,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 407,
+        "title": "Fix style and stale comments in task interceptor and tests",
+        "description": "Remove extra blank line between get_task_summary and _extract_status in task_interceptor.py (3 blank lines -> 2). Update stale TDD docstring in TestTaskmasterBackendGetTasksSignature in test_task_utils.py.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8143,7 +8154,7 @@
       ],
       "created": "2026-04-03T06:30:22.226Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-03T06:30:22.229Z"
+      "updated": "2026-04-03T06:30:24.010Z"
     }
   }
 }
