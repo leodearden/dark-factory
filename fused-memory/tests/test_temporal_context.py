@@ -11,6 +11,8 @@ Organised by pipeline layer (bottom-up):
   TestAddEpisodeReferenceTime           — step-5 (reference_time)
   TestMCPToolAddEpisodeReferenceTime    — step-7 (reference_time)
   TestReferenceTimeTemporalContextInteraction — step-9
+
+  TestExecuteGraphitiWriteReferenceTimeErrorHandling — step-12
 """
 
 from __future__ import annotations
@@ -695,3 +697,78 @@ class TestReferenceTimeTemporalContextInteraction:
         call_kwargs = service.graphiti.add_episode.call_args[1]
         assert call_kwargs.get('temporal_context') == 'retrospective'
         assert call_kwargs.get('reference_time') == ref_expected
+
+
+# ---------------------------------------------------------------------------
+# Step 12: MemoryService._execute_graphiti_write — invalid reference_time handling
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteGraphitiWriteReferenceTimeErrorHandling:
+    """_execute_graphiti_write gracefully handles invalid reference_time values
+    in the queue payload by falling back to None and logging a warning.
+
+    These tests FAIL until step-13 wraps the fromisoformat() call in try/except.
+    """
+
+    @pytest.mark.asyncio
+    async def test_invalid_reference_time_in_payload_falls_back_to_none(
+        self, service, caplog
+    ):
+        """Payload with reference_time='not-a-date' → does NOT raise, graphiti.add_episode
+        called with reference_time=None, and a warning is logged.
+        """
+        import logging
+
+        payload = {
+            'uuid': 'test-uuid',
+            'name': 'episode_test',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': 'notes',
+            'reference_time': 'not-a-date',
+        }
+        with caplog.at_level(logging.WARNING):
+            # Must NOT raise — invalid value should be silently discarded with a warning
+            await service._execute_graphiti_write('add_episode', payload)
+
+        # graphiti.add_episode must still be called with reference_time=None
+        call_kwargs = service.graphiti.add_episode.call_args[1]
+        assert call_kwargs.get('reference_time') is None
+
+        # A warning must be emitted containing the invalid value
+        warning_texts = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('not-a-date' in str(w) for w in warning_texts), (
+            f'Expected warning containing invalid value, got: {warning_texts}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_string_reference_time_falls_back_to_none(
+        self, service, caplog
+    ):
+        """Payload with reference_time='' (empty string) → does NOT raise,
+        graphiti.add_episode called with reference_time=None, and a warning is logged.
+        """
+        import logging
+
+        payload = {
+            'uuid': 'test-uuid',
+            'name': 'episode_test',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': 'notes',
+            'reference_time': '',
+        }
+        with caplog.at_level(logging.WARNING):
+            # Must NOT raise
+            await service._execute_graphiti_write('add_episode', payload)
+
+        call_kwargs = service.graphiti.add_episode.call_args[1]
+        assert call_kwargs.get('reference_time') is None
+
+        warning_texts = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(w for w in warning_texts), (
+            f'Expected at least one warning log, got: {warning_texts}'
+        )
