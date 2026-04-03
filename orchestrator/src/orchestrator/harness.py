@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_with_cap_retry
 from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle, mcp_call
 from orchestrator.review_checkpoint import ReviewCheckpoint
@@ -138,6 +139,9 @@ class Harness:
         self._merge_worker: MergeWorker | None = None  # lazy import
         self._merge_worker_task: asyncio.Task | None = None
 
+        # Event store — created at run start with a generated run_id
+        self.event_store: EventStore | None = None
+
     async def run(
         self,
         prd_path: Path | None = None,
@@ -151,6 +155,17 @@ class Harness:
         server runs immediately) before executing tasks.
         """
         self.report.started_at = datetime.now(UTC).isoformat()
+
+        # 0. Create event store for this run
+        import uuid
+
+        run_id = f'run-{uuid.uuid4().hex[:12]}'
+        try:
+            db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
+            self.event_store = EventStore(db_path, run_id)
+            self.scheduler.event_store = self.event_store
+        except Exception:
+            logger.warning('Failed to create event store', exc_info=True)
 
         # 1. Start fused-memory HTTP server
         logger.info('Starting fused-memory HTTP server...')
@@ -673,6 +688,7 @@ Output JSON matching the schema. Every task must appear in the output.
                         briefing=self.briefing,
                         usage_gate=self.usage_gate,
                         config_dir=config_dir,
+                        event_store=self.event_store,
                     )
                 steward_factory = _make_steward
 
@@ -689,7 +705,16 @@ Output JSON matching the schema. Every task must appear in the output.
                 initial_plan=recovered_plan,
                 steward_factory=steward_factory,
                 merge_queue=self._merge_queue,
+                event_store=self.event_store,
             )
+
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.task_started,
+                    task_id=assignment.task_id,
+                    data={'title': assignment.task.get('title', '')},
+                )
+
             outcome = await workflow.run()
 
             steward_cost = 0.0
@@ -699,7 +724,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 steward_cost = steward.metrics.total_cost_usd
                 steward_invocations = steward.metrics.invocations
 
-            return TaskReport(
+            report = TaskReport(
                 task_id=assignment.task_id,
                 title=assignment.task.get('title', ''),
                 outcome=outcome,
@@ -713,6 +738,25 @@ Output JSON matching the schema. Every task must appear in the output.
                 steward_invocations=steward_invocations,
                 completed_at=datetime.now(UTC).isoformat(),
             )
+
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.task_completed,
+                    task_id=assignment.task_id,
+                    cost_usd=report.cost_usd,
+                    duration_ms=report.duration_ms,
+                    data={
+                        'outcome': outcome.value,
+                        'agent_invocations': report.agent_invocations,
+                        'execute_iterations': report.execute_iterations,
+                        'verify_attempts': report.verify_attempts,
+                        'review_cycles': report.review_cycles,
+                        'steward_cost_usd': report.steward_cost_usd,
+                        'steward_invocations': report.steward_invocations,
+                    },
+                )
+
+            return report
         except Exception as e:
             logger.exception(f'Workflow slot error for task {assignment.task_id}: {e}')
             return TaskReport(
@@ -849,7 +893,9 @@ Output JSON matching the schema. Every task must appear in the output.
         """Start the merge queue worker as a background asyncio task."""
         from orchestrator.merge_queue import MergeWorker
 
-        self._merge_worker = MergeWorker(self.git_ops, self._merge_queue)
+        self._merge_worker = MergeWorker(
+            self.git_ops, self._merge_queue, event_store=self.event_store,
+        )
         self._merge_worker_task = asyncio.create_task(
             self._merge_worker.run(), name='merge-worker',
         )
