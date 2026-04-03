@@ -54,6 +54,25 @@ from persisting in entity summaries.
 - {_STAGE1_PROJECT_ID_GUIDELINE}
 - When you have completed your work, produce your final structured report as your response.
 
+## Retrospective Episodes
+When creating or reviewing retrospective summaries via `add_episode`, always pass \
+`reference_time` set to the ISO 8601 date when the described state was **current**, \
+not today's date. This prevents temporal contamination where Graphiti assigns \
+`valid_at = ingestion_time` instead of the correct historical timestamp.
+
+Example: if ingesting a summary of system state from 2026-03-22, use:
+  reference_time="2026-03-22T00:00:00+00:00", temporal_context="retrospective"
+
+The two parameters are complementary:
+- `temporal_context="retrospective"` marks the *kind* of episode (prepends \
+`[temporal:retrospective]` to source_description so downstream readers know it \
+describes past state)
+- `reference_time` sets the *timestamp* (Graphiti assigns this as `valid_at` on \
+extracted edges instead of defaulting to ingestion time)
+
+An episode can use either parameter independently, but retrospective summaries \
+should always use both to fully prevent temporal contamination.
+
 ## Cycle Fence
 When a cycle fence timestamp is provided in the payload, do NOT delete, merge, or modify \
 any memory with metadata source=targeted_reconciliation created after that timestamp. \
