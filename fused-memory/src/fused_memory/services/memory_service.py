@@ -502,6 +502,7 @@ class MemoryService:
                     '_causation_id': causation_id,
                     '_write_op_id': write_op_id,
                     'temporal_context': temporal_context,
+                    'reference_time': reference_time.isoformat() if reference_time is not None else None,
                 },
                 callback_type='dual_write_episode',
             )
