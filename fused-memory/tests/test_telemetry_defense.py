@@ -80,9 +80,10 @@ class TestSetdefaultPrecedesFusedMemoryImports:
                 in_type_checking = False
 
             # Track earliest real fused_memory / mem0 import
-            if not in_type_checking and earliest_import_line is None:
-                if stripped.startswith('from fused_memory') or stripped.startswith('import mem0'):
-                    earliest_import_line = i
+            if not in_type_checking and earliest_import_line is None and (
+                stripped.startswith('from fused_memory') or stripped.startswith('import mem0')
+            ):
+                earliest_import_line = i
 
         assert setdefault_line is not None, f"setdefault call not found in {MAIN_PY}"
         assert earliest_import_line is not None, (
