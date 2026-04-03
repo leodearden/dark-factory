@@ -14,11 +14,6 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
-from fused_memory.utils.task_utils import (
-    _collect_all_tasks,
-    _compact_tasks,
-    _filter_tasks_by_status,
-)
 
 if TYPE_CHECKING:
     from fused_memory.middleware.task_file_committer import TaskFileCommitter
@@ -360,73 +355,16 @@ class TaskInterceptor:
     # ── Pure reads (direct pass-through) ───────────────────────────────
 
     async def get_tasks(
-        self,
-        project_root: str,
-        tag: str | None = None,
-        status: list[str] | None = None,
-        compact: bool = False,
+        self, project_root: str, tag: str | None = None
     ) -> dict:
-        """Get tasks, optionally filtered by status and/or compacted.
-
-        Args:
-            project_root: Absolute path to project root.
-            tag: Tag context (optional).
-            status: If provided, only return tasks whose status is in this list.
-                    Subtasks are filtered recursively.
-            compact: If True, strip verbose fields (description, details) from
-                     each task dict, recursively. Reduces payload size for
-                     reconciliation agents. Defaults to False (backward compat).
-        """
         tm = await self._ensure_taskmaster()
-        result = await tm.get_tasks(project_root, tag)
-        if status and isinstance(result, dict):
-            tasks = result.get('tasks', [])
-            if isinstance(tasks, list):
-                result = {**result, 'tasks': _filter_tasks_by_status(tasks, status)}
-        if compact and isinstance(result, dict):
-            tasks = result.get('tasks', [])
-            if isinstance(tasks, list):
-                result = {**result, 'tasks': _compact_tasks(tasks)}
-        return result
+        return await tm.get_tasks(project_root, tag)
 
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict:
         tm = await self._ensure_taskmaster()
         return await tm.get_task(task_id, project_root, tag)
-
-    async def get_task_summary(
-        self, project_root: str, tag: str | None = None
-    ) -> dict:
-        """Return a lightweight summary of the task tree.
-
-        Returns:
-            {
-                "counts": {"pending": N, "done": N, ...},
-                "tasks": [{"id": ..., "status": ..., "title": ...}, ...]
-            }
-
-        The counts include all tasks (top-level + subtasks, recursively).
-        The tasks list is flat (not hierarchical) and contains only
-        id/status/title for each task/subtask.
-        """
-        result = await self.get_tasks(project_root, tag=tag)
-        tasks = result.get('tasks', []) if isinstance(result, dict) else []
-        all_tasks = _collect_all_tasks(tasks)
-
-        counts: dict[str, int] = {}
-        compact_list = []
-        for t in all_tasks:
-            status = t.get('status', 'unknown')
-            counts[status] = counts.get(status, 0) + 1
-            compact_list.append({
-                'id': t.get('id'),
-                'status': status,
-                'title': t.get('title', ''),
-            })
-
-        return {'counts': counts, 'tasks': compact_list}
-
 
 
 def _extract_status(task_data: dict) -> str:

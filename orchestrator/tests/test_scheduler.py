@@ -413,41 +413,46 @@ class TestGetTasksSeedsCache:
 
 
     @pytest.mark.asyncio
-    async def test_get_tasks_does_not_downgrade_terminal_cache(
+    async def test_get_tasks_resyncs_from_store_on_reinstatement(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """get_tasks() must NOT overwrite a terminal cache entry with stale taskmaster data."""
+        """get_tasks() must update cache when store shows a reinstated (non-terminal) status.
+
+        External processes may reinstate cancelled/done tasks to pending.  The
+        store is the source of truth — the cache must reflect the reinstatement
+        so that set_task_status() does not silently reject valid transitions.
+        """
         # Step 1: Populate cache with terminal status via set_task_status
         set_mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', set_mock)
-        await scheduler.set_task_status('42', 'done')
-        assert scheduler._status_cache.get('42') == 'done'
+        await scheduler.set_task_status('42', 'cancelled')
+        assert scheduler._status_cache.get('42') == 'cancelled'
 
-        # Step 2: Simulate stale taskmaster data — task 42 shows 'in-progress'
-        stale_response = {
+        # Step 2: Simulate store reinstatement — task 42 is now 'pending'
+        reinstated_response = {
             'result': {
                 'content': [
                     {
                         'type': 'text',
-                        'text': '{"tasks": [{"id": "42", "status": "in-progress", "title": "T"}]}',
+                        'text': '{"tasks": [{"id": "42", "status": "pending", "title": "T"}]}',
                     }
                 ]
             }
         }
-        get_mock = AsyncMock(return_value=stale_response)
+        get_mock = AsyncMock(return_value=reinstated_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', get_mock)
 
-        # Step 3: get_tasks() must NOT downgrade the terminal cache entry
+        # Step 3: get_tasks() must resync cache to match store
         await scheduler.get_tasks()
-        assert scheduler._status_cache.get('42') == 'done', (
-            'get_tasks() must not downgrade terminal status to stale in-progress'
+        assert scheduler._status_cache.get('42') == 'pending', (
+            'get_tasks() must trust store reinstatement of cancelled -> pending'
         )
 
-        # Step 4: set_task_status('blocked') must still be rejected
+        # Step 4: set_task_status('in-progress') must now succeed
         call_count_before = get_mock.call_count
-        await scheduler.set_task_status('42', 'blocked')
-        assert get_mock.call_count == call_count_before, (
-            'set_task_status(blocked) must be rejected after get_tasks() seeding'
+        await scheduler.set_task_status('42', 'in-progress')
+        assert get_mock.call_count == call_count_before + 1, (
+            'set_task_status(in-progress) must succeed after store reinstatement'
         )
 
     @pytest.mark.asyncio
@@ -1059,3 +1064,123 @@ class TestUpdateTaskMetadataSerialization:
         # Must be valid JSON that round-trips correctly
         parsed = json.loads(metadata)
         assert parsed == {'prd': '/abs/path/to/feature.prd'}
+
+
+class TestCancelledTaskResync:
+    """Regression: externally reinstated cancelled tasks must not spin-loop.
+
+    Reproduces the bug where 15 cancelled tasks were reinstated to pending in
+    the store, but the scheduler's _status_cache still held 'cancelled'.  The
+    terminal guard rejected every cancelled->in-progress transition, and the
+    task was immediately reacquired — an infinite spin that starved pending
+    tasks (156k+ rejections for a single task).
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_reinstated_cancelled_task_dispatches_successfully(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Full cycle: cancel -> external reinstatement -> acquire -> in-progress succeeds."""
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # 1. Orchestrator cancels the task — cache records 'cancelled'
+        await scheduler.set_task_status('64', 'cancelled')
+        assert scheduler._status_cache['64'] == 'cancelled'
+
+        # 2. External process reinstates to pending (store returns pending)
+        reinstated_task = {
+            'id': '64',
+            'title': 'Reinstated task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'modules': ['backend']},
+        }
+        reinstated_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [' + __import__('json').dumps(reinstated_task) + ']}',
+                    }
+                ]
+            }
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=reinstated_response),
+        )
+
+        # 3. acquire_next picks up the task and resyncs cache
+        assignment = await scheduler.acquire_next()
+        assert assignment is not None, (
+            'Reinstated task must be acquirable — was silently rejected before fix'
+        )
+        assert assignment.task_id == '64'
+
+        # 4. Cache must now show 'pending' (resynced from store)
+        #    so that set_task_status('in-progress') is NOT rejected
+        assert scheduler._status_cache['64'] == 'pending'
+
+        # 5. Transition to in-progress must succeed (not be silently dropped)
+        ip_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', ip_mock)
+        await scheduler.set_task_status('64', 'in-progress')
+
+        assert ip_mock.call_count == 1, (
+            'set_task_status(in-progress) must issue MCP call after reinstatement — '
+            'was silently rejected by stale terminal guard before fix'
+        )
+        assert scheduler._status_cache['64'] == 'in-progress'
+
+    @pytest.mark.asyncio
+    async def test_spin_loop_does_not_occur(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Simulates N acquire cycles — each must make progress, not spin on rejection."""
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Cancel the task
+        await scheduler.set_task_status('57', 'cancelled')
+
+        # Store reinstates to pending
+        task = {
+            'id': '57',
+            'title': 'Spin-loop candidate',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'modules': ['frontend']},
+        }
+        store_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [' + __import__('json').dumps(task) + ']}',
+                    }
+                ]
+            }
+        }
+        store_mock = AsyncMock(return_value=store_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', store_mock)
+
+        # First acquire — should get the task
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '57'
+
+        # set_task_status should succeed (not be silently rejected)
+        ip_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', ip_mock)
+        await scheduler.set_task_status('57', 'in-progress')
+        assert ip_mock.call_count == 1, 'in-progress transition must not be rejected'
+
+        # Second acquire — task is already dispatched, should return None
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', store_mock)
+        a2 = await scheduler.acquire_next()
+        assert a2 is None, 'Task already dispatched — second acquire must return None'

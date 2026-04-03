@@ -186,16 +186,21 @@ class Scheduler:
                     else:
                         tasks = data.get('tasks', [])
                     # Seed status cache from task list.
-                    # Never downgrade a terminal status — stale taskmaster data
-                    # (e.g., 'in-progress') must not reopen the terminal guard window
-                    # for a task the cache already knows is 'done' or 'cancelled'.
+                    # Always trust the store — it is the source of truth.
+                    # External processes may reinstate cancelled/done tasks
+                    # to pending; the cache must reflect that to avoid
+                    # silent rejection loops in set_task_status().
                     for t in tasks:
                         tid = str(t.get('id', ''))
                         s = t.get('status', '')
-                        if tid and s and (
-                            tid not in self._status_cache
-                            or self._status_cache[tid] not in TERMINAL_STATUSES
-                        ):
+                        if tid and s:
+                            old = self._status_cache.get(tid)
+                            if old in TERMINAL_STATUSES and old != s:
+                                logger.info(
+                                    'Task %s: store status %s overrides cached %s '
+                                    '(external reinstatement)',
+                                    tid, s, old,
+                                )
                             self._status_cache[tid] = s
                     return tasks
         except Exception as e:

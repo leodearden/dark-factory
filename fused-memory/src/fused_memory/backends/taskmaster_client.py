@@ -160,17 +160,8 @@ class TaskmasterBackend:
         return args
 
     async def get_tasks(
-        self,
-        project_root: str,
-        tag: str | None = None,
+        self, project_root: str, tag: str | None = None
     ) -> dict:
-        """Get all tasks from Taskmaster.
-
-        Returns the full raw response from the upstream Taskmaster MCP tool.
-        Status filtering is the responsibility of the TaskInterceptor layer
-        (middleware), not the backend. This keeps the backend as a faithful
-        proxy of the upstream response.
-        """
         args = self._base_args(project_root, tag)
         return await self.call_tool('get_tasks', args)
 
