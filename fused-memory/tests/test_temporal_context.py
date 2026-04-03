@@ -15,7 +15,7 @@ Organised by pipeline layer (bottom-up):
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -444,7 +444,7 @@ class TestExecuteGraphitiWriteReferenceTime:
     async def test_reference_time_iso_string_forwarded_as_datetime(self, service):
         """Payload with 'reference_time' ISO string → graphiti.add_episode called with parsed datetime."""
         ref_iso = '2026-03-22T12:00:00+00:00'
-        ref_expected = datetime(2026, 3, 22, 12, 0, 0, tzinfo=timezone.utc)
+        ref_expected = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
         payload = {
             'uuid': 'test-uuid',
             'name': 'episode_test',
@@ -559,7 +559,7 @@ class TestMCPToolAddEpisodeReferenceTime:
     ):
         """Valid ISO string '2026-03-22T00:00:00+00:00' → service called with parsed datetime."""
         iso_str = '2026-03-22T00:00:00+00:00'
-        expected_dt = datetime(2026, 3, 22, 0, 0, 0, tzinfo=timezone.utc)
+        expected_dt = datetime(2026, 3, 22, 0, 0, 0, tzinfo=UTC)
         await mcp_server._tool_manager.call_tool(
             'add_episode',
             {
@@ -642,7 +642,7 @@ class TestReferenceTimeTemporalContextInteraction:
         service receives both parameters.
         """
         iso_str = '2026-03-22T00:00:00+00:00'
-        expected_dt = datetime(2026, 3, 22, 0, 0, 0, tzinfo=timezone.utc)
+        expected_dt = datetime(2026, 3, 22, 0, 0, 0, tzinfo=UTC)
         await mcp_server._tool_manager.call_tool(
             'add_episode',
             {
@@ -680,7 +680,7 @@ class TestReferenceTimeTemporalContextInteraction:
         graphiti.add_episode called with both.
         """
         ref_iso = '2026-03-22T00:00:00+00:00'
-        ref_expected = datetime(2026, 3, 22, 0, 0, 0, tzinfo=timezone.utc)
+        ref_expected = datetime(2026, 3, 22, 0, 0, 0, tzinfo=UTC)
         payload = {
             'uuid': 'test-uuid',
             'name': 'episode_test',
