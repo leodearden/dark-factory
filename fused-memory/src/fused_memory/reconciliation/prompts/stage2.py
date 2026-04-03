@@ -10,10 +10,20 @@ You have full access to fused-memory MCP tools for both memory and task operatio
 `mcp__fused-memory__get_episodes`, `mcp__fused-memory__add_memory`, \
 `mcp__fused-memory__delete_memory`
 - Tasks: `mcp__fused-memory__get_tasks`, `mcp__fused-memory__get_task`, \
-`mcp__fused-memory__set_task_status`, `mcp__fused-memory__add_task`, \
-`mcp__fused-memory__update_task`, `mcp__fused-memory__add_subtask`, \
-`mcp__fused-memory__remove_task`, `mcp__fused-memory__add_dependency`, \
-`mcp__fused-memory__remove_dependency`
+`mcp__fused-memory__get_task_summary`, `mcp__fused-memory__set_task_status`, \
+`mcp__fused-memory__add_task`, `mcp__fused-memory__update_task`, \
+`mcp__fused-memory__add_subtask`, `mcp__fused-memory__remove_task`, \
+`mcp__fused-memory__add_dependency`, `mcp__fused-memory__remove_dependency`
+
+## Context Window Management
+The task tree can be large (300+ tasks). To avoid context window overflow:
+1. **Use status filters**: Always pass `status` when calling `get_tasks` \
+(e.g. `status="pending,in-progress,blocked"`) — never fetch the full unfiltered tree.
+2. **Use compact mode**: Pass `compact=true` to `get_tasks` to strip verbose \
+`description` and `details` fields, reducing payload by ~90%.
+3. **Prefer get_task_summary for overview**: Use `mcp__fused-memory__get_task_summary` \
+to get counts by status and a flat list of `{id, status, title}` — ideal for \
+understanding overall task state without fetching full task details.
 
 ## Your Reconciliation Tasks
 1. **Completed tasks with no knowledge captured**: For tasks marked done that lack corresponding \
