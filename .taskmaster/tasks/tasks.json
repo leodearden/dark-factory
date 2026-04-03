@@ -2624,13 +2624,13 @@
         "description": "Graphiti entity summaries accumulate stale and duplicated lines over time as new edges are added. This is a systemic issue (observed across reify entities for M5, M5 decomposition, M5 types, Task 139, Task 147, and others with recurrence >= 4). Entity summaries should be periodically rebuilt or deduplicated to reflect only current, non-invalidated edge facts.\n\nAcceptance criteria:\n1. Identify the Graphiti entity summary update path and understand why stale/duplicate lines persist\n2. Implement a mechanism to rebuild entity summaries from current valid edges (either on-write dedup or periodic batch rebuild)\n3. Expose this as a fused-memory management operation (e.g. rebuild_entity_summaries) \n4. Validate against known affected entities (reify project: M5, M5 decomposition, M5 types)\n\nmemory_hints:\n- entities: [\"M5\", \"M5 decomposition\", \"M5 types\", \"Task 139\"]\n- search queries: [\"entity summary accumulation stale\", \"Graphiti entity summary rebuild\"]",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "382"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-03T23:01:43.177Z",
+        "updatedAt": "2026-04-03T23:54:30.767Z",
         "metadata": {
           "files": [
             "fused-memory/src/fused_memory/backends/graphiti_client.py",
@@ -3021,12 +3021,9 @@
             "dashboard/src/dashboard/templates"
           ],
           "memory_hints": {
-            "entities": [
-              "reconciliation.py"
-            ],
+            "entities": [],
             "queries": [
-              "reconciliation detail HTMX Idiomorph morphing x-show polling dashboard",
-              "dashboard stability concerns HTMX Alpine state preservation across morphs"
+              "resolution for: Fix reconciliation detail rows leaking \"Loading...\" between run rows"
             ]
           },
           "_causation_id": "0a2dc790-e788-44ff-bece-7e734501facb"
@@ -8362,7 +8359,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T23:47:49.775Z",
+      "lastModified": "2026-04-03T23:54:30.767Z",
       "taskCount": 397,
       "completedCount": 386,
       "tags": [
