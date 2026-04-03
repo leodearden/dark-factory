@@ -5361,7 +5361,10 @@
             ]
           },
           "block_reason": "Depends on task 403 (merge queue metrics instrumentation). Re-evaluate 3 days after 403 is done — need real data showing sustained queue depth >3 and merge cycle time dominating throughput before speculative pipeline is justified.",
-          "_causation_id": "eaf99cc7-85f9-47d1-8bdd-81c6af26139e"
+          "_causation_id": "ab680a53-4a0e-4462-b2e7-db7f6332f008",
+          "dependency_403_completed": "2026-04-02T22:19:01.801Z",
+          "unblock_evaluation_date": "2026-04-05",
+          "unblock_note": "Task 403 (merge queue metrics) completed 2026-04-02. Block condition requires 3 days of metric data showing sustained queue depth >3 and merge cycle time dominating throughput. Re-evaluate on 2026-04-05."
         }
       },
       {
