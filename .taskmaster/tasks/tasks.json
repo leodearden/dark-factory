@@ -8172,10 +8172,11 @@
         "description": "In task_interceptor.py, get_task_summary should check if self.get_tasks() returns an error dict (has 'error' key) and propagate it instead of silently returning {'counts': {}, 'tasks': []}.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-03T06:33:15.745Z"
       },
       {
         "id": "411",
@@ -8202,7 +8203,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T06:33:15.527Z",
+      "lastModified": "2026-04-03T06:33:15.745Z",
       "taskCount": 391,
       "completedCount": 370,
       "tags": [
