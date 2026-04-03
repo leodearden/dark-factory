@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # Return type for advance_main — lets callers distinguish transient
 # (CAS) failures from permanent ones (not-a-descendant, contamination).
-AdvanceResult = Literal['advanced', 'cas_failed', 'not_descendant', 'contaminated']
+AdvanceResult = Literal['advanced', 'cas_failed', 'not_descendant', 'contaminated', 'stash_failed']
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +559,11 @@ class GitOps:
     ) -> AdvanceResult:
         """Advance main branch ref to *merge_sha* atomically.
 
-        Uses ``update-ref`` so the project_root working tree is never touched.
+        Uses ``update-ref`` to advance the ref, then syncs the working tree
+        via ``read-tree`` when project_root has main checked out.  Uncommitted
+        changes are stashed before the advance and popped after, so user work
+        survives and merge conflicts become visible markers rather than silent
+        reverts (see incident ``0ea23cb5c``).
 
         Returns an :data:`AdvanceResult` literal:
 
@@ -570,6 +574,8 @@ class GitOps:
           of main after *max_attempts* (permanent; stop retrying).
         * ``'contaminated'`` — ``.task/`` contamination gate failed
           (permanent; stop retrying).
+        * ``'stash_failed'`` — ``git stash push`` failed before the advance
+          (permanent; halt merge to prevent code loss).
 
         When *branch* is provided and a rebase fails, the method will abort
         the rebase, reset to current main, and re-merge *branch* before
@@ -674,6 +680,41 @@ class GitOps:
             )
             return 'not_descendant'
 
+        # ── Working-tree protection ──────────────────────────────────
+        # When project_root has main checked out, update-ref will desync
+        # the working tree from HEAD.  Stash any uncommitted work first,
+        # sync after, then pop.  This prevents silent reverts (see 0ea23cb5c).
+        is_on_main = False
+        did_stash = False
+
+        rc, current_branch, _ = await _run(
+            ['git', 'symbolic-ref', '--short', 'HEAD'],
+            cwd=self.project_root,
+        )
+        if rc == 0 and current_branch.strip() == self.config.main_branch:
+            is_on_main = True
+
+            # Check for uncommitted changes (staged or unstaged)
+            _, porcelain, _ = await _run(
+                ['git', 'status', '--porcelain'],
+                cwd=self.project_root,
+            )
+            if porcelain.strip():
+                stash_rc, _, stash_err = await _run(
+                    ['git', 'stash', 'push', '-m',
+                     f'merge-queue: pre-advance for {branch or merge_sha[:8]}'],
+                    cwd=self.project_root,
+                )
+                if stash_rc != 0:
+                    logger.error(
+                        'CRITICAL: git stash push failed before advance_main '
+                        '— halting merge to prevent code loss. error=%s',
+                        stash_err,
+                    )
+                    return 'stash_failed'
+                did_stash = True
+                logger.info('Stashed uncommitted changes before advance_main')
+
         # All checks passed — advance the ref (CAS when expected_main provided)
         update_cmd = [
             'git', 'update-ref',
@@ -683,6 +724,9 @@ class GitOps:
             update_cmd.append(expected_main)
         rc, _, err = await _run(update_cmd, cwd=self.project_root)
         if rc != 0:
+            # Restore stash before returning — ref didn't move
+            if did_stash:
+                await _run(['git', 'stash', 'pop'], cwd=self.project_root)
             if expected_main is not None:
                 logger.warning(
                     f'CAS update-ref failed (expected {expected_main[:8]}): {err}'
@@ -693,17 +737,34 @@ class GitOps:
 
         logger.info(f'Advanced {self.config.main_branch} to {merge_sha[:8]}')
 
-        # Refresh tasks.json in project root so Taskmaster/fused-memory
-        # don't auto-commit a stale snapshot.  update-ref deliberately
-        # leaves the working tree untouched, but TaskFileCommitter will
-        # stage and commit whatever is on disk — which is now stale.
-        # We only touch this one file to avoid interfering with other
-        # working-tree state.
-        await _run(
-            ['git', 'checkout', 'HEAD', '--',
-             '.taskmaster/tasks/tasks.json'],
-            cwd=self.project_root,
-        )
+        # ── Sync working tree to new HEAD ────────────────────────────
+        # update-ref moved the ref but left the working tree stale.
+        # read-tree syncs the index and working tree to the new HEAD.
+        # Then pop the stash to restore any in-progress user work.
+        if is_on_main:
+            sync_rc, _, sync_err = await _run(
+                ['git', 'read-tree', '-u', '--reset', 'HEAD'],
+                cwd=self.project_root,
+            )
+            if sync_rc != 0:
+                logger.error(
+                    'read-tree failed after advancing main — working tree '
+                    'is stale. error=%s', sync_err,
+                )
+
+            if did_stash:
+                pop_rc, _, pop_err = await _run(
+                    ['git', 'stash', 'pop'],
+                    cwd=self.project_root,
+                )
+                if pop_rc != 0:
+                    # Conflicts expected when user's WIP touches merged files.
+                    # The session will see conflict markers and resolve them.
+                    logger.warning(
+                        'Stash pop produced conflicts after merge advance '
+                        '(task %s). Active session should resolve: %s',
+                        branch or merge_sha[:8], pop_err,
+                    )
 
         return 'advanced'
 

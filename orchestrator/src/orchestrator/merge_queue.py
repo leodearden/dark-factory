@@ -230,7 +230,7 @@ class MergeWorker:
             self._emit_merge(req.task_id, 'done')
             return MergeOutcome('done')
 
-        if result in ('not_descendant', 'contaminated'):
+        if result in ('not_descendant', 'contaminated', 'stash_failed'):
             # Permanent failure — do NOT re-enqueue
             self._cas_retries.pop(req.task_id, None)
             return MergeOutcome(
