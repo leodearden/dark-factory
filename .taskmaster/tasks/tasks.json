@@ -8248,7 +8248,7 @@
         "description": "MEM0_TELEMETRY is not set anywhere in the application code, .env file, or systemd unit files. The briefing documents this as a critical stability rule: mem0's capture_event() creates a new Posthog Consumer thread per API call, leaking ~8000 threads/day and causing 1400% CPU.\n\nCurrently this relies entirely on external deployment configuration (e.g., systemd Environment= or shell profile), but none of those contain it either. If the fused-memory server starts without this env var, mem0 defaults to telemetry=True and the thread leak returns.\n\n**Fix:** Add `os.environ.setdefault('MEM0_TELEMETRY', 'false')` to `fused-memory/src/fused_memory/server/main.py` early in module initialization (before line 14 where dotenv is loaded, or immediately after). This ensures the protection is always active regardless of deployment configuration.\n\n**memory_hints:** search for \"mem0 posthog thread leak\" and \"MEM0_TELEMETRY\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
@@ -8260,7 +8260,7 @@
             "fused-memory/src/fused_memory/server"
           ]
         },
-        "updatedAt": "2026-04-03T07:03:15.492Z"
+        "updatedAt": "2026-04-03T07:05:34.556Z"
       },
       {
         "id": "414",
@@ -8287,9 +8287,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T07:05:10.096Z",
+      "lastModified": "2026-04-03T07:05:34.556Z",
       "taskCount": 393,
-      "completedCount": 375,
+      "completedCount": 376,
       "tags": [
         "master"
       ]
