@@ -8365,15 +8365,16 @@
         "description": "Dashboard currently reads tasks.json directly via Path.read_text() + json.loads(), bypassing the fused-memory MCP proxy. All task access — including reads — should route through fused-memory for architectural consistency. Replace direct file reads with fused-memory get_tasks calls.",
         "details": "Files to change:\\n- dashboard/src/dashboard/data/orchestrator.py:156-205 (load_task_tree) — replace json file read with fused-memory HTTP call\\n- dashboard/src/dashboard/data/burndown.py:101-102 — same\\n- dashboard/src/dashboard/config.py:41 (tasks_json property) — may become unused after migration\\n\\nThe fused-memory HTTP server runs on port 8002 (systemd service). Dashboard already has HTTP client infrastructure.\\n\\nmemory_hints: search \"dashboard task routing convention\" and \"fused-memory HTTP server\"",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-03T13:59:38.847Z"
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T13:59:38.713Z",
+      "lastModified": "2026-04-03T13:59:38.847Z",
       "taskCount": 397,
       "completedCount": 384,
       "tags": [
