@@ -8338,7 +8338,19 @@
         "status": "pending",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "orchestrator/src/orchestrator/agents/invoke.py",
+            "shared/src/shared/cli_invoke.py",
+            "orchestrator/tests/test_invoke.py"
+          ],
+          "modules": [
+            "orchestrator/src/orchestrator/agents",
+            "shared/src/shared",
+            "orchestrator/tests"
+          ]
+        }
       }
     ],
     "metadata": {
