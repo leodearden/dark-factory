@@ -16,7 +16,6 @@ from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.utils.task_utils import (
     _collect_all_tasks,
-    _compact_task,
     _compact_tasks,
     _filter_tasks_by_status,
 )

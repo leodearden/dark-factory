@@ -22,6 +22,7 @@ from fused_memory.reconciliation.prompts import (
 )
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.utils.task_utils import _filter_tasks_by_status
 
 logger = logging.getLogger(__name__)
 
@@ -49,35 +50,27 @@ class TaskKnowledgeSync(BaseStage):
     ) -> str:
         stage1_report = prior_reports[0] if prior_reports else None
 
-        # Get task tree — use status filter to avoid context-window overflow
+        # Get task tree — filter locally since TaskmasterBackend is a faithful proxy
+        # (status filtering is the TaskInterceptor's responsibility; harness uses backend directly)
         active_tasks: list = []
         done_tasks: list = []
         if self.taskmaster:
             try:
-                active_data = await self.taskmaster.get_tasks(
+                all_data = await self.taskmaster.get_tasks(
                     project_root=self.project_root,
-                    status=['pending', 'in-progress', 'review', 'blocked'],
                 )
-                active_tasks = active_data.get('tasks', [])
-                if not isinstance(active_tasks, list):
-                    active_tasks = []
+                all_tasks = all_data.get('tasks', [])
+                if not isinstance(all_tasks, list):
+                    all_tasks = []
+                active_tasks = _filter_tasks_by_status(
+                    all_tasks, ['pending', 'in-progress', 'review', 'blocked']
+                )
+                done_tasks = _filter_tasks_by_status(all_tasks, ['done'])
             except Exception as e:
                 logger.warning(
-                    'Stage 2: failed to fetch active tasks from taskmaster: %s', e
+                    'Stage 2: failed to fetch tasks from taskmaster: %s', e
                 )
                 active_tasks = []
-            try:
-                done_data = await self.taskmaster.get_tasks(
-                    project_root=self.project_root,
-                    status=['done'],
-                )
-                done_tasks = done_data.get('tasks', [])
-                if not isinstance(done_tasks, list):
-                    done_tasks = []
-            except Exception as e:
-                logger.warning(
-                    'Stage 2: failed to fetch done tasks from taskmaster: %s', e
-                )
                 done_tasks = []
 
         remediation_note = ''
