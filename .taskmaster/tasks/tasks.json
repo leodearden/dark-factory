@@ -8252,6 +8252,17 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 414,
+        "title": "Track reconciliation judge tasks to prevent orphaned coroutines on shutdown",
+        "description": "In fused-memory/src/fused_memory/reconciliation/harness.py, judge tasks are created fire-and-forget at lines 453 and 665 via `asyncio.create_task(self._run_judge(run_id))` without being tracked in any managed set.\n\nWhile `_run_judge` has a try/except that prevents crashes, the task reference is immediately lost. If the harness shuts down while a judge task is still running (judge calls the external CLI which can take seconds), the task becomes an orphaned coroutine. asyncio will emit a \"Task was destroyed but it is pending\" warning, and the judge's CLI subprocess may not be properly terminated.\n\n**Fix:** Add a `self._judge_tasks: set[asyncio.Task]` to the harness. When creating a judge task, add it to the set with a done callback that removes it. On shutdown (in `_stop_escalation_server` or the harness cleanup path), cancel and await all pending judge tasks.\n\n**memory_hints:** search for \"fire-and-forget\" and \"judge task\" and \"reconciliation harness\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8264,7 +8275,7 @@
       ],
       "created": "2026-04-03T06:57:21.407Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-03T06:57:21.410Z"
+      "updated": "2026-04-03T06:57:28.981Z"
     }
   }
 }
