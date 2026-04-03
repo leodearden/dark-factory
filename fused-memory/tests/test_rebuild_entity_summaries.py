@@ -745,3 +745,122 @@ class TestDetectStaleSummariesBulk:
         })
         result = await backend.detect_stale_summaries(group_id='test')
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# N+1 fix step-9: rebuild_entity_summaries parallel + no re-fetch
+# ---------------------------------------------------------------------------
+
+class TestRebuildEntitySummariesParallel:
+    """rebuild_entity_summaries uses _rebuild_entity_from_edges (no re-fetch) + asyncio.gather."""
+
+    @pytest.mark.asyncio
+    async def test_non_force_does_not_call_get_valid_edges_for_node(self, mock_config, make_backend):
+        """Non-force path: get_valid_edges_for_node is never called (edges come from bulk fetch)."""
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
+        })
+        backend.get_node_text = AsyncMock(side_effect=[
+            ('Alice', 'stale1'),
+            ('Bob', 'stale2'),
+        ])
+        backend.update_node_summary = AsyncMock()
+        backend.get_valid_edges_for_node = AsyncMock()
+
+        result = await backend.rebuild_entity_summaries(group_id='test')
+
+        backend.get_valid_edges_for_node.assert_not_awaited()
+        assert result['rebuilt'] == 2
+
+    @pytest.mark.asyncio
+    async def test_force_calls_get_all_valid_edges_once_not_refresh_entity_summary(
+        self, mock_config, make_backend
+    ):
+        """Force path: get_all_valid_edges called once; refresh_entity_summary never called."""
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'ok'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'also ok'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
+        })
+        backend.get_node_text = AsyncMock(side_effect=[
+            ('Alice', 'ok'),
+            ('Bob', 'also ok'),
+        ])
+        backend.update_node_summary = AsyncMock()
+        backend.refresh_entity_summary = AsyncMock()
+
+        result = await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+        backend.get_all_valid_edges.assert_awaited_once()
+        backend.refresh_entity_summary.assert_not_awaited()
+        assert result['total_entities'] == 2
+        assert result['rebuilt'] == 2
+
+    @pytest.mark.asyncio
+    async def test_concurrent_all_five_entities_processed(self, mock_config, make_backend):
+        """With 5 target entities, all 5 get update_node_summary calls (parallel processing)."""
+        n = 5
+        entities = [
+            {'uuid': f'uuid-{i}', 'name': f'Entity{i}', 'summary': f'stale{i}'}
+            for i in range(n)
+        ]
+        edges = {
+            f'uuid-{i}': [{'uuid': f'e{i}', 'fact': f'current{i}', 'name': 'edge'}]
+            for i in range(n)
+        }
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+        backend.get_all_valid_edges = AsyncMock(return_value=edges)
+        backend.get_node_text = AsyncMock(side_effect=[
+            (f'Entity{i}', f'stale{i}') for i in range(n)
+        ])
+        backend.update_node_summary = AsyncMock()
+
+        result = await backend.rebuild_entity_summaries(group_id='test')
+
+        assert backend.update_node_summary.await_count == n
+        assert result['rebuilt'] == n
+        assert result['errors'] == 0
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_in_update_does_not_cancel_others(
+        self, mock_config, make_backend
+    ):
+        """If update_node_summary fails for one entity, others still complete.
+
+        asyncio.gather with return_exceptions=True ensures partial failures are
+        captured rather than propagated, so the gather completes for all entities.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
+        })
+        backend.get_node_text = AsyncMock(side_effect=[
+            ('Alice', 'stale1'),
+            ('Bob', 'stale2'),
+        ])
+        # First entity's write fails, second succeeds
+        backend.update_node_summary = AsyncMock(side_effect=[
+            RuntimeError('FalkorDB timeout'),
+            None,
+        ])
+
+        result = await backend.rebuild_entity_summaries(group_id='test')
+
+        assert result['rebuilt'] == 1
+        assert result['errors'] == 1
