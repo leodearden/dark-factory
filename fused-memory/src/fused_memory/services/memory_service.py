@@ -275,7 +275,17 @@ class MemoryService:
         write_op_id = payload.pop('_write_op_id', None)
         temporal_context = payload.pop('temporal_context', None)
         reference_time_iso = payload.pop('reference_time', None)
-        reference_time = datetime.fromisoformat(reference_time_iso) if reference_time_iso is not None else None
+        if reference_time_iso is not None:
+            try:
+                reference_time = datetime.fromisoformat(reference_time_iso)
+            except ValueError:
+                logger.warning(
+                    'Invalid reference_time %r in queue payload; treating as None',
+                    reference_time_iso,
+                )
+                reference_time = None
+        else:
+            reference_time = None
 
         result = await self._journaled_backend_call(
             write_op_id=write_op_id,
