@@ -2630,7 +2630,7 @@
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-03T13:52:03.398Z",
+        "updatedAt": "2026-04-03T13:52:03.055Z",
         "metadata": {
           "files": [
             "fused-memory/src/fused_memory/backends/graphiti_client.py",
@@ -2992,7 +2992,7 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-03T13:52:03.169Z",
+        "updatedAt": "2026-04-03T13:52:03.344Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/orchestrators.html",
@@ -8362,7 +8362,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T13:52:03.398Z",
+      "lastModified": "2026-04-03T13:52:03.344Z",
       "taskCount": 396,
       "completedCount": 384,
       "tags": [
