@@ -696,6 +696,11 @@ class ReconciliationHarness:
                 stage.project_id = project_id
                 stage.project_root = project_root
 
+                # Apply tier limits to Stage 1 (same as run_full_cycle)
+                if isinstance(stage, MemoryConsolidator):
+                    stage.episode_limit = tier.episode_limit
+                    stage.memory_limit = tier.memory_limit
+
                 report = await stage.run(
                     [], watermark, reports, run_id, model=tier.model,
                 )

@@ -1306,3 +1306,158 @@ async def test_opus_tier_propagates_limits_to_consolidator(
     assert captured.get('memory_limit') == 1000, (
         f"Expected memory_limit=1000 for opus tier, got {captured.get('memory_limit')}"
     )
+
+
+# ── Remediation attribute-propagation tests ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_remediation_propagates_tier_limits_to_consolidator(
+    journal, event_buffer, mock_memory_service,
+):
+    """_run_remediation_pass applies TierConfig limits onto MemoryConsolidator."""
+    from fused_memory.reconciliation.harness import TierConfig
+    from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    stages = harness._make_stages()
+    harness._make_stages = lambda: stages
+
+    captured: dict = {}
+
+    async def capture_attrs(stage):
+        captured['episode_limit'] = stage.episode_limit
+        captured['memory_limit'] = stage.memory_limit
+        captured['remediation_findings'] = stage.remediation_findings
+
+    stage1 = stages[0]
+    assert isinstance(stage1, MemoryConsolidator)
+
+    # Zero-sentinel to ensure test fails if propagation is absent
+    stage1.episode_limit = 0
+    stage1.memory_limit = 0
+
+    _mock_stage_run(stage1, before_return=capture_attrs)
+    _mock_stage_run(stages[1])
+    _mock_stage_run(stages[2])
+
+    findings = [_make_s3_findings()[0]]  # one actionable finding
+    tier = TierConfig(model='sonnet', episode_limit=125, memory_limit=250)
+
+    await harness._run_remediation_pass(
+        'test-project', '/tmp/test', 'parent-run-id', findings, tier,
+    )
+
+    assert captured.get('episode_limit') == 125, (
+        f"Expected episode_limit=125, got {captured.get('episode_limit')}"
+    )
+    assert captured.get('memory_limit') == 250, (
+        f"Expected memory_limit=250, got {captured.get('memory_limit')}"
+    )
+    assert captured.get('remediation_findings') == findings
+
+
+@pytest.mark.asyncio
+async def test_remediation_sets_project_id_and_root_on_all_stages(
+    journal, event_buffer, mock_memory_service,
+):
+    """_run_remediation_pass sets project_id and project_root on every stage."""
+    from fused_memory.reconciliation.harness import TierConfig
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    stages = harness._make_stages()
+    harness._make_stages = lambda: stages
+
+    stage_attrs: dict[str, dict] = {}
+
+    for stage in stages:
+        stage_name = type(stage).__name__
+
+        async def capture(s, _name=stage_name):
+            stage_attrs[_name] = {
+                'project_id': s.project_id,
+                'project_root': s.project_root,
+            }
+
+        _mock_stage_run(stage, before_return=capture)
+
+    findings = [_make_s3_findings()[0]]
+    tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+
+    await harness._run_remediation_pass(
+        'my-project', '/srv/my-project', 'parent-run-id', findings, tier,
+    )
+
+    for name, attrs in stage_attrs.items():
+        assert attrs['project_id'] == 'my-project', (
+            f"{name}: expected project_id='my-project', got {attrs['project_id']!r}"
+        )
+        assert attrs['project_root'] == '/srv/my-project', (
+            f"{name}: expected project_root='/srv/my-project', got {attrs['project_root']!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_remediation_sets_remediation_mode_on_task_knowledge_sync(
+    journal, event_buffer, mock_memory_service,
+):
+    """_run_remediation_pass sets remediation_mode=True on TaskKnowledgeSync."""
+    from fused_memory.reconciliation.harness import TierConfig
+    from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    stages = harness._make_stages()
+    harness._make_stages = lambda: stages
+
+    captured: dict = {}
+
+    stage2 = stages[1]
+    assert isinstance(stage2, TaskKnowledgeSync)
+
+    async def capture_mode(s):
+        captured['remediation_mode'] = s.remediation_mode
+
+    _mock_stage_run(stages[0])
+    _mock_stage_run(stage2, before_return=capture_mode)
+    _mock_stage_run(stages[2])
+
+    findings = [_make_s3_findings()[0]]
+    tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+
+    await harness._run_remediation_pass(
+        'test-project', '/tmp/test', 'parent-run-id', findings, tier,
+    )
+
+    assert captured.get('remediation_mode') is True
+
+
+@pytest.mark.asyncio
+async def test_remediation_forwards_tier_model_to_stage_run(
+    journal, event_buffer, mock_memory_service,
+):
+    """_run_remediation_pass forwards tier.model as the model kwarg to each stage.run()."""
+    from fused_memory.reconciliation.harness import TierConfig
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    stages = harness._make_stages()
+    harness._make_stages = lambda: stages
+
+    models_seen: dict[str, str | None] = {}
+
+    for stage in stages:
+        stage_name = type(stage).__name__
+        call_args: dict = {}
+        _mock_stage_run(stage, capture_call_args=call_args)
+        models_seen[stage_name] = call_args  # populated after run
+
+    findings = [_make_s3_findings()[0]]
+    tier = TierConfig(model='opus', episode_limit=500, memory_limit=1000)
+
+    await harness._run_remediation_pass(
+        'test-project', '/tmp/test', 'parent-run-id', findings, tier,
+    )
+
+    for name, call_args in models_seen.items():
+        assert call_args.get('model') == 'opus', (
+            f"{name}: expected model='opus', got {call_args.get('model')!r}"
+        )
