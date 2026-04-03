@@ -50,39 +50,27 @@ class TaskKnowledgeSync(BaseStage):
     ) -> str:
         stage1_report = prior_reports[0] if prior_reports else None
 
-        # Get task tree — two separate calls so each can fail independently.
-        # Active tasks: pending/in-progress/review/blocked.
-        # Done tasks: fetched separately to isolate failures and enable independent logging.
+        # Fetch the task tree once and split by status in-memory.
+        # Uses a single network call to avoid doubling serialization/latency
+        # on large task trees (300+ tasks).
         active_tasks: list = []
         done_tasks: list = []
         if self.taskmaster:
             try:
-                active_data = await self.taskmaster.get_tasks(
+                data = await self.taskmaster.get_tasks(
                     project_root=self.project_root,
                 )
-                all_active = active_data.get('tasks', [])
-                if not isinstance(all_active, list):
-                    all_active = []
+                all_tasks_raw = data.get('tasks', [])
+                if not isinstance(all_tasks_raw, list):
+                    all_tasks_raw = []
                 active_tasks = _filter_tasks_by_status(
-                    all_active, ['pending', 'in-progress', 'review', 'blocked']
+                    all_tasks_raw, ['pending', 'in-progress', 'review', 'blocked']
                 )
+                done_tasks = _filter_tasks_by_status(all_tasks_raw, ['done'])
             except Exception as e:
                 logger.warning(
-                    'Stage 2: failed to fetch active tasks from taskmaster: %s', e
+                    'Stage 2: failed to fetch tasks from taskmaster: %s', e
                 )
-                active_tasks = []
-
-            try:
-                done_data = await self.taskmaster.get_tasks(
-                    project_root=self.project_root,
-                )
-                all_done = done_data.get('tasks', [])
-                if not isinstance(all_done, list):
-                    all_done = []
-                done_tasks = _filter_tasks_by_status(all_done, ['done'])
-            except Exception as e:
-                logger.warning('Stage 2: done tasks fetch failed: %s', e)
-                done_tasks = []
 
         remediation_note = ''
         if self.remediation_mode:

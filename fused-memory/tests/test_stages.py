@@ -346,11 +346,10 @@ class TestTaskKnowledgeSyncPayload:
 
         await stage.assemble_payload([], watermark, [])
 
-        # Stage 2 now makes two filtered calls (active + done) instead of one
-        calls = mock_deps['taskmaster'].get_tasks.call_args_list
-        assert len(calls) == 2
-        for call in calls:
-            assert call.kwargs['project_root'] == '/home/leo/src/reify'
+        # Stage 2 fetches once and splits by status in-memory
+        mock_deps['taskmaster'].get_tasks.assert_called_once_with(
+            project_root='/home/leo/src/reify',
+        )
 
     @pytest.mark.asyncio
     async def test_payload_uses_dynamic_project_root_in_instructions(self, mock_deps, watermark):
@@ -1334,51 +1333,8 @@ class TestTaskKnowledgeSyncErrorLogging:
         assert isinstance(payload, str)
 
     @pytest.mark.asyncio
-    async def test_done_tasks_exception_is_logged(self, mock_deps, watermark, caplog):
-        """When the second get_tasks call (done tasks) raises, a warning/error is logged."""
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'test_proj'
-        stage.project_root = '/tmp/test_proj'
-
-        # First call (active) succeeds, second call (done) fails
-        call_count = 0
-        async def side_effect(**kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return {'tasks': []}
-            raise RuntimeError('done tasks fetch failed')
-
-        mock_deps['taskmaster'].get_tasks.side_effect = side_effect
-
-        with caplog.at_level(logging.WARNING):
-            await stage.assemble_payload([], watermark, [])
-
-        assert 'done tasks fetch failed' in caplog.text
-
-    @pytest.mark.asyncio
-    async def test_done_tasks_exception_degrades_gracefully(self, mock_deps, watermark):
-        """When done tasks get_tasks raises, done_tasks defaults to [] and payload still assembles."""
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'test_proj'
-        stage.project_root = '/tmp/test_proj'
-
-        call_count = 0
-        async def side_effect(**kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return {'tasks': []}
-            raise RuntimeError('oops')
-
-        mock_deps['taskmaster'].get_tasks.side_effect = side_effect
-
-        payload = await stage.assemble_payload([], watermark, [])
-        assert isinstance(payload, str)
-
-    @pytest.mark.asyncio
-    async def test_both_calls_fail_payload_still_assembles(self, mock_deps, watermark):
-        """When both get_tasks calls fail, payload still assembles without raising."""
+    async def test_single_fetch_failure_payload_still_assembles(self, mock_deps, watermark):
+        """When the single get_tasks call fails, payload still assembles without raising."""
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_proj'
         stage.project_root = '/tmp/test_proj'
@@ -1386,6 +1342,30 @@ class TestTaskKnowledgeSyncErrorLogging:
 
         payload = await stage.assemble_payload([], watermark, [])
         assert isinstance(payload, str)
+
+    @pytest.mark.asyncio
+    async def test_single_fetch_splits_active_and_done(self, mock_deps, watermark):
+        """A single get_tasks call is split into active and done tasks in-memory."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_proj'
+        stage.project_root = '/tmp/test_proj'
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                {'id': 1, 'title': 'Active', 'status': 'pending'},
+                {'id': 2, 'title': 'Done', 'status': 'done'},
+                {'id': 3, 'title': 'Blocked', 'status': 'blocked'},
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # Single network call
+        mock_deps['taskmaster'].get_tasks.assert_called_once()
+        # Active section should contain pending and blocked but not done
+        assert '(pending) Active' in payload
+        assert '(blocked) Blocked' in payload
+        # Done section should contain the done task
+        assert '(done) Done' in payload
 
 
 class TestStage2SystemPromptContextWindowGuidance:
