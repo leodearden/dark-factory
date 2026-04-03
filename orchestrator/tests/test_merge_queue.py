@@ -193,6 +193,9 @@ class TestMergeWorker:
         )
         assert 'queued = True' in content
 
+        # File should also be in the working tree (working tree synced)
+        assert (git_ops.project_root / 'queued.py').exists()
+
         await worker.stop()
         worker_task.cancel()
         with pytest.raises(asyncio.CancelledError):

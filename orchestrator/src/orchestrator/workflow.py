@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 from shared.config_dir import TaskConfigDir
 
 from orchestrator.agents.invoke import AgentResult, invoke_with_cap_retry
-from orchestrator.event_store import EventStore, EventType
 from orchestrator.agents.roles import (
     ALL_REVIEWERS,
     ARCHITECT,
@@ -25,6 +24,7 @@ from orchestrator.agents.roles import (
 )
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment, files_to_modules
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted

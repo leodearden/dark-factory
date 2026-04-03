@@ -127,6 +127,9 @@ class TestWorktreeLifecycle:
         )
         assert 'merged = True' in content
 
+        # File should also be in the working tree (working tree synced)
+        assert (git_ops.project_root / 'merged.py').exists()
+
         await git_ops.cleanup_merge_worktree(result.merge_worktree)
         assert not result.merge_worktree.exists()
 
@@ -261,3 +264,182 @@ class TestMergeConflicts:
 
         # Clean up the conflict worktree
         await git_ops.cleanup_merge_worktree(result_b.merge_worktree)
+
+
+@pytest.mark.asyncio
+class TestWorkingTreeSync:
+    """Tests for the stash/read-tree/pop working-tree protection in advance_main."""
+
+    async def _merge_and_advance(self, git_ops: GitOps, branch: str, filename: str, content: str):
+        """Helper: create a file on a branch, merge it, advance main."""
+        worktree, _ = await git_ops.create_worktree(branch)
+        (worktree / filename).write_text(content)
+        await git_ops.commit(worktree, f'Add {filename}')
+        result = await git_ops.merge_to_main(worktree, branch)
+        assert result.success
+        assert result.merge_commit is not None
+        assert result.merge_worktree is not None
+        advance = await git_ops.advance_main(result.merge_commit)
+        await git_ops.cleanup_merge_worktree(result.merge_worktree)
+        return advance
+
+    async def test_advance_syncs_working_tree(self, git_ops: GitOps):
+        """Merged file appears in the working tree after advance_main."""
+        result = await self._merge_and_advance(git_ops, 'sync-basic', 'synced.py', 'synced = True\n')
+        assert result == 'advanced'
+        assert (git_ops.project_root / 'synced.py').exists()
+        assert 'synced = True' in (git_ops.project_root / 'synced.py').read_text()
+
+    async def test_advance_stashes_and_restores_dirty_work(self, git_ops: GitOps):
+        """Uncommitted user work survives the merge advance."""
+        # Create dirty file in project_root (uncommitted)
+        (git_ops.project_root / 'wip.py').write_text('work_in_progress = True\n')
+
+        result = await self._merge_and_advance(git_ops, 'stash-restore', 'merged.py', 'merged = True\n')
+        assert result == 'advanced'
+
+        # Merged file should be in working tree
+        assert (git_ops.project_root / 'merged.py').exists()
+        # User's dirty file should survive
+        assert (git_ops.project_root / 'wip.py').exists()
+        assert 'work_in_progress' in (git_ops.project_root / 'wip.py').read_text()
+
+    async def test_advance_stash_pop_conflict_markers(self, git_ops: GitOps):
+        """Conflicting dirty changes produce git conflict markers."""
+        # Create dirty change to README.md in project_root (don't commit)
+        (git_ops.project_root / 'README.md').write_text('# Local WIP edit\n')
+
+        # Merge a conflicting change to README.md
+        worktree, _ = await git_ops.create_worktree('conflict-readme')
+        (worktree / 'README.md').write_text('# Merged from branch\n')
+        await git_ops.commit(worktree, 'Change README on branch')
+        merge_result = await git_ops.merge_to_main(worktree, 'conflict-readme')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+        assert result == 'advanced'
+
+        # README.md should have conflict markers
+        readme_content = (git_ops.project_root / 'README.md').read_text()
+        assert '<<<<<<<' in readme_content
+
+    async def test_advance_no_stash_when_clean(self, git_ops: GitOps):
+        """Clean working tree: no stash, but read-tree still syncs files."""
+        result = await self._merge_and_advance(git_ops, 'clean-sync', 'clean.py', 'clean = True\n')
+        assert result == 'advanced'
+        assert (git_ops.project_root / 'clean.py').exists()
+
+        # No stash entries should exist
+        _, stash_list, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_list.strip() == ''
+
+    async def test_advance_skips_sync_when_not_on_main(self, git_ops: GitOps):
+        """When project_root is on another branch, working tree is untouched."""
+        # Switch project_root to a different branch
+        await _run(['git', 'checkout', '-b', 'other-branch'], cwd=git_ops.project_root)
+
+        # Create a marker file to detect working tree changes
+        marker_content = '# Should not change\n'
+        (git_ops.project_root / 'README.md').write_text(marker_content)
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Mark README'], cwd=git_ops.project_root)
+
+        # Merge a file to main (via worktree from main)
+        # Need to create worktree from main for the merge to work
+        worktree, _ = await git_ops.create_worktree('not-on-main')
+        (worktree / 'should_not_appear.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add file')
+        merge_result = await git_ops.merge_to_main(worktree, 'not-on-main')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+        assert result == 'advanced'
+
+        # File should NOT appear in working tree (we're on other-branch)
+        assert not (git_ops.project_root / 'should_not_appear.py').exists()
+        # README should be unchanged
+        assert (git_ops.project_root / 'README.md').read_text() == marker_content
+
+    async def test_stash_failure_returns_stash_failed(self, git_ops: GitOps):
+        """If git stash push fails, advance_main returns 'stash_failed' without moving the ref."""
+        # Get current main SHA before the attempt
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
+        # Create a merge commit that could be advanced
+        worktree, _ = await git_ops.create_worktree('stash-fail')
+        (worktree / 'stash_fail.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add file')
+        merge_result = await git_ops.merge_to_main(worktree, 'stash-fail')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Make working tree dirty
+        (git_ops.project_root / 'dirty.py').write_text('dirty = True\n')
+
+        # Sabotage git stash by making .git/refs/stash unwritable
+        # Instead, use a simpler approach: lock the index
+        from unittest.mock import patch
+
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None):
+            if cmd[:3] == ['git', 'stash', 'push']:
+                return (1, '', 'fatal: cannot stash changes')
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await git_ops.advance_main(merge_result.merge_commit)
+
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+        assert result == 'stash_failed'
+
+        # Main ref should NOT have moved
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip()
+
+    async def test_stash_restored_on_cas_failure(self, git_ops: GitOps):
+        """On CAS failure, stash is popped to restore the original working tree."""
+        # Create and merge a file
+        worktree, _ = await git_ops.create_worktree('cas-stash')
+        (worktree / 'cas_file.py').write_text('cas = True\n')
+        await git_ops.commit(worktree, 'Add file')
+        merge_result = await git_ops.merge_to_main(worktree, 'cas-stash')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Make working tree dirty
+        (git_ops.project_root / 'user_wip.py').write_text('wip = True\n')
+
+        # Force CAS failure by passing a wrong expected_main
+        result = await git_ops.advance_main(
+            merge_result.merge_commit,
+            merge_result.merge_worktree,
+            branch='cas-stash',
+            expected_main='0000000000000000000000000000000000000000',
+        )
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+        assert result == 'cas_failed'
+
+        # Dirty file should be restored (stash popped)
+        assert (git_ops.project_root / 'user_wip.py').exists()
+        assert 'wip = True' in (git_ops.project_root / 'user_wip.py').read_text()
+
+        # No leftover stash entries
+        _, stash_list, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_list.strip() == ''
