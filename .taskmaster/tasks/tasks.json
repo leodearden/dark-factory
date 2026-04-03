@@ -8293,7 +8293,7 @@
         "description": "The fused-memory systemd service correctly sets `Environment=MEM0_TELEMETRY=false`, protecting production. However, `load_dotenv()` in `server/main.py:14` loads from `.env` which does NOT contain this setting. Non-systemd starts (dev, debug, manual `uv run`) will silently enable mem0 Posthog telemetry, causing thread leaks (~8000 threads/day).\n\nFix: Add `MEM0_TELEMETRY=false` to `/home/leo/src/dark-factory/.env`. Optionally also add `os.environ.setdefault('MEM0_TELEMETRY', 'false')` early in `server/main.py` before any mem0 imports for belt-and-suspenders defense.\n\nNote: Task 413 (\"Set MEM0_TELEMETRY=false in fused-memory server startup\") is marked done — the systemd fix satisfies that. This task is for the additional code/env-level defense layer.\n\nmemory_hints:\n- search: \"MEM0_TELEMETRY thread leak posthog\"\n- entity: \"Mem0 Posthog Thread Leak\"",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -8304,9 +8304,15 @@
           ],
           "modules": [
             "fused-memory/server"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Add MEM0_TELEMETRY=false to .env for defense-in-depth outside systemd"
+            ]
+          }
         },
-        "updatedAt": "2026-04-03T12:29:08.976Z"
+        "updatedAt": "2026-04-03T12:30:51.654Z"
       },
       {
         "id": "416",
@@ -8356,7 +8362,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T12:29:08.976Z",
+      "lastModified": "2026-04-03T12:30:51.655Z",
       "taskCount": 396,
       "completedCount": 382,
       "tags": [
