@@ -97,9 +97,33 @@ class TestSetdefaultPrecedesFusedMemoryImports:
 
 class TestEnvVarIsFalseAtRuntime:
     def test_env_var_is_false_at_runtime(self):
-        """After importing server.main, MEM0_TELEMETRY must equal 'false' in os.environ."""
-        import fused_memory.server.main  # noqa: F401 — triggers setdefault side effect
+        """Module-level setdefault must write 'false' when MEM0_TELEMETRY is absent.
 
-        assert os.environ.get('MEM0_TELEMETRY') == 'false', (
-            "MEM0_TELEMETRY should be 'false' after importing fused_memory.server.main"
-        )
+        Uses a controlled-environment approach: save the current env var value, delete it,
+        reload the module to re-trigger the setdefault call in a clean state, assert the
+        value is 'false', then restore the original value in a finally block.
+
+        This avoids spurious failures when MEM0_TELEMETRY is pre-set by CI, systemd, or a
+        prior test — since os.environ.setdefault is intentionally a no-op when the key
+        already exists. The static source-analysis tests (1-3) remain the primary guards;
+        this test adds a complementary runtime check.
+
+        Reload side effects (load_dotenv re-runs, logging reconfigured, cached module
+        imports are no-ops) are benign for this test purpose.
+        """
+        import importlib
+
+        import fused_memory.server.main
+
+        original = os.environ.pop('MEM0_TELEMETRY', None)
+        try:
+            importlib.reload(fused_memory.server.main)
+            assert os.environ.get('MEM0_TELEMETRY') == 'false', (
+                "MEM0_TELEMETRY should be 'false' after module-level setdefault runs "
+                "in a clean environment (key absent from os.environ before reload)"
+            )
+        finally:
+            if original is None:
+                os.environ.pop('MEM0_TELEMETRY', None)
+            else:
+                os.environ['MEM0_TELEMETRY'] = original
