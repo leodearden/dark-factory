@@ -133,6 +133,28 @@ class ReconciliationHarness:
                 s._escalation_url = self._escalation_url
         return stages
 
+    @staticmethod
+    def _configure_consolidator(
+        stage: MemoryConsolidator,
+        tier: TierConfig,
+        *,
+        prior_s3_findings: list[dict] | None = None,
+        cycle_fence_time: datetime | None = None,
+        assembled_payload: AssembledPayload | None = None,
+        remediation_findings: list[dict] | None = None,
+    ) -> None:
+        """Apply tier limits and mode-specific attributes to MemoryConsolidator.
+
+        Shared between run_full_cycle and _run_remediation_pass to prevent
+        attribute-configuration divergence.
+        """
+        stage.episode_limit = tier.episode_limit
+        stage.memory_limit = tier.memory_limit
+        stage.prior_s3_findings = prior_s3_findings
+        stage.cycle_fence_time = cycle_fence_time
+        stage.assembled_payload = assembled_payload
+        stage.remediation_findings = remediation_findings
+
     # ── Stale-run recovery ─────────────────────────────────────────────
 
     async def _recover_stale_runs(self) -> None:
@@ -475,11 +497,12 @@ class ReconciliationHarness:
 
                 # Apply tier limits, prior S3 findings, and cycle fence to Stage 1
                 if isinstance(stage, MemoryConsolidator):
-                    stage.episode_limit = tier.episode_limit
-                    stage.memory_limit = tier.memory_limit
-                    stage.prior_s3_findings = prior_s3_findings
-                    stage.cycle_fence_time = cycle_start_time
-                    stage.assembled_payload = assembled_payload
+                    self._configure_consolidator(
+                        stage, tier,
+                        prior_s3_findings=prior_s3_findings,
+                        cycle_fence_time=cycle_start_time,
+                        assembled_payload=assembled_payload,
+                    )
 
                 report = await stage.run(
                     events, watermark, reports, run_id, model=tier.model,
@@ -686,7 +709,9 @@ class ReconciliationHarness:
             stage2 = stages[1]
             assert isinstance(stage1, MemoryConsolidator)
             assert isinstance(stage2, TaskKnowledgeSync)
-            stage1.remediation_findings = findings
+            self._configure_consolidator(
+                stage1, tier, remediation_findings=findings,
+            )
             stage2.remediation_mode = True
 
             watermark = await self.journal.get_watermark(project_id)
@@ -695,11 +720,6 @@ class ReconciliationHarness:
                 current_stage_name = stage.stage_id.value
                 stage.project_id = project_id
                 stage.project_root = project_root
-
-                # Apply tier limits to Stage 1 (same as run_full_cycle)
-                if isinstance(stage, MemoryConsolidator):
-                    stage.episode_limit = tier.episode_limit
-                    stage.memory_limit = tier.memory_limit
 
                 report = await stage.run(
                     [], watermark, reports, run_id, model=tier.model,

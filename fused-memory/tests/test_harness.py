@@ -1442,7 +1442,7 @@ async def test_remediation_forwards_tier_model_to_stage_run(
     stages = harness._make_stages()
     harness._make_stages = lambda: stages
 
-    models_seen: dict[str, str | None] = {}
+    models_seen: dict[str, dict] = {}
 
     for stage in stages:
         stage_name = type(stage).__name__
