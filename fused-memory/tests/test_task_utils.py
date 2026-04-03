@@ -1,5 +1,11 @@
 """Tests for fused_memory.utils.task_utils pure utility functions."""
 
+import inspect
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.utils.task_utils import (
     _collect_all_tasks,
     _compact_task,
@@ -216,3 +222,50 @@ class TestCompactTasks:
     def test_empty_list_returns_empty(self):
         result = _compact_tasks([])
         assert result == []
+
+
+class TestTaskmasterBackendGetTasksSignature:
+    """Verify TaskmasterBackend.get_tasks() has no dead 'status' parameter.
+
+    Step 17 tests: these fail against the current code which still has the
+    dead 'status: list[str] | None = None' parameter.
+    """
+
+    def test_get_tasks_signature_has_no_status_parameter(self):
+        """get_tasks should only accept (self, project_root, tag) — no status."""
+        sig = inspect.signature(TaskmasterBackend.get_tasks)
+        param_names = list(sig.parameters.keys())
+        # 'self' is included when inspecting an unbound method
+        assert 'status' not in param_names, (
+            f"TaskmasterBackend.get_tasks() has a dead 'status' parameter: {param_names}. "
+            "Filtering is the interceptor's responsibility — remove it from the backend."
+        )
+
+    def test_get_tasks_parameters_are_project_root_and_tag(self):
+        """get_tasks accepts exactly project_root and tag (besides self)."""
+        sig = inspect.signature(TaskmasterBackend.get_tasks)
+        param_names = [p for p in sig.parameters if p != 'self']
+        assert param_names == ['project_root', 'tag'], (
+            f"Expected ['project_root', 'tag'], got {param_names}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_returns_raw_call_tool_result_unchanged(self):
+        """get_tasks must return the call_tool result directly, no post-processing."""
+        config = MagicMock()
+        backend = TaskmasterBackend(config=config)
+
+        raw_result = {
+            'tasks': [
+                {'id': '1', 'status': 'done', 'title': 'Done task'},
+                {'id': '2', 'status': 'pending', 'title': 'Pending task'},
+            ]
+        }
+
+        with patch.object(backend, 'call_tool', new=AsyncMock(return_value=raw_result)):
+            result = await backend.get_tasks(project_root='/some/project')
+
+        # The result must be the exact dict returned by call_tool —
+        # no filtering, no modification.
+        assert result == raw_result
+        assert len(result['tasks']) == 2  # both tasks preserved
