@@ -447,6 +447,40 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
+    async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[dict]]:
+        """Return all currently-valid RELATES_TO edges, grouped by entity UUID.
+
+        Issues a single bulk Cypher query rather than one query per entity,
+        eliminating the O(N) round-trips in detect_stale_summaries.
+
+        Uses ro_query since no writes are performed.
+
+        Args:
+            group_id: Project graph to query.
+
+        Returns:
+            Dict keyed by entity UUID; each value is a list of edge dicts
+            with keys: uuid, fact, name.  Same edge shape as
+            get_valid_edges_for_node output.
+        """
+        graph = self._graph_for(group_id)
+        cypher = (
+            'MATCH (n:Entity)-[e:RELATES_TO]-() '
+            'WHERE e.invalid_at IS NULL '
+            'RETURN n.uuid, DISTINCT e.uuid, e.fact, e.name'
+        )
+        result = await graph.ro_query(cypher)
+        grouped: dict[str, list[dict]] = {}
+        for row in (result.result_set or []):
+            entity_uuid = row[0]
+            edge = {
+                'uuid': row[1],
+                'fact': row[2] or '',
+                'name': row[3] or '',
+            }
+            grouped.setdefault(entity_uuid, []).append(edge)
+        return grouped
+
     async def bulk_remove_edges(self, uuids: list[str], *, group_id: str) -> int:
         """Delete RELATES_TO edges by UUID list. Returns count of actually matched edges.
 
