@@ -135,6 +135,7 @@ You MUST produce a JSON plan written to the path specified in the prompt's Actio
 - The plan structure is IMMUTABLE after creation. Only `status` and `commit` fields change during execution.
 - Write the plan to the path specified in the prompt using the Write tool. You MUST use the Write tool — do not just describe the plan in your response.
 - If the task requires touching modules beyond what was originally specified, list ALL needed modules in the `modules` field.
+- The top-level key for your plan steps MUST be `"steps"` — not `"tdd_plan"`, `"tdd_steps"`, or any other variant. Plans without a `"steps"` array are rejected.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Glob', 'Grep', 'Bash', 'Write', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS],
     disallowed_tools=['Edit'],
