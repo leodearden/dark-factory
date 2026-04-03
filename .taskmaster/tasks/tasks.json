@@ -8153,6 +8153,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 409,
+        "title": "Add missing edge case tests for task_utils filter functions",
+        "description": "Add tests: (1) _filter_tasks_by_status with empty statuses list [] — document it returns []. (2) _filter_tasks_by_status with task dict missing 'status' key — verify treated as 'unknown'.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8165,7 +8176,7 @@
       ],
       "created": "2026-04-03T06:30:22.226Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-03T06:30:26.295Z"
+      "updated": "2026-04-03T06:30:28.069Z"
     }
   }
 }
