@@ -8186,6 +8186,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 412,
+        "title": "Fix empty status filter parsing and document cancelled/deferred exclusion",
+        "description": "In tools.py, after parsing status_list from comma-separated string, return error if list is empty (e.g. status=',' or '  '). Also document or fix the cancelled/deferred exclusion from proactive sample in task_knowledge_sync.py.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8198,7 +8209,7 @@
       ],
       "created": "2026-04-03T06:30:22.226Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-03T06:30:31.906Z"
+      "updated": "2026-04-03T06:30:34.110Z"
     }
   }
 }
