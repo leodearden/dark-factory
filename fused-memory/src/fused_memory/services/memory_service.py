@@ -274,6 +274,16 @@ class MemoryService:
         causation_id = payload.pop('_causation_id', None)
         write_op_id = payload.pop('_write_op_id', None)
         temporal_context = payload.pop('temporal_context', None)
+        reference_time_iso = payload.pop('reference_time', None)
+        reference_time = None
+        if reference_time_iso is not None:
+            try:
+                reference_time = datetime.fromisoformat(reference_time_iso)
+            except (ValueError, TypeError):
+                logger.warning(
+                    'Invalid reference_time %r in queue payload; treating as None',
+                    reference_time_iso,
+                )
 
         result = await self._journaled_backend_call(
             write_op_id=write_op_id,
@@ -289,6 +299,7 @@ class MemoryService:
                 source_description=payload.get('source_description', ''),
                 uuid=payload.get('uuid'),
                 temporal_context=temporal_context,
+                reference_time=reference_time,
             ),
         )
         # Post-write dedup: remove duplicate edges created within this episode
@@ -499,6 +510,7 @@ class MemoryService:
                     '_causation_id': causation_id,
                     '_write_op_id': write_op_id,
                     'temporal_context': temporal_context,
+                    'reference_time': reference_time.isoformat() if reference_time is not None else None,
                 },
                 callback_type='dual_write_episode',
             )
