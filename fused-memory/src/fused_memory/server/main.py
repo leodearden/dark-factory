@@ -11,11 +11,6 @@ from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
-# Defense-in-depth: suppress mem0 Posthog telemetry before any mem0 imports.
-# The systemd unit also sets this, but non-systemd starts (dev, debug, manual
-# `uv run`) would otherwise silently enable telemetry causing thread leaks.
-os.environ.setdefault('MEM0_TELEMETRY', 'false')
-
 load_dotenv()
 
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402

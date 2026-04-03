@@ -513,6 +513,13 @@ class TaskWorkflow:
             logger.error(f'Task {self.task_id}: architect produced no plan.json')
             return WorkflowOutcome.BLOCKED
 
+        if not self.plan.get('steps'):
+            logger.error(
+                f'Task {self.task_id}: architect wrote plan.json but missing/empty '
+                f'"steps" — full plan content: {json.dumps(self.plan, indent=2)}'
+            )
+            return WorkflowOutcome.BLOCKED
+
         # Stamp provenance and acquire lock
         self.artifacts.stamp_plan_provenance(self.session_id)
         self.artifacts.lock_plan(self.session_id)
@@ -599,8 +606,17 @@ class TaskWorkflow:
             await self._replan(reviews)
             # Re-stamp provenance — architect may have overwritten plan.json
             assert self.artifacts is not None
-            self.artifacts.stamp_plan_provenance(self.session_id)
             self.plan = self.artifacts.read_plan()
+            if not self.plan or not self.plan.get('steps'):
+                logger.error(
+                    f'Task {self.task_id}: replan produced plan.json with '
+                    f'missing/empty "steps" — full plan content: '
+                    f'{json.dumps(self.plan, indent=2) if self.plan else "None"}'
+                )
+                return await self._mark_blocked(
+                    'Architect replan produced no valid steps'
+                )
+            self.artifacts.stamp_plan_provenance(self.session_id)
             self.metrics.review_cycles += 1
 
     async def _execute_iterations(self) -> WorkflowOutcome:
