@@ -8142,6 +8142,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 408,
+        "title": "Remove duplicate utility function tests from test_task_interceptor.py",
+        "description": "Delete _compact_task/_compact_tasks/_collect_all_tasks test block (lines ~723-1058) from test_task_interceptor.py — canonical versions live in test_task_utils.py. Remove duplicate degradation test from test_stages.py (test_single_fetch_failure_payload_still_assembles).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8154,7 +8165,7 @@
       ],
       "created": "2026-04-03T06:30:22.226Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-03T06:30:24.010Z"
+      "updated": "2026-04-03T06:30:26.295Z"
     }
   }
 }
