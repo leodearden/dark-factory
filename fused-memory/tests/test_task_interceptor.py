@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
-from fused_memory.middleware.task_interceptor import (
-    TaskInterceptor,
+from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.utils.task_utils import (
     _collect_all_tasks,
     _compact_task,
     _compact_tasks,
