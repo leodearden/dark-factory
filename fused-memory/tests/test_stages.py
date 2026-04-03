@@ -1387,3 +1387,38 @@ class TestTaskKnowledgeSyncErrorLogging:
         payload = await stage.assemble_payload([], watermark, [])
         assert isinstance(payload, str)
 
+
+class TestStage2SystemPromptContextWindowGuidance:
+    """Tests that STAGE2_SYSTEM_PROMPT instructs agents to manage context window."""
+
+    def test_prompt_mentions_status_filter(self):
+        """STAGE2_SYSTEM_PROMPT must instruct agents to use status filter when calling get_tasks."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'status' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must mention status filter for get_tasks"
+        )
+
+    def test_prompt_mentions_compact_mode(self):
+        """STAGE2_SYSTEM_PROMPT must instruct agents to use compact=true."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'compact' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must mention compact mode for get_tasks"
+        )
+
+    def test_prompt_mentions_get_task_summary(self):
+        """STAGE2_SYSTEM_PROMPT must mention get_task_summary as a lightweight overview tool."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'get_task_summary' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must mention get_task_summary as an alternative for overview"
+        )
+
+    def test_prompt_has_context_window_section(self):
+        """STAGE2_SYSTEM_PROMPT must have a dedicated Context Window Management section."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'Context Window' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must include a Context Window Management section"
+        )
