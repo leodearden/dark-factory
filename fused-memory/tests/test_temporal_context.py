@@ -1,14 +1,21 @@
-"""Tests for temporal_context threading through the add_episode pipeline.
+"""Tests for temporal_context and reference_time threading through the add_episode pipeline.
 
 Organised by pipeline layer (bottom-up):
   TestGraphitiBackendTemporalContext    — step-1 / step-2
   TestExecuteGraphitiWriteTemporalContext — step-3 / step-4
   TestAddEpisodeTemporalContext         — step-5 / step-6
   TestMCPToolAddEpisodeTemporalContext  — step-7 / step-8
+
+  TestGraphitiBackendReferenceTime      — step-1 (reference_time)
+  TestExecuteGraphitiWriteReferenceTime — step-3 (reference_time)
+  TestAddEpisodeReferenceTime           — step-5 (reference_time)
+  TestMCPToolAddEpisodeReferenceTime    — step-7 (reference_time)
+  TestReferenceTimeTemporalContextInteraction — step-9
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -360,3 +367,331 @@ class TestMCPToolAddEpisodeTemporalContext:
         )
         _, kwargs = mock_memory_service.add_episode.call_args
         assert kwargs.get('temporal_context') == 'current'
+
+
+# ---------------------------------------------------------------------------
+# Step 1 (reference_time): GraphitiBackend.add_episode — reference_time forwarding
+# ---------------------------------------------------------------------------
+
+
+class TestGraphitiBackendReferenceTime:
+    """GraphitiBackend.add_episode forwards reference_time to the Graphiti client.
+
+    This verifies existing backend behavior that becomes load-bearing once we
+    thread reference_time from the MCP layer through the full pipeline.
+    """
+
+    @pytest.mark.asyncio
+    async def test_explicit_datetime_passed_to_client(self, backend):
+        """Explicit reference_time datetime → client receives exactly that datetime."""
+        ref_dt = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
+        await backend.add_episode(
+            name='ep',
+            content='historical content',
+            source_description='session notes',
+            reference_time=ref_dt,
+        )
+        call_kwargs = backend.client.add_episode.call_args[1]
+        assert call_kwargs['reference_time'] == ref_dt
+
+    @pytest.mark.asyncio
+    async def test_none_reference_time_defaults_to_now(self, backend):
+        """reference_time=None → client receives a datetime close to now (UTC)."""
+        before = datetime.now(UTC)
+        await backend.add_episode(
+            name='ep',
+            content='content',
+            source_description='notes',
+            reference_time=None,
+        )
+        after = datetime.now(UTC)
+        call_kwargs = backend.client.add_episode.call_args[1]
+        ref = call_kwargs['reference_time']
+        # Should be a UTC-aware datetime between before and after
+        assert ref.tzinfo is not None
+        assert before <= ref <= after
+
+    @pytest.mark.asyncio
+    async def test_default_omission_same_as_none(self, backend):
+        """Omitting reference_time defaults to None → client gets datetime.now(UTC)."""
+        before = datetime.now(UTC)
+        await backend.add_episode(
+            name='ep',
+            content='content',
+            source_description='notes',
+            # reference_time intentionally omitted
+        )
+        after = datetime.now(UTC)
+        call_kwargs = backend.client.add_episode.call_args[1]
+        ref = call_kwargs['reference_time']
+        assert ref.tzinfo is not None
+        assert before <= ref <= after
+
+
+# ---------------------------------------------------------------------------
+# Step 3 (reference_time): MemoryService._execute_graphiti_write — extraction
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteGraphitiWriteReferenceTime:
+    """_execute_graphiti_write pops reference_time ISO string from payload and
+    forwards it as a parsed datetime to graphiti.add_episode.
+
+    These tests will FAIL until step-4 implementation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reference_time_iso_string_forwarded_as_datetime(self, service):
+        """Payload with 'reference_time' ISO string → graphiti.add_episode called with parsed datetime."""
+        ref_iso = '2026-03-22T12:00:00+00:00'
+        ref_expected = datetime(2026, 3, 22, 12, 0, 0, tzinfo=timezone.utc)
+        payload = {
+            'uuid': 'test-uuid',
+            'name': 'episode_test',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': 'notes',
+            'reference_time': ref_iso,
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+        call_kwargs = service.graphiti.add_episode.call_args[1]
+        assert call_kwargs.get('reference_time') == ref_expected
+
+    @pytest.mark.asyncio
+    async def test_missing_reference_time_passes_none(self, service):
+        """Payload without reference_time → graphiti.add_episode called with reference_time=None."""
+        payload = {
+            'uuid': 'test-uuid',
+            'name': 'episode_test',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': 'notes',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+        call_kwargs = service.graphiti.add_episode.call_args[1]
+        assert call_kwargs.get('reference_time') is None
+
+    @pytest.mark.asyncio
+    async def test_reference_time_popped_not_leaked(self, service):
+        """reference_time must be popped from payload dict (not passed via remaining kwargs)."""
+        ref_iso = '2026-03-22T00:00:00+00:00'
+        payload = {
+            'uuid': 'test-uuid',
+            'name': 'episode_test',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': 'notes',
+            'reference_time': ref_iso,
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+        # The key should have been popped from the payload dict
+        assert 'reference_time' not in payload
+
+
+# ---------------------------------------------------------------------------
+# Step 5 (reference_time): MemoryService.add_episode — serialization into payload
+# ---------------------------------------------------------------------------
+
+
+class TestAddEpisodeReferenceTime:
+    """MemoryService.add_episode serializes reference_time datetime to ISO string
+    in the durable queue enqueue payload.
+
+    These tests will FAIL until step-6 implementation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_explicit_datetime_serialized_to_iso_in_payload(self, service):
+        """add_episode(reference_time=datetime(2026,3,22,...)) → payload has ISO string."""
+        ref_dt = datetime(2026, 3, 22, 0, 0, 0, tzinfo=UTC)
+        await service.add_episode(
+            content='historical content',
+            project_id='test',
+            reference_time=ref_dt,
+        )
+        call_kwargs = service.durable_queue.enqueue.call_args[1]
+        payload = call_kwargs['payload']
+        assert payload.get('reference_time') == ref_dt.isoformat()
+
+    @pytest.mark.asyncio
+    async def test_none_reference_time_in_payload(self, service):
+        """add_episode(reference_time=None) → payload has reference_time=None or key absent."""
+        await service.add_episode(
+            content='test content',
+            project_id='test',
+            reference_time=None,
+        )
+        call_kwargs = service.durable_queue.enqueue.call_args[1]
+        payload = call_kwargs['payload']
+        # Either None or absent — both acceptable
+        assert payload.get('reference_time') is None
+
+    @pytest.mark.asyncio
+    async def test_default_omission_reference_time_is_none(self, service):
+        """Calling add_episode without reference_time → payload has None (default)."""
+        await service.add_episode(
+            content='default content',
+            project_id='test',
+        )
+        call_kwargs = service.durable_queue.enqueue.call_args[1]
+        payload = call_kwargs['payload']
+        assert payload.get('reference_time') is None
+
+
+# ---------------------------------------------------------------------------
+# Step 7 (reference_time): MCP tool add_episode — validation + passthrough
+# ---------------------------------------------------------------------------
+
+
+class TestMCPToolAddEpisodeReferenceTime:
+    """MCP add_episode tool accepts reference_time as ISO 8601 string, validates,
+    parses to datetime, and passes to memory_service.add_episode.
+
+    These tests will FAIL until step-8 implementation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_valid_iso_string_parsed_and_forwarded(
+        self, mcp_server, mock_memory_service
+    ):
+        """Valid ISO string '2026-03-22T00:00:00+00:00' → service called with parsed datetime."""
+        iso_str = '2026-03-22T00:00:00+00:00'
+        expected_dt = datetime(2026, 3, 22, 0, 0, 0, tzinfo=timezone.utc)
+        await mcp_server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': 'historical content',
+                'project_id': 'test',
+                'reference_time': iso_str,
+            },
+        )
+        mock_memory_service.add_episode.assert_called_once()
+        _, kwargs = mock_memory_service.add_episode.call_args
+        assert kwargs.get('reference_time') == expected_dt
+
+    @pytest.mark.asyncio
+    async def test_invalid_iso_string_returns_error(
+        self, mcp_server, mock_memory_service
+    ):
+        """Invalid string 'not-a-date' → error dict returned, service not called."""
+        result = await mcp_server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': 'some content',
+                'project_id': 'test',
+                'reference_time': 'not-a-date',
+            },
+        )
+        assert 'error' in result
+        mock_memory_service.add_episode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_none_reference_time_passes_none_to_service(
+        self, mcp_server, mock_memory_service
+    ):
+        """reference_time omitted → service called with reference_time=None."""
+        await mcp_server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': 'some content',
+                'project_id': 'test',
+            },
+        )
+        mock_memory_service.add_episode.assert_called_once()
+        _, kwargs = mock_memory_service.add_episode.call_args
+        assert kwargs.get('reference_time') is None
+
+    @pytest.mark.asyncio
+    async def test_iso_string_with_timezone_offset_accepted(
+        self, mcp_server, mock_memory_service
+    ):
+        """ISO 8601 string with timezone offset is accepted and parsed correctly."""
+        iso_str = '2026-03-22T14:30:00+05:30'
+        expected_dt = datetime.fromisoformat(iso_str)
+        await mcp_server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': 'some content',
+                'project_id': 'test',
+                'reference_time': iso_str,
+            },
+        )
+        mock_memory_service.add_episode.assert_called_once()
+        _, kwargs = mock_memory_service.add_episode.call_args
+        assert kwargs.get('reference_time') == expected_dt
+
+
+# ---------------------------------------------------------------------------
+# Step 9: Integration — reference_time + temporal_context work together
+# ---------------------------------------------------------------------------
+
+
+class TestReferenceTimeTemporalContextInteraction:
+    """Verify reference_time and temporal_context work together correctly
+    across the full mocked pipeline (MCP tool → service → _execute_graphiti_write → backend).
+    """
+
+    @pytest.mark.asyncio
+    async def test_both_reference_time_and_temporal_context_forwarded(
+        self, mcp_server, mock_memory_service
+    ):
+        """add_episode with both temporal_context='retrospective' and reference_time →
+        service receives both parameters.
+        """
+        iso_str = '2026-03-22T00:00:00+00:00'
+        expected_dt = datetime(2026, 3, 22, 0, 0, 0, tzinfo=timezone.utc)
+        await mcp_server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': 'historical state summary',
+                'project_id': 'test',
+                'temporal_context': 'retrospective',
+                'reference_time': iso_str,
+            },
+        )
+        mock_memory_service.add_episode.assert_called_once()
+        _, kwargs = mock_memory_service.add_episode.call_args
+        assert kwargs.get('temporal_context') == 'retrospective'
+        assert kwargs.get('reference_time') == expected_dt
+
+    @pytest.mark.asyncio
+    async def test_service_serializes_both_to_queue_payload(self, service):
+        """add_episode(temporal_context='retrospective', reference_time=dt) →
+        enqueue payload contains both 'temporal_context' and 'reference_time' (ISO string).
+        """
+        ref_dt = datetime(2026, 3, 22, 0, 0, 0, tzinfo=UTC)
+        await service.add_episode(
+            content='historical state summary',
+            project_id='test',
+            temporal_context='retrospective',
+            reference_time=ref_dt,
+        )
+        call_kwargs = service.durable_queue.enqueue.call_args[1]
+        payload = call_kwargs['payload']
+        assert payload.get('temporal_context') == 'retrospective'
+        assert payload.get('reference_time') == ref_dt.isoformat()
+
+    @pytest.mark.asyncio
+    async def test_execute_graphiti_write_forwards_both(self, service):
+        """_execute_graphiti_write with both temporal_context and reference_time →
+        graphiti.add_episode called with both.
+        """
+        ref_iso = '2026-03-22T00:00:00+00:00'
+        ref_expected = datetime(2026, 3, 22, 0, 0, 0, tzinfo=timezone.utc)
+        payload = {
+            'uuid': 'test-uuid',
+            'name': 'episode_test',
+            'content': 'historical content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': 'session notes',
+            'temporal_context': 'retrospective',
+            'reference_time': ref_iso,
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+        call_kwargs = service.graphiti.add_episode.call_args[1]
+        assert call_kwargs.get('temporal_context') == 'retrospective'
+        assert call_kwargs.get('reference_time') == ref_expected
