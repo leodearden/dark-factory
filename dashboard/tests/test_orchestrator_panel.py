@@ -141,6 +141,32 @@ class TestOrchestratorRouteBasics:
             html = client.get('/partials/orchestrators').text
         assert 'Show tasks' in html
 
+    def test_table_wrapper_hidden_by_default(self, client):
+        """Task table wrapper must have style='display:none' so it is hidden
+        even before Alpine processes the element after an HTMX morph."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'style="display:none"' in html
+
+    def test_table_wrapper_has_x_cloak(self, client):
+        """Wrapper retains x-cloak for initial page load (non-HTMX) scenarios."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'x-cloak' in html
+
+    def test_table_wrapper_x_show_uses_store(self, client):
+        """x-show references $store.panels[key] so state persists across morphs."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # The x-show must use $store.panels, not local x-data state
+        assert "x-show=\"$store.panels[" in html
+
+    def test_button_x_text_uses_store(self, client):
+        """Button x-text expression uses $store.panels[key] for label toggling."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert "x-text=\"$store.panels[" in html
+
     def test_card_shows_single_pid_label(self, client):
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
