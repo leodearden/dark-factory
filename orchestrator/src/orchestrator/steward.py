@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
+from orchestrator.event_store import EventStore, EventType
 
 if TYPE_CHECKING:
     from escalation.models import Escalation
@@ -64,6 +65,7 @@ class TaskSteward:
         briefing: BriefingAssembler,
         usage_gate: UsageGate | None = None,
         config_dir: TaskConfigDir | None = None,
+        event_store: EventStore | None = None,
     ):
         self.task_id = task_id
         self.task = task
@@ -74,6 +76,7 @@ class TaskSteward:
         self.briefing = briefing
         self.usage_gate = usage_gate
         self._config_dir = config_dir
+        self.event_store = event_store
 
         self._session_id: str | None = None
         self._stopped = False
@@ -290,6 +293,20 @@ class TaskSteward:
             f'(success={result.success}, cost=${result.cost_usd:.2f}, '
             f'turns={result.turns})'
         )
+
+        if self.event_store:
+            self.event_store.emit(
+                EventType.invocation_end,
+                task_id=self.task_id, phase='escalated', role='steward',
+                cost_usd=result.cost_usd, duration_ms=result.duration_ms,
+                data={
+                    'turns': result.turns, 'success': result.success,
+                    'escalation_id': escalation.id,
+                    'category': escalation.category,
+                    'retry_count': retry_count,
+                    'account_name': result.account_name,
+                },
+            )
 
         # Patch resolution metadata
         self._patch_resolution_metadata(escalation.id, result)
