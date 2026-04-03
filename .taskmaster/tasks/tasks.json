@@ -7991,7 +7991,7 @@
         "description": "Mem0 search has silently regressed twice (Task 98, Task 401). Both times, all queries returned 0 results despite thousands of memories existing, and the issue was only discovered reactively.\n\nAdd a periodic health probe that:\n1. Runs a known-good search query against Mem0 (e.g., a query that should always return results for the dark_factory project)\n2. Alerts/logs a warning if 0 results are returned\n3. Can be integrated into the fused-memory server's health check or run as a separate periodic task\n\nThis should run on the fused-memory server side, not as a client-side check.\n\n## memory_hints\n- search: \"Mem0 search regression broken zero results\"\n- search: \"Task 98 Mem0 search fix\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -8027,7 +8027,8 @@
             "fused-memory/config",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-03T06:45:03.034Z"
       },
       {
         "id": "403",
@@ -8244,7 +8245,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T06:45:02.838Z",
+      "lastModified": "2026-04-03T06:45:03.034Z",
       "taskCount": 391,
       "completedCount": 373,
       "tags": [
