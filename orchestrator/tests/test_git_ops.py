@@ -262,8 +262,29 @@ class TestMergeConflicts:
         assert result_b.conflicts
         assert result_b.merge_worktree is not None
 
-        # Clean up the conflict worktree
-        await git_ops.cleanup_merge_worktree(result_b.merge_worktree)
+
+@pytest.mark.asyncio
+class TestHasUncommittedWork:
+    async def test_clean_worktree_returns_false(self, git_ops: GitOps):
+        wt, _ = await git_ops.create_worktree('clean-wt')
+        assert not await git_ops.has_uncommitted_work(wt)
+
+    async def test_untracked_file_returns_true(self, git_ops: GitOps):
+        wt, _ = await git_ops.create_worktree('untracked-wt')
+        (wt / 'new_file.py').write_text('x = 1\n')
+        assert await git_ops.has_uncommitted_work(wt)
+
+    async def test_modified_tracked_file_returns_true(self, git_ops: GitOps):
+        wt, _ = await git_ops.create_worktree('modified-wt')
+        (wt / 'README.md').write_text('# Changed\n')
+        assert await git_ops.has_uncommitted_work(wt)
+
+    async def test_file_only_in_task_dir_returns_false(self, git_ops: GitOps):
+        wt, _ = await git_ops.create_worktree('taskdir-wt')
+        task_dir = wt / '.task'
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / 'plan.json').write_text('{}')
+        assert not await git_ops.has_uncommitted_work(wt)
 
 
 @pytest.mark.asyncio

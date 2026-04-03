@@ -312,11 +312,26 @@ class TaskWorkflow:
                 and await self.git_ops.is_ancestor(wt_head, current_main)
             )
             if already_on_main and not self._worktree_external:
-                logger.info(
-                    f'Task {self.task_id}: worktree HEAD {wt_head[:8]} '
-                    f'already on main — skipping to DONE (prior merge survived)'
+                # Guard: a stale branch point (requeued task that was planned
+                # but never implemented) also satisfies is_ancestor.  Only
+                # skip if there's evidence of prior implementation work.
+                has_work = (
+                    self._has_prior_implementation()
+                    or await self.git_ops.has_uncommitted_work(self.worktree)
                 )
-            else:
+                if has_work:
+                    logger.info(
+                        f'Task {self.task_id}: worktree HEAD {wt_head[:8]} '
+                        f'already on main — skipping to DONE (prior merge survived)'
+                    )
+                else:
+                    logger.info(
+                        f'Task {self.task_id}: worktree HEAD {wt_head[:8]} '
+                        f'is ancestor of main but no prior implementation '
+                        f'— stale branch point, proceeding normally'
+                    )
+                    already_on_main = False
+            if not already_on_main or self._worktree_external:
                 # Normal path: EXECUTE + VERIFY + REVIEW loop (with escalation retry)
                 while True:
                     outcome = await self._execute_verify_review_loop()
@@ -358,6 +373,17 @@ class TaskWorkflow:
                     already_merged = await self.git_ops.is_ancestor(
                         branch_head.strip(), main_sha,
                     )
+
+                    # Defense-in-depth: same stale-branch-point guard as
+                    # the pre-EXECUTE check.  Should rarely fire since
+                    # we just ran execute, but guards against edge cases.
+                    if already_merged and not self._has_prior_implementation():
+                        logger.warning(
+                            f'Task {self.task_id}: branch appears merged at '
+                            f'merge phase but has no implementation entries '
+                            f'— proceeding with merge'
+                        )
+                        already_merged = False
 
                     if not already_merged:
                         # Phase 1: pre-merge rebase (no lock, no queue slot)
@@ -1290,6 +1316,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
         stdout, _ = await proc.communicate()
         return stdout.decode().strip()
+
+    def _has_prior_implementation(self) -> bool:
+        """Check whether a prior run did any implementation in this worktree.
+
+        Inspects .task/iterations.jsonl for implementer/debugger entries.
+        Planning-only runs don't write these, so absence means stale branch
+        point rather than a legitimately merged prior run.
+        """
+        if self.artifacts is None:
+            return False
+        entries, _ = self.artifacts.read_iteration_log()
+        return any(e.get('agent') in ('implementer', 'debugger') for e in entries)
 
     def _escalate_plan_overwrite(self) -> None:
         """Submit a blocking escalation when plan.json is overwritten by a foreign session."""

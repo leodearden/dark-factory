@@ -158,11 +158,19 @@ class MergeWorker:
         )
         main_sha = await self._git_ops.get_main_sha()
         if await self._git_ops.is_ancestor(branch_head.strip(), main_sha):
-            logger.info(
-                f'Task {req.task_id}: branch already on main — skipping merge'
-            )
-            self._emit_merge(req.task_id, 'already_merged')
-            return MergeOutcome('already_merged')
+            # Guard: if worktree has uncommitted changes, an agent may
+            # have started work — don't skip.
+            if await self._git_ops.has_uncommitted_work(req.worktree):
+                logger.warning(
+                    f'Task {req.task_id}: branch is ancestor of main but '
+                    f'worktree has uncommitted changes — not skipping merge'
+                )
+            else:
+                logger.info(
+                    f'Task {req.task_id}: branch already on main — skipping merge'
+                )
+                self._emit_merge(req.task_id, 'already_merged')
+                return MergeOutcome('already_merged')
 
         # 2. Merge in a temporary worktree
         merge_result = await self._git_ops.merge_to_main(

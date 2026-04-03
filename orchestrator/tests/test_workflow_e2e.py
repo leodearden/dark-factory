@@ -1596,3 +1596,92 @@ class TestReviewerErrors:
         assert outcome == WorkflowOutcome.DONE
         # robustness was called twice (initial fail + retry success)
         assert call_counts['reviewer_robustness'] == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests: Ghost-Loop Guard (stale worktree false positive)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGhostLoopGuard:
+    """Ghost-loop check must not skip when no implementation was done."""
+
+    async def test_stale_branch_point_proceeds_to_execute(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Reused worktree with no implementation entries → normal execution."""
+        # 1. Pre-create the worktree (simulates a prior run that planned but requeued)
+        wt, _ = await git_ops.create_worktree(task_assignment.task_id)
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
+
+        # 2. Advance main so the worktree HEAD becomes a stale ancestor
+        (config.project_root / 'other.py').write_text('x = 1\n')
+        from orchestrator.git_ops import _run
+        await _run(['git', 'add', '-A'], cwd=config.project_root)
+        await _run(['git', 'commit', '-m', 'Advance main'], cwd=config.project_root)
+
+        # 3. Build and run workflow — it should reuse the worktree and NOT skip
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        # The implementer MUST have been called (ghost-loop did not skip)
+        assert 'implementer' in stub.calls
+
+    async def test_legitimate_ghost_loop_skips_to_done(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Worktree with implementer iteration entry + HEAD on main → skip."""
+        # 1. Create worktree and simulate prior implementation
+        wt, _ = await git_ops.create_worktree(task_assignment.task_id)
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
+
+        # Write an implementer iteration log entry
+        import json as _json
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+
+        # Make an implementation commit on the branch
+        (wt / 'farewell.py').write_text('def farewell(name):\n    return f"Bye, {name}"\n')
+        await git_ops.commit(wt, 'Implement farewell')
+
+        # 2. Merge the branch into main so its HEAD becomes an ancestor
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # 3. Build and run workflow — should detect prior merge and skip
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        # The implementer must NOT have been called (ghost-loop skipped)
+        assert 'implementer' not in stub.calls

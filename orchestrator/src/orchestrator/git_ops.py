@@ -372,6 +372,14 @@ class GitOps:
         )
         return rc == 0
 
+    async def has_uncommitted_work(self, worktree: Path) -> bool:
+        """Return True if worktree has staged or unstaged changes outside .task/."""
+        rc, output, _ = await _run(
+            ['git', 'status', '--porcelain', '--', '.', ':!.task'],
+            cwd=worktree,
+        )
+        return rc == 0 and bool(output.strip())
+
     async def get_changed_files(self, from_sha: str, to_sha: str) -> list[str]:
         """Return list of files changed between two commits."""
         _, output, _ = await _run(
