@@ -8,6 +8,7 @@ import logging
 from dataclasses import dataclass
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp_lifecycle import mcp_call
 from orchestrator.task_status import TERMINAL_STATUSES, is_valid_transition
 
@@ -153,9 +154,10 @@ class ModuleLockTable:
 class Scheduler:
     """Selects next eligible task and manages module locks."""
 
-    def __init__(self, config: OrchestratorConfig):
+    def __init__(self, config: OrchestratorConfig, event_store: EventStore | None = None):
         self.config = config
         self.lock_table = ModuleLockTable(config)
+        self.event_store = event_store
         self._dispatched: set[str] = set()
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
@@ -345,6 +347,12 @@ class Scheduler:
             task_id = str(task.get('id', ''))
             if self.lock_table.try_acquire(task_id, modules):
                 self._dispatched.add(task_id)
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.lock_acquired,
+                        task_id=task_id,
+                        data={'modules': modules},
+                    )
                 return TaskAssignment(task_id=task_id, task=task, modules=modules)
 
         return None
@@ -391,7 +399,14 @@ class Scheduler:
     def release(self, task_id: str) -> None:
         """Release all module locks for a task and clear dispatch guard."""
         self._dispatched.discard(task_id)
+        modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
+        if self.event_store and modules:
+            self.event_store.emit(
+                EventType.lock_released,
+                task_id=task_id,
+                data={'modules': modules},
+            )
 
     def _get_modules(self, task: dict) -> list[str]:
         """Extract module list from task metadata, normalized for locking.

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from shared.config_dir import TaskConfigDir
 
 from orchestrator.agents.invoke import AgentResult, invoke_with_cap_retry
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.agents.roles import (
     ALL_REVIEWERS,
     ARCHITECT,
@@ -137,6 +138,7 @@ class TaskWorkflow:
         initial_plan: dict | None = None,
         steward_factory=None,
         merge_queue: asyncio.Queue | None = None,
+        event_store: EventStore | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -145,8 +147,10 @@ class TaskWorkflow:
         self.briefing = briefing
         self.mcp = mcp
         self.merge_queue = merge_queue
+        self.event_store = event_store
 
         self.state = WorkflowState.PLAN
+        self._phase_cost_at_entry: float = 0.0
         self.task = assignment.task
         self.task_id = assignment.task_id
         self.modules = list(assignment.modules)
@@ -179,6 +183,24 @@ class TaskWorkflow:
         """Return the file list from the current plan, or None if unavailable/empty."""
         files = self.plan.get('files', [])
         return files if files else None
+
+    def _enter_phase(self, new_state: WorkflowState) -> None:
+        """Transition to a new workflow phase, emitting events."""
+        if self.event_store:
+            prev = self.state
+            if prev not in (WorkflowState.DONE, WorkflowState.BLOCKED):
+                cost_delta = self.metrics.total_cost_usd - self._phase_cost_at_entry
+                self.event_store.emit(
+                    EventType.phase_exit,
+                    task_id=self.task_id, phase=prev.value,
+                    cost_usd=cost_delta,
+                )
+            self.event_store.emit(
+                EventType.phase_enter,
+                task_id=self.task_id, phase=new_state.value,
+            )
+        self._phase_cost_at_entry = self.metrics.total_cost_usd
+        self.state = new_state
 
     async def run(self) -> WorkflowOutcome:
         """Execute the full state machine."""
@@ -259,11 +281,17 @@ class TaskWorkflow:
                     f'({len(self.plan.get("steps", []))} steps)'
                 )
             else:
-                self.state = WorkflowState.PLAN
+                self._enter_phase(WorkflowState.PLAN)
                 plan_outcome = await self._plan()
                 if plan_outcome == WorkflowOutcome.REQUEUED:
                     return WorkflowOutcome.REQUEUED
                 if plan_outcome == WorkflowOutcome.BLOCKED:
+                    if self.event_store:
+                        self.event_store.emit(
+                            EventType.waste_detected,
+                            task_id=self.task_id, phase='plan',
+                            data={'waste_type': 'replan_after_failure'},
+                        )
                     return await self._mark_blocked('Planning failed')
 
             # ── Ghost-loop early exit (before EXECUTE) ─────────────
@@ -293,7 +321,7 @@ class TaskWorkflow:
                 while True:
                     outcome = await self._execute_verify_review_loop()
                     if outcome == WorkflowOutcome.ESCALATED:
-                        self.state = WorkflowState.ESCALATED
+                        self._enter_phase(WorkflowState.ESCALATED)
                         await self._ensure_steward_started()
                         logger.info(f'Task {self.task_id}: waiting for escalation resolution')
                         try:
@@ -318,7 +346,7 @@ class TaskWorkflow:
 
                 # MERGE (skip for eval mode — no merge into main)
                 if not self._worktree_external:
-                    self.state = WorkflowState.MERGE
+                    self._enter_phase(WorkflowState.MERGE)
 
                     # Ghost-loop early exit: if branch is already on main,
                     # skip the entire merge phase (prevents infinite retry
@@ -349,6 +377,15 @@ class TaskWorkflow:
                                     f'Task {self.task_id}: post-rebase verification '
                                     f'failed: {verify.summary}'
                                 )
+                                if self.event_store:
+                                    self.event_store.emit(
+                                        EventType.waste_detected,
+                                        task_id=self.task_id, phase='merge',
+                                        data={
+                                            'waste_type': 'post_rebase_verify_fail',
+                                            'summary': verify.summary[:200],
+                                        },
+                                    )
                                 break
                             main_after = await self.git_ops.get_main_sha()
                             if main_before == main_after:
@@ -384,7 +421,7 @@ class TaskWorkflow:
             # Wait for steward to finish any pending work (suggestion triage, etc.)
             await self._ensure_steward_started()
             await self._await_steward_completion()
-            self.state = WorkflowState.DONE
+            self._enter_phase(WorkflowState.DONE)
             await self.scheduler.set_task_status(self.task_id, 'done')
             logger.info(
                 f'Task {self.task_id} DONE — '
@@ -563,7 +600,7 @@ class TaskWorkflow:
 
         while True:
             # EXECUTE
-            self.state = WorkflowState.EXECUTE
+            self._enter_phase(WorkflowState.EXECUTE)
             exec_outcome = await self._execute_iterations()
             if exec_outcome == WorkflowOutcome.ESCALATED:
                 return WorkflowOutcome.ESCALATED
@@ -571,7 +608,7 @@ class TaskWorkflow:
                 return await self._mark_blocked('Execution iterations exhausted')
 
             # VERIFY + DEBUGFIX loop
-            self.state = WorkflowState.VERIFY
+            self._enter_phase(WorkflowState.VERIFY)
             verify_outcome = await self._verify_debugfix_loop()
             if verify_outcome == WorkflowOutcome.ESCALATED:
                 return WorkflowOutcome.ESCALATED
@@ -579,7 +616,7 @@ class TaskWorkflow:
                 return await self._mark_blocked('Verification attempts exhausted')
 
             # REVIEW
-            self.state = WorkflowState.REVIEW
+            self._enter_phase(WorkflowState.REVIEW)
             reviews = await self._review()
             if reviews.reviewer_errors:
                 names = ', '.join(reviews.reviewer_errors)
@@ -1169,10 +1206,37 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         self.metrics.agent_invocations += 1
 
         logger.info(
-            f'Task {self.task_id} [{role.name}]: '
-            f'success={result.success} cost=${result.cost_usd:.2f} '
-            f'turns={result.turns} timeout={timeout_val:.0f}s'
+            'Task %s [%s]: success=%s cost=$%.2f turns=%d timeout=%.0fs',
+            self.task_id, role.name, result.success, result.cost_usd,
+            result.turns, timeout_val,
+            extra={
+                'task_id': self.task_id, 'role': role.name, 'model': model,
+                'cost_usd': result.cost_usd, 'turns': result.turns,
+                'input_tokens': result.input_tokens,
+                'output_tokens': result.output_tokens,
+            },
         )
+
+        if self.event_store:
+            self.event_store.emit(
+                EventType.invocation_end,
+                task_id=self.task_id,
+                phase=self.state.value,
+                role=role.name,
+                cost_usd=result.cost_usd,
+                duration_ms=result.duration_ms,
+                data={
+                    'turns': result.turns,
+                    'success': result.success,
+                    'subtype': result.subtype,
+                    'model': model,
+                    'account_name': result.account_name,
+                    'input_tokens': result.input_tokens,
+                    'output_tokens': result.output_tokens,
+                    'cache_read_tokens': result.cache_read_tokens,
+                    'cache_create_tokens': result.cache_create_tokens,
+                },
+            )
 
         return result
 
@@ -1254,6 +1318,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             workflow_state=self.state.value,
         )
         self.escalation_queue.submit(esc)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=self.task_id, phase=self.state.value,
+                data={'escalation_id': esc.id, 'category': esc.category,
+                      'severity': esc.severity, 'summary': summary[:200]},
+            )
 
     def _escalate_corruption(self, corrupted: list[str]) -> None:
         """Submit an info-severity escalation for corrupted iteration log lines."""
@@ -1297,7 +1368,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 self.task_id, reason,
             )
             return WorkflowOutcome.DONE
-        self.state = WorkflowState.BLOCKED
+        self._enter_phase(WorkflowState.BLOCKED)
         await self.scheduler.set_task_status(self.task_id, 'blocked')
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
 
@@ -1344,6 +1415,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 )
                 self.escalation_queue.submit(esc)
 
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.escalation_created,
+                        task_id=self.task_id, phase=self.state.value,
+                        data={'escalation_id': esc.id, 'category': 'task_failure',
+                              'severity': 'blocking', 'summary': reason[:200]},
+                    )
+
             # Give the steward a chance to resolve the escalation
             await self._ensure_steward_started()
             if self._steward:
@@ -1355,6 +1434,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     self.task_id, status='pending', level=0,
                 )
                 if not remaining:
+                    if self.event_store:
+                        self.event_store.emit(
+                            EventType.escalation_resolved,
+                            task_id=self.task_id, phase=self.state.value,
+                            data={'outcome': 'requeued'},
+                        )
                     await self.scheduler.set_task_status(self.task_id, 'pending')
                     logger.info(
                         f'Task {self.task_id}: steward resolved blocking '
@@ -1496,6 +1581,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             workflow_state=self.state.value,
         )
         self.escalation_queue.submit(esc)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=self.task_id, phase=self.state.value,
+                data={'escalation_id': esc.id, 'category': 'review_suggestions',
+                      'severity': 'info', 'count': len(suggestions)},
+            )
         logger.info(
             f'Task {self.task_id}: submitted {len(suggestions)} suggestions '
             f'for steward triage ({esc.id})'
@@ -1528,6 +1620,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             workflow_state=self.state.value,
         )
         self.escalation_queue.submit(esc)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=self.task_id, phase=self.state.value,
+                data={'escalation_id': esc.id, 'category': 'review_issues',
+                      'severity': 'blocking', 'n_blocking': n_blocking,
+                      'n_suggestions': n_suggestions},
+            )
         logger.info(
             f'Task {self.task_id}: escalated {n_blocking} review issues '
             f'to steward ({esc.id})'
