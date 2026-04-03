@@ -2624,13 +2624,13 @@
         "description": "Graphiti entity summaries accumulate stale and duplicated lines over time as new edges are added. This is a systemic issue (observed across reify entities for M5, M5 decomposition, M5 types, Task 139, Task 147, and others with recurrence >= 4). Entity summaries should be periodically rebuilt or deduplicated to reflect only current, non-invalidated edge facts.\n\nAcceptance criteria:\n1. Identify the Graphiti entity summary update path and understand why stale/duplicate lines persist\n2. Implement a mechanism to rebuild entity summaries from current valid edges (either on-write dedup or periodic batch rebuild)\n3. Expose this as a fused-memory management operation (e.g. rebuild_entity_summaries) \n4. Validate against known affected entities (reify project: M5, M5 decomposition, M5 types)\n\nmemory_hints:\n- entities: [\"M5\", \"M5 decomposition\", \"M5 types\", \"Task 139\"]\n- search queries: [\"entity summary accumulation stale\", \"Graphiti entity summary rebuild\"]",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [
           "382"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-03T10:29:48.633Z",
+        "updatedAt": "2026-04-03T12:23:48.024Z",
         "metadata": {
           "files": [
             "fused-memory/src/fused_memory/backends/graphiti_client.py",
@@ -2988,11 +2988,11 @@
         "description": "Regression: The orchestrator card renders the task table visible on load but the toggle button says \"Show tasks\". Clicking toggles to \"Hide tasks\" (still visible), then a second click hides the table correctly. On HTMX refresh (every 10s), state resets to the broken initial state. The Alpine x-data state is lost on morph.",
         "details": "Files: dashboard/src/dashboard/templates/partials/orchestrators.html.\n\nTwo issues: (1) Initial Alpine state should default to table hidden (x-show with open:false, but the table HTML is not wrapped in x-show or the logic is inverted). (2) Alpine state resets on every HTMX morph because Idiomorph replaces the x-data element, losing the toggled state. Fix: use Alpine.store('panels') which persists across morphs, or use hx-swap=\"morph:outerHTML\" which Idiomorph handles better for preserving Alpine state.\n\nmemory_hint: search \"Alpine state HTMX morph\" for prior patterns.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-03T10:29:48.512Z",
+        "updatedAt": "2026-04-03T12:23:48.067Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/orchestrators.html",
@@ -8355,7 +8355,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T12:23:47.977Z",
+      "lastModified": "2026-04-03T12:23:48.067Z",
       "taskCount": 396,
       "completedCount": 381,
       "tags": [
