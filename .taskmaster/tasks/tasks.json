@@ -2992,7 +2992,7 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-03T13:52:27.533Z",
+        "updatedAt": "2026-04-03T13:52:27.930Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/orchestrators.html",
@@ -8362,7 +8362,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T13:52:27.689Z",
+      "lastModified": "2026-04-03T13:52:27.930Z",
       "taskCount": 396,
       "completedCount": 384,
       "tags": [
