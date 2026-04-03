@@ -467,7 +467,7 @@ class GraphitiBackend:
         cypher = (
             'MATCH (n:Entity)-[e:RELATES_TO]-() '
             'WHERE e.invalid_at IS NULL '
-            'RETURN n.uuid, DISTINCT e.uuid, e.fact, e.name'
+            'RETURN n.uuid, e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher)
         grouped: dict[str, list[dict]] = {}
