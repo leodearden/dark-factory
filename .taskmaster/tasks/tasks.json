@@ -8148,10 +8148,11 @@
         "description": "Remove extra blank line between get_task_summary and _extract_status in task_interceptor.py (3 blank lines -> 2). Update stale TDD docstring in TestTaskmasterBackendGetTasksSignature in test_task_utils.py.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-03T06:36:20.279Z"
       },
       {
         "id": "408",
@@ -8213,7 +8214,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T06:36:20.197Z",
+      "lastModified": "2026-04-03T06:36:20.279Z",
       "taskCount": 391,
       "completedCount": 370,
       "tags": [
