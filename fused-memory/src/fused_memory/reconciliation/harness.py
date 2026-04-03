@@ -108,6 +108,30 @@ class ReconciliationHarness:
         # Escalation support
         self._escalation_queue: EscalationQueue | None = None
         self._escalation_task: asyncio.Task | None = None
+        self._escalation_url: str | None = None
+
+        # Per-project concurrent loops
+        self._project_tasks: dict[str, asyncio.Task] = {}
+
+    def _make_stages(self) -> list:
+        """Create a fresh set of stage instances for one reconciliation cycle."""
+        stage1 = MemoryConsolidator(
+            StageId.memory_consolidator, self.memory, self.taskmaster, self.journal,
+            self.config, usage_gate=self.usage_gate,
+        )
+        stage2 = TaskKnowledgeSync(
+            StageId.task_knowledge_sync, self.memory, self.taskmaster, self.journal,
+            self.config, usage_gate=self.usage_gate,
+        )
+        stage3 = IntegrityCheck(
+            StageId.integrity_check, self.memory, self.taskmaster, self.journal,
+            self.config, usage_gate=self.usage_gate,
+        )
+        stages = [stage1, stage2, stage3]
+        if self._escalation_url:
+            for s in stages:
+                s._escalation_url = self._escalation_url
+        return stages
 
     # ── Stale-run recovery ─────────────────────────────────────────────
 
@@ -181,8 +205,9 @@ class ReconciliationHarness:
         logger.info(f'Reconciliation escalation server starting on {host}:{port}')
         await asyncio.sleep(0.5)
 
-        # Set escalation URL on all stages
+        # Store escalation URL for _make_stages() and set on existing stages
         escalation_url = f'http://{host}:{port}/mcp'
+        self._escalation_url = escalation_url
         for stage in self.stages:
             stage._escalation_url = escalation_url
 
@@ -242,7 +267,7 @@ class ReconciliationHarness:
     # ── Main loop ──────────────────────────────────────────────────────
 
     async def run_loop(self) -> None:
-        """Background loop — check trigger conditions, run pipeline when needed."""
+        """Management loop — discover active projects, spawn per-project loops."""
         logger.info('Reconciliation harness background loop started')
         if self.usage_gate:
             await self.usage_gate.check_at_startup()
@@ -253,65 +278,27 @@ class ReconciliationHarness:
         try:
             while True:
                 try:
-                    # Recover stale runs each iteration
                     await self._recover_stale_runs()
 
+                    # Discover active projects, spawn loops for new ones
                     for project_id in await self.buffer.get_active_projects():
-                        should, reason = await self.buffer.should_trigger(project_id)
-                        if should:
-                            acquired = await self.buffer.mark_run_active(project_id)
-                            if acquired:
-                                # Skip cycle for halted projects
-                                if self.judge and self.judge.is_halted(project_id):
-                                    logger.warning(
-                                        f'Skipping cycle for halted project {project_id}'
-                                    )
-                                    await self.buffer.mark_run_complete(project_id)
-                                    await self._replay_deferred_writes(project_id)
-                                    continue
+                        existing = self._project_tasks.get(project_id)
+                        if existing is None or existing.done():
+                            task = asyncio.create_task(
+                                self._project_loop(project_id),
+                                name=f'recon-{project_id}',
+                            )
+                            self._project_tasks[project_id] = task
 
-                                # Select tier before draining
-                                tier = await self._select_tier(project_id)
-
-                                # Check if backlog iteration is needed
-                                iterator = BacklogIterator(
-                                    self.config, self.journal, self.buffer, self,
+                    # Reap completed tasks, log unexpected failures
+                    for pid in list(self._project_tasks):
+                        task = self._project_tasks[pid]
+                        if task.done():
+                            del self._project_tasks[pid]
+                            if not task.cancelled() and task.exception():
+                                logger.error(
+                                    f'Project loop for {pid} crashed: {task.exception()}'
                                 )
-                                if await iterator.should_iterate(project_id):
-                                    heartbeat_task = asyncio.create_task(
-                                        self._heartbeat_loop(project_id)
-                                    )
-                                    try:
-                                        await iterator.run(project_id)
-                                    finally:
-                                        heartbeat_task.cancel()
-                                        with suppress(asyncio.CancelledError):
-                                            await heartbeat_task
-                                        await self.buffer.mark_run_complete(project_id)
-                                        await self._replay_deferred_writes(project_id)
-                                else:
-                                    heartbeat_task = asyncio.create_task(
-                                        self._heartbeat_loop(project_id)
-                                    )
-                                    try:
-                                        await asyncio.wait_for(
-                                            self.run_full_cycle(
-                                                project_id, reason, tier=tier,
-                                            ),
-                                            timeout=self.config.cycle_timeout_seconds,
-                                        )
-                                    except TimeoutError:
-                                        logger.error(
-                                            f'Full cycle timed out after '
-                                            f'{self.config.cycle_timeout_seconds}s for {project_id}'
-                                        )
-                                        await self.buffer.restore_drained(project_id)
-                                    finally:
-                                        heartbeat_task.cancel()
-                                        with suppress(asyncio.CancelledError):
-                                            await heartbeat_task
-                                        await self.buffer.mark_run_complete(project_id)
-                                        await self._replay_deferred_writes(project_id)
 
                     # Periodic cleanup of drained events (~every 50s / 10 iterations)
                     loop_count += 1
@@ -327,7 +314,74 @@ class ReconciliationHarness:
                     logger.error(f'Reconciliation loop error: {e}')
                 await asyncio.sleep(5)
         finally:
+            # Graceful shutdown: cancel all project loops
+            for task in self._project_tasks.values():
+                task.cancel()
+            if self._project_tasks:
+                await asyncio.gather(
+                    *self._project_tasks.values(), return_exceptions=True,
+                )
+            self._project_tasks.clear()
             await self._stop_escalation_server()
+
+    async def _project_loop(self, project_id: str) -> None:
+        """Independent reconciliation loop for a single project."""
+        logger.info(f'Project reconciliation loop started for {project_id}')
+        idle_ticks = 0
+        while True:
+            try:
+                should, reason = await self.buffer.should_trigger(project_id)
+                if not should:
+                    idle_ticks += 1
+                    if idle_ticks > 12:  # ~60s idle → exit, respawn on demand
+                        logger.debug(f'Project loop idle exit for {project_id}')
+                        return
+                    await asyncio.sleep(5)
+                    continue
+
+                idle_ticks = 0
+                acquired = await self.buffer.mark_run_active(project_id)
+                if not acquired:
+                    await asyncio.sleep(5)
+                    continue
+
+                # Halt check
+                if self.judge and self.judge.is_halted(project_id):
+                    logger.warning(f'Skipping cycle for halted project {project_id}')
+                    await self.buffer.mark_run_complete(project_id)
+                    await self._replay_deferred_writes(project_id)
+                    return  # Don't keep spinning on a halted project
+
+                tier = await self._select_tier(project_id)
+                iterator = BacklogIterator(self.config, self.journal, self.buffer, self)
+                heartbeat_task = asyncio.create_task(self._heartbeat_loop(project_id))
+                try:
+                    if await iterator.should_iterate(project_id):
+                        await iterator.run(project_id)
+                    else:
+                        await asyncio.wait_for(
+                            self.run_full_cycle(project_id, reason, tier=tier),
+                            timeout=self.config.cycle_timeout_seconds,
+                        )
+                except TimeoutError:
+                    logger.error(
+                        f'Full cycle timed out after '
+                        f'{self.config.cycle_timeout_seconds}s for {project_id}'
+                    )
+                    await self.buffer.restore_drained(project_id)
+                finally:
+                    heartbeat_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await heartbeat_task
+                    await self.buffer.mark_run_complete(project_id)
+                    await self._replay_deferred_writes(project_id)
+
+            except asyncio.CancelledError:
+                raise  # Propagate shutdown
+            except Exception as e:
+                logger.error(f'Project loop error for {project_id}: {e}')
+
+            await asyncio.sleep(5)  # Cooldown between cycles
 
     async def _heartbeat_loop(self, project_id: str) -> None:
         """Keep the reconciliation lock alive while a run is in progress."""
@@ -411,9 +465,10 @@ class ReconciliationHarness:
 
         current_stage_name: str | None = None
         cycle_start_time = datetime.now(UTC)
+        stages = self._make_stages()
         try:
             reports = []
-            for stage in self.stages:
+            for stage in stages:
                 current_stage_name = stage.stage_id.value
                 stage.project_id = project_id
                 stage.project_root = project_root
@@ -515,11 +570,6 @@ class ReconciliationHarness:
             raise
         finally:
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
-            # Reset stage state to prevent leaking into next cycle
-            for stage in self.stages:
-                if isinstance(stage, MemoryConsolidator):
-                    stage.prior_s3_findings = None
-                    stage.cycle_fence_time = None
 
     # ── Remediation support ───────────────────────────────────────────
 
@@ -629,10 +679,11 @@ class ReconciliationHarness:
         )
 
         current_stage_name: str | None = None
+        stages = self._make_stages()
         try:
             # Configure stages for remediation mode
-            stage1 = self.stages[0]
-            stage2 = self.stages[1]
+            stage1 = stages[0]
+            stage2 = stages[1]
             assert isinstance(stage1, MemoryConsolidator)
             assert isinstance(stage2, TaskKnowledgeSync)
             stage1.remediation_findings = findings
@@ -640,7 +691,7 @@ class ReconciliationHarness:
 
             watermark = await self.journal.get_watermark(project_id)
             reports = []
-            for stage in self.stages:
+            for stage in stages:
                 current_stage_name = stage.stage_id.value
                 stage.project_id = project_id
                 stage.project_root = project_root
@@ -703,13 +754,6 @@ class ReconciliationHarness:
 
         finally:
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
-            # Reset stage state to prevent leaking into next cycle
-            for stage in self.stages:
-                if isinstance(stage, MemoryConsolidator):
-                    stage.remediation_findings = None
-                    stage.prior_s3_findings = None
-                if isinstance(stage, TaskKnowledgeSync):
-                    stage.remediation_mode = False
 
 
 # ── Backlog iteration ──────────────────────────────────────────────────

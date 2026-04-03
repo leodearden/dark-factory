@@ -144,6 +144,7 @@ async def test_run_full_cycle_restores_events_on_failure(journal, event_buffer, 
         event_buffer=event_buffer,
         config=config,
     )
+    harness._make_stages = lambda: harness.stages
 
     # Make first stage raise
     harness.stages[0].run = AsyncMock(side_effect=RuntimeError('stage exploded'))
@@ -203,6 +204,7 @@ async def test_full_cycle_extracts_project_root_from_events(journal, event_buffe
         event_buffer=event_buffer,
         config=config,
     )
+    harness._make_stages = lambda: harness.stages
 
     # Mock each stage's run method and capture the stage state
     captured_stages = []
@@ -285,13 +287,16 @@ def _make_test_harness(journal, event_buffer, mock_memory_service):
         )
     )
 
-    return ReconciliationHarness(
+    harness = ReconciliationHarness(
         memory_service=mock_memory_service,
         taskmaster=AsyncMock(),
         journal=journal,
         event_buffer=event_buffer,
         config=config,
     )
+    # Patch _make_stages so tests that mock harness.stages[N].run still work
+    harness._make_stages = lambda: harness.stages
+    return harness
 
 
 def _mock_stage_run(stage, items_flagged=None, before_return=None, capture_call_args=None):
@@ -701,28 +706,43 @@ async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_ser
 
 
 @pytest.mark.asyncio
-async def test_stage_state_reset_after_remediation(journal, event_buffer, mock_memory_service):
-    """Stage state (remediation_findings, remediation_mode) is reset after remediation."""
+async def test_make_stages_returns_clean_instances(journal, event_buffer, mock_memory_service):
+    """_make_stages() returns fresh stage instances with no leftover per-run state.
+
+    Previously, shared stages needed explicit cleanup after remediation.  Now each
+    run_full_cycle and _run_remediation_pass creates its own stages via _make_stages(),
+    so no cleanup is needed — fresh instances are always clean.
+    """
+    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+    from fused_memory.reconciliation.harness import ReconciliationHarness
     from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
     from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    config = FusedMemoryConfig(
+        reconciliation=ReconciliationConfig(
+            enabled=True,
+            explore_codebase_root='/tmp/test',
+            agent_llm_provider='anthropic',
+            agent_llm_model='claude-sonnet-4-20250514',
+        )
+    )
+    harness = ReconciliationHarness(
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        journal=journal,
+        event_buffer=event_buffer,
+        config=config,
+    )
 
-    await event_buffer.push(_make_event())
-
-    _mock_stage_run(harness.stages[0])
-    _mock_stage_run(harness.stages[1])
-    _mock_stage_run(harness.stages[2], items_flagged=_make_s3_findings())
-
-    await harness.run_full_cycle('test-project', 'buffer_size:1')
-
-    # Verify state was cleaned up
-    stage1 = harness.stages[0]
-    stage2 = harness.stages[1]
+    stages = harness._make_stages()
+    stage1 = stages[0]
+    stage2 = stages[1]
     assert isinstance(stage1, MemoryConsolidator)
     assert isinstance(stage2, TaskKnowledgeSync)
     assert stage1.remediation_findings is None
     assert stage1.prior_s3_findings is None
+    assert stage1.cycle_fence_time is None
+    assert stage1.assembled_payload is None
     assert stage2.remediation_mode is False
 
 
