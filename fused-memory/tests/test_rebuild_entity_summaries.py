@@ -622,3 +622,66 @@ class TestRebuildSummariesManager:
         assert result.stale_entities == 3
         assert result.rebuilt == 3
         assert len(result.details) == 1
+
+
+# ---------------------------------------------------------------------------
+# N+1 fix step-5: GraphitiBackend.get_all_valid_edges (bulk fetch)
+# ---------------------------------------------------------------------------
+
+class TestGetAllValidEdges:
+    """GraphitiBackend.get_all_valid_edges() bulk-fetches all valid edges, grouped by entity."""
+
+    @pytest.mark.asyncio
+    async def test_groups_edges_by_entity_uuid(self, mock_config, make_backend, make_graph_mock):
+        """Returns dict keyed by entity uuid; each value is a list of edge dicts."""
+        backend = make_backend(mock_config)
+        rows = [
+            ['node-1', 'e1', 'factA', 'edge1'],
+            ['node-1', 'e2', 'factB', 'edge2'],
+            ['node-2', 'e3', 'factC', 'edge3'],
+        ]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert set(result.keys()) == {'node-1', 'node-2'}
+        assert len(result['node-1']) == 2
+        assert {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'} in result['node-1']
+        assert {'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'} in result['node-1']
+        assert result['node-2'] == [{'uuid': 'e3', 'fact': 'factC', 'name': 'edge3'}]
+
+    @pytest.mark.asyncio
+    async def test_empty_graph_returns_empty_dict(self, mock_config, make_backend, make_graph_mock):
+        """Returns empty dict when no valid edges exist."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """Uses ro_query (read-only) — graph.query must NOT be called."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_all_valid_edges(group_id='test')
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cypher_filters_invalid_at_is_null(self, mock_config, make_backend, make_graph_mock):
+        """Cypher query includes 'invalid_at IS NULL' to exclude invalidated edges."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_all_valid_edges(group_id='test')
+        call_args = graph.ro_query.call_args
+        cypher = call_args[0][0] if call_args[0] else call_args[1].get('q', '')
+        assert 'invalid_at IS NULL' in cypher
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        """Raises RuntimeError when backend not initialized."""
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.get_all_valid_edges(group_id='test')
