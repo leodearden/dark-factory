@@ -549,19 +549,26 @@ class TaskWorkflow:
         """Invoke the architect to produce a plan."""
         assert self.worktree is not None and self.artifacts is not None
 
-        # Defense-in-depth: if plan.lock already exists, this is a duplicate workflow.
-        # Return REQUEUED so run() exits immediately — the original lock-holder retains
-        # ownership. Do NOT re-stamp provenance (that would hijack the first workflow's
-        # session_id and cause its validate_plan_owner() checks to fail).
+        # Defense-in-depth: if plan.lock already exists, check if it's stale.
+        # If stale (self-lock from crashed session or age exceeds threshold),
+        # clear it and proceed with fresh planning. If held by an active session,
+        # requeue to avoid duplicate execution.
         if self.artifacts.is_plan_locked() and self.artifacts.read_plan():
-            lock_data = self.artifacts.read_plan_lock()
-            lock_owner = lock_data.get('session_id', 'unknown') if lock_data else 'unknown'
-            logger.info(
-                f'Task {self.task_id}: plan.lock is held by session {lock_owner!r}, '
-                f'skipping architect — requeuing to avoid duplicate execution'
-            )
-            await self.scheduler.set_task_status(self.task_id, 'pending')
-            return WorkflowOutcome.REQUEUED
+            cleared = self.artifacts.clear_stale_plan_lock(self.task_id)
+            if not cleared:
+                lock_data = self.artifacts.read_plan_lock()
+                lock_owner = lock_data.get('session_id', 'unknown') if lock_data else 'unknown'
+                logger.info(
+                    f'Task {self.task_id}: plan.lock is held by session {lock_owner!r}, '
+                    f'skipping architect — requeuing to avoid duplicate execution'
+                )
+                await self.scheduler.set_task_status(self.task_id, 'pending')
+                return WorkflowOutcome.REQUEUED
+            # Lock was stale and cleared — remove the stale plan so architect
+            # creates a fresh one
+            plan_path = self.artifacts.root / 'plan.json'
+            if plan_path.exists():
+                plan_path.unlink()
 
         prompt = await self.briefing.build_architect_prompt(self.task, worktree=self.worktree)
         result = await self._invoke(ARCHITECT, prompt, self.worktree)

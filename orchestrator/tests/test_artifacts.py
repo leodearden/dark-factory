@@ -284,6 +284,52 @@ class TestPlanProvenance:
             plan_path.chmod(0o644)
 
 
+class TestStalePlanLock:
+    """Tests for stale plan.lock detection and cleanup."""
+
+    def _create_lock(self, artifacts: TaskArtifacts, session_id: str, locked_at: str):
+        lock_path = artifacts.root / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': session_id,
+            'locked_at': locked_at,
+        }))
+
+    def test_self_lock_cleared(self, artifacts: TaskArtifacts):
+        """Lock from a prior session of the same task (matching task_id prefix) is cleared."""
+        self._create_lock(artifacts, 'task-1-abcd1234', '2026-04-03T12:00:00+00:00')
+        result = artifacts.clear_stale_plan_lock('task-1')
+        assert result is True
+        assert not (artifacts.root / 'plan.lock').exists()
+
+    def test_recent_foreign_lock_preserved(self, artifacts: TaskArtifacts):
+        """Lock from a different task with recent timestamp is NOT cleared."""
+        from datetime import UTC, datetime
+        recent = datetime.now(UTC).isoformat()
+        self._create_lock(artifacts, 'task-99-ffff0000', recent)
+        result = artifacts.clear_stale_plan_lock('task-1')
+        assert result is False
+        assert (artifacts.root / 'plan.lock').exists()
+
+    def test_old_foreign_lock_cleared(self, artifacts: TaskArtifacts):
+        """Lock from a different task with old timestamp IS cleared."""
+        self._create_lock(artifacts, 'task-99-ffff0000', '2025-01-01T00:00:00+00:00')
+        result = artifacts.clear_stale_plan_lock('task-1', stale_threshold_secs=600.0)
+        assert result is True
+        assert not (artifacts.root / 'plan.lock').exists()
+
+    def test_no_lock_returns_false(self, artifacts: TaskArtifacts):
+        """No lock file → returns False."""
+        result = artifacts.clear_stale_plan_lock('task-1')
+        assert result is False
+
+    def test_unparseable_timestamp_cleared(self, artifacts: TaskArtifacts):
+        """Lock with garbage timestamp is treated as stale and cleared."""
+        self._create_lock(artifacts, 'task-99-ffff0000', 'not-a-timestamp')
+        result = artifacts.clear_stale_plan_lock('task-1')
+        assert result is True
+        assert not (artifacts.root / 'plan.lock').exists()
+
+
 class TestPlanLock:
     def test_is_plan_locked_false_initially(self, artifacts: TaskArtifacts):
         assert artifacts.is_plan_locked() is False

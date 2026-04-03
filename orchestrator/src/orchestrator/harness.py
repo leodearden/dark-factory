@@ -636,6 +636,11 @@ Output JSON matching the schema. Every task must appear in the output.
                 f'{len(completed)}/{total} steps done — storing for resumption'
             )
             self._recovered_plans[task_id] = plan
+            # Clear stale plan.lock so the new session doesn't immediately requeue
+            lock_path = entry / '.task' / 'plan.lock'
+            if lock_path.exists():
+                lock_path.unlink()
+                logger.info(f'Recovery: cleared stale plan.lock for task {task_id}')
             recovered += 1
 
         # Reset in-progress tasks to pending
@@ -658,6 +663,7 @@ Output JSON matching the schema. Every task must appear in the output.
         self, assignment, sem: asyncio.Semaphore
     ) -> TaskReport | None:
         """Run a single workflow slot."""
+        report = None
         try:
             logger.info(
                 f'Starting workflow for task {assignment.task_id}: '
@@ -766,7 +772,8 @@ Output JSON matching the schema. Every task must appear in the output.
             )
         finally:
             self._escalation_events.pop(assignment.task_id, None)
-            self.scheduler.release(assignment.task_id)
+            requeued = report is not None and report.outcome == WorkflowOutcome.REQUEUED
+            self.scheduler.release(assignment.task_id, requeued=requeued)
             sem.release()
 
     def _collect_done_reports(

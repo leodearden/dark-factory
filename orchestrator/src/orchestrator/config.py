@@ -288,6 +288,7 @@ class OrchestratorConfig(BaseSettings):
     max_advance_attempts: int = Field(default=3)
     max_pre_merge_retries: int = Field(default=2)
     inter_iteration_rebase: bool = Field(default=True)
+    requeue_cooldown_secs: float = Field(default=30.0)
 
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)

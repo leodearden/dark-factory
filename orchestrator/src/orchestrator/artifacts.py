@@ -312,5 +312,51 @@ class TaskArtifacts:
             return None
         return json.loads(lock_path.read_text())
 
+    def clear_stale_plan_lock(
+        self, current_task_id: str, stale_threshold_secs: float = 600.0
+    ) -> bool:
+        """Remove plan.lock if it's stale. Returns True if lock was cleared."""
+        lock_data = self.read_plan_lock()
+        if lock_data is None:
+            return False
+
+        lock_session = lock_data.get('session_id', '')
+        locked_at_str = lock_data.get('locked_at', '')
+
+        # Self-lock from a crashed previous session of the same task — always clear.
+        # Session IDs are formatted as '{task_id}-{uuid_hex[:8]}', so a lock
+        # from any prior session of the same task shares the task_id prefix.
+        if lock_session.startswith(current_task_id + '-'):
+            logger.info(
+                'Clearing self-owned plan.lock (session %s, task %s)',
+                lock_session,
+                current_task_id,
+            )
+            (self.root / 'plan.lock').unlink(missing_ok=True)
+            return True
+
+        # Age-based stale detection
+        try:
+            locked_at = datetime.fromisoformat(locked_at_str)
+            age_secs = (datetime.now(UTC) - locked_at).total_seconds()
+            if age_secs > stale_threshold_secs:
+                logger.warning(
+                    'Clearing stale plan.lock (session %s, age %.0fs > %.0fs threshold)',
+                    lock_session,
+                    age_secs,
+                    stale_threshold_secs,
+                )
+                (self.root / 'plan.lock').unlink(missing_ok=True)
+                return True
+        except (ValueError, TypeError):
+            # Unparseable timestamp — treat as stale
+            logger.warning(
+                'Clearing plan.lock with unparseable timestamp: %r', locked_at_str
+            )
+            (self.root / 'plan.lock').unlink(missing_ok=True)
+            return True
+
+        return False
+
     def _write_json(self, path: Path, data: dict) -> None:
         path.write_text(json.dumps(data, indent=2) + '\n')

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import time
 from dataclasses import dataclass
 
 from orchestrator.config import OrchestratorConfig
@@ -164,6 +165,7 @@ class Scheduler:
         self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
         self._status_cache: dict[str, str] = {}
         self._fallback_warned: set[str] = set()  # task IDs already warned about fallback
+        self._requeue_until: dict[str, float] = {}  # task_id -> monotonic deadline
 
     async def get_tasks(self) -> list[dict]:
         """Fetch all tasks from fused-memory/taskmaster."""
@@ -317,6 +319,12 @@ class Scheduler:
                 continue
             if str(t.get('id', '')) in self._dispatched:
                 continue
+            tid_str = str(t.get('id', ''))
+            cooldown_deadline = self._requeue_until.get(tid_str)
+            if cooldown_deadline is not None:
+                if time.monotonic() < cooldown_deadline:
+                    continue
+                del self._requeue_until[tid_str]
             if not self._deps_satisfied(t, status_map):
                 continue
             candidates.append(t)
@@ -396,9 +404,13 @@ class Scheduler:
         self.lock_table.release(task_id)
         return False
 
-    def release(self, task_id: str) -> None:
+    def release(self, task_id: str, *, requeued: bool = False) -> None:
         """Release all module locks for a task and clear dispatch guard."""
         self._dispatched.discard(task_id)
+        if requeued:
+            self._requeue_until[task_id] = (
+                time.monotonic() + self.config.requeue_cooldown_secs
+            )
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
         if self.event_store and modules:

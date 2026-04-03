@@ -1184,3 +1184,93 @@ class TestCancelledTaskResync:
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', store_mock)
         a2 = await scheduler.acquire_next()
         assert a2 is None, 'Task already dispatched — second acquire must return None'
+
+
+class TestRequeueCooldown:
+    """Tests for the requeue cooldown that prevents ghost loops."""
+
+    @pytest.fixture
+    def pending_task(self):
+        return {
+            'id': '99',
+            'title': 'Cooldown test task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'modules': ['backend']},
+        }
+
+    @pytest.fixture
+    def task_response(self, pending_task):
+        import json as _json
+        return {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [' + _json.dumps(pending_task) + ']}',
+                    }
+                ]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_requeue_cooldown_blocks_reacquire(self, monkeypatch, task_response):
+        """After release(requeued=True), task must not be re-acquired during cooldown."""
+        config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Acquire the task
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99'
+
+        # Release with requeue flag
+        scheduler.release('99', requeued=True)
+
+        # Try to acquire again — should be blocked by cooldown
+        a2 = await scheduler.acquire_next()
+        assert a2 is None, 'Task must not be re-acquired during requeue cooldown'
+
+    @pytest.mark.asyncio
+    async def test_requeue_cooldown_expires(self, monkeypatch, task_response):
+        """After cooldown expires, task should be acquirable again."""
+        config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Acquire and release with requeue
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None
+
+        scheduler.release('99', requeued=True)
+
+        # Fast-forward time past cooldown
+        import time
+        original_monotonic = time.monotonic
+        offset = 31.0  # past the 30s cooldown
+        monkeypatch.setattr(time, 'monotonic', lambda: original_monotonic() + offset)
+
+        a2 = await scheduler.acquire_next()
+        assert a2 is not None and a2.task_id == '99'
+
+    @pytest.mark.asyncio
+    async def test_normal_release_no_cooldown(self, monkeypatch, task_response):
+        """Normal release (not requeued) should not impose a cooldown."""
+        config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None
+
+        # Normal release — no requeue flag
+        scheduler.release('99')
+
+        a2 = await scheduler.acquire_next()
+        assert a2 is not None and a2.task_id == '99'
