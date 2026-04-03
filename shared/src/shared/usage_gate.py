@@ -43,7 +43,6 @@ __all__ = [
 CAP_HIT_PREFIXES = [
     "You've hit your",
     "You've used",
-    "You're out of extra usage",
 ]
 # Secondary confirmation — must also appear in the same text
 CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade"]
@@ -51,7 +50,6 @@ CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade"]
 # Patterns for near-cap warnings (pause proactively)
 NEAR_CAP_PREFIXES = [
     "You're close to",
-    "You're now using extra usage",
 ]
 
 # Codex (OpenAI) cap-hit patterns

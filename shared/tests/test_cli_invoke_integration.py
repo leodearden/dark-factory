@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from shared.cli_invoke import invoke_claude_agent
+from shared.config_dir import TaskConfigDir
 
 # Discover available OAuth tokens from env
 _TOKEN_ENV_VARS = [f'CLAUDE_OAUTH_TOKEN_{c}' for c in 'BCDEF']
@@ -108,3 +109,51 @@ class TestCrossAccountResume:
         assert 'ZEPPELIN' in r2.output.upper(), (
             f'Expected ZEPPELIN in cross-account resumed output, got: {r2.output!r}'
         )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+class TestConfigDirCredentials:
+    """Test credential passing via env var with and without TaskConfigDir.
+
+    These tests MUST use real agents because they validate the actual Claude
+    CLI's OAuth token handling.  Stale or invalid tokens produce "Invalid API
+    key" or "You're out of extra usage" — errors that only manifest with the
+    real CLI, not mocks.
+    """
+
+    @_need_one_account
+    async def test_env_var_auth_succeeds(self):
+        """OAuth token via CLAUDE_CODE_OAUTH_TOKEN env var authenticates."""
+        _name, token = _AVAILABLE_TOKENS[0]
+        result = await invoke_claude_agent(
+            prompt='Say exactly: PONG',
+            oauth_token=token,
+            **_INVOKE_DEFAULTS,
+        )
+        # Budget may be exceeded (cost > $0.01) but the CLI must authenticate
+        assert 'invalid api key' not in result.output.lower(), (
+            f'Token rejected as invalid: {result.output!r}'
+        )
+        assert 'not logged in' not in result.output.lower(), (
+            f'Token not recognized: {result.output!r}'
+        )
+
+    @_need_one_account
+    async def test_config_dir_plus_env_var_auth_succeeds(self):
+        """Auth with both config dir and env var — the orchestrator pattern."""
+        _name, token = _AVAILABLE_TOKENS[0]
+        config_dir = TaskConfigDir('test-config-dir-both')
+        try:
+            config_dir.write_credentials(token)
+            result = await invoke_claude_agent(
+                prompt='Say exactly: PONG',
+                oauth_token=token,
+                config_dir=config_dir.path,
+                **_INVOKE_DEFAULTS,
+            )
+            assert 'invalid api key' not in result.output.lower(), (
+                f'Token rejected as invalid: {result.output!r}'
+            )
+        finally:
+            config_dir.cleanup()

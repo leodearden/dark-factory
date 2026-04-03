@@ -679,7 +679,7 @@ class TestRunProbe:
         proc = _make_mock_proc(
             returncode=0,
             stderr=b'Some info',
-            stdout=b"You're now using extra usage for this billing period",
+            stdout=b"You're close to your usage limit for this billing period",
         )
 
         with patch('asyncio.create_subprocess_exec', return_value=proc):
