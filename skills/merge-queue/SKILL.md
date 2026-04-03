@@ -44,7 +44,7 @@ mcp__escalation__get_pending_escalations()
 ```
 mcp__escalation__merge_request(
   task_id="<TASK_ID>",
-  branch="task/<TASK_ID>",
+  branch="<TASK_ID>",
   worktree="<path to worktree>",
   description="<brief description of what's being merged>"
 )
@@ -52,7 +52,7 @@ mcp__escalation__merge_request(
 
 Parameters:
 - `task_id` — the task number (string)
-- `branch` — full branch name, typically `task/<TASK_ID>`
+- `branch` — the task ID only (e.g., `"466"`), **not** the full branch name. The merge worker prepends the `task/` prefix automatically.
 - `worktree` — absolute path to the task's worktree (e.g., `/home/leo/src/dark-factory/.worktrees/42/`)
 - `description` — optional context for logs
 

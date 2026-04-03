@@ -2065,7 +2065,11 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
+<<<<<<< HEAD
         "updatedAt": "2026-04-03T14:33:24.982Z",
+=======
+        "updatedAt": "2026-04-03T14:31:07.884Z",
+>>>>>>> fix/merge-queue-branch-prefix
         "metadata": {
           "files": [
             "fused-memory/src/fused_memory/services/memory_service.py",
@@ -8373,7 +8377,11 @@
     ],
     "metadata": {
       "version": "1.0.0",
+<<<<<<< HEAD
       "lastModified": "2026-04-03T14:33:24.982Z",
+=======
+      "lastModified": "2026-04-03T14:31:07.884Z",
+>>>>>>> fix/merge-queue-branch-prefix
       "taskCount": 397,
       "completedCount": 384,
       "tags": [
