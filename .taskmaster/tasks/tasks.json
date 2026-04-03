@@ -8182,11 +8182,17 @@
         "description": "In task_interceptor.py, get_task_summary should check if self.get_tasks() returns an error dict (has 'error' key) and propagate it instead of silently returning {'counts': {}, 'tasks': []}.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-03T06:33:15.745Z"
+        "updatedAt": "2026-04-03T06:36:22.744Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/middleware",
+            "fused-memory/tests/test_task_interceptor.py"
+          ]
+        }
       },
       {
         "id": "411",
@@ -8214,7 +8220,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T06:36:20.279Z",
+      "lastModified": "2026-04-03T06:36:22.744Z",
       "taskCount": 391,
       "completedCount": 370,
       "tags": [
