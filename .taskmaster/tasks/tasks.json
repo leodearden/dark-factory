@@ -8314,7 +8314,7 @@
         "description": "The routing module (classifier.py, router.py) correctly uses a cached singleton pattern for LLM clients (`_openai_client` lazy init). However, the reconciliation module creates new `AsyncAnthropic()` and `AsyncOpenAI()` clients on every `_call_llm()` invocation:\n\n- `fused-memory/src/fused_memory/reconciliation/judge.py:167` — `client = anthropic.AsyncAnthropic()`\n- `fused-memory/src/fused_memory/reconciliation/judge.py:179` — `client = AsyncOpenAI()`\n- `fused-memory/src/fused_memory/reconciliation/agent_loop.py:209` — `client = anthropic.AsyncAnthropic()`\n- `fused-memory/src/fused_memory/reconciliation/agent_loop.py:231` — `client = AsyncOpenAI()`\n\nEach instantiation creates a new httpx connection pool, wasting TCP connections and adding latency. The agent_loop case is more concerning since it runs multiple LLM calls per loop iteration.\n\nFix: Follow the same `_get_openai_client()` / `_get_anthropic_client()` singleton pattern used in `routing/classifier.py:64-73` and `routing/router.py:97-106`.\n\nmemory_hints:\n- search: \"LLM client singleton pattern routing\"\n- search: \"per-call client creation thread leak\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -8327,7 +8327,7 @@
             "fused-memory/src/fused_memory/reconciliation"
           ]
         },
-        "updatedAt": "2026-04-03T12:23:48.159Z"
+        "updatedAt": "2026-04-03T12:23:48.907Z"
       },
       {
         "id": "417",
@@ -8356,7 +8356,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T12:23:48.722Z",
+      "lastModified": "2026-04-03T12:23:48.907Z",
       "taskCount": 396,
       "completedCount": 381,
       "tags": [
