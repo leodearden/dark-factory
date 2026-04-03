@@ -6,8 +6,6 @@ from __future__ import annotations
 import json
 import logging
 
-logger = logging.getLogger(__name__)
-
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageReport,
@@ -24,6 +22,8 @@ from fused_memory.reconciliation.prompts import (
 )
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
+
+logger = logging.getLogger(__name__)
 
 
 class TaskKnowledgeSync(BaseStage):

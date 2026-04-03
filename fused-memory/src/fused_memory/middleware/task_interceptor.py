@@ -440,7 +440,7 @@ def _collect_all_tasks(tasks: list) -> list:
     return flat
 
 
-def _compact_task(task: object) -> object:
+def _compact_task(task: Any) -> Any:
     """Return a compact version of a task dict with verbose fields stripped.
 
     Keeps: id, status, title, dependencies, priority.
