@@ -17,6 +17,7 @@ Organised by pipeline layer (bottom-up):
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -718,7 +719,6 @@ class TestExecuteGraphitiWriteReferenceTimeErrorHandling:
         """Payload with reference_time='not-a-date' → does NOT raise, graphiti.add_episode
         called with reference_time=None, and a warning is logged.
         """
-        import logging
 
         payload = {
             'uuid': 'test-uuid',
@@ -750,7 +750,6 @@ class TestExecuteGraphitiWriteReferenceTimeErrorHandling:
         """Payload with reference_time='' (empty string) → does NOT raise,
         graphiti.add_episode called with reference_time=None, and a warning is logged.
         """
-        import logging
 
         payload = {
             'uuid': 'test-uuid',
