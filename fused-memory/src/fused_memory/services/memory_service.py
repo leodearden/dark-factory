@@ -274,6 +274,8 @@ class MemoryService:
         causation_id = payload.pop('_causation_id', None)
         write_op_id = payload.pop('_write_op_id', None)
         temporal_context = payload.pop('temporal_context', None)
+        reference_time_iso = payload.pop('reference_time', None)
+        reference_time = datetime.fromisoformat(reference_time_iso) if reference_time_iso is not None else None
 
         result = await self._journaled_backend_call(
             write_op_id=write_op_id,
@@ -289,6 +291,7 @@ class MemoryService:
                 source_description=payload.get('source_description', ''),
                 uuid=payload.get('uuid'),
                 temporal_context=temporal_context,
+                reference_time=reference_time,
             ),
         )
         # Post-write dedup: remove duplicate edges created within this episode
