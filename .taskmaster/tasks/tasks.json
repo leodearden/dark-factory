@@ -2061,11 +2061,11 @@
         "description": "Reconciliation retrospective summaries that describe past state can pollute the temporal knowledge graph. Graphiti assigns valid_at = ingestion_time when no temporal_context is provided. Episode 1e560d42 (ingested 2026-03-23 20:24 UTC, describing 2026-03-22 state) caused 7 stale edges with wrong timestamps, requiring manual deletion in Stage 1 run 0ee2c5a9.\\n\\nFix: Add a mechanism to pass a temporal_context hint (valid_at override or historical_date annotation) when ingesting retrospective episodes, so Graphiti assigns historical valid_at rather than ingestion time. Options:\\n1. Pass `valid_at` to `add_episode` calls for retrospective content\\n2. Add an `episode_type: retrospective` flag that suppresses valid_at assignment\\n3. Document the pattern in reconciliation agent prompts: \\\"when ingesting retrospective summaries, set valid_at to the date the described state was current, not today\\\"\\n\\n## memory_hints\\n- search: \\\"historical episode temporal contamination retrospective valid_at ingestion time\\\"\\n- search: \\\"add_episode valid_at temporal context annotation Graphiti\\\"\\n- entity: \\\"add_episode\\\"\\n- search: \\\"reconciliation retrospective summary episode ingestion pattern\\\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-03T14:07:14.317Z",
+        "updatedAt": "2026-04-03T14:07:14.369Z",
         "metadata": {
           "files": [
             "fused-memory/src/fused_memory/services/memory_service.py",
@@ -8373,7 +8373,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T14:07:14.317Z",
+      "lastModified": "2026-04-03T14:07:14.369Z",
       "taskCount": 397,
       "completedCount": 384,
       "tags": [
