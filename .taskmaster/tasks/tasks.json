@@ -8128,11 +8128,11 @@
         "description": "Remove leading underscores from four exported functions in task_utils.py (filter_tasks_by_status, collect_all_tasks, compact_task, compact_tasks) and update all import sites. Hoist _VERBOSE_FIELDS to module-level frozenset. Pass pre-built status_set through recursion instead of rebuilding at each level.",
         "details": "Files: fused-memory/src/fused_memory/utils/task_utils.py, middleware/task_interceptor.py, reconciliation/stages/task_knowledge_sync.py, tests/test_task_utils.py, tests/test_task_interceptor.py. Source: task 396 review suggestions #1, #3, #6.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-03T07:03:15.769Z",
+        "updatedAt": "2026-04-03T07:05:09.655Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/middleware",
@@ -8286,9 +8286,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-03T07:03:15.770Z",
+      "lastModified": "2026-04-03T07:05:09.655Z",
       "taskCount": 393,
-      "completedCount": 374,
+      "completedCount": 375,
       "tags": [
         "master"
       ]
