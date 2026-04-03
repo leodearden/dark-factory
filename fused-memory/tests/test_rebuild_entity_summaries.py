@@ -685,3 +685,58 @@ class TestGetAllValidEdges:
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.get_all_valid_edges(group_id='test')
+
+
+# ---------------------------------------------------------------------------
+# N+1 fix step-7: detect_stale_summaries uses bulk get_all_valid_edges
+# ---------------------------------------------------------------------------
+
+class TestDetectStaleSummariesBulk:
+    """detect_stale_summaries uses get_all_valid_edges (one query) not N per-entity queries."""
+
+    @pytest.mark.asyncio
+    async def test_calls_get_all_valid_edges_once_not_per_entity(self, mock_config, make_backend):
+        """detect_stale_summaries calls get_all_valid_edges exactly once (not N times)."""
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'factB'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'}],
+        })
+        backend.get_valid_edges_for_node = AsyncMock()
+        await backend.detect_stale_summaries(group_id='test')
+        backend.get_all_valid_edges.assert_awaited_once()
+        backend.get_valid_edges_for_node.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_correctly_identifies_stale_with_bulk_edges(self, mock_config, make_backend):
+        """Stale entity is returned; clean entity is not — using bulk-fetched edges."""
+        backend = make_backend(mock_config)
+        # uuid-1 is stale (summary has old fact), uuid-2 is clean
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old fact'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'current fact'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current fact', 'name': 'edge2'}],
+        })
+        result = await backend.detect_stale_summaries(group_id='test')
+        assert len(result) == 1
+        assert result[0]['uuid'] == 'uuid-1'
+
+    @pytest.mark.asyncio
+    async def test_empty_summary_entities_skipped_with_bulk_path(self, mock_config, make_backend):
+        """Empty-summary entity is skipped even with bulk edges data source."""
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': ''},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'some fact', 'name': 'edge1'}],
+        })
+        result = await backend.detect_stale_summaries(group_id='test')
+        assert result == []
