@@ -650,3 +650,14 @@ class TestGetAllValidEdges:
         assert result['entity-1'][0] == {'uuid': 'edge-a', 'fact': 'Alice knows Bob', 'name': 'knows'}
         assert result['entity-1'][1] == {'uuid': 'edge-b', 'fact': 'Alice lives in Paris', 'name': 'lives_in'}
         assert result['entity-2'][0] == {'uuid': 'edge-c', 'fact': 'Bob works at Acme', 'name': 'works_at'}
+
+    @pytest.mark.asyncio
+    async def test_cypher_uses_return_distinct(self, mock_config, make_backend, make_graph_mock):
+        """Cypher query passed to ro_query contains 'RETURN DISTINCT'."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_all_valid_edges(group_id='test')
+        called_args = graph.ro_query.call_args
+        cypher = called_args[0][0]
+        assert 'RETURN DISTINCT' in cypher
