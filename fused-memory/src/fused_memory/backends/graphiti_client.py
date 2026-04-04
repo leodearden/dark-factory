@@ -1000,9 +1000,13 @@ class GraphitiBackend:
         """
         if force:
             all_entities = await self.list_entity_nodes(group_id=group_id)
-            all_edges = await self.get_all_valid_edges(group_id=group_id)
             targets = [{'uuid': e['uuid'], 'name': e['name']} for e in all_entities]
             total_entities = len(all_entities)
+            # Only fetch edges when we will actually use them (not in dry_run)
+            if dry_run:
+                all_edges: dict[str, list[dict]] = {}
+            else:
+                all_edges = await self.get_all_valid_edges(group_id=group_id)
         else:
             stale, all_edges, total_entities = await self._detect_stale_summaries_with_edges(group_id=group_id)
             targets = [{'uuid': s['uuid'], 'name': s['name']} for s in stale]
