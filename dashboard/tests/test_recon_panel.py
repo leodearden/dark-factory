@@ -933,3 +933,15 @@ class TestRunPanelAlpineComponent:
         with _patch_recon_data():
             html = client.get('/partials/recon').text
         assert 'x-data="{ open: false }"' not in html
+
+    def test_badge_button_uses_toggle_detail_handler(self, client):
+        """Badge button uses @click=\"toggleDetail()\" not inline open = !open."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert '@click="toggleDetail()"' in html
+
+    def test_old_inline_click_handler_gone(self, client):
+        """Old @click=\"open = !open\" handler is removed from the badge button."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert '@click="open = !open"' not in html
