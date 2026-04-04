@@ -136,3 +136,67 @@ class TestCanonicalFacts:
         result = GraphitiBackend._canonical_facts(edges)
         assert isinstance(result, list)
         assert result == ['A', 'B']
+
+
+# ---------------------------------------------------------------------------
+# step-5: refresh_entity_summary optional name/old_summary params
+# ---------------------------------------------------------------------------
+
+class TestRefreshEntitySummaryOptionalParams:
+    """refresh_entity_summary optional name+old_summary params."""
+
+    @pytest.mark.asyncio
+    async def test_raises_if_name_without_old_summary(self, mock_config, make_backend):
+        """ValueError raised when name is provided without old_summary."""
+        backend = make_backend(mock_config)
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[])
+        backend.update_node_summary = AsyncMock()
+        with pytest.raises(ValueError, match='both'):
+            await backend.refresh_entity_summary(
+                'u1', group_id='test', name='Alice'
+            )
+
+    @pytest.mark.asyncio
+    async def test_raises_if_old_summary_without_name(self, mock_config, make_backend):
+        """ValueError raised when old_summary is provided without name."""
+        backend = make_backend(mock_config)
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[])
+        backend.update_node_summary = AsyncMock()
+        with pytest.raises(ValueError, match='both'):
+            await backend.refresh_entity_summary(
+                'u1', group_id='test', old_summary='old summary text'
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_node_text_not_called_when_both_provided(self, mock_config, make_backend):
+        """When both name and old_summary provided, get_node_text is NOT called."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(return_value=('should-not-be-called', ''))
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'fact': 'Alice knows Bob'},
+        ])
+        backend.update_node_summary = AsyncMock()
+
+        result = await backend.refresh_entity_summary(
+            'u1', group_id='test', name='Alice', old_summary='stale summary'
+        )
+
+        backend.get_node_text.assert_not_called()
+        assert result['name'] == 'Alice'
+        assert result['old_summary'] == 'stale summary'
+
+    @pytest.mark.asyncio
+    async def test_get_node_text_called_when_neither_provided(self, mock_config, make_backend):
+        """When neither name nor old_summary provided, get_node_text IS called (backward compat)."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock(return_value=('Alice', 'old summary'))
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'fact': 'Alice knows Bob'},
+        ])
+        backend.update_node_summary = AsyncMock()
+
+        result = await backend.refresh_entity_summary('u1', group_id='test')
+
+        backend.get_node_text.assert_called_once()
+        assert result['name'] == 'Alice'
+        assert result['old_summary'] == 'old summary'
