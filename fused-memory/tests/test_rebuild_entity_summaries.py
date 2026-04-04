@@ -184,46 +184,6 @@ class TestDetectStaleSummaries:
         result = await backend.detect_stale_summaries(group_id='test')
         assert result[0]['summary_line_count'] == 3
 
-    @pytest.mark.asyncio
-    async def test_continues_on_edge_fetch_error(self, mock_config, make_backend):
-        """When get_valid_edges_for_node raises for one entity, processing continues for others."""
-        backend = make_backend(mock_config)
-        # Three entities: entity 1 is clean, entity 2 errors out, entity 3 is stale
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'good fact'},
-            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'some summary'},
-            {'uuid': 'uuid-3', 'name': 'Carol', 'summary': 'factA\nfactA'},
-        ])
-        backend.get_valid_edges_for_node = AsyncMock(side_effect=[
-            [{'uuid': 'e1', 'fact': 'good fact', 'name': 'edge1'}],  # entity 1 clean
-            RuntimeError('FalkorDB timeout'),                          # entity 2 errors
-            [{'uuid': 'e3', 'fact': 'factA', 'name': 'edge3'}],      # entity 3 stale (dup)
-        ])
-        result = await backend.detect_stale_summaries(group_id='test')
-        # Method must NOT raise; only entity 3 should be in the stale list
-        assert len(result) == 1
-        assert result[0]['uuid'] == 'uuid-3'
-
-    @pytest.mark.asyncio
-    async def test_edge_fetch_error_logs_warning(self, mock_config, make_backend, caplog):
-        """A warning-level log is emitted containing the failed entity uuid and exception text."""
-        import logging
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'good fact'},
-            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'some summary'},
-            {'uuid': 'uuid-3', 'name': 'Carol', 'summary': 'factA\nfactA'},
-        ])
-        backend.get_valid_edges_for_node = AsyncMock(side_effect=[
-            [{'uuid': 'e1', 'fact': 'good fact', 'name': 'edge1'}],
-            RuntimeError('FalkorDB timeout'),
-            [{'uuid': 'e3', 'fact': 'factA', 'name': 'edge3'}],
-        ])
-        with caplog.at_level(logging.WARNING):
-            await backend.detect_stale_summaries(group_id='test')
-        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert any('uuid-2' in msg and 'FalkorDB timeout' in msg for msg in warning_messages)
-
 
 # ---------------------------------------------------------------------------
 # step-3: GraphitiBackend.rebuild_entity_summaries
@@ -236,17 +196,13 @@ class TestRebuildEntitySummaries:
     async def test_rebuilds_only_stale_entities(self, mock_config, make_backend):
         """Only rebuilds entities flagged by _detect_stale_summaries_with_edges."""
         backend = make_backend(mock_config)
-        # _detect_stale_summaries_with_edges returns (stale_list, all_edges_dict)
+        # _detect_stale_summaries_with_edges returns (stale_list, all_edges_dict, total_count)
         backend._detect_stale_summaries_with_edges = AsyncMock(return_value=(
             [{'uuid': 'uuid-1', 'name': 'Alice', 'duplicate_count': 0,
               'stale_line_count': 1, 'valid_fact_count': 0, 'summary_line_count': 1}],
             {'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
+            2,
         ))
-        # list_entity_nodes is still called for total_entities count
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale'},
-            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'clean'},
-        ])
         backend.get_node_text = AsyncMock(return_value=('Alice', 'stale'))
         backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test')
@@ -299,11 +255,8 @@ class TestRebuildEntitySummaries:
                 'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
                 'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
             },
+            2,
         ))
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
-            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
-        ])
         # Entity 1 fails at get_node_text; entity 2 succeeds
         backend.get_node_text = AsyncMock(side_effect=[
             RuntimeError('FalkorDB timeout'),
@@ -339,10 +292,8 @@ class TestRebuildEntitySummaries:
             [{'uuid': 'uuid-1', 'name': 'Alice', 'duplicate_count': 0,
               'stale_line_count': 1, 'valid_fact_count': 0, 'summary_line_count': 1}],
             {'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
+            1,
         ))
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale'},
-        ])
         backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test', dry_run=True)
         assert result['stale_entities'] == 1

@@ -467,7 +467,7 @@ class GraphitiBackend:
         cypher = (
             'MATCH (n:Entity)-[e:RELATES_TO]-() '
             'WHERE e.invalid_at IS NULL '
-            'RETURN n.uuid, e.uuid, e.fact, e.name'
+            'RETURN DISTINCT n.uuid, e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher)
         grouped: dict[str, list[dict]] = {}
@@ -817,8 +817,8 @@ class GraphitiBackend:
 
     async def _detect_stale_summaries_with_edges(
         self, *, group_id: str
-    ) -> tuple[list[dict], dict[str, list[dict]]]:
-        """Internal: detect stale summaries and return (stale_list, all_edges_dict).
+    ) -> tuple[list[dict], dict[str, list[dict]], int]:
+        """Internal: detect stale summaries and return (stale_list, all_edges_dict, total_count).
 
         Shared by detect_stale_summaries (public API) and rebuild_entity_summaries
         to avoid a duplicate bulk edge fetch when both are needed.
@@ -827,8 +827,8 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            Tuple of (stale_list, all_edges_dict) where all_edges_dict is keyed
-            by entity UUID.
+            Tuple of (stale_list, all_edges_dict, total_entity_count) where
+            all_edges_dict is keyed by entity UUID.
         """
         entities = await self.list_entity_nodes(group_id=group_id)
         all_edges = await self.get_all_valid_edges(group_id=group_id)
@@ -861,7 +861,7 @@ class GraphitiBackend:
                 'valid_fact_count': len(valid_facts),
                 'summary_line_count': len(summary_lines),
             })
-        return stale, all_edges
+        return stale, all_edges, len(entities)
 
     async def detect_stale_summaries(self, *, group_id: str) -> list[dict]:
         """Identify Entity nodes whose summary is out of sync with valid edge facts.
@@ -889,7 +889,7 @@ class GraphitiBackend:
             duplicate_count, stale_line_count, valid_fact_count,
             summary_line_count.
         """
-        stale, _ = await self._detect_stale_summaries_with_edges(group_id=group_id)
+        stale, _, _ = await self._detect_stale_summaries_with_edges(group_id=group_id)
         return stale
 
     async def _rebuild_entity_from_edges(
@@ -963,11 +963,8 @@ class GraphitiBackend:
             targets = [{'uuid': e['uuid'], 'name': e['name']} for e in all_entities]
             total_entities = len(all_entities)
         else:
-            stale, all_edges = await self._detect_stale_summaries_with_edges(group_id=group_id)
-            # Need total_entities for reporting — list_entity_nodes is cheap (read-only).
-            all_entities = await self.list_entity_nodes(group_id=group_id)
+            stale, all_edges, total_entities = await self._detect_stale_summaries_with_edges(group_id=group_id)
             targets = [{'uuid': s['uuid'], 'name': s['name']} for s in stale]
-            total_entities = len(all_entities)
 
         stale_entities = len(targets)
         rebuilt = 0
