@@ -346,6 +346,12 @@ class TestIndexHtmlUsesMacro:
         # Recon polls every 15s
         assert "polling_section('recon', '/partials/recon', 15," in content
 
+    def test_orchestrators_section_uses_innerHTML_swap(self):
+        """Orchestrators polling_section call must pass hx_swap='innerHTML' to
+        prevent Idiomorph from clobbering Alpine's x-show DOM effects on each poll."""
+        content = self._index_content()
+        assert "hx_swap='innerHTML'" in content or 'hx_swap="innerHTML"' in content
+
 
 class TestEquivalenceJsCouplingAttributes:
     """Regression guard for JS coupling: data-section and data-updated-for
