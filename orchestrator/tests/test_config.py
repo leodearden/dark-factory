@@ -11,6 +11,7 @@ from orchestrator.config import (
     OrchestratorConfig,
     _deep_merge,
     _discover_module_configs,
+    discover_module_configs,
     load_config,
 )
 
@@ -160,6 +161,19 @@ class TestModuleConfigDiscovery:
     def test_discover_empty_dir(self, tmp_path: Path):
         configs = _discover_module_configs(tmp_path)
         assert configs == {}
+
+    def test_public_discover_module_configs_works(self, tmp_path: Path):
+        """discover_module_configs (public API) behaves identically to _discover_module_configs."""
+        sub = tmp_path / 'mymod'
+        sub.mkdir()
+        (sub / 'orchestrator.yaml').write_text(yaml.dump({
+            'test_command': 'uv run pytest mymod/',
+        }))
+        configs = discover_module_configs(tmp_path)
+        assert 'mymod' in configs
+        mc = configs['mymod']
+        assert mc.prefix == 'mymod'
+        assert mc.test_command == 'uv run pytest mymod/'
 
     def test_for_module_matches_first_component(self):
         config = OrchestratorConfig()

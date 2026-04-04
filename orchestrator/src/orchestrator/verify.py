@@ -281,9 +281,9 @@ async def run_full_verification(
     for every subproject that has an orchestrator.yaml. Used by review
     checkpoints to check integration health across the whole codebase.
     """
-    from orchestrator.config import _discover_module_configs
+    from orchestrator.config import discover_module_configs
 
-    module_configs = _discover_module_configs(project_root)
+    module_configs = discover_module_configs(project_root)
     if not module_configs:
         logger.info('Full verification: no subproject configs — using global')
         return await run_verification(project_root, config)

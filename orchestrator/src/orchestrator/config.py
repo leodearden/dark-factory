@@ -247,7 +247,7 @@ class ModuleConfig:
     module_overrides: dict[str, int] | None = None
 
 
-def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
+def discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
     """Scan project_root/*/orchestrator.yaml and load overridable fields."""
     configs: dict[str, ModuleConfig] = {}
     for yaml_path in sorted(project_root.glob('*/orchestrator.yaml')):
@@ -263,6 +263,10 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
             configs[prefix] = ModuleConfig(prefix=prefix, **kwargs)
             logger.info('Loaded module config for %r: %s', prefix, list(kwargs))
     return configs
+
+
+# Backward-compat alias — prefer discover_module_configs in new code.
+_discover_module_configs = discover_module_configs
 
 
 # --- Top-level ---
@@ -411,5 +415,5 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
             'No project config file found (checked config.yaml, orchestrator/config.yaml). '
             'Using package defaults. Pass --config or set ORCH_CONFIG_PATH to specify.',
         )
-    config._module_configs = _discover_module_configs(config.project_root)
+    config._module_configs = discover_module_configs(config.project_root)
     return config
