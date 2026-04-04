@@ -8613,11 +8613,18 @@
         "description": "Two call sites in graphiti_client.py still use positional tuple unpacking instead of named StaleSummaryResult attribute access:\n1. `detect_stale_summaries` (line 933): change `stale, _, _ = await self._detect_stale_summaries_with_edges(...)` to `result = await ...; return result.stale`\n2. `rebuild_entity_summaries` (line 1023): change `stale, all_edges, total_entities = await ...` to `result = await ...; stale = result.stale; all_edges = result.edges; total_entities = result.total_count`\n3. Consider renaming the StaleSummaryResult field `edges` → `all_edges` (line 36) to match the usage variable name and signal that it is the full graph-wide edge dict, not per-entity edges. If renamed, update all field references accordingly.\n\nMemory hints: search for \"StaleSummaryResult\" entity, search \"NamedTuple positional unpacking graphiti\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-04T14:17:59.108Z"
+        "updatedAt": "2026-04-04T18:06:24.166Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/tests/test_graphiti_quality_433.py",
+            "fused-memory/tests/test_stale_summary_named_access_438.py"
+          ]
+        }
       },
       {
         "id": "439",
@@ -8699,7 +8706,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T14:17:59.108Z",
+      "lastModified": "2026-04-04T18:06:24.166Z",
       "taskCount": 424,
       "completedCount": 393,
       "tags": [
