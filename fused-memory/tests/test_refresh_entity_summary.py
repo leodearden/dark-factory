@@ -544,6 +544,46 @@ class TestRefreshEntitySummaryMcpTool:
 
 
 # ---------------------------------------------------------------------------
+# step-7 (task-309): FUSED_MEMORY_INSTRUCTIONS and tool docstring
+# ---------------------------------------------------------------------------
+
+class TestFusedMemoryInstructionsEntityName:
+    """FUSED_MEMORY_INSTRUCTIONS mentions entity name-based lookup for refresh_entity_summary."""
+
+    def test_instructions_mention_entity_name_lookup(self):
+        """FUSED_MEMORY_INSTRUCTIONS describes name-based lookup for refresh_entity_summary."""
+        from fused_memory.server.tools import FUSED_MEMORY_INSTRUCTIONS
+        # The refresh_entity_summary entry specifically should mention UUID or name acceptance
+        assert 'entity_name' in FUSED_MEMORY_INSTRUCTIONS or (
+            'name' in FUSED_MEMORY_INSTRUCTIONS
+            and 'refresh_entity_summary: ' in FUSED_MEMORY_INSTRUCTIONS
+        )
+        # Specifically: the instructions must say the tool accepts a name (not just UUID)
+        refresh_line = next(
+            (line for line in FUSED_MEMORY_INSTRUCTIONS.splitlines()
+             if 'refresh_entity_summary' in line and ('uuid' in line.lower() or 'name' in line.lower())),
+            None,
+        )
+        assert refresh_line is not None, (
+            'refresh_entity_summary line in FUSED_MEMORY_INSTRUCTIONS should mention uuid or name'
+        )
+
+    def test_tool_docstring_mentions_both_uuid_and_name(self):
+        """The refresh_entity_summary tool docstring describes both entity_uuid and entity_name."""
+        from fused_memory.server.tools import create_mcp_server
+        from unittest.mock import AsyncMock
+        svc = AsyncMock()
+        server = create_mcp_server(svc)
+
+        import asyncio
+        tools = asyncio.get_event_loop().run_until_complete(server.list_tools())
+        tool = next(t for t in tools if t.name == 'refresh_entity_summary')
+        desc = tool.description or ''
+        assert 'entity_uuid' in desc
+        assert 'entity_name' in desc
+
+
+# ---------------------------------------------------------------------------
 # step-11: DISALLOW_MEMORY_WRITES list in cli_stage_runner.py
 # ---------------------------------------------------------------------------
 
