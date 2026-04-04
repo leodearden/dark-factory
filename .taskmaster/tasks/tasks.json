@@ -8587,6 +8587,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 433,
+        "title": "Extract shared parse_optional_dt utility and test payload fixture",
+        "description": "Extract a shared `parse_optional_dt(val, *, on_error='none')` utility for ISO datetime parsing with configurable error handling. Three call sites: tools.py:269-277, memory_service.py:278-285, journal.py:654-657 (_parse_dt). Also extract the repeated 7-key base payload dict in test_temporal_context.py into a pytest fixture.",
+        "details": "Files: fused-memory/src/fused_memory/server/tools.py, fused-memory/src/fused_memory/services/memory_service.py, fused-memory/src/fused_memory/reconciliation/journal.py, fused-memory/tests/test_temporal_context.py. Source: review suggestions from task 125 (esc-125-9).",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8599,7 +8610,7 @@
       ],
       "created": "2026-04-04T06:43:47.452Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T06:43:52.440Z"
+      "updated": "2026-04-04T06:43:57.780Z"
     }
   }
 }
