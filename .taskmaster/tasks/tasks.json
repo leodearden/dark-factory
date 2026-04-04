@@ -8387,10 +8387,11 @@
         "description": "Two related improvements for the journal detail row click handler in recon.html:\n\n1. **Extract to named Alpine component**: The @click handler is a multi-statement imperative JS expression (store toggle, getElementById, conditional htmx.trigger) in a Jinja2 attribute. Other store-toggle patterns (burndown, costs) are simple one-liners. Extract to `Alpine.data('runPanel', ...)` with a `toggleDetail()` method. Also uses `var` where `const`/`let` is the norm. (suggestion 5)\n\n2. **Add double-click guard**: The click handler guards with `!el.dataset.loaded`, but loaded is only set in hx-on::after-swap (after server response). Rapid double-clicks before the response arrives dispatch two load-detail events. Set `el.dataset.loading = 'true'` synchronously in click handler and guard with `!el.dataset.loaded && !el.dataset.loading`. (suggestion 19)\n\nmemory_hint: search \"recon detail HTMX Alpine\" for prior context.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T08:24:51.260Z"
       },
       {
         "id": "422",
@@ -8459,7 +8460,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T08:24:51.191Z",
+      "lastModified": "2026-04-04T08:24:51.260Z",
       "taskCount": 405,
       "completedCount": 388,
       "tags": [
