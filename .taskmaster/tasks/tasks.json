@@ -8547,10 +8547,11 @@
         "description": "Review suggestions from task 419 reviewers (deferred as non-blocking). All in graphiti_client.py backend code:\n\n1. Invert if/pass/else guard in refresh_entity_summary — replace empty pass branch with inverted condition (architect, reuse_auditor)\n2. Enforce name+old_summary pairing with ValueError when only one provided (architect, robustness)\n3. Replace anonymous 3-tuple return from _detect_stale_summaries_with_edges with NamedTuple/dataclass (architect)\n4. Extract _canonical_facts() helper for the dict.fromkeys dedup expression used in 3 places (reuse_auditor)\n5. Type annotation: refresh_kwargs dict -> dict[str, Any] (architect)\n6. Variable scoping: declare all_entities before if/else branches (architect)\n7. Skip entity_map construction in dry_run mode (performance)\n8. Add TOCTOU/eventual-consistency comment for pre-fetched edge optimization (robustness)",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T13:04:28.522Z"
       },
       {
         "id": "434",
@@ -8566,7 +8567,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T13:04:28.352Z",
+      "lastModified": "2026-04-04T13:04:28.522Z",
       "taskCount": 413,
       "completedCount": 390,
       "tags": [
