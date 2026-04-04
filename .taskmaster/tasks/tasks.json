@@ -8576,6 +8576,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 432,
+        "title": "Strengthen test assertions in test_temporal_context.py",
+        "description": "Four improvements: (1) Line 771: change `any(w for w in warning_texts)` to check for specific warning content. (2) Line 591: add assertions for error_type='ValidationError' and that error message contains the invalid value. (3) Remove stale 'will FAIL until step-N' docstrings at lines 443, 506, 712. (4) Fix test step numbering gap (jumps from step 9 to step 12).",
+        "details": "File: fused-memory/tests/test_temporal_context.py. Source: review suggestions from task 125 (esc-125-9). memory_hints: search(\"temporal_context test assertions\")",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8588,7 +8599,7 @@
       ],
       "created": "2026-04-04T06:43:47.452Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T06:43:47.456Z"
+      "updated": "2026-04-04T06:43:52.440Z"
     }
   }
 }
