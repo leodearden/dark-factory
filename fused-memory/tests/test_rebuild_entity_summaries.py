@@ -814,6 +814,43 @@ class TestRebuildEntitySummariesParallel:
         assert result['errors'] == 0
 
     @pytest.mark.asyncio
+    async def test_force_path_passes_old_summary_no_get_node_text(
+        self, mock_config, make_backend
+    ):
+        """Force path: old_summary from list_entity_nodes is passed to
+        _rebuild_entity_from_edges and get_node_text is never called."""
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'alice summary'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'bob summary'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
+        })
+        backend.get_node_text = AsyncMock()
+        backend.update_node_summary = AsyncMock()
+
+        captured_calls: list[dict] = []
+        original_rebuild = backend._rebuild_entity_from_edges
+
+        async def capture_rebuild(uuid, name, edges, *, group_id, old_summary=None):
+            captured_calls.append({'uuid': uuid, 'old_summary': old_summary})
+            return await original_rebuild(uuid, name, edges, group_id=group_id, old_summary=old_summary)
+
+        backend._rebuild_entity_from_edges = capture_rebuild
+
+        result = await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+        assert result['rebuilt'] == 2
+        # old_summary must be threaded from list_entity_nodes summary field
+        by_uuid = {c['uuid']: c for c in captured_calls}
+        assert by_uuid['uuid-1']['old_summary'] == 'alice summary'
+        assert by_uuid['uuid-2']['old_summary'] == 'bob summary'
+        # get_node_text must never be called
+        backend.get_node_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_partial_failure_in_update_does_not_cancel_others(
         self, mock_config, make_backend
     ):
