@@ -573,3 +573,86 @@ class TestSpeculativeMergeWorker:
         worker_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await worker_task
+
+    async def test_speculative_depth_cap(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """With depth-1 cap, N+2 is not speculatively merged until N+1's
+        speculation resolves.  Submit N, N+1, N+2 — all complete as 'done'.
+
+        Verified by tracking concurrent active merge worktrees: the count must
+        never exceed 2 (N's worktree while N is being verified, plus N+1's
+        speculative worktree).  N+2 is only started after N finishes.
+        """
+        wt_n = await _make_branch_with_file(
+            git_ops, 'cap-n', 'file_cap_n.py', 'cap_n = 1\n',
+        )
+        wt_n1 = await _make_branch_with_file(
+            git_ops, 'cap-n1', 'file_cap_n1.py', 'cap_n1 = 2\n',
+        )
+        wt_n2 = await _make_branch_with_file(
+            git_ops, 'cap-n2', 'file_cap_n2.py', 'cap_n2 = 3\n',
+        )
+
+        # Track maximum number of merge worktrees active at the same time.
+        # Each merge worktree is created in _create_merge_worktree and removed
+        # in cleanup_merge_worktree.  With depth-1, the peak must be ≤ 2.
+        active_worktrees: set[str] = set()
+        max_concurrent = 0
+        original_create = git_ops._create_merge_worktree
+        original_cleanup = git_ops.cleanup_merge_worktree
+
+        async def _tracking_create(base_sha=None):
+            wt, sha = await original_create(base_sha)
+            active_worktrees.add(str(wt))
+            nonlocal max_concurrent
+            max_concurrent = max(max_concurrent, len(active_worktrees))
+            return wt, sha
+
+        async def _tracking_cleanup(merge_wt):
+            active_worktrees.discard(str(merge_wt))
+            await original_cleanup(merge_wt)
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with (
+            patch.object(git_ops, '_create_merge_worktree', side_effect=_tracking_create),
+            patch.object(git_ops, 'cleanup_merge_worktree', side_effect=_tracking_cleanup),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req_n = _make_request('cap-n', 'cap-n', wt_n, config)
+            req_n1 = _make_request('cap-n1', 'cap-n1', wt_n1, config)
+            req_n2 = _make_request('cap-n2', 'cap-n2', wt_n2, config)
+            await queue.put(req_n)
+            await queue.put(req_n1)
+            await queue.put(req_n2)
+
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
+            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=60)
+
+        assert outcome_n.status == 'done', f'N: {outcome_n}'
+        assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
+        assert outcome_n2.status == 'done', f'N+2: {outcome_n2}'
+
+        # Depth-1 cap: at most 2 merge worktrees active simultaneously
+        # (the item being verified + 1 speculative item)
+        assert max_concurrent <= 2, (
+            f'Depth-1 cap violated: {max_concurrent} concurrent merge worktrees '
+            f'(expected ≤ 2)'
+        )
+
+        # All three files on main
+        for fname in ('file_cap_n.py', 'file_cap_n1.py', 'file_cap_n2.py'):
+            rc, _, _ = await _run(
+                ['git', 'cat-file', '-e', f'main:{fname}'],
+                cwd=git_ops.project_root,
+            )
+            assert rc == 0, f'{fname} not on main'
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
