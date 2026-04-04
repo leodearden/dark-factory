@@ -235,14 +235,17 @@ def create_server(
         wt = Path(worktree)
 
         try:
-            config = _load_config_for_worktree(wt)
+            loop = asyncio.get_running_loop()
+            config = await loop.run_in_executor(
+                None, _load_config_for_worktree, wt,
+            )
             task_files = await _get_task_files(wt)
             module_configs = _filter_module_configs(config.module_configs, task_files)
         except Exception as exc:
             logger.exception('Config/scoping setup failed for %s', worktree)
             return {'error': f'Config/scoping setup failed: {exc}'}
 
-        future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
+        future: asyncio.Future[MergeOutcome] = loop.create_future()
         await merge_queue.put(MergeRequest(
             task_id=task_id,
             branch=branch,
