@@ -211,6 +211,62 @@ class TestModuleConfigDiscovery:
         assert config._module_configs['backend'].max_per_module == 2
 
 
+class TestReloadModuleConfigs:
+    """Tests for OrchestratorConfig.reload_module_configs and module_configs property."""
+
+    def test_module_configs_empty_on_fresh_config(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = OrchestratorConfig()
+        assert config.module_configs == {}
+
+    def test_reload_module_configs_discovers_from_path(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = OrchestratorConfig()
+        sub = tmp_path / 'frontend'
+        sub.mkdir()
+        (sub / 'orchestrator.yaml').write_text(yaml.dump({
+            'test_command': 'uv run pytest frontend/',
+        }))
+        config.reload_module_configs(tmp_path)
+        assert 'frontend' in config.module_configs
+        assert config.module_configs['frontend'].test_command == 'uv run pytest frontend/'
+
+    def test_module_configs_property_returns_dict_after_reload(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = OrchestratorConfig()
+        sub = tmp_path / 'backend'
+        sub.mkdir()
+        (sub / 'orchestrator.yaml').write_text(yaml.dump({'lint_command': 'ruff check backend/'}))
+        config.reload_module_configs(tmp_path)
+        result = config.module_configs
+        assert isinstance(result, dict)
+        assert 'backend' in result
+        assert result['backend'].lint_command == 'ruff check backend/'
+
+    def test_reload_replaces_previous_module_configs(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = OrchestratorConfig()
+        # Load with one subproject
+        sub_a = tmp_path / 'alpha'
+        sub_a.mkdir()
+        (sub_a / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest alpha/'}))
+        config.reload_module_configs(tmp_path)
+        assert 'alpha' in config.module_configs
+        # Now point at a different dir with a different subproject
+        new_root = tmp_path / 'newroot'
+        new_root.mkdir()
+        sub_b = new_root / 'beta'
+        sub_b.mkdir()
+        (sub_b / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest beta/'}))
+        config.reload_module_configs(new_root)
+        assert 'beta' in config.module_configs
+        assert 'alpha' not in config.module_configs
+
+
 class TestLayeredConfig:
     """Tests for deep merge of package defaults + project config."""
 

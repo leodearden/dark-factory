@@ -348,6 +348,19 @@ class OrchestratorConfig(BaseSettings):
         self.project_root = self.project_root.resolve()
         return self
 
+    @property
+    def module_configs(self) -> dict[str, 'ModuleConfig']:
+        """Read-only access to discovered per-module configs."""
+        return self._module_configs
+
+    def reload_module_configs(self, project_root: Path) -> None:
+        """Re-discover per-module configs from *project_root*/\\*/orchestrator.yaml.
+
+        Replaces any previously loaded module configs. Useful when the
+        project_root differs from the initial load path (e.g. a worktree).
+        """
+        self._module_configs = discover_module_configs(project_root)
+
     def for_module(self, module_path: str) -> ModuleConfig | None:
         """Return ModuleConfig matching the first path component, or None."""
         if not self._module_configs:
