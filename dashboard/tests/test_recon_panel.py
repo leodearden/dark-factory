@@ -894,6 +894,67 @@ class TestVerdictCardExplanation:
         assert 'data-testid="verdict-explanation"' not in html
 
 
+class TestRunPanelJournalBadgeRegression:
+    """Regression tests: badge behaviours must survive the Alpine component refactor."""
+
+    def test_badge_visible_with_journal_entries(self, client):
+        """Badge renders when journal_entry_count > 0."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'data-testid="journal-badge"' in html
+
+    def test_badge_hidden_with_zero_entries(self, client):
+        """Badge not rendered when journal_entry_count == 0."""
+        runs_zero = [{**MOCK_RUNS[0], 'journal_entry_count': 0}]
+        with _patch_recon_data(runs=runs_zero):
+            html = client.get('/partials/recon').text
+        assert 'data-testid="journal-badge"' not in html
+
+    def test_badge_aria_label_contains_count(self, client):
+        """aria-label reflects the entry count."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'aria-label="Show 3 journal entries"' in html
+
+    def test_badge_is_button_element(self, client):
+        """Badge is a <button>, not a <span> or <div>."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        tag = _get_opening_tag(html, 'data-testid="journal-badge"')
+        assert tag.startswith('<button')
+
+    def test_badge_has_blue_bg_class(self, client):
+        """Badge retains its blue background CSS class."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'bg-blue-900' in html
+
+    def test_badge_has_hover_style(self, client):
+        """Badge retains hover style."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'hover:bg-blue-800' in html
+
+    def test_badge_has_focus_ring(self, client):
+        """Badge retains focus-ring accessibility styles."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'focus:ring-2' in html
+        assert 'focus:ring-blue-400' in html
+
+    def test_x_show_open_still_on_detail_row(self, client):
+        """Detail row still uses x-show=\"open\" for show/hide."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-show="open"' in html
+
+    def test_x_cloak_still_on_detail_row(self, client):
+        """Detail row still has x-cloak to prevent flash of unstyled content."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-cloak' in html
+
+
 class TestPartitionBurstStateNoneGuard:
     """Direct classification test for partition_burst_state with None last_write_at."""
 
