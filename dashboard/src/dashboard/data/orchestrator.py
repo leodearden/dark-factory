@@ -314,7 +314,7 @@ def discover_orchestrators(config: DashboardConfig) -> list[dict]:
 
     # Cache per-project data so we don't re-read the same tasks.json
     # when multiple processes share a project root.
-    project_cache: dict[Path, tuple[list[dict], dict[str, dict]]] = {}
+    project_cache: dict[Path, tuple[list[dict], dict[int, dict]]] = {}
 
     result: list[dict] = []
     for project_root, group in groups.items():

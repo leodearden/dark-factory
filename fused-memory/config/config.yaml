@@ -7,6 +7,7 @@ server:
   port: 8002
   stateless_http: true
   json_response: true
+  keepalive_timeout: 120
 
 llm:
   provider: "openai"

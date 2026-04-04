@@ -1168,21 +1168,27 @@ class MemoryService:
 
     async def refresh_entity_summary(
         self,
-        entity_uuid: str,
+        entity_uuid: str | None = None,
         project_id: str = 'main',
         agent_id: str | None = None,
         session_id: str | None = None,
         causation_id: str | None = None,
         _source: str = 'mcp_tool',
+        entity_name: str | None = None,
     ) -> dict:
         """Regenerate a Graphiti entity node's summary from its valid edges.
+
+        Accepts either *entity_uuid* (canonical identifier) or *entity_name*
+        (resolved via an exact name lookup).  When both are supplied, entity_uuid
+        takes precedence.  Raises ValueError if neither is provided.
 
         Delegates to GraphitiBackend.refresh_entity_summary(), which queries
         remaining valid edges, deduplicates their facts, and writes back a
         clean summary. Logs the operation via write journal if available.
 
         Args:
-            entity_uuid: UUID of the Entity node to refresh.
+            entity_uuid: UUID of the Entity node to refresh (optional when entity_name is given).
+            entity_name: Exact entity name to resolve to a UUID (optional when entity_uuid is given).
             project_id: Project scope (for journal logging).
             agent_id: Which agent is calling (optional).
             session_id: Session context (optional).
@@ -1191,11 +1197,27 @@ class MemoryService:
 
         Returns:
             Dict from backend: {uuid, name, old_summary, new_summary, edge_count}.
+
+        Raises:
+            ValueError: if neither entity_uuid nor entity_name is provided.
         """
+        if entity_uuid is None and entity_name is None:
+            raise ValueError('Either entity_uuid or entity_name must be provided')
+
+        # Resolve entity_name → UUID when UUID is not directly supplied
+        if entity_uuid is None:
+            assert entity_name is not None  # guaranteed by the ValueError check above
+            entity_uuid = await self.graphiti.resolve_entity_by_name(
+                entity_name, group_id=project_id
+            )
+
         write_op_id = str(uuid_mod.uuid4())
         success = True
         error_msg = None
         result: dict = {}
+        journal_params: dict = {'entity_uuid': entity_uuid}
+        if entity_name is not None:
+            journal_params['entity_name'] = entity_name
         try:
             result = await self.graphiti.refresh_entity_summary(entity_uuid, group_id=project_id)
         except Exception as e:
@@ -1213,7 +1235,7 @@ class MemoryService:
                         project_id=project_id,
                         agent_id=agent_id,
                         session_id=session_id,
-                        params={'entity_uuid': entity_uuid},
+                        params=journal_params,
                         result_summary=result if success else None,
                         success=success,
                         error=error_msg,

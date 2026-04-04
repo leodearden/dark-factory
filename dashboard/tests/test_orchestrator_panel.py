@@ -21,14 +21,14 @@ MOCK_ORCHESTRATOR_RUNNING = {
         {'id': 5, 'title': 'Deploy', 'status': 'pending', 'priority': 'low', 'dependencies': [4], 'metadata': {}},
     ],
     'worktrees': {
-        '1': {
+        1: {
             'phase': 'DONE',
             'plan_progress': {'done': 3, 'total': 3},
             'iteration_count': 2,
             'review_summary': '2/2 passed',
             'modules': ['infra/'],
         },
-        '3': {
+        3: {
             'phase': 'EXECUTE',
             'plan_progress': {'done': 1, 'total': 4},
             'iteration_count': 5,
@@ -140,6 +140,59 @@ class TestOrchestratorRouteBasics:
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
         assert 'Show tasks' in html
+
+    def test_table_wrapper_hidden_by_default(self, client):
+        """Task table wrapper must have style='display:none' so it is hidden
+        even before Alpine processes the element after an HTMX morph."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'style="display:none"' in html
+
+    def test_table_wrapper_has_x_cloak(self, client):
+        """Wrapper retains x-cloak for initial page load (non-HTMX) scenarios."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'x-cloak' in html
+
+    def test_table_wrapper_x_show_uses_store(self, client):
+        """x-show references $store.panels[key] so state persists across morphs."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # The x-show must use $store.panels, not local x-data state
+        assert "x-show=\"$store.panels[" in html
+
+    def test_button_x_text_uses_store(self, client):
+        """Button x-text expression uses $store.panels[key] for label toggling."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert "x-text=\"$store.panels[" in html
+
+    def test_task_table_wrapper_has_x_cloak(self, client):
+        """x-show div must have x-cloak so it is hidden before Alpine initializes
+        after an innerHTML swap (MutationObserver detects new x-data elements)."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'x-cloak' in html
+
+    def test_store_key_consistent_between_toggle_and_show(self, client):
+        """The $store.panels key in @click toggle must match the x-show key.
+
+        Extracts both keys from the rendered HTML and asserts they are equal.
+        Guards against key drift between the button and the table wrapper.
+        """
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # Extract key from @click: $store.panels['<key>'] = !$store.panels['<key>']
+        click_match = re.search(r"\$store\.panels\['([^']+)'\]\s*=\s*!", html)
+        # Extract key from x-show: x-show="$store.panels['<key>']"
+        show_match = re.search(r'x-show="\$store\.panels\[\'([^\']+)\'\]"', html)
+        assert click_match is not None, '@click $store.panels key not found'
+        assert show_match is not None, 'x-show $store.panels key not found'
+        assert click_match.group(1) == show_match.group(1), (
+            f'Key mismatch: @click uses {click_match.group(1)!r} '
+            f'but x-show uses {show_match.group(1)!r}'
+        )
 
     def test_card_shows_single_pid_label(self, client):
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
