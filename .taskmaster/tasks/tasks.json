@@ -8544,6 +8544,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 434,
+        "title": "Test improvements for rebuild/refresh entity summary pipeline",
+        "description": "Review suggestions from task 419 reviewers (deferred as non-blocking). All in test files:\n\n1. Stale mock: test_returns_aggregate_result mocks list_entity_nodes but non-force path now routes through _detect_stale_summaries_with_edges — mock the private method consistently (test_analyst)\n2. Missing edge case: no test for old_summary=empty-string with name provided — valid production path from force-path optimization (test_analyst)\n3. Assertion clarity: test_prefetched_edges_produce_correct_summary should assert unique fact count differs from edge_count (test_analyst)\n4. Misleading mock: test_force_list_entity_nodes_called_exactly_once uses uuid-1 data for all calls — use generic return values (test_analyst)\n\nFiles: fused-memory/tests/test_rebuild_entity_summaries.py, fused-memory/tests/test_refresh_entity_summary.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8556,7 +8567,7 @@
       ],
       "created": "2026-04-04T08:47:48.334Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T08:48:00.310Z"
+      "updated": "2026-04-04T08:48:07.682Z"
     }
   }
 }
