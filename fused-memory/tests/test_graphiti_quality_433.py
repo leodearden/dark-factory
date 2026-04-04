@@ -249,3 +249,61 @@ class TestRebuildEntitySummariesForceDryRun:
         assert len(result['details']) == 3
         for detail in result['details']:
             assert detail['status'] == 'skipped_dry_run'
+
+
+# ---------------------------------------------------------------------------
+# step-9: regression – rebuild_entity_summaries(force=False) data flow
+# ---------------------------------------------------------------------------
+
+class TestRebuildEntitySummariesDataFlow:
+    """rebuild_entity_summaries(force=False) correctly flows total_entities from detect step."""
+
+    @pytest.mark.asyncio
+    async def test_total_entities_flows_from_detect_step(self, mock_config, make_backend):
+        """total_entities in result matches _detect_stale_summaries_with_edges.total_count."""
+        from fused_memory.backends.graphiti_client import StaleSummaryResult
+
+        backend = make_backend(mock_config)
+        stale_list = [{'uuid': 'u1', 'name': 'Alice'}]
+        all_edges = {'u1': [{'fact': 'Alice knows Bob'}]}
+        # total_count=10 means 10 entities exist but only 1 is stale
+        detect_result = StaleSummaryResult(
+            stale=stale_list, edges=all_edges, total_count=10
+        )
+        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
+        backend._rebuild_entity_from_edges = AsyncMock(return_value={
+            'uuid': 'u1', 'name': 'Alice',
+            'old_summary': 'old', 'new_summary': 'Alice knows Bob', 'edge_count': 1,
+        })
+
+        result = await backend.rebuild_entity_summaries(group_id='test', force=False)
+
+        assert result['total_entities'] == 10   # flows from total_count=10
+        assert result['stale_entities'] == 1    # only 1 stale
+        assert result['rebuilt'] == 1
+        assert result['skipped'] == 0
+        assert result['errors'] == 0
+
+    @pytest.mark.asyncio
+    async def test_force_false_dry_run_total_entities_from_detect(self, mock_config, make_backend):
+        """force=False, dry_run=True: total_entities still comes from detect step."""
+        from fused_memory.backends.graphiti_client import StaleSummaryResult
+
+        backend = make_backend(mock_config)
+        stale_list = [
+            {'uuid': 'u1', 'name': 'Alice'},
+            {'uuid': 'u2', 'name': 'Bob'},
+        ]
+        detect_result = StaleSummaryResult(
+            stale=stale_list, edges={}, total_count=7
+        )
+        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
+
+        result = await backend.rebuild_entity_summaries(
+            group_id='test', force=False, dry_run=True
+        )
+
+        assert result['total_entities'] == 7
+        assert result['stale_entities'] == 2
+        assert result['skipped'] == 2
+        assert result['rebuilt'] == 0
