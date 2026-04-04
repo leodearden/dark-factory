@@ -712,7 +712,8 @@ class TestReconDetailTrigger:
     def test_no_local_open_state_in_x_data(self, client):
         with _patch_recon_data():
             html = client.get('/partials/recon').text
-        assert 'x-data="{ open: false }"' in html
+        assert 'x-data="runPanel"' in html
+        assert 'x-data="{ open: false }"' not in html
         assert "x-data='{ open: false }'" not in html
 
     def test_zero_journal_count_hides_badge_and_detail(self, client):
