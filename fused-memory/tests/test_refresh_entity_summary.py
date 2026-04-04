@@ -60,6 +60,28 @@ class TestGetValidEdgesForNode:
             await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
 
     @pytest.mark.asyncio
+    async def test_null_fact_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
+        """Rows with NULL fact field (row[1] is None) yield fact='' in result dict."""
+        backend = make_backend(mock_config)
+        rows = [['edge-1', None, 'knows']]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
+        assert len(result) == 1
+        assert result[0]['fact'] == ''
+
+    @pytest.mark.asyncio
+    async def test_null_name_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
+        """Rows with NULL name field (row[2] is None) yield name='' in result dict."""
+        backend = make_backend(mock_config)
+        rows = [['edge-1', 'Alice knows Bob', None]]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
+        assert len(result) == 1
+        assert result[0]['name'] == ''
+
+    @pytest.mark.asyncio
     async def test_passes_uuid_to_query(self, mock_config, make_backend, make_graph_mock):
         """Passes node UUID as parameter to the Cypher query."""
         backend = make_backend(mock_config)
