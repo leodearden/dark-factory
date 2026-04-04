@@ -8500,6 +8500,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 430,
+        "title": "Improve type clarity and reduce duplication in stale detection",
+        "description": "In graphiti_client.py: (1) Define a NamedTuple for the 3-tuple returned by _detect_stale_summaries_with_edges. (2) Extract `list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))` into a _canonical_facts helper. (3) Hoist all_entities declaration above the if/else in rebuild_entity_summaries.",
+        "details": "File: fused-memory/src/fused_memory/backends/graphiti_client.py (lines 764-826, 777/843, 892-906). Source: review suggestions from task 419 (esc-419-25).",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8512,7 +8523,7 @@
       ],
       "created": "2026-04-04T08:43:24.308Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T08:43:24.310Z"
+      "updated": "2026-04-04T08:43:27.418Z"
     }
   }
 }
