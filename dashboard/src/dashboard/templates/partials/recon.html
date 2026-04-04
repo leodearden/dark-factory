@@ -193,6 +193,7 @@
                 {% endif %}
               </td>
             </tr>
+            {% if run.journal_entry_count > 0 %}
             <tr x-show="open" x-cloak>
               <td colspan="{{ col_count }}" class="p-4 bg-gray-900/50">
                 <div hx-get="/partials/recon/run/{{ run.id }}" hx-trigger="load-detail" hx-swap="innerHTML" x-ref="detail" hx-on::after-swap="this.dataset.loaded = 'true'; delete this.dataset.loading" hx-on::after-request="if(event.detail.failed || !event.detail.successful) delete this.dataset.loading">
@@ -200,6 +201,7 @@
                 </div>
               </td>
             </tr>
+            {% endif %}
           </tbody>
         {% endfor %}
       </table>
