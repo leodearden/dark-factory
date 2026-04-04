@@ -225,6 +225,18 @@ async def run_server():
             logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')
             configure_uvicorn_logging()
             starlette_app = mcp.streamable_http_app()
+
+            # Return JSON (not plain-text) for 404s so that MCP SDK
+            # clients attempting OAuth discovery against well-known
+            # endpoints don't crash on JSON.parse("Not Found").
+            from starlette.exceptions import HTTPException
+            from starlette.requests import Request as StarletteRequest
+            from starlette.responses import JSONResponse
+
+            async def _json_http_error(request: StarletteRequest, exc: HTTPException) -> JSONResponse:
+                return JSONResponse({'error': exc.detail}, status_code=exc.status_code)
+
+            starlette_app.add_exception_handler(HTTPException, _json_http_error)  # type: ignore[arg-type]
             uv_config = uvicorn.Config(
                 starlette_app,
                 host=config.server.host,
