@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,8 @@ from fastmcp import FastMCP
 
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+
+logger = logging.getLogger(__name__)
 
 CATEGORIES = [
     'scope_violation',
@@ -27,6 +30,57 @@ CATEGORIES = [
     # Review triage
     'review_suggestions',
 ]
+
+
+# --- Merge-request helpers ---
+
+
+def _filter_module_configs(
+    all_configs: dict[str, Any],
+    task_files: list[str] | None,
+) -> list[Any]:
+    """Return only module configs whose prefix matches at least one task file.
+
+    When *task_files* is ``None`` or empty, returns all configs (no filtering).
+    """
+    if not task_files:
+        return list(all_configs.values())
+    return [
+        mc for prefix, mc in all_configs.items()
+        if any(f.startswith(prefix + '/') for f in task_files)
+    ]
+
+
+async def _get_task_files(wt: Path) -> list[str] | None:
+    """Get changed files in the worktree branch vs main via ``git diff``."""
+    proc = await asyncio.create_subprocess_exec(
+        'git', 'diff', 'main..HEAD', '--name-only',
+        cwd=str(wt),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        logger.warning('git diff failed in %s: %s', wt, stderr.decode().strip())
+        return None
+    files = [f for f in stdout.decode().strip().split('\n') if f]
+    return files if files else None
+
+
+def _load_config_for_worktree(wt: Path) -> Any:
+    """Load OrchestratorConfig from the worktree's project config.
+
+    Falls back to default config when the config file is absent.
+    Re-discovers module configs from the worktree so that any
+    orchestrator.yaml changes on the branch are picked up.
+    """
+    from orchestrator.config import _discover_module_configs, load_config
+
+    config_path = wt / 'orchestrator' / 'config.yaml'
+    config = load_config(config_path if config_path.exists() else None)
+    # Re-discover from worktree to pick up branch-local orchestrator.yaml changes
+    config._module_configs = _discover_module_configs(wt)
+    return config
 
 
 def create_server(
@@ -166,18 +220,23 @@ def create_server(
         if merge_queue is None:
             return {'error': 'Merge queue not available — orchestrator not running'}
 
-        from orchestrator.config import OrchestratorConfig
         from orchestrator.merge_queue import MergeOutcome, MergeRequest
+
+        wt = Path(worktree)
+
+        config = _load_config_for_worktree(wt)
+        task_files = await _get_task_files(wt)
+        module_configs = _filter_module_configs(config._module_configs, task_files)
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
         await merge_queue.put(MergeRequest(
             task_id=task_id,
             branch=branch,
-            worktree=Path(worktree),
+            worktree=wt,
             pre_rebased=False,
-            task_files=None,
-            module_configs=[],
-            config=OrchestratorConfig(),
+            task_files=task_files,
+            module_configs=module_configs,
+            config=config,
             result=future,
         ))
 
