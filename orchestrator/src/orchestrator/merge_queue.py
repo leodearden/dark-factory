@@ -540,8 +540,13 @@ class SpeculativeMergeWorker:
         """Verify and CAS-advance for each SpeculativeItem from the Merger.
 
         When N's verification/advance fails and N+1 was speculatively merged,
-        the Verifier re-merges N+1 against actual main and re-verifies.
+        the Verifier discards N+1's stale worktree and re-merges it against
+        actual main before re-verifying.
         """
+        # True when the previous non-speculative item failed verification
+        # or CAS, meaning any following speculative item is invalid.
+        n_failed = False
+
         while True:
             item = await self._verifier_queue.get()
             if item is None:
@@ -549,32 +554,69 @@ class SpeculativeMergeWorker:
 
             req = item.request
 
+            # ── Discard stale speculative merge when N failed ──────────
+            if item.speculative and n_failed:
+                # Clean up the stale merge worktree (merged against N's commit
+                # which never reached main).
+                if item.merge_wt:
+                    await self._git_ops.cleanup_merge_worktree(item.merge_wt)
+                self._emit_speculative(
+                    EventType.speculative_discard, req.task_id,
+                    reason='previous_failed',
+                )
+                logger.info(
+                    f'Task {req.task_id}: discarding stale speculative merge, '
+                    f're-merging against actual main'
+                )
+                item = await self._remerge(req)
+
             # ── Immediate outcome (already_merged / conflict / blocked) ─
             if item.immediate_outcome is not None:
                 if not req.result.done():
                     req.result.set_result(item.immediate_outcome)
-                # Free the speculation slot if this was a speculative item
-                if item.speculative:
-                    self._speculation_slot.set()
-                else:
-                    self._speculation_slot.set()  # always free after processing
+                n_failed = item.immediate_outcome.status not in ('done', 'already_merged')
+                self._speculation_slot.set()
                 continue
 
-            merge_wt = item.merge_wt
-            assert merge_wt is not None
-            assert item.merge_result is not None
-            assert item.merge_result.merge_commit is not None
-
             n_succeeded = await self._verify_and_advance(item)
-            # Free speculation slot after we've processed this item
+            n_failed = not n_succeeded
             self._speculation_slot.set()
 
-            if not n_succeeded and item.speculative:
-                # N failed but N+1 (this item) was speculatively merged —
-                # Verifier re-merges N+1 against actual main.
-                # (This path is reached when a subsequent item arrives
-                # with speculative=True and the previous N failed.)
-                pass  # handled inside _verify_and_advance
+    async def _remerge(self, req: MergeRequest) -> SpeculativeItem:
+        """Re-merge a request against actual main after speculation invalidation."""
+        actual_main = await self._git_ops.get_main_sha()
+        merge_result = await self._git_ops.merge_to_main(
+            req.worktree, req.branch, base_sha=None,
+        )
+        if merge_result.conflicts:
+            self._emit_merge(req.task_id, 'conflict')
+            if merge_result.merge_worktree:
+                await self._git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+            return SpeculativeItem(
+                request=req, merge_result=None, merge_wt=None,
+                base_sha=actual_main, speculative=False, skip_verify=False,
+                immediate_outcome=MergeOutcome(
+                    'conflict', conflict_details=merge_result.details,
+                ),
+            )
+        if not merge_result.success:
+            if merge_result.merge_worktree:
+                await self._git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+            return SpeculativeItem(
+                request=req, merge_result=None, merge_wt=None,
+                base_sha=actual_main, speculative=False, skip_verify=False,
+                immediate_outcome=MergeOutcome('blocked', reason=merge_result.details),
+            )
+        skip_verify = (
+            req.pre_rebased
+            and merge_result.pre_merge_sha is not None
+            and merge_result.pre_merge_sha == actual_main
+        )
+        return SpeculativeItem(
+            request=req, merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=actual_main, speculative=False, skip_verify=skip_verify,
+        )
 
     async def _verify_and_advance(self, item: SpeculativeItem) -> bool:
         """Run verification + CAS advance for one item.
