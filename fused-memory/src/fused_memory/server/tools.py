@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid as uuid_mod
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -226,6 +227,7 @@ def create_mcp_server(
         source_description: str = '',
         metadata: dict | None = None,
         temporal_context: str | None = None,
+        reference_time: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add an episode to memory. Full ingestion pipeline: raw content is processed
@@ -244,6 +246,13 @@ def create_mcp_server(
                 "planning", or "current". When set, the value is prepended to
                 source_description as '[temporal:X] ' so downstream readers can
                 infer the time-frame of the episode without parsing content.
+            reference_time: Optional ISO 8601 datetime string (e.g.
+                "2026-03-22T00:00:00+00:00") that sets the historical valid_at
+                anchor for Graphiti edge extraction. Use when ingesting retrospective
+                episodes to prevent temporal contamination (valid_at = ingestion
+                time instead of the date the described state was current).
+                Complements temporal_context='retrospective': temporal_context marks
+                the *kind* of episode; reference_time sets the *timestamp*.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         if err := validate_project_id(project_id):
@@ -256,6 +265,18 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
+        parsed_reference_time = None
+        if reference_time is not None:
+            try:
+                parsed_reference_time = datetime.fromisoformat(reference_time)
+            except ValueError:
+                return {
+                    'error': (
+                        f'Invalid reference_time {reference_time!r}. '
+                        'Must be an ISO 8601 datetime string, e.g. "2026-03-22T00:00:00+00:00".'
+                    ),
+                    'error_type': 'ValidationError',
+                }
         try:
             causation_id, op_source, _ = _extract_causation(metadata, agent_id)
             result = await memory_service.add_episode(
@@ -267,6 +288,7 @@ def create_mcp_server(
                 source_description=source_description,
                 causation_id=causation_id,
                 temporal_context=temporal_context,
+                reference_time=parsed_reference_time,
                 _source=op_source,
             )
             return result.model_dump()
