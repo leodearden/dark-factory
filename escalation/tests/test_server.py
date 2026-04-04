@@ -11,9 +11,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from escalation.queue import EscalationQueue
 from escalation.server import (
     _filter_module_configs,
     _get_task_files,
+    _load_config_for_worktree,
+    create_server,
 )
 
 
@@ -199,8 +202,7 @@ class TestLoadConfigForWorktree:
         mock_config_mod.load_config.return_value = mock_config
 
         with sys_patch:
-            from escalation.server import _load_config_for_worktree as load_fn
-            result = load_fn(tmp_path)
+            result = _load_config_for_worktree(tmp_path)
 
         mock_config_mod.load_config.assert_called_once_with(config_file)
         assert result is mock_config
@@ -211,8 +213,7 @@ class TestLoadConfigForWorktree:
         mock_config_mod.load_config.return_value = mock_config
 
         with sys_patch:
-            from escalation.server import _load_config_for_worktree as load_fn
-            result = load_fn(tmp_path)
+            result = _load_config_for_worktree(tmp_path)
 
         mock_config_mod.load_config.assert_called_once_with(None)
         assert result is mock_config
@@ -224,8 +225,7 @@ class TestLoadConfigForWorktree:
         mock_config_mod.load_config.return_value = mock_config
 
         with sys_patch:
-            from escalation.server import _load_config_for_worktree as load_fn
-            load_fn(tmp_path)
+            _load_config_for_worktree(tmp_path)
 
         mock_config.reload_module_configs.assert_called_once_with(tmp_path)
 
@@ -238,8 +238,7 @@ class TestLoadConfigForWorktree:
         mock_config_mod.load_config.return_value = mock_config
 
         with sys_patch:
-            from escalation.server import _load_config_for_worktree as load_fn
-            load_fn(tmp_path)
+            _load_config_for_worktree(tmp_path)
 
         # _module_configs should never be set as an attribute
         assert '_module_configs' not in mock_config.__dict__
@@ -251,9 +250,6 @@ class TestMergeRequestIntegration:
     @pytest.mark.asyncio
     async def test_merge_request_populates_scoping_fields(self):
         """MergeRequest receives task_files from git diff and filtered module_configs."""
-        from escalation.queue import EscalationQueue
-        from escalation.server import create_server
-
         captured: list = []
 
         async def capture_put(req):
@@ -294,9 +290,6 @@ class TestMergeRequestIntegration:
 
     @pytest.mark.asyncio
     async def test_merge_request_no_queue_returns_error(self):
-        from escalation.queue import EscalationQueue
-        from escalation.server import create_server
-
         server = create_server(EscalationQueue(Path('/tmp/fake-queue')), merge_queue=None)
         result = await server.call_tool(
             'merge_request',
@@ -307,9 +300,6 @@ class TestMergeRequestIntegration:
     @pytest.mark.asyncio
     async def test_config_setup_failure_returns_error_dict(self):
         """When _load_config_for_worktree raises, merge_request returns an error dict."""
-        from escalation.queue import EscalationQueue
-        from escalation.server import create_server
-
         mock_queue = MagicMock()
         sys_patch, _, _ = _mock_orchestrator_modules()
 
@@ -340,9 +330,6 @@ class TestMergeRequestIntegration:
         Patches MERGE_TIMEOUT_SECS to 0.01 so the test finishes in milliseconds.
         The future is never resolved (simulating a stalled merge worker).
         """
-        from escalation.queue import EscalationQueue
-        from escalation.server import create_server
-
         captured: list = []
 
         async def capture_put_no_resolve(req):
