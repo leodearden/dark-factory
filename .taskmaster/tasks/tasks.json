@@ -8483,10 +8483,11 @@
         "description": "In fused-memory/src/fused_memory/services/memory_service.py, around the refresh_entity_summary method (lines 1169-1249): (1) Move entity_name parameter to immediately follow entity_uuid in the signature; (2) Remove the assert entity_name is not None at line 1209 — replace with a comment since the ValueError above is sufficient; (3) Add NodeNotFoundError and AmbiguousEntityError to the Raises section of the docstring; (4) Move the resolve_entity_by_name call at lines 1208-1212 inside the try block (before write_op_id initialization) so that resolution failures are journaled via the finally handler.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T04:33:43.215Z"
       },
       {
         "id": "427",
@@ -8535,7 +8536,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T04:33:42.989Z",
+      "lastModified": "2026-04-04T04:33:43.215Z",
       "taskCount": 409,
       "completedCount": 388,
       "tags": [
