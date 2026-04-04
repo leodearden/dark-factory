@@ -8519,11 +8519,11 @@
         "description": "Refactor tests that mock private _detect_stale_summaries_with_edges to instead mock leaf DB methods (list_entity_nodes, get_all_valid_edges). This decouples tests from internal factoring while preserving behavioral coverage.",
         "details": "File: fused-memory/tests/test_rebuild_entity_summaries.py (lines 207, 283, 320, _make_private_mock). Source: review suggestions from task 419 (esc-419-25).",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-04-04T13:22:20.131Z"
+        "updatedAt": "2026-04-04T14:11:38.539Z"
       },
       {
         "id": "432",
@@ -8609,9 +8609,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T13:22:20.133Z",
+      "lastModified": "2026-04-04T14:11:38.539Z",
       "taskCount": 416,
-      "completedCount": 391,
+      "completedCount": 392,
       "tags": [
         "master"
       ]
