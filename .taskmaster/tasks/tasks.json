@@ -8431,10 +8431,11 @@
         "description": "Five test gaps identified in test_rebuild_entity_summaries.py:\n\n1. **Entity with zero valid edges**: No test for entity with non-empty summary but zero valid edges. Should flag stale with stale_line_count>0, valid_fact_count=0. Rebuild should write empty summary. (suggestion 11)\n\n2. **dry_run assertion gap**: test_dry_run only asserts update_node_summary not awaited but not get_node_text. Add assertion that get_node_text is also not called. (suggestion 12)\n\n3. **Fragile Cypher extraction**: test_cypher_filters_invalid_at_is_null extracts Cypher via fragile call_args logic with silent fallback to empty string. Use `call_args.args[0]` with informative assertion message. (suggestion 13)\n\n4. **NULL edge values**: No test for rows with NULL fact/name values. Production code handles with `row[2] or ''` but this isn't tested. (suggestion 14)\n\n5. **Ordering-sensitive staleness**: No test documenting that summary with same facts in different order triggers rebuild. Add test documenting this as expected behavior. (suggestion 16)\n\nmemory_hint: search \"test_rebuild_entity_summaries\" for test file context.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T08:40:34.567Z"
       },
       {
         "id": "425",
@@ -8492,7 +8493,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T08:40:34.502Z",
+      "lastModified": "2026-04-04T08:40:34.567Z",
       "taskCount": 407,
       "completedCount": 388,
       "tags": [
