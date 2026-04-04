@@ -921,3 +921,15 @@ class TestRunPanelAlpineComponent:
         with _patch_recon_data():
             html = client.get('/partials/recon').text
         assert "alpine:init" not in html
+
+    def test_tbody_uses_named_component(self, client):
+        """tbody uses x-data=\"runPanel\" (named component, not inline object)."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-data="runPanel"' in html
+
+    def test_inline_open_false_not_present(self, client):
+        """Old inline x-data=\"{ open: false }\" pattern is removed."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-data="{ open: false }"' not in html

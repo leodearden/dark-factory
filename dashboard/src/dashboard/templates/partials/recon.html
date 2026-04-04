@@ -159,7 +159,7 @@
         </thead>
         {% set col_count = 8 if multi_project_runs else 7 %}
         {% for run in runs %}
-          <tbody x-data="{ open: false }" id="run-{{ run.id }}">
+          <tbody x-data="runPanel" id="run-{{ run.id }}">
             <tr class="border-b border-gray-700">
               {% if multi_project_runs %}
                 <td class="py-2 text-gray-300">{{ run.project_id | project_name }}</td>
