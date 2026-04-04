@@ -503,3 +503,73 @@ class TestSpeculativeMergeWorker:
         worker_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await worker_task
+
+    async def test_speculative_discard_on_failure(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """When N's verification fails, N+1's speculative merge is discarded
+        and re-merged against actual main.  N returns 'blocked', N+1 returns
+        'done' after the fresh re-merge.
+        """
+        wt_n = await _make_branch_with_file(
+            git_ops, 'disc-n', 'file_disc_n.py', 'disc_n = 1\n',
+        )
+        wt_n1 = await _make_branch_with_file(
+            git_ops, 'disc-n1', 'file_disc_n1.py', 'disc_n1 = 2\n',
+        )
+
+        # Track how many times verify is called per task
+        verify_calls: dict[str, int] = {}
+
+        async def _verify_side_effect(merge_wt, cfg, module_configs, task_files=None):
+            # Determine which task by looking at which file is present
+            n_file = merge_wt / 'file_disc_n.py'
+            if n_file.exists():
+                verify_calls['n'] = verify_calls.get('n', 0) + 1
+                result = AsyncMock()
+                result.passed = False
+                result.summary = 'N tests failed'
+                return result
+            else:
+                verify_calls['n1'] = verify_calls.get('n1', 0) + 1
+                result = AsyncMock()
+                result.passed = True
+                result.summary = ''
+                return result
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=_verify_side_effect,
+        ):
+            req_n = _make_request('disc-n', 'disc-n', wt_n, config)
+            req_n1 = _make_request('disc-n1', 'disc-n1', wt_n1, config)
+            await queue.put(req_n)
+            await queue.put(req_n1)
+
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
+
+        assert outcome_n.status == 'blocked', f'N should be blocked: {outcome_n}'
+        assert outcome_n1.status == 'done', f'N+1 should succeed after re-merge: {outcome_n1}'
+
+        # N+1's file must appear on main (re-merged and advanced)
+        _, out_n1, _ = await _run(
+            ['git', 'show', 'main:file_disc_n1.py'], cwd=git_ops.project_root,
+        )
+        assert 'disc_n1 = 2' in out_n1
+
+        # N's file must NOT be on main (N was blocked)
+        rc, _, _ = await _run(
+            ['git', 'cat-file', '-e', 'main:file_disc_n.py'],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, 'N file should not be on main'
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
