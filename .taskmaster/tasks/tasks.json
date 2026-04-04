@@ -8362,6 +8362,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 420,
+        "title": "Move batch rebuild orchestration from GraphitiBackend to service/manager layer",
+        "description": "GraphitiBackend is a data-access layer (thin Cypher wrappers), but `rebuild_entity_summaries` introduces cross-cutting concerns: concurrency policy (asyncio.Semaphore(20)), error aggregation with asyncio.gather(return_exceptions=True), structured result dicts with status fields, and structured logging. These belong in `MemoryService.rebuild_entity_summaries()` or `RebuildSummariesManager.run()`.\n\nThe backend should expose only:\n- `refresh_entity_summary` (single-entity primitive)\n- `list_entity_nodes` and `get_all_valid_edges` (bulk reads)\n\nThe service/manager layer owns fan-out, retry policy, and aggregate reporting.\n\nmemory_hint: search \"GraphitiBackend rebuild\" for current architecture.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8374,7 +8385,7 @@
       ],
       "created": "2026-04-04T03:14:41.895Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T03:15:09.460Z"
+      "updated": "2026-04-04T03:15:14.947Z"
     }
   }
 }
