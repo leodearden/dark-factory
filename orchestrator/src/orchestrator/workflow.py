@@ -8,10 +8,12 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from shared.config_dir import TaskConfigDir
+from shared.cost_store import CostStore
 
 from orchestrator.agents.invoke import AgentResult, invoke_with_cap_retry
 from orchestrator.agents.roles import (
@@ -139,6 +141,7 @@ class TaskWorkflow:
         steward_factory=None,
         merge_queue: asyncio.Queue | None = None,
         event_store: EventStore | None = None,
+        cost_store: CostStore | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -148,6 +151,7 @@ class TaskWorkflow:
         self.mcp = mcp
         self.merge_queue = merge_queue
         self.event_store = event_store
+        self.cost_store = cost_store
 
         self.state = WorkflowState.PLAN
         self._phase_cost_at_entry: float = 0.0
@@ -1224,6 +1228,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 escalation_url = f'http://{esc.host}:{esc.port}/mcp'
             mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
 
+        started_at = datetime.now(UTC).isoformat()
         result = await invoke_with_cap_retry(
             usage_gate=self.usage_gate,
             label=f'Task {self.task_id} [{role.name}]',
@@ -1243,6 +1248,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             backend=backend_val,
             timeout_seconds=timeout_val,
         )
+        completed_at = datetime.now(UTC).isoformat()
 
         # Track metrics
         self.metrics.total_cost_usd += result.cost_usd
@@ -1281,6 +1287,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     'cache_create_tokens': result.cache_create_tokens,
                 },
             )
+
+        if self.cost_store:
+            try:
+                await self.cost_store.save_invocation(
+                    run_id=self.event_store.run_id if self.event_store else '',
+                    task_id=self.task_id,
+                    project_id=self.config.fused_memory.project_id,
+                    account_name=result.account_name,
+                    model=model,
+                    role=role.name,
+                    cost_usd=result.cost_usd,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    cache_read_tokens=result.cache_read_tokens,
+                    cache_create_tokens=result.cache_create_tokens,
+                    duration_ms=result.duration_ms,
+                    capped=False,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                )
+            except Exception:
+                logger.warning('Failed to save invocation cost', exc_info=True)
 
         return result
 
