@@ -15,10 +15,78 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.backends.graphiti_client import (
+    AmbiguousEntityError,
+    GraphitiBackend,
+    NodeNotFoundError,
+)
 
 # ---------------------------------------------------------------------------
-# step-1: GraphitiBackend.get_valid_edges_for_node
+# step-1 (task-309): GraphitiBackend.resolve_entity_by_name
+# ---------------------------------------------------------------------------
+
+class TestResolveEntityByName:
+    """GraphitiBackend.resolve_entity_by_name(name, group_id) resolves name→UUID."""
+
+    @pytest.mark.asyncio
+    async def test_returns_uuid_on_exact_name_match(self, mock_config, make_backend, make_graph_mock):
+        """Returns the single UUID when exactly one entity matches the name."""
+        backend = make_backend(mock_config)
+        rows = [['uuid-alice', 'Alice']]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.resolve_entity_by_name('Alice', group_id='test')
+        assert result == 'uuid-alice'
+
+    @pytest.mark.asyncio
+    async def test_raises_node_not_found_when_no_match(self, mock_config, make_backend, make_graph_mock):
+        """Raises NodeNotFoundError when no entity has the given name."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        with pytest.raises(NodeNotFoundError):
+            await backend.resolve_entity_by_name('NonExistent', group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_raises_ambiguous_error_when_multiple_match(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """Raises AmbiguousEntityError when multiple entities share the same name."""
+        backend = make_backend(mock_config)
+        rows = [['uuid-1', 'Alice'], ['uuid-2', 'Alice']]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        with pytest.raises(AmbiguousEntityError) as exc_info:
+            await backend.resolve_entity_by_name('Alice', group_id='test')
+        # Error message should include both UUIDs so callers can disambiguate
+        assert 'uuid-1' in str(exc_info.value)
+        assert 'uuid-2' in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        """Raises RuntimeError when backend client is not initialized."""
+        backend = GraphitiBackend(mock_config)  # _driver is None
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.resolve_entity_by_name('Alice', group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_passes_name_as_cypher_parameter(self, mock_config, make_backend, make_graph_mock):
+        """Passes the name as a Cypher parameter (not interpolated into query string)."""
+        backend = make_backend(mock_config)
+        rows = [['uuid-alice', 'Alice']]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        entity_name = 'Alice'
+        await backend.resolve_entity_by_name(entity_name, group_id='test')
+        call_args = graph.query.call_args
+        assert call_args is not None
+        args, kwargs = call_args
+        cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        assert cypher_params.get('name') == entity_name
+
+
+# ---------------------------------------------------------------------------
+# step-1 (original): GraphitiBackend.get_valid_edges_for_node
 # ---------------------------------------------------------------------------
 
 class TestGetValidEdgesForNode:
