@@ -779,7 +779,14 @@ class GraphitiBackend:
         """
         return list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
 
-    async def refresh_entity_summary(self, node_uuid: str, *, group_id: str) -> dict:
+    async def refresh_entity_summary(
+        self,
+        node_uuid: str,
+        *,
+        group_id: str,
+        name: str | None = None,
+        old_summary: str | None = None,
+    ) -> dict[str, Any]:
         """Regenerate an Entity node's summary from its currently-valid edges.
 
         Fetches the node's current name and summary, queries all valid
@@ -792,11 +799,22 @@ class GraphitiBackend:
 
         Args:
             node_uuid: UUID of the Entity node to refresh.
+            group_id: Project graph to target.
+            name: Optional entity name (must be paired with old_summary). When
+                both are supplied, get_node_text is skipped — useful when the
+                caller already has this data (e.g. _rebuild_entity_from_edges).
+            old_summary: Optional current summary text (must be paired with name).
 
         Returns:
             Dict with keys: uuid, name, old_summary, new_summary, edge_count.
+
+        Raises:
+            ValueError: if exactly one of name/old_summary is provided.
         """
-        name, old_summary = await self.get_node_text(node_uuid, group_id=group_id)
+        if (name is None) != (old_summary is None):
+            raise ValueError('name and old_summary must both be provided or both omitted')
+        if name is None:
+            name, old_summary = await self.get_node_text(node_uuid, group_id=group_id)
         edges = await self.get_valid_edges_for_node(node_uuid, group_id=group_id)
         facts = self._canonical_facts(edges)
         new_summary = '\n'.join(facts)
