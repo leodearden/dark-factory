@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -801,7 +803,6 @@ class TestSpeculativeMergeWorker:
             await asyncio.wait_for(req_n.result, timeout=60)
             await asyncio.wait_for(req_n1.result, timeout=60)
 
-        import sqlite3
         conn = sqlite3.connect(str(db_path))
         rows = conn.execute(
             "SELECT event_type, task_id FROM events ORDER BY id"
@@ -852,6 +853,290 @@ class TestSpeculativeMergeWorker:
 
         assert outcome_n.status == 'done', f'N: {outcome_n}'
         assert outcome_n1.status == 'already_merged', f'N+1: {outcome_n1}'
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_verifier_exception_releases_speculation_slot(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """_verify_and_advance raising must resolve N's Future and release the slot.
+
+        Without the try/except/finally fix: the verifier loop crashes before
+        calling _speculation_slot.set() and before resolving N's Future, causing
+        both a deadlock (merger blocked waiting for slot) and a hung Future.
+
+        With the fix: except clause resolves N's Future as 'blocked' with a
+        'Verifier error' reason; finally clause always sets _speculation_slot.
+        """
+        wt_n = await _make_branch_with_file(
+            git_ops, 'vex-n', 'file_vex_n.py', 'n = 1\n',
+        )
+        wt_n1 = await _make_branch_with_file(
+            git_ops, 'vex-n1', 'file_vex_n1.py', 'n1 = 2\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # Capture original before replacing with mock
+        original_vaa = worker._verify_and_advance
+        call_count = 0
+
+        async def mock_vaa(item):  # type: ignore[no-untyped-def]
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError('Unexpected verifier error')
+            return await original_vaa(item)
+
+        worker._verify_and_advance = mock_vaa  # type: ignore[method-assign]
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req_n = _make_request('vex-n', 'vex-n', wt_n, config)
+            req_n1 = _make_request('vex-n1', 'vex-n1', wt_n1, config)
+            await queue.put(req_n)
+            await queue.put(req_n1)
+
+            # N must resolve as 'blocked' with 'Verifier error' (not hang forever)
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            assert outcome_n.status == 'blocked', f'N: {outcome_n}'
+            assert 'Verifier error' in outcome_n.reason, (
+                f'Expected Verifier error in reason, got: {outcome_n.reason}'
+            )
+            assert 'Unexpected verifier error' in outcome_n.reason
+
+            # _speculation_slot must be set (not stuck cleared → deadlock)
+            assert worker._speculation_slot.is_set(), (
+                '_speculation_slot stuck cleared — merger will deadlock on next request'
+            )
+
+            # N+1 must also complete (not hang forever)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            assert outcome_n1.status in ('done', 'blocked'), f'N+1: {outcome_n1}'
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_verifier_remerge_exception_releases_slot(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """_remerge raising must resolve N+1's Future and release the speculation slot.
+
+        Scenario: N fails verification (n_failed=True), N+1 is speculative.
+        The verifier calls _remerge(N+1) which raises unexpectedly.
+
+        Without fix: exception propagates out of loop body, N+1's Future is never
+        resolved, _speculation_slot may be left cleared → downstream deadlock.
+
+        With fix: except clause resolves N+1's Future as 'blocked' with
+        'Verifier error'; finally clause always sets _speculation_slot.
+        """
+        wt_n = await _make_branch_with_file(
+            git_ops, 'vre-n', 'file_vre_n.py', 'n = 1\n',
+        )
+        wt_n1 = await _make_branch_with_file(
+            git_ops, 'vre-n1', 'file_vre_n1.py', 'n1 = 2\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # N fails verification → n_failed=True; _remerge then raises for N+1
+        mock_verify = AsyncMock()
+        mock_verify.return_value.passed = False
+        mock_verify.return_value.summary = 'tests failed'
+
+        async def raise_on_remerge(req):  # type: ignore[no-untyped-def]
+            raise RuntimeError('_remerge failed unexpectedly')
+
+        worker._remerge = raise_on_remerge  # type: ignore[method-assign]
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', mock_verify):
+            req_n = _make_request('vre-n', 'vre-n', wt_n, config)
+            req_n1 = _make_request('vre-n1', 'vre-n1', wt_n1, config)
+            await queue.put(req_n)
+            await queue.put(req_n1)
+
+            # N fails verification → blocked
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            assert outcome_n.status == 'blocked', f'N: {outcome_n}'
+
+            # N+1: _remerge raised → 'blocked' with Verifier error (not hang)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            assert outcome_n1.status == 'blocked', f'N+1: {outcome_n1}'
+            assert 'Verifier error' in outcome_n1.reason, (
+                f'Expected Verifier error in N+1 reason, got: {outcome_n1.reason}'
+            )
+            assert '_remerge failed' in outcome_n1.reason
+
+            # _speculation_slot must be released
+            assert worker._speculation_slot.is_set(), (
+                '_speculation_slot stuck cleared after _remerge exception'
+            )
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_run_cancels_subtasks_on_cancellation(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Cancelling run()'s outer task must cancel both _merger_task and _verifier_task.
+
+        Without fix: run() only catches CancelledError and re-raises, leaving
+        the subtasks running (orphaned). If one subtask raises RuntimeError,
+        the other continues running forever.
+
+        With fix: any BaseException cancels both subtasks before re-raising.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # ── Part 1: outer task cancellation ──────────────────────────────
+        worker_task = asyncio.create_task(worker.run())
+        # Give merger and verifier tasks a chance to start
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert worker._merger_task is not None
+        assert worker._verifier_task is not None
+
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+        assert worker._merger_task.done(), 'merger_task not done after cancellation'
+        assert worker._verifier_task.done(), 'verifier_task not done after cancellation'
+        assert worker._merger_task.cancelled() or worker._merger_task.exception() is not None
+        assert worker._verifier_task.cancelled() or worker._verifier_task.exception() is not None
+
+        # ── Part 2: subtask RuntimeError cancels sibling ─────────────────
+        worker2 = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+        async def crashing_merger():
+            raise RuntimeError('Merger crashed unexpectedly')
+
+        worker2._merger_loop = crashing_merger  # type: ignore[method-assign]
+
+        worker_task2 = asyncio.create_task(worker2.run())
+        # Allow merger to crash
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        with pytest.raises((RuntimeError, asyncio.CancelledError)):
+            await asyncio.wait_for(worker_task2, timeout=5)
+
+        assert worker2._verifier_task is not None
+        assert worker2._verifier_task.done(), (
+            'verifier_task not cancelled after merger RuntimeError'
+        )
+
+    async def test_merger_exception_sends_verifier_sentinel(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """_merger_loop must put None sentinel into verifier queue even when it crashes.
+
+        Without the try/finally fix: if merge_to_main raises, the exception propagates
+        out of the while-loop and the sentinel (previously only at the end of the
+        function body) is never sent. The verifier hangs on queue.get() forever.
+
+        With fix: try/finally wraps the while-loop; finally always puts None so the
+        verifier exits cleanly regardless of how the merger terminates.
+
+        We test _merger_loop() directly to isolate this from the run() subtask
+        cancellation logic (step-24), which also terminates the verifier.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'mes-n', 'file_mes_n.py', 'n = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # merge_to_main raises on the first call to simulate an unexpected crash
+        async def crash_merge(worktree, branch, base_sha=None):  # type: ignore[no-untyped-def]
+            raise RuntimeError('Unexpected error in merge_to_main')
+
+        req = _make_request('mes-n', 'mes-n', wt, config)
+        await queue.put(req)
+
+        with (
+            patch.object(git_ops, 'merge_to_main', new=crash_merge),
+            contextlib.suppress(RuntimeError),
+        ):
+            await worker._merger_loop()
+
+        # The verifier queue must contain the sentinel (None).
+        # Without the try/finally fix, the queue would be empty here.
+        assert not worker._verifier_queue.empty(), (
+            'Verifier queue is empty — sentinel was never sent by dying merger'
+        )
+        sentinel = worker._verifier_queue.get_nowait()
+        assert sentinel is None, f'Expected sentinel (None), got: {sentinel}'
+
+    async def test_revparse_failure_produces_blocked(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """git rev-parse HEAD failure must resolve Future as blocked (not crash).
+
+        Without fix: the return code from git rev-parse HEAD is not checked.
+        A non-zero rc leaves branch_head as empty/garbage, and the subsequent
+        is_ancestor() call may crash or behave incorrectly.
+
+        With fix: rc != 0 triggers an immediate blocked outcome pushed to the
+        verifier queue with reason 'rev-parse HEAD failed: <err>'. Subsequent
+        requests are still processed normally.
+        """
+        wt_n = await _make_branch_with_file(
+            git_ops, 'rp-n', 'file_rp_n.py', 'n = 1\n',
+        )
+        wt_ok = await _make_branch_with_file(
+            git_ops, 'rp-ok', 'file_rp_ok.py', 'ok = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # Mock _run to fail rev-parse for rp-n worktree only
+        original_run = __import__(
+            'orchestrator.merge_queue', fromlist=['_run']
+        )._run
+        # We patch the module-level _run used inside merge_queue
+        call_log: list[tuple] = []
+
+        async def mock_run(cmd, cwd=None, **kwargs):  # type: ignore[no-untyped-def]
+            call_log.append(tuple(cmd))
+            if cmd[:2] == ['git', 'rev-parse'] and cwd == wt_n:
+                return (1, '', 'fatal: not a git repository')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        with (
+            patch('orchestrator.merge_queue._run', new=mock_run),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req_n = _make_request('rp-n', 'rp-n', wt_n, config)
+            req_ok = _make_request('rp-ok', 'rp-ok', wt_ok, config)
+            await queue.put(req_n)
+            await queue.put(req_ok)
+
+            # rp-n must resolve as blocked with rev-parse reason
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            assert outcome_n.status == 'blocked', f'rp-n: {outcome_n}'
+            assert 'rev-parse' in outcome_n.reason.lower(), (
+                f'Expected rev-parse in reason: {outcome_n.reason}'
+            )
+
+            # rp-ok must still succeed (merger loop continues after the error)
+            outcome_ok = await asyncio.wait_for(req_ok.result, timeout=30)
+            assert outcome_ok.status == 'done', f'rp-ok: {outcome_ok}'
 
         await worker.stop()
         worker_task.cancel()
