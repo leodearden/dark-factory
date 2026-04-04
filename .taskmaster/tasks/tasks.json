@@ -8509,6 +8509,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 429,
+        "title": "Update stage1 reconciliation prompt for entity_name support",
+        "description": "In fused-memory/src/fused_memory/reconciliation/prompts/stage1.py, lines 49-52: change 'call mcp__fused-memory__refresh_entity_summary with the entity's UUID' to mention both entity_uuid and entity_name as alternatives, so reconciliation agents can use the ergonomic name-based path when they don't hold a UUID.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8521,7 +8532,7 @@
       ],
       "created": "2026-04-04T04:32:57.699Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T04:33:07.645Z"
+      "updated": "2026-04-04T04:33:11.141Z"
     }
   }
 }
