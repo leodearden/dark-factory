@@ -47,6 +47,8 @@ class _StubMergeOutcome:
 def _mock_orchestrator_modules():
     """Inject mock orchestrator modules into sys.modules for deferred imports."""
     mock_config_mod = MagicMock()
+    # Expose public name — _load_config_for_worktree should use discover_module_configs
+    mock_config_mod.discover_module_configs = MagicMock(return_value={})
     mock_mq_mod = MagicMock()
     mock_mq_mod.MergeRequest = _StubMergeRequest
     mock_mq_mod.MergeOutcome = _StubMergeOutcome
@@ -171,21 +173,18 @@ class TestLoadConfigForWorktree:
         mock_config = MagicMock()
         sys_patch, mock_config_mod, _ = _mock_orchestrator_modules()
         mock_config_mod.load_config.return_value = mock_config
-        mock_config_mod._discover_module_configs.return_value = {'esc': _mc('esc')}
 
         with sys_patch:
             from escalation.server import _load_config_for_worktree as load_fn
             result = load_fn(tmp_path)
 
         mock_config_mod.load_config.assert_called_once_with(config_file)
-        mock_config_mod._discover_module_configs.assert_called_once_with(tmp_path)
         assert result is mock_config
 
     def test_passes_none_when_config_absent(self, tmp_path):
         mock_config = MagicMock()
         sys_patch, mock_config_mod, _ = _mock_orchestrator_modules()
         mock_config_mod.load_config.return_value = mock_config
-        mock_config_mod._discover_module_configs.return_value = {}
 
         with sys_patch:
             from escalation.server import _load_config_for_worktree as load_fn
@@ -195,18 +194,31 @@ class TestLoadConfigForWorktree:
         assert result is mock_config
 
     def test_rediscovers_module_configs_from_worktree(self, tmp_path):
+        """reload_module_configs is called with the worktree path (not _module_configs directly)."""
         mock_config = MagicMock()
         sys_patch, mock_config_mod, _ = _mock_orchestrator_modules()
         mock_config_mod.load_config.return_value = mock_config
-        discovered = {'escalation': _mc('escalation')}
-        mock_config_mod._discover_module_configs.return_value = discovered
 
         with sys_patch:
             from escalation.server import _load_config_for_worktree as load_fn
             load_fn(tmp_path)
 
-        mock_config_mod._discover_module_configs.assert_called_once_with(tmp_path)
-        assert mock_config._module_configs is discovered
+        mock_config.reload_module_configs.assert_called_once_with(tmp_path)
+
+    def test_does_not_access_private_module_configs(self, tmp_path):
+        """_load_config_for_worktree never sets config._module_configs directly."""
+        mock_config = MagicMock(spec=[
+            'reload_module_configs', 'module_configs', 'for_module',
+        ])
+        sys_patch, mock_config_mod, _ = _mock_orchestrator_modules()
+        mock_config_mod.load_config.return_value = mock_config
+
+        with sys_patch:
+            from escalation.server import _load_config_for_worktree as load_fn
+            load_fn(tmp_path)
+
+        # _module_configs should never be set as an attribute
+        assert '_module_configs' not in mock_config.__dict__
 
 
 class TestMergeRequestIntegration:
@@ -231,7 +243,7 @@ class TestMergeRequestIntegration:
         task_files = ['escalation/src/escalation/server.py']
 
         mock_config = MagicMock()
-        mock_config._module_configs = {'escalation': esc_mc, 'orchestrator': _mc('orchestrator')}
+        mock_config.module_configs = {'escalation': esc_mc, 'orchestrator': _mc('orchestrator')}
 
         sys_patch, _, _ = _mock_orchestrator_modules()
 

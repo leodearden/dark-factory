@@ -74,12 +74,12 @@ def _load_config_for_worktree(wt: Path) -> Any:
     Re-discovers module configs from the worktree so that any
     orchestrator.yaml changes on the branch are picked up.
     """
-    from orchestrator.config import _discover_module_configs, load_config
+    from orchestrator.config import load_config
 
     config_path = wt / 'orchestrator' / 'config.yaml'
     config = load_config(config_path if config_path.exists() else None)
     # Re-discover from worktree to pick up branch-local orchestrator.yaml changes
-    config._module_configs = _discover_module_configs(wt)
+    config.reload_module_configs(wt)
     return config
 
 
@@ -226,7 +226,7 @@ def create_server(
 
         config = _load_config_for_worktree(wt)
         task_files = await _get_task_files(wt)
-        module_configs = _filter_module_configs(config._module_configs, task_files)
+        module_configs = _filter_module_configs(config.module_configs, task_files)
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
         await merge_queue.put(MergeRequest(
