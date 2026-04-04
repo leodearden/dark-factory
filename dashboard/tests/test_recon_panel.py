@@ -1078,3 +1078,18 @@ class TestRunPanelAlpineComponent:
         with _patch_recon_data():
             html = client.get('/partials/recon').text
         assert 'this.$refs.detail' in html
+
+    def test_toggle_detail_null_guards_refs_detail(self, client):
+        """toggleDetail() guards against undefined $refs.detail with 'if (!detail) return'."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'if (!detail) return' in html
+
+    def test_null_guard_appears_before_dataset_access(self, client):
+        """Null guard appears immediately after $refs lookup, before dataset access."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        refs_pos = html.index('const detail = this.$refs.detail')
+        null_guard_pos = html.index('if (!detail) return')
+        dataset_pos = html.index('detail.dataset.loaded')
+        assert refs_pos < null_guard_pos < dataset_pos

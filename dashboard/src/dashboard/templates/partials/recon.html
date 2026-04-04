@@ -6,6 +6,7 @@
       this.open = !this.open;
       if (!this.open) return;
       const detail = this.$refs.detail;
+      if (!detail) return;
       if (!detail.dataset.loaded && !detail.dataset.loading) {
         detail.dataset.loading = 'true';
         htmx.trigger(detail, 'load-detail');
