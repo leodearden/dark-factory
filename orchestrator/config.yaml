@@ -1,8 +1,7 @@
 # Dark Factory — project-specific orchestrator overrides.
 # Core defaults are in the orchestrator package (defaults.yaml).
 
-# Reduced concurrency — single token gets 401 auth errors at 12 concurrent
-max_concurrent_tasks: 4
+max_concurrent_tasks: 12
 
 # Verification commands (dark-factory multi-subproject layout)
 test_command: "pytest"
@@ -10,7 +9,6 @@ lint_command: "ruff check shared escalation fused-memory orchestrator dashboard"
 type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright"
 
 # Fused memory HTTP server — port 8002
-# Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
 fused_memory:
   url: "http://localhost:8002"
   project_id: "dark_factory"
