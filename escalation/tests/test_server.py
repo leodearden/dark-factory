@@ -160,6 +160,30 @@ class TestGetTaskFiles:
         _, kwargs = mock_exec.call_args
         assert kwargs['cwd'] == '/my/worktree'
 
+    @pytest.mark.asyncio
+    async def test_returns_none_and_kills_on_timeout(self):
+        """_get_task_files returns None and kills the process when git diff hangs.
+
+        Patches asyncio.wait_for to raise TimeoutError immediately so the test
+        does not actually wait 30 seconds.  When the real implementation wraps
+        proc.communicate() in asyncio.wait_for(timeout=30.0), this patch fires
+        and the TimeoutError handler must kill the process and return None.
+        """
+        mock_proc = AsyncMock()
+        # communicate() returns normally when called for cleanup after kill
+        mock_proc.communicate.return_value = (b'', b'')
+        mock_proc.returncode = 0
+        mock_proc.kill = MagicMock()
+
+        with (
+            patch('escalation.server.asyncio.create_subprocess_exec', return_value=mock_proc),
+            patch('escalation.server.asyncio.wait_for', side_effect=asyncio.TimeoutError),
+        ):
+            result = await _get_task_files(Path('/my/worktree'))
+
+        assert result is None
+        mock_proc.kill.assert_called_once()
+
 
 class TestLoadConfigForWorktree:
     """_load_config_for_worktree loads project config and re-discovers module configs."""

@@ -59,7 +59,13 @@ async def _get_task_files(wt: Path) -> list[str] | None:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()  # reap zombie
+        logger.warning('git diff timed out in %s — treating as no changed files', wt)
+        return None
     if proc.returncode != 0:
         logger.warning('git diff failed in %s: %s', wt, stderr.decode().strip())
         return None
