@@ -708,6 +708,25 @@ class TestDetectStaleSummariesBulk:
         result = await backend.detect_stale_summaries(group_id='test')
         assert result == []
 
+    @pytest.mark.asyncio
+    async def test_detect_stale_summaries_includes_summary_field(
+        self, mock_config, make_backend
+    ):
+        """Stale entity dicts returned by _detect_stale_summaries_with_edges include
+        a 'summary' key whose value is the entity's original (pre-rebuild) summary."""
+        backend = make_backend(mock_config)
+        original_summary = 'old stale fact'
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': original_summary},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
+        })
+        stale, _, _ = await backend._detect_stale_summaries_with_edges(group_id='test')
+        assert len(stale) == 1
+        assert 'summary' in stale[0]
+        assert stale[0]['summary'] == original_summary
+
 
 # ---------------------------------------------------------------------------
 # N+1 fix step-9: rebuild_entity_summaries parallel + no re-fetch
