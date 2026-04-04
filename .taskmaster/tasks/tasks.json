@@ -8649,6 +8649,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 442,
+        "title": "Parallelize list_entity_nodes + get_all_valid_edges in force=True path",
+        "description": "In rebuild_entity_summaries (graphiti_client.py ~line 1015), the force=True branch awaits list_entity_nodes and get_all_valid_edges sequentially. These are independent bulk graph queries and can run concurrently.\n\nFix: replace the sequential awaits with asyncio.gather:\n```python\nall_entities, all_edges = await asyncio.gather(\n    self.list_entity_nodes(group_id=group_id),\n    self.get_all_valid_edges(group_id=group_id),\n)\n```\nGate the gather on dry_run to avoid fetching edges unnecessarily (preserving the existing skip-on-dry_run optimization).\n\nMemory hints: search \"rebuild_entity_summaries concurrency\", search \"asyncio.gather graphiti\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8661,7 +8672,7 @@
       ],
       "created": "2026-04-04T14:14:49.611Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T14:15:09.153Z"
+      "updated": "2026-04-04T14:15:13.726Z"
     }
   }
 }
