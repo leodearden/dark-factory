@@ -143,6 +143,17 @@ class TestPollingSectionAttributes:
         )
         assert 'hx-swap="innerHTML"' in html
 
+    def test_polling_section_default_hx_swap_unchanged(self, jinja_env):
+        """Omitting hx_swap retains the default hx-swap="morph:innerHTML" (backward compat)."""
+        html = render_polling_section(
+            jinja_env,
+            name='recon',
+            hx_get='/partials/recon',
+            poll_base=15,
+            hx_request_timeout=12000,
+        )
+        assert 'hx-swap="morph:innerHTML"' in html
+
 
 class TestPollingSectionUpdatedForDiv:
     """Tests for the data-updated-for timestamp div."""
