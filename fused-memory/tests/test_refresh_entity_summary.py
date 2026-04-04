@@ -20,6 +20,7 @@ from fused_memory.backends.graphiti_client import (
     GraphitiBackend,
     NodeNotFoundError,
 )
+from fused_memory.server.tools import create_mcp_server
 
 # ---------------------------------------------------------------------------
 # step-1 (task-309): GraphitiBackend.resolve_entity_by_name
@@ -570,8 +571,6 @@ class TestFusedMemoryInstructionsEntityName:
 
     def test_tool_docstring_mentions_both_uuid_and_name(self):
         """The refresh_entity_summary tool docstring describes both entity_uuid and entity_name."""
-        from fused_memory.server.tools import create_mcp_server
-        from unittest.mock import AsyncMock
         svc = AsyncMock()
         server = create_mcp_server(svc)
 

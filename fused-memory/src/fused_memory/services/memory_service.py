@@ -1206,6 +1206,7 @@ class MemoryService:
 
         # Resolve entity_name → UUID when UUID is not directly supplied
         if entity_uuid is None:
+            assert entity_name is not None  # guaranteed by the ValueError check above
             entity_uuid = await self.graphiti.resolve_entity_by_name(
                 entity_name, group_id=project_id
             )
