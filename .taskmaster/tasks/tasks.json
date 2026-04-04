@@ -8464,10 +8464,11 @@
         "description": "The escalation MCP's merge_request tool (escalation/src/escalation/server.py:173-180) passes module_configs=[] and task_files=None to MergeRequest. This causes run_scoped_verification to fall through to global mode, running bare pytest/pyright/ruff from the repo root without uv run wrappers — which fails because subproject venvs aren't on PATH.",
         "details": "Fix: compute module_configs and task_files from the worktree before submitting to the merge queue.\n\n1. Discover module configs: use _discover_module_configs(project_root) from orchestrator.config to find all subproject orchestrator.yaml files.\n2. Compute task_files: run `git diff main..HEAD --name-only` in the worktree to get the list of changed files.\n3. Filter module_configs to only those whose prefix matches at least one task_file.\n4. Pass both to MergeRequest.\n\nReference: the orchestrator's own merge flow (workflow.py:1066-1075) passes self._module_configs (resolved via _resolve_module_configs at line 479) and self._task_files (from plan['files'] at line 182). The external merge_request should approximate this from git diff instead of plan metadata.\n\nAlso consider loading a proper OrchestratorConfig from the project's orchestrator.yaml instead of using the bare default OrchestratorConfig().\n\nFiles: escalation/src/escalation/server.py\nmemory_hint: search \"merge_request module_configs verification\" for prior context on this issue.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T14:15:37.448Z"
       },
       {
         "id": "427",
@@ -8675,7 +8676,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T14:15:34.692Z",
+      "lastModified": "2026-04-04T14:15:37.450Z",
       "taskCount": 422,
       "completedCount": 393,
       "tags": [
