@@ -935,11 +935,20 @@ class GraphitiBackend:
 
     async def _rebuild_entity_from_edges(
         self, uuid: str, name: str, edges: list[dict], *, group_id: str
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Rebuild one Entity node's summary from pre-fetched edges.
 
         Accepts the edges already fetched by the bulk call, avoiding a
         per-entity get_valid_edges_for_node round-trip.
+
+        .. note:: TOCTOU / eventual-consistency risk:
+            The ``edges`` argument is pre-fetched by the caller in a single
+            bulk query.  By the time this method runs (potentially after a
+            concurrency gap), the graph may have changed — new edges added,
+            existing edges invalidated.  Summaries written here therefore
+            reflect a snapshot, not necessarily the current DB state.  This
+            is an accepted trade-off: callers that require stronger consistency
+            should re-fetch edges per entity via ``refresh_entity_summary``.
 
         Args:
             uuid: Entity UUID.
@@ -972,7 +981,7 @@ class GraphitiBackend:
         group_id: str,
         force: bool = False,
         dry_run: bool = False,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Batch-rebuild Entity node summaries from their current valid edges.
 
         When ``force=False`` (default), only entities identified by
@@ -998,14 +1007,17 @@ class GraphitiBackend:
             - ``errors``: number of per-entity refresh failures.
             - ``details``: list of per-entity result dicts.
         """
+        # Declare before if/else for explicit scoping — all branches assign these.
+        targets: list[dict] = []
+        all_edges: dict[str, list[dict]] = {}
+        total_entities: int = 0
+
         if force:
             all_entities = await self.list_entity_nodes(group_id=group_id)
             targets = [{'uuid': e['uuid'], 'name': e['name']} for e in all_entities]
             total_entities = len(all_entities)
             # Only fetch edges when we will actually use them (not in dry_run)
-            if dry_run:
-                all_edges: dict[str, list[dict]] = {}
-            else:
+            if not dry_run:
                 all_edges = await self.get_all_valid_edges(group_id=group_id)
         else:
             stale, all_edges, total_entities = await self._detect_stale_summaries_with_edges(group_id=group_id)
