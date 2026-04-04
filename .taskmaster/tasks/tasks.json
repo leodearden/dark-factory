@@ -8542,7 +8542,20 @@
           "modules": [
             "fused-memory/src/fused_memory/backends",
             "fused-memory/tests/test_rebuild_entity_summaries.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "GraphitiClient",
+              "_rebuild_entity_from_edges",
+              "StaleSummaryResult"
+            ],
+            "queries": [
+              "rebuild_entity_summaries get_node_text N+1 optimization",
+              "list_entity_nodes entity map pre-fetch old_summary",
+              "threading name old_summary _rebuild_entity_from_edges eliminate round-trip"
+            ]
+          },
+          "_causation_id": "92ad9489-6741-4fe6-8f3f-c7bb9e9e5371"
         }
       },
       {
