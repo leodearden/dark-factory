@@ -8736,6 +8736,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 449,
+        "title": "Test suite: relocate TestGetAllValidEdges and add missing test cases",
+        "description": "In fused-memory/tests/: (1) Move TestGetAllValidEdges from test_rebuild_entity_summaries.py to test_refresh_entity_summary.py alongside TestGetValidEdgesForNode; (2) Change the DISTINCT assertion in test_cypher_uses_return_distinct to use `graph.ro_query.call_args.args[0]` instead of `call_args[0][0]` for robustness; (3) Add a test where `result.result_set = None` is set on the mock to verify the `or []` guard works; (4) Add a test feeding two identical rows (same entity_uuid + edge_uuid) and asserting two entries appear in the result list — making explicit that Python does no dedup and DISTINCT is the sole guard.\n\nmemory_hint: search \"TestGetAllValidEdges test_rebuild_entity_summaries\" for context on current test placement.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8748,7 +8759,7 @@
       ],
       "created": "2026-04-04T18:25:51.169Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T18:26:00.533Z"
+      "updated": "2026-04-04T18:26:05.882Z"
     }
   }
 }
