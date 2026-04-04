@@ -856,3 +856,89 @@ class TestSpeculativeMergeWorker:
         worker_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestSpeculativeBackwardCompat — step-17
+# Run key MergeWorker scenarios through SpeculativeMergeWorker to confirm
+# they behave identically with queue depth 1.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSpeculativeBackwardCompat:
+    async def test_basic_merge(self, git_ops: GitOps, config: OrchestratorConfig):
+        worktree, _ = await git_ops.create_worktree('compat-basic')
+        (worktree / 'compat.py').write_text('compat = True\n')
+        await git_ops.commit(worktree, 'Add compat file')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req = _make_request('compat-1', 'compat-basic', worktree, config)
+            await queue.put(req)
+            result = await asyncio.wait_for(req.result, timeout=30)
+
+        assert result.status == 'done'
+        _, content, _ = await _run(
+            ['git', 'show', 'main:compat.py'], cwd=git_ops.project_root,
+        )
+        assert 'compat = True' in content
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_already_merged(self, git_ops: GitOps, config: OrchestratorConfig):
+        worktree, _ = await git_ops.create_worktree('compat-am')
+        (worktree / 'am.py').write_text('am = True\n')
+        await git_ops.commit(worktree, 'Add am file')
+
+        result = await git_ops.merge_to_main(worktree, 'compat-am')
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        req = _make_request('compat-am', 'compat-am', worktree, config)
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=10)
+        assert outcome.status == 'already_merged'
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_verify_failure(self, git_ops: GitOps, config: OrchestratorConfig):
+        worktree, _ = await git_ops.create_worktree('compat-vf')
+        (worktree / 'bad.py').write_text('bad = True\n')
+        await git_ops.commit(worktree, 'Add bad file')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        mock_verify = AsyncMock()
+        mock_verify.return_value.passed = False
+        mock_verify.return_value.summary = 'tests failed'
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', mock_verify):
+            req = _make_request('compat-vf', 'compat-vf', worktree, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked'
+        assert 'verification failed' in outcome.reason.lower()
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task

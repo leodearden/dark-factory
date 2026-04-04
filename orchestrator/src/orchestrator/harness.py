@@ -25,7 +25,7 @@ from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 if TYPE_CHECKING:
-    from orchestrator.merge_queue import MergeWorker
+    from orchestrator.merge_queue import MergeWorker, SpeculativeMergeWorker
 
 try:
     from escalation.queue import EscalationQueue
@@ -138,7 +138,7 @@ class Harness:
 
         # Merge queue — single worker owns all main-branch advancement
         self._merge_queue: asyncio.Queue = asyncio.Queue()
-        self._merge_worker: MergeWorker | None = None  # lazy import
+        self._merge_worker: MergeWorker | SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
 
         # Event store — created at run start with a generated run_id
@@ -923,16 +923,20 @@ Output JSON matching the schema. Every task must appear in the output.
             logger.warning('Failed to save HarnessReport: %s', e)
 
     async def _start_merge_worker(self) -> None:
-        """Start the merge queue worker as a background asyncio task."""
-        from orchestrator.merge_queue import MergeWorker
+        """Start the merge queue worker as a background asyncio task.
 
-        self._merge_worker = MergeWorker(
+        Uses SpeculativeMergeWorker (two-coroutine pipeline) by default.
+        MergeWorker (serial) is preserved but deprecated.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        self._merge_worker = SpeculativeMergeWorker(
             self.git_ops, self._merge_queue, event_store=self.event_store,
         )
         self._merge_worker_task = asyncio.create_task(
             self._merge_worker.run(), name='merge-worker',
         )
-        logger.info('Merge worker started')
+        logger.info('Speculative merge worker started')
 
     async def _stop_merge_worker(self) -> None:
         """Stop the merge worker gracefully."""
