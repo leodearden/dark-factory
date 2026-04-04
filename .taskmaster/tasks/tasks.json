@@ -8537,10 +8537,11 @@
         "description": "In fused-memory/src/fused_memory/reconciliation/prompts/stage1.py, lines 49-52: change 'call mcp__fused-memory__refresh_entity_summary with the entity's UUID' to mention both entity_uuid and entity_name as alternatives, so reconciliation agents can use the ergonomic name-based path when they don't hold a UUID.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T04:39:14.475Z"
       },
       {
         "id": "430",
@@ -8557,7 +8558,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T04:39:13.933Z",
+      "lastModified": "2026-04-04T04:39:14.475Z",
       "taskCount": 409,
       "completedCount": 388,
       "tags": [
