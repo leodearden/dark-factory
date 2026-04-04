@@ -9,8 +9,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeOutcome, MergeRequest, MergeWorker
+from orchestrator.merge_queue import MergeOutcome, MergeRequest, MergeWorker, SpeculativeMergeWorker
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -420,6 +421,83 @@ class TestMergeWorker:
         assert 'not_descendant' in outcome.reason
         # Should only be called once — no re-enqueue for permanent failures
         assert call_count == 1
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+
+# ---------------------------------------------------------------------------
+# Helpers for speculative tests
+# ---------------------------------------------------------------------------
+
+async def _make_branch_with_file(
+    git_ops: GitOps,
+    branch_name: str,
+    filename: str,
+    content: str,
+) -> Path:
+    """Create a worktree branch with one committed file and return its path."""
+    worktree, _ = await git_ops.create_worktree(branch_name)
+    (worktree / filename).write_text(content)
+    await git_ops.commit(worktree, f'Add {filename}')
+    return worktree
+
+
+# ---------------------------------------------------------------------------
+# TestSpeculativeMergeWorker
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSpeculativeMergeWorker:
+    async def test_speculative_basic_throughput(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Submit 2 merge requests. Both complete as 'done', both files on main.
+
+        N+1 is speculatively merged against N's merge SHA (not original main).
+        Both complete without error.
+        """
+        wt_n = await _make_branch_with_file(
+            git_ops, 'spec-n', 'file_n.py', 'n = 1\n',
+        )
+        wt_n1 = await _make_branch_with_file(
+            git_ops, 'spec-n1', 'file_n1.py', 'n1 = 2\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _mock_verify_pass(),
+        ):
+            req_n = _make_request('spec-n', 'spec-n', wt_n, config)
+            req_n1 = _make_request('spec-n1', 'spec-n1', wt_n1, config)
+
+            # Submit both before the worker processes them
+            await queue.put(req_n)
+            await queue.put(req_n1)
+
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
+
+        assert outcome_n.status == 'done', f'N failed: {outcome_n}'
+        assert outcome_n1.status == 'done', f'N+1 failed: {outcome_n1}'
+
+        # Both files must appear on main
+        _, out_n, _ = await _run(
+            ['git', 'show', 'main:file_n.py'], cwd=git_ops.project_root,
+        )
+        assert 'n = 1' in out_n
+
+        _, out_n1, _ = await _run(
+            ['git', 'show', 'main:file_n1.py'], cwd=git_ops.project_root,
+        )
+        assert 'n1 = 2' in out_n1
 
         await worker.stop()
         worker_task.cancel()
