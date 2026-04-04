@@ -13,8 +13,7 @@
   </thead>
   <tbody>
     {% for task in orch.tasks|sort(attribute='id', reverse=true) %}
-      {% set tid = task.id|string %}
-      {% set wt = orch.worktrees.get(tid, {}) %}
+      {% set wt = orch.worktrees.get(task.id, {}) %}
       <tr class="border-b border-gray-700">
         <td class="px-3 py-2">{{ task.id }}</td>
         <td class="px-3 py-2">{{ task.title }}</td>
