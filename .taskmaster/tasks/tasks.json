@@ -8642,6 +8642,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 438,
+        "title": "Fix ID-0 default and type annotation in orchestrator.py",
+        "description": "Two fixes: (1) Line 198: Replace `int(task.get('id', 0))` with explicit missing-ID check that logs a warning and skips the entry, consistent with existing malformed-entry handling. (2) Line 317: Change `dict[str, dict]` to `dict[int, dict]` in project_cache type annotation to match actual return type of _scan_worktrees.",
+        "details": "File: dashboard/src/dashboard/data/orchestrator.py. Source: review suggestions from task 158 (esc-158-16). memory_hints: search(\"task ID normalization orchestrator\")",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8654,7 +8665,7 @@
       ],
       "created": "2026-04-04T06:43:47.452Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T06:44:14.489Z"
+      "updated": "2026-04-04T06:44:17.109Z"
     }
   }
 }
