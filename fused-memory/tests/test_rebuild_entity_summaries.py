@@ -341,7 +341,12 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_dry_run_returns_stale_without_rebuilding(self, mock_config, make_backend):
-        """With dry_run=True, detects stale entities but does not call refresh_entity_summary."""
+        """With dry_run=True, detects stale entities but does not call refresh_entity_summary.
+
+        Explicitly mocks get_node_text and update_node_summary to document that
+        the dry_run guarantee holds even if rebuild_entity_summaries were refactored
+        to bypass refresh_entity_summary and call those methods directly.
+        """
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale'},
@@ -351,11 +356,15 @@ class TestRebuildEntitySummaries:
              'valid_fact_count': 0, 'summary_line_count': 1},
         ])
         backend.refresh_entity_summary = AsyncMock()
+        backend.get_node_text = AsyncMock()
+        backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test', dry_run=True)
         assert result['stale_entities'] == 1
         assert result['rebuilt'] == 0
         assert result['skipped'] == 1
         backend.refresh_entity_summary.assert_not_awaited()
+        backend.get_node_text.assert_not_awaited()
+        backend.update_node_summary.assert_not_awaited()
         assert result['details'][0]['status'] == 'skipped_dry_run'
 
 
