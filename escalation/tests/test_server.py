@@ -332,3 +332,47 @@ class TestMergeRequestIntegration:
         response_text = str(result.content)
         assert 'error' in response_text
         assert 'bad yaml' in response_text
+
+    @pytest.mark.asyncio
+    async def test_merge_worker_timeout_returns_error_dict(self):
+        """When the merge worker never responds, merge_request returns an error dict.
+
+        Patches MERGE_TIMEOUT_SECS to 0.01 so the test finishes in milliseconds.
+        The future is never resolved (simulating a stalled merge worker).
+        """
+        from escalation.queue import EscalationQueue
+        from escalation.server import create_server
+
+        captured: list = []
+
+        async def capture_put_no_resolve(req):
+            captured.append(req)
+            # Intentionally do NOT call req.result.set_result() — worker is stalled
+
+        mock_queue = MagicMock()
+        mock_queue.put = capture_put_no_resolve
+
+        esc_mc = _mc('escalation')
+        mock_config = MagicMock()
+        mock_config.module_configs = {'escalation': esc_mc}
+
+        sys_patch, _, _ = _mock_orchestrator_modules()
+
+        with (
+            sys_patch,
+            patch('escalation.server._load_config_for_worktree', return_value=mock_config),
+            patch('escalation.server._get_task_files', return_value=['escalation/a.py']),
+            patch('escalation.server.MERGE_TIMEOUT_SECS', 0.01),
+        ):
+            server = create_server(
+                EscalationQueue(Path('/tmp/fake-queue')),
+                merge_queue=mock_queue,
+            )
+            result = await server.call_tool(
+                'merge_request',
+                {'task_id': '77', 'branch': 'task/77', 'worktree': '/fake/wt'},
+            )
+
+        response_text = str(result.content)
+        assert 'error' in response_text
+        assert 'timeout' in response_text.lower()

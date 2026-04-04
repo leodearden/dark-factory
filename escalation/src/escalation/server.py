@@ -14,6 +14,10 @@ from escalation.queue import EscalationQueue
 
 logger = logging.getLogger(__name__)
 
+# Timeout for waiting on the merge worker to complete (seconds).
+# Extracted as a module-level constant so tests can patch it to a short value.
+MERGE_TIMEOUT_SECS: float = 300.0
+
 CATEGORIES = [
     'scope_violation',
     'design_concern',
@@ -250,7 +254,10 @@ def create_server(
             result=future,
         ))
 
-        outcome = await future
+        try:
+            outcome = await asyncio.wait_for(future, timeout=MERGE_TIMEOUT_SECS)
+        except asyncio.TimeoutError:
+            return {'error': 'Merge worker did not respond within timeout'}
         return {
             'status': outcome.status,
             'reason': outcome.reason,
