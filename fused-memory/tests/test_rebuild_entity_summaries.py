@@ -202,6 +202,29 @@ class TestDetectStaleSummaries:
         assert result[0]['uuid'] == 'uuid-3'
 
     @pytest.mark.asyncio
+    async def test_entity_with_zero_valid_edges_flagged_stale(self, mock_config, make_backend):
+        """Entity with non-empty summary but zero valid edges is flagged stale.
+
+        When get_valid_edges_for_node returns [], the canonical summary is ''
+        (empty). Since summary != canonical, the entity is stale. All summary
+        lines are counted as stale_line_count because none appear in the empty
+        valid_fact_set. valid_fact_count=0, duplicate_count=0.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old fact A\nold fact B'},
+        ])
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[])
+        result = await backend.detect_stale_summaries(group_id='test')
+        assert len(result) == 1
+        entity = result[0]
+        assert entity['uuid'] == 'uuid-1'
+        assert entity['stale_line_count'] == 2
+        assert entity['valid_fact_count'] == 0
+        assert entity['duplicate_count'] == 0
+        assert entity['summary_line_count'] == 2
+
+    @pytest.mark.asyncio
     async def test_edge_fetch_error_logs_warning(self, mock_config, make_backend, caplog):
         """A warning-level log is emitted containing the failed entity uuid and exception text."""
         import logging
