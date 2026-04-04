@@ -184,6 +184,58 @@ class TestDetectStaleSummaries:
         result = await backend.detect_stale_summaries(group_id='test')
         assert result[0]['summary_line_count'] == 3
 
+    @pytest.mark.asyncio
+    async def test_same_facts_different_order_triggers_rebuild(self, mock_config, make_backend):
+        """Identical facts in a different order flag the entity as stale.
+
+        This is expected (not a bug): canonical summary follows edge-result order,
+        so 'factB\\nfactA' != 'factA\\nfactB'. The entity is flagged stale purely
+        because the string comparison summary != canonical fails. Both lines exist
+        in valid_fact_set, so stale_line_count == 0 and duplicate_count == 0.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factB\nfactA'},
+        ])
+        # Edges return factA first, factB second → canonical = 'factA\nfactB'
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [
+                {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'},
+                {'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'},
+            ],
+        })
+        result = await backend.detect_stale_summaries(group_id='test')
+        assert len(result) == 1
+        entity = result[0]
+        assert entity['uuid'] == 'uuid-1'
+        # Both lines are present in valid_fact_set → stale_line_count == 0
+        assert entity['stale_line_count'] == 0
+        # No duplicate lines → duplicate_count == 0
+        assert entity['duplicate_count'] == 0
+        # Entity is stale due to order mismatch (summary != canonical), not content issues
+
+    @pytest.mark.asyncio
+    async def test_entity_with_zero_valid_edges_flagged_stale(self, mock_config, make_backend):
+        """Entity with non-empty summary but zero valid edges is flagged stale.
+
+        When get_all_valid_edges returns no edges for the entity, the canonical
+        summary is '' (empty). Since summary != canonical, the entity is stale.
+        All summary lines are counted as stale_line_count because none appear
+        in the empty valid_fact_set. valid_fact_count=0, duplicate_count=0.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old fact A\nold fact B'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        result = await backend.detect_stale_summaries(group_id='test')
+        assert len(result) == 1
+        entity = result[0]
+        assert entity['uuid'] == 'uuid-1'
+        assert entity['stale_line_count'] == 2
+        assert entity['valid_fact_count'] == 0
+        assert entity['duplicate_count'] == 0
+        assert entity['summary_line_count'] == 2
 
 # ---------------------------------------------------------------------------
 # step-3: GraphitiBackend.rebuild_entity_summaries
@@ -286,7 +338,12 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_dry_run_returns_stale_without_rebuilding(self, mock_config, make_backend):
-        """With dry_run=True, detects stale entities but does not call _rebuild_entity_from_edges."""
+        """With dry_run=True, detects stale entities but does not call _rebuild_entity_from_edges.
+
+        Explicitly mocks get_node_text and update_node_summary to document that
+        the dry_run guarantee holds even if rebuild_entity_summaries were refactored
+        to bypass _rebuild_entity_from_edges and call those methods directly.
+        """
         backend = make_backend(mock_config)
         backend._detect_stale_summaries_with_edges = AsyncMock(return_value=(
             [{'uuid': 'uuid-1', 'name': 'Alice', 'duplicate_count': 0,
@@ -294,11 +351,13 @@ class TestRebuildEntitySummaries:
             {'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
             1,
         ))
+        backend.get_node_text = AsyncMock()
         backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test', dry_run=True)
         assert result['stale_entities'] == 1
         assert result['rebuilt'] == 0
         assert result['skipped'] == 1
+        backend.get_node_text.assert_not_awaited()
         backend.update_node_summary.assert_not_awaited()
         assert result['details'][0]['status'] == 'skipped_dry_run'
 
