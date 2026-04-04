@@ -167,6 +167,13 @@ class TestOrchestratorRouteBasics:
             html = client.get('/partials/orchestrators').text
         assert "x-text=\"$store.panels[" in html
 
+    def test_task_table_wrapper_has_x_cloak(self, client):
+        """x-show div must have x-cloak so it is hidden before Alpine initializes
+        after an innerHTML swap (MutationObserver detects new x-data elements)."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'x-cloak' in html
+
     def test_card_shows_single_pid_label(self, client):
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
