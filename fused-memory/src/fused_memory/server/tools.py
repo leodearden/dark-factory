@@ -53,7 +53,7 @@ Task operations (when Taskmaster is connected):
 Management:
 - delete_memory: Remove a specific memory (edges for Graphiti, vector entries for Mem0)
 - delete_episode: Remove a Graphiti episode (with optional cascade)
-- refresh_entity_summary: Rebuild an entity node's summary from its valid edges
+- refresh_entity_summary: Rebuild an entity node's summary from its valid edges (accepts entity_uuid or entity_name)
 - merge_entities: Consolidate two duplicate entity nodes (redirects edges, deletes deprecated)
 - get_status: Health check for all backends
 
