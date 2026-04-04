@@ -303,3 +303,32 @@ class TestMergeRequestIntegration:
             {'task_id': '1', 'branch': '1', 'worktree': '/fake/wt'},
         )
         assert any('error' in str(c) for c in result.content)
+
+    @pytest.mark.asyncio
+    async def test_config_setup_failure_returns_error_dict(self):
+        """When _load_config_for_worktree raises, merge_request returns an error dict."""
+        from escalation.queue import EscalationQueue
+        from escalation.server import create_server
+
+        mock_queue = MagicMock()
+        sys_patch, _, _ = _mock_orchestrator_modules()
+
+        with (
+            sys_patch,
+            patch(
+                'escalation.server._load_config_for_worktree',
+                side_effect=RuntimeError('bad yaml'),
+            ),
+        ):
+            server = create_server(
+                EscalationQueue(Path('/tmp/fake-queue')),
+                merge_queue=mock_queue,
+            )
+            result = await server.call_tool(
+                'merge_request',
+                {'task_id': '99', 'branch': 'task/99', 'worktree': '/fake/wt'},
+            )
+
+        response_text = str(result.content)
+        assert 'error' in response_text
+        assert 'bad yaml' in response_text
