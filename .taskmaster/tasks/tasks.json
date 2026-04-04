@@ -8598,6 +8598,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 434,
+        "title": "Move Alpine.data('runPanel') to static JS and add robustness guards",
+        "description": "Extract Alpine.data('runPanel') registration from recon.html:2-15 into a static JS file or base.html alpine:init block. Fixes re-registration on every HTMX poll cycle. Also add typeof htmx guard and try/catch around htmx.trigger() in toggleDetail() to prevent stuck loading state if htmx fails to load.",
+        "details": "Files: dashboard/src/dashboard/templates/partials/recon.html, dashboard/src/dashboard/templates/base.html. Source: review suggestions from task 421 (esc-421-19). memory_hints: search(\"Alpine.js component registration HTMX partial\")",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8610,7 +8621,7 @@
       ],
       "created": "2026-04-04T06:43:47.452Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T06:43:57.780Z"
+      "updated": "2026-04-04T06:44:02.343Z"
     }
   }
 }
