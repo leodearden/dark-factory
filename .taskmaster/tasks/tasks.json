@@ -8520,6 +8520,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 430,
+        "title": "Fix test quality issues in test_refresh_entity_summary.py",
+        "description": "In fused-memory/tests/test_refresh_entity_summary.py, address multiple test quality issues: (1) Hoist import json and import asyncio to module-level imports (lines 465, 485, 511, 577); (2) Extract the 6-line MCP result-parsing block at lines 465-470, 485-490, 511-520 into a module-level _parse_mcp_result(result) helper; (3) Replace asyncio.get_event_loop().run_until_complete(server.list_tools()) at line 578 with @pytest.mark.asyncio + await; (4) Add assert parsed.get('error_type') == 'ValidationError' to test_neither_uuid_nor_name_returns_validation_error at line 521; (5) Replace the weak OR branch in test_instructions_mention_entity_name_lookup (lines 558-560) with assert 'entity_name' in FUSED_MEMORY_INSTRUCTIONS unconditionally; (6) Add two MemoryService tests: NodeNotFoundError and AmbiguousEntityError from resolve_entity_by_name propagate and journal is NOT awaited; (7) Add two MCP tool tests: NodeNotFoundError and AmbiguousEntityError are serialized into error dicts with correct error_type field.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8532,7 +8543,7 @@
       ],
       "created": "2026-04-04T04:32:57.699Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T04:33:11.141Z"
+      "updated": "2026-04-04T04:33:19.666Z"
     }
   }
 }
