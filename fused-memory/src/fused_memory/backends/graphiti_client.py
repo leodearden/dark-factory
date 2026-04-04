@@ -898,6 +898,7 @@ class GraphitiBackend:
             stale.append({
                 'uuid': entity['uuid'],
                 'name': entity['name'],
+                'summary': summary,
                 'duplicate_count': duplicate_count,
                 'stale_line_count': stale_line_count,
                 'valid_fact_count': len(valid_facts),
@@ -935,7 +936,8 @@ class GraphitiBackend:
         return stale
 
     async def _rebuild_entity_from_edges(
-        self, uuid: str, name: str, edges: list[dict], *, group_id: str
+        self, uuid: str, name: str, edges: list[dict], *, group_id: str,
+        old_summary: str,
     ) -> dict[str, Any]:
         """Rebuild one Entity node's summary from pre-fetched edges.
 
@@ -956,11 +958,12 @@ class GraphitiBackend:
             name: Entity name (for logging / result dict).
             edges: Pre-fetched valid edge dicts (uuid, fact, name).
             group_id: Graph to update.
+            old_summary: Current summary text (caller must supply — avoids
+                per-entity ``get_node_text`` DB round-trip).
 
         Returns:
             Dict with keys: uuid, name, old_summary, new_summary, edge_count.
         """
-        _, old_summary = await self.get_node_text(uuid, group_id=group_id)
         facts = self._canonical_facts(edges)
         new_summary = '\n'.join(facts)
         await self.update_node_summary(uuid, new_summary, group_id=group_id)
@@ -1015,14 +1018,14 @@ class GraphitiBackend:
 
         if force:
             all_entities = await self.list_entity_nodes(group_id=group_id)
-            targets = [{'uuid': e['uuid'], 'name': e['name']} for e in all_entities]
+            targets = [{'uuid': e['uuid'], 'name': e['name'], 'old_summary': e['summary']} for e in all_entities]
             total_entities = len(all_entities)
             # Only fetch edges when we will actually use them (not in dry_run)
             if not dry_run:
                 all_edges = await self.get_all_valid_edges(group_id=group_id)
         else:
             stale, all_edges, total_entities = await self._detect_stale_summaries_with_edges(group_id=group_id)
-            targets = [{'uuid': s['uuid'], 'name': s['name']} for s in stale]
+            targets = [{'uuid': s['uuid'], 'name': s['name'], 'old_summary': s['summary']} for s in stale]
 
         stale_entities = len(targets)
         rebuilt = 0
@@ -1041,7 +1044,8 @@ class GraphitiBackend:
                 async with sem:
                     edges = all_edges.get(t['uuid'], [])
                     return await self._rebuild_entity_from_edges(
-                        t['uuid'], t['name'], edges, group_id=group_id
+                        t['uuid'], t['name'], edges, group_id=group_id,
+                        old_summary=t['old_summary'],
                     )
 
             results = await asyncio.gather(
