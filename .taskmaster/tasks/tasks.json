@@ -8533,6 +8533,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 433,
+        "title": "Code quality improvements in graphiti_client.py rebuild/refresh pipeline",
+        "description": "Review suggestions from task 419 reviewers (deferred as non-blocking). All in graphiti_client.py backend code:\n\n1. Invert if/pass/else guard in refresh_entity_summary — replace empty pass branch with inverted condition (architect, reuse_auditor)\n2. Enforce name+old_summary pairing with ValueError when only one provided (architect, robustness)\n3. Replace anonymous 3-tuple return from _detect_stale_summaries_with_edges with NamedTuple/dataclass (architect)\n4. Extract _canonical_facts() helper for the dict.fromkeys dedup expression used in 3 places (reuse_auditor)\n5. Type annotation: refresh_kwargs dict -> dict[str, Any] (architect)\n6. Variable scoping: declare all_entities before if/else branches (architect)\n7. Skip entity_map construction in dry_run mode (performance)\n8. Add TOCTOU/eventual-consistency comment for pre-fetched edge optimization (robustness)",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8545,7 +8556,7 @@
       ],
       "created": "2026-04-04T08:47:48.334Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T08:47:48.336Z"
+      "updated": "2026-04-04T08:48:00.310Z"
     }
   }
 }
