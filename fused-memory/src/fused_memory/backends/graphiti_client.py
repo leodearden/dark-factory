@@ -893,7 +893,8 @@ class GraphitiBackend:
         return stale
 
     async def _rebuild_entity_from_edges(
-        self, uuid: str, name: str, edges: list[dict], *, group_id: str
+        self, uuid: str, name: str, edges: list[dict], *, group_id: str,
+        old_summary: str | None = None,
     ) -> dict:
         """Rebuild one Entity node's summary from pre-fetched edges.
 
@@ -905,11 +906,16 @@ class GraphitiBackend:
             name: Entity name (for logging / result dict).
             edges: Pre-fetched valid edge dicts (uuid, fact, name).
             group_id: Graph to update.
+            old_summary: Current summary text.  When provided, the
+                per-entity ``get_node_text`` DB round-trip is skipped.
+                When ``None``, ``get_node_text`` is called as a fallback
+                (backward-compatible behaviour during transition).
 
         Returns:
             Dict with keys: uuid, name, old_summary, new_summary, edge_count.
         """
-        _, old_summary = await self.get_node_text(uuid, group_id=group_id)
+        if old_summary is None:
+            _, old_summary = await self.get_node_text(uuid, group_id=group_id)
         facts = list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
         new_summary = '\n'.join(facts)
         await self.update_node_summary(uuid, new_summary, group_id=group_id)
