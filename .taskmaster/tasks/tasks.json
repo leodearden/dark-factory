@@ -8810,6 +8810,17 @@
           "multi-project"
         ],
         "subtasks": []
+      },
+      {
+        "id": 451,
+        "title": "Fix docstrings: detect_stale_summaries missing summary key + cross-reference _rebuild vs refresh",
+        "description": "Two docstring accuracy issues from task 432 review:\n\n1. `detect_stale_summaries` (line ~931) Returns section lists keys `uuid, name, duplicate_count, stale_line_count, valid_fact_count, summary_line_count` but omits the `summary` key that `_detect_stale_summaries_with_edges` now includes in every stale dict. Add `summary` to the documented keys.\n\n2. `_rebuild_entity_from_edges` and `refresh_entity_summary` implement the same core logic with different data-sourcing contracts (bulk-caller-supplied vs self-contained). Add cross-reference notes in both docstrings to make the intentional fork explicit. E.g. in `_rebuild_entity_from_edges`: \"For single-entity use (not bulk) see `refresh_entity_summary`, which fetches its own summary via `get_node_text`.\" And vice versa in `refresh_entity_summary`.\n\nmemory_hints:\n- search: \"detect_stale_summaries docstring summary key\"\n- search: \"_rebuild_entity_from_edges refresh_entity_summary design fork\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8821,7 +8832,8 @@
         "master"
       ],
       "created": "2026-04-04T23:10:48.091Z",
-      "description": "Tasks for master context"
+      "description": "Tasks for master context",
+      "updated": "2026-04-04T23:14:38.859Z"
     }
   }
 }
