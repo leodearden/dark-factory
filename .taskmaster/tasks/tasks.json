@@ -8627,6 +8627,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 440,
+        "title": "Test file hygiene: rename test_graphiti_quality_433 and remove deferred imports",
+        "description": "Two cleanup tasks in fused-memory/tests/test_graphiti_quality_433.py:\n1. Rename the file to `test_graphiti_rebuild_pipeline.py` (or `test_graphiti_summary_refresh.py`) — the current name embeds ephemeral task ID 433, which conveys no information after the task is closed.\n2. Remove the two `from fused_memory.backends.graphiti_client import StaleSummaryResult` statements inside test method bodies at lines 263 and 289 — StaleSummaryResult is already imported at the module top-level (line 18), making these dead weight that also violates the project convention against deferred imports.\n\nMemory hints: search \"test file naming conventions\", search \"deferred import convention\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8639,7 +8650,7 @@
       ],
       "created": "2026-04-04T14:14:49.611Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T14:14:57.040Z"
+      "updated": "2026-04-04T14:15:02.411Z"
     }
   }
 }
