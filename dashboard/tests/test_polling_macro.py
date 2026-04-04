@@ -31,21 +31,30 @@ def render_polling_section(
     poll_base: int,
     hx_request_timeout: int,
     caller_content: str = '<p>skeleton content</p>',
+    hx_swap: str | None = None,
 ) -> str:
-    """Render the polling_section macro with a caller block and return HTML."""
+    """Render the polling_section macro with a caller block and return HTML.
+
+    Pass hx_swap to override the default swap mode (morph:innerHTML).
+    When hx_swap is None, the macro uses its own default.
+    """
+    extra_args = ', hx_swap=hx_swap' if hx_swap is not None else ''
     source = (
         "{% from 'macros/polling_section.html' import polling_section %}"
-        "{% call polling_section(name, hx_get, poll_base, hx_request_timeout) %}"
+        f"{{% call polling_section(name, hx_get, poll_base, hx_request_timeout{extra_args}) %}}"
         + caller_content
         + "{% endcall %}"
     )
+    render_ctx: dict = {
+        'name': name,
+        'hx_get': hx_get,
+        'poll_base': poll_base,
+        'hx_request_timeout': hx_request_timeout,
+    }
+    if hx_swap is not None:
+        render_ctx['hx_swap'] = hx_swap
     tmpl = env.from_string(source)
-    return tmpl.render(
-        name=name,
-        hx_get=hx_get,
-        poll_base=poll_base,
-        hx_request_timeout=hx_request_timeout,
-    )
+    return tmpl.render(**render_ctx)
 
 
 class TestPollingSectionAttributes:
@@ -121,6 +130,18 @@ class TestPollingSectionAttributes:
             hx_request_timeout=8000,
         )
         assert 'aria-live="polite"' in html
+
+    def test_polling_section_renders_custom_hx_swap(self, jinja_env):
+        """Passing hx_swap='innerHTML' produces hx-swap="innerHTML" in the output."""
+        html = render_polling_section(
+            jinja_env,
+            name='orchestrators',
+            hx_get='/partials/orchestrators',
+            poll_base=10,
+            hx_request_timeout=8000,
+            hx_swap='innerHTML',
+        )
+        assert 'hx-swap="innerHTML"' in html
 
 
 class TestPollingSectionUpdatedForDiv:
