@@ -656,3 +656,203 @@ class TestSpeculativeMergeWorker:
         worker_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await worker_task
+
+    async def test_speculative_single_item_degenerates(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Single merge request through SpeculativeMergeWorker completes as 'done'.
+
+        Confirms the speculative pipeline degenerates to serial behavior when
+        there is only one item in the queue (no look-ahead possible).
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'single', 'single.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req = _make_request('single', 'single', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done'
+        _, out, _ = await _run(['git', 'show', 'main:single.py'], cwd=git_ops.project_root)
+        assert 'x = 1' in out
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_speculative_shutdown_drains_both(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """stop() resolves all pending Futures as 'blocked' with shutdown reason."""
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Don't start worker — just queue items and stop
+        wt_a, _ = await git_ops.create_worktree('shut-a')
+        wt_b, _ = await git_ops.create_worktree('shut-b')
+        req_a = _make_request('shut-a', 'shut-a', wt_a, config)
+        req_b = _make_request('shut-b', 'shut-b', wt_b, config)
+        await queue.put(req_a)
+        await queue.put(req_b)
+
+        await worker.stop()
+
+        assert req_a.result.done()
+        assert req_b.result.done()
+        outcome_a = req_a.result.result()
+        outcome_b = req_b.result.result()
+        assert outcome_a.status == 'blocked'
+        assert outcome_b.status == 'blocked'
+        assert 'shutting down' in outcome_a.reason.lower()
+        assert 'shutting down' in outcome_b.reason.lower()
+
+    async def test_speculative_conflict_n_plus_1(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """N merges cleanly; N+1 conflicts when speculatively merged.
+        N completes as 'done'; N+1 returns 'conflict'.
+        """
+        wt_n = await _make_branch_with_file(
+            git_ops, 'cfl-n', 'file_cfl_n.py', 'cfl_n = 1\n',
+        )
+
+        # Create N+1 worktree from current main, then advance main via
+        # a direct commit to cause a conflict on the same file.
+        wt_n1, _ = await git_ops.create_worktree('cfl-n1')
+        # Write conflicting content to README.md in both main and wt_n1
+        (git_ops.project_root / 'README.md').write_text('# Main conflict\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Main side change'], cwd=git_ops.project_root)
+        (wt_n1 / 'README.md').write_text('# N+1 conflict\n')
+        await git_ops.commit(wt_n1, 'N+1 conflicting change')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req_n = _make_request('cfl-n', 'cfl-n', wt_n, config)
+            req_n1 = _make_request('cfl-n1', 'cfl-n1', wt_n1, config)
+            await queue.put(req_n)
+            await queue.put(req_n1)
+
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
+
+        assert outcome_n.status == 'done', f'N: {outcome_n}'
+        assert outcome_n1.status == 'conflict', f'N+1: {outcome_n1}'
+        assert outcome_n1.conflict_details
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_speculative_events_emitted(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """speculative_merge event emitted when N+1 is speculatively merged.
+        speculative_discard event emitted when N fails and N+1 is discarded.
+        """
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        wt_n = await _make_branch_with_file(
+            git_ops, 'ev-n', 'file_ev_n.py', 'ev_n = 1\n',
+        )
+        wt_n1 = await _make_branch_with_file(
+            git_ops, 'ev-n1', 'file_ev_n1.py', 'ev_n1 = 2\n',
+        )
+
+        async def _fail_n_pass_n1(merge_wt, cfg, module_configs, task_files=None):
+            result = AsyncMock()
+            result.passed = not (merge_wt / 'file_ev_n.py').exists() or \
+                            (merge_wt / 'file_ev_n1.py').exists() and \
+                            not (merge_wt / 'file_ev_n.py').exists()
+            # Simpler: fail when both N and N+1 are present (speculative), pass after re-merge
+            n_present = (merge_wt / 'file_ev_n.py').exists()
+            n1_present = (merge_wt / 'file_ev_n1.py').exists()
+            if n_present and not n1_present:
+                result.passed = False   # N verification → fail
+                result.summary = 'N failed'
+            else:
+                result.passed = True    # N+1 (re-merged, no N) → pass
+                result.summary = ''
+            return result
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=_fail_n_pass_n1,
+        ):
+            req_n = _make_request('ev-n', 'ev-n', wt_n, config)
+            req_n1 = _make_request('ev-n1', 'ev-n1', wt_n1, config)
+            await queue.put(req_n)
+            await queue.put(req_n1)
+            await asyncio.wait_for(req_n.result, timeout=60)
+            await asyncio.wait_for(req_n1.result, timeout=60)
+
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id FROM events ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        event_types = [r[0] for r in rows]
+        assert 'speculative_merge' in event_types, f'No speculative_merge event: {event_types}'
+        assert 'speculative_discard' in event_types, f'No speculative_discard event: {event_types}'
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_speculative_already_merged_n_plus_1(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """N+1 branch already on main → returns 'already_merged' without
+        attempting a speculative merge.
+        """
+        wt_n = await _make_branch_with_file(
+            git_ops, 'am-n', 'file_am_n.py', 'am_n = 1\n',
+        )
+        # Create N+1 as already-merged: merge it first, then submit it
+        wt_n1, _ = await git_ops.create_worktree('am-n1')
+        (wt_n1 / 'file_am_n1.py').write_text('am_n1 = 2\n')
+        await git_ops.commit(wt_n1, 'N+1 file')
+        result = await git_ops.merge_to_main(wt_n1, 'am-n1')
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req_n = _make_request('am-n', 'am-n', wt_n, config)
+            req_n1 = _make_request('am-n1', 'am-n1', wt_n1, config)
+            await queue.put(req_n)
+            await queue.put(req_n1)
+
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
+
+        assert outcome_n.status == 'done', f'N: {outcome_n}'
+        assert outcome_n1.status == 'already_merged', f'N+1: {outcome_n1}'
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
