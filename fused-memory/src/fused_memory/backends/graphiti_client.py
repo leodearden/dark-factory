@@ -856,6 +856,7 @@ class GraphitiBackend:
             stale.append({
                 'uuid': entity['uuid'],
                 'name': entity['name'],
+                'summary': summary,
                 'duplicate_count': duplicate_count,
                 'stale_line_count': stale_line_count,
                 'valid_fact_count': len(valid_facts),
