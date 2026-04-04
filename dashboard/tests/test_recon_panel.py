@@ -945,3 +945,21 @@ class TestRunPanelAlpineComponent:
         with _patch_recon_data():
             html = client.get('/partials/recon').text
         assert '@click="open = !open"' not in html
+
+    def test_detail_div_uses_custom_trigger(self, client):
+        """Detail div uses hx-trigger=\"load-detail\" custom event (not \"revealed\")."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'hx-trigger="load-detail"' in html
+
+    def test_revealed_trigger_removed(self, client):
+        """Old hx-trigger=\"revealed\" is no longer present in the recon partial."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'hx-trigger="revealed"' not in html
+
+    def test_detail_div_has_x_ref(self, client):
+        """Detail div has x-ref=\"detail\" for Alpine $refs access."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-ref="detail"' in html
