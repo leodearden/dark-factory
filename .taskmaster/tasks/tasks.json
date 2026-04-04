@@ -8465,11 +8465,11 @@
         "description": "Two test gaps in test_recon_panel.py:\n\n1. **Redundant assertion**: test_no_local_open_state_in_x_data makes two assertions checking the same substring (both Python literals evaluate to identical string). Replace second assertion with single-quote form `x-data='{ open: false }'` to cover both quoting styles. (suggestion 10)\n\n2. **Missing journal_entry_count=0 test**: All TestReconDetailTrigger tests use MOCK_RUNS with journal_entry_count=3. No test verifies that when journal_entry_count=0, the badge and detail div are absent (template guards with `{% if run.journal_entry_count > 0 %}`). Add test with journal_entry_count=0. (suggestion 15)\n\nmemory_hint: search \"test_recon_panel journal\" for test file context.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-04-04T04:22:24.526Z",
+        "updatedAt": "2026-04-04T04:53:11.519Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/templates",
@@ -8569,7 +8569,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T04:53:11.190Z",
+      "lastModified": "2026-04-04T04:53:11.519Z",
       "taskCount": 409,
       "completedCount": 389,
       "tags": [
