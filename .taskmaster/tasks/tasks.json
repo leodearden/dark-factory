@@ -8683,6 +8683,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 445,
+        "title": "Extract factory helper for two-mock setup in TestRebuildEntitySummaries",
+        "description": "All six tests in TestRebuildEntitySummaries share an identical two-mock setup pattern:\n```python\nbackend.list_entity_nodes = AsyncMock(return_value=[...])\nbackend.get_all_valid_edges = AsyncMock(return_value={...})\n```\n\nThis appears verbatim six times. The conftest already uses factory fixtures (`make_backend`, `make_graph_mock`, `make_fake_maintenance_service`).\n\nExtract a helper — either a local method on the test class or a conftest fixture — e.g.:\n```python\ndef make_edge_backend(backend, nodes, edges):\n    backend.list_entity_nodes = AsyncMock(return_value=nodes)\n    backend.get_all_valid_edges = AsyncMock(return_value=edges)\n    return backend\n```\n\nEach test then becomes: `backend = make_edge_backend(make_backend(mock_config), nodes=[...], edges={...})`.\n\nAlso check TestDetectStaleSummaries (step-2 tests) which uses the same pattern 8+ times — the helper should serve both test classes.\n\nmemory_hints: search \"conftest fixtures make_backend make_graph_mock\" for existing pattern; search \"consolidate duplicated test fixture\" for prior task 348 as model.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8695,7 +8706,7 @@
       ],
       "created": "2026-04-04T14:17:37.480Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T14:17:37.506Z"
+      "updated": "2026-04-04T14:17:45.078Z"
     }
   }
 }
