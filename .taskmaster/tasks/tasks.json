@@ -8403,10 +8403,11 @@
         "description": "Two logging issues in the rebuild summaries pipeline:\n\n1. **Remove duplicate logging**: `RebuildSummariesManager.run()` emits structured log with total/stale/rebuilt/skipped/errors, then `run_rebuild_summaries` immediately emits near-identical log. The `run_cleanup` / `CleanupManager` precedent logs only from the outer entrypoint. Remove the log from `RebuildSummariesManager.run()` and keep only `run_rebuild_summaries`. (suggestion 9)\n\n2. **Condense journal payload**: In `memory_service.py:1271`, `result_summary=result` passes the full result dict including a 'details' key with one entry per rebuilt entity (hundreds/thousands). Pass a condensed summary with only aggregate fields: total_entities, stale_entities, rebuilt, errors. (suggestion 20)\n\nmemory_hint: search \"rebuild summaries logging\" for current patterns.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T04:14:25.787Z"
       },
       {
         "id": "423",
@@ -8451,7 +8452,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T04:14:25.144Z",
+      "lastModified": "2026-04-04T04:14:25.788Z",
       "taskCount": 404,
       "completedCount": 387,
       "tags": [
