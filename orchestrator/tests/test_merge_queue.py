@@ -502,9 +502,7 @@ class TestSpeculativeMergeWorker:
         assert 'n1 = 2' in out_n1
 
         await worker.stop()
-        worker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await worker_task
+        await worker_task
 
     async def test_speculative_discard_on_failure(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -572,9 +570,7 @@ class TestSpeculativeMergeWorker:
         assert rc != 0, 'N file should not be on main'
 
         await worker.stop()
-        worker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await worker_task
+        await worker_task
 
     async def test_speculative_depth_cap(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -655,9 +651,7 @@ class TestSpeculativeMergeWorker:
             assert rc == 0, f'{fname} not on main'
 
         await worker.stop()
-        worker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await worker_task
+        await worker_task
 
     async def test_speculative_single_item_degenerates(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -684,9 +678,7 @@ class TestSpeculativeMergeWorker:
         assert 'x = 1' in out
 
         await worker.stop()
-        worker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await worker_task
+        await worker_task
 
     async def test_speculative_shutdown_drains_both(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -752,9 +744,7 @@ class TestSpeculativeMergeWorker:
         assert outcome_n1.conflict_details
 
         await worker.stop()
-        worker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await worker_task
+        await worker_task
 
     async def test_speculative_events_emitted(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
@@ -814,9 +804,7 @@ class TestSpeculativeMergeWorker:
         assert 'speculative_discard' in event_types, f'No speculative_discard event: {event_types}'
 
         await worker.stop()
-        worker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await worker_task
+        await worker_task
 
     async def test_speculative_already_merged_n_plus_1(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -855,9 +843,7 @@ class TestSpeculativeMergeWorker:
         assert outcome_n1.status == 'already_merged', f'N+1: {outcome_n1}'
 
         await worker.stop()
-        worker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await worker_task
+        await worker_task
 
     async def test_verifier_exception_releases_speculation_slot(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -919,9 +905,7 @@ class TestSpeculativeMergeWorker:
             assert outcome_n1.status in ('done', 'blocked'), f'N+1: {outcome_n1}'
 
         await worker.stop()
-        worker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await worker_task
+        await worker_task
 
     async def test_verifier_remerge_exception_releases_slot(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -982,9 +966,7 @@ class TestSpeculativeMergeWorker:
             )
 
         await worker.stop()
-        worker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await worker_task
+        await worker_task
 
     async def test_run_cancels_subtasks_on_cancellation(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -1139,9 +1121,7 @@ class TestSpeculativeMergeWorker:
             assert outcome_ok.status == 'done', f'rp-ok: {outcome_ok}'
 
         await worker.stop()
-        worker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await worker_task
+        await worker_task
 
 
 # ---------------------------------------------------------------------------
@@ -1174,9 +1154,7 @@ class TestSpeculativeBackwardCompat:
         assert 'compat = True' in content
 
         await worker.stop()
-        worker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await worker_task
+        await worker_task
 
     async def test_already_merged(self, git_ops: GitOps, config: OrchestratorConfig):
         worktree, _ = await git_ops.create_worktree('compat-am')
@@ -1200,9 +1178,7 @@ class TestSpeculativeBackwardCompat:
         assert outcome.status == 'already_merged'
 
         await worker.stop()
-        worker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await worker_task
+        await worker_task
 
     async def test_verify_failure(self, git_ops: GitOps, config: OrchestratorConfig):
         worktree, _ = await git_ops.create_worktree('compat-vf')
@@ -1226,6 +1202,4 @@ class TestSpeculativeBackwardCompat:
         assert 'verification failed' in outcome.reason.lower()
 
         await worker.stop()
-        worker_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await worker_task
+        await worker_task

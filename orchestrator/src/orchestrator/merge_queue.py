@@ -362,18 +362,30 @@ class SpeculativeMergeWorker:
             except asyncio.QueueEmpty:
                 break
 
-        # Drain verifier queue
+        # Drain verifier queue — also clean up orphaned merge worktrees
         while not self._verifier_queue.empty():
             try:
                 item = self._verifier_queue.get_nowait()
-                if item is not None and not item.request.result.done():
-                    item.request.result.set_result(shutdown)
+                if item is not None:
+                    if item.merge_wt is not None:
+                        await self._git_ops.cleanup_merge_worktree(item.merge_wt)
+                    if not item.request.result.done():
+                        item.request.result.set_result(shutdown)
             except asyncio.QueueEmpty:
                 break
 
         # Send sentinels to unblock both loops
         await self._queue.put(None)  # type: ignore[arg-type]
         await self._verifier_queue.put(None)  # type: ignore[arg-type]
+
+        # Allow worker tasks to exit gracefully via sentinels before the
+        # harness cancels them, preventing unresolved mid-flight Futures.
+        tasks_to_wait = [
+            t for t in (self._merger_task, self._verifier_task)
+            if t is not None and not t.done()
+        ]
+        if tasks_to_wait:
+            await asyncio.wait(tasks_to_wait, timeout=5.0)
 
     # ------------------------------------------------------------------
     # Event helpers
@@ -610,6 +622,19 @@ class SpeculativeMergeWorker:
                         'blocked', reason=f'Verifier error: {exc}',
                     ))
                 n_failed = True
+            except BaseException:
+                # CancelledError or other fatal — resolve the in-flight Future
+                # and clean up the merge worktree so callers don't hang forever.
+                if item.merge_wt is not None:
+                    try:
+                        await self._git_ops.cleanup_merge_worktree(item.merge_wt)
+                    except Exception:
+                        pass  # best-effort cleanup during cancellation
+                if not req.result.done():
+                    req.result.set_result(MergeOutcome(
+                        'blocked', reason='Merge worker cancelled',
+                    ))
+                raise
             finally:
                 self._speculation_slot.set()
 
