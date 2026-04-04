@@ -490,6 +490,58 @@ class TestRefreshEntitySummaryMcpTool:
         assert 'error' in parsed
         assert 'FalkorDB connection failed' in parsed['error']
 
+    # -- step-5 (task-309): entity_name support in the MCP tool --
+
+    @pytest.mark.asyncio
+    async def test_tool_accepts_entity_name(self, mcp_server, mock_service):
+        """Tool accepts entity_name and passes it to memory_service."""
+        await mcp_server._tool_manager.call_tool(
+            'refresh_entity_summary',
+            {'entity_name': 'Alice', 'project_id': 'dark_factory'},
+        )
+        mock_service.refresh_entity_summary.assert_awaited_once()
+        call_kwargs = mock_service.refresh_entity_summary.call_args[1]
+        assert call_kwargs.get('entity_name') == 'Alice'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_neither_uuid_nor_name_returns_validation_error(self, mcp_server, mock_service):
+        """Returns validation error when neither entity_uuid nor entity_name is provided."""
+        import json
+        result = await mcp_server._tool_manager.call_tool(
+            'refresh_entity_summary',
+            {'project_id': 'dark_factory'},
+        )
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            parsed = json.loads(content)
+        else:
+            parsed = result
+        assert 'error' in parsed
+        mock_service.refresh_entity_summary.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_entity_uuid_alone_still_works(self, mcp_server, mock_service):
+        """Backward compat: entity_uuid alone still calls the service correctly."""
+        await mcp_server._tool_manager.call_tool(
+            'refresh_entity_summary',
+            {'entity_uuid': 'node-1', 'project_id': 'dark_factory'},
+        )
+        mock_service.refresh_entity_summary.assert_awaited_once()
+        call_kwargs = mock_service.refresh_entity_summary.call_args[1]
+        assert call_kwargs.get('entity_uuid') == 'node-1'
+
+    @pytest.mark.asyncio
+    async def test_entity_name_alone_resolves_correctly(self, mcp_server, mock_service):
+        """entity_name alone is passed through; service does the resolution."""
+        await mcp_server._tool_manager.call_tool(
+            'refresh_entity_summary',
+            {'entity_name': 'Alice', 'project_id': 'dark_factory'},
+        )
+        call_kwargs = mock_service.refresh_entity_summary.call_args[1]
+        assert call_kwargs.get('entity_name') == 'Alice'
+        assert call_kwargs.get('entity_uuid') is None
+
 
 # ---------------------------------------------------------------------------
 # step-11: DISALLOW_MEMORY_WRITES list in cli_stage_runner.py
