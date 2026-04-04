@@ -636,8 +636,9 @@ def create_mcp_server(
 
     @mcp.tool()
     async def refresh_entity_summary(
-        entity_uuid: str,
         project_id: str,
+        entity_uuid: str | None = None,
+        entity_name: str | None = None,
         agent_id: str | None = None,
         session_id: str | None = None,
         metadata: dict | None = None,
@@ -645,16 +646,24 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Regenerate a Graphiti entity node's summary from its valid edges.
 
-        After deleting edges from an entity, call this tool with the entity's
-        UUID to rebuild its summary from the remaining valid edges. This prevents
-        stale duplicate text from persisting in entity summaries.
+        After deleting edges from an entity, call this tool to rebuild its
+        summary from the remaining valid edges. This prevents stale duplicate
+        text from persisting in entity summaries.
+
+        Accepts either *entity_uuid* (the canonical FalkorDB node UUID) or
+        *entity_name* (exact entity name — resolved to a UUID automatically).
+        When both are supplied, entity_uuid takes precedence. At least one must
+        be provided.
 
         The summary is rebuilt by deduplicating the facts of all currently-valid
         RELATES_TO edges — no LLM call is made.
 
         Args:
-            entity_uuid: UUID of the Graphiti Entity node to refresh
             project_id: Project scope (required)
+            entity_uuid: UUID of the Graphiti Entity node to refresh (optional when
+                entity_name is provided)
+            entity_name: Exact name of the Entity node to resolve and refresh
+                (optional when entity_uuid is provided)
             agent_id: Which agent is calling (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
@@ -662,10 +671,17 @@ def create_mcp_server(
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         if err := validate_project_id(project_id):
             return err
+        if not entity_uuid and not entity_name:
+            return {
+                'error': 'Either entity_uuid or entity_name must be provided',
+                'error_type': 'ValidationError',
+            }
         try:
             causation_id, source, _ = _extract_causation(metadata, agent_id)
             return await memory_service.refresh_entity_summary(
-                entity_uuid=entity_uuid, project_id=project_id,
+                entity_uuid=entity_uuid or None,
+                entity_name=entity_name or None,
+                project_id=project_id,
                 agent_id=agent_id, session_id=session_id,
                 causation_id=causation_id, _source=source,
             )
