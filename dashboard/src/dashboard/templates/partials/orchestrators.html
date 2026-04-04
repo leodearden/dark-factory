@@ -33,7 +33,7 @@
 
         <button @click="$store.panels['{{ orch_key }}'] = !$store.panels['{{ orch_key }}']" class="mt-3 text-sm text-blue-400 hover:text-blue-300" x-text="$store.panels['{{ orch_key }}'] ? 'Hide tasks' : 'Show tasks'">Show tasks</button>
 
-        <div x-show="$store.panels['{{ orch_key }}']" x-cloak class="mt-4">
+        <div x-show="$store.panels['{{ orch_key }}']" x-cloak style="display:none" class="mt-4">
           {% include 'partials/tasks.html' %}
         </div>
       </div>
