@@ -8,6 +8,7 @@ Covers:
 - MCP tool rebuild_entity_summaries             (step 5)
 - DISALLOW_MEMORY_WRITES list                   (step 6)
 - RebuildSummariesManager / run_rebuild_summaries (step 7)
+- GraphitiBackend.get_all_valid_edges()         (task-423)
 """
 from __future__ import annotations
 
@@ -622,3 +623,30 @@ class TestRebuildSummariesManager:
         assert result.stale_entities == 3
         assert result.rebuilt == 3
         assert len(result.details) == 1
+
+
+# ---------------------------------------------------------------------------
+# task-423: GraphitiBackend.get_all_valid_edges
+# ---------------------------------------------------------------------------
+
+class TestGetAllValidEdges:
+    """GraphitiBackend.get_all_valid_edges() returns all valid edges grouped by entity UUID."""
+
+    @pytest.mark.asyncio
+    async def test_groups_edges_by_entity_uuid(self, mock_config, make_backend, make_graph_mock):
+        """Returns dict grouping edges by entity UUID with {uuid, fact, name} shape."""
+        backend = make_backend(mock_config)
+        rows = [
+            ['entity-1', 'edge-a', 'Alice knows Bob', 'knows'],
+            ['entity-1', 'edge-b', 'Alice lives in Paris', 'lives_in'],
+            ['entity-2', 'edge-c', 'Bob works at Acme', 'works_at'],
+        ]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert set(result.keys()) == {'entity-1', 'entity-2'}
+        assert len(result['entity-1']) == 2
+        assert len(result['entity-2']) == 1
+        assert result['entity-1'][0] == {'uuid': 'edge-a', 'fact': 'Alice knows Bob', 'name': 'knows'}
+        assert result['entity-1'][1] == {'uuid': 'edge-b', 'fact': 'Alice lives in Paris', 'name': 'lives_in'}
+        assert result['entity-2'][0] == {'uuid': 'edge-c', 'fact': 'Bob works at Acme', 'name': 'works_at'}
