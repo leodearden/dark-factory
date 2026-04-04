@@ -981,3 +981,39 @@ class TestRunPanelAlpineComponent:
         with _patch_recon_data():
             html = client.get('/partials/recon').text
         assert 'delete this.dataset.loading' in html
+
+    def test_toggle_detail_guards_against_loaded(self, client):
+        """toggleDetail() checks detail.dataset.loaded before dispatching event."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'detail.dataset.loaded' in html
+
+    def test_toggle_detail_guards_against_loading(self, client):
+        """toggleDetail() checks detail.dataset.loading before dispatching event."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'detail.dataset.loading' in html
+
+    def test_toggle_detail_sets_loading_synchronously(self, client):
+        """toggleDetail() sets detail.dataset.loading='true' before HTMX trigger."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert "detail.dataset.loading = 'true'" in html
+
+    def test_toggle_detail_dispatches_load_detail_event(self, client):
+        """toggleDetail() calls htmx.trigger(detail, 'load-detail')."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert "htmx.trigger(detail, 'load-detail')" in html
+
+    def test_toggle_detail_early_returns_when_closing(self, client):
+        """toggleDetail() early-returns when open becomes false (closing)."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'if (!this.open)' in html
+
+    def test_toggle_detail_uses_refs_detail(self, client):
+        """toggleDetail() uses this.$refs.detail to access the detail element."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'this.$refs.detail' in html

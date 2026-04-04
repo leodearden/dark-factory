@@ -4,6 +4,12 @@
     open: false,
     toggleDetail() {
       this.open = !this.open;
+      if (!this.open) return;
+      const detail = this.$refs.detail;
+      if (!detail.dataset.loaded && !detail.dataset.loading) {
+        detail.dataset.loading = 'true';
+        htmx.trigger(detail, 'load-detail');
+      }
     },
   }));
 </script>
