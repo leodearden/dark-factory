@@ -826,3 +826,32 @@ class TestRebuildEntitySummariesParallel:
 
         assert result['rebuilt'] == 1
         assert result['errors'] == 1
+
+
+# ---------------------------------------------------------------------------
+# task-432 step-1: _rebuild_entity_from_edges accepts old_summary kwarg
+# ---------------------------------------------------------------------------
+
+class TestRebuildEntityFromEdgesOldSummary:
+    """_rebuild_entity_from_edges accepts old_summary kwarg and skips get_node_text."""
+
+    @pytest.mark.asyncio
+    async def test_rebuild_entity_from_edges_uses_passed_old_summary(
+        self, mock_config, make_backend
+    ):
+        """When old_summary kwarg is provided, it is used in the result dict and
+        get_node_text is NOT called."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock()
+        backend.update_node_summary = AsyncMock()
+
+        edges = [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]
+        result = await backend._rebuild_entity_from_edges(
+            'uuid-1', 'Alice', edges, group_id='test', old_summary='prior summary'
+        )
+
+        assert result['old_summary'] == 'prior summary'
+        assert result['new_summary'] == 'current fact'
+        assert result['uuid'] == 'uuid-1'
+        assert result['name'] == 'Alice'
+        backend.get_node_text.assert_not_awaited()
