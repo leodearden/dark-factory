@@ -267,7 +267,7 @@ class TestLoadTaskTree:
 
         assert len(result) == 2
         assert result[0]['status'] == 'done'
-        assert result[1]['dependencies'] == ['1']
+        assert result[1]['dependencies'] == [1]
 
     def test_file_not_found(self, tmp_path):
         """Non-existent path returns empty list."""
@@ -344,6 +344,37 @@ class TestLoadTaskTree:
         result = load_task_tree(tasks_json)
 
         assert result == []
+
+
+    def test_non_numeric_id_skipped(self, tmp_path):
+        """Task with non-numeric ID (e.g. 'task-abc') is skipped, not crashed on."""
+        import json
+
+        from dashboard.data.orchestrator import load_task_tree
+
+        tasks_json = tmp_path / 'tasks.json'
+        tasks_json.write_text(json.dumps({'tasks': [
+            {'id': 'task-abc', 'title': 'Bad', 'status': 'pending'},
+            {'id': '5', 'title': 'Good', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+        ]}))
+
+        result = load_task_tree(tasks_json)
+        assert len(result) == 1
+        assert result[0]['id'] == 5
+
+    def test_string_dependencies_normalised_to_int(self, tmp_path):
+        """String dependency values are converted to int for consistent comparisons."""
+        import json
+
+        from dashboard.data.orchestrator import load_task_tree
+
+        tasks_json = tmp_path / 'tasks.json'
+        tasks_json.write_text(json.dumps({'tasks': [
+            {'id': 3, 'title': 'T3', 'status': 'done', 'dependencies': ['1', '2']},
+        ]}))
+
+        result = load_task_tree(tasks_json)
+        assert result[0]['dependencies'] == [1, 2]
 
 
 class TestReadTaskArtifacts:
@@ -485,22 +516,22 @@ class TestExtractTaskId:
     """Tests for _extract_task_id — normalises worktree directory names to numeric task IDs."""
 
     def test_strips_task_prefix(self):
-        """'task-7' returns '7'."""
+        """'task-7' returns 7."""
         from dashboard.data.orchestrator import _extract_task_id
 
-        assert _extract_task_id('task-7') == '7'
+        assert _extract_task_id('task-7') == 7
 
     def test_plain_numeric_unchanged(self):
-        """Plain numeric string '33' returns '33' unchanged."""
+        """Plain numeric string '33' returns 33."""
         from dashboard.data.orchestrator import _extract_task_id
 
-        assert _extract_task_id('33') == '33'
+        assert _extract_task_id('33') == 33
 
     def test_multi_digit_task_prefix(self):
-        """'task-123' returns '123'."""
+        """'task-123' returns 123."""
         from dashboard.data.orchestrator import _extract_task_id
 
-        assert _extract_task_id('task-123') == '123'
+        assert _extract_task_id('task-123') == 123
 
     def test_task_prefix_only_returns_none(self):
         """'task-' with empty suffix returns None (invalid)."""
@@ -574,8 +605,8 @@ class TestDiscoverOrchestrators:
         assert entry['prd'] == prd_path
         assert entry['running'] is True
         assert len(entry['tasks']) == 6
-        assert '7' in entry['worktrees']
-        assert entry['worktrees']['7']['phase'] == 'EXECUTE'
+        assert 7 in entry['worktrees']
+        assert entry['worktrees'][7]['phase'] == 'EXECUTE'
         assert entry['summary'] == {'total': 6, 'done': 2, 'in_progress': 2, 'blocked': 1, 'pending': 1}
 
     def test_no_running_orchestrators(self, tmp_path):
@@ -642,10 +673,10 @@ class TestDiscoverOrchestrators:
 
         assert len(result) == 1
         worktrees = result[0]['worktrees']
-        # Key must be '7' not 'task-7'
-        assert '7' in worktrees
+        # Key must be 7 (int) not 'task-7'
+        assert 7 in worktrees
         assert 'task-7' not in worktrees
-        assert worktrees['7']['phase'] == 'EXECUTE'
+        assert worktrees[7]['phase'] == 'EXECUTE'
 
     def test_non_task_worktree_dirs_excluded(self, tmp_path):
         """Non-task directories (e.g. 'tmp-backup') are excluded; plain and 'task-' numeric dirs included."""
@@ -680,8 +711,8 @@ class TestDiscoverOrchestrators:
             result = discover_orchestrators(config)
 
         worktrees = result[0]['worktrees']
-        assert '3' in worktrees
-        assert '5' in worktrees
+        assert 3 in worktrees
+        assert 5 in worktrees
         assert 'tmp-backup' not in worktrees
         assert 'task-3' not in worktrees
 
@@ -742,7 +773,7 @@ class TestDiscoverOrchestrators:
         assert entry['pids'] == [1234, 5678]
         # Shared data should appear once
         assert len(entry['tasks']) == 1
-        assert '1' in entry['worktrees']
+        assert 1 in entry['worktrees']
         assert entry['summary']['total'] == 1
 
     def test_different_projects_produce_separate_entries(self, tmp_path):
@@ -865,8 +896,8 @@ class TestScanWorktrees:
         (wt_dir / 'tmp-backup').mkdir()
 
         result = _scan_worktrees(wt_dir)
-        assert '5' in result
-        assert '7' in result
+        assert 5 in result
+        assert 7 in result
         assert 'tmp-backup' not in result
 
     def test_missing_dir_returns_empty(self, tmp_path):
@@ -987,10 +1018,10 @@ class TestDiscoverOrchestratorsPerProject:
             result = discover_orchestrators(config)
 
         by_root = {e['project_root']: e for e in result}
-        assert set(by_root[str(proj_a)]['worktrees'].keys()) == {'3'}
-        assert by_root[str(proj_a)]['worktrees']['3']['phase'] == 'DONE'
-        assert set(by_root[str(proj_b)]['worktrees'].keys()) == {'5'}
-        assert by_root[str(proj_b)]['worktrees']['5']['phase'] == 'EXECUTE'
+        assert set(by_root[str(proj_a)]['worktrees'].keys()) == {3}
+        assert by_root[str(proj_a)]['worktrees'][3]['phase'] == 'DONE'
+        assert set(by_root[str(proj_b)]['worktrees'].keys()) == {5}
+        assert by_root[str(proj_b)]['worktrees'][5]['phase'] == 'EXECUTE'
 
     def test_fallback_to_config_project_root(self, tmp_path):
         """When PRD path has no .taskmaster/ ancestor, falls back to config project_root."""

@@ -50,6 +50,37 @@ class TestWorktreeLifecycle:
         assert (worktree / 'README.md').exists()
         assert len(base_sha) == 40
 
+    async def test_create_worktree_replaces_stale_directory(self, git_ops: GitOps):
+        """A directory that exists but is NOT a registered git worktree must be
+        replaced with a real worktree — not silently reused (regression test for
+        esc-158-11: stale .task/ dirs mistaken for valid worktrees)."""
+        worktree_path = git_ops.worktree_base / 'stale-1'
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        # Simulate a stale .task/ directory left from a previous run
+        task_dir = worktree_path / '.task'
+        task_dir.mkdir()
+        (task_dir / 'state.json').write_text('{}')
+
+        # The directory exists but is NOT a registered git worktree
+        assert worktree_path.exists()
+
+        worktree, base_sha = await git_ops.create_worktree('stale-1')
+        # Should have created a real worktree with repo content
+        assert worktree.exists()
+        assert (worktree / 'README.md').exists()
+        assert len(base_sha) == 40
+
+    async def test_create_worktree_reuses_registered_worktree(self, git_ops: GitOps):
+        """A directory that IS a registered git worktree should be reused."""
+        worktree, base_sha = await git_ops.create_worktree('reuse-1')
+        assert worktree.exists()
+        assert (worktree / 'README.md').exists()
+
+        # Call again — should reuse (not fail or recreate)
+        worktree2, base_sha2 = await git_ops.create_worktree('reuse-1')
+        assert worktree2 == worktree
+        assert (worktree2 / 'README.md').exists()
+
     async def test_commit_in_worktree(self, git_ops: GitOps):
         worktree, _ = await git_ops.create_worktree('feature-2')
         (worktree / 'new_file.py').write_text('print("hello")\n')

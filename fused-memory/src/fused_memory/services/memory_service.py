@@ -1226,6 +1226,72 @@ class MemoryService:
 
         return result
 
+    async def rebuild_entity_summaries(
+        self,
+        project_id: str = 'main',
+        force: bool = False,
+        dry_run: bool = False,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
+    ) -> dict:
+        """Batch-rebuild Entity node summaries from their current valid edges.
+
+        Delegates to GraphitiBackend.rebuild_entity_summaries(), which detects
+        stale entities (or iterates all when force=True) and calls
+        refresh_entity_summary for each.  Logs the operation via write journal
+        if available.
+
+        Args:
+            project_id: Project scope (determines FalkorDB graph).
+            force: Rebuild every entity regardless of staleness.
+            dry_run: Detect stale entities but do not write any summaries.
+            agent_id: Which agent is calling (optional).
+            session_id: Session context (optional).
+            causation_id: Reconciliation causation ID (optional).
+            _source: Source label for journal entry.
+
+        Returns:
+            Dict from backend: {total_entities, stale_entities, rebuilt,
+            skipped, errors, details}.
+        """
+        write_op_id = str(uuid_mod.uuid4())
+        success = True
+        error_msg = None
+        result: dict = {}
+        try:
+            result = await self.graphiti.rebuild_entity_summaries(
+                group_id=project_id, force=force, dry_run=dry_run
+            )
+        except Exception as e:
+            success = False
+            error_msg = str(e)
+            raise
+        finally:
+            if self._write_journal:
+                try:
+                    await self._write_journal.log_write_op(
+                        write_op_id=write_op_id,
+                        causation_id=causation_id,
+                        source=_source,
+                        operation='rebuild_entity_summaries',
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        params={'force': force, 'dry_run': dry_run},
+                        result_summary=result if success else None,
+                        success=success,
+                        error=error_msg,
+                    )
+                except Exception as journal_exc:
+                    logger.warning(
+                        'rebuild_entity_summaries: journal log_write_op failed: %s',
+                        journal_exc,
+                    )
+
+        return result
+
     async def merge_entities(
         self,
         deprecated_uuid: str,

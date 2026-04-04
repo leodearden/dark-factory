@@ -725,6 +725,54 @@ def create_mcp_server(
             logger.error(f'merge_entities error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
+    @mcp.tool()
+    async def rebuild_entity_summaries(
+        project_id: str,
+        force: bool = False,
+        dry_run: bool = False,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Batch-rebuild Graphiti entity summaries from their current valid edges.
+
+        Scans all Entity nodes in the project graph and identifies those whose
+        summary is out of sync with their currently-valid RELATES_TO edges
+        (duplicated lines, or lines from invalidated edges).  For each stale
+        entity, rebuilds the summary using the same deduplication logic as
+        refresh_entity_summary — no LLM call is made.
+
+        Use ``dry_run=True`` to inspect which entities are stale without making
+        any changes.  Use ``force=True`` to rebuild every entity regardless of
+        detected staleness.
+
+        Args:
+            project_id: Project scope (required)
+            force: Rebuild every entity regardless of staleness (default: false)
+            dry_run: Detect stale entities but do not write summaries (default: false)
+            agent_id: Which agent is calling (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := validate_project_id(project_id):
+            return err
+        try:
+            causation_id, source, _ = _extract_causation(metadata, agent_id)
+            return await memory_service.rebuild_entity_summaries(
+                project_id=project_id,
+                force=force,
+                dry_run=dry_run,
+                agent_id=agent_id,
+                session_id=session_id,
+                causation_id=causation_id,
+                _source=source,
+            )
+        except Exception as e:
+            logger.error(f'rebuild_entity_summaries error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
     # ------------------------------------------------------------------
     # Management tools
     # ------------------------------------------------------------------

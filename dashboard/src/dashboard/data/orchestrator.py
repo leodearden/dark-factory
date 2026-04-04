@@ -67,9 +67,9 @@ def _read_project_root_from_config(config_path: str) -> Path | None:
     return p.resolve() if p.is_absolute() else None
 
 
-def _scan_worktrees(worktrees_dir: Path) -> dict[str, dict]:
+def _scan_worktrees(worktrees_dir: Path) -> dict[int, dict]:
     """Scan a .worktrees/ directory and return {task_id: artifact_data}."""
-    worktrees: dict[str, dict] = {}
+    worktrees: dict[int, dict] = {}
     if worktrees_dir.is_dir():
         for subdir in sorted(worktrees_dir.iterdir()):
             if subdir.is_dir():
@@ -79,21 +79,24 @@ def _scan_worktrees(worktrees_dir: Path) -> dict[str, dict]:
     return worktrees
 
 
-def _extract_task_id(dirname: str) -> str | None:
-    """Normalise a worktree directory name to a numeric task ID string.
+def _extract_task_id(dirname: str) -> int | None:
+    """Normalise a worktree directory name to a numeric task ID.
 
     Handles two naming conventions:
     - ``'task-{id}'`` (e.g. ``'task-7'``) — strips the prefix and returns the
-      digit portion.
-    - ``'{id}'`` (e.g. ``'7'``) — returns it directly.
+      digit portion as an int.
+    - ``'{id}'`` (e.g. ``'7'``) — returns it as an int.
 
     Returns ``None`` for any name that doesn't yield a non-empty digit string
     (e.g. ``'task-abc'``, ``'task-'``, ``'random-dir'``, ``''``).
     """
+    digits: str | None = None
     if dirname.startswith('task-'):
         suffix = dirname[len('task-'):]
-        return suffix if suffix.isdigit() and suffix else None
-    return dirname if dirname.isdigit() and dirname else None
+        digits = suffix if suffix.isdigit() and suffix else None
+    else:
+        digits = dirname if dirname.isdigit() and dirname else None
+    return int(digits) if digits is not None else None
 
 
 def find_running_orchestrators() -> list[dict]:
@@ -190,16 +193,17 @@ def load_task_tree(tasks_json_path: Path) -> list[dict]:
     result: list[dict] = []
     for task in raw_tasks:
         try:
+            raw_deps = task.get('dependencies', [])
             result.append({
                 'id': int(task.get('id', 0)),
                 'title': task.get('title'),
                 'status': task.get('status'),
                 'priority': task.get('priority'),
-                'dependencies': task.get('dependencies', []),
+                'dependencies': [int(d) for d in raw_deps if str(d).isdigit()],
                 'metadata': task.get('metadata', {}),
             })
-        except AttributeError:
-            logger.warning('Skipping non-dict task entry in %s', tasks_json_path)
+        except (AttributeError, TypeError, ValueError):
+            logger.warning('Skipping malformed task entry in %s', tasks_json_path)
             continue
 
     return result

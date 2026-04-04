@@ -3,8 +3,9 @@
 # use the module's pyproject.toml config and don't resolve orchestrator
 # from the main project's editable install.
 
-# Verification commands — run from the fused-memory/ subdirectory so
-# pyright/ruff pick up the local pyproject.toml configuration.
+# Verification commands — must run from a directory where fused-memory/ is
+# a direct subdirectory (repo root or full-checkout worktree), so that
+# --project fused-memory and --directory fused-memory resolve correctly.
 test_command: "uv run --project fused-memory --directory fused-memory pytest tests/ --tb=short -q"
 lint_command: "uv run --project fused-memory --directory fused-memory ruff check src/ tests/"
 type_check_command: "uv run --project fused-memory --directory fused-memory pyright src/ tests/"
