@@ -8609,6 +8609,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 435,
+        "title": "Align costs/runs.html Alpine pattern with recon.html convention",
+        "description": "Update costs/runs.html to use named Alpine.data component pattern instead of inline x-data=\"{ open: false }\", matching the convention established in recon.html.",
+        "details": "File: dashboard/src/dashboard/templates/partials/costs/runs.html. Source: review suggestions from task 421 (esc-421-19).",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8621,7 +8632,7 @@
       ],
       "created": "2026-04-04T06:43:47.452Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T06:44:02.343Z"
+      "updated": "2026-04-04T06:44:05.452Z"
     }
   }
 }
