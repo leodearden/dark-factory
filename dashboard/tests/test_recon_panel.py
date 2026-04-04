@@ -894,6 +894,67 @@ class TestVerdictCardExplanation:
         assert 'data-testid="verdict-explanation"' not in html
 
 
+class TestRunPanelJournalBadgeRegression:
+    """Regression tests: badge behaviours must survive the Alpine component refactor."""
+
+    def test_badge_visible_with_journal_entries(self, client):
+        """Badge renders when journal_entry_count > 0."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'data-testid="journal-badge"' in html
+
+    def test_badge_hidden_with_zero_entries(self, client):
+        """Badge not rendered when journal_entry_count == 0."""
+        runs_zero = [{**MOCK_RUNS[0], 'journal_entry_count': 0}]
+        with _patch_recon_data(runs=runs_zero):
+            html = client.get('/partials/recon').text
+        assert 'data-testid="journal-badge"' not in html
+
+    def test_badge_aria_label_contains_count(self, client):
+        """aria-label reflects the entry count."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'aria-label="Show 3 journal entries"' in html
+
+    def test_badge_is_button_element(self, client):
+        """Badge is a <button>, not a <span> or <div>."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        tag = _get_opening_tag(html, 'data-testid="journal-badge"')
+        assert tag.startswith('<button')
+
+    def test_badge_has_blue_bg_class(self, client):
+        """Badge retains its blue background CSS class."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'bg-blue-900' in html
+
+    def test_badge_has_hover_style(self, client):
+        """Badge retains hover style."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'hover:bg-blue-800' in html
+
+    def test_badge_has_focus_ring(self, client):
+        """Badge retains focus-ring accessibility styles."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'focus:ring-2' in html
+        assert 'focus:ring-blue-400' in html
+
+    def test_x_show_open_still_on_detail_row(self, client):
+        """Detail row still uses x-show=\"open\" for show/hide."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-show="open"' in html
+
+    def test_x_cloak_still_on_detail_row(self, client):
+        """Detail row still has x-cloak to prevent flash of unstyled content."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-cloak' in html
+
+
 class TestPartitionBurstStateNoneGuard:
     """Direct classification test for partition_burst_state with None last_write_at."""
 
@@ -905,3 +966,155 @@ class TestPartitionBurstStateNoneGuard:
         active, idle = partition_burst_state([agent])
         assert idle == [agent]
         assert active == []
+
+
+class TestRunPanelAlpineComponent:
+    """Tests for the named Alpine.data('runPanel') component in recon.html."""
+
+    def test_alpine_data_run_panel_definition_present(self, client):
+        """Alpine.data('runPanel') script block is rendered when journal entries exist."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert "Alpine.data('runPanel'" in html
+
+    def test_run_panel_script_not_inside_alpine_init(self, client):
+        """Registration must NOT be wrapped in alpine:init (partial loads after init)."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert "alpine:init" not in html
+
+    def test_tbody_uses_named_component(self, client):
+        """tbody uses x-data=\"runPanel\" (named component, not inline object)."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-data="runPanel"' in html
+
+    def test_inline_open_false_not_present(self, client):
+        """Old inline x-data=\"{ open: false }\" pattern is removed."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-data="{ open: false }"' not in html
+
+    def test_badge_button_uses_toggle_detail_handler(self, client):
+        """Badge button uses @click=\"toggleDetail()\" not inline open = !open."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert '@click="toggleDetail()"' in html
+
+    def test_old_inline_click_handler_gone(self, client):
+        """Old @click=\"open = !open\" handler is removed from the badge button."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert '@click="open = !open"' not in html
+
+    def test_detail_div_uses_custom_trigger(self, client):
+        """Detail div uses hx-trigger=\"load-detail\" custom event (not \"revealed\")."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'hx-trigger="load-detail"' in html
+
+    def test_revealed_trigger_removed(self, client):
+        """Old hx-trigger=\"revealed\" is no longer present in the recon partial."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'hx-trigger="revealed"' not in html
+
+    def test_detail_div_has_x_ref(self, client):
+        """Detail div has x-ref=\"detail\" for Alpine $refs access."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-ref="detail"' in html
+
+    def test_detail_div_has_after_swap_handler(self, client):
+        """Detail div has hx-on::after-swap to set dataset.loaded flag."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'hx-on::after-swap' in html
+
+    def test_after_swap_sets_loaded_flag(self, client):
+        """hx-on::after-swap sets this.dataset.loaded='true'."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert "this.dataset.loaded = 'true'" in html
+
+    def test_after_swap_removes_loading_flag(self, client):
+        """hx-on::after-swap deletes this.dataset.loading."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'delete this.dataset.loading' in html
+
+    def test_toggle_detail_guards_against_loaded(self, client):
+        """toggleDetail() checks detail.dataset.loaded before dispatching event."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'detail.dataset.loaded' in html
+
+    def test_toggle_detail_guards_against_loading(self, client):
+        """toggleDetail() checks detail.dataset.loading before dispatching event."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'detail.dataset.loading' in html
+
+    def test_toggle_detail_sets_loading_synchronously(self, client):
+        """toggleDetail() sets detail.dataset.loading='true' before HTMX trigger."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert "detail.dataset.loading = 'true'" in html
+
+    def test_toggle_detail_dispatches_load_detail_event(self, client):
+        """toggleDetail() calls htmx.trigger(detail, 'load-detail')."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert "htmx.trigger(detail, 'load-detail')" in html
+
+    def test_toggle_detail_early_returns_when_closing(self, client):
+        """toggleDetail() early-returns when open becomes false (closing)."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'if (!this.open)' in html
+
+    def test_toggle_detail_uses_refs_detail(self, client):
+        """toggleDetail() uses this.$refs.detail to access the detail element."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'this.$refs.detail' in html
+
+    def test_toggle_detail_null_guards_refs_detail(self, client):
+        """toggleDetail() guards against undefined $refs.detail with 'if (!detail) return'."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'if (!detail) return' in html
+
+    def test_null_guard_appears_before_dataset_access(self, client):
+        """Null guard appears immediately after $refs lookup, before dataset access."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        refs_pos = html.index('const detail = this.$refs.detail')
+        null_guard_pos = html.index('if (!detail) return')
+        dataset_pos = html.index('detail.dataset.loaded')
+        assert refs_pos < null_guard_pos < dataset_pos
+
+    def test_detail_div_has_after_request_handler(self, client):
+        """Detail div has hx-on::after-request to clear loading flag on failure."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'hx-on::after-request' in html
+
+    def test_after_request_clears_loading_on_failure(self, client):
+        """hx-on::after-request clears dataset.loading when request fails."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        # Handler must check for failure via event.detail.failed or !event.detail.successful
+        assert 'event.detail.failed' in html or '!event.detail.successful' in html
+
+    def test_after_request_deletes_loading_on_failure(self, client):
+        """hx-on::after-request deletes dataset.loading to allow retry after failure."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        # The failure handler must delete this.dataset.loading so retry is possible
+        # Extract the after-request handler value from the HTML
+        assert 'hx-on::after-request' in html
+        after_req_idx = html.index('hx-on::after-request')
+        # Ensure delete this.dataset.loading appears near the after-request handler
+        segment = html[after_req_idx:after_req_idx + 200]
+        assert 'delete this.dataset.loading' in segment

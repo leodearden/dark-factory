@@ -91,9 +91,9 @@ class TestDetectStaleSummaries:
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'Alice knows Bob'},
         ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'uuid': 'e1', 'fact': 'Alice knows Bob', 'name': 'knows'},
-        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'Alice knows Bob', 'name': 'knows'}],
+        })
         result = await backend.detect_stale_summaries(group_id='test')
         assert result == []
 
@@ -105,10 +105,12 @@ class TestDetectStaleSummaries:
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA\nfactA\nfactB'},
         ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'},
-            {'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'},
-        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [
+                {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'},
+                {'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'},
+            ],
+        })
         result = await backend.detect_stale_summaries(group_id='test')
         assert len(result) == 1
         assert result[0]['uuid'] == 'uuid-1'
@@ -122,9 +124,9 @@ class TestDetectStaleSummaries:
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'current fact\nold stale fact'},
         ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'},
-        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
+        })
         result = await backend.detect_stale_summaries(group_id='test')
         assert len(result) == 1
         assert result[0]['stale_line_count'] == 1
@@ -138,9 +140,9 @@ class TestDetectStaleSummaries:
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA\nfactA\nold'},
         ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'},
-        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'}],
+        })
         result = await backend.detect_stale_summaries(group_id='test')
         assert len(result) == 1
         assert result[0]['duplicate_count'] == 1
@@ -155,17 +157,18 @@ class TestDetectStaleSummaries:
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': ''},
         ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
         result = await backend.detect_stale_summaries(group_id='test')
         assert result == []
-        # get_valid_edges_for_node should not have been called for empty-summary node
-        backend.get_valid_edges_for_node.assert_not_awaited()
+        # get_all_valid_edges still called once (before the loop), even if no edges
+        backend.get_all_valid_edges.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_no_entities_returns_empty(self, mock_config, make_backend):
         """Empty graph returns empty stale list."""
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=[])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
         result = await backend.detect_stale_summaries(group_id='test')
         assert result == []
 
@@ -176,52 +179,64 @@ class TestDetectStaleSummaries:
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'lineA\nlineB\nlineC'},
         ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'uuid': 'e1', 'fact': 'lineA', 'name': 'edge1'},
-        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'lineA', 'name': 'edge1'}],
+        })
         result = await backend.detect_stale_summaries(group_id='test')
         assert result[0]['summary_line_count'] == 3
 
     @pytest.mark.asyncio
-    async def test_continues_on_edge_fetch_error(self, mock_config, make_backend):
-        """When get_valid_edges_for_node raises for one entity, processing continues for others."""
+    async def test_same_facts_different_order_triggers_rebuild(self, mock_config, make_backend):
+        """Identical facts in a different order flag the entity as stale.
+
+        This is expected (not a bug): canonical summary follows edge-result order,
+        so 'factB\\nfactA' != 'factA\\nfactB'. The entity is flagged stale purely
+        because the string comparison summary != canonical fails. Both lines exist
+        in valid_fact_set, so stale_line_count == 0 and duplicate_count == 0.
+        """
         backend = make_backend(mock_config)
-        # Three entities: entity 1 is clean, entity 2 errors out, entity 3 is stale
         backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'good fact'},
-            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'some summary'},
-            {'uuid': 'uuid-3', 'name': 'Carol', 'summary': 'factA\nfactA'},
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factB\nfactA'},
         ])
-        backend.get_valid_edges_for_node = AsyncMock(side_effect=[
-            [{'uuid': 'e1', 'fact': 'good fact', 'name': 'edge1'}],  # entity 1 clean
-            RuntimeError('FalkorDB timeout'),                          # entity 2 errors
-            [{'uuid': 'e3', 'fact': 'factA', 'name': 'edge3'}],      # entity 3 stale (dup)
-        ])
+        # Edges return factA first, factB second → canonical = 'factA\nfactB'
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [
+                {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'},
+                {'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'},
+            ],
+        })
         result = await backend.detect_stale_summaries(group_id='test')
-        # Method must NOT raise; only entity 3 should be in the stale list
         assert len(result) == 1
-        assert result[0]['uuid'] == 'uuid-3'
+        entity = result[0]
+        assert entity['uuid'] == 'uuid-1'
+        # Both lines are present in valid_fact_set → stale_line_count == 0
+        assert entity['stale_line_count'] == 0
+        # No duplicate lines → duplicate_count == 0
+        assert entity['duplicate_count'] == 0
+        # Entity is stale due to order mismatch (summary != canonical), not content issues
 
     @pytest.mark.asyncio
-    async def test_edge_fetch_error_logs_warning(self, mock_config, make_backend, caplog):
-        """A warning-level log is emitted containing the failed entity uuid and exception text."""
-        import logging
+    async def test_entity_with_zero_valid_edges_flagged_stale(self, mock_config, make_backend):
+        """Entity with non-empty summary but zero valid edges is flagged stale.
+
+        When get_all_valid_edges returns no edges for the entity, the canonical
+        summary is '' (empty). Since summary != canonical, the entity is stale.
+        All summary lines are counted as stale_line_count because none appear
+        in the empty valid_fact_set. valid_fact_count=0, duplicate_count=0.
+        """
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'good fact'},
-            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'some summary'},
-            {'uuid': 'uuid-3', 'name': 'Carol', 'summary': 'factA\nfactA'},
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old fact A\nold fact B'},
         ])
-        backend.get_valid_edges_for_node = AsyncMock(side_effect=[
-            [{'uuid': 'e1', 'fact': 'good fact', 'name': 'edge1'}],
-            RuntimeError('FalkorDB timeout'),
-            [{'uuid': 'e3', 'fact': 'factA', 'name': 'edge3'}],
-        ])
-        with caplog.at_level(logging.WARNING):
-            await backend.detect_stale_summaries(group_id='test')
-        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert any('uuid-2' in msg and 'FalkorDB timeout' in msg for msg in warning_messages)
-
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        result = await backend.detect_stale_summaries(group_id='test')
+        assert len(result) == 1
+        entity = result[0]
+        assert entity['uuid'] == 'uuid-1'
+        assert entity['stale_line_count'] == 2
+        assert entity['valid_fact_count'] == 0
+        assert entity['duplicate_count'] == 0
+        assert entity['summary_line_count'] == 2
 
 # ---------------------------------------------------------------------------
 # step-3: GraphitiBackend.rebuild_entity_summaries
@@ -232,71 +247,83 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_rebuilds_only_stale_entities(self, mock_config, make_backend):
-        """Only calls refresh_entity_summary for entities flagged by detect_stale_summaries."""
+        """Only rebuilds entities flagged as stale by _detect_stale_summaries_with_edges.
+
+        Alice has summary='stale fact' but her only valid edge has fact='current fact',
+        so the canonical is 'current fact' != 'stale fact' → stale.
+        Bob has summary='current fact' matching his edge canonical → clean.
+        Total entities=2, stale=1, rebuilt=1.
+        """
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale'},
-            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'clean'},
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale fact'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'current fact'},
         ])
-        backend.detect_stale_summaries = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'duplicate_count': 0, 'stale_line_count': 1,
-             'valid_fact_count': 0, 'summary_line_count': 1},
-        ])
-        backend.refresh_entity_summary = AsyncMock(return_value={
-            'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'stale',
-            'new_summary': 'current fact', 'edge_count': 1,
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current fact', 'name': 'edge2'}],
         })
+        backend.get_node_text = AsyncMock(return_value=('Alice', 'stale'))
+        backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test')
         assert result['total_entities'] == 2
         assert result['stale_entities'] == 1
         assert result['rebuilt'] == 1
-        backend.refresh_entity_summary.assert_awaited_once_with('uuid-1', group_id='test')
+        backend.update_node_summary.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_force_rebuilds_all(self, mock_config, make_backend):
-        """With force=True, rebuilds all entities regardless of staleness."""
+        """With force=True, rebuilds all entities using get_all_valid_edges (no refresh_entity_summary)."""
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'ok'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'also ok'},
         ])
-        backend.refresh_entity_summary = AsyncMock(return_value={
-            'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'ok',
-            'new_summary': 'ok', 'edge_count': 1,
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
         })
+        backend.get_node_text = AsyncMock(side_effect=[('Alice', 'ok'), ('Bob', 'also ok')])
+        backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test', force=True)
         assert result['total_entities'] == 2
         assert result['stale_entities'] == 2
         assert result['rebuilt'] == 2
-        assert backend.refresh_entity_summary.await_count == 2
+        assert backend.update_node_summary.await_count == 2
 
     @pytest.mark.asyncio
     async def test_returns_aggregate_result(self, mock_config, make_backend):
         """Returns dict with total_entities, stale_entities, rebuilt, skipped, errors, details."""
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=[])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
         result = await backend.rebuild_entity_summaries(group_id='test')
         assert set(result.keys()) == {'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors', 'details'}
 
     @pytest.mark.asyncio
     async def test_partial_failure_continues(self, mock_config, make_backend):
-        """If one entity's refresh fails, continues with remaining and reports error in results."""
+        """If one entity's rebuild fails, continues with remaining and reports error in results.
+
+        Alice has summary='stale1' while her edge canonical is 'current1' → stale.
+        Bob has summary='stale2' while his edge canonical is 'current2' → stale.
+        Both are detected stale by _detect_stale_summaries_with_edges naturally.
+        Alice's get_node_text raises RuntimeError; Bob's succeeds.
+        """
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
         ])
-        backend.detect_stale_summaries = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'duplicate_count': 0, 'stale_line_count': 1,
-             'valid_fact_count': 0, 'summary_line_count': 1},
-            {'uuid': 'uuid-2', 'name': 'Bob', 'duplicate_count': 0, 'stale_line_count': 1,
-             'valid_fact_count': 0, 'summary_line_count': 1},
-        ])
-        backend.refresh_entity_summary = AsyncMock(side_effect=[
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
+        })
+        # Entity 1 fails at get_node_text; entity 2 succeeds
+        backend.get_node_text = AsyncMock(side_effect=[
             RuntimeError('FalkorDB timeout'),
-            {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'stale2',
-             'new_summary': 'new fact', 'edge_count': 1},
+            ('Bob', 'stale2'),
         ])
+        backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test')
         assert result['errors'] == 1
         assert result['rebuilt'] == 1
@@ -309,6 +336,7 @@ class TestRebuildEntitySummaries:
         """No entities means all counts are 0."""
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=[])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
         result = await backend.rebuild_entity_summaries(group_id='test')
         assert result['total_entities'] == 0
         assert result['stale_entities'] == 0
@@ -319,21 +347,29 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_dry_run_returns_stale_without_rebuilding(self, mock_config, make_backend):
-        """With dry_run=True, detects stale entities but does not call refresh_entity_summary."""
+        """With dry_run=True, detects stale entities but does not call _rebuild_entity_from_edges.
+
+        Alice has summary='stale fact' while her edge canonical is 'current fact' → stale.
+        _detect_stale_summaries_with_edges runs naturally and flags Alice.
+        Explicitly mocks get_node_text and update_node_summary to document that
+        the dry_run guarantee holds even if rebuild_entity_summaries were refactored
+        to bypass _rebuild_entity_from_edges and call those methods directly.
+        """
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale'},
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale fact'},
         ])
-        backend.detect_stale_summaries = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'duplicate_count': 0, 'stale_line_count': 1,
-             'valid_fact_count': 0, 'summary_line_count': 1},
-        ])
-        backend.refresh_entity_summary = AsyncMock()
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
+        })
+        backend.get_node_text = AsyncMock()
+        backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test', dry_run=True)
         assert result['stale_entities'] == 1
         assert result['rebuilt'] == 0
         assert result['skipped'] == 1
-        backend.refresh_entity_summary.assert_not_awaited()
+        backend.get_node_text.assert_not_awaited()
+        backend.update_node_summary.assert_not_awaited()
         assert result['details'][0]['status'] == 'skipped_dry_run'
 
 
@@ -626,30 +662,29 @@ class TestRebuildSummariesManager:
 
 
 # ---------------------------------------------------------------------------
-# task-423: GraphitiBackend.get_all_valid_edges
+# N+1 fix step-5: GraphitiBackend.get_all_valid_edges (bulk fetch)
 # ---------------------------------------------------------------------------
 
 class TestGetAllValidEdges:
-    """GraphitiBackend.get_all_valid_edges() returns all valid edges grouped by entity UUID."""
+    """GraphitiBackend.get_all_valid_edges() bulk-fetches all valid edges, grouped by entity."""
 
     @pytest.mark.asyncio
     async def test_groups_edges_by_entity_uuid(self, mock_config, make_backend, make_graph_mock):
-        """Returns dict grouping edges by entity UUID with {uuid, fact, name} shape."""
+        """Returns dict keyed by entity uuid; each value is a list of edge dicts."""
         backend = make_backend(mock_config)
         rows = [
-            ['entity-1', 'edge-a', 'Alice knows Bob', 'knows'],
-            ['entity-1', 'edge-b', 'Alice lives in Paris', 'lives_in'],
-            ['entity-2', 'edge-c', 'Bob works at Acme', 'works_at'],
+            ['node-1', 'e1', 'factA', 'edge1'],
+            ['node-1', 'e2', 'factB', 'edge2'],
+            ['node-2', 'e3', 'factC', 'edge3'],
         ]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_all_valid_edges(group_id='test')
-        assert set(result.keys()) == {'entity-1', 'entity-2'}
-        assert len(result['entity-1']) == 2
-        assert len(result['entity-2']) == 1
-        assert result['entity-1'][0] == {'uuid': 'edge-a', 'fact': 'Alice knows Bob', 'name': 'knows'}
-        assert result['entity-1'][1] == {'uuid': 'edge-b', 'fact': 'Alice lives in Paris', 'name': 'lives_in'}
-        assert result['entity-2'][0] == {'uuid': 'edge-c', 'fact': 'Bob works at Acme', 'name': 'works_at'}
+        assert set(result.keys()) == {'node-1', 'node-2'}
+        assert len(result['node-1']) == 2
+        assert {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'} in result['node-1']
+        assert {'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'} in result['node-1']
+        assert result['node-2'] == [{'uuid': 'e3', 'fact': 'factC', 'name': 'edge3'}]
 
     @pytest.mark.asyncio
     async def test_cypher_uses_return_distinct(self, mock_config, make_backend, make_graph_mock):
@@ -664,7 +699,7 @@ class TestGetAllValidEdges:
 
     @pytest.mark.asyncio
     async def test_empty_graph_returns_empty_dict(self, mock_config, make_backend, make_graph_mock):
-        """ro_query returns empty result_set → result is {}."""
+        """Returns empty dict when no valid edges exist."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
@@ -673,7 +708,7 @@ class TestGetAllValidEdges:
 
     @pytest.mark.asyncio
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
-        """ro_query was awaited; query was NOT awaited."""
+        """Uses ro_query (read-only) — graph.query must NOT be called."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
@@ -685,25 +720,210 @@ class TestGetAllValidEdges:
     async def test_null_fact_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
         """Row with None fact returns fact=''."""
         backend = make_backend(mock_config)
-        rows = [['entity-1', 'edge-a', None, 'knows']]
+        rows = [['node-1', 'e1', None, 'edge1']]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_all_valid_edges(group_id='test')
-        assert result['entity-1'][0]['fact'] == ''
+        assert result['node-1'][0]['fact'] == ''
 
     @pytest.mark.asyncio
     async def test_null_name_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
         """Row with None name returns name=''."""
         backend = make_backend(mock_config)
-        rows = [['entity-1', 'edge-a', 'some fact', None]]
+        rows = [['node-1', 'e1', 'factA', None]]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_all_valid_edges(group_id='test')
-        assert result['entity-1'][0]['name'] == ''
+        assert result['node-1'][0]['name'] == ''
+
+    @pytest.mark.asyncio
+    async def test_cypher_filters_invalid_at_is_null(self, mock_config, make_backend, make_graph_mock):
+        """Cypher query includes 'invalid_at IS NULL' to exclude invalidated edges."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_all_valid_edges(group_id='test')
+        call_args = graph.ro_query.call_args
+        cypher = call_args[0][0] if call_args[0] else call_args[1].get('q', '')
+        assert 'invalid_at IS NULL' in cypher
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
-        """Uninitialized backend raises RuntimeError with 'not initialized'."""
+        """Raises RuntimeError when backend not initialized."""
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.get_all_valid_edges(group_id='test')
+
+
+# ---------------------------------------------------------------------------
+# N+1 fix step-7: detect_stale_summaries uses bulk get_all_valid_edges
+# ---------------------------------------------------------------------------
+
+class TestDetectStaleSummariesBulk:
+    """detect_stale_summaries uses get_all_valid_edges (one query) not N per-entity queries."""
+
+    @pytest.mark.asyncio
+    async def test_calls_get_all_valid_edges_once_not_per_entity(self, mock_config, make_backend):
+        """detect_stale_summaries calls get_all_valid_edges exactly once (not N times)."""
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'factB'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'}],
+        })
+        backend.get_valid_edges_for_node = AsyncMock()
+        await backend.detect_stale_summaries(group_id='test')
+        backend.get_all_valid_edges.assert_awaited_once()
+        backend.get_valid_edges_for_node.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_correctly_identifies_stale_with_bulk_edges(self, mock_config, make_backend):
+        """Stale entity is returned; clean entity is not — using bulk-fetched edges."""
+        backend = make_backend(mock_config)
+        # uuid-1 is stale (summary has old fact), uuid-2 is clean
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old fact'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'current fact'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current fact', 'name': 'edge2'}],
+        })
+        result = await backend.detect_stale_summaries(group_id='test')
+        assert len(result) == 1
+        assert result[0]['uuid'] == 'uuid-1'
+
+    @pytest.mark.asyncio
+    async def test_empty_summary_entities_skipped_with_bulk_path(self, mock_config, make_backend):
+        """Empty-summary entity is skipped even with bulk edges data source."""
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': ''},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'some fact', 'name': 'edge1'}],
+        })
+        result = await backend.detect_stale_summaries(group_id='test')
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# N+1 fix step-9: rebuild_entity_summaries parallel + no re-fetch
+# ---------------------------------------------------------------------------
+
+class TestRebuildEntitySummariesParallel:
+    """rebuild_entity_summaries uses _rebuild_entity_from_edges (no re-fetch) + asyncio.gather."""
+
+    @pytest.mark.asyncio
+    async def test_non_force_does_not_call_get_valid_edges_for_node(self, mock_config, make_backend):
+        """Non-force path: get_valid_edges_for_node is never called (edges come from bulk fetch)."""
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
+        })
+        backend.get_node_text = AsyncMock(side_effect=[
+            ('Alice', 'stale1'),
+            ('Bob', 'stale2'),
+        ])
+        backend.update_node_summary = AsyncMock()
+        backend.get_valid_edges_for_node = AsyncMock()
+
+        result = await backend.rebuild_entity_summaries(group_id='test')
+
+        backend.get_valid_edges_for_node.assert_not_awaited()
+        assert result['rebuilt'] == 2
+
+    @pytest.mark.asyncio
+    async def test_force_calls_get_all_valid_edges_once_not_refresh_entity_summary(
+        self, mock_config, make_backend
+    ):
+        """Force path: get_all_valid_edges called once; refresh_entity_summary never called."""
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'ok'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'also ok'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
+        })
+        backend.get_node_text = AsyncMock(side_effect=[
+            ('Alice', 'ok'),
+            ('Bob', 'also ok'),
+        ])
+        backend.update_node_summary = AsyncMock()
+        backend.refresh_entity_summary = AsyncMock()
+
+        result = await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+        backend.get_all_valid_edges.assert_awaited_once()
+        backend.refresh_entity_summary.assert_not_awaited()
+        assert result['total_entities'] == 2
+        assert result['rebuilt'] == 2
+
+    @pytest.mark.asyncio
+    async def test_concurrent_all_five_entities_processed(self, mock_config, make_backend):
+        """With 5 target entities, all 5 get update_node_summary calls (parallel processing)."""
+        n = 5
+        entities = [
+            {'uuid': f'uuid-{i}', 'name': f'Entity{i}', 'summary': f'stale{i}'}
+            for i in range(n)
+        ]
+        edges = {
+            f'uuid-{i}': [{'uuid': f'e{i}', 'fact': f'current{i}', 'name': 'edge'}]
+            for i in range(n)
+        }
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+        backend.get_all_valid_edges = AsyncMock(return_value=edges)
+        backend.get_node_text = AsyncMock(side_effect=[
+            (f'Entity{i}', f'stale{i}') for i in range(n)
+        ])
+        backend.update_node_summary = AsyncMock()
+
+        result = await backend.rebuild_entity_summaries(group_id='test')
+
+        assert backend.update_node_summary.await_count == n
+        assert result['rebuilt'] == n
+        assert result['errors'] == 0
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_in_update_does_not_cancel_others(
+        self, mock_config, make_backend
+    ):
+        """If update_node_summary fails for one entity, others still complete.
+
+        asyncio.gather with return_exceptions=True ensures partial failures are
+        captured rather than propagated, so the gather completes for all entities.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
+        })
+        backend.get_node_text = AsyncMock(side_effect=[
+            ('Alice', 'stale1'),
+            ('Bob', 'stale2'),
+        ])
+        # First entity's write fails, second succeeds
+        backend.update_node_summary = AsyncMock(side_effect=[
+            RuntimeError('FalkorDB timeout'),
+            None,
+        ])
+
+        result = await backend.rebuild_entity_summaries(group_id='test')
+
+        assert result['rebuilt'] == 1
+        assert result['errors'] == 1

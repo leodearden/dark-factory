@@ -1,4 +1,19 @@
 {% from 'macros/badges.html' import status_badge, severity_badge %}
+<script>
+  Alpine.data('runPanel', () => ({
+    open: false,
+    toggleDetail() {
+      this.open = !this.open;
+      if (!this.open) return;
+      const detail = this.$refs.detail;
+      if (!detail) return;
+      if (!detail.dataset.loaded && !detail.dataset.loading) {
+        detail.dataset.loading = 'true';
+        htmx.trigger(detail, 'load-detail');
+      }
+    },
+  }));
+</script>
 {% if verdict and verdict.severity == 'serious' %}
 <div class="bg-red-900/30 border border-red-800 rounded-lg p-4 text-red-300 mb-6 flex items-start gap-3" data-testid="verdict-alert">
   <div class="flex-1">
@@ -151,7 +166,7 @@
         </thead>
         {% set col_count = 8 if multi_project_runs else 7 %}
         {% for run in runs %}
-          <tbody x-data="{ open: false }" id="run-{{ run.id }}">
+          <tbody x-data="runPanel" id="run-{{ run.id }}">
             <tr class="border-b border-gray-700">
               {% if multi_project_runs %}
                 <td class="py-2 text-gray-300">{{ run.project_id | project_name }}</td>
@@ -172,7 +187,7 @@
               <td class="py-2 text-gray-400">{{ run.started_at | timeago }}</td>
               <td class="py-2">
                 {% if run.journal_entry_count > 0 %}
-                  <button class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-900 text-blue-200 hover:bg-blue-800 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:ring-offset-1 focus:ring-offset-gray-800" @click="open = !open" aria-label="Show {{ run.journal_entry_count }} journal entries" data-testid="journal-badge">
+                  <button class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-900 text-blue-200 hover:bg-blue-800 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:ring-offset-1 focus:ring-offset-gray-800" @click="toggleDetail()" aria-label="Show {{ run.journal_entry_count }} journal entries" data-testid="journal-badge">
                     {{ run.journal_entry_count }}
                   </button>
                 {% endif %}
@@ -180,7 +195,7 @@
             </tr>
             <tr x-show="open" x-cloak>
               <td colspan="{{ col_count }}" class="p-4 bg-gray-900/50">
-                <div hx-get="/partials/recon/run/{{ run.id }}" hx-trigger="revealed" hx-swap="innerHTML">
+                <div hx-get="/partials/recon/run/{{ run.id }}" hx-trigger="load-detail" hx-swap="innerHTML" x-ref="detail" hx-on::after-swap="this.dataset.loaded = 'true'; delete this.dataset.loading" hx-on::after-request="if(event.detail.failed || !event.detail.successful) delete this.dataset.loading">
                   <span class="text-xs text-gray-500">Loading...</span>
                 </div>
               </td>
