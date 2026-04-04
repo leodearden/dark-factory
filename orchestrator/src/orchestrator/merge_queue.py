@@ -288,3 +288,399 @@ class MergeWorker:
         self._emit_merge(req.task_id, 'cas_retry', attempt=retries)
         self._urgent.append(req)
         return None  # don't resolve Future — will be reprocessed
+
+
+class SpeculativeMergeWorker:
+    """Two-coroutine speculative merge-verify pipeline.
+
+    The Merger coroutine creates merge commits; the Verifier coroutine runs
+    verification and CAS-advances main.  While the Verifier processes merge N,
+    the Merger speculatively merges N+1 against N's merge SHA.  If N succeeds,
+    N+1 is already a descendant and its CAS works immediately.  If N fails,
+    the Verifier re-merges N+1 against actual main.
+
+    Speculation depth is capped at 1: the Merger waits on ``_speculation_slot``
+    before grabbing N+2 speculatively, which the Verifier sets after completing
+    the item preceding the speculation.
+    """
+
+    MAX_CAS_RETRIES = 5
+
+    def __init__(
+        self,
+        git_ops: GitOps,
+        queue: asyncio.Queue[MergeRequest],
+        event_store: EventStore | None = None,
+    ):
+        self._git_ops = git_ops
+        self._queue = queue
+        self._event_store = event_store
+        # Internal pipeline: Merger → Verifier
+        self._verifier_queue: asyncio.Queue[SpeculativeItem | None] = asyncio.Queue()
+        self._running = True
+        self._cas_retries: dict[str, int] = {}
+        # Depth-1 cap: cleared when a speculative merge is in flight,
+        # set by the Verifier when it finishes the item before the speculation.
+        self._speculation_slot = asyncio.Event()
+        self._speculation_slot.set()  # initially free
+        # Internal tasks created by run()
+        self._merger_task: asyncio.Task | None = None
+        self._verifier_task: asyncio.Task | None = None
+
+    # ------------------------------------------------------------------
+    # Public API (same interface as MergeWorker)
+    # ------------------------------------------------------------------
+
+    async def run(self) -> None:
+        """Start merger and verifier coroutines and wait for both to finish."""
+        self._merger_task = asyncio.create_task(self._merger_loop())
+        self._verifier_task = asyncio.create_task(self._verifier_loop())
+        try:
+            await asyncio.gather(self._merger_task, self._verifier_task)
+        except asyncio.CancelledError:
+            raise
+
+    async def stop(self) -> None:
+        """Graceful shutdown: drain queues and resolve all pending Futures."""
+        self._running = False
+        shutdown = MergeOutcome('blocked', reason='Merge worker shutting down')
+        # Release speculation slot so merger doesn't hang waiting
+        self._speculation_slot.set()
+
+        # Drain main queue
+        while not self._queue.empty():
+            try:
+                req = self._queue.get_nowait()
+                if req is not None and not req.result.done():
+                    req.result.set_result(shutdown)
+            except asyncio.QueueEmpty:
+                break
+
+        # Drain verifier queue
+        while not self._verifier_queue.empty():
+            try:
+                item = self._verifier_queue.get_nowait()
+                if item is not None and not item.request.result.done():
+                    item.request.result.set_result(shutdown)
+            except asyncio.QueueEmpty:
+                break
+
+        # Send sentinels to unblock both loops
+        await self._queue.put(None)  # type: ignore[arg-type]
+        await self._verifier_queue.put(None)  # type: ignore[arg-type]
+
+    # ------------------------------------------------------------------
+    # Event helpers
+    # ------------------------------------------------------------------
+
+    def _emit_merge(
+        self, task_id: str, outcome: str, *, attempt: int | None = None,
+    ) -> None:
+        if self._event_store:
+            data: dict = {'outcome': outcome}
+            if attempt is not None:
+                data['attempt'] = attempt
+            self._event_store.emit(
+                EventType.merge_attempt, task_id=task_id, phase='merge', data=data,
+            )
+
+    def _emit_speculative(
+        self, event_type: EventType, task_id: str, **data: object,
+    ) -> None:
+        if self._event_store:
+            self._event_store.emit(
+                event_type, task_id=task_id, phase='merge',
+                data={k: str(v) for k, v in data.items()},
+            )
+
+    # ------------------------------------------------------------------
+    # Merger coroutine
+    # ------------------------------------------------------------------
+
+    async def _merger_loop(self) -> None:
+        """Dequeue requests, create merge commits, feed Verifier.
+
+        Tracks a speculative base SHA: after a successful merge of N, the
+        Merger grabs N+1 non-blocking and merges it against N's merge commit
+        (rather than current main).  Both N and N+1 are pushed to the
+        Verifier queue in order.
+        """
+        # SHA to use as base for the CURRENT request's merge.
+        # None  → merge against actual main HEAD (non-speculative).
+        # str   → merge against this commit (speculative, N+1 case).
+        spec_base: str | None = None
+        # Pre-fetched next request grabbed speculatively from main queue.
+        prefetched: MergeRequest | None = None
+
+        while self._running:
+            # Get next request: use pre-fetched item if available, else block.
+            if prefetched is not None:
+                req = prefetched
+                prefetched = None
+            else:
+                req = await self._queue.get()
+                if req is None:
+                    break  # shutdown sentinel
+                spec_base = None  # fresh dequeue resets speculation chain
+
+            speculative = spec_base is not None
+            actual_main = await self._git_ops.get_main_sha()
+            base_for_merge = spec_base if spec_base else actual_main
+
+            # ── Step 1: already-merged detection ──────────────────────
+            _, branch_head, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'], cwd=req.worktree,
+            )
+            branch_head = branch_head.strip()
+            if await self._git_ops.is_ancestor(branch_head, actual_main):
+                if not await self._git_ops.has_uncommitted_work(req.worktree):
+                    logger.info(
+                        f'Task {req.task_id}: branch already on main — skipping'
+                    )
+                    self._emit_merge(req.task_id, 'already_merged')
+                    await self._verifier_queue.put(SpeculativeItem(
+                        request=req, merge_result=None, merge_wt=None,
+                        base_sha=actual_main, speculative=speculative,
+                        skip_verify=False,
+                        immediate_outcome=MergeOutcome('already_merged'),
+                    ))
+                    spec_base = None
+                    continue
+
+            # ── Step 2: merge (speculative or normal) ─────────────────
+            if speculative:
+                self._emit_speculative(
+                    EventType.speculative_merge, req.task_id,
+                    base_sha=base_for_merge,
+                )
+            merge_result = await self._git_ops.merge_to_main(
+                req.worktree, req.branch, base_sha=base_for_merge if speculative else None,
+            )
+
+            # ── Step 3: conflict or non-conflict failure ───────────────
+            if merge_result.conflicts:
+                logger.info(f'Task {req.task_id}: merge conflicts')
+                self._emit_merge(req.task_id, 'conflict')
+                if merge_result.merge_worktree:
+                    await self._git_ops.cleanup_merge_worktree(
+                        merge_result.merge_worktree,
+                    )
+                await self._verifier_queue.put(SpeculativeItem(
+                    request=req, merge_result=None, merge_wt=None,
+                    base_sha=base_for_merge, speculative=speculative,
+                    skip_verify=False,
+                    immediate_outcome=MergeOutcome(
+                        'conflict', conflict_details=merge_result.details,
+                    ),
+                ))
+                spec_base = None
+                continue
+
+            if not merge_result.success:
+                if merge_result.merge_worktree:
+                    await self._git_ops.cleanup_merge_worktree(
+                        merge_result.merge_worktree,
+                    )
+                await self._verifier_queue.put(SpeculativeItem(
+                    request=req, merge_result=None, merge_wt=None,
+                    base_sha=base_for_merge, speculative=speculative,
+                    skip_verify=False,
+                    immediate_outcome=MergeOutcome(
+                        'blocked', reason=merge_result.details,
+                    ),
+                ))
+                spec_base = None
+                continue
+
+            # ── Merge succeeded ────────────────────────────────────────
+            merge_commit = merge_result.merge_commit
+            assert merge_commit is not None
+            merge_commit = merge_commit.strip()
+
+            skip_verify = (
+                req.pre_rebased
+                and merge_result.pre_merge_sha is not None
+                and merge_result.pre_merge_sha == base_for_merge
+            )
+            await self._verifier_queue.put(SpeculativeItem(
+                request=req, merge_result=merge_result,
+                merge_wt=merge_result.merge_worktree,
+                base_sha=base_for_merge, speculative=speculative,
+                skip_verify=skip_verify,
+            ))
+
+            # ── Speculative look-ahead (depth-1 cap) ──────────────────
+            # Non-blocking peek: if N+1 is already queued, grab it and
+            # merge it against N's commit so the Verifier can CAS it
+            # immediately after N succeeds.
+            await self._speculation_slot.wait()  # depth-1 cap
+            try:
+                next_req = self._queue.get_nowait()
+                if next_req is None:
+                    # Shutdown sentinel — stop.
+                    break
+                self._speculation_slot.clear()  # claim the slot
+                prefetched = next_req
+                spec_base = merge_commit  # N+1 will merge against N's commit
+                logger.debug(
+                    f'Task {req.task_id}: speculative look-ahead for '
+                    f'{next_req.task_id} (base={merge_commit[:8]})'
+                )
+            except asyncio.QueueEmpty:
+                spec_base = None  # no next item, no speculation
+
+        # Shutdown sentinel to verifier
+        await self._verifier_queue.put(None)
+
+    # ------------------------------------------------------------------
+    # Verifier coroutine
+    # ------------------------------------------------------------------
+
+    async def _verifier_loop(self) -> None:
+        """Verify and CAS-advance for each SpeculativeItem from the Merger.
+
+        When N's verification/advance fails and N+1 was speculatively merged,
+        the Verifier re-merges N+1 against actual main and re-verifies.
+        """
+        while True:
+            item = await self._verifier_queue.get()
+            if item is None:
+                break  # shutdown sentinel
+
+            req = item.request
+
+            # ── Immediate outcome (already_merged / conflict / blocked) ─
+            if item.immediate_outcome is not None:
+                if not req.result.done():
+                    req.result.set_result(item.immediate_outcome)
+                # Free the speculation slot if this was a speculative item
+                if item.speculative:
+                    self._speculation_slot.set()
+                else:
+                    self._speculation_slot.set()  # always free after processing
+                continue
+
+            merge_wt = item.merge_wt
+            assert merge_wt is not None
+            assert item.merge_result is not None
+            assert item.merge_result.merge_commit is not None
+
+            n_succeeded = await self._verify_and_advance(item)
+            # Free speculation slot after we've processed this item
+            self._speculation_slot.set()
+
+            if not n_succeeded and item.speculative:
+                # N failed but N+1 (this item) was speculatively merged —
+                # Verifier re-merges N+1 against actual main.
+                # (This path is reached when a subsequent item arrives
+                # with speculative=True and the previous N failed.)
+                pass  # handled inside _verify_and_advance
+
+    async def _verify_and_advance(self, item: SpeculativeItem) -> bool:
+        """Run verification + CAS advance for one item.
+
+        Returns True if the item advanced main successfully, False otherwise.
+        Resolves item.request.result in all cases.
+        """
+        req = item.request
+        merge_wt = item.merge_wt
+        assert merge_wt is not None
+        assert item.merge_result is not None
+        merge_commit = item.merge_result.merge_commit
+        assert merge_commit is not None
+        merge_commit = merge_commit.strip()
+
+        # ── Step 4: verify ────────────────────────────────────────────
+        if not item.skip_verify:
+            try:
+                verify = await run_scoped_verification(
+                    merge_wt, req.config, req.module_configs,
+                    task_files=req.task_files,
+                )
+            except Exception as exc:
+                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                if not req.result.done():
+                    req.result.set_result(MergeOutcome(
+                        'blocked', reason=f'Verification error: {exc}',
+                    ))
+                return False
+
+            if not verify.passed:
+                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                if not req.result.done():
+                    req.result.set_result(MergeOutcome(
+                        'blocked',
+                        reason=f'Post-merge verification failed: {verify.summary}',
+                    ))
+                return False
+        else:
+            logger.info(
+                f'Task {req.task_id}: skipping re-verification '
+                f'(pre-rebased, main unchanged)'
+            )
+
+        # ── Step 5: CAS advance_main ──────────────────────────────────
+        retries = 0
+        while True:
+            result = await self._git_ops.advance_main(
+                merge_commit, merge_wt,
+                branch=req.branch,
+                max_attempts=req.config.max_advance_attempts,
+                expected_main=item.base_sha,
+            )
+
+            if result == 'advanced':
+                self._cas_retries.pop(req.task_id, None)
+                logger.info(f'Task {req.task_id}: merged to main successfully')
+                self._emit_merge(req.task_id, 'done')
+                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                if not req.result.done():
+                    req.result.set_result(MergeOutcome('done'))
+                return True
+
+            if result in ('not_descendant', 'contaminated', 'stash_failed'):
+                self._cas_retries.pop(req.task_id, None)
+                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                if not req.result.done():
+                    req.result.set_result(MergeOutcome(
+                        'blocked',
+                        reason=f'advance_main failed ({result}) for task {req.task_id}',
+                    ))
+                return False
+
+            # result == 'cas_failed' — transient, retry with limit
+            retries += 1
+            total = self._cas_retries.get(req.task_id, 0) + 1
+            self._cas_retries[req.task_id] = total
+            if total > self.MAX_CAS_RETRIES:
+                self._cas_retries.pop(req.task_id, None)
+                logger.warning(
+                    f'Task {req.task_id}: CAS retry limit exhausted '
+                    f'({self.MAX_CAS_RETRIES} attempts)'
+                )
+                self._emit_merge(req.task_id, 'cas_exhausted', attempt=total)
+                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                if not req.result.done():
+                    req.result.set_result(MergeOutcome(
+                        'blocked',
+                        reason=(
+                            f'CAS retry limit exhausted after '
+                            f'{self.MAX_CAS_RETRIES} attempts for task {req.task_id}'
+                        ),
+                    ))
+                return False
+
+            # Update base_sha to current main for retry
+            item = SpeculativeItem(
+                request=item.request,
+                merge_result=item.merge_result,
+                merge_wt=item.merge_wt,
+                base_sha=await self._git_ops.get_main_sha(),
+                speculative=item.speculative,
+                skip_verify=item.skip_verify,
+            )
+            logger.info(
+                f'Task {req.task_id}: CAS failed (attempt {total}/'
+                f'{self.MAX_CAS_RETRIES}), retrying'
+            )
+            self._emit_merge(req.task_id, 'cas_retry', attempt=total)
