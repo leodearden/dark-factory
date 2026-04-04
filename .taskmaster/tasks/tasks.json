@@ -8637,7 +8637,18 @@
             "fused-memory/src/fused_memory/backends",
             "fused-memory/tests/test_graphiti_quality_433.py",
             "fused-memory/tests/test_stale_summary_named_access_438.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "StaleSummaryResult",
+              "GraphitiClient"
+            ],
+            "queries": [
+              "StaleSummaryResult NamedTuple named attribute access graphiti_client",
+              "detect_stale_summaries rebuild_entity_summaries positional unpacking call sites"
+            ]
+          },
+          "_causation_id": "92ad9489-6741-4fe6-8f3f-c7bb9e9e5371"
         }
       },
       {
