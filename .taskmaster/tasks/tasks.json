@@ -8582,6 +8582,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 436,
+        "title": "Improve test_same_facts_different_order_triggers_rebuild completeness",
+        "description": "In fused-memory/tests/test_rebuild_entity_summaries.py, make two changes to the test at lines 188-215:\n1. Add `assert entity['valid_fact_count'] == 2` after line 214 to complete the diagnostic triple and prove edges were consulted.\n2. Update the docstring to say 'This is a known limitation of the current implementation, not a deliberate design invariant: canonical summary follows edge-result order, which is non-deterministic. Future work to sort facts would require updating this test.' Remove or rephrase the 'expected (not a bug)' framing.\n\nmemory_hint: search \"test_same_facts_different_order\" for test context.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8594,7 +8605,7 @@
       ],
       "created": "2026-04-03T22:38:18.083Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T13:21:59.015Z"
+      "updated": "2026-04-04T13:22:04.794Z"
     }
   }
 }
