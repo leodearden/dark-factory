@@ -1093,3 +1093,28 @@ class TestRunPanelAlpineComponent:
         null_guard_pos = html.index('if (!detail) return')
         dataset_pos = html.index('detail.dataset.loaded')
         assert refs_pos < null_guard_pos < dataset_pos
+
+    def test_detail_div_has_after_request_handler(self, client):
+        """Detail div has hx-on::after-request to clear loading flag on failure."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'hx-on::after-request' in html
+
+    def test_after_request_clears_loading_on_failure(self, client):
+        """hx-on::after-request clears dataset.loading when request fails."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        # Handler must check for failure via event.detail.failed or !event.detail.successful
+        assert 'event.detail.failed' in html or '!event.detail.successful' in html
+
+    def test_after_request_deletes_loading_on_failure(self, client):
+        """hx-on::after-request deletes dataset.loading to allow retry after failure."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        # The failure handler must delete this.dataset.loading so retry is possible
+        # Extract the after-request handler value from the HTML
+        assert 'hx-on::after-request' in html
+        after_req_idx = html.index('hx-on::after-request')
+        # Ensure delete this.dataset.loading appears near the after-request handler
+        segment = html[after_req_idx:after_req_idx + 200]
+        assert 'delete this.dataset.loading' in segment
