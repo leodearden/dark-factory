@@ -8487,6 +8487,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 427,
+        "title": "Clean up tools.py validation and empty-string normalization",
+        "description": "In fused-memory/src/fused_memory/server/tools.py: (1) Remove or document the entity_uuid or None / entity_name or None at lines 682-683 — either pass parameters directly or add a comment explaining empty-string normalization; (2) Evaluate removing the duplicate 'at least one identifier' guard at lines 674-678 and letting the service-layer ValueError propagate through the existing except Exception handler.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8499,7 +8510,7 @@
       ],
       "created": "2026-04-04T04:32:57.699Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T04:32:57.709Z"
+      "updated": "2026-04-04T04:33:01.783Z"
     }
   }
 }
