@@ -5,7 +5,7 @@ import contextlib
 import logging
 from collections import Counter
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
@@ -22,6 +22,19 @@ from graphiti_core.nodes import EpisodeType, EpisodicNode
 from fused_memory.config.schema import FusedMemoryConfig
 
 logger = logging.getLogger(__name__)
+
+
+class StaleSummaryResult(NamedTuple):
+    """Structured return type for _detect_stale_summaries_with_edges.
+
+    Inherits from tuple for full backward-compatibility: callers using
+    ``stale, edges, total = await self._detect_stale_summaries_with_edges(...)``
+    continue to work unchanged.
+    """
+
+    stale: list[dict]
+    edges: dict[str, list[dict]]
+    total_count: int
 
 
 class NodeNotFoundError(Exception):
@@ -817,7 +830,7 @@ class GraphitiBackend:
 
     async def _detect_stale_summaries_with_edges(
         self, *, group_id: str
-    ) -> tuple[list[dict], dict[str, list[dict]], int]:
+    ) -> StaleSummaryResult:
         """Internal: detect stale summaries and return (stale_list, all_edges_dict, total_count).
 
         Shared by detect_stale_summaries (public API) and rebuild_entity_summaries
@@ -861,7 +874,7 @@ class GraphitiBackend:
                 'valid_fact_count': len(valid_facts),
                 'summary_line_count': len(summary_lines),
             })
-        return stale, all_edges, len(entities)
+        return StaleSummaryResult(stale=stale, edges=all_edges, total_count=len(entities))
 
     async def detect_stale_summaries(self, *, group_id: str) -> list[dict]:
         """Identify Entity nodes whose summary is out of sync with valid edge facts.
