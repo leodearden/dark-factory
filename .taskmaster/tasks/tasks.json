@@ -8533,11 +8533,11 @@
         "description": "Task 175 added _rebuild_entity_from_edges which takes pre-fetched edges but still calls get_node_text(uuid) per entity to get old_summary. The entity name is already available from the caller, and old_summary is available from list_entity_nodes data. Thread both through to eliminate the redundant DB call. This was the remaining unmerged value from cancelled task 419.\n\nSpecific changes:\n1. Add name and old_summary params to _rebuild_entity_from_edges\n2. In rebuild_entity_summaries, build entity_map from all_entities/list_entity_nodes and pass name+old_summary\n3. Update tests in test_rebuild_entity_summaries.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-04T13:04:28.352Z",
+        "updatedAt": "2026-04-04T19:02:01.836Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/backends",
@@ -8758,7 +8758,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T19:02:01.444Z",
+      "lastModified": "2026-04-04T19:02:01.836Z",
       "taskCount": 428,
       "completedCount": 394,
       "tags": [
