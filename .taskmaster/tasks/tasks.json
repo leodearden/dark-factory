@@ -8631,6 +8631,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 437,
+        "title": "Fix misleading 'retrying...' error text for non-polled HTMX requests",
+        "description": "The showError handler in base.html:42-46 displays 'Failed to load — retrying...' for all HTMX errors, but load-detail requests have no auto-retry. Either change text to 'Failed to load — click to retry' or scope the 'retrying' message to only appear on elements with data-poll-base.",
+        "details": "File: dashboard/src/dashboard/templates/base.html. Source: review suggestions from task 421 (esc-421-19).",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8643,7 +8654,7 @@
       ],
       "created": "2026-04-04T06:43:47.452Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T06:44:11.221Z"
+      "updated": "2026-04-04T06:44:14.489Z"
     }
   }
 }
