@@ -65,7 +65,7 @@ async def _get_task_files(wt: Path) -> list[str] | None:
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         proc.kill()
         await proc.communicate()  # reap zombie
         logger.warning('git diff timed out in %s — treating as no changed files', wt)
@@ -256,7 +256,7 @@ def create_server(
 
         try:
             outcome = await asyncio.wait_for(future, timeout=MERGE_TIMEOUT_SECS)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return {'error': 'Merge worker did not respond within timeout'}
         return {
             'status': outcome.status,
