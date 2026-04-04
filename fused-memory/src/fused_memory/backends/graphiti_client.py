@@ -28,6 +28,14 @@ class NodeNotFoundError(Exception):
     """Raised when a node UUID is not found in FalkorDB."""
 
 
+class AmbiguousEntityError(Exception):
+    """Raised when multiple entity nodes share the same name.
+
+    The error message includes all matching UUIDs so the caller can
+    disambiguate and call refresh_entity_summary with a specific UUID.
+    """
+
+
 class _MultiTenantFalkorDriver(FalkorDriver):
     """FalkorDriver that suppresses auto-indexing.
 
@@ -682,6 +690,35 @@ class GraphitiBackend:
             raise NodeNotFoundError(f'Entity node not found: {uuid}')
         row = result.result_set[0]
         return (row[0], row[1] or '')
+
+    async def resolve_entity_by_name(self, name: str, *, group_id: str) -> str:
+        """Resolve an entity name to its UUID via an exact Cypher lookup.
+
+        Args:
+            name: Exact name of the Entity node to resolve.
+            group_id: Project graph to query.
+
+        Returns:
+            The UUID string of the matching entity.
+
+        Raises:
+            NodeNotFoundError: if no entity with that name exists.
+            AmbiguousEntityError: if multiple entities share the same name,
+                with all matching UUIDs listed in the error message.
+            RuntimeError: if the backend is not initialized.
+        """
+        graph = self._graph_for(group_id)
+        cypher = 'MATCH (n:Entity {name: $name}) RETURN n.uuid, n.name'
+        result = await graph.query(cypher, {'name': name})
+        rows = result.result_set
+        if not rows:
+            raise NodeNotFoundError(f'No entity found with name: {name!r}')
+        if len(rows) > 1:
+            uuids = [row[0] for row in rows]
+            raise AmbiguousEntityError(
+                f'Multiple entities found with name {name!r}: {uuids}'
+            )
+        return rows[0][0]
 
     async def refresh_entity_summary(self, node_uuid: str, *, group_id: str) -> dict:
         """Regenerate an Entity node's summary from its currently-valid edges.
