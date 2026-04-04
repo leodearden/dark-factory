@@ -8821,6 +8821,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 452,
+        "title": "Test quality: fix capture_rebuild contract, extract spy helper, add missing assertions and edge cases",
+        "description": "Five test quality improvements in test_rebuild_entity_summaries.py from task 432 review:\n\n1. **Fix capture_rebuild contract mismatch** (lines 930, 974): The spy wrapper declares `old_summary=None` as a default, but production `_rebuild_entity_from_edges` requires `old_summary: str` (no default). Remove the default so the test fails loudly with TypeError if old_summary is ever omitted: `async def capture_rebuild(uuid, name, edges, *, group_id, old_summary):`\n\n2. **Extract shared spy helper** (lines 924-934 and 968-978): The `capture_rebuild` spy pattern is copy-pasted in `test_force_path_passes_old_summary_no_get_node_text` and `test_non_force_path_passes_old_summary_no_get_node_text`. Extract into a fixture or `_make_rebuild_spy(backend)` helper that returns `(captured_calls, original_rebuild)`.\n\n3. **Add edge_count assertion** (line ~1044): `test_rebuild_entity_from_edges_uses_passed_old_summary` asserts uuid, name, old_summary, new_summary but omits edge_count. Add `assert result['edge_count'] == 1`.\n\n4. **Add empty-string old_summary edge case**: No test covers `old_summary=''`. `list_entity_nodes` returns `row[2] or ''` when FalkorDB stores NULL. Add a variant where one entity has `'summary': ''` and verify `old_summary` captured is `''`.\n\n5. **Add end-to-end details assertions** (lines 936-944, 980-986): The threading tests verify old_summary reaches `_rebuild_entity_from_edges` but don't assert `result['details']` surfaces correct old_summary/new_summary. Add: `by_detail = {d['uuid']: d for d in result['details']}; assert by_detail['uuid-1']['old_summary'] == 'alice summary'`.\n\nmemory_hints:\n- search: \"capture_rebuild spy helper test_rebuild\"\n- entity: \"test_rebuild_entity_summaries.py\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8833,7 +8844,7 @@
       ],
       "created": "2026-04-04T23:10:48.091Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T23:14:38.859Z"
+      "updated": "2026-04-04T23:14:50.968Z"
     }
   }
 }
