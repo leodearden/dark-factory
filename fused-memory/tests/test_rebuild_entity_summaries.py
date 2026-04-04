@@ -661,3 +661,49 @@ class TestGetAllValidEdges:
         called_args = graph.ro_query.call_args
         cypher = called_args[0][0]
         assert 'RETURN DISTINCT' in cypher
+
+    @pytest.mark.asyncio
+    async def test_empty_graph_returns_empty_dict(self, mock_config, make_backend, make_graph_mock):
+        """ro_query returns empty result_set → result is {}."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """ro_query was awaited; query was NOT awaited."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_all_valid_edges(group_id='test')
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_null_fact_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
+        """Row with None fact returns fact=''."""
+        backend = make_backend(mock_config)
+        rows = [['entity-1', 'edge-a', None, 'knows']]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result['entity-1'][0]['fact'] == ''
+
+    @pytest.mark.asyncio
+    async def test_null_name_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
+        """Row with None name returns name=''."""
+        backend = make_backend(mock_config)
+        rows = [['entity-1', 'edge-a', 'some fact', None]]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result['entity-1'][0]['name'] == ''
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        """Uninitialized backend raises RuntimeError with 'not initialized'."""
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.get_all_valid_edges(group_id='test')
