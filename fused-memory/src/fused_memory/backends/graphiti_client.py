@@ -990,8 +990,8 @@ class GraphitiBackend:
                 *(_rebuild_one(t) for t in targets), return_exceptions=True
             )
 
-            for t, r in zip(targets, results):
-                if isinstance(r, Exception):
+            for t, r in zip(targets, results, strict=True):
+                if isinstance(r, BaseException):
                     errors += 1
                     logger.error(
                         'rebuild_entity_summaries: failed to rebuild node=%s name=%r: %s',
