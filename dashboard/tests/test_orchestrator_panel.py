@@ -21,14 +21,14 @@ MOCK_ORCHESTRATOR_RUNNING = {
         {'id': 5, 'title': 'Deploy', 'status': 'pending', 'priority': 'low', 'dependencies': [4], 'metadata': {}},
     ],
     'worktrees': {
-        '1': {
+        1: {
             'phase': 'DONE',
             'plan_progress': {'done': 3, 'total': 3},
             'iteration_count': 2,
             'review_summary': '2/2 passed',
             'modules': ['infra/'],
         },
-        '3': {
+        3: {
             'phase': 'EXECUTE',
             'plan_progress': {'done': 1, 'total': 4},
             'iteration_count': 5,
