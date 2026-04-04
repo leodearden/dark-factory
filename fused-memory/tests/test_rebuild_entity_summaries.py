@@ -246,15 +246,22 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_rebuilds_only_stale_entities(self, mock_config, make_backend):
-        """Only rebuilds entities flagged by _detect_stale_summaries_with_edges."""
+        """Only rebuilds entities flagged as stale by _detect_stale_summaries_with_edges.
+
+        Alice has summary='stale fact' but her only valid edge has fact='current fact',
+        so the canonical is 'current fact' != 'stale fact' → stale.
+        Bob has summary='current fact' matching his edge canonical → clean.
+        Total entities=2, stale=1, rebuilt=1.
+        """
         backend = make_backend(mock_config)
-        # _detect_stale_summaries_with_edges returns (stale_list, all_edges_dict, total_count)
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=(
-            [{'uuid': 'uuid-1', 'name': 'Alice', 'duplicate_count': 0,
-              'stale_line_count': 1, 'valid_fact_count': 0, 'summary_line_count': 1}],
-            {'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
-            2,
-        ))
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale fact'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'current fact'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current fact', 'name': 'edge2'}],
+        })
         backend.get_node_text = AsyncMock(return_value=('Alice', 'stale'))
         backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test')
@@ -294,21 +301,22 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_partial_failure_continues(self, mock_config, make_backend):
-        """If one entity's rebuild fails, continues with remaining and reports error in results."""
+        """If one entity's rebuild fails, continues with remaining and reports error in results.
+
+        Alice has summary='stale1' while her edge canonical is 'current1' → stale.
+        Bob has summary='stale2' while his edge canonical is 'current2' → stale.
+        Both are detected stale by _detect_stale_summaries_with_edges naturally.
+        Alice's get_node_text raises RuntimeError; Bob's succeeds.
+        """
         backend = make_backend(mock_config)
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=(
-            [
-                {'uuid': 'uuid-1', 'name': 'Alice', 'duplicate_count': 0,
-                 'stale_line_count': 1, 'valid_fact_count': 0, 'summary_line_count': 1},
-                {'uuid': 'uuid-2', 'name': 'Bob', 'duplicate_count': 0,
-                 'stale_line_count': 1, 'valid_fact_count': 0, 'summary_line_count': 1},
-            ],
-            {
-                'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
-                'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
-            },
-            2,
-        ))
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
+        })
         # Entity 1 fails at get_node_text; entity 2 succeeds
         backend.get_node_text = AsyncMock(side_effect=[
             RuntimeError('FalkorDB timeout'),
@@ -340,17 +348,19 @@ class TestRebuildEntitySummaries:
     async def test_dry_run_returns_stale_without_rebuilding(self, mock_config, make_backend):
         """With dry_run=True, detects stale entities but does not call _rebuild_entity_from_edges.
 
+        Alice has summary='stale fact' while her edge canonical is 'current fact' → stale.
+        _detect_stale_summaries_with_edges runs naturally and flags Alice.
         Explicitly mocks get_node_text and update_node_summary to document that
         the dry_run guarantee holds even if rebuild_entity_summaries were refactored
         to bypass _rebuild_entity_from_edges and call those methods directly.
         """
         backend = make_backend(mock_config)
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=(
-            [{'uuid': 'uuid-1', 'name': 'Alice', 'duplicate_count': 0,
-              'stale_line_count': 1, 'valid_fact_count': 0, 'summary_line_count': 1}],
-            {'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
-            1,
-        ))
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale fact'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
+        })
         backend.get_node_text = AsyncMock()
         backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test', dry_run=True)
