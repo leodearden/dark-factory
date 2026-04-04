@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -626,10 +627,8 @@ class SpeculativeMergeWorker:
                 # CancelledError or other fatal — resolve the in-flight Future
                 # and clean up the merge worktree so callers don't hang forever.
                 if item.merge_wt is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         await self._git_ops.cleanup_merge_worktree(item.merge_wt)
-                    except Exception:
-                        pass  # best-effort cleanup during cancellation
                 if not req.result.done():
                     req.result.set_result(MergeOutcome(
                         'blocked', reason='Merge worker cancelled',
