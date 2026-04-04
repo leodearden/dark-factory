@@ -8593,6 +8593,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 437,
+        "title": "Expand NULL/empty-value coercion test coverage in TestGetValidEdgesForNode",
+        "description": "In fused-memory/tests/test_refresh_entity_summary.py:\n1. Merge test_null_fact_defaults_to_empty_string (line 132) and test_null_name_defaults_to_empty_string (line 143) into a single @pytest.mark.parametrize test covering both positions.\n2. Add a third parametrize case (or separate test) for explicit empty-string '' to document `'' or ''` pass-through behavior and guard against future `is not None` tightening.\n3. Add test_null_uuid_in_row: assert behavior when row[0] is None (either empty-string default or row-skipping), closing the NULL-safety gap for all three columns since production code has no null guard on row[0].\n\nmemory_hint: search \"null coercion get_valid_edges\" for context on the production code pattern.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8605,7 +8616,7 @@
       ],
       "created": "2026-04-03T22:38:18.083Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T13:22:04.794Z"
+      "updated": "2026-04-04T13:22:09.373Z"
     }
   }
 }
