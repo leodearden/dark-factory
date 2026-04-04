@@ -2990,13 +2990,9 @@
             "dashboard/src/dashboard/templates"
           ],
           "memory_hints": {
-            "entities": [
-              "Idiomorph",
-              "Alpine.js"
-            ],
+            "entities": [],
             "queries": [
-              "Alpine state HTMX morph preservation Idiomorph",
-              "htmx:afterSettle fix pattern Chart.js Idiomorph"
+              "resolution for: Fix orchestrator task table default state — shows visible with \"Show tasks\" label"
             ]
           }
         }
@@ -3007,11 +3003,11 @@
         "description": "The reconciliation Recent Runs table shows \"Loading...\" text between every run row. Detail rows use x-show=\"open\" with x-cloak and hx-trigger=\"revealed\", but Idiomorph morphing every 15s briefly makes hidden rows visible, triggering unnecessary HTMX fetches. The \"Loading...\" text from in-flight fetches remains visible.",
         "details": "File: dashboard/src/dashboard/templates/partials/recon.html (lines 159-164).\n\nFix approach: (1) Change hx-trigger from \"revealed\" to a manual trigger fired by the Alpine @click handler (e.g. hx-trigger=\"load-detail\" and dispatch the event on click). This prevents morph-triggered fetches. (2) Use Alpine.store or id-based state preservation to maintain open/closed state across morphs.\n\nmemory_hint: search \"reconciliation detail HTMX\" for prior discussion.",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "blocked",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-04T00:20:06.278Z",
+        "updatedAt": "2026-04-04T03:14:39.102Z",
         "metadata": {
           "files": [
             "dashboard/src/dashboard/templates/partials/recon.html",
@@ -8359,7 +8355,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T00:20:06.279Z",
+      "lastModified": "2026-04-04T03:14:39.102Z",
       "taskCount": 397,
       "completedCount": 387,
       "tags": [
