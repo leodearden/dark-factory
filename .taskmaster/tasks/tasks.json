@@ -8616,6 +8616,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 439,
+        "title": "Eliminate N+1 get_node_text round-trips in _rebuild_entity_from_edges",
+        "description": "_rebuild_entity_from_edges at line 962 calls get_node_text per entity for old_summary, emitting N extra RPCs inside the asyncio.gather fan-out (semaphore=20). The name/old_summary optional params were added to refresh_entity_summary explicitly to fix this, but _rebuild_entity_from_edges was never updated.\n\nPreferred fix (option a): have _rebuild_entity_from_edges accept an optional `old_summary: str | None = None` parameter. When provided, skip get_node_text. Thread pre-fetched data from rebuild_entity_summaries callers — for force=True entities, all_entities[i]['summary'] is available; for stale entities, add summary to the stale dict in _detect_stale_summaries_with_edges.\n\nAlternative (option b): have _rebuild_entity_from_edges delegate entirely to refresh_entity_summary(uuid, group_id=group_id, name=name, old_summary=old_summary) and remove the structural duplication.\n\nAlso consider making get_node_text failure non-fatal to the summary write path.\n\nMemory hints: search \"refresh_entity_summary name old_summary optimization\", get_entity \"GraphitiClient\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8628,7 +8639,7 @@
       ],
       "created": "2026-04-04T14:14:49.611Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T14:14:49.623Z"
+      "updated": "2026-04-04T14:14:57.040Z"
     }
   }
 }
