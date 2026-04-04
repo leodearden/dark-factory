@@ -371,8 +371,10 @@ dependencies = [
 requires-dist = [
     { name = "fastmcp", specifier = ">=2.0" },
     { name = "inotify-simple", specifier = ">=1.3" },
+    { name = "orchestrator", marker = "extra == 'merge'", editable = "." },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
+provides-extras = ["merge"]
 
 [package.metadata.requires-dev]
 dev = [
