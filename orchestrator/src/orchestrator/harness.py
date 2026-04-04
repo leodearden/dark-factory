@@ -709,7 +709,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 esc_q = self._escalation_queue  # capture for closure (narrows type)
 
                 def _make_steward(worktree: Path, config_dir=None, *, _assign=assignment) -> TaskSteward:  # type: ignore[name-defined]
-                    return TaskSteward(
+                    return TaskSteward(  # type: ignore[reportPossiblyUnbound]
                         task_id=_assign.task_id,
                         task=_assign.task,
                         worktree=worktree,

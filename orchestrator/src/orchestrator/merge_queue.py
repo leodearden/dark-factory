@@ -432,20 +432,19 @@ class SpeculativeMergeWorker:
                 ['git', 'rev-parse', 'HEAD'], cwd=req.worktree,
             )
             branch_head = branch_head.strip()
-            if await self._git_ops.is_ancestor(branch_head, actual_main):
-                if not await self._git_ops.has_uncommitted_work(req.worktree):
-                    logger.info(
-                        f'Task {req.task_id}: branch already on main — skipping'
-                    )
-                    self._emit_merge(req.task_id, 'already_merged')
-                    await self._verifier_queue.put(SpeculativeItem(
-                        request=req, merge_result=None, merge_wt=None,
-                        base_sha=actual_main, speculative=speculative,
-                        skip_verify=False,
-                        immediate_outcome=MergeOutcome('already_merged'),
-                    ))
-                    spec_base = None
-                    continue
+            if await self._git_ops.is_ancestor(branch_head, actual_main) and not await self._git_ops.has_uncommitted_work(req.worktree):
+                logger.info(
+                    f'Task {req.task_id}: branch already on main — skipping'
+                )
+                self._emit_merge(req.task_id, 'already_merged')
+                await self._verifier_queue.put(SpeculativeItem(
+                    request=req, merge_result=None, merge_wt=None,
+                    base_sha=actual_main, speculative=speculative,
+                    skip_verify=False,
+                    immediate_outcome=MergeOutcome('already_merged'),
+                ))
+                spec_base = None
+                continue
 
             # ── Step 2: merge (speculative or normal) ─────────────────
             if speculative:

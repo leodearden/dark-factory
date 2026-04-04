@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeOutcome, MergeRequest, MergeWorker, SpeculativeMergeWorker
 
@@ -832,6 +832,7 @@ class TestSpeculativeMergeWorker:
         await git_ops.commit(wt_n1, 'N+1 file')
         result = await git_ops.merge_to_main(wt_n1, 'am-n1')
         assert result.success
+        assert result.merge_commit is not None
         await git_ops.advance_main(result.merge_commit)
         if result.merge_worktree:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
@@ -899,6 +900,7 @@ class TestSpeculativeBackwardCompat:
 
         result = await git_ops.merge_to_main(worktree, 'compat-am')
         assert result.success
+        assert result.merge_commit is not None
         await git_ops.advance_main(result.merge_commit)
         if result.merge_worktree:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
