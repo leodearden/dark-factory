@@ -8,6 +8,7 @@ Covers:
 - MCP tool rebuild_entity_summaries             (step 5)
 - DISALLOW_MEMORY_WRITES list                   (step 6)
 - RebuildSummariesManager / run_rebuild_summaries (step 7)
+- GraphitiBackend.get_all_valid_edges()         (task-423)
 """
 from __future__ import annotations
 
@@ -686,6 +687,17 @@ class TestGetAllValidEdges:
         assert result['node-2'] == [{'uuid': 'e3', 'fact': 'factC', 'name': 'edge3'}]
 
     @pytest.mark.asyncio
+    async def test_cypher_uses_return_distinct(self, mock_config, make_backend, make_graph_mock):
+        """Cypher query passed to ro_query contains 'RETURN DISTINCT'."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_all_valid_edges(group_id='test')
+        called_args = graph.ro_query.call_args
+        cypher = called_args[0][0]
+        assert 'RETURN DISTINCT' in cypher
+
+    @pytest.mark.asyncio
     async def test_empty_graph_returns_empty_dict(self, mock_config, make_backend, make_graph_mock):
         """Returns empty dict when no valid edges exist."""
         backend = make_backend(mock_config)
@@ -703,6 +715,26 @@ class TestGetAllValidEdges:
         await backend.get_all_valid_edges(group_id='test')
         graph.ro_query.assert_awaited_once()
         graph.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_null_fact_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
+        """Row with None fact returns fact=''."""
+        backend = make_backend(mock_config)
+        rows = [['node-1', 'e1', None, 'edge1']]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result['node-1'][0]['fact'] == ''
+
+    @pytest.mark.asyncio
+    async def test_null_name_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
+        """Row with None name returns name=''."""
+        backend = make_backend(mock_config)
+        rows = [['node-1', 'e1', 'factA', None]]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result['node-1'][0]['name'] == ''
 
     @pytest.mark.asyncio
     async def test_cypher_filters_invalid_at_is_null(self, mock_config, make_backend, make_graph_mock):

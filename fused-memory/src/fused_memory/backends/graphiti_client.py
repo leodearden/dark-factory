@@ -461,10 +461,12 @@ class GraphitiBackend:
         ]
 
     async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[dict]]:
-        """Return all currently-valid RELATES_TO edges, grouped by entity UUID.
+        """Return all currently-valid RELATES_TO edges grouped by entity UUID.
 
-        Issues a single bulk Cypher query rather than one query per entity,
-        eliminating the O(N) round-trips in detect_stale_summaries.
+        Bulk variant of get_valid_edges_for_node that issues a single Cypher query
+        instead of O(N) per-entity round-trips.  The undirected MATCH pattern can
+        produce duplicate rows; RETURN DISTINCT is used defensively, matching the
+        pattern in get_valid_edges_for_node.
 
         Uses ro_query since no writes are performed.
 
@@ -472,9 +474,8 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            Dict keyed by entity UUID; each value is a list of edge dicts
-            with keys: uuid, fact, name.  Same edge shape as
-            get_valid_edges_for_node output.
+            Dict mapping entity UUID → list of edge dicts with keys: uuid, fact, name.
+            fact and name default to empty string when the property is NULL.
         """
         graph = self._graph_for(group_id)
         cypher = (
