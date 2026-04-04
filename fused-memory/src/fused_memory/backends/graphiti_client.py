@@ -821,7 +821,7 @@ class GraphitiBackend:
         await self.update_node_summary(node_uuid, new_summary, group_id=group_id)
         logger.info(
             'refresh_entity_summary: node=%s name=%r edges=%d old_len=%d new_len=%d',
-            node_uuid, name, len(edges), len(old_summary), len(new_summary),
+            node_uuid, name, len(edges), len(old_summary or ''), len(new_summary),
         )
         return {
             'uuid': node_uuid,

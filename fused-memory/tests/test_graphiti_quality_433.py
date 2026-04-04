@@ -9,7 +9,7 @@ Task 433: 8 code-quality improvements deferred from task-419 review.
 """
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -17,7 +17,6 @@ from fused_memory.backends.graphiti_client import (
     GraphitiBackend,
     StaleSummaryResult,
 )
-
 
 # ---------------------------------------------------------------------------
 # step-1: StaleSummaryResult named tuple with backward-compat tuple unpacking
@@ -219,7 +218,7 @@ class TestRebuildEntitySummariesForceDryRun:
         ])
         backend.get_all_valid_edges = AsyncMock(return_value={})
 
-        result = await backend.rebuild_entity_summaries(
+        await backend.rebuild_entity_summaries(
             group_id='test', force=True, dry_run=True
         )
 
