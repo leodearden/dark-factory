@@ -963,3 +963,21 @@ class TestRunPanelAlpineComponent:
         with _patch_recon_data():
             html = client.get('/partials/recon').text
         assert 'x-ref="detail"' in html
+
+    def test_detail_div_has_after_swap_handler(self, client):
+        """Detail div has hx-on::after-swap to set dataset.loaded flag."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'hx-on::after-swap' in html
+
+    def test_after_swap_sets_loaded_flag(self, client):
+        """hx-on::after-swap sets this.dataset.loaded='true'."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert "this.dataset.loaded = 'true'" in html
+
+    def test_after_swap_removes_loading_flag(self, client):
+        """hx-on::after-swap deletes this.dataset.loading."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'delete this.dataset.loading' in html

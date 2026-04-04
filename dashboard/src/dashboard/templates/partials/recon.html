@@ -188,7 +188,7 @@
             </tr>
             <tr x-show="open" x-cloak>
               <td colspan="{{ col_count }}" class="p-4 bg-gray-900/50">
-                <div hx-get="/partials/recon/run/{{ run.id }}" hx-trigger="load-detail" hx-swap="innerHTML" x-ref="detail">
+                <div hx-get="/partials/recon/run/{{ run.id }}" hx-trigger="load-detail" hx-swap="innerHTML" x-ref="detail" hx-on::after-swap="this.dataset.loaded = 'true'; delete this.dataset.loading">
                   <span class="text-xs text-gray-500">Loading...</span>
                 </div>
               </td>
