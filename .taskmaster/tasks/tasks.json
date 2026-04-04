@@ -8638,6 +8638,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 441,
+        "title": "Document or strengthen name/old_summary coupling in refresh_entity_summary",
+        "description": "The name and old_summary parameters on refresh_entity_summary (graphiti_client.py ~line 787) have a both-or-neither contract enforced only at runtime via a ValueError. The type signature `str | None` allows callers to pass one without the other, so the constraint is invisible to static analysis.\n\nMinimum fix: add a brief inline comment at the parameter definition acknowledging this as a known pragmatic trade-off (e.g. 'Both-or-neither enforced at runtime; a composite NodeTextHint type would be cleaner but is deferred').\n\nStronger fix (if N+1 elimination task is done first): introduce a NodeTextHint(name: str, summary: str) dataclass/NamedTuple and replace the two params with `node_hint: NodeTextHint | None = None`, eliminating the runtime XOR check.\n\nMemory hints: search \"refresh_entity_summary parameter design\", search \"NodeTextHint\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8650,7 +8661,7 @@
       ],
       "created": "2026-04-04T14:14:49.611Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T14:15:02.411Z"
+      "updated": "2026-04-04T14:15:09.153Z"
     }
   }
 }
