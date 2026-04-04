@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.verify import run_scoped_verification
 
 if TYPE_CHECKING:
@@ -49,6 +49,23 @@ class MergeOutcome:
     status: Literal['done', 'conflict', 'blocked', 'already_merged']
     reason: str = ''
     conflict_details: str = ''
+
+
+@dataclass
+class SpeculativeItem:
+    """Internal message passed from Merger coroutine to Verifier coroutine.
+
+    Holds everything the Verifier needs to run verification and CAS-advance
+    main, or to immediately resolve a Future (for conflict/already_merged).
+    """
+
+    request: MergeRequest
+    merge_result: MergeResult | None  # None means already_merged or conflict
+    merge_wt: Path | None             # Merge worktree (if merge succeeded)
+    base_sha: str                      # main SHA at merge time (actual or speculative)
+    speculative: bool                  # True → merged against pending N's SHA
+    skip_verify: bool                  # True → pre_rebased and main unchanged
+    immediate_outcome: MergeOutcome | None = None  # Set for conflict/already_merged
 
 
 class MergeWorker:
