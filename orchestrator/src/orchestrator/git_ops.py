@@ -188,6 +188,26 @@ class GitOps:
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
 
+    async def _is_registered_worktree(self, path: Path) -> bool:
+        """Check if *path* is a registered git worktree.
+
+        Uses ``git worktree list --porcelain`` and checks whether the
+        resolved *path* appears as a ``worktree <path>`` line.  This
+        prevents stale directories (containing only .task/ state files)
+        from being mistaken for reusable worktrees.
+        """
+        resolved = str(path.resolve())
+        rc, output, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return False
+        for line in output.splitlines():
+            if line.startswith('worktree ') and line[9:] == resolved:
+                return True
+        return False
+
     async def create_worktree(self, branch_name: str) -> tuple[Path, str]:
         """Create a git worktree for a task branch, based off main.
 
@@ -217,11 +237,21 @@ class GitOps:
             cwd=self.project_root,
         )
 
-        # If worktree already exists, reuse it (common after requeue)
+        # If worktree already exists, reuse it (common after requeue) —
+        # but ONLY if it is a real registered git worktree.  A stale
+        # directory (e.g. containing only .task/ state files from a previous
+        # run) must be removed so a fresh worktree can be created.
         if worktree_path.exists():
-            logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
-            _ensure_task_gitignore(worktree_path)
-            return worktree_path, base_sha
+            if await self._is_registered_worktree(worktree_path):
+                logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
+                _ensure_task_gitignore(worktree_path)
+                return worktree_path, base_sha
+            else:
+                logger.warning(
+                    f'Directory {worktree_path} exists but is NOT a registered '
+                    f'git worktree — removing stale directory and creating fresh worktree'
+                )
+                shutil.rmtree(worktree_path)
 
         # If branch exists but worktree doesn't (stale from a previous run), clean up
         rc, _, _ = await _run(
