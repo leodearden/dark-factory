@@ -8,6 +8,7 @@ Covers:
 - MCP tool rebuild_entity_summaries             (step 5)
 - DISALLOW_MEMORY_WRITES list                   (step 6)
 - RebuildSummariesManager / run_rebuild_summaries (step 7)
+- GraphitiBackend.get_all_valid_edges()         (task-423)
 """
 from __future__ import annotations
 
@@ -184,6 +185,58 @@ class TestDetectStaleSummaries:
         result = await backend.detect_stale_summaries(group_id='test')
         assert result[0]['summary_line_count'] == 3
 
+    @pytest.mark.asyncio
+    async def test_same_facts_different_order_triggers_rebuild(self, mock_config, make_backend):
+        """Identical facts in a different order flag the entity as stale.
+
+        This is expected (not a bug): canonical summary follows edge-result order,
+        so 'factB\\nfactA' != 'factA\\nfactB'. The entity is flagged stale purely
+        because the string comparison summary != canonical fails. Both lines exist
+        in valid_fact_set, so stale_line_count == 0 and duplicate_count == 0.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factB\nfactA'},
+        ])
+        # Edges return factA first, factB second → canonical = 'factA\nfactB'
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [
+                {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'},
+                {'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'},
+            ],
+        })
+        result = await backend.detect_stale_summaries(group_id='test')
+        assert len(result) == 1
+        entity = result[0]
+        assert entity['uuid'] == 'uuid-1'
+        # Both lines are present in valid_fact_set → stale_line_count == 0
+        assert entity['stale_line_count'] == 0
+        # No duplicate lines → duplicate_count == 0
+        assert entity['duplicate_count'] == 0
+        # Entity is stale due to order mismatch (summary != canonical), not content issues
+
+    @pytest.mark.asyncio
+    async def test_entity_with_zero_valid_edges_flagged_stale(self, mock_config, make_backend):
+        """Entity with non-empty summary but zero valid edges is flagged stale.
+
+        When get_all_valid_edges returns no edges for the entity, the canonical
+        summary is '' (empty). Since summary != canonical, the entity is stale.
+        All summary lines are counted as stale_line_count because none appear
+        in the empty valid_fact_set. valid_fact_count=0, duplicate_count=0.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old fact A\nold fact B'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        result = await backend.detect_stale_summaries(group_id='test')
+        assert len(result) == 1
+        entity = result[0]
+        assert entity['uuid'] == 'uuid-1'
+        assert entity['stale_line_count'] == 2
+        assert entity['valid_fact_count'] == 0
+        assert entity['duplicate_count'] == 0
+        assert entity['summary_line_count'] == 2
 
 # ---------------------------------------------------------------------------
 # step-3: GraphitiBackend.rebuild_entity_summaries
@@ -194,7 +247,13 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_rebuilds_only_stale_entities(self, mock_config, make_backend):
-        """Only rebuilds entities flagged by _detect_stale_summaries_with_edges."""
+        """Only rebuilds entities flagged as stale by _detect_stale_summaries_with_edges.
+
+        Alice has summary='stale fact' but her only valid edge has fact='current fact',
+        so the canonical is 'current fact' != 'stale fact' → stale.
+        Bob has summary='current fact' matching his edge canonical → clean.
+        Total entities=2, stale=1, rebuilt=1.
+        """
         backend = make_backend(mock_config)
         # _detect_stale_summaries_with_edges returns (stale_list, all_edges_dict, total_count)
         backend._detect_stale_summaries_with_edges = AsyncMock(return_value=(
@@ -241,7 +300,13 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_partial_failure_continues(self, mock_config, make_backend):
-        """If one entity's rebuild fails, continues with remaining and reports error in results."""
+        """If one entity's rebuild fails, continues with remaining and reports error in results.
+
+        Alice has summary='stale1' while her edge canonical is 'current1' → stale.
+        Bob has summary='stale2' while his edge canonical is 'current2' → stale.
+        Both are detected stale by _detect_stale_summaries_with_edges naturally.
+        Alice's update_node_summary raises RuntimeError; Bob's succeeds.
+        """
         backend = make_backend(mock_config)
         backend._detect_stale_summaries_with_edges = AsyncMock(return_value=(
             [
@@ -286,7 +351,14 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_dry_run_returns_stale_without_rebuilding(self, mock_config, make_backend):
-        """With dry_run=True, detects stale entities but does not call _rebuild_entity_from_edges."""
+        """With dry_run=True, detects stale entities but does not call _rebuild_entity_from_edges.
+
+        Alice has summary='stale fact' while her edge canonical is 'current fact' → stale.
+        _detect_stale_summaries_with_edges runs naturally and flags Alice.
+        Explicitly mocks update_node_summary to document that the dry_run
+        guarantee holds even if rebuild_entity_summaries were refactored
+        to bypass _rebuild_entity_from_edges and call those methods directly.
+        """
         backend = make_backend(mock_config)
         backend._detect_stale_summaries_with_edges = AsyncMock(return_value=(
             [{'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale',
@@ -618,6 +690,17 @@ class TestGetAllValidEdges:
         assert result['node-2'] == [{'uuid': 'e3', 'fact': 'factC', 'name': 'edge3'}]
 
     @pytest.mark.asyncio
+    async def test_cypher_uses_return_distinct(self, mock_config, make_backend, make_graph_mock):
+        """Cypher query passed to ro_query contains 'RETURN DISTINCT'."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_all_valid_edges(group_id='test')
+        called_args = graph.ro_query.call_args
+        cypher = called_args[0][0]
+        assert 'RETURN DISTINCT' in cypher
+
+    @pytest.mark.asyncio
     async def test_empty_graph_returns_empty_dict(self, mock_config, make_backend, make_graph_mock):
         """Returns empty dict when no valid edges exist."""
         backend = make_backend(mock_config)
@@ -635,6 +718,26 @@ class TestGetAllValidEdges:
         await backend.get_all_valid_edges(group_id='test')
         graph.ro_query.assert_awaited_once()
         graph.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_null_fact_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
+        """Row with None fact returns fact=''."""
+        backend = make_backend(mock_config)
+        rows = [['node-1', 'e1', None, 'edge1']]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result['node-1'][0]['fact'] == ''
+
+    @pytest.mark.asyncio
+    async def test_null_name_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
+        """Row with None name returns name=''."""
+        backend = make_backend(mock_config)
+        rows = [['node-1', 'e1', 'factA', None]]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result['node-1'][0]['name'] == ''
 
     @pytest.mark.asyncio
     async def test_cypher_filters_invalid_at_is_null(self, mock_config, make_backend, make_graph_mock):

@@ -5817,7 +5817,7 @@
         "description": "Add a re-summarize entity MCP tool that triggers Graphiti to regenerate an entity node's summary from its current edges. Currently, entity summaries can only be updated when a new episode touches the entity. This means stale or aspirational summaries (e.g., from PRD ingestion) persist indefinitely if no new episodes arrive. The tool should accept an entity UUID or name and force summary regeneration from the existing edge set.\n\nMemory hints:\n- Search: 'entity summary stale aspirational PRD content'\n- Search: 'Graphiti entity node re-summarization'\n- Entities: UsageGate, Graphiti",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [
           "158"
         ],
@@ -5846,13 +5846,14 @@
             "fused-memory/tests/test_tools_validation.py"
           ],
           "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/src/fused_memory/reconciliation",
             "fused-memory/src/fused_memory/server",
             "fused-memory/src/fused_memory/services",
-            "fused-memory/src/fused_memory/backends",
-            "fused-memory/tests"
+            "fused-memory/tests/test_refresh_entity_summary.py"
           ]
         },
-        "updatedAt": "2026-04-04T08:40:34.502Z"
+        "updatedAt": "2026-04-04T13:06:35.468Z"
       },
       {
         "id": "310",
@@ -8420,10 +8421,11 @@
         "description": "get_all_valid_edges (line ~460) uses `RETURN n.uuid, e.uuid, e.fact, e.name` without DISTINCT, while the existing get_valid_edges_for_node uses `RETURN DISTINCT`. Undirected `MATCH (n:Entity)-[e:RELATES_TO]-()` patterns can produce duplicate rows. Downstream dedup via dict.fromkeys masks this for summaries, but the raw grouped dict holds redundant entries.\n\nFix: Add DISTINCT to match the defensive pattern in get_valid_edges_for_node.\n\nmemory_hint: search \"get_all_valid_edges DISTINCT\" for context.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T18:26:16.919Z"
       },
       {
         "id": "424",
@@ -8431,11 +8433,11 @@
         "description": "Five test gaps identified in test_rebuild_entity_summaries.py:\n\n1. **Entity with zero valid edges**: No test for entity with non-empty summary but zero valid edges. Should flag stale with stale_line_count>0, valid_fact_count=0. Rebuild should write empty summary. (suggestion 11)\n\n2. **dry_run assertion gap**: test_dry_run only asserts update_node_summary not awaited but not get_node_text. Add assertion that get_node_text is also not called. (suggestion 12)\n\n3. **Fragile Cypher extraction**: test_cypher_filters_invalid_at_is_null extracts Cypher via fragile call_args logic with silent fallback to empty string. Use `call_args.args[0]` with informative assertion message. (suggestion 13)\n\n4. **NULL edge values**: No test for rows with NULL fact/name values. Production code handles with `row[2] or ''` but this isn't tested. (suggestion 14)\n\n5. **Ordering-sensitive staleness**: No test documenting that summary with same facts in different order triggers rebuild. Add test documenting this as expected behavior. (suggestion 16)\n\nmemory_hint: search \"test_rebuild_entity_summaries\" for test file context.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-04-04T08:40:34.567Z"
+        "updatedAt": "2026-04-04T13:22:19.714Z"
       },
       {
         "id": "425",
@@ -8443,11 +8445,11 @@
         "description": "Two test gaps in test_recon_panel.py:\n\n1. **Redundant assertion**: test_no_local_open_state_in_x_data makes two assertions checking the same substring (both Python literals evaluate to identical string). Replace second assertion with single-quote form `x-data='{ open: false }'` to cover both quoting styles. (suggestion 10)\n\n2. **Missing journal_entry_count=0 test**: All TestReconDetailTrigger tests use MOCK_RUNS with journal_entry_count=3. No test verifies that when journal_entry_count=0, the badge and detail div are absent (template guards with `{% if run.journal_entry_count > 0 %}`). Add test with journal_entry_count=0. (suggestion 15)\n\nmemory_hint: search \"test_recon_panel journal\" for test file context.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "low",
         "subtasks": [],
-        "updatedAt": "2026-04-04T08:24:51.001Z",
+        "updatedAt": "2026-04-04T13:10:50.829Z",
         "metadata": {
           "memory_hints": {
             "entities": [],
@@ -8463,10 +8465,11 @@
         "description": "The escalation MCP's merge_request tool (escalation/src/escalation/server.py:173-180) passes module_configs=[] and task_files=None to MergeRequest. This causes run_scoped_verification to fall through to global mode, running bare pytest/pyright/ruff from the repo root without uv run wrappers — which fails because subproject venvs aren't on PATH.",
         "details": "Fix: compute module_configs and task_files from the worktree before submitting to the merge queue.\n\n1. Discover module configs: use _discover_module_configs(project_root) from orchestrator.config to find all subproject orchestrator.yaml files.\n2. Compute task_files: run `git diff main..HEAD --name-only` in the worktree to get the list of changed files.\n3. Filter module_configs to only those whose prefix matches at least one task_file.\n4. Pass both to MergeRequest.\n\nReference: the orchestrator's own merge flow (workflow.py:1066-1075) passes self._module_configs (resolved via _resolve_module_configs at line 479) and self._task_files (from plan['files'] at line 182). The external merge_request should approximate this from git diff instead of plan metadata.\n\nAlso consider loading a proper OrchestratorConfig from the project's orchestrator.yaml instead of using the bare default OrchestratorConfig().\n\nFiles: escalation/src/escalation/server.py\nmemory_hint: search \"merge_request module_configs verification\" for prior context on this issue.",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T14:15:37.448Z"
       },
       {
         "id": "427",
@@ -8518,10 +8521,11 @@
         "description": "Refactor tests that mock private _detect_stale_summaries_with_edges to instead mock leaf DB methods (list_entity_nodes, get_all_valid_edges). This decouples tests from internal factoring while preserving behavioral coverage.",
         "details": "File: fused-memory/tests/test_rebuild_entity_summaries.py (lines 207, 283, 320, _make_private_mock). Source: review suggestions from task 419 (esc-419-25).",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T14:11:38.539Z"
       },
       {
         "id": "432",
@@ -8529,10 +8533,17 @@
         "description": "Task 175 added _rebuild_entity_from_edges which takes pre-fetched edges but still calls get_node_text(uuid) per entity to get old_summary. The entity name is already available from the caller, and old_summary is available from list_entity_nodes data. Thread both through to eliminate the redundant DB call. This was the remaining unmerged value from cancelled task 419.\n\nSpecific changes:\n1. Add name and old_summary params to _rebuild_entity_from_edges\n2. In rebuild_entity_summaries, build entity_map from all_entities/list_entity_nodes and pass name+old_summary\n3. Update tests in test_rebuild_entity_summaries.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T19:02:01.836Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/tests/test_rebuild_entity_summaries.py"
+          ]
+        }
       },
       {
         "id": "433",
@@ -8540,10 +8551,11 @@
         "description": "Review suggestions from task 419 reviewers (deferred as non-blocking). All in graphiti_client.py backend code:\n\n1. Invert if/pass/else guard in refresh_entity_summary — replace empty pass branch with inverted condition (architect, reuse_auditor)\n2. Enforce name+old_summary pairing with ValueError when only one provided (architect, robustness)\n3. Replace anonymous 3-tuple return from _detect_stale_summaries_with_edges with NamedTuple/dataclass (architect)\n4. Extract _canonical_facts() helper for the dict.fromkeys dedup expression used in 3 places (reuse_auditor)\n5. Type annotation: refresh_kwargs dict -> dict[str, Any] (architect)\n6. Variable scoping: declare all_entities before if/else branches (architect)\n7. Skip entity_map construction in dry_run mode (performance)\n8. Add TOCTOU/eventual-consistency comment for pre-fetched edge optimization (robustness)",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T14:15:34.687Z"
       },
       {
         "id": "434",
@@ -8554,14 +8566,201 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-04-04T13:10:50.742Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/tests/test_rebuild_entity_summaries.py",
+            "fused-memory/tests/test_refresh_entity_summary.py"
+          ]
+        }
+      },
+      {
+        "id": "435",
+        "title": "Fix fragile call_args indexing in test_refresh_entity_summary.py",
+        "description": "In fused-memory/tests/test_refresh_entity_summary.py, lines 163, 107, 137, and 150 use bare `call_args.args[N]` which raises an opaque IndexError if graph.query changes to keyword-passing. Replace with defensive pattern: `call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get('params', {})` for params, and `call_args.args[0] if call_args.args else call_args.kwargs.get('query', '')` for cypher. Alternatively, add an `assert len(call_args.args) > N, f'Expected positional args, got: {call_args}'` guard before each index access.\n\nmemory_hint: search \"call_args fragile indexing\" for context on this pattern.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "436",
+        "title": "Improve test_same_facts_different_order_triggers_rebuild completeness",
+        "description": "In fused-memory/tests/test_rebuild_entity_summaries.py, make two changes to the test at lines 188-215:\n1. Add `assert entity['valid_fact_count'] == 2` after line 214 to complete the diagnostic triple and prove edges were consulted.\n2. Update the docstring to say 'This is a known limitation of the current implementation, not a deliberate design invariant: canonical summary follows edge-result order, which is non-deterministic. Future work to sort facts would require updating this test.' Remove or rephrase the 'expected (not a bug)' framing.\n\nmemory_hint: search \"test_same_facts_different_order\" for test context.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "437",
+        "title": "Expand NULL/empty-value coercion test coverage in TestGetValidEdgesForNode",
+        "description": "In fused-memory/tests/test_refresh_entity_summary.py:\n1. Merge test_null_fact_defaults_to_empty_string (line 132) and test_null_name_defaults_to_empty_string (line 143) into a single @pytest.mark.parametrize test covering both positions.\n2. Add a third parametrize case (or separate test) for explicit empty-string '' to document `'' or ''` pass-through behavior and guard against future `is not None` tightening.\n3. Add test_null_uuid_in_row: assert behavior when row[0] is None (either empty-string default or row-skipping), closing the NULL-safety gap for all three columns since production code has no null guard on row[0].\n\nmemory_hint: search \"null coercion get_valid_edges\" for context on the production code pattern.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "438",
+        "title": "Fix StaleSummaryResult positional unpacking at both call sites",
+        "description": "Two call sites in graphiti_client.py still use positional tuple unpacking instead of named StaleSummaryResult attribute access:\n1. `detect_stale_summaries` (line 933): change `stale, _, _ = await self._detect_stale_summaries_with_edges(...)` to `result = await ...; return result.stale`\n2. `rebuild_entity_summaries` (line 1023): change `stale, all_edges, total_entities = await ...` to `result = await ...; stale = result.stale; all_edges = result.edges; total_entities = result.total_count`\n3. Consider renaming the StaleSummaryResult field `edges` → `all_edges` (line 36) to match the usage variable name and signal that it is the full graph-wide edge dict, not per-entity edges. If renamed, update all field references accordingly.\n\nMemory hints: search for \"StaleSummaryResult\" entity, search \"NamedTuple positional unpacking graphiti\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-04-04T18:06:24.166Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/tests/test_graphiti_quality_433.py",
+            "fused-memory/tests/test_stale_summary_named_access_438.py"
+          ]
+        }
+      },
+      {
+        "id": "439",
+        "title": "Eliminate N+1 get_node_text round-trips in _rebuild_entity_from_edges",
+        "description": "_rebuild_entity_from_edges at line 962 calls get_node_text per entity for old_summary, emitting N extra RPCs inside the asyncio.gather fan-out (semaphore=20). The name/old_summary optional params were added to refresh_entity_summary explicitly to fix this, but _rebuild_entity_from_edges was never updated.\n\nPreferred fix (option a): have _rebuild_entity_from_edges accept an optional `old_summary: str | None = None` parameter. When provided, skip get_node_text. Thread pre-fetched data from rebuild_entity_summaries callers — for force=True entities, all_entities[i]['summary'] is available; for stale entities, add summary to the stale dict in _detect_stale_summaries_with_edges.\n\nAlternative (option b): have _rebuild_entity_from_edges delegate entirely to refresh_entity_summary(uuid, group_id=group_id, name=name, old_summary=old_summary) and remove the structural duplication.\n\nAlso consider making get_node_text failure non-fatal to the summary write path.\n\nMemory hints: search \"refresh_entity_summary name old_summary optimization\", get_entity \"GraphitiClient\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-04-04T19:02:01.444Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/tests/test_rebuild_entity_summaries.py"
+          ]
+        }
+      },
+      {
+        "id": "440",
+        "title": "Test file hygiene: rename test_graphiti_quality_433 and remove deferred imports",
+        "description": "Two cleanup tasks in fused-memory/tests/test_graphiti_quality_433.py:\n1. Rename the file to `test_graphiti_rebuild_pipeline.py` (or `test_graphiti_summary_refresh.py`) — the current name embeds ephemeral task ID 433, which conveys no information after the task is closed.\n2. Remove the two `from fused_memory.backends.graphiti_client import StaleSummaryResult` statements inside test method bodies at lines 263 and 289 — StaleSummaryResult is already imported at the module top-level (line 18), making these dead weight that also violates the project convention against deferred imports.\n\nMemory hints: search \"test file naming conventions\", search \"deferred import convention\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "441",
+        "title": "Document or strengthen name/old_summary coupling in refresh_entity_summary",
+        "description": "The name and old_summary parameters on refresh_entity_summary (graphiti_client.py ~line 787) have a both-or-neither contract enforced only at runtime via a ValueError. The type signature `str | None` allows callers to pass one without the other, so the constraint is invisible to static analysis.\n\nMinimum fix: add a brief inline comment at the parameter definition acknowledging this as a known pragmatic trade-off (e.g. 'Both-or-neither enforced at runtime; a composite NodeTextHint type would be cleaner but is deferred').\n\nStronger fix (if N+1 elimination task is done first): introduce a NodeTextHint(name: str, summary: str) dataclass/NamedTuple and replace the two params with `node_hint: NodeTextHint | None = None`, eliminating the runtime XOR check.\n\nMemory hints: search \"refresh_entity_summary parameter design\", search \"NodeTextHint\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "442",
+        "title": "Parallelize list_entity_nodes + get_all_valid_edges in force=True path",
+        "description": "In rebuild_entity_summaries (graphiti_client.py ~line 1015), the force=True branch awaits list_entity_nodes and get_all_valid_edges sequentially. These are independent bulk graph queries and can run concurrently.\n\nFix: replace the sequential awaits with asyncio.gather:\n```python\nall_entities, all_edges = await asyncio.gather(\n    self.list_entity_nodes(group_id=group_id),\n    self.get_all_valid_edges(group_id=group_id),\n)\n```\nGate the gather on dry_run to avoid fetching edges unnecessarily (preserving the existing skip-on-dry_run optimization).\n\nMemory hints: search \"rebuild_entity_summaries concurrency\", search \"asyncio.gather graphiti\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "443",
+        "title": "Fill test coverage gaps in graphiti rebuild/refresh tests",
+        "description": "Five test gaps in the graphiti rebuild/refresh test file (currently test_graphiti_quality_433.py, to be renamed per hygiene task):\n\n1. **Missing positive edge-fetch test**: Add test_force_no_dry_run_calls_get_all_valid_edges — set force=True, dry_run=False, mock _rebuild_entity_from_edges, assert backend.get_all_valid_edges.assert_awaited_once().\n\n2. **Error path untested**: Add a test where _rebuild_entity_from_edges has side_effect=RuntimeError('boom'), and assert result['errors'] == 1 and result['details'][0]['status'] == 'error'.\n\n3. **Missing DB-write assertion**: In test_get_node_text_not_called_when_both_provided (line 169), add backend.update_node_summary.assert_awaited_once_with('u1', 'Alice knows Bob', group_id='test') to verify the summary written matches the deduped edge facts.\n\n4. **Weak tuple subclass test**: In test_is_tuple_subclass (line 57), replace the bare isinstance check with actual tuple equality comparison: assert result == (stale_list, edges, 1), or remove as redundant.\n\n5. **Whitespace fact edge case**: Add a test case to TestCanonicalFacts with {'fact': '   '} to document whether whitespace-only strings are included or filtered.\n\nMemory hints: search \"graphiti test coverage rebuild\", search \"StaleSummaryResult tests\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "444",
+        "title": "Tighten assertions and fix data inconsistencies in rebuild_entity_summaries tests",
+        "description": "Seven review suggestions from task 431's review cycle target assertion gaps and minor data issues in TestRebuildEntitySummaries. All changes are in a single file.\n\nChanges needed:\n1. **Docstring cleanup (line 308)**: Replace reference to private method `_detect_stale_summaries_with_edges` in `test_partial_failure_continues` docstring with behavior-focused language: \"Both entities are detected stale because their summaries differ from the canonical facts derived from their valid edges.\"\n2. **assert_awaited_once_with (line 271)**: In `test_rebuilds_only_stale_entities`, replace `backend.update_node_summary.assert_awaited_once()` with `backend.update_node_summary.assert_awaited_once_with('uuid-1', mock.ANY, group_id='test')` to verify Alice (not Bob) was updated.\n3. **group_id assertions**: Add `backend.list_entity_nodes.assert_awaited_once_with(group_id='test')` and `backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')` to `test_rebuilds_only_stale_entities`, `test_partial_failure_continues`, and `test_dry_run_returns_stale_without_rebuilding`.\n4. **Fix mock data inconsistency (line 265)**: Change `get_node_text` mock return from `('Alice', 'stale')` to `('Alice', 'stale fact')` to match Alice's node summary. Optionally assert `result['details'][0]['old_summary'] == 'stale fact'`.\n5. **Consistent count assertions**: Add `assert result['stale_entities'] == 1` and `assert result['total_entities'] == 2` to `test_rebuilds_only_stale_entities` (already present in dry_run test — apply same pattern).\n6. **Ordering comment (line 321)**: Add inline comment to `test_partial_failure_continues`: `# side_effect order matches list_entity_nodes return order: Alice first, Bob second`. Also assert the failing entity by uuid: `assert error_detail['uuid'] == 'uuid-1'`.\n\nmemory_hints: search \"rebuild entity summaries test refactor\" for task 431 context; get_entity for update_node_summary signature.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "445",
+        "title": "Extract factory helper for two-mock setup in TestRebuildEntitySummaries",
+        "description": "All six tests in TestRebuildEntitySummaries share an identical two-mock setup pattern:\n```python\nbackend.list_entity_nodes = AsyncMock(return_value=[...])\nbackend.get_all_valid_edges = AsyncMock(return_value={...})\n```\n\nThis appears verbatim six times. The conftest already uses factory fixtures (`make_backend`, `make_graph_mock`, `make_fake_maintenance_service`).\n\nExtract a helper — either a local method on the test class or a conftest fixture — e.g.:\n```python\ndef make_edge_backend(backend, nodes, edges):\n    backend.list_entity_nodes = AsyncMock(return_value=nodes)\n    backend.get_all_valid_edges = AsyncMock(return_value=edges)\n    return backend\n```\n\nEach test then becomes: `backend = make_edge_backend(make_backend(mock_config), nodes=[...], edges={...})`.\n\nAlso check TestDetectStaleSummaries (step-2 tests) which uses the same pattern 8+ times — the helper should serve both test classes.\n\nmemory_hints: search \"conftest fixtures make_backend make_graph_mock\" for existing pattern; search \"consolidate duplicated test fixture\" for prior task 348 as model.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "446",
+        "title": "Fix misleading docstring: DISTINCT scope and double-attribution semantics",
+        "description": "Update the get_all_valid_edges docstring in fused-memory/src/fused_memory/backends/graphiti_client.py (lines ~467-478) to: (1) Correct the DISTINCT rationale — it guards self-loop duplicates only, not directed A→B edge duplication, which produces two genuinely distinct rows (A.uuid, e.uuid) and (B.uuid, e.uuid); (2) Add a Returns-section note that each directed edge appears under both its source and target entity UUID (undirected MATCH semantics); (3) Optionally note that a directed MATCH (n:Entity)-[e:RELATES_TO]->() would give single-appearance semantics if ever needed.\n\nmemory_hint: search \"get_all_valid_edges DISTINCT docstring\" for context on the current wording and rationale.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "447",
+        "title": "Null safety guards in get_all_valid_edges row processing",
+        "description": "In fused-memory/src/fused_memory/backends/graphiti_client.py around lines 488-495: (1) Add `if not entity_uuid: logger.warning(...); continue` before grouped.setdefault to prevent None dict keys from partially-corrupt nodes; (2) Change `'uuid': row[1]` to skip (or log+skip) when row[1] is None, consistent with the or-'' guard on fact/name — an edge without a UUID is not actionable by callers like bulk_remove_edges.\n\nmemory_hint: search \"get_all_valid_edges null safety\" for context.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "448",
+        "title": "Use ro_query consistently and extract shared _edge_dict helper",
+        "description": "In fused-memory/src/fused_memory/backends/graphiti_client.py: (1) Change get_valid_edges_for_node (line ~453) from `await graph.query(cypher, {'uuid': node_uuid})` to `await graph.ro_query(cypher, ...)` to match the correct pattern introduced in get_all_valid_edges — check ro_query signature for param passing; (2) Optionally extract a private `_edge_dict(uuid, fact, name)` helper to remove the verbatim dict-building duplication between the two methods. Update TestGetValidEdgesForNode mock assertions accordingly.\n\nmemory_hint: search \"ro_query get_valid_edges_for_node\" for context on the inconsistency.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "449",
+        "title": "Test suite: relocate TestGetAllValidEdges and add missing test cases",
+        "description": "In fused-memory/tests/: (1) Move TestGetAllValidEdges from test_rebuild_entity_summaries.py to test_refresh_entity_summary.py alongside TestGetValidEdgesForNode; (2) Change the DISTINCT assertion in test_cypher_uses_return_distinct to use `graph.ro_query.call_args.args[0]` instead of `call_args[0][0]` for robustness; (3) Add a test where `result.result_set = None` is set on the mock to verify the `or []` guard works; (4) Add a test feeding two identical rows (same entity_uuid + edge_uuid) and asserting two entries appear in the result list — making explicit that Python does no dedup and DISTINCT is the sole guard.\n\nmemory_hint: search \"TestGetAllValidEdges test_rebuild_entity_summaries\" for context on current test placement.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
         "subtasks": []
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T13:00:40.592Z",
-      "taskCount": 413,
-      "completedCount": 390,
+      "lastModified": "2026-04-04T19:02:01.836Z",
+      "taskCount": 428,
+      "completedCount": 394,
       "tags": [
         "master"
       ]

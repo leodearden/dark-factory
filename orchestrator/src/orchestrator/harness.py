@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from shared.cost_store import CostStore
+
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_with_cap_retry
 from orchestrator.config import OrchestratorConfig
@@ -142,6 +144,9 @@ class Harness:
         # Event store — created at run start with a generated run_id
         self.event_store: EventStore | None = None
 
+        # Cost store — per-invocation cost tracking (shares runs.db)
+        self.cost_store: CostStore | None = None
+
     async def run(
         self,
         prd_path: Path | None = None,
@@ -166,6 +171,24 @@ class Harness:
             self.scheduler.event_store = self.event_store
         except Exception:
             logger.warning('Failed to create event store', exc_info=True)
+
+        # 0b. Create cost store (shares runs.db with EventStore/RunStore)
+        try:
+            self.cost_store = CostStore(db_path)
+            await self.cost_store.open()
+        except Exception:
+            logger.warning('Failed to create cost store', exc_info=True)
+
+        # Wire cost store into usage gate for cap/failover/resume events
+        if self.usage_gate and self.cost_store:
+            self.usage_gate._cost_store = self.cost_store
+            self.usage_gate._project_id = self.config.fused_memory.project_id
+            self.usage_gate._run_id = run_id
+
+        # Wire cost store into review checkpoint for review invocation costs
+        if self.review_checkpoint and self.cost_store:
+            self.review_checkpoint.cost_store = self.cost_store
+            self.review_checkpoint.run_id = run_id
 
         # 1. Start fused-memory HTTP server
         logger.info('Starting fused-memory HTTP server...')
@@ -366,6 +389,8 @@ class Harness:
                     self.report.paused_for_cap = True
                     self.report.cap_pause_duration_secs = self.usage_gate.total_pause_secs
                 await self.usage_gate.shutdown()
+            if self.cost_store:
+                await self.cost_store.close()
             await self._stop_merge_worker()
             await self._stop_escalation_server()
             await self.mcp.stop()
@@ -712,6 +737,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 steward_factory=steward_factory,
                 merge_queue=self._merge_queue,
                 event_store=self.event_store,
+                cost_store=self.cost_store,
             )
 
             if self.event_store:
