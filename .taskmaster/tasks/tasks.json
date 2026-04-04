@@ -8620,6 +8620,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 436,
+        "title": "Refactor test_recon_panel.py: fixtures, scoping, and deduplication",
+        "description": "Major test quality pass: (1) Add class-scoped HTML fixtures for TestRunPanelAlpineComponent and TestRunPanelJournalBadgeRegression (matching existing recon_layout_html pattern at line 709). (2) Move x-show/x-cloak tests from badge regression to Alpine component class. (3) Parametrize badge CSS class assertions. (4) Scope badge CSS and x-show/x-cloak assertions to specific elements using _get_opening_tag. (5) Replace 200-char proximity assertion with attribute-scoped check. (6) Add multi-run test with 2+ runs for Alpine component isolation. (7) Replace brittle JS source-string assertions with behavioral tests where feasible.",
+        "details": "File: dashboard/tests/test_recon_panel.py. Source: review suggestions from task 421 (esc-421-19). memory_hints: search(\"recon panel test patterns\")",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8632,7 +8643,7 @@
       ],
       "created": "2026-04-04T06:43:47.452Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T06:44:05.452Z"
+      "updated": "2026-04-04T06:44:11.221Z"
     }
   }
 }
