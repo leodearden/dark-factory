@@ -8668,7 +8668,21 @@
           "modules": [
             "fused-memory/src/fused_memory/backends",
             "fused-memory/tests/test_rebuild_entity_summaries.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "GraphitiClient",
+              "_rebuild_entity_from_edges",
+              "refresh_entity_summary"
+            ],
+            "queries": [
+              "refresh_entity_summary name old_summary optimization pre-fetch",
+              "N+1 get_node_text round-trips rebuild_entity_summaries eliminate",
+              "task 432 threading name old_summary status"
+            ]
+          },
+          "recon_note": "Task 432 (in-progress) addresses the same core N+1 issue via simpler param-threading. Evaluate 439 after 432 completes — may be superseded or reduced in scope.",
+          "_causation_id": "92ad9489-6741-4fe6-8f3f-c7bb9e9e5371"
         }
       },
       {
