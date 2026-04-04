@@ -16,6 +16,14 @@ dependencies = [
     "uvicorn>=0.30",
 ]
 
+[project.optional-dependencies]
+# merge_request tool imports orchestrator at runtime; install this extra when
+# the escalation server needs to serve the merge_request MCP tool.
+merge = ["orchestrator"]
+
+[tool.uv.sources]
+orchestrator = { path = "../orchestrator", editable = true }
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
