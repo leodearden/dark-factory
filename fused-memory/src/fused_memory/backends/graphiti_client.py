@@ -967,11 +967,11 @@ class GraphitiBackend:
         if force:
             all_entities = await self.list_entity_nodes(group_id=group_id)
             all_edges = await self.get_all_valid_edges(group_id=group_id)
-            targets = [{'uuid': e['uuid'], 'name': e['name']} for e in all_entities]
+            targets = [{'uuid': e['uuid'], 'name': e['name'], 'old_summary': e['summary']} for e in all_entities]
             total_entities = len(all_entities)
         else:
             stale, all_edges, total_entities = await self._detect_stale_summaries_with_edges(group_id=group_id)
-            targets = [{'uuid': s['uuid'], 'name': s['name']} for s in stale]
+            targets = [{'uuid': s['uuid'], 'name': s['name'], 'old_summary': s['summary']} for s in stale]
 
         stale_entities = len(targets)
         rebuilt = 0
@@ -990,7 +990,8 @@ class GraphitiBackend:
                 async with sem:
                     edges = all_edges.get(t['uuid'], [])
                     return await self._rebuild_entity_from_edges(
-                        t['uuid'], t['name'], edges, group_id=group_id
+                        t['uuid'], t['name'], edges, group_id=group_id,
+                        old_summary=t['old_summary'],
                     )
 
             results = await asyncio.gather(
