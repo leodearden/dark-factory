@@ -8476,6 +8476,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 428,
+        "title": "Add positive and mixed-count journal detail row tests",
+        "description": "Add test cases: (1) positive case asserting x-show=\"open\" and detail hx-get ARE present when journal_entry_count > 0, (2) multi-run test with mixed journal_entry_count values (e.g., [count=3, count=0, count=1]) asserting detail rows emitted only for runs with count > 0.",
+        "details": "File: dashboard/tests/test_recon_panel.py. Source: review suggestions from task 425 (esc-425-23).",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8488,7 +8499,7 @@
       ],
       "created": "2026-04-04T08:25:35.970Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T08:27:06.474Z"
+      "updated": "2026-04-04T08:27:08.680Z"
     }
   }
 }
