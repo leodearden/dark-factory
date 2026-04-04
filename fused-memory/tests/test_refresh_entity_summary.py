@@ -68,9 +68,8 @@ class TestGetValidEdgesForNode:
         node_uuid = 'my-node-uuid'
         await backend.get_valid_edges_for_node(node_uuid, group_id='test')
         call_args = graph.query.call_args
-        assert call_args is not None
-        args, kwargs = call_args
-        cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        assert call_args is not None, "graph.query was not called"
+        cypher_params = call_args.args[1]
         assert cypher_params.get('uuid') == node_uuid
 
     @pytest.mark.asyncio
@@ -81,9 +80,9 @@ class TestGetValidEdgesForNode:
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
         call_args = graph.query.call_args
-        args, kwargs = call_args
-        cypher = args[0] if args else kwargs.get('query', '')
-        assert 'invalid_at IS NULL' in cypher
+        assert call_args is not None, "graph.query was not called"
+        cypher = call_args.args[0]
+        assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +111,8 @@ class TestUpdateNodeSummary:
         summary = 'Alice knows Bob.'
         await backend.update_node_summary(node_uuid, summary, group_id='test')
         call_args = graph.query.call_args
-        args, kwargs = call_args
-        cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        assert call_args is not None, "graph.query was not called"
+        cypher_params = call_args.args[1]
         assert cypher_params.get('uuid') == node_uuid
         assert cypher_params.get('summary') == summary
 
@@ -125,9 +124,9 @@ class TestUpdateNodeSummary:
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.update_node_summary('node-uuid-1', 'some summary', group_id='test')
         call_args = graph.query.call_args
-        args, kwargs = call_args
-        cypher = args[0] if args else kwargs.get('query', '')
-        assert 'SET n.summary' in cypher
+        assert call_args is not None, "graph.query was not called"
+        cypher = call_args.args[0]
+        assert 'SET n.summary' in cypher, f"Cypher must SET n.summary: {cypher}"
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
