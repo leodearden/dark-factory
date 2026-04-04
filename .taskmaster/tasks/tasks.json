@@ -8498,6 +8498,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 428,
+        "title": "Improve FalkorDB query correctness in resolve_entity_by_name",
+        "description": "In fused-memory/src/fused_memory/backends/graphiti_client.py, resolve_entity_by_name method (lines ~710-721): (1) Add CREATE INDEX FOR (n:Entity) ON (n.name) to _ensure_indices so the MATCH (n:Entity {name: $name}) query is index-backed, similar to how _indexed_graphs guards UUID indexes; (2) Add LIMIT 2 to the Cypher query at line 711 — only 2 rows are needed to distinguish not-found/unique/ambiguous; (3) Add a null check after rows[0][0] at line 721: if uuid is None raise NodeNotFoundError(...).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8510,7 +8521,7 @@
       ],
       "created": "2026-04-04T04:32:57.699Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T04:33:01.783Z"
+      "updated": "2026-04-04T04:33:07.645Z"
     }
   }
 }
