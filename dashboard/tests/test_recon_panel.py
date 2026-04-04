@@ -715,6 +715,13 @@ class TestReconDetailTrigger:
         assert 'x-data="{ open: false }"' in html
         assert "x-data='{ open: false }'" not in html
 
+    def test_zero_journal_count_hides_badge_and_detail(self, client):
+        runs_zero = [{**MOCK_RUNS[0], 'journal_entry_count': 0}]
+        with _patch_recon_data(runs=runs_zero):
+            html = client.get('/partials/recon').text
+        assert 'data-testid="journal-badge"' not in html
+        assert 'x-show="open"' not in html
+
 
 @pytest.fixture(scope='class')
 def recon_layout_html():
