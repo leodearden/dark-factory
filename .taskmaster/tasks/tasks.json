@@ -8653,6 +8653,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 439,
+        "title": "Update test fixtures to use canonical integer IDs",
+        "description": "In dashboard/tests/test_orchestrator.py: (1) Add test cases with integer IDs in fixtures to cover the canonical no-coercion path (lines ~236-238, 260-261, 298). (2) Update worktree-keying test fixture at line 658 to use integer ID (7 instead of '7'). Keep existing string-ID fixtures for backward-compatible coercion coverage.",
+        "details": "File: dashboard/tests/test_orchestrator.py. Source: review suggestions from task 158 (esc-158-16).",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8665,7 +8676,7 @@
       ],
       "created": "2026-04-04T06:43:47.452Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T06:44:17.109Z"
+      "updated": "2026-04-04T06:44:19.934Z"
     }
   }
 }
