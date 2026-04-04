@@ -8714,6 +8714,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 447,
+        "title": "Null safety guards in get_all_valid_edges row processing",
+        "description": "In fused-memory/src/fused_memory/backends/graphiti_client.py around lines 488-495: (1) Add `if not entity_uuid: logger.warning(...); continue` before grouped.setdefault to prevent None dict keys from partially-corrupt nodes; (2) Change `'uuid': row[1]` to skip (or log+skip) when row[1] is None, consistent with the or-'' guard on fact/name — an edge without a UUID is not actionable by callers like bulk_remove_edges.\n\nmemory_hint: search \"get_all_valid_edges null safety\" for context.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8726,7 +8737,7 @@
       ],
       "created": "2026-04-04T18:25:51.169Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T18:25:51.172Z"
+      "updated": "2026-04-04T18:25:55.162Z"
     }
   }
 }
