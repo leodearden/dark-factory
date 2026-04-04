@@ -767,6 +767,18 @@ class GraphitiBackend:
             )
         return rows[0][0]
 
+    @staticmethod
+    def _canonical_facts(edges: list[dict]) -> list[str]:
+        """Deduplicate edge facts preserving insertion order, skipping missing/falsy values.
+
+        Args:
+            edges: List of edge dicts, each optionally containing a 'fact' key.
+
+        Returns:
+            List of unique non-empty fact strings in their first-seen order.
+        """
+        return list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
+
     async def refresh_entity_summary(self, node_uuid: str, *, group_id: str) -> dict:
         """Regenerate an Entity node's summary from its currently-valid edges.
 
@@ -786,8 +798,7 @@ class GraphitiBackend:
         """
         name, old_summary = await self.get_node_text(node_uuid, group_id=group_id)
         edges = await self.get_valid_edges_for_node(node_uuid, group_id=group_id)
-        # Deduplicate facts while preserving insertion order
-        facts = list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
+        facts = self._canonical_facts(edges)
         new_summary = '\n'.join(facts)
         await self.update_node_summary(node_uuid, new_summary, group_id=group_id)
         logger.info(
@@ -852,8 +863,7 @@ class GraphitiBackend:
                 # Empty summary — not stale by definition
                 continue
             edges = all_edges.get(entity['uuid'], [])
-            # Canonical (deduped) facts
-            valid_facts = list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
+            valid_facts = self._canonical_facts(edges)
             canonical = '\n'.join(valid_facts)
             if summary == canonical:
                 continue  # Already up-to-date
@@ -923,7 +933,7 @@ class GraphitiBackend:
             Dict with keys: uuid, name, old_summary, new_summary, edge_count.
         """
         _, old_summary = await self.get_node_text(uuid, group_id=group_id)
-        facts = list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
+        facts = self._canonical_facts(edges)
         new_summary = '\n'.join(facts)
         await self.update_node_summary(uuid, new_summary, group_id=group_id)
         logger.info(
