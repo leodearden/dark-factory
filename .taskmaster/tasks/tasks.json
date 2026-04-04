@@ -8725,6 +8725,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 448,
+        "title": "Use ro_query consistently and extract shared _edge_dict helper",
+        "description": "In fused-memory/src/fused_memory/backends/graphiti_client.py: (1) Change get_valid_edges_for_node (line ~453) from `await graph.query(cypher, {'uuid': node_uuid})` to `await graph.ro_query(cypher, ...)` to match the correct pattern introduced in get_all_valid_edges — check ro_query signature for param passing; (2) Optionally extract a private `_edge_dict(uuid, fact, name)` helper to remove the verbatim dict-building duplication between the two methods. Update TestGetValidEdgesForNode mock assertions accordingly.\n\nmemory_hint: search \"ro_query get_valid_edges_for_node\" for context on the inconsistency.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -8737,7 +8748,7 @@
       ],
       "created": "2026-04-04T18:25:51.169Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-04T18:25:55.162Z"
+      "updated": "2026-04-04T18:26:00.533Z"
     }
   }
 }
