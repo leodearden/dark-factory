@@ -8421,10 +8421,11 @@
         "description": "get_all_valid_edges (line ~460) uses `RETURN n.uuid, e.uuid, e.fact, e.name` without DISTINCT, while the existing get_valid_edges_for_node uses `RETURN DISTINCT`. Undirected `MATCH (n:Entity)-[e:RELATES_TO]-()` patterns can produce duplicate rows. Downstream dedup via dict.fromkeys masks this for summaries, but the raw grouped dict holds redundant entries.\n\nFix: Add DISTINCT to match the defensive pattern in get_valid_edges_for_node.\n\nmemory_hint: search \"get_all_valid_edges DISTINCT\" for context.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T18:06:24.257Z"
       },
       {
         "id": "424",
@@ -8706,7 +8707,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T18:06:24.166Z",
+      "lastModified": "2026-04-04T18:06:24.258Z",
       "taskCount": 424,
       "completedCount": 393,
       "tags": [
