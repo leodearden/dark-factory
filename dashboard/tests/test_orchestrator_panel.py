@@ -174,6 +174,26 @@ class TestOrchestratorRouteBasics:
             html = client.get('/partials/orchestrators').text
         assert 'x-cloak' in html
 
+    def test_store_key_consistent_between_toggle_and_show(self, client):
+        """The $store.panels key in @click toggle must match the x-show key.
+
+        Extracts both keys from the rendered HTML and asserts they are equal.
+        Guards against key drift between the button and the table wrapper.
+        """
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # Extract key from @click: $store.panels['<key>'] = !$store.panels['<key>']
+        click_match = re.search(r"\$store\.panels\['([^']+)'\]\s*=\s*!", html)
+        # Extract key from x-show: x-show="$store.panels['<key>']"
+        show_match = re.search(r'x-show="\$store\.panels\[\'([^\']+)\'\]"', html)
+        assert click_match is not None, '@click $store.panels key not found'
+        assert show_match is not None, 'x-show $store.panels key not found'
+        assert click_match.group(1) == show_match.group(1), (
+            f'Key mismatch: @click uses {click_match.group(1)!r} '
+            f'but x-show uses {show_match.group(1)!r}'
+        )
+
     def test_card_shows_single_pid_label(self, client):
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
