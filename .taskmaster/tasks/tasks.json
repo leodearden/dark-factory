@@ -8726,10 +8726,11 @@
         "description": "Five test gaps in the graphiti rebuild/refresh test file (currently test_graphiti_quality_433.py, to be renamed per hygiene task):\n\n1. **Missing positive edge-fetch test**: Add test_force_no_dry_run_calls_get_all_valid_edges — set force=True, dry_run=False, mock _rebuild_entity_from_edges, assert backend.get_all_valid_edges.assert_awaited_once().\n\n2. **Error path untested**: Add a test where _rebuild_entity_from_edges has side_effect=RuntimeError('boom'), and assert result['errors'] == 1 and result['details'][0]['status'] == 'error'.\n\n3. **Missing DB-write assertion**: In test_get_node_text_not_called_when_both_provided (line 169), add backend.update_node_summary.assert_awaited_once_with('u1', 'Alice knows Bob', group_id='test') to verify the summary written matches the deduped edge facts.\n\n4. **Weak tuple subclass test**: In test_is_tuple_subclass (line 57), replace the bare isinstance check with actual tuple equality comparison: assert result == (stale_list, edges, 1), or remove as redundant.\n\n5. **Whitespace fact edge case**: Add a test case to TestCanonicalFacts with {'fact': '   '} to document whether whitespace-only strings are included or filtered.\n\nMemory hints: search \"graphiti test coverage rebuild\", search \"StaleSummaryResult tests\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T23:15:02.202Z"
       },
       {
         "id": "444",
@@ -8836,7 +8837,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T23:15:01.894Z",
+      "lastModified": "2026-04-04T23:15:02.202Z",
       "taskCount": 431,
       "completedCount": 395,
       "tags": [
