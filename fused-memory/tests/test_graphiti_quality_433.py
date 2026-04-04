@@ -200,3 +200,52 @@ class TestRefreshEntitySummaryOptionalParams:
         backend.get_node_text.assert_called_once()
         assert result['name'] == 'Alice'
         assert result['old_summary'] == 'old summary'
+
+
+# ---------------------------------------------------------------------------
+# step-7: rebuild_entity_summaries(force=True, dry_run=True) skips edge fetch
+# ---------------------------------------------------------------------------
+
+class TestRebuildEntitySummariesForceDryRun:
+    """rebuild_entity_summaries(force=True, dry_run=True) skips get_all_valid_edges."""
+
+    @pytest.mark.asyncio
+    async def test_force_dry_run_does_not_call_get_all_valid_edges(self, mock_config, make_backend):
+        """When force=True and dry_run=True, get_all_valid_edges is NOT called."""
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+
+        result = await backend.rebuild_entity_summaries(
+            group_id='test', force=True, dry_run=True
+        )
+
+        backend.get_all_valid_edges.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_force_dry_run_returns_correct_aggregate(self, mock_config, make_backend):
+        """When force=True and dry_run=True, result has correct structure."""
+        backend = make_backend(mock_config)
+        entities = [
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
+            {'uuid': 'u3', 'name': 'Carol', 'summary': 'summary C'},
+        ]
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+
+        result = await backend.rebuild_entity_summaries(
+            group_id='test', force=True, dry_run=True
+        )
+
+        assert result['total_entities'] == 3
+        assert result['stale_entities'] == 3  # force=True targets all
+        assert result['skipped'] == 3  # dry_run=True skips all
+        assert result['rebuilt'] == 0
+        assert result['errors'] == 0
+        assert len(result['details']) == 3
+        for detail in result['details']:
+            assert detail['status'] == 'skipped_dry_run'
