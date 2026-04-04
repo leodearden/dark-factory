@@ -223,7 +223,6 @@ class TestRebuildEntitySummaries:
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
         })
-        backend.get_node_text = AsyncMock(side_effect=[('Alice', 'ok'), ('Bob', 'also ok')])
         backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test', force=True)
         assert result['total_entities'] == 2
@@ -749,10 +748,6 @@ class TestRebuildEntitySummariesParallel:
             'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
         })
-        backend.get_node_text = AsyncMock(side_effect=[
-            ('Alice', 'stale1'),
-            ('Bob', 'stale2'),
-        ])
         backend.update_node_summary = AsyncMock()
         backend.get_valid_edges_for_node = AsyncMock()
 
@@ -775,10 +770,6 @@ class TestRebuildEntitySummariesParallel:
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
         })
-        backend.get_node_text = AsyncMock(side_effect=[
-            ('Alice', 'ok'),
-            ('Bob', 'also ok'),
-        ])
         backend.update_node_summary = AsyncMock()
         backend.refresh_entity_summary = AsyncMock()
 
@@ -804,9 +795,6 @@ class TestRebuildEntitySummariesParallel:
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=entities)
         backend.get_all_valid_edges = AsyncMock(return_value=edges)
-        backend.get_node_text = AsyncMock(side_effect=[
-            (f'Entity{i}', f'stale{i}') for i in range(n)
-        ])
         backend.update_node_summary = AsyncMock()
 
         result = await backend.rebuild_entity_summaries(group_id='test')
@@ -912,10 +900,6 @@ class TestRebuildEntitySummariesParallel:
             'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
         })
-        backend.get_node_text = AsyncMock(side_effect=[
-            ('Alice', 'stale1'),
-            ('Bob', 'stale2'),
-        ])
         # First entity's write fails, second succeeds
         backend.update_node_summary = AsyncMock(side_effect=[
             RuntimeError('FalkorDB timeout'),
