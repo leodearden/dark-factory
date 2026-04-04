@@ -86,3 +86,53 @@ class TestStaleSummaryResult:
         assert total == 1
         assert isinstance(stale, list)
         assert isinstance(edges, dict)
+
+
+# ---------------------------------------------------------------------------
+# step-3: _canonical_facts() @staticmethod
+# ---------------------------------------------------------------------------
+
+class TestCanonicalFacts:
+    """GraphitiBackend._canonical_facts deduplicates facts preserving order."""
+
+    def test_deduplicates_preserving_insertion_order(self):
+        """Duplicate facts are removed but original order is preserved."""
+        edges = [
+            {'fact': 'A knows B'},
+            {'fact': 'B lives in London'},
+            {'fact': 'A knows B'},  # duplicate
+            {'fact': 'C works at Acme'},
+        ]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == ['A knows B', 'B lives in London', 'C works at Acme']
+
+    def test_empty_edge_list_returns_empty_list(self):
+        """Empty input returns an empty list."""
+        assert GraphitiBackend._canonical_facts([]) == []
+
+    def test_edges_missing_fact_key_are_skipped(self):
+        """Edges without 'fact' key are silently skipped."""
+        edges = [
+            {'name': 'edge1'},  # no 'fact' key
+            {'fact': 'A knows B'},
+            {'uuid': 'some-uuid'},  # no 'fact' key
+        ]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == ['A knows B']
+
+    def test_edges_with_falsy_fact_value_are_skipped(self):
+        """Edges with empty string fact value are skipped."""
+        edges = [
+            {'fact': ''},  # falsy
+            {'fact': 'A knows B'},
+            {'fact': None},  # falsy
+        ]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == ['A knows B']
+
+    def test_returns_list_not_set(self):
+        """Return type is list, not set (order matters)."""
+        edges = [{'fact': 'A'}, {'fact': 'B'}]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert isinstance(result, list)
+        assert result == ['A', 'B']
