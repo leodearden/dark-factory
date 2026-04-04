@@ -358,6 +358,56 @@ class TestMemoryServiceRefreshEntitySummary:
         assert 'new_summary' in result
         assert 'edge_count' in result
 
+    # -- step-3 (task-309): entity_name support --
+
+    @pytest.mark.asyncio
+    async def test_resolves_entity_name_to_uuid(self, service):
+        """Resolves entity_name to UUID via graphiti.resolve_entity_by_name, then refreshes."""
+        service.graphiti.resolve_entity_by_name = AsyncMock(return_value='node-1')
+        result = await service.refresh_entity_summary(
+            entity_name='Alice',
+            project_id='dark_factory',
+        )
+        service.graphiti.resolve_entity_by_name.assert_awaited_once_with('Alice', group_id='dark_factory')
+        service.graphiti.refresh_entity_summary.assert_awaited_once_with('node-1', group_id='dark_factory')
+        assert result['uuid'] == 'node-1'
+
+    @pytest.mark.asyncio
+    async def test_raises_value_error_when_neither_provided(self, service):
+        """Raises ValueError when neither entity_uuid nor entity_name is provided."""
+        with pytest.raises(ValueError, match='entity_uuid.*entity_name|entity_name.*entity_uuid'):
+            await service.refresh_entity_summary(
+                project_id='dark_factory',
+            )
+
+    @pytest.mark.asyncio
+    async def test_prefers_uuid_when_both_provided(self, service):
+        """Uses entity_uuid directly and skips resolve when both params are given."""
+        service.graphiti.resolve_entity_by_name = AsyncMock(return_value='other-node')
+        await service.refresh_entity_summary(
+            entity_uuid='node-1',
+            entity_name='Alice',
+            project_id='dark_factory',
+        )
+        service.graphiti.resolve_entity_by_name.assert_not_awaited()
+        service.graphiti.refresh_entity_summary.assert_awaited_once_with('node-1', group_id='dark_factory')
+
+    @pytest.mark.asyncio
+    async def test_journal_includes_entity_name_when_used(self, service):
+        """Journal params include entity_name when resolution path is taken."""
+        service.graphiti.resolve_entity_by_name = AsyncMock(return_value='node-1')
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        service.set_write_journal(mock_journal)
+        await service.refresh_entity_summary(
+            entity_name='Alice',
+            project_id='dark_factory',
+            agent_id='test-agent',
+        )
+        mock_journal.log_write_op.assert_awaited_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs['params'].get('entity_name') == 'Alice'
+
 
 # ---------------------------------------------------------------------------
 # step-9: MCP tool refresh_entity_summary
