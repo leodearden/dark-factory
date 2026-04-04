@@ -8359,10 +8359,11 @@
         "description": "Multiple reviewers identified redundant database queries in the rebuild_entity_summaries pipeline:\n\n1. **Thread old_summary to _rebuild_entity_from_edges**: The method calls `get_node_text(uuid)` per entity solely to capture old_summary for the result dict, but old_summary was already loaded by `list_entity_nodes()` earlier. Add `old_summary: str` parameter and pass it from the already-fetched entity data. (suggestions 1, 7)\n\n2. **Return entities from _detect_stale_summaries_with_edges**: In the non-force path, `list_entity_nodes` is called twice — once inside `_detect_stale_summaries_with_edges` and again to get `total_entities`. Change return to 3-tuple `(stale_list, all_edges_dict, all_entities_list)`. (suggestions 2, 6, 8, 18)\n\n3. **DRY: Merge _rebuild_entity_from_edges into refresh_entity_summary**: Both methods implement the same 3-step pattern (get_node_text, dedup, update_node_summary). Add optional `edges: list[dict] | None = None` and `old_summary: str = ''` parameters to `refresh_entity_summary`. When edges provided, skip `get_valid_edges_for_node`. Remove `_rebuild_entity_from_edges`. (suggestion 4)\n\nmemory_hint: search \"rebuild_entity_summaries\" and \"refresh_entity_summary\" for implementation context.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-04T04:06:58.040Z"
       },
       {
         "id": "420",
@@ -8433,7 +8434,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-04T04:06:57.969Z",
+      "lastModified": "2026-04-04T04:06:58.040Z",
       "taskCount": 404,
       "completedCount": 387,
       "tags": [
