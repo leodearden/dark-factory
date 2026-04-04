@@ -1,4 +1,12 @@
 {% from 'macros/badges.html' import status_badge, severity_badge %}
+<script>
+  Alpine.data('runPanel', () => ({
+    open: false,
+    toggleDetail() {
+      this.open = !this.open;
+    },
+  }));
+</script>
 {% if verdict and verdict.severity == 'serious' %}
 <div class="bg-red-900/30 border border-red-800 rounded-lg p-4 text-red-300 mb-6 flex items-start gap-3" data-testid="verdict-alert">
   <div class="flex-1">

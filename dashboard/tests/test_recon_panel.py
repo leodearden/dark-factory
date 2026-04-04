@@ -905,3 +905,19 @@ class TestPartitionBurstStateNoneGuard:
         active, idle = partition_burst_state([agent])
         assert idle == [agent]
         assert active == []
+
+
+class TestRunPanelAlpineComponent:
+    """Tests for the named Alpine.data('runPanel') component in recon.html."""
+
+    def test_alpine_data_run_panel_definition_present(self, client):
+        """Alpine.data('runPanel') script block is rendered when journal entries exist."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert "Alpine.data('runPanel'" in html
+
+    def test_run_panel_script_not_inside_alpine_init(self, client):
+        """Registration must NOT be wrapped in alpine:init (partial loads after init)."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert "alpine:init" not in html
