@@ -15,6 +15,7 @@ import aiosqlite
 
 from dashboard.config import DashboardConfig
 from dashboard.data.orchestrator import (
+    _read_project_root_from_config,
     _resolve_project_root,
     find_running_orchestrators,
     load_task_tree,
@@ -90,10 +91,15 @@ async def collect_snapshot(
     # Snapshot any additional projects discovered from running orchestrators.
     orchestrators = await asyncio.to_thread(find_running_orchestrators)
     for proc in orchestrators:
-        root = proc.get('project_root') or proc.get('prd')
-        if not root:
+        if proc.get('prd'):
+            project_root = _resolve_project_root(proc['prd'], config.project_root)
+        elif proc.get('config_path'):
+            resolved = _read_project_root_from_config(proc['config_path'])
+            if resolved is None:
+                continue
+            project_root = resolved
+        else:
             continue
-        project_root = _resolve_project_root(root, config.project_root)
         root_str = str(project_root)
         if root_str in seen_roots:
             continue

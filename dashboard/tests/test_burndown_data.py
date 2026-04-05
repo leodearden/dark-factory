@@ -163,6 +163,41 @@ class TestCollectSnapshot:
 
         assert count == 1
 
+    @pytest.mark.asyncio
+    async def test_discovers_config_flag_orchestrator(self, tmp_path):
+        """Orchestrators launched with --config (no --prd) are snapshotted."""
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        from dashboard.config import DashboardConfig
+        config = DashboardConfig(project_root=tmp_path)
+
+        reify_root = Path('/home/leo/src/reify')
+        fake_orchestrators = [
+            {'prd': None, 'config_path': '/home/leo/src/reify/orchestrator.yaml'},
+        ]
+        reify_tasks = [{'status': 'done'}, {'status': 'pending'}]
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', side_effect=[[], reify_tasks]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
+                patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT * FROM snapshots ORDER BY project_id') as cur:
+                rows = list(await cur.fetchall())
+
+        assert len(rows) == 2
+        ids = {row[1] for row in rows}
+        assert str(tmp_path) in ids       # main project
+        assert str(reify_root) in ids      # config-discovered project
+        # Check reify row counts
+        reify_row = next(r for r in rows if r[1] == str(reify_root))
+        assert reify_row[3] == 1  # pending
+        assert reify_row[8] == 1  # done
+
 
 # ---------------------------------------------------------------------------
 # downsample
