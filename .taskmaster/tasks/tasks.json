@@ -8824,6 +8824,15 @@
             "status": "pending",
             "dependencies": [],
             "parentTaskId": 450
+          },
+          {
+            "id": 2,
+            "title": "Add configured project roots list to DashboardConfig",
+            "description": "Add a configured list of known project roots (e.g. in DashboardConfig or a dashboard config file) so the burndown collector always snapshots all registered projects even when their orchestrators are not running. The chart rendering already handles multiple projects — only collect_snapshot() needs the configured roots.",
+            "details": "",
+            "status": "pending",
+            "dependencies": [],
+            "parentTaskId": 450
           }
         ]
       },
