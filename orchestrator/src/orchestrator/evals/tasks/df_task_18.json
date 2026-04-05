@@ -18,10 +18,12 @@
     "fused-memory/src/fused_memory"
   ],
   "complexity": "medium",
-  "setup_commands": ["cd orchestrator && uv sync --quiet"],
+  "setup_commands": [
+    "cd orchestrator && uv sync --quiet"
+  ],
   "expected_files_changed": [],
   "plan": {
-    "task_id": "18",
+    "task_id": "df_task_18",
     "title": "Sleep mode reconciliation system",
     "modules": [
       "fused-memory/src/fused_memory/models",

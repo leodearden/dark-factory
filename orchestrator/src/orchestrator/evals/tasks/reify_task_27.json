@@ -22,7 +22,7 @@
   "complexity": "high",
   "expected_files_changed": [],
   "plan": {
-    "task_id": "task_27",
+    "task_id": "reify_task_27",
     "title": "Warm-start protocol with LRU pool",
     "modules": [
       "crates/reify-types/src",

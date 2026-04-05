@@ -18,12 +18,14 @@
     "orchestrator/src/orchestrator"
   ],
   "complexity": "small",
-  "setup_commands": ["cd orchestrator && uv sync --quiet"],
+  "setup_commands": [
+    "cd orchestrator && uv sync --quiet"
+  ],
   "expected_files_changed": [
     "orchestrator/src/orchestrator/verify.py"
   ],
   "plan": {
-    "task_id": "12",
+    "task_id": "df_task_12",
     "title": "Bug: verify.py fails with 'source: not found' on dash systems",
     "modules": [
       "orchestrator/src/orchestrator",
