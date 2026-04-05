@@ -121,6 +121,11 @@ class WorkflowMetrics:
     pre_merge_rebase_ok: int = 0
     advance_main_retries: int = 0
     inter_iteration_rebases: int = 0
+    total_turns: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cache_read_tokens: int = 0
+    total_cache_create_tokens: int = 0
 
 
 class TaskWorkflow:
@@ -1254,6 +1259,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         self.metrics.total_cost_usd += result.cost_usd
         self.metrics.total_duration_ms += result.duration_ms
         self.metrics.agent_invocations += 1
+        self.metrics.total_turns += result.turns
+        self.metrics.total_input_tokens += result.input_tokens or 0
+        self.metrics.total_output_tokens += result.output_tokens or 0
+        self.metrics.total_cache_read_tokens += result.cache_read_tokens or 0
+        self.metrics.total_cache_create_tokens += result.cache_create_tokens or 0
 
         logger.info(
             'Task %s [%s]: success=%s cost=$%.2f turns=%d timeout=%.0fs',

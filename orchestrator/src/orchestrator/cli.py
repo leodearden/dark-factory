@@ -86,10 +86,23 @@ def status(config_path: Path | None):
 @click.option('--config-name', default=None,
               help='Eval config name (e.g. claude-opus-high) or "all"')
 @click.option('--matrix', is_flag=True, help='Run full eval matrix (all tasks × all configs)')
-@click.option('--judge', is_flag=True, help='Run LLM judge on existing results')
+@click.option('--judge', is_flag=True, help='Run Elo-based LLM judge on existing results')
 @click.option('--plan-only', is_flag=True, help='Generate plans for tasks (no execution)')
 @click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
               default=None, help='Path to orchestrator config YAML')
+@click.option('--max-parallel', type=int, default=None,
+              help='Max concurrent eval runs (default: unlimited)')
+@click.option('--trials', type=int, default=1,
+              help='Number of trials per (task, config) pair')
+@click.option('--force', is_flag=True, help='Re-run even if results exist')
+@click.option('--cleanup', is_flag=True, help='Remove eval worktrees')
+@click.option('--timeout', type=int, default=None,
+              help='Timeout in minutes per eval run (overrides task JSON)')
+@click.option('--max-rounds', type=int, default=50,
+              help='Max judge invocations per task (default: 50)')
+@click.option('--reset', is_flag=True, help='Clear judge state and start fresh')
+@click.option('--report', 'report_only', is_flag=True,
+              help='Generate report from existing state (no new judge calls)')
 def eval_cmd(
     task_path: Path | None,
     config_name: str | None,
@@ -97,12 +110,28 @@ def eval_cmd(
     judge: bool,
     plan_only: bool,
     config_path: Path | None,
+    max_parallel: int | None,
+    trials: int,
+    force: bool,
+    cleanup: bool,
+    timeout: int | None,
+    max_rounds: int,
+    reset: bool,
+    report_only: bool,
 ):
     """Run multi-provider implementor evaluations."""
     base_config = load_config(config_path)
 
+    if cleanup:
+        _run_cleanup(base_config)
+        return
+
+    if report_only:
+        _run_report_cmd()
+        return
+
     if judge:
-        _run_judge_cmd()
+        _run_judge_cmd(max_rounds=max_rounds, reset=reset)
         return
 
     if plan_only:
@@ -110,17 +139,24 @@ def eval_cmd(
         return
 
     if matrix:
-        _run_matrix_cmd(base_config)
+        _run_matrix_cmd(
+            base_config,
+            max_parallel=max_parallel, trials=trials,
+            force=force, timeout=timeout,
+        )
         return
 
     if task_path is None:
         click.echo('Error: --task is required (or use --matrix / --judge / --plan-only)', err=True)
         sys.exit(1)
 
-    _run_single_eval(task_path, config_name, base_config)
+    _run_single_eval(task_path, config_name, base_config, force=force, timeout=timeout)
 
 
-def _run_single_eval(task_path: Path, config_name: str | None, base_config):
+def _run_single_eval(
+    task_path: Path, config_name: str | None, base_config,
+    force: bool = False, timeout: int | None = None,
+):
     """Run eval for a single task with one or all configs."""
     from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
     from orchestrator.evals.runner import run_eval
@@ -137,7 +173,9 @@ def _run_single_eval(task_path: Path, config_name: str | None, base_config):
 
     async def _run():
         for cfg in configs:
-            result = await run_eval(task_path, cfg, base_config)
+            result = await run_eval(
+                task_path, cfg, base_config, timeout_override=timeout,
+            )
             click.echo(
                 f'{result.task_id} × {result.config_name}: '
                 f'{result.outcome} ({result.wall_clock_ms / 1000:.1f}s)'
@@ -146,7 +184,13 @@ def _run_single_eval(task_path: Path, config_name: str | None, base_config):
     asyncio.run(_run())
 
 
-def _run_matrix_cmd(base_config):
+def _run_matrix_cmd(
+    base_config,
+    max_parallel: int | None = None,
+    trials: int = 1,
+    force: bool = False,
+    timeout: int | None = None,
+):
     """Run full eval matrix."""
     from orchestrator.evals.configs import EVAL_CONFIGS
     from orchestrator.evals.runner import run_eval_matrix
@@ -161,10 +205,21 @@ def _run_matrix_cmd(base_config):
         click.echo('No task files found in evals/tasks/', err=True)
         sys.exit(1)
 
-    click.echo(f'Running eval matrix: {len(task_paths)} tasks × {len(EVAL_CONFIGS)} configs')
+    total = len(task_paths) * len(EVAL_CONFIGS) * trials
+    click.echo(
+        f'Running eval matrix: {len(task_paths)} tasks × {len(EVAL_CONFIGS)} configs'
+        f' × {trials} trials = {total} runs'
+        f' (max_parallel={max_parallel or "unlimited"})'
+    )
 
     async def _run():
-        results = await run_eval_matrix(task_paths, EVAL_CONFIGS, base_config)
+        results = await run_eval_matrix(
+            task_paths, EVAL_CONFIGS, base_config,
+            max_parallel=max_parallel,
+            trials=trials,
+            force=force,
+            timeout_override=timeout,
+        )
         click.echo(f'\nCompleted {len(results)} eval runs:')
         for r in results:
             score = r.metrics.get('composite_score', 0)
@@ -176,65 +231,141 @@ def _run_matrix_cmd(base_config):
     asyncio.run(_run())
 
 
-def _run_judge_cmd():
-    """Run LLM judge on existing results."""
-    from orchestrator.evals.runner import load_results
+def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
+    """Run Elo-based judge on existing results."""
+    from orchestrator.evals.elo import JudgeState, TaskPool, load_state, save_state
+    from orchestrator.evals.judge import run_elo_tournament
+    from orchestrator.evals.report import build_report, format_markdown, save_report
+    from orchestrator.evals.runner import load_results, load_task
+    from orchestrator.evals.snapshots import get_diff_between_commits
+
+    # Load or reset state
+    if reset:
+        state = JudgeState()
+        click.echo('Judge state reset.')
+    else:
+        state = load_state()
+        if state.per_task:
+            click.echo(f'Resuming from existing state ({len(state.per_task)} tasks)')
 
     results = load_results()
     if not results:
         click.echo('No existing results found in evals/results/', err=True)
         sys.exit(1)
 
-    # Group by task
+    # Group by task, filter to passing with existing worktrees
     by_task: dict[str, list] = {}
     for r in results:
         by_task.setdefault(r.task_id, []).append(r)
 
-    # Filter to passing results with existing worktrees
-    passing: dict[str, list] = {}
+    passing: dict[str, list[dict]] = {}
     for task_id, task_results in by_task.items():
-        p = [r for r in task_results
+        p = [r.to_dict() for r in task_results
              if r.metrics.get('tests_pass', False)
              and Path(r.worktree_path).exists()]
-        if len(p) >= 2:
+        if p:
             passing[task_id] = p
             click.echo(f'  {task_id}: {len(p)} contenders with worktrees')
 
     if not passing:
-        click.echo('Need at least 2 passing results per task for judge comparison', err=True)
+        click.echo('No passing results with existing worktrees found', err=True)
         sys.exit(1)
 
-    from orchestrator.evals.judge import run_tournament
-    from orchestrator.evals.runner import load_task
+    tasks_dir = Path(__file__).parent / 'evals' / 'tasks'
 
     async def _run():
-        for task_id, task_results in passing.items():
-            # Load task definition
-            tasks_dir = Path(__file__).parent / 'evals' / 'tasks'
+        for task_id, result_dicts in passing.items():
             task_file = tasks_dir / f'{task_id}.json'
             if not task_file.exists():
                 click.echo(f'Skipping {task_id}: task file not found')
                 continue
 
             task = load_task(task_file)
-            result_dicts = [r.to_dict() for r in task_results]
 
-            click.echo(f'\nJudging {task_id} ({len(result_dicts)} contenders)...')
-            verdicts = await run_tournament(result_dicts, task)
+            # Add reference implementation if post_task_commit exists
+            pre = task.get('pre_task_commit')
+            post = task.get('post_task_commit')
+            if pre and post:
+                try:
+                    project_root = Path(task['project_root'])
+                    ref_diff = await get_diff_between_commits(project_root, pre, post)
+                    if ref_diff.strip():
+                        result_dicts.append({
+                            'config_name': 'reference',
+                            'diff': ref_diff,
+                            'worktree_path': '',
+                        })
+                        click.echo(f'  {task_id}: added reference implementation')
+                except Exception as e:
+                    click.echo(f'  {task_id}: could not compute reference diff: {e}')
 
-            # Tally wins
-            wins: dict[str, int] = {}
-            for v in verdicts:
-                if v.winner == 'A':
-                    wins[v.config_a] = wins.get(v.config_a, 0) + 1
-                elif v.winner == 'B':
-                    wins[v.config_b] = wins.get(v.config_b, 0) + 1
+            if len(result_dicts) < 2:
+                click.echo(f'Skipping {task_id}: need at least 2 contenders')
+                continue
 
-            click.echo(f'  Results for {task_id}:')
-            for cfg, w in sorted(wins.items(), key=lambda x: -x[1]):
-                click.echo(f'    {cfg}: {w} wins')
+            # Get or create task pool
+            if task_id not in state.per_task:
+                state.per_task[task_id] = TaskPool()
+            pool = state.per_task[task_id]
+
+            click.echo(
+                f'\nJudging {task_id} '
+                f'({len(result_dicts)} contenders, max {max_rounds} rounds)...'
+            )
+            rounds_used = await run_elo_tournament(
+                result_dicts, task, pool, max_rounds,
+            )
+            click.echo(f'  {task_id}: {rounds_used} judge calls')
+
+            # Save state after each task (crash resilience)
+            save_state(state)
+
+        # Generate and print report
+        report = build_report(state)
+        report_path = save_report(report)
+        click.echo(f'\nReport saved to {report_path}')
+        click.echo('\n' + format_markdown(report))
 
     asyncio.run(_run())
+
+
+def _run_report_cmd():
+    """Generate report from existing judge state (no new judge calls)."""
+    from orchestrator.evals.elo import load_state
+    from orchestrator.evals.report import build_report, format_markdown, save_report
+
+    state = load_state()
+    if not state.per_task:
+        click.echo('No judge state found. Run --judge first.', err=True)
+        sys.exit(1)
+
+    report = build_report(state)
+    report_path = save_report(report)
+    click.echo(f'Report saved to {report_path}')
+    click.echo('\n' + format_markdown(report))
+
+
+def _run_cleanup(base_config):
+    """Remove all eval worktrees."""
+    from orchestrator.evals.snapshots import cleanup_eval_worktree
+
+    worktree_root = base_config.project_root / '.eval-worktrees'
+    if not worktree_root.exists():
+        click.echo('No eval worktrees found.')
+        return
+
+    async def _cleanup():
+        count = 0
+        for task_dir in sorted(worktree_root.iterdir()):
+            if not task_dir.is_dir():
+                continue
+            for run_dir in sorted(task_dir.iterdir()):
+                if run_dir.is_dir():
+                    await cleanup_eval_worktree(base_config.project_root, run_dir)
+                    count += 1
+        click.echo(f'Cleaned up {count} eval worktrees.')
+
+    asyncio.run(_cleanup())
 
 
 def _run_plan_only(task_path: Path | None, base_config):
@@ -274,7 +405,7 @@ def _run_plan_only(task_path: Path | None, base_config):
             project_root = Path(task['project_root'])
 
             # Create worktree at pre-task commit
-            worktree = await create_eval_worktree(
+            worktree, _run_id = await create_eval_worktree(
                 project_root, task_id, task['pre_task_commit'],
                 setup_commands=task.get('setup_commands'),
             )
