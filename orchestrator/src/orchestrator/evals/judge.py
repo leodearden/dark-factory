@@ -13,6 +13,14 @@ from typing import Any
 
 from orchestrator.agents.invoke import invoke_agent
 
+from .elo import (
+    MAX_PER_PAIR,
+    TaskPool,
+    _pair_key,
+    ensure_config_in_pool,
+    next_matchup,
+    record_match,
+)
 from .snapshots import get_diff
 
 logger = logging.getLogger(__name__)
@@ -63,9 +71,9 @@ async def run_judge(
 
     result_a/b are EvalResult dicts with 'worktree_path' and 'config_name'.
     """
-    # Get diffs
-    diff_a = await get_diff(Path(result_a['worktree_path']))
-    diff_b = await get_diff(Path(result_b['worktree_path']))
+    # Get diffs (use pre-computed diff if available, e.g. for reference impl)
+    diff_a = result_a.get('diff') or await get_diff(Path(result_a['worktree_path']))
+    diff_b = result_b.get('diff') or await get_diff(Path(result_b['worktree_path']))
 
     # Randomize assignment to prevent position bias
     swapped = random.random() > 0.5
@@ -140,7 +148,10 @@ async def run_tournament(
     task: dict,
     rounds_per_pair: int = 3,
 ) -> list[JudgeVerdict]:
-    """Run all pairwise comparisons, N rounds each for consistency."""
+    """Run all pairwise comparisons, N rounds each for consistency.
+
+    .. deprecated:: Use :func:`run_elo_tournament` for budget-efficient judging.
+    """
     verdicts = []
     pairs = list(combinations(results, 2))
 
@@ -154,3 +165,50 @@ async def run_tournament(
             verdicts.append(v)
 
     return verdicts
+
+
+async def run_elo_tournament(
+    result_dicts: list[dict],
+    task: dict,
+    pool: TaskPool,
+    max_rounds: int = 50,
+) -> int:
+    """Run Elo-based matchup selection until budget exhausted or all pairs maxed.
+
+    Mutates *pool* in place.  Returns the number of judge calls made.
+    """
+    # Seed any new configs into the pool
+    for r in result_dicts:
+        ensure_config_in_pool(pool, r['config_name'])
+
+    # Build lookup: config_name → result dict
+    by_config: dict[str, dict] = {r['config_name']: r for r in result_dicts}
+
+    rounds_used = 0
+    while rounds_used < max_rounds:
+        matchup = next_matchup(pool)
+        if matchup is None:
+            logger.info('All pairs maxed out, stopping')
+            break
+
+        config_a, config_b = matchup
+
+        # Skip if either config has no result available (e.g. worktree deleted)
+        if config_a not in by_config or config_b not in by_config:
+            key = _pair_key(config_a, config_b)
+            pool.pair_counts[key] = MAX_PER_PAIR  # avoid infinite loop
+            continue
+
+        logger.info(
+            f'Elo match: {config_a} ({pool.ratings[config_a]:.0f}) vs '
+            f'{config_b} ({pool.ratings[config_b]:.0f})'
+        )
+
+        verdict = await run_judge(by_config[config_a], by_config[config_b], task)
+        record_match(
+            pool, config_a, config_b,
+            verdict.winner, verdict.confidence, verdict.reasoning,
+        )
+        rounds_used += 1
+
+    return rounds_used

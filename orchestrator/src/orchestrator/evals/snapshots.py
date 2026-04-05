@@ -36,7 +36,8 @@ async def create_eval_worktree(
     After checkout, runs any setup_commands (e.g. 'uv sync') to create
     an isolated environment matching the worktree's source state.
 
-    Returns the path to the new worktree.
+    Returns ``(worktree_path, run_id)`` so callers can include the run ID in
+    result filenames for multi-trial support.
     """
     project_root = Path(project_root)
     run_id = uuid4().hex[:8]
@@ -70,7 +71,7 @@ async def create_eval_worktree(
             else:
                 logger.info(f'Setup command OK: {cmd_str}')
 
-    return worktree_path
+    return worktree_path, run_id
 
 
 async def cleanup_eval_worktree(
@@ -109,3 +110,13 @@ async def get_diff(worktree_path: Path) -> str:
         except Exception:
             pass
     return await _run(['git', 'diff', 'HEAD'], cwd=worktree_path)
+
+
+async def get_diff_between_commits(
+    project_root: Path, base_commit: str, target_commit: str,
+) -> str:
+    """Get diff between two commits directly (no worktree needed)."""
+    return await _run(
+        ['git', 'diff', f'{base_commit}..{target_commit}'],
+        cwd=project_root,
+    )

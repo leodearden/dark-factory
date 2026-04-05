@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -27,10 +28,16 @@ class EvalMetrics:
 
     # Efficiency
     cost_usd: float = 0.0
-    wall_clock_ms: int = 0
+    workflow_duration_ms: int = 0
     turns_used: int = 0
     iterations: int = 0          # implementer re-invocations
     debug_cycles: int = 0        # debugger invocations
+
+    # Token usage
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_create_tokens: int = 0
 
     # Quality signals
     review_blocking_issues: int = 0
@@ -86,8 +93,10 @@ async def collect_metrics(
     blocking_issues = len(reviews.blocking_issues) if reviews else 0
     suggestions = len(reviews.suggestions) if reviews else 0
 
-    # Git stats
-    lines_changed, files_changed = await _git_diff_stats(worktree)
+    # Git stats (diff against pre-task commit to capture all workflow changes)
+    lines_changed, files_changed = await _git_diff_stats(
+        worktree, task['pre_task_commit'],
+    )
 
     m = EvalMetrics(
         tests_pass=verify.passed if verify else False,
@@ -96,10 +105,14 @@ async def collect_metrics(
         plan_completion_pct=plan_completion,
         plan_steps=total_steps,
         cost_usd=wf_metrics.total_cost_usd,
-        wall_clock_ms=wf_metrics.total_duration_ms,
-        turns_used=0,  # aggregated per-agent, not tracked at workflow level
+        workflow_duration_ms=wf_metrics.total_duration_ms,
+        turns_used=wf_metrics.total_turns,
         iterations=wf_metrics.execute_iterations,
         debug_cycles=wf_metrics.verify_attempts,
+        input_tokens=wf_metrics.total_input_tokens,
+        output_tokens=wf_metrics.total_output_tokens,
+        cache_read_tokens=wf_metrics.total_cache_read_tokens,
+        cache_create_tokens=wf_metrics.total_cache_create_tokens,
         review_blocking_issues=blocking_issues,
         review_suggestions=suggestions,
         lines_changed=lines_changed,
@@ -109,26 +122,25 @@ async def collect_metrics(
     return m
 
 
-async def _git_diff_stats(worktree: Path) -> tuple[int, int]:
-    """Get lines changed and files changed from git diff --stat."""
+async def _git_diff_stats(worktree: Path, base_commit: str) -> tuple[int, int]:
+    """Get lines changed and files changed vs the pre-task baseline commit."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            'git', 'diff', '--stat', 'HEAD',
+            'git', 'diff', '--stat', f'{base_commit}..HEAD',
             cwd=str(worktree),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await proc.communicate()
-        lines = stdout.decode().strip().split('\n')
-        if not lines:
+        output = stdout.decode().strip()
+        if not output:
             return 0, 0
 
         # Last line: " X files changed, Y insertions(+), Z deletions(-)"
-        summary = lines[-1]
+        summary = output.split('\n')[-1]
         files_changed = 0
         lines_changed = 0
 
-        import re
         m = re.search(r'(\d+) files? changed', summary)
         if m:
             files_changed = int(m.group(1))
