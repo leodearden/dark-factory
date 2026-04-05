@@ -149,10 +149,13 @@ class TestCostsPage:
         html = client.get('/costs').text
         assert 'all' in html.lower()
 
-    def test_sections_use_morph_swap(self, client):
-        """All 7 HTMX polling sections must use morph:innerHTML for DOM diffing."""
+    def test_sections_use_correct_swap(self, client):
+        """Non-chart sections use morph:innerHTML; chart sections use innerHTML."""
         html = client.get('/costs').text
-        assert html.count('morph:innerHTML') == 7
+        # summary, events, runs = morph:innerHTML (no charts)
+        assert html.count('morph:innerHTML') == 3
+        # by-project, by-account, by-role, trend = innerHTML (charts need script re-execution)
+        assert html.count('hx-swap="innerHTML"') == 4
 
     def test_nav_costs_link_is_active(self, client):
         """The 'Costs' nav link should have the active class on the /costs page."""
