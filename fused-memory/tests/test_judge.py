@@ -410,3 +410,80 @@ async def test_judge_call_llm_openai_none_content(mock_journal):
         result = await judge._call_llm('Evaluate this run.')
 
     assert result == ''
+
+
+# --- Error trend detection tests ---
+
+
+def _make_verdicts(severities: list[str]):
+    """Build a list of JudgeVerdict objects from severity strings."""
+    from datetime import datetime, timezone
+    from fused_memory.models.reconciliation import JudgeVerdict, VerdictSeverity
+    return [
+        JudgeVerdict(
+            run_id=f'run-{i}',
+            reviewed_at=datetime.now(tz=timezone.utc),
+            severity=VerdictSeverity(s),
+        )
+        for i, s in enumerate(severities)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_error_trend_minor_only_does_not_halt(mock_journal):
+    """5+ minor verdicts should NOT trigger a halt (the bug fix)."""
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    verdicts = _make_verdicts(['minor'] * 10)
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+
+
+@pytest.mark.asyncio
+async def test_error_trend_moderate_triggers_halt(mock_journal):
+    """5+ moderate verdicts should trigger a halt."""
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    verdicts = _make_verdicts(['moderate'] * 5 + ['ok'] * 5)
+    await judge._check_error_trends('proj', verdicts)
+
+    assert judge.is_halted('proj')
+
+
+@pytest.mark.asyncio
+async def test_error_trend_mixed_moderate_serious_triggers_halt(mock_journal):
+    """Mix of moderate+serious at threshold triggers halt."""
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    verdicts = _make_verdicts(['moderate'] * 3 + ['serious'] * 2 + ['ok'] * 5)
+    await judge._check_error_trends('proj', verdicts)
+
+    assert judge.is_halted('proj')
+
+
+@pytest.mark.asyncio
+async def test_error_trend_under_threshold_no_halt(mock_journal):
+    """4 moderate + 6 ok should NOT trigger a halt."""
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    verdicts = _make_verdicts(['moderate'] * 4 + ['ok'] * 6)
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+
+
+@pytest.mark.asyncio
+async def test_error_trend_disabled_config_no_halt(mock_journal):
+    """Even 10 moderate verdicts should not halt when halt_on_judge_serious=False."""
+    config = _make_judge_config(halt_on_judge_serious=False)
+    judge = Judge(config=config, journal=mock_journal)
+
+    verdicts = _make_verdicts(['moderate'] * 10)
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
