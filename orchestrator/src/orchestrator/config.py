@@ -333,6 +333,9 @@ class OrchestratorConfig(BaseSettings):
     # Usage cap handling
     usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)
 
+    # Environment overrides forwarded to agent invocations
+    env_overrides: dict[str, str] = Field(default_factory=dict)
+
     # Project
     project_root: Path = Field(default=Path('.'))
 

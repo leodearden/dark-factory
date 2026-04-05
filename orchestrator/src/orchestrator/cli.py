@@ -103,6 +103,8 @@ def status(config_path: Path | None):
 @click.option('--reset', is_flag=True, help='Clear judge state and start fresh')
 @click.option('--report', 'report_only', is_flag=True,
               help='Generate report from existing state (no new judge calls)')
+@click.option('--vllm-url', default=None,
+              help='vLLM endpoint URL (e.g. http://workstation:8000)')
 def eval_cmd(
     task_path: Path | None,
     config_name: str | None,
@@ -118,9 +120,16 @@ def eval_cmd(
     max_rounds: int,
     reset: bool,
     report_only: bool,
+    vllm_url: str | None,
 ):
     """Run multi-provider implementor evaluations."""
     base_config = load_config(config_path)
+
+    # Inject ANTHROPIC_BASE_URL into vLLM configs when --vllm-url is set
+    if vllm_url:
+        from orchestrator.evals.configs import VLLM_EVAL_CONFIGS
+        for cfg in VLLM_EVAL_CONFIGS:
+            cfg.env_overrides['ANTHROPIC_BASE_URL'] = vllm_url
 
     if cleanup:
         _run_cleanup(base_config)
@@ -158,18 +167,20 @@ def _run_single_eval(
     force: bool = False, timeout: int | None = None,
 ):
     """Run eval for a single task with one or all configs."""
-    from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
+    from orchestrator.evals.configs import EVAL_CONFIGS, VLLM_EVAL_CONFIGS, get_config_by_name
     from orchestrator.evals.runner import run_eval
+
+    all_configs = EVAL_CONFIGS + VLLM_EVAL_CONFIGS
 
     if config_name and config_name != 'all':
         cfg = get_config_by_name(config_name)
         if not cfg:
             click.echo(f'Unknown config: {config_name}', err=True)
-            click.echo(f'Available: {", ".join(c.name for c in EVAL_CONFIGS)}', err=True)
+            click.echo(f'Available: {", ".join(c.name for c in all_configs)}', err=True)
             sys.exit(1)
         configs = [cfg]
     else:
-        configs = EVAL_CONFIGS
+        configs = all_configs
 
     async def _run():
         for cfg in configs:
@@ -192,8 +203,10 @@ def _run_matrix_cmd(
     timeout: int | None = None,
 ):
     """Run full eval matrix."""
-    from orchestrator.evals.configs import EVAL_CONFIGS
+    from orchestrator.evals.configs import EVAL_CONFIGS, VLLM_EVAL_CONFIGS
     from orchestrator.evals.runner import run_eval_matrix
+
+    all_configs = EVAL_CONFIGS + VLLM_EVAL_CONFIGS
 
     tasks_dir = Path(__file__).parent / 'evals' / 'tasks'
     if not tasks_dir.exists():
@@ -205,16 +218,16 @@ def _run_matrix_cmd(
         click.echo('No task files found in evals/tasks/', err=True)
         sys.exit(1)
 
-    total = len(task_paths) * len(EVAL_CONFIGS) * trials
+    total = len(task_paths) * len(all_configs) * trials
     click.echo(
-        f'Running eval matrix: {len(task_paths)} tasks × {len(EVAL_CONFIGS)} configs'
+        f'Running eval matrix: {len(task_paths)} tasks × {len(all_configs)} configs'
         f' × {trials} trials = {total} runs'
         f' (max_parallel={max_parallel or "unlimited"})'
     )
 
     async def _run():
         results = await run_eval_matrix(
-            task_paths, EVAL_CONFIGS, base_config,
+            task_paths, all_configs, base_config,
             max_parallel=max_parallel,
             trials=trials,
             force=force,

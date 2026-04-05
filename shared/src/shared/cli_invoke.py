@@ -112,6 +112,7 @@ async def invoke_claude_agent(
     timeout_seconds: float | None = None,
     resume_session_id: str | None = None,
     config_dir: Path | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
@@ -121,6 +122,9 @@ async def invoke_claude_agent(
     *resume_session_id*, when set, resumes an existing session via
     ``--resume <id>`` instead of starting a new one.  The system prompt is
     skipped on resume (it was already set in the initial session).
+
+    *env_overrides*, when set, are merged into the subprocess environment.
+    Used to point Claude Code at a vLLM endpoint via ``ANTHROPIC_BASE_URL``.
     """
     return await _invoke_claude(
         prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
@@ -130,6 +134,7 @@ async def invoke_claude_agent(
         permission_mode=permission_mode, effort=effort,
         oauth_token=oauth_token, timeout_seconds=timeout_seconds,
         resume_session_id=resume_session_id, config_dir=config_dir,
+        env_overrides=env_overrides,
     )
 
 
@@ -291,6 +296,7 @@ async def _invoke_claude(
     timeout_seconds: float | None = None,
     resume_session_id: str | None = None,
     config_dir: Path | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     cmd = ['claude', '--print', '--output-format', 'json']
@@ -337,6 +343,9 @@ async def _invoke_claude(
 
     # Strip ANTHROPIC_API_KEY so `claude` falls back to OAuth
     env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+    # Merge caller-supplied overrides (e.g. ANTHROPIC_BASE_URL for vLLM)
+    if env_overrides:
+        env.update(env_overrides)
     # Multi-account failover: inject per-invocation OAuth token
     if oauth_token:
         env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token

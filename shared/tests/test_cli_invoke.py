@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -812,3 +813,111 @@ class TestLargePayloadHandling:
         assert '--resume' in captured_cmd
         assert '--system-prompt-file' not in captured_cmd
         assert '--system-prompt' not in captured_cmd
+
+
+# ── env_overrides plumbing ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestEnvOverrides:
+    """Verify env_overrides are merged into the subprocess env without mutating os.environ."""
+
+    async def test_env_overrides_merged_into_subprocess_env(self, tmp_path):
+        """env_overrides keys appear in the env dict passed to create_subprocess_exec."""
+        captured_kwargs = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        overrides = {
+            'ANTHROPIC_BASE_URL': 'http://vllm:8000/v1',
+            'ANTHROPIC_API_KEY': 'dummy',
+            'ANTHROPIC_DEFAULT_SONNET_MODEL': 'Qwen/Qwen3-Coder-Next',
+        }
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                env_overrides=overrides,
+            )
+
+        env = captured_kwargs['env']
+        assert env['ANTHROPIC_BASE_URL'] == 'http://vllm:8000/v1'
+        assert env['ANTHROPIC_API_KEY'] == 'dummy'
+        assert env['ANTHROPIC_DEFAULT_SONNET_MODEL'] == 'Qwen/Qwen3-Coder-Next'
+
+    async def test_env_overrides_do_not_mutate_os_environ(self, tmp_path):
+        """Passing env_overrides must not modify the calling process's os.environ."""
+        captured_kwargs = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        sentinel_key = '_TEST_ENV_OVERRIDE_SENTINEL'
+        assert sentinel_key not in os.environ, 'Sentinel already in os.environ — test precondition violated'
+
+        overrides = {sentinel_key: 'should-not-leak'}
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                env_overrides=overrides,
+            )
+
+        # The override must reach the subprocess env
+        assert captured_kwargs['env'][sentinel_key] == 'should-not-leak'
+        # But must NOT leak into os.environ
+        assert sentinel_key not in os.environ
+
+    async def test_env_overrides_none_is_harmless(self, tmp_path):
+        """env_overrides=None (default) produces a valid subprocess env."""
+        captured_kwargs = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                env_overrides=None,
+            )
+
+        # Should still have an env dict (base os.environ minus ANTHROPIC_API_KEY)
+        assert isinstance(captured_kwargs['env'], dict)
+        assert len(captured_kwargs['env']) > 0

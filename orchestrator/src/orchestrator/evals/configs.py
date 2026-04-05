@@ -15,6 +15,30 @@ class EvalConfig:
     env_overrides: dict[str, str] = field(default_factory=dict)
 
 
+def _vllm_config(name: str, hf_model: str, effort: str = 'high') -> EvalConfig:
+    """Build an EvalConfig that routes through a vLLM-compatible endpoint."""
+    return EvalConfig(
+        name=name, backend='claude', model='sonnet', effort=effort,
+        env_overrides={
+            'ANTHROPIC_API_KEY': 'dummy',
+            'ANTHROPIC_DEFAULT_SONNET_MODEL': hf_model,
+            # ANTHROPIC_BASE_URL injected at runtime via --vllm-url
+        },
+    )
+
+
+VLLM_EVAL_CONFIGS = [
+    # Spark tier (RunPod H100s)
+    _vllm_config('minimax-m25-fp8',       'MiniMaxAI/MiniMax-M2.5'),
+    _vllm_config('qwen3-coder-next-fp8',  'Qwen/Qwen3-Coder-Next'),
+    _vllm_config('reap-139b-nvfp4',       'cerebras/MiniMax-M2.5-REAP-139B-A10B'),
+    _vllm_config('reap-172b-nvfp4',       'cerebras/MiniMax-M2.5-REAP-172B-A10B'),
+    # 3090 tier (workstation)
+    _vllm_config('qwen3-coder-30b-q4',    'Qwen/Qwen3-Coder-30B-A3B-Instruct'),
+    _vllm_config('devstral-small-2505-q6', 'mistralai/Devstral-Small-2505'),
+    _vllm_config('qwen25-coder-32b-q4',   'Qwen/Qwen2.5-Coder-32B-Instruct'),
+]
+
 EVAL_CONFIGS = [
     EvalConfig('claude-opus-high', 'claude', 'opus', 'high'),
     EvalConfig('claude-opus-max', 'claude', 'opus', 'max'),
@@ -28,7 +52,7 @@ EVAL_CONFIGS = [
 
 def get_config_by_name(name: str) -> EvalConfig | None:
     """Look up an eval config by name."""
-    for cfg in EVAL_CONFIGS:
+    for cfg in EVAL_CONFIGS + VLLM_EVAL_CONFIGS:
         if cfg.name == name:
             return cfg
     return None

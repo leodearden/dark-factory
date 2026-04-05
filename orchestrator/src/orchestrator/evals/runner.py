@@ -152,6 +152,7 @@ def build_eval_orch_config(
         git=base.git,
         usage_cap=base.usage_cap,
         project_root=Path(task.get('project_root', str(base.project_root))),
+        env_overrides=config.env_overrides,
     )
 
 

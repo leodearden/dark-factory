@@ -45,6 +45,11 @@ class EvalMetrics:
     lines_changed: int = 0
     files_changed: int = 0
 
+    # Inference speed
+    tokens_per_second: float = 0.0       # output_tokens / generation_seconds
+    is_local_model: bool = False          # True when env_overrides has ANTHROPIC_BASE_URL
+    hardware_time_seconds: float = 0.0    # wall-clock for hardware cost imputation
+
     # Derived
     composite_score: float = 0.0
 
@@ -98,6 +103,11 @@ async def collect_metrics(
         worktree, task['pre_task_commit'],
     )
 
+    # Inference speed metrics
+    duration_secs = wf_metrics.total_duration_ms / 1000 if wf_metrics.total_duration_ms else 0.0
+    tps = wf_metrics.total_output_tokens / duration_secs if duration_secs > 0 else 0.0
+    is_local = bool(workflow.config.env_overrides.get('ANTHROPIC_BASE_URL'))
+
     m = EvalMetrics(
         tests_pass=verify.passed if verify else False,
         lint_clean=(not verify.lint_output) if verify else False,
@@ -117,6 +127,9 @@ async def collect_metrics(
         review_suggestions=suggestions,
         lines_changed=lines_changed,
         files_changed=files_changed,
+        tokens_per_second=round(tps, 2),
+        is_local_model=is_local,
+        hardware_time_seconds=round(duration_secs, 3),
     )
     m.composite_score = compute_composite(m)
     return m
