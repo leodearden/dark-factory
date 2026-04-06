@@ -36,9 +36,9 @@ from fused_memory.reconciliation.task_filter import FilteredTaskTree, filter_tas
 from fused_memory.services.memory_service import MemoryService
 
 try:
-    from escalation.models import Escalation  # noqa: F811
-    from escalation.queue import EscalationQueue  # noqa: F811
-    from escalation.server import create_server as create_escalation_server
+    from escalation.models import Escalation  # noqa: F811  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # noqa: F811  # type: ignore[import-untyped]
+    from escalation.server import create_server as create_escalation_server  # type: ignore[import-untyped]
     HAS_ESCALATION = True
 except ImportError:
     HAS_ESCALATION = False
