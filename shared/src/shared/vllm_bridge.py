@@ -145,9 +145,11 @@ class VllmBridge:
         self.upstream_url = upstream_url.rstrip('/')
         self.url: str = ''
         self._runner: web.AppRunner | None = None
+        self._session: ClientSession | None = None
 
     async def start(self) -> None:
         """Start the bridge server and bind to a random local port."""
+        self._session = ClientSession()
         app = web.Application()
         # Specific route must be registered before catch-all
         app.router.add_post('/v1/messages', self._handle_messages)
@@ -168,6 +170,9 @@ class VllmBridge:
         if self._runner is not None:
             runner, self._runner = self._runner, None
             await runner.cleanup()
+        if self._session is not None:
+            session, self._session = self._session, None
+            await session.close()
 
     async def __aenter__(self) -> VllmBridge:
         await self.start()
@@ -186,7 +191,8 @@ class VllmBridge:
             k: v for k, v in request.headers.items()
             if k.lower() not in _HOP_BY_HOP
         }
-        async with ClientSession() as session, session.post(
+        assert self._session is not None, 'bridge not started'
+        async with self._session.post(
             self.upstream_url + '/v1/messages',
             json=body,
             headers=headers,
@@ -222,7 +228,8 @@ class VllmBridge:
         }
         data = await request.read()
 
-        async with ClientSession() as session, session.request(
+        assert self._session is not None, 'bridge not started'
+        async with self._session.request(
             method=request.method,
             url=upstream_url,
             headers=headers,
