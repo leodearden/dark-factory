@@ -104,22 +104,7 @@ async def collect_snapshot(
 
     # Always snapshot the main project.
     seen_roots: set[str] = {str(config.project_root)}
-    tasks = await asyncio.to_thread(load_task_tree, config.tasks_json)
-    counts = _count_statuses(tasks)
-    await conn.execute(
-        'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        (
-            str(config.project_root),
-            now,
-            counts['pending'],
-            counts['in_progress'],
-            counts['blocked'],
-            counts['deferred'],
-            counts['cancelled'],
-            counts['done'],
-        ),
-    )
+    await _insert_snapshot_for_root(conn, str(config.project_root), config.tasks_json, now)
 
     # Snapshot any additional projects discovered from running orchestrators.
     orchestrators = await asyncio.to_thread(find_running_orchestrators)
@@ -137,22 +122,8 @@ async def collect_snapshot(
         if root_str in seen_roots:
             continue
         seen_roots.add(root_str)
-        tasks_json = project_root / '.taskmaster' / 'tasks' / 'tasks.json'
-        extra_tasks = await asyncio.to_thread(load_task_tree, tasks_json)
-        extra_counts = _count_statuses(extra_tasks)
-        await conn.execute(
-            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            (
-                root_str,
-                now,
-                extra_counts['pending'],
-                extra_counts['in_progress'],
-                extra_counts['blocked'],
-                extra_counts['deferred'],
-                extra_counts['cancelled'],
-                extra_counts['done'],
-            ),
+        await _insert_snapshot_for_root(
+            conn, root_str, project_root / '.taskmaster' / 'tasks' / 'tasks.json', now
         )
 
     # Snapshot any additional projects from the configured known_project_roots list.
@@ -163,22 +134,8 @@ async def collect_snapshot(
         if root_str in seen_roots:
             continue
         seen_roots.add(root_str)
-        tasks_json = resolved / '.taskmaster' / 'tasks' / 'tasks.json'
-        extra_tasks = await asyncio.to_thread(load_task_tree, tasks_json)
-        extra_counts = _count_statuses(extra_tasks)
-        await conn.execute(
-            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            (
-                root_str,
-                now,
-                extra_counts['pending'],
-                extra_counts['in_progress'],
-                extra_counts['blocked'],
-                extra_counts['deferred'],
-                extra_counts['cancelled'],
-                extra_counts['done'],
-            ),
+        await _insert_snapshot_for_root(
+            conn, root_str, resolved / '.taskmaster' / 'tasks' / 'tasks.json', now
         )
 
     await conn.commit()
