@@ -290,6 +290,48 @@ class TestCollectSnapshot:
         assert count == 1  # only one row for reify, not two
 
     @pytest.mark.asyncio
+    async def test_propagates_load_task_tree_error_for_known_root(self, tmp_path):
+        """PermissionError on a known-root load_task_tree call propagates out of collect_snapshot.
+
+        This pins option (a) behaviour: collect_snapshot has no per-root try/except, so
+        an error on any load_task_tree call propagates uncaught. Because the single
+        conn.commit() is at the very end of the function and is never reached, no rows
+        are committed — the operation is atomic in the failure case.
+
+        When the deferred robustness task lands (option (b)), this test's assertions should
+        flip to: no exception raised, exactly one row for the main project, zero rows for the
+        failing known root.
+        """
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        from dashboard.config import DashboardConfig
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[Path('/home/leo/src/reify')],
+        )
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree',
+                      side_effect=[[], PermissionError('mocked permission denied')]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                with pytest.raises(PermissionError):
+                    await collect_snapshot(conn, config)
+
+        # Verify no rows were durably committed. Use a fresh connection so only
+        # committed data is visible — the same connection would see its own
+        # uncommitted in-flight transaction state (SQLite read-your-own-writes).
+        # conn.commit() was never reached, so the implicit transaction is rolled back
+        # when the connection closes.
+        async with aiosqlite.connect(str(db_path)) as fresh_conn:
+            async with fresh_conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+                row = await cur.fetchone()
+                assert row is not None
+                assert row[0] == 0
+
+    @pytest.mark.asyncio
     async def test_discovers_config_flag_orchestrator(self, tmp_path):
         """Orchestrators launched with --config (no --prd) are snapshotted."""
         db_path = tmp_path / 'burndown.db'
