@@ -42,6 +42,44 @@ class TestTranslateMessagesResponseConvertsOpenAIToolCalls:
         assert 'tool_calls' not in result
 
 
+class TestTranslateMessagesResponseStopReason:
+
+    def test_rewrites_stop_reason_tool_calls_when_tool_use_in_content(self):
+        """stop_reason='tool_calls' is rewritten to 'tool_use' when content has tool_use blocks."""
+        body = {
+            'role': 'assistant',
+            'content': [
+                {'type': 'text', 'text': 'here'},
+                {'type': 'tool_use', 'id': 'toolu_x', 'name': 'Read', 'input': {}},
+            ],
+            'stop_reason': 'tool_calls',
+        }
+        result = _translate_messages_response(body)
+        assert result['stop_reason'] == 'tool_use'
+
+    def test_rewrites_stop_reason_end_turn_when_tool_use_in_content(self):
+        """stop_reason='end_turn' is rewritten to 'tool_use' when content has tool_use blocks."""
+        body = {
+            'role': 'assistant',
+            'content': [
+                {'type': 'tool_use', 'id': 'toolu_y', 'name': 'Write', 'input': {}},
+            ],
+            'stop_reason': 'end_turn',
+        }
+        result = _translate_messages_response(body)
+        assert result['stop_reason'] == 'tool_use'
+
+    def test_passes_through_stop_reason_when_no_tool_use_in_content(self):
+        """stop_reason passes through unchanged when content has no tool_use blocks."""
+        body = {
+            'role': 'assistant',
+            'content': [{'type': 'text', 'text': 'done'}],
+            'stop_reason': 'end_turn',
+        }
+        result = _translate_messages_response(body)
+        assert result['stop_reason'] == 'end_turn'
+
+
 class TestNormalizeToolUseBlockIdempotent:
 
     def test_idempotent_for_correct_block(self):
