@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.vllm_bridge import _normalize_tool_use_block, _translate_messages_response
+from shared.vllm_bridge import VllmBridge, _normalize_tool_use_block, _translate_messages_response
 
 
 class TestTranslateMessagesResponseConvertsOpenAIToolCalls:
@@ -191,3 +191,30 @@ class TestNormalizeToolUseBlockJsonStringInput:
         }
         result = _normalize_tool_use_block(block)
         assert result['name'] == 'get_weather'
+
+
+# ── VllmBridge server lifecycle ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestVllmBridgeLifecycle:
+
+    async def test_start_binds_local_port(self):
+        """VllmBridge.start() binds to 127.0.0.1 on an OS-assigned port != the upstream port."""
+        bridge = VllmBridge(upstream_url='http://127.0.0.1:1')
+        await bridge.start()
+        try:
+            assert bridge.url.startswith('http://127.0.0.1:')
+            port_str = bridge.url.split(':')[-1]
+            port = int(port_str)
+            assert port > 0
+            assert port != 1
+        finally:
+            await bridge.stop()
+
+    async def test_context_manager_lifecycle(self):
+        """async with VllmBridge sets bridge.url inside block; stop() is idempotent outside."""
+        async with VllmBridge(upstream_url='http://127.0.0.1:1') as bridge:
+            assert bridge.url.startswith('http://127.0.0.1:')
+        # stop() after context exit should be a no-op (no raise)
+        await bridge.stop()
