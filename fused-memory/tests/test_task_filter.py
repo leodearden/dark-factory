@@ -256,3 +256,36 @@ class TestFormatFilteredTaskTree:
         # Must render deps as empty list, not None
         assert 'deps=[]' in output, f'Expected deps=[] in output, got: {output!r}'
         assert 'deps=None' not in output, f'Found deps=None in output: {output!r}'
+
+    def test_negative_budget_returns_header_plus_summary(self):
+        """When max_chars is too small to hold any task lines, return header+summary cleanly.
+
+        With max_chars=50 and 5 active tasks, the header+summary alone exceed 50 chars.
+        The budget goes negative, the line-accumulation loop produces 0 kept_lines, and
+        the result must NOT include 'truncated for budget' — instead it should early-return
+        just header + summary_line. Bug: missing early-return guard causes a truncation
+        notice to be appended even when no task lines are kept.
+        """
+        active = [_make_task(i, 'pending', f'Task {i}') for i in range(1, 6)]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            done_count=2,
+            cancelled_count=1,
+            other_count=0,
+            total_count=8,
+        )
+        output = format_filtered_task_tree(tree, max_chars=50)
+
+        # Must not crash
+        assert isinstance(output, str)
+
+        # Must contain the header marker
+        assert '### Active Task Tree' in output
+
+        # Must contain the summary em-dash line
+        assert '\u2014 omitted' in output
+
+        # Must NOT contain the truncation notice when budget is exhausted with no kept lines
+        assert 'truncated for budget' not in output, (
+            f'Found "truncated for budget" in output when budget was exhausted: {output!r}'
+        )
