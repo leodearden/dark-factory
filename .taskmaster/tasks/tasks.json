@@ -10045,6 +10045,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 518,
+        "title": "Fix mock/fixture coherence in test_partial_success_one_error_one_rebuilt",
+        "description": "Two related readability/coherence issues from post-merge review of task 503 in fused-memory/tests/test_graphiti_quality_433.py::TestRebuildEntitySummariesErrorHandling::test_partial_success_one_error_one_rebuilt:\n\n1) Fixture inconsistency (line 443 vs 447): get_all_valid_edges is mocked to return {} but the mock result dict claims edge_count=3. Because _rebuild_entity_from_edges is fully mocked the test passes, but a reader tracing the data flow sees a mismatch — a real call would derive edges=[] and produce edge_count=0. Task 503 deliberately chose non-zero to distinguish 'key present' from .get() fallback. The better fix is to populate get_all_valid_edges with three real edge dicts for u2, e.g.:\n   backend.get_all_valid_edges = AsyncMock(return_value={\n       'u2': [\n           {'uuid': 'e1', 'fact': 'fact1'},\n           {'uuid': 'e2', 'fact': 'fact2'},\n           {'uuid': 'e3', 'fact': 'fact3'},\n       ]\n   })\nThen update the assert_any_call for u2 (line 479-481) to pass the actual edges list instead of [], which also strengthens end-to-end forwarding coverage of the edges kwarg. Alice/u1 still gets [] since she is not in the dict.\n\n2) Visual ambiguity (lines 441, 447, 480): entity summary 'stale summary 2', mock-return 'old_summary' 'stale summary 2', and assert_any_call's old_summary='stale summary 2' are all the same string. A reader can't tell at a glance whether the assert_any_call is anchored to the entity setup (intent) or is accidentally re-asserting the mock output. Change the mock-return's old_summary to a clearly distinct sentinel (e.g., '<echoed-old-summary>'). Then the three values (entity summary, mock return old_summary, assert_any_call old_summary) differ except where the test intends to assert equality:\n   - assert_any_call old_summary must equal the entity fixture's summary ('stale summary 2') — this is the forwarding invariant.\n   - ok_detail['old_summary'] asserts the mock return's distinct sentinel, proving it flows from mock → detail.\n\nVerify: pytest fused-memory/tests/test_graphiti_quality_433.py::TestRebuildEntitySummariesErrorHandling::test_partial_success_one_error_one_rebuilt -x\n\nReviewers: reviewer_architect_reviewer, reviewer_robustness. Source: steward triage of escalation esc-503-45.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10057,7 +10068,7 @@
       ],
       "created": "2026-04-06T22:28:33.729Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:28:33.733Z"
+      "updated": "2026-04-06T22:28:50.957Z"
     }
   }
 }
