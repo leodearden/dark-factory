@@ -438,6 +438,7 @@ class DurableWriteQueue:
             ValueError: When no filter is supplied and confirm_purge_all is False.
         """
         assert self._db is not None
+        ids = ids or None  # normalise empty list to None so it contributes no filter
         has_filter = group_id is not None or error_pattern is not None or ids is not None
         if not has_filter and not confirm_purge_all:
             raise ValueError(

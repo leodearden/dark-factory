@@ -751,3 +751,42 @@ class TestPurgeDead:
         assert len(dead_after) == 0
 
         await q.close()
+
+    @pytest.mark.asyncio
+    async def test_purge_dead_empty_ids_list(self, tmp_path):
+        """purge_dead(ids=[]) is a no-op; purge_dead(ids=[], group_id=...) filters by group_id only."""
+        execute = AsyncMock(side_effect=RuntimeError('always fails'))
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+
+        for i in range(2):
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': f'item{i}', 'group_id': 'proj1', 'name': f'ep{i}'},
+            )
+        await asyncio.sleep(1.0)
+
+        dead_before = await q.get_dead_items()
+        assert len(dead_before) == 2
+
+        # ids=[] alone: treated as no filter → should raise ValueError (no effective filter)
+        with pytest.raises(ValueError, match='confirm_purge_all'):
+            await q.purge_dead(ids=[])
+
+        # All 2 items still dead
+        assert len(await q.get_dead_items()) == 2
+
+        # ids=[] + group_id: empty ids is ignored, group_id takes effect
+        purged = await q.purge_dead(ids=[], group_id='proj1')
+        assert purged == 2
+        assert len(await q.get_dead_items()) == 0
+
+        await q.close()
