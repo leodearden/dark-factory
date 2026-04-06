@@ -358,13 +358,18 @@ async def _invoke_claude(
     # Start a per-invocation vLLM bridge when ANTHROPIC_BASE_URL is set so that
     # Claude CLI talks to the local bridge (which translates vLLM tool_use format)
     # rather than the upstream endpoint directly.
+    # NOTE: sentinel must be declared BEFORE the try block so the finally clause
+    # has the variable in scope.  Instantiation and start() happen INSIDE the try
+    # so that if start() raises mid-init (e.g. AppRunner setup succeeds but
+    # TCPSite.start() fails), the finally clause still calls stop() to release
+    # any partially-initialised AppRunner resources.
     bridge: VllmBridge | None = None
-    if env_overrides and env_overrides.get('ANTHROPIC_BASE_URL'):
-        bridge = VllmBridge(upstream_url=env_overrides['ANTHROPIC_BASE_URL'])
-        await bridge.start()
-        env['ANTHROPIC_BASE_URL'] = bridge.url
-
     try:
+        if env_overrides and env_overrides.get('ANTHROPIC_BASE_URL'):
+            bridge = VllmBridge(upstream_url=env_overrides['ANTHROPIC_BASE_URL'])
+            await bridge.start()
+            env['ANTHROPIC_BASE_URL'] = bridge.url
+
         result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data)
         return _parse_claude_output(result)
     finally:
