@@ -1092,3 +1092,37 @@ class TestVllmBridgeActivation:
 
         # stop() awaited exactly once despite the exception
         mock_bridge.stop.assert_awaited_once()
+
+    async def test_stops_bridge_when_start_raises(self, tmp_path):
+        """bridge.stop() is awaited in the finally clause even when bridge.start() raises."""
+        # Construct a bridge mock whose start() raises mid-way through initialisation
+        mock_instance = MagicMock()
+        mock_instance.start = AsyncMock(side_effect=RuntimeError('partial init failure'))
+        mock_instance.stop = AsyncMock()
+        mock_instance.url = 'http://127.0.0.1:54321'
+        MockVllmBridge = MagicMock(return_value=mock_instance)
+
+        # fake_exec must NEVER be reached because start() raises before the subprocess call
+        captured_kwargs: dict = {}
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                  side_effect=_make_fake_exec(captured_kwargs)),
+            patch('shared.cli_invoke.VllmBridge', MockVllmBridge, create=True),
+            pytest.raises(RuntimeError, match='partial init failure'),
+        ):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                env_overrides={'ANTHROPIC_BASE_URL': 'http://upstream:8000'},
+            )
+
+        # Bridge WAS constructed with the upstream URL
+        MockVllmBridge.assert_called_once_with(upstream_url='http://upstream:8000')
+        # start() was attempted exactly once
+        mock_instance.start.assert_awaited_once()
+        # stop() was called by the finally clause despite the start failure
+        mock_instance.stop.assert_awaited_once()
+        # subprocess was never reached (start raised before _run_subprocess)
+        assert not captured_kwargs
