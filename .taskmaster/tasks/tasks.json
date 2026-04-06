@@ -9868,6 +9868,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 505,
+        "title": "Extract make_rebuild_detail shared test fixture to conftest.py",
+        "description": "The inline rebuild detail dict `{'uuid': ..., 'name': ..., 'old_summary': '', 'new_summary': ..., 'edge_count': 0}` appears in at least three test files without a shared factory:\n- fused-memory/tests/test_graphiti_quality_433.py\n- fused-memory/tests/test_rebuild_entity_summaries.py (lines ~920, ~979, ~1022, ~1078, ~1107)\n- fused-memory/tests/test_merge_entities.py (line ~226)\n\nCreate a `make_rebuild_detail(uuid, name, *, old_summary='', new_summary='', edge_count=0, status='rebuilt')` factory function in `fused-memory/tests/conftest.py` and replace inline dict literals across all affected test files. This makes schema changes (e.g. adding a new key to the detail dict) a single-point edit.\n\nMemory hints: search \"rebuild detail dict test fixture\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9880,7 +9891,7 @@
       ],
       "created": "2026-04-06T20:17:46.781Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T20:17:53.161Z"
+      "updated": "2026-04-06T20:17:58.948Z"
     }
   }
 }
