@@ -140,13 +140,45 @@ class TestCollectSnapshot:
         assert len(rows) == 1
         row = rows[0]
         # row: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
-        assert row[1] == str(config.project_root)  # project_id
+        assert row[1] == str(config.project_root.resolve())  # project_id
         assert row[3] == 1   # pending
         assert row[4] == 1   # in_progress
         assert row[5] == 0   # blocked
         assert row[6] == 0   # deferred
         assert row[7] == 0   # cancelled
         assert row[8] == 2   # done
+
+    @pytest.mark.asyncio
+    async def test_symlinked_root_deduplicates_with_orchestrator(self, tmp_path):
+        """Symlinked project_root and orchestrator resolving to real path produce only 1 row."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        config = DashboardConfig(project_root=link)
+
+        # Orchestrator resolves the same project via _resolve_project_root to the real path
+        fake_orchestrators = [{'prd': 'fake_prd.md', 'config_path': None}]
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
+                patch('dashboard.data.burndown._resolve_project_root', return_value=real_dir.resolve()),
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+                row = await cur.fetchone()
+                assert row is not None
+                count = row[0]
+
+        # Only 1 row — symlink and real path should deduplicate
+        assert count == 1
 
     @pytest.mark.asyncio
     async def test_deduplicates_main_project_from_orchestrators(self, burndown_env):
@@ -198,7 +230,7 @@ class TestCollectSnapshot:
 
         assert len(rows) == 3
         project_ids = {row[0] for row in rows}
-        assert str(base_config.project_root) in project_ids
+        assert str(base_config.project_root.resolve()) in project_ids
         assert str(reify_root.resolve()) in project_ids
         assert str(autopilot_root.resolve()) in project_ids
 
@@ -219,11 +251,44 @@ class TestCollectSnapshot:
             await collect_snapshot(conn, config)
 
         async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
-                                (str(base_config.project_root),)) as cur:
+                                (str(base_config.project_root.resolve()),)) as cur:
             row = await cur.fetchone()
             assert row is not None
             count = row[0]
 
+        assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_symlinked_root_deduplicates_with_known_roots(self, tmp_path):
+        """If known_project_roots includes the resolved real path, it deduplicates with a symlinked project_root."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        from dashboard.config import DashboardConfig
+        # project_root is the symlink; known_project_roots contains the resolved real path
+        config = DashboardConfig(
+            project_root=link,
+            known_project_roots=[real_dir],  # same underlying dir, unresolved
+        )
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+                row = await cur.fetchone()
+                assert row is not None
+                count = row[0]
+
+        # Only 1 row — symlink project_root and known real path deduplicate
         assert count == 1
 
     @pytest.mark.asyncio
@@ -260,6 +325,33 @@ class TestCollectSnapshot:
         assert count == 1  # only one row for reify, not two
 
     @pytest.mark.asyncio
+    async def test_main_project_id_is_resolved_path(self, tmp_path):
+        """project_id in snapshot must be the resolved path even when project_root is a symlink."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        config = DashboardConfig(project_root=link)
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+
+        assert len(rows) == 1
+        # project_id must be the resolved real path, not the symlink path
+        assert rows[0][0] == str(real_dir.resolve())
+
+    @pytest.mark.asyncio
     async def test_discovers_config_flag_orchestrator(self, burndown_env):
         """Orchestrators launched with --config (no --prd) are snapshotted."""
         db_path, config, conn = burndown_env
@@ -282,12 +374,51 @@ class TestCollectSnapshot:
 
         assert len(rows) == 2
         ids = {row[1] for row in rows}
-        assert str(config.project_root) in ids  # main project
+        assert str(config.project_root.resolve()) in ids  # main project
         assert str(reify_root) in ids            # config-discovered project
         # Check reify row counts
         reify_row = next(r for r in rows if r[1] == str(reify_root))
         assert reify_row[3] == 1  # pending
         assert reify_row[8] == 1  # done
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_fallback_deduplicates_against_resolved_root(self, tmp_path):
+        """When _resolve_project_root falls back to the symlinked config.project_root, it still deduplicates."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        from dashboard.config import DashboardConfig
+        config = DashboardConfig(project_root=link)
+
+        # PRD path lives directly under tmp_path (not under real_dir), so
+        # _resolve_project_root will walk up from tmp_path, find no .taskmaster,
+        # and fall back to config.project_root (the unresolved symlink).
+        prd_path = str(tmp_path / 'fake_prd.md')
+        fake_orchestrators = [{'prd': prd_path, 'config_path': None}]
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
+                # _resolve_project_root is NOT mocked — it runs for real and falls
+                # back to config.project_root (the symlink) because prd_path has no
+                # .taskmaster in its ancestor chain.
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+                row = await cur.fetchone()
+                assert row is not None
+                count = row[0]
+
+        # Only 1 row — the orchestrator fallback targets the same project as the
+        # main project_root; resolved and unresolved paths must deduplicate.
+        assert count == 1
 
 
 # ---------------------------------------------------------------------------
