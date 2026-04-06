@@ -137,3 +137,26 @@ class TestNoNameCollisions:
         """All names across both config lists are unique."""
         all_names = [cfg.name for cfg in EVAL_CONFIGS + VLLM_EVAL_CONFIGS]
         assert len(all_names) == len(set(all_names)), f'Duplicate names: {all_names}'
+
+
+class TestEvalConfigsIncludesVllm:
+    """EVAL_CONFIGS must be the canonical list that includes vLLM configs."""
+
+    _CLOUD_BASELINE_COUNT = 7
+    _VLLM_COUNT = 6
+
+    def test_eval_configs_includes_all_vllm_configs(self):
+        """Every vLLM config name must be present in EVAL_CONFIGS."""
+        eval_names = {cfg.name for cfg in EVAL_CONFIGS}
+        vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+        assert vllm_names.issubset(eval_names), (
+            f'vLLM configs missing from EVAL_CONFIGS: {vllm_names - eval_names}'
+        )
+
+    def test_eval_configs_total_count(self):
+        """EVAL_CONFIGS must have 7 cloud baselines + 6 vLLM = 13 total entries."""
+        expected = self._CLOUD_BASELINE_COUNT + self._VLLM_COUNT
+        assert len(EVAL_CONFIGS) == expected, (
+            f'Expected {expected} configs, got {len(EVAL_CONFIGS)}: '
+            f'{[c.name for c in EVAL_CONFIGS]}'
+        )
