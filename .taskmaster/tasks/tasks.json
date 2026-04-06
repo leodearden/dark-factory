@@ -10079,6 +10079,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 521,
+        "title": "Improve test code quality: portable paths, key-consistency comment, extract _fake_load helper",
+        "description": "In dashboard/tests/test_burndown_data.py, make three targeted improvements:\n\n1. In test_load_task_tree_calls_run_concurrently (lines 468-469), replace `Path('/home/leo/src/reify')` and `Path('/home/leo/src/autopilot-video')` with `tmp_path / 'reify'` and `tmp_path / 'autopilot'` (load_task_tree is mocked so the paths don't need to exist) — addresses suggestion [0].\n\n2. In test_dedupes_known_root_against_running_orchestrator (around line 325), add a comment above `_tasks_map` explaining that the orchestrator entry intentionally omits `.resolve()` because `_read_project_root_from_config` returns the raw (unresolved) path, matching production code at burndown.py line 99 — addresses suggestion [1].\n\n3. Add a module-level helper after `_insert_snapshot`:\n```python\ndef _fake_load(tasks_map):\n    return lambda path: tasks_map[path]\n```\nReplace the three inline `fake_load` function definitions (lines 229-231, 331-333, 393-395) with `side_effect=_fake_load(_tasks_map)` — addresses suggestion [5].\n\nSource: review suggestions on task 470 (reviewer_architect_reviewer, reviewer_reuse_auditor).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10091,7 +10102,7 @@
       ],
       "created": "2026-04-06T22:40:15.611Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:40:22.332Z"
+      "updated": "2026-04-06T22:40:31.343Z"
     }
   }
 }
