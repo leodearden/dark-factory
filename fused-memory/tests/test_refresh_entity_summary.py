@@ -158,8 +158,8 @@ class TestGetValidEdgesForNode:
         backend._driver._get_graph = MagicMock(return_value=graph)
         node_uuid = 'my-node-uuid'
         await backend.get_valid_edges_for_node(node_uuid, group_id='test')
-        call_args = graph.query.call_args
-        assert call_args is not None, "graph.query was not called"
+        call_args = graph.ro_query.call_args
+        assert call_args is not None, "graph.ro_query was not called"
         cypher_params = call_args.args[1]
         assert cypher_params.get('uuid') == node_uuid
 
@@ -170,10 +170,50 @@ class TestGetValidEdgesForNode:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
-        call_args = graph.query.call_args
-        assert call_args is not None, "graph.query was not called"
+        call_args = graph.ro_query.call_args
+        assert call_args is not None, "graph.ro_query was not called"
         cypher = call_args.args[0]
         assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """Uses ro_query (read-only) — graph.query must NOT be called."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# step-3 (task-448): GraphitiBackend._edge_dict static helper
+# ---------------------------------------------------------------------------
+
+class TestEdgeDict:
+    """GraphitiBackend._edge_dict(uuid, fact, name) returns a normalised edge dict."""
+
+    def test_returns_dict_with_correct_keys(self):
+        """Returns dict with keys uuid, fact, name for normal (non-None) values."""
+        result = GraphitiBackend._edge_dict('e-1', 'Alice knows Bob', 'knows')
+        assert result == {'uuid': 'e-1', 'fact': 'Alice knows Bob', 'name': 'knows'}
+
+    def test_none_fact_coerced_to_empty_string(self):
+        """None fact is coerced to '' in the returned dict."""
+        result = GraphitiBackend._edge_dict('e-1', None, 'knows')
+        assert result['fact'] == ''
+
+    def test_none_name_coerced_to_empty_string(self):
+        """None name is coerced to '' in the returned dict."""
+        result = GraphitiBackend._edge_dict('e-1', 'Alice knows Bob', None)
+        assert result['name'] == ''
+
+    def test_preserves_non_none_values(self):
+        """Non-None fact and name values are kept as-is."""
+        result = GraphitiBackend._edge_dict('e-42', 'some fact', 'some_name')
+        assert result['uuid'] == 'e-42'
+        assert result['fact'] == 'some fact'
+        assert result['name'] == 'some_name'
 
 
 # ---------------------------------------------------------------------------
