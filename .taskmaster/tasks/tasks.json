@@ -9282,11 +9282,11 @@
         "description": "In fused-memory/fused_memory/backends/graphiti_client.py, update `_canonical_facts` to strip whitespace before the truthiness check:\n\n```python\nif e.get('fact', '').strip()\n```\n\nWithout this, edges with fact='   ' are truthy and pass through _canonical_facts unchanged. Since '   ' != '' and is unlikely to match any legitimate stored summary, entities with such edge facts will perpetually appear stale in `detect_stale_summaries` and be included in every rebuild_entity_summaries batch — triggering an unnecessary `update_node_summary` write per rebuild cycle per affected entity. Real performance tail-risk if whitespace-only facts accumulate in the graph.\n\nThe test at fused-memory/tests/test_graphiti_quality_433.py line 140 (`test_whitespace_only_fact_is_kept`) documents the current behavior and should be updated when the fix is applied — either flipped to assert filtering, or split into 'documents current behavior' vs 'desired filtered behavior'.\n\nAlternative: if the current behavior is intentional (preserve raw graph data), add an explicit guard in the ingest path that prevents whitespace-only facts from being written in the first place.\n\nFiles: fused-memory/fused_memory/backends/graphiti_client.py, fused-memory/tests/test_graphiti_quality_433.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T19:11:58.798Z",
+        "updatedAt": "2026-04-06T19:15:39.676Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/backends",
@@ -9608,7 +9608,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T19:15:39.564Z",
+      "lastModified": "2026-04-06T19:15:39.676Z",
       "taskCount": 467,
       "completedCount": 409,
       "tags": [
