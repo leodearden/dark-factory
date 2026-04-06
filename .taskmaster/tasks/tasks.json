@@ -9645,10 +9645,11 @@
         "description": "In fused-memory/src/fused_memory/backends/graphiti_client.py line 1059, the accumulator loop uses `isinstance(r, BaseException)` which catches `asyncio.CancelledError` (a BaseException subclass in Python 3.8+). When rebuild_entity_summaries is called during graceful shutdown and tasks are cancelled, the method silently converts CancelledError into error detail entries instead of propagating.\n\nFix: Change `isinstance(r, BaseException)` to `isinstance(r, Exception)` so CancelledError propagates naturally. Alternatively, add an explicit re-raise after the gather loop for any CancelledError results. Add a test documenting the chosen behavior.\n\nMemory hints: search for \"rebuild_entity_summaries gather pattern\" and \"CancelledError handling convention\".",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:04:10.748Z"
       },
       {
         "id": "485",
@@ -9884,7 +9885,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T22:04:10.431Z",
+      "lastModified": "2026-04-06T22:04:10.748Z",
       "taskCount": 484,
       "completedCount": 421,
       "tags": [
