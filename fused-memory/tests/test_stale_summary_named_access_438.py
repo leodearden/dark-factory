@@ -22,31 +22,6 @@ from fused_memory.backends.graphiti_client import (
 )
 
 
-class TestStaleSummaryResultAllEdgesField:
-    """StaleSummaryResult exposes the renamed ``all_edges`` field."""
-
-    def test_stale_summary_result_has_all_edges_field(self):
-        """StaleSummaryResult accepts and exposes the ``all_edges`` keyword argument."""
-        result = StaleSummaryResult(stale=[], all_edges={}, total_count=0)
-        assert result.all_edges == {}
-
-    def test_all_edges_holds_per_entity_map(self):
-        """all_edges stores the full graph-wide edge dict keyed by entity UUID."""
-        edge_map = {'u1': [{'fact': 'Alice knows Bob'}]}
-        result = StaleSummaryResult(stale=[], all_edges=edge_map, total_count=1)
-        assert result.all_edges is edge_map
-
-    def test_tuple_unpacking_still_works_after_rename(self):
-        """NamedTuple backward-compat: positional unpacking still works after rename."""
-        stale = [{'uuid': 'u1'}]
-        edges = {'u1': []}
-        result = StaleSummaryResult(stale=stale, all_edges=edges, total_count=4)
-        a, b, c = result
-        assert a is stale
-        assert b is edges
-        assert c == 4
-
-
 class TestDetectStaleSummariesNamedAccess:
     """detect_stale_summaries uses result.stale (named access) not positional unpacking."""
 
