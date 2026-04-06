@@ -384,7 +384,7 @@ class TestCollectSnapshot:
 
         assert len(rows) == 2
         ids = {row[1] for row in rows}
-        assert str(tmp_path) in ids       # main project
+        assert str(tmp_path.resolve()) in ids       # main project
         assert str(reify_root) in ids      # config-discovered project
         # Check reify row counts
         reify_row = next(r for r in rows if r[1] == str(reify_root))

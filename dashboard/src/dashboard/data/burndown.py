@@ -101,7 +101,7 @@ async def collect_snapshot(
             project_root = resolved
         else:
             continue
-        root_str = str(project_root)
+        root_str = str(project_root.resolve())
         if root_str in seen_roots:
             continue
         seen_roots.add(root_str)
