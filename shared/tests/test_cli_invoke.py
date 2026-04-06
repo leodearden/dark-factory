@@ -823,7 +823,12 @@ class TestEnvOverrides:
     """Verify env_overrides are merged into the subprocess env without mutating os.environ."""
 
     async def test_env_overrides_merged_into_subprocess_env(self, tmp_path):
-        """env_overrides keys appear in the env dict passed to create_subprocess_exec."""
+        """env_overrides keys appear in the env dict passed to create_subprocess_exec.
+
+        When ANTHROPIC_BASE_URL is present, the bridge is started and the URL in
+        the subprocess env is the bridge's local URL (not the raw upstream value).
+        Other overrides are merged verbatim.
+        """
         captured_kwargs = {}
 
         async def fake_exec(*args, **kwargs):
@@ -845,7 +850,12 @@ class TestEnvOverrides:
             'ANTHROPIC_DEFAULT_SONNET_MODEL': 'Qwen/Qwen3-Coder-Next',
         }
 
-        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+        MockVllmBridge, mock_bridge = _make_mock_bridge('http://127.0.0.1:54321')
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.VllmBridge', MockVllmBridge),
+        ):
             await invoke_claude_agent(
                 prompt='hello',
                 system_prompt='sys',
@@ -854,7 +864,8 @@ class TestEnvOverrides:
             )
 
         env = captured_kwargs['env']
-        assert env['ANTHROPIC_BASE_URL'] == 'http://vllm:8000/v1'
+        # ANTHROPIC_BASE_URL is rewritten to the bridge's local URL
+        assert env['ANTHROPIC_BASE_URL'] == 'http://127.0.0.1:54321'
         assert env['ANTHROPIC_API_KEY'] == 'dummy'
         assert env['ANTHROPIC_DEFAULT_SONNET_MODEL'] == 'Qwen/Qwen3-Coder-Next'
 
@@ -921,3 +932,197 @@ class TestEnvOverrides:
         # Should still have an env dict (base os.environ minus ANTHROPIC_API_KEY)
         assert isinstance(captured_kwargs['env'], dict)
         assert len(captured_kwargs['env']) > 0
+
+
+# ── VllmBridge activation tests ──────────────────────────────────────────────
+
+
+def _make_mock_bridge(url: str = 'http://127.0.0.1:54321'):
+    """Return a (MockClass, mock_instance) pair for patching VllmBridge."""
+    mock_instance = MagicMock()
+    mock_instance.start = AsyncMock()
+    mock_instance.stop = AsyncMock()
+    mock_instance.url = url
+    MockClass = MagicMock(return_value=mock_instance)
+    return MockClass, mock_instance
+
+
+def _make_fake_exec(captured_kwargs: dict):
+    """Return a fake create_subprocess_exec that records env kwargs."""
+    async def fake_exec(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(
+            _successful_json_output().encode(),
+            b'',
+        ))
+        proc.returncode = 0
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        return proc
+    return fake_exec
+
+
+@pytest.mark.asyncio
+class TestVllmBridgeActivation:
+    """VllmBridge is started transparently when env_overrides contains ANTHROPIC_BASE_URL."""
+
+    async def test_starts_bridge_when_base_url_present(self, tmp_path):
+        """Bridge is constructed with upstream_url, started, and env is rewritten to bridge URL."""
+        captured_kwargs: dict = {}
+        MockVllmBridge, mock_bridge = _make_mock_bridge('http://127.0.0.1:54321')
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                  side_effect=_make_fake_exec(captured_kwargs)),
+            patch('shared.cli_invoke.VllmBridge', MockVllmBridge, create=True),
+        ):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                env_overrides={'ANTHROPIC_BASE_URL': 'http://upstream:8000'},
+            )
+
+        # Bridge constructed with upstream URL
+        MockVllmBridge.assert_called_once_with(upstream_url='http://upstream:8000')
+        # start() awaited exactly once
+        mock_bridge.start.assert_awaited_once()
+        # subprocess env has bridge URL, not original upstream URL
+        assert captured_kwargs['env']['ANTHROPIC_BASE_URL'] == 'http://127.0.0.1:54321'
+
+    async def test_does_not_start_bridge_when_base_url_absent(self, tmp_path):
+        """Bridge is NOT instantiated when env_overrides lacks ANTHROPIC_BASE_URL."""
+        MockVllmBridge, _ = _make_mock_bridge()
+        captured_kwargs: dict = {}
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                  side_effect=_make_fake_exec(captured_kwargs)),
+            patch('shared.cli_invoke.VllmBridge', MockVllmBridge, create=True),
+        ):
+            # No ANTHROPIC_BASE_URL in overrides
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                env_overrides={'FOO': 'bar'},
+            )
+            # No env_overrides at all
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                env_overrides=None,
+            )
+
+        # Bridge was never instantiated
+        MockVllmBridge.assert_not_called()
+
+    async def test_stops_bridge_on_success(self, tmp_path):
+        """bridge.stop() is awaited after a successful subprocess invocation."""
+        call_order: list[str] = []
+        captured_kwargs: dict = {}
+
+        mock_instance = MagicMock()
+
+        async def mock_start():
+            call_order.append('start')
+
+        async def mock_stop():
+            call_order.append('stop')
+
+        mock_instance.start = mock_start
+        mock_instance.stop = mock_stop
+        mock_instance.url = 'http://127.0.0.1:54321'
+        MockVllmBridge = MagicMock(return_value=mock_instance)
+
+        async def fake_exec_recording(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            call_order.append('exec')
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                  side_effect=fake_exec_recording),
+            patch('shared.cli_invoke.VllmBridge', MockVllmBridge, create=True),
+        ):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                env_overrides={'ANTHROPIC_BASE_URL': 'http://upstream:8000'},
+            )
+
+        assert 'start' in call_order
+        assert 'stop' in call_order
+        # start before exec, stop after exec
+        assert call_order.index('start') < call_order.index('exec')
+        assert call_order.index('exec') < call_order.index('stop')
+
+    async def test_stops_bridge_on_subprocess_exception(self, tmp_path):
+        """bridge.stop() is awaited even when the subprocess raises."""
+        MockVllmBridge, mock_bridge = _make_mock_bridge()
+
+        async def fake_exec_raises(*args, **kwargs):
+            raise RuntimeError('subprocess failed')
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                  side_effect=fake_exec_raises),
+            patch('shared.cli_invoke.VllmBridge', MockVllmBridge, create=True),
+            pytest.raises(RuntimeError, match='subprocess failed'),
+        ):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                env_overrides={'ANTHROPIC_BASE_URL': 'http://upstream:8000'},
+            )
+
+        # stop() awaited exactly once despite the exception
+        mock_bridge.stop.assert_awaited_once()
+
+    async def test_stops_bridge_when_start_raises(self, tmp_path):
+        """bridge.stop() is awaited in the finally clause even when bridge.start() raises."""
+        # Construct a bridge mock whose start() raises mid-way through initialisation
+        mock_instance = MagicMock()
+        mock_instance.start = AsyncMock(side_effect=RuntimeError('partial init failure'))
+        mock_instance.stop = AsyncMock()
+        mock_instance.url = 'http://127.0.0.1:54321'
+        MockVllmBridge = MagicMock(return_value=mock_instance)
+
+        # fake_exec must NEVER be reached because start() raises before the subprocess call
+        captured_kwargs: dict = {}
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                  side_effect=_make_fake_exec(captured_kwargs)),
+            patch('shared.cli_invoke.VllmBridge', MockVllmBridge, create=True),
+            pytest.raises(RuntimeError, match='partial init failure'),
+        ):
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                env_overrides={'ANTHROPIC_BASE_URL': 'http://upstream:8000'},
+            )
+
+        # Bridge WAS constructed with the upstream URL
+        MockVllmBridge.assert_called_once_with(upstream_url='http://upstream:8000')
+        # start() was attempted exactly once
+        mock_instance.start.assert_awaited_once()
+        # stop() was called by the finally clause despite the start failure
+        mock_instance.stop.assert_awaited_once()
+        # subprocess was never reached (start raised before _run_subprocess)
+        assert not captured_kwargs

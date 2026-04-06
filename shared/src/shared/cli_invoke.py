@@ -13,6 +13,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from shared.vllm_bridge import VllmBridge
+
 if TYPE_CHECKING:
     from shared.config_dir import TaskConfigDir
     from shared.cost_store import CostStore
@@ -353,12 +355,28 @@ async def _invoke_claude(
     if config_dir:
         env['CLAUDE_CONFIG_DIR'] = str(config_dir)
 
+    # Start a per-invocation vLLM bridge when ANTHROPIC_BASE_URL is set so that
+    # Claude CLI talks to the local bridge (which translates vLLM tool_use format)
+    # rather than the upstream endpoint directly.
+    # NOTE: sentinel must be declared BEFORE the try block so the finally clause
+    # has the variable in scope.  Instantiation and start() happen INSIDE the try
+    # so that if start() raises mid-init (e.g. AppRunner setup succeeds but
+    # TCPSite.start() fails), the finally clause still calls stop() to release
+    # any partially-initialised AppRunner resources.
+    bridge: VllmBridge | None = None
     try:
+        if env_overrides and env_overrides.get('ANTHROPIC_BASE_URL'):
+            bridge = VllmBridge(upstream_url=env_overrides['ANTHROPIC_BASE_URL'])
+            await bridge.start()
+            env['ANTHROPIC_BASE_URL'] = bridge.url
+
         result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data)
         return _parse_claude_output(result)
     finally:
         for path in temp_files:
             Path(path).unlink(missing_ok=True)
+        if bridge is not None:
+            await bridge.stop()
 
 
 def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
