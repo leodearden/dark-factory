@@ -9668,10 +9668,11 @@
         "description": "Task 448 established the convention 'Uses ro_query since no writes are performed' for get_valid_edges_for_node and get_all_valid_edges_bulk. Five other pure-read methods still call graph.query() instead of graph.ro_query():\n\n1. get_node_text (line ~727) — MATCH read\n2. resolve_entity_by_name (line ~751) — MATCH read\n3. delete_entity_node pre-check (line ~704) — the MATCH check before the DETACH DELETE (only the pre-check, not the delete itself)\n4. get_edge_text (line ~1128) — MATCH read\n5. list_indices (line ~1158) — CALL db.indexes() read\n\nUpdate each to use ro_query and add the docstring convention comment. Update corresponding test mock assertions to assert ro_query is called (not query) for the read paths.\n\nmemory_hint: search \"ro_query convention read-only graphiti\" for context on this pattern.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:12:11.128Z"
       },
       {
         "id": "487",
@@ -9907,7 +9908,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T22:12:10.879Z",
+      "lastModified": "2026-04-06T22:12:11.128Z",
       "taskCount": 486,
       "completedCount": 423,
       "tags": [
