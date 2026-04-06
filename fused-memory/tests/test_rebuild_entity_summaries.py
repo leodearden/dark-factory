@@ -1158,3 +1158,37 @@ class TestRebuildEntitySummariesCancellation:
 
         with pytest.raises(asyncio.CancelledError):
             await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates_alongside_other_errors(
+        self, mock_config, make_backend
+    ):
+        """CancelledError must take precedence over per-entity RuntimeErrors in the same batch.
+
+        When gather(return_exceptions=True) returns a mix of Exception subclasses and
+        CancelledError, the propagation pass (which runs before per-entity accumulation)
+        must still re-raise the CancelledError even if a RuntimeError appears first in
+        the results list. This guards against a regression where someone reorders the
+        guard branches and accidentally promotes RuntimeError accounting before the
+        cancellation check.
+
+        The propagation pass scans *all* results before any per-entity bookkeeping, so
+        even if RuntimeError occupies the first slot, CancelledError in the second slot
+        is still detected and re-raised.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
+        })
+        # First entity raises a normal RuntimeError; second raises CancelledError
+        backend.update_node_summary = AsyncMock(
+            side_effect=[RuntimeError('per-entity failure'), asyncio.CancelledError()]
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await backend.rebuild_entity_summaries(group_id='test', force=True)
