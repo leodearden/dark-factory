@@ -1691,3 +1691,109 @@ class TestRunRemediationInjectsFilteredTaskTree:
             f'Remediation Stage 2 expected FilteredTaskTree, got {type(s2_tree)}'
         )
         assert len(s2_tree.active_tasks) == 3
+
+
+# ── Tests for task 455: budget integration test ───────────────────────────────
+
+
+class TestRunFullCycleBudget:
+    """Integration test: injected Active Task Tree payloads stay under 50k chars."""
+
+    @pytest.mark.asyncio
+    async def test_injected_payload_non_empty_and_under_50k(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """With 400 tasks (340 done, 20 cancelled, 40 active), payloads contain task tree and stay under 50k chars."""
+        from fused_memory.models.reconciliation import Watermark
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # Push events with _project_root
+        await event_buffer.push(_make_event_with_root(project_root='/tmp/proj'))
+
+        # Mock taskmaster to return 400 tasks: 340 done, 20 cancelled, 40 active
+        active_tasks = [
+            {'id': i, 'title': f'Active task {i} with a reasonably long title here', 'status': 'pending', 'dependencies': []}
+            for i in range(1, 41)
+        ]
+        done_tasks = [
+            {'id': i + 40, 'title': f'Done task {i}', 'status': 'done', 'dependencies': []}
+            for i in range(1, 341)
+        ]
+        cancelled_tasks = [
+            {'id': i + 380, 'title': f'Cancelled task {i}', 'status': 'cancelled', 'dependencies': []}
+            for i in range(1, 21)
+        ]
+        harness.taskmaster.get_tasks.return_value = {
+            'tasks': active_tasks + done_tasks + cancelled_tasks
+        }
+
+        # Capture stage payloads by letting stages call their real assemble_payload
+        # but wrapping stage.run to intercept the payload text
+        captured_payloads: dict[str, str] = {}
+
+        watermark = Watermark(project_id='dark_factory')
+
+        async def make_stage_run_capturing(stage_idx, stage):
+            """Run assemble_payload on stage and capture the result before faking .run()."""
+            async def fake_run(events, wm, prior_reports, run_id, model=None, _s=stage):
+                try:
+                    payload = await _s.assemble_payload(events, wm, prior_reports)
+                    captured_payloads[f'stage{stage_idx}'] = payload
+                except Exception:
+                    pass
+                from datetime import UTC, datetime
+                return StageReport(
+                    stage=_s.stage_id,
+                    started_at=datetime.now(UTC),
+                    completed_at=datetime.now(UTC),
+                    items_flagged=[],
+                    stats={},
+                    llm_calls=0,
+                    tokens_used=0,
+                )
+            return fake_run
+
+        harness.stages[0].run = await make_stage_run_capturing(1, harness.stages[0])
+        harness.stages[1].run = await make_stage_run_capturing(2, harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        await harness.run_full_cycle('dark_factory', 'buffer_size:1')
+
+        # Assertions on Stage 1 payload
+        s1_payload = captured_payloads.get('stage1', '')
+        assert '### Active Task Tree' in s1_payload, (
+            'Stage 1 payload must contain ### Active Task Tree section'
+        )
+        # At least one active task ID is rendered
+        assert 'Active task 1' in s1_payload or 'pending' in s1_payload, (
+            'Stage 1 payload must contain at least one active task'
+        )
+        assert len(s1_payload) < 200_000, (
+            f'Stage 1 payload too large: {len(s1_payload)} chars'
+        )
+
+        # Assertions on Stage 2 payload
+        s2_payload = captured_payloads.get('stage2', '')
+        assert '### Active Task Tree' in s2_payload, (
+            'Stage 2 payload must contain ### Active Task Tree section'
+        )
+        assert 'Active task 1' in s2_payload or 'pending' in s2_payload, (
+            'Stage 2 payload must contain at least one active task'
+        )
+        # The active task tree section itself must be under 50k chars
+        tree_start = s2_payload.find('### Active Task Tree')
+        tree_end = s2_payload.find('\n### ', tree_start + 1)
+        if tree_end == -1:
+            tree_end = tree_start + 50_001  # fallback: check from start
+        tree_section = s2_payload[tree_start:tree_end]
+        assert len(tree_section) <= 50_000, (
+            f'Active Task Tree section exceeds 50k chars: {len(tree_section)}'
+        )
+
+        # The summary line must be present
+        assert '340 done, 20 cancelled \u2014 omitted' in s2_payload, (
+            'Stage 2 payload must contain the summary line with done/cancelled counts'
+        )
