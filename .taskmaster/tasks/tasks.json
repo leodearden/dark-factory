@@ -9470,6 +9470,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 479,
+        "title": "Extract _render_task_tree_section() in MemoryConsolidator and consolidate _make_task() test helper",
+        "description": "Two DRY fixes:\n1. In memory_consolidator.py, the three-line task_tree_section construction block appears verbatim at lines 138-141 and 203-207. Extract a `def _render_task_tree_section(self) -> str` private helper returning the formatted section (or empty string) and call it from both `assemble_payload()` and `_format_assembled_payload()`.\n2. The `_make_task()` helper is defined identically in test_task_filter.py and twice in test_stages.py. Move it to `fused-memory/tests/conftest.py` as a module-level function and import it in both test files.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9482,7 +9493,7 @@
       ],
       "created": "2026-04-06T18:58:00.750Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T18:58:27.245Z"
+      "updated": "2026-04-06T18:58:33.717Z"
     }
   }
 }
