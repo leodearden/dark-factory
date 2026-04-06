@@ -9170,7 +9170,15 @@
             ]
           },
           "_causation_id": "575fd7e6-9c9d-401e-9ef8-39f0159ffd6d",
-          "stage1_finding_id": "2"
+          "stage1_finding_id": "2",
+          "files": [
+            "fused-memory/src/fused_memory/reconciliation/harness.py",
+            "fused-memory/tests/test_harness.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests"
+          ]
         }
       },
       {
@@ -9200,7 +9208,13 @@
             ]
           },
           "_causation_id": "575fd7e6-9c9d-401e-9ef8-39f0159ffd6d",
-          "stage1_finding_id": "3"
+          "stage1_finding_id": "3",
+          "files": [
+            "fused-memory/src/fused_memory/services/durable_queue.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/services"
+          ]
         }
       }
     ],
