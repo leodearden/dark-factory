@@ -690,6 +690,8 @@ class GraphitiBackend:
         """Delete an Entity node and all remaining relationships.
 
         Validates that the node exists first, then issues DETACH DELETE.
+        Pre-check uses ro_query since it performs no writes; the DETACH DELETE
+        itself uses graph.query.
 
         Args:
             uuid: UUID of the Entity node to delete.
@@ -700,8 +702,8 @@ class GraphitiBackend:
             RuntimeError: if the backend is not initialized.
         """
         graph = self._graph_for(group_id)
-        # Pre-check: verify node exists before deleting
-        check_result = await graph.query(
+        # Pre-check: verify node exists before deleting (read-only)
+        check_result = await graph.ro_query(
             'MATCH (n:Entity {uuid: $uuid}) RETURN n.name, n.summary',
             {'uuid': uuid},
         )
@@ -716,6 +718,8 @@ class GraphitiBackend:
     async def get_node_text(self, uuid: str, *, group_id: str) -> tuple[str, str]:
         """Return (name, summary) for the Entity node with the given UUID.
 
+        Uses ro_query since no writes are performed.
+
         Raises:
             NodeNotFoundError: if no node with that UUID exists.
         """
@@ -724,7 +728,7 @@ class GraphitiBackend:
             'MATCH (n:Entity {uuid: $uuid}) '
             'RETURN n.name, n.summary'
         )
-        result = await graph.query(cypher, {'uuid': uuid})
+        result = await graph.ro_query(cypher, {'uuid': uuid})
         if not result.result_set:
             raise NodeNotFoundError(f'Entity node not found: {uuid}')
         row = result.result_set[0]
@@ -732,6 +736,8 @@ class GraphitiBackend:
 
     async def resolve_entity_by_name(self, name: str, *, group_id: str) -> str:
         """Resolve an entity name to its UUID via an exact Cypher lookup.
+
+        Uses ro_query since no writes are performed.
 
         Args:
             name: Exact name of the Entity node to resolve.
@@ -748,7 +754,7 @@ class GraphitiBackend:
         """
         graph = self._graph_for(group_id)
         cypher = 'MATCH (n:Entity {name: $name}) RETURN n.uuid, n.name'
-        result = await graph.query(cypher, {'name': name})
+        result = await graph.ro_query(cypher, {'name': name})
         rows = result.result_set
         if not rows:
             raise NodeNotFoundError(f'No entity found with name: {name!r}')
@@ -1135,6 +1141,8 @@ class GraphitiBackend:
     async def get_edge_text(self, uuid: str, *, group_id: str) -> tuple[str, str]:
         """Return (name, fact) for the RELATES_TO edge with the given UUID.
 
+        Uses ro_query since no writes are performed.
+
         Raises:
             EdgeNotFoundError: if no edge with that UUID exists.
         """
@@ -1143,7 +1151,7 @@ class GraphitiBackend:
             'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
             'RETURN e.name, e.fact'
         )
-        result = await graph.query(cypher, {'uuid': uuid})
+        result = await graph.ro_query(cypher, {'uuid': uuid})
         if not result.result_set:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
         row = result.result_set[0]
@@ -1170,10 +1178,12 @@ class GraphitiBackend:
     async def list_indices(self, *, group_id: str) -> list[dict]:
         """Return parsed index records from the graph.
 
+        Uses ro_query since no writes are performed.
+
         Each record is a dict with keys: label, field, type, entity_type.
         """
         graph = self._graph_for(group_id)
-        result = await graph.query('CALL db.indexes()')
+        result = await graph.ro_query('CALL db.indexes()')
         indices = []
         for row in (result.result_set or []):
             indices.append({
