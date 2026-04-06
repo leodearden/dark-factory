@@ -9305,6 +9305,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 464,
+        "title": "Assert write side-effect in empty-old-summary refresh test",
+        "description": "In fused-memory/tests/test_refresh_entity_summary.py, test `test_refresh_entity_summary_with_empty_old_summary_and_name` (around line 307, ends at line 327):\nAdd `backend.update_node_summary.assert_awaited_once_with('node-uuid-1', 'Alice knows Bob', group_id='test')` after the existing assertions to confirm the persistent write fires correctly when the empty-string old_summary guard is satisfied.\n\nFiles: fused-memory/tests/test_refresh_entity_summary.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9317,7 +9328,7 @@
       ],
       "created": "2026-04-06T17:40:44.513Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T17:40:47.930Z"
+      "updated": "2026-04-06T17:40:51.111Z"
     }
   }
 }
