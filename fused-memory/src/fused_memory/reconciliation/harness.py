@@ -33,6 +33,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
 )
+from fused_memory.reconciliation.task_filter import FilteredTaskTree, filter_task_tree
 from fused_memory.services.memory_service import MemoryService
 
 if TYPE_CHECKING:
@@ -142,6 +143,7 @@ class ReconciliationHarness:
         cycle_fence_time: datetime | None = None,
         assembled_payload: AssembledPayload | None = None,
         remediation_findings: list[dict] | None = None,
+        filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
         """Apply tier limits and mode-specific attributes to MemoryConsolidator.
 
@@ -154,6 +156,32 @@ class ReconciliationHarness:
         stage.cycle_fence_time = cycle_fence_time
         stage.assembled_payload = assembled_payload
         stage.remediation_findings = remediation_findings
+        stage.filtered_task_tree = filtered_task_tree
+
+    async def _fetch_filtered_task_tree(self, project_root: str) -> FilteredTaskTree:
+        """Fetch the task tree once and return a filtered subset of active tasks.
+
+        Degrades gracefully on failure — returns an empty FilteredTaskTree so
+        stages can still do useful memory work without task data. (ref: task 455)
+
+        Args:
+            project_root: Absolute path to the project root for taskmaster.
+
+        Returns:
+            FilteredTaskTree with active tasks sorted by priority and aggregate
+            counts. Returns empty FilteredTaskTree if taskmaster is unavailable,
+            project_root is empty, or the fetch fails.
+        """
+        if not self.taskmaster or not project_root:
+            return FilteredTaskTree()
+        try:
+            tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
+            return filter_task_tree(tasks_data)
+        except Exception as exc:
+            logger.warning(
+                f'_fetch_filtered_task_tree failed for {project_root!r}: {exc}'
+            )
+            return FilteredTaskTree()
 
     # ── Stale-run recovery ─────────────────────────────────────────────
 
@@ -485,6 +513,9 @@ class ReconciliationHarness:
         # Load prior S3 findings from last completed run (backstop for normal pass)
         prior_s3_findings = await self._get_prior_s3_findings(project_id)
 
+        # Pre-fetch filtered task tree ONCE for the cycle (task 455)
+        filtered_tree = await self._fetch_filtered_task_tree(project_root)
+
         current_stage_name: str | None = None
         cycle_start_time = datetime.now(UTC)
         stages = self._make_stages()
@@ -502,7 +533,12 @@ class ReconciliationHarness:
                         prior_s3_findings=prior_s3_findings,
                         cycle_fence_time=cycle_start_time,
                         assembled_payload=assembled_payload,
+                        filtered_task_tree=filtered_tree,
                     )
+
+                # Inject filtered task tree into Stage 2 (task 455)
+                if isinstance(stage, TaskKnowledgeSync):
+                    stage.filtered_task_tree = filtered_tree
 
                 report = await stage.run(
                     events, watermark, reports, run_id, model=tier.model,
@@ -701,6 +737,9 @@ class ReconciliationHarness:
             },
         )
 
+        # Pre-fetch filtered task tree for remediation pass (task 455)
+        remediation_tree = await self._fetch_filtered_task_tree(project_root)
+
         current_stage_name: str | None = None
         stages = self._make_stages()
         try:
@@ -710,9 +749,12 @@ class ReconciliationHarness:
             assert isinstance(stage1, MemoryConsolidator)
             assert isinstance(stage2, TaskKnowledgeSync)
             self._configure_consolidator(
-                stage1, tier, remediation_findings=findings,
+                stage1, tier,
+                remediation_findings=findings,
+                filtered_task_tree=remediation_tree,
             )
             stage2.remediation_mode = True
+            stage2.filtered_task_tree = remediation_tree
 
             watermark = await self.journal.get_watermark(project_id)
             reports = []
