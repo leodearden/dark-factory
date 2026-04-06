@@ -5319,13 +5319,13 @@
         "description": "Add a 2-step speculative pipeline to the merge queue: while Worker B verifies merge N, Worker A speculatively merges N+1 against N's merge SHA. If N succeeds, N+1 is already a descendant and CAS works immediately (~2-3x throughput when queue depth >3). Cap speculation depth at 1.",
         "details": "BLOCKED: Waiting for merge queue (task 292) to be implemented and stable, with real metrics on queue depth and merge cycle time.\n\nUnblock condition: sustained queue depth >3 and merge cycle time dominating task throughput.\n\nDesign notes:\n- Worker A (merger): dequeue, create merge_wt, git merge --no-ff, scrub .task/\n- Worker B (verifier): run_scoped_verification, CAS update-ref, notify task Future\n- Speculative base: merge N+1 against N's merge commit, not current main\n- If N succeeds: N+1 is descendant, CAS works\n- If N fails: discard N+1, re-merge against actual main (one wasted merge ~2s)\n- Key risk: verification validity — N+1 verified against tree containing N's changes; if N rejected, N+1's verify was against non-existent state. Mitigated by scoped verification (task_files only) and depth-1 cap.\n- See comment block above advance_main() in git_ops.py for full rationale",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "403"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T17:19:17.786Z",
+        "updatedAt": "2026-04-06T17:19:18.147Z",
         "metadata": {
           "memory_hints": {
             "entities": [
@@ -5861,7 +5861,7 @@
             "fused-memory/tests/test_refresh_entity_summary.py"
           ]
         },
-        "updatedAt": "2026-04-04T13:06:35.468Z"
+        "updatedAt": "2026-04-06T17:26:24.612Z"
       },
       {
         "id": "310",
@@ -8554,7 +8554,7 @@
         "description": "In graphiti_client.py refresh_entity_summary: (1) Invert `if name is not None and old_summary is not None: pass else:` to `if name is None or old_summary is None:`. (2) Add ValueError when exactly one of name/old_summary is provided (must be both or neither). (3) Add test for old_summary='' edge case in test_refresh_entity_summary.py.",
         "details": "Files: fused-memory/src/fused_memory/backends/graphiti_client.py (lines 718-722), fused-memory/tests/test_refresh_entity_summary.py. Source: review suggestions from task 419 (esc-419-25).",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -8567,7 +8567,8 @@
             "fused-memory/src/fused_memory/backends",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-06T18:37:13.467Z"
       },
       {
         "id": "430",
@@ -8649,11 +8650,11 @@
         "description": "Review suggestions from task 419 reviewers (deferred as non-blocking). All in test files:\n\n1. Stale mock: test_returns_aggregate_result mocks list_entity_nodes but non-force path now routes through _detect_stale_summaries_with_edges — mock the private method consistently (test_analyst)\n2. Missing edge case: no test for old_summary=empty-string with name provided — valid production path from force-path optimization (test_analyst)\n3. Assertion clarity: test_prefetched_edges_produce_correct_summary should assert unique fact count differs from edge_count (test_analyst)\n4. Misleading mock: test_force_list_entity_nodes_called_exactly_once uses uuid-1 data for all calls — use generic return values (test_analyst)\n\nFiles: fused-memory/tests/test_rebuild_entity_summaries.py, fused-memory/tests/test_refresh_entity_summary.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-04T13:10:50.742Z",
+        "updatedAt": "2026-04-06T17:41:06.841Z",
         "metadata": {
           "modules": [
             "fused-memory/tests/test_rebuild_entity_summaries.py",
@@ -8724,11 +8725,11 @@
         "description": "Two call sites in graphiti_client.py still use positional tuple unpacking instead of named StaleSummaryResult attribute access:\n1. `detect_stale_summaries` (line 933): change `stale, _, _ = await self._detect_stale_summaries_with_edges(...)` to `result = await ...; return result.stale`\n2. `rebuild_entity_summaries` (line 1023): change `stale, all_edges, total_entities = await ...` to `result = await ...; stale = result.stale; all_edges = result.edges; total_entities = result.total_count`\n3. Consider renaming the StaleSummaryResult field `edges` → `all_edges` (line 36) to match the usage variable name and signal that it is the full graph-wide edge dict, not per-entity edges. If renamed, update all field references accordingly.\n\nMemory hints: search for \"StaleSummaryResult\" entity, search \"NamedTuple positional unpacking graphiti\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T17:19:17.862Z",
+        "updatedAt": "2026-04-06T17:59:02.125Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/backends",
@@ -8754,13 +8755,13 @@
         "description": "_rebuild_entity_from_edges at line 962 calls get_node_text per entity for old_summary, emitting N extra RPCs inside the asyncio.gather fan-out (semaphore=20). The name/old_summary optional params were added to refresh_entity_summary explicitly to fix this, but _rebuild_entity_from_edges was never updated.\n\nPreferred fix (option a): have _rebuild_entity_from_edges accept an optional `old_summary: str | None = None` parameter. When provided, skip get_node_text. Thread pre-fetched data from rebuild_entity_summaries callers — for force=True entities, all_entities[i]['summary'] is available; for stale entities, add summary to the stale dict in _detect_stale_summaries_with_edges.\n\nAlternative (option b): have _rebuild_entity_from_edges delegate entirely to refresh_entity_summary(uuid, group_id=group_id, name=name, old_summary=old_summary) and remove the structural duplication.\n\nAlso consider making get_node_text failure non-fatal to the summary write path.\n\nMemory hints: search \"refresh_entity_summary name old_summary optimization\", get_entity \"GraphitiClient\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "432"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-04T19:02:01.444Z",
+        "updatedAt": "2026-04-06T18:45:54.364Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/backends",
@@ -8848,11 +8849,11 @@
         "description": "Five test gaps in the graphiti rebuild/refresh test file (currently test_graphiti_quality_433.py, to be renamed per hygiene task):\n\n1. **Missing positive edge-fetch test**: Add test_force_no_dry_run_calls_get_all_valid_edges — set force=True, dry_run=False, mock _rebuild_entity_from_edges, assert backend.get_all_valid_edges.assert_awaited_once().\n\n2. **Error path untested**: Add a test where _rebuild_entity_from_edges has side_effect=RuntimeError('boom'), and assert result['errors'] == 1 and result['details'][0]['status'] == 'error'.\n\n3. **Missing DB-write assertion**: In test_get_node_text_not_called_when_both_provided (line 169), add backend.update_node_summary.assert_awaited_once_with('u1', 'Alice knows Bob', group_id='test') to verify the summary written matches the deduped edge facts.\n\n4. **Weak tuple subclass test**: In test_is_tuple_subclass (line 57), replace the bare isinstance check with actual tuple equality comparison: assert result == (stale_list, edges, 1), or remove as redundant.\n\n5. **Whitespace fact edge case**: Add a test case to TestCanonicalFacts with {'fact': '   '} to document whether whitespace-only strings are included or filtered.\n\nMemory hints: search \"graphiti test coverage rebuild\", search \"StaleSummaryResult tests\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-04T23:17:19.111Z",
+        "updatedAt": "2026-04-06T17:40:34.997Z",
         "metadata": {
           "modules": [
             "fused-memory/tests/test_graphiti_quality_433.py"
@@ -8981,7 +8982,7 @@
         "id": "450",
         "title": "Burndown view: show all registered projects, not just dark-factory",
         "description": "The burndown page only displays dark-factory despite orchestrators running for reify and autopilot-video. Two bugs in collect_snapshot() (dashboard/src/dashboard/data/burndown.py:64-119):\n\n**Bug 1 — config-launched orchestrators silently skipped (lines 92-95):**\ncollect_snapshot tries `proc.get('project_root') or proc.get('prd')` but find_running_orchestrators() returns dicts with keys {pid, prd, config_path, running, started} — there is no 'project_root' key. For orchestrators launched with `--config` (reify, autopilot-video), 'prd' is None, so `if not root: continue` drops them entirely. Only --prd-launched orchestrators survive.\n\n**Bug 2 — _read_project_root_from_config never called:**\norchestrator.py:41 has _read_project_root_from_config() which extracts project_root from a config YAML, but collect_snapshot never calls it. When config_path is present, it should use _read_project_root_from_config(config_path) to resolve the project root.\n\n**Fix:** In collect_snapshot's orchestrator loop, when prd is None but config_path is present, call _read_project_root_from_config(config_path) to get the project root. Also import _read_project_root_from_config from orchestrator.py into burndown.py.\n\n**Separate issue (task 450 original scope):** Even with this fix, projects whose orchestrators are not running at snapshot time will still be missed. A configured list of known project roots in DashboardConfig would address that, but fixing the config_path resolution bug is the immediate priority.\n\nKey files:\n- dashboard/src/dashboard/data/burndown.py: collect_snapshot() lines 64-119\n- dashboard/src/dashboard/data/orchestrator.py: find_running_orchestrators (line 102), _read_project_root_from_config (line 41)\n- dashboard/src/dashboard/config.py: DashboardConfig",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "tags": [
@@ -9012,7 +9013,7 @@
             "parentId": "undefined"
           }
         ],
-        "updatedAt": "2026-04-06T17:19:17.893Z",
+        "updatedAt": "2026-04-06T18:13:09.895Z",
         "metadata": {
           "memory_hints": {
             "entities": [
@@ -9084,7 +9085,9 @@
         "details": "Stream 1 (dark-factory eval plumbing) and Stream 2 (runpod-toolkit Docker image) are complete. Stream 3 is the actual self-hosted eval run.\n\nKey files:\n- orchestrator/src/orchestrator/evals/configs.py — EVAL_CONFIGS dict, add entries for self-hosted models\n- orchestrator/src/orchestrator/evals/tasks/ — eval task JSON files (df_task_12/13/18, reify_task_27 — plan.task_id values fixed in commit 53486e8023)\n- docs/vllm-eval-status.md — current stream status and next steps\n\nenv_overrides constraint: only implementer and debugger roles may use vLLM endpoint; architect and reviewer must use real Claude OAuth (enforced in workflow.py since commit 53486e8023).\n\nModels: 6 active (Qwen2.5-Coder-32B dropped). See memory \"Evaluating vLLM plan with 6 active models\".",
         "testStrategy": "",
         "status": "blocked",
-        "dependencies": [],
+        "dependencies": [
+          "457"
+        ],
         "priority": "medium",
         "subtasks": [],
         "updatedAt": "2026-04-06T17:16:00.978Z",
@@ -9150,7 +9153,7 @@
         "description": "Task 394 (done 2026-04-02) identified the fix for the false-empty task tree bug: modify reconciliation harness (harness.py) to filter the get_tasks response before injecting into Stage 1/Stage 2 prompts. However, as of 2026-04-06 (recon run 94151a78), Stage 2 is STILL receiving 0 active tasks — the filter was never implemented.\n\nThe symptom: get_tasks returns 701k+ characters (370+ tasks, 85% done/cancelled), which overflows the Claude context. The fix recommended by task 394 was to strip done/cancelled tasks from the injected payload, keeping only active (pending/in-progress/blocked/deferred) tasks plus a summary of done/cancelled counts.\n\n## Required changes in harness.py (reconciliation harness)\n1. After calling get_tasks, filter the response to exclude done/cancelled tasks\n2. Keep full details only for active tasks (pending, in-progress, blocked, deferred)\n3. Inject a compact summary of done/cancelled counts (e.g. \"385 done, 12 cancelled — omitted\")\n4. Verify the injected payload fits within context limits (target: <50k chars)\n5. Test by running a reconciliation cycle and confirming Stage 1 + Stage 2 receive non-empty active task lists\n\n## memory_hints\n- entity: \\\"reconciliation harness\\\" — current harness.py structure and injection point\n- search: \\\"false-empty task tree Stage 1 Stage 2 recurring bug\\\"\n- search: \\\"get_tasks context window overflow 600K filter done cancelled\\\"\n- search: \\\"reconciliation harness task tree injection\\\"\n- task: 394 — original analysis and recommended fix approaches",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
@@ -9160,13 +9163,9 @@
           "confirmed_affected_run": "94151a78",
           "zero_active_tasks_since": "2026-04-02",
           "memory_hints": {
-            "entities": [
-              "reconciliation harness"
-            ],
-            "searches": [
-              "false-empty task tree Stage 1 Stage 2 recurring bug",
-              "get_tasks context window overflow 600K filter done cancelled",
-              "reconciliation harness task tree injection"
+            "entities": [],
+            "queries": [
+              "resolution for: Implement harness-level task filtering: inject only active tasks into recon Stage 1/Stage 2 prompts"
             ]
           },
           "_causation_id": "575fd7e6-9c9d-401e-9ef8-39f0159ffd6d",
@@ -9179,7 +9178,8 @@
             "fused-memory/src/fused_memory/reconciliation",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-06T18:38:43.478Z"
       },
       {
         "id": "456",
@@ -9187,7 +9187,7 @@
         "description": "The fused-memory dead letter queue (DLQ) has grown monotonically from 6 (pre-Task 401) → 37 (during Task 401) → 30 (2026-04-02 baseline, run baed7766) → 55 (2026-04-06, run 94151a78). Task 401 (Fix Mem0 search regression) is marked done, but post-fix DLQ replay was never confirmed. No active task tracks the DLQ backlog.\n\n## Investigation steps\n1. Call `get_queue_stats` to inspect current DLQ contents and patterns\n2. Call `replay_dead_letters` to attempt replay of valid dead letters\n3. Examine replay outcomes — track success vs persistent failure\n4. For persistently-failing dead letters: inspect error patterns, determine if purgeable\n5. Call `replay_dead_letters` again or `purge` genuinely invalid entries\n6. Confirm post-remediation DLQ count drops\n7. Write a memory recording the final DLQ count and any patterns found\n\n## Context\n- DLQ grew during Mem0 search regression period — dead letters may be failed Mem0 writes\n- Mem0 search is now operational (search returns results), so replayed writes should succeed\n- If DLQ entries are Graphiti writes, check if entities already exist (idempotent replay)\n- The fused-memory MCP exposes `replay_dead_letters` and `get_queue_stats` tools\n\n## memory_hints\n- search: \\\"dead letter queue DLQ growth Mem0 write failures\\\"\n- search: \\\"DLQ baseline 55 dead letters 2026-04-06\\\"\n- search: \\\"replay dead letters DurableWriteQueue fused-memory\\\"\n- entity: \\\"DurableWriteQueue\\\" — write queue implementation details\n- task: 401 — Mem0 search fix context (DLQ grew during this period)",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -9204,25 +9204,223 @@
             "searches": [
               "dead letter queue DLQ growth Mem0 write failures",
               "DLQ baseline 55 dead letters 2026-04-06",
-              "replay dead letters DurableWriteQueue fused-memory"
-            ]
+              "replay dead letters DurableWriteQueue fused-memory",
+              "vector dimension mismatch DLQ replay failure modes",
+              "FalkorDB vector index rebuild dimension mismatch 1536 1024"
+            ],
+            "memories": [
+              "85603be3-ddcf-4bc8-80a6-3dcacd0e236d"
+            ],
+            "safety_warning": "inspect_error_types_before_replay_vector_dimension_mismatch_1536_1024_not_safe_for_bulk_replay"
           },
-          "_causation_id": "575fd7e6-9c9d-401e-9ef8-39f0159ffd6d",
+          "_causation_id": "4eddd6c4-9864-4b20-9ca7-1fb4c182d5a4",
           "stage1_finding_id": "3",
           "files": [
             "fused-memory/src/fused_memory/services/durable_queue.py"
           ],
           "modules": [
             "fused-memory/src/fused_memory/services"
-          ]
-        }
+          ],
+          "reconciliation_note": "stage2 (run 4eddd6c4): outer priority field is still medium — PERPLEXITY_API_KEY not set, blocking prompt-based update_task; metadata.priority correctly=high; inline SAFETY note for step 2 also blocked by same missing key; manual fix required: set outer priority=high and prepend to step 2: 'SAFETY: Inspect error types before bulk replay — Vector dimension mismatch 1536→1024 entries were generated before task 88 rebuilt the FalkorDB index (done 2026-03-21+). Verify current index dimension before bulk-replaying these entries.'",
+          "stage2_blocker": "PERPLEXITY_API_KEY not set; prompt-based update_task unavailable; outer priority and description edits require manual intervention or API key setup"
+        },
+        "updatedAt": "2026-04-06T18:31:40.498Z"
+      },
+      {
+        "id": "457",
+        "title": "Fix vLLM tool-format bridge bug: cli_invoke.py + /v1/messages shim",
+        "description": "The vLLM eval tool-format bridge is broken: every tool_use response from a vLLM-backed model errors in the Claude CLI, making all vLLM-backed evals impossible. This is the primary blocker for Task 453 (Complete vLLM eval Stream 3).\n\n## Problem\ncli_invoke.py passes tool_use responses through a /v1/messages shim that Claude CLI cannot parse correctly. Every eval attempt with any self-hosted model fails at the tool_use response boundary. No vLLM-backed eval has ever produced outcome=done.\n\n## Confirmed Evidence\n- Graphiti entity: 4919b7e2-02a5-4bed-b0ee-3fe459adeff4 (tool_format_bridge_bug)\n- Graphiti edges: d6208d0e-b5e8-49f6-bbde-2bc6f6503787, a37383d4-3008-42ac-a8a0-468e3067e181\n- Episodes: 544fd5f8 (session 2026-04-06 diagnosis), 99a05c0d (bridge bug confirmation)\n- Documented in MEMORY.md: project_vllm_eval_tool_format_bridge_bug.md\n\n## Investigation Steps\n1. Read cli_invoke.py — find where tool_use responses from /v1/messages are translated\n2. Reproduce: run a minimal eval against any vLLM endpoint with a simple tool-calling task\n3. Capture the exact error from Claude CLI on tool_use response\n4. Fix the shim translation layer so tool_use blocks are formatted correctly for Claude CLI\n5. Re-run the gate eval (e.g. reap-139b-nvfp4-new) to verify outcome=done is achievable\n6. Update Task 453 status once confirmed working\n\n## memory_hints\n- entity: \"4919b7e2-02a5-4bed-b0ee-3fe459adeff4\" — tool_format_bridge_bug entity\n- search: \"vLLM tool format bridge bug cli_invoke messages shim\"\n- search: \"tool_use response Claude CLI error vLLM eval\"\n- episode: \"544fd5f8\" — session 2026-04-06 diagnosis\n- episode: \"99a05c0d\" — bridge bug confirmation",
+        "details": "",
+        "testStrategy": "",
+        "status": "done",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": [],
+        "updatedAt": "2026-04-06T18:45:54.219Z"
+      },
+      {
+        "id": "458",
+        "title": "Fix naming and comment accuracy in TestStaleSummaryResult",
+        "description": "Two related fixes in fused-memory/tests/test_graphiti_quality_433.py around test_is_tuple_subclass (line 57):\n\n1. Rename the method from `test_is_tuple_subclass` to `test_value_equal_to_plain_tuple` (or `test_equals_plain_tuple`) to match the actual value-equality assertion. The current name contradicts the assertion which was changed from `isinstance(result, tuple)` to `result == (stale_list, edges, 1)`.\n\n2. Replace the inline comment at line 62-63 — 'only actual tuple subclasses compare equal to plain tuples this way' — with something accurate like: '# NamedTuple is a tuple subclass, so value-equality with a plain tuple holds — this confirms the backward-compat contract is in place.' The current comment is misleading because any Python object can implement __eq__ to compare equal to a tuple.\n\nFiles: fused-memory/tests/test_graphiti_quality_433.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "done",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-04-06T18:38:43.201Z"
+      },
+      {
+        "id": "459",
+        "title": "Strengthen error-path assertions in TestRebuildEntitySummariesErrorHandling",
+        "description": "Improve test_rebuild_entity_error_recorded_in_result (lines 370-396) in fused-memory/tests/test_graphiti_quality_433.py with three additions:\n\n1. Assert `detail['uuid'] == 'u1'` and `detail['name'] == 'Alice'` — the implementation at graphiti_client.py:1062-1067 sets both fields in the error branch from t['uuid']/t['name']; not asserting them means wrong-entity bugs go undetected.\n\n2. Assert `result['total_entities'] == 1` and `result['stale_entities'] == 1` to confirm counting logic is not disturbed by the error path. The implementation sets these from list_entity_nodes and the targets list respectively.\n\n3. Add a second test with two entities using `side_effect=[RuntimeError('boom'), {'uuid': 'u2', 'name': 'Bob', 'old_summary': '', 'new_summary': '', 'edge_count': 0}]` to exercise the partial-success path (rebuilt==1, errors==1) — this is the core value of `asyncio.gather(return_exceptions=True)` and could hide a bug where one exception poisons the accumulator loop.\n\nFiles: fused-memory/tests/test_graphiti_quality_433.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "460",
+        "title": "Add await_count guard in test_force_no_dry_run_calls_get_all_valid_edges",
+        "description": "In fused-memory/tests/test_graphiti_quality_433.py at TestRebuildEntitySummariesForceDryRun.test_force_no_dry_run_calls_get_all_valid_edges (line 278), add after the existing get_all_valid_edges assertion:\n\n```python\nassert backend._rebuild_entity_from_edges.await_count == 2\n```\n\nThis guards the O(N) gather fan-out — a regression silently dropping one entity (e.g. off-by-one in the gather targets list) would not be caught by the current single-call assertion on get_all_valid_edges alone.\n\nFiles: fused-memory/tests/test_graphiti_quality_433.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "461",
+        "title": "Fix whitespace-only fact filtering in _canonical_facts",
+        "description": "In fused-memory/fused_memory/backends/graphiti_client.py, update `_canonical_facts` to strip whitespace before the truthiness check:\n\n```python\nif e.get('fact', '').strip()\n```\n\nWithout this, edges with fact='   ' are truthy and pass through _canonical_facts unchanged. Since '   ' != '' and is unlikely to match any legitimate stored summary, entities with such edge facts will perpetually appear stale in `detect_stale_summaries` and be included in every rebuild_entity_summaries batch — triggering an unnecessary `update_node_summary` write per rebuild cycle per affected entity. Real performance tail-risk if whitespace-only facts accumulate in the graph.\n\nThe test at fused-memory/tests/test_graphiti_quality_433.py line 140 (`test_whitespace_only_fact_is_kept`) documents the current behavior and should be updated when the fix is applied — either flipped to assert filtering, or split into 'documents current behavior' vs 'desired filtered behavior'.\n\nAlternative: if the current behavior is intentional (preserve raw graph data), add an explicit guard in the ingest path that prevents whitespace-only facts from being written in the first place.\n\nFiles: fused-memory/fused_memory/backends/graphiti_client.py, fused-memory/tests/test_graphiti_quality_433.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "462",
+        "title": "Fix test_prefetched_edges: remove tautological assertion, rename, fix separator coupling",
+        "description": "In fused-memory/tests/test_rebuild_entity_summaries.py, test `test_prefetched_edges_produce_correct_summary` (around line 1082):\n1. Remove the tautological line `assert result['edge_count'] != len(unique_facts)` (line 1109) — already proven by the two concrete equality assertions.\n2. Rename the test to `test_duplicate_edges_deduplicated_in_summary_but_counted_in_edge_count` (or similar) so the invariant is scannable from the test index.\n3. Replace `result['new_summary'].split('\\n')` (line 1105) with a full-string assertion: `assert result['new_summary'] == 'Alice knows Bob\\nAlice works at Acme'` (then derive unique_facts from the known expected string, or just drop the split entirely since the set/count checks are superseded by the string equality).\n\nFiles: fused-memory/tests/test_rebuild_entity_summaries.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "463",
+        "title": "Complete bulk-fetch contract assertions in test_force_list_entity_nodes_called_exactly_once",
+        "description": "In fused-memory/tests/test_rebuild_entity_summaries.py, test `test_force_list_entity_nodes_called_exactly_once` (around line 886):\n1. After line 911 (`backend.list_entity_nodes.assert_awaited_once()`), add `backend.get_all_valid_edges.assert_awaited_once()` to fully guard the single bulk-fetch guarantee.\n2. After `result['rebuilt'] == 3`, add `assert backend.update_node_summary.await_count == 3` to verify all three summary writes were dispatched.\n\nFiles: fused-memory/tests/test_rebuild_entity_summaries.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "464",
+        "title": "Assert write side-effect in empty-old-summary refresh test",
+        "description": "In fused-memory/tests/test_refresh_entity_summary.py, test `test_refresh_entity_summary_with_empty_old_summary_and_name` (around line 307, ends at line 327):\nAdd `backend.update_node_summary.assert_awaited_once_with('node-uuid-1', 'Alice knows Bob', group_id='test')` after the existing assertions to confirm the persistent write fires correctly when the empty-string old_summary guard is satisfied.\n\nFiles: fused-memory/tests/test_refresh_entity_summary.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "465",
+        "title": "Finish StaleSummaryResult named-access refactor: last positional unpack + docstring",
+        "description": "Follow-up from task 438 review. The NamedTuple named-attribute migration was applied almost everywhere, but two loose ends remain:\n\n1. **fused-memory/tests/test_rebuild_entity_summaries.py:829** — sole surviving positional unpack in the codebase: `stale, _, _ = await backend._detect_stale_summaries_with_edges(group_id='test')`. The NamedTuple backward-compat guarantee keeps it working, but every other call site was migrated and this single holdout will confuse future readers who see both styles side by side in the same file. Replace with:\n   ```python\n   result = await backend._detect_stale_summaries_with_edges(group_id='test')\n   stale = result.stale\n   ```\n\n2. **fused-memory/src/fused_memory/backends/graphiti_client.py:864,873** — the `_detect_stale_summaries_with_edges` docstring still describes the return value as a positional `Tuple of (stale_list, all_edges_dict, total_entity_count)`. Update the summary line and the `Returns:` section to describe the NamedTuple shape so docstring matches the caller convention. Suggested:\n   ```\n   Returns:\n       StaleSummaryResult with fields:\n         .stale        - list of stale entity dicts\n         .all_edges    - dict[uuid, list[dict]] of valid edges for all entities\n         .total_count  - total number of entity nodes scanned\n   ```\n\nVerify by running: `pytest fused-memory/tests/test_rebuild_entity_summaries.py fused-memory/tests/test_graphiti_quality_433.py fused-memory/tests/test_stale_summary_named_access_438.py -x`\n\nMemory hints: search for \"StaleSummaryResult named-attribute access refactor\" and \"graphiti_client _detect_stale_summaries_with_edges\".",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "466",
+        "title": "Consolidate and harden test_stale_summary_named_access_438.py",
+        "description": "Follow-up from task 438 review. Five test-quality improvements for fused-memory/tests/test_stale_summary_named_access_438.py:\n\n1. **Remove duplicate TestStaleSummaryResultAllEdgesField class (lines 26-57).** All three tests in this class duplicate coverage already present in fused-memory/tests/test_graphiti_quality_433.py::TestStaleSummaryResult after the rename was applied in the same diff:\n   - `test_stale_summary_result_has_all_edges_field` duplicates `test_named_attribute_all_edges`\n   - `test_all_edges_holds_per_entity_map` is a minor variant of the same\n   - `test_tuple_unpacking_still_works_after_rename` duplicates `test_tuple_unpacking_backward_compat`\n   Delete the class entirely. The genuine value of this file is `TestDetectStaleSummariesNamedAccess` and `TestRebuildEntitySummariesNamedAccess`, which exercise the two public callers — keep those.\n\n2. **Strengthen assertion from equality to identity (line 67).** In `test_detect_stale_summaries_named_access`, change `assert returned == stale_list` to `assert returned is stale_list`. The production code does `return result.stale` — a direct attribute read with no copy — so identity is the correct, stronger check and locks in the no-copy contract. Value equality would still pass if the implementation accidentally returned a shallow copy.\n\n3. **Add negative hasattr test for removed `edges` field.** Nothing currently asserts that the old `edges` attribute name is absent from `StaleSummaryResult`. Add a test:\n   ```python\n   result = StaleSummaryResult(stale=[], all_edges={}, total_count=0)\n   assert not hasattr(result, 'edges')\n   ```\n   This closes the gap against a stale positional-only construction path silently re-exposing an `edges` alias. Add it either in test_graphiti_quality_433.py::TestStaleSummaryResult or in the remaining test file after step 1.\n\n4. **Fix fixture shape inconsistency (line 78).** In `test_rebuild_entity_summaries_named_access`, the stale dict uses only `{uuid, name, summary}`. Every other stale-entity fixture across the suite includes the diagnostic keys. Use the full shape:\n   ```python\n   {'uuid': 'u1', 'name': 'A', 'summary': 'old', 'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 1, 'summary_line_count': 1}\n   ```\n\n5. **Add empty-stale-list coverage in TestDetectStaleSummariesNamedAccess (lines 50-68).** The class currently has only the non-empty case. Add a second test that mocks `_detect_stale_summaries_with_edges` to return `StaleSummaryResult(stale=[], all_edges={}, total_count=0)` and asserts `await backend.detect_stale_summaries(group_id='t') == []`. Documents that the function makes no non-empty assumption and guards against a future filter-before-return refactor.\n\nVerify by running: `pytest fused-memory/tests/test_stale_summary_named_access_438.py fused-memory/tests/test_graphiti_quality_433.py -x`\n\nMemory hints: search for \"test_stale_summary_named_access_438\" and \"StaleSummaryResult\".",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "467",
+        "title": "Fix import convention violations and reduce test boilerplate in burndown tests",
+        "description": "Move all deferred `from dashboard.config import DashboardConfig` imports to module top-level in both `dashboard/tests/test_scaffold.py` and `dashboard/tests/test_burndown_data.py`. In test_burndown_data.py, also add a `@pytest.fixture` (or `@pytest.fixture` async) that provides the common `(db_path, config, conn)` setup shared by all five `TestCollectSnapshot` methods — each currently repeats `_create_burndown_db`, `DashboardConfig(project_root=tmp_path)`, `aiosqlite.connect`, and the two-patch block inline.\n\nFiles:\n- dashboard/tests/test_burndown_data.py\n- dashboard/tests/test_scaffold.py\n\nSource: review suggestions on task 450 (burndown known_project_roots feature).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "468",
+        "title": "Remove redundant test_known_project_roots_is_list_not_tuple",
+        "description": "Delete `test_known_project_roots_is_list_not_tuple` from `dashboard/tests/test_scaffold.py` (lines 31-35). The adjacent `test_known_project_roots_default_empty_list` asserts `cfg.known_project_roots == []`, which already proves the list type (a tuple can never equal `[]`).\n\nFiles:\n- dashboard/tests/test_scaffold.py\n\nSource: review suggestions on task 450.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "469",
+        "title": "Fix path-normalization consistency bug in collect_snapshot deduplication",
+        "description": "In `dashboard/src/dashboard/data/burndown.py` line 73, change `seen_roots: set[str] = {str(config.project_root)}` to `seen_roots: set[str] = {str(config.project_root.resolve())}`. Also use this resolved string as the `project_id` in the main-project INSERT (line 80). This ensures deduplication is consistent with both the orchestrator loop (which calls `.resolve()` internally via `_resolve_project_root`/`_read_project_root_from_config`) and the known_project_roots loop (line 129).\n\nOptionally, pre-resolve `known_project_roots` at `DashboardConfig` construction time in `config.py` `from_env()` (line 73) to avoid repeated `lstat` syscalls on every snapshot cycle.\n\nFiles:\n- dashboard/src/dashboard/config.py\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 450 — without this, a symlinked `config.project_root` will silently produce duplicate snapshot rows.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "470",
+        "title": "Parallelize load_task_tree calls with asyncio.gather in collect_snapshot",
+        "description": "In `dashboard/src/dashboard/data/burndown.py`, replace the sequential `asyncio.to_thread` dispatches in the `known_project_roots` loop (lines 127-149) — and optionally the orchestrator loop (lines 92-123) — with a single `asyncio.gather(...)` collecting all independent `asyncio.to_thread(load_task_tree, ...)` calls before iterating results. The roots are fully enumerated before the loop, so all reads are independent.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 450 (reviewer_performance).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "471",
+        "title": "Extract _insert_snapshot_for_root helper to remove INSERT duplication in collect_snapshot",
+        "description": "In `dashboard/src/dashboard/data/burndown.py`, extract a private coroutine `async def _insert_snapshot_for_root(conn, root_str: str, tasks_json: Path, now: str) -> None` that calls `load_task_tree`, `_count_statuses`, and executes the INSERT. Hoist the INSERT SQL to a module-level constant. Replace the three inline copy-pasted INSERT blocks (lines 76-89, 110-122, 136-148) with calls to this helper.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 450 (reviewer_reuse_auditor).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "472",
+        "title": "Improve burndown test coverage: count columns, dedup assertion, error-mode tests",
+        "description": "Three test improvements in `dashboard/tests/test_burndown_data.py`:\n\n1. `test_snapshots_known_project_roots_when_no_orchestrators` (lines 193-200): change `SELECT project_id` to `SELECT *` and add assertions on count columns for the reify row (done==2) and autopilot row (in_progress==1). As written, a bug zeroing out counts for known roots would go undetected.\n\n2. `test_dedupes_known_root_against_main_project` (lines 221-226): replace `SELECT COUNT(*) FROM snapshots WHERE project_id = ?` with `SELECT COUNT(*) FROM snapshots` (no WHERE) to catch the case where two rows with different project_id strings are inserted for the same physical directory (symlink-based false negative).\n\n3. Add a new test that patches `load_task_tree` to raise `PermissionError` on the known-root call and asserts either: (a) `collect_snapshot` propagates the exception, or (b) if per-root error handling is added (see robustness task), that the main-project row is still committed and the failing root is skipped.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n- dashboard/tests/test_burndown_data.py\n\nSource: review suggestions on task 450 (reviewer_test_analyst).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "473",
+        "title": "Add per-root error isolation for PermissionError in known_project_roots loop",
+        "description": "In `dashboard/src/dashboard/data/burndown.py` lines 127-149, wrap each known root's `asyncio.to_thread(load_task_tree, ...)` call and INSERT in a `try/except OSError` block that logs a warning and `continue`s to the next root. This prevents a single unreadable `tasks.json` from unwinding the entire `collect_snapshot` coroutine and dropping all snapshots for the cycle before `conn.commit()` (line 151).\n\nAlternatively, broaden the `except` inside `load_task_tree` itself to catch all `OSError` so all callers benefit. Match the graceful-degradation pattern already used by `get_burndown_projects` and `get_burndown_series`.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 450 (reviewer_robustness). Risk grows linearly with the number of configured known roots.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T17:19:17.893Z",
-      "taskCount": 435,
-      "completedCount": 396,
+      "lastModified": "2026-04-06T18:45:54.364Z",
+      "taskCount": 452,
+      "completedCount": 404,
       "tags": [
         "master"
       ]

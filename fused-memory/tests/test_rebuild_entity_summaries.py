@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.backends.graphiti_client import GraphitiBackend, StaleSummaryResult
 
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.list_entity_nodes
@@ -255,13 +255,12 @@ class TestRebuildEntitySummaries:
         Total entities=2, stale=1, rebuilt=1.
         """
         backend = make_backend(mock_config)
-        # _detect_stale_summaries_with_edges returns (stale_list, all_edges_dict, total_count)
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=(
-            [{'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale',
-              'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
-              'summary_line_count': 1}],
-            {'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
-            2,
+        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=StaleSummaryResult(
+            stale=[{'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale',
+                    'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
+                    'summary_line_count': 1}],
+            all_edges={'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
+            total_count=2,
         ))
         backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test')
@@ -293,8 +292,9 @@ class TestRebuildEntitySummaries:
     async def test_returns_aggregate_result(self, mock_config, make_backend):
         """Returns dict with total_entities, stale_entities, rebuilt, skipped, errors, details."""
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[])
-        backend.get_all_valid_edges = AsyncMock(return_value={})
+        backend._detect_stale_summaries_with_edges = AsyncMock(
+            return_value=StaleSummaryResult(stale=[], all_edges={}, total_count=0)
+        )
         result = await backend.rebuild_entity_summaries(group_id='test')
         assert set(result.keys()) == {'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors', 'details'}
 
@@ -308,8 +308,8 @@ class TestRebuildEntitySummaries:
         Alice's update_node_summary raises RuntimeError; Bob's succeeds.
         """
         backend = make_backend(mock_config)
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=(
-            [
+        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=StaleSummaryResult(
+            stale=[
                 {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1',
                  'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
                  'summary_line_count': 1},
@@ -317,11 +317,11 @@ class TestRebuildEntitySummaries:
                  'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
                  'summary_line_count': 1},
             ],
-            {
+            all_edges={
                 'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
                 'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
             },
-            2,
+            total_count=2,
         ))
         # Entity 1 fails at update_node_summary; entity 2 succeeds
         backend.update_node_summary = AsyncMock(side_effect=[
@@ -360,12 +360,12 @@ class TestRebuildEntitySummaries:
         to bypass _rebuild_entity_from_edges and call those methods directly.
         """
         backend = make_backend(mock_config)
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=(
-            [{'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale',
-              'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
-              'summary_line_count': 1}],
-            {'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
-            1,
+        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=StaleSummaryResult(
+            stale=[{'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale',
+                    'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
+                    'summary_line_count': 1}],
+            all_edges={'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
+            total_count=1,
         ))
         backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test', dry_run=True)
@@ -884,6 +884,42 @@ class TestRebuildEntitySummariesParallel:
         assert result['rebuilt'] == 2
 
     @pytest.mark.asyncio
+    async def test_force_list_entity_nodes_called_exactly_once(
+        self, mock_config, make_backend
+    ):
+        """Force path: list_entity_nodes is awaited exactly once (single bulk fetch).
+
+        Uses three distinct entities with distinct facts so a regression that returns
+        uuid-1 data for every call would produce incorrect per-entity summaries and
+        fail the final per-uuid assertions.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'summary-1'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'summary-2'},
+            {'uuid': 'uuid-3', 'name': 'Carol', 'summary': 'summary-3'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'fact-1', 'name': 'rel-1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'fact-2', 'name': 'rel-2'}],
+            'uuid-3': [{'uuid': 'e3', 'fact': 'fact-3', 'name': 'rel-3'}],
+        })
+        backend.update_node_summary = AsyncMock()
+
+        result = await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+        # list_entity_nodes must be called exactly once — no per-entity re-fetch
+        backend.list_entity_nodes.assert_awaited_once()
+        assert result['total_entities'] == 3
+        assert result['rebuilt'] == 3
+
+        # Each entity must carry its own edge data, not uuid-1's data for every entry
+        by_uuid = {d['uuid']: d for d in result['details']}
+        assert by_uuid['uuid-1']['new_summary'] == 'fact-1'
+        assert by_uuid['uuid-2']['new_summary'] == 'fact-2'
+        assert by_uuid['uuid-3']['new_summary'] == 'fact-3'
+
+    @pytest.mark.asyncio
     async def test_concurrent_all_five_entities_processed(self, mock_config, make_backend):
         """With 5 target entities, all 5 get update_node_summary calls (parallel processing)."""
         n = 5
@@ -950,8 +986,8 @@ class TestRebuildEntitySummariesParallel:
         """Non-force path: old_summary from _detect_stale_summaries_with_edges stale dict
         is passed to _rebuild_entity_from_edges and get_node_text is never called."""
         backend = make_backend(mock_config)
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=(
-            [
+        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=StaleSummaryResult(
+            stale=[
                 {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'alice stale',
                  'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 1,
                  'summary_line_count': 1},
@@ -959,11 +995,11 @@ class TestRebuildEntitySummariesParallel:
                  'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 1,
                  'summary_line_count': 1},
             ],
-            {
+            all_edges={
                 'uuid-1': [{'uuid': 'e1', 'fact': 'alice current', 'name': 'edge1'}],
                 'uuid-2': [{'uuid': 'e2', 'fact': 'bob current', 'name': 'edge2'}],
             },
-            2,
+            total_count=2,
         ))
         backend.get_node_text = AsyncMock()
         backend.update_node_summary = AsyncMock()
@@ -1042,3 +1078,33 @@ class TestRebuildEntityFromEdgesOldSummary:
         assert result['uuid'] == 'uuid-1'
         assert result['name'] == 'Alice'
         backend.get_node_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prefetched_edges_produce_correct_summary(
+        self, mock_config, make_backend
+    ):
+        """edge_count == len(raw edges) while new_summary deduplicates facts via _canonical_facts.
+
+        3 raw edges with 1 duplicate → edge_count=3, but only 2 unique facts in new_summary.
+        This documents that edge_count and unique-fact count are intentionally different
+        concepts so future maintainers do not misread edge_count as a deduplicated count.
+        """
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock()
+        backend.update_node_summary = AsyncMock()
+
+        edges = [
+            {'uuid': 'e1', 'fact': 'Alice knows Bob', 'name': 'knows'},
+            {'uuid': 'e2', 'fact': 'Alice knows Bob', 'name': 'knows'},   # duplicate
+            {'uuid': 'e3', 'fact': 'Alice works at Acme', 'name': 'works_at'},
+        ]
+        result = await backend._rebuild_entity_from_edges(
+            'uuid-1', 'Alice', edges, group_id='test', old_summary='prior'
+        )
+
+        assert result['edge_count'] == 3
+        unique_facts = result['new_summary'].split('\n')
+        assert len(unique_facts) == 2
+        assert set(unique_facts) == {'Alice knows Bob', 'Alice works at Acme'}
+        # Explicitly document that these are intentionally different values
+        assert result['edge_count'] != len(unique_facts)

@@ -22,6 +22,18 @@ class TestConfigDefaults:
         assert cfg.project_root == Path('/home/leo/src/dark-factory')
         assert cfg.fused_memory_urls == list(DEFAULT_FUSED_MEMORY_URLS)
 
+    def test_known_project_roots_default_empty_list(self):
+        from dashboard.config import DashboardConfig
+
+        cfg = DashboardConfig()
+        assert cfg.known_project_roots == []
+
+    def test_known_project_roots_is_list_not_tuple(self):
+        from dashboard.config import DashboardConfig
+
+        cfg = DashboardConfig()
+        assert isinstance(cfg.known_project_roots, list)
+
     def test_config_derived_paths(self):
         from dashboard.config import DashboardConfig
 
@@ -82,6 +94,44 @@ class TestConfigEnvOverrides:
         monkeypatch.setenv('DASHBOARD_FUSED_MEMORY_URLS', ',http://a:1,,http://b:2,')
         cfg = DashboardConfig.from_env()
         assert cfg.fused_memory_urls == ['http://a:1', 'http://b:2']
+
+    def test_known_project_roots_single(self, monkeypatch):
+        from dashboard.config import DashboardConfig
+
+        monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', '/home/leo/src/reify')
+        cfg = DashboardConfig.from_env()
+        assert cfg.known_project_roots == [Path('/home/leo/src/reify')]
+
+    def test_known_project_roots_comma_separated(self, monkeypatch):
+        from dashboard.config import DashboardConfig
+
+        monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', '/a,/b')
+        cfg = DashboardConfig.from_env()
+        assert cfg.known_project_roots == [Path('/a'), Path('/b')]
+
+    def test_known_project_roots_extra_commas_and_whitespace(self, monkeypatch):
+        from dashboard.config import DashboardConfig
+
+        monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', ' ,/a, , /b , ')
+        cfg = DashboardConfig.from_env()
+        assert cfg.known_project_roots == [Path('/a'), Path('/b')]
+
+    def test_known_project_roots_empty_string(self, monkeypatch):
+        from dashboard.config import DashboardConfig
+
+        monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', '')
+        cfg = DashboardConfig.from_env()
+        assert cfg.known_project_roots == []
+
+    def test_known_project_roots_unset_preserves_default(self, monkeypatch):
+        from dashboard.config import DashboardConfig
+
+        monkeypatch.setenv('DASHBOARD_HOST', '0.0.0.0')
+        # DASHBOARD_KNOWN_PROJECT_ROOTS is intentionally NOT set
+        cfg = DashboardConfig.from_env()
+        assert cfg.known_project_roots == []
+        # verify other overrides still apply
+        assert cfg.host == '0.0.0.0'
 
     def test_env_derived_paths_update(self, monkeypatch):
         from dashboard.config import DashboardConfig

@@ -28,12 +28,12 @@ class StaleSummaryResult(NamedTuple):
     """Structured return type for _detect_stale_summaries_with_edges.
 
     Inherits from tuple for full backward-compatibility: callers using
-    ``stale, edges, total = await self._detect_stale_summaries_with_edges(...)``
+    ``stale, all_edges, total = await self._detect_stale_summaries_with_edges(...)``
     continue to work unchanged.
     """
 
     stale: list[dict]
-    edges: dict[str, list[dict]]
+    all_edges: dict[str, list[dict]]
     total_count: int
 
 
@@ -904,7 +904,7 @@ class GraphitiBackend:
                 'valid_fact_count': len(valid_facts),
                 'summary_line_count': len(summary_lines),
             })
-        return StaleSummaryResult(stale=stale, edges=all_edges, total_count=len(entities))
+        return StaleSummaryResult(stale=stale, all_edges=all_edges, total_count=len(entities))
 
     async def detect_stale_summaries(self, *, group_id: str) -> list[dict]:
         """Identify Entity nodes whose summary is out of sync with valid edge facts.
@@ -932,8 +932,8 @@ class GraphitiBackend:
             duplicate_count, stale_line_count, valid_fact_count,
             summary_line_count.
         """
-        stale, _, _ = await self._detect_stale_summaries_with_edges(group_id=group_id)
-        return stale
+        result = await self._detect_stale_summaries_with_edges(group_id=group_id)
+        return result.stale
 
     async def _rebuild_entity_from_edges(
         self, uuid: str, name: str, edges: list[dict], *, group_id: str,
@@ -1024,7 +1024,10 @@ class GraphitiBackend:
             if not dry_run:
                 all_edges = await self.get_all_valid_edges(group_id=group_id)
         else:
-            stale, all_edges, total_entities = await self._detect_stale_summaries_with_edges(group_id=group_id)
+            result = await self._detect_stale_summaries_with_edges(group_id=group_id)
+            stale = result.stale
+            all_edges = result.all_edges
+            total_entities = result.total_count
             targets = [{'uuid': s['uuid'], 'name': s['name'], 'old_summary': s['summary']} for s in stale]
 
         stale_entities = len(targets)

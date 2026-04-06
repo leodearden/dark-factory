@@ -29,38 +29,39 @@ class TestStaleSummaryResult:
         """StaleSummaryResult.stale holds the stale list."""
         stale_list = [{'uuid': 'u1', 'name': 'Alice'}]
         edges = {'u1': [{'fact': 'fact1'}]}
-        result = StaleSummaryResult(stale=stale_list, edges=edges, total_count=5)
+        result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=5)
         assert result.stale is stale_list
 
-    def test_named_attribute_edges(self):
-        """StaleSummaryResult.edges holds the edges dict."""
+    def test_named_attribute_all_edges(self):
+        """StaleSummaryResult.all_edges holds the edges dict."""
         stale_list: list[dict] = []
         edges = {'u1': [{'fact': 'fact1'}]}
-        result = StaleSummaryResult(stale=stale_list, edges=edges, total_count=3)
-        assert result.edges is edges
+        result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=3)
+        assert result.all_edges is edges
 
     def test_named_attribute_total_count(self):
         """StaleSummaryResult.total_count holds the total entity count."""
-        result = StaleSummaryResult(stale=[], edges={}, total_count=42)
+        result = StaleSummaryResult(stale=[], all_edges={}, total_count=42)
         assert result.total_count == 42
 
     def test_tuple_unpacking_backward_compat(self):
         """StaleSummaryResult supports 3-tuple unpacking (backward compat)."""
         stale_list = [{'uuid': 'u1'}]
         edges = {'u1': []}
-        result = StaleSummaryResult(stale=stale_list, edges=edges, total_count=7)
+        result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=7)
         a, b, c = result
         assert a is stale_list
         assert b is edges
         assert c == 7
 
     def test_is_tuple_subclass(self):
-        """StaleSummaryResult IS a tuple — plain tuple equality works."""
+        """StaleSummaryResult compares value-equal to a plain 3-tuple (backward-compat promise)."""
         stale_list = [{'uuid': 'u1'}]
         edges: dict = {}
-        result = StaleSummaryResult(stale=stale_list, edges=edges, total_count=1)
-        # Plain tuple comparison (existing mock code uses this implicitly)
-        assert isinstance(result, tuple)
+        result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=1)
+        # Value-equality with a plain tuple proves the NamedTuple backward-compat promise:
+        # only actual tuple subclasses compare equal to plain tuples this way.
+        assert result == (stale_list, edges, 1)
 
     @pytest.mark.asyncio
     async def test_detect_stale_summaries_returns_named_result(self, mock_config, make_backend):
@@ -78,7 +79,7 @@ class TestStaleSummaryResult:
         assert isinstance(result, StaleSummaryResult)
         assert result.total_count == 1
         assert isinstance(result.stale, list)
-        assert isinstance(result.edges, dict)
+        assert isinstance(result.all_edges, dict)
 
         # Positional (backward compat)
         stale, edges, total = result
@@ -136,6 +137,24 @@ class TestCanonicalFacts:
         assert isinstance(result, list)
         assert result == ['A', 'B']
 
+    def test_whitespace_only_fact_is_kept(self):
+        """Whitespace-only facts are KEPT, not filtered.
+
+        The filter is ``if e.get('fact')`` which tests Python truthiness.
+        A non-empty string like '   ' is truthy even though it contains only
+        spaces, so it passes the filter and is included in the result.
+
+        This test documents *current* behavior. Any future decision to strip
+        whitespace-only facts would be a deliberate change and would require
+        updating this test explicitly.
+        """
+        edges = [
+            {'fact': '   '},    # whitespace-only — truthy, so kept
+            {'fact': 'A knows B'},
+        ]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == ['   ', 'A knows B']
+
 
 # ---------------------------------------------------------------------------
 # step-5: refresh_entity_summary optional name/old_summary params
@@ -183,6 +202,12 @@ class TestRefreshEntitySummaryOptionalParams:
         backend.get_node_text.assert_not_called()
         assert result['name'] == 'Alice'
         assert result['old_summary'] == 'stale summary'
+        # Verify the summary actually written matches the joined canonical facts.
+        # _canonical_facts([{'fact': 'Alice knows Bob'}]) == ['Alice knows Bob'],
+        # joined with '\n' gives 'Alice knows Bob'.
+        backend.update_node_summary.assert_awaited_once_with(
+            'u1', 'Alice knows Bob', group_id='test'
+        )
 
     @pytest.mark.asyncio
     async def test_get_node_text_called_when_neither_provided(self, mock_config, make_backend):
@@ -249,6 +274,32 @@ class TestRebuildEntitySummariesForceDryRun:
         for detail in result['details']:
             assert detail['status'] == 'skipped_dry_run'
 
+    @pytest.mark.asyncio
+    async def test_force_no_dry_run_calls_get_all_valid_edges(self, mock_config, make_backend):
+        """Positive complement: force=True, dry_run=False calls get_all_valid_edges exactly once.
+
+        This is the paired positive case for test_force_dry_run_does_not_call_get_all_valid_edges.
+        When dry_run=False the edges ARE needed for the actual rebuild, so
+        get_all_valid_edges must be called before processing entities.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        # Mock the inner rebuild to avoid touching real write path
+        backend._rebuild_entity_from_edges = AsyncMock(return_value={
+            'uuid': 'u1', 'name': 'Alice',
+            'old_summary': '', 'new_summary': '', 'edge_count': 0,
+        })
+
+        await backend.rebuild_entity_summaries(
+            group_id='test', force=True, dry_run=False
+        )
+
+        backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
+
 
 # ---------------------------------------------------------------------------
 # step-9: regression – rebuild_entity_summaries(force=False) data flow
@@ -267,7 +318,7 @@ class TestRebuildEntitySummariesDataFlow:
         all_edges = {'u1': [{'fact': 'Alice knows Bob'}]}
         # total_count=10 means 10 entities exist but only 1 is stale
         detect_result = StaleSummaryResult(
-            stale=stale_list, edges=all_edges, total_count=10
+            stale=stale_list, all_edges=all_edges, total_count=10
         )
         backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
         backend._rebuild_entity_from_edges = AsyncMock(return_value={
@@ -290,11 +341,11 @@ class TestRebuildEntitySummariesDataFlow:
 
         backend = make_backend(mock_config)
         stale_list = [
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'old-a'},
-            {'uuid': 'u2', 'name': 'Bob', 'summary': 'old-b'},
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'old A'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'old B'},
         ]
         detect_result = StaleSummaryResult(
-            stale=stale_list, edges={}, total_count=7
+            stale=stale_list, all_edges={}, total_count=7
         )
         backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
 
@@ -306,3 +357,40 @@ class TestRebuildEntitySummariesDataFlow:
         assert result['stale_entities'] == 2
         assert result['skipped'] == 2
         assert result['rebuilt'] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-5 (task 443): error-accumulation path in rebuild_entity_summaries
+# ---------------------------------------------------------------------------
+
+class TestRebuildEntitySummariesErrorHandling:
+    """rebuild_entity_summaries records per-entity errors without raising."""
+
+    @pytest.mark.asyncio
+    async def test_rebuild_entity_error_recorded_in_result(self, mock_config, make_backend):
+        """When _rebuild_entity_from_edges raises, errors counter increments and details record it.
+
+        rebuild_entity_summaries uses asyncio.gather(return_exceptions=True) so a
+        per-entity failure does not abort the whole batch. Each exception is captured
+        into result['errors'] and result['details'] with status='error'.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'stale summary'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        # Simulate _rebuild_entity_from_edges failing for this entity
+        backend._rebuild_entity_from_edges = AsyncMock(
+            side_effect=RuntimeError('boom')
+        )
+
+        result = await backend.rebuild_entity_summaries(
+            group_id='test', force=True, dry_run=False
+        )
+
+        assert result['errors'] == 1
+        assert result['rebuilt'] == 0
+        assert len(result['details']) == 1
+        detail = result['details'][0]
+        assert detail['status'] == 'error'
+        assert detail['error'] == 'boom'
