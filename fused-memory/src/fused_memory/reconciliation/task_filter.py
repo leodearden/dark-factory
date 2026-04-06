@@ -187,6 +187,8 @@ def format_filtered_task_tree(
     if len(result) > max_chars and active:
         task_lines = body.rstrip('\n').split('\n')
         budget = max_chars - len(header) - len(summary_line) - 50  # 50 chars for truncation notice
+        if budget <= 0:
+            return header + summary_line
         kept_lines: list[str] = []
         used = 0
         for line in task_lines:
