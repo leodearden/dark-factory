@@ -9401,6 +9401,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 473,
+        "title": "Add per-root error isolation for PermissionError in known_project_roots loop",
+        "description": "In `dashboard/src/dashboard/data/burndown.py` lines 127-149, wrap each known root's `asyncio.to_thread(load_task_tree, ...)` call and INSERT in a `try/except OSError` block that logs a warning and `continue`s to the next root. This prevents a single unreadable `tasks.json` from unwinding the entire `collect_snapshot` coroutine and dropping all snapshots for the cycle before `conn.commit()` (line 151).\n\nAlternatively, broaden the `except` inside `load_task_tree` itself to catch all `OSError` so all callers benefit. Match the graceful-degradation pattern already used by `get_burndown_projects` and `get_burndown_series`.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 450 (reviewer_robustness). Risk grows linearly with the number of configured known roots.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9413,7 +9424,7 @@
       ],
       "created": "2026-04-06T18:12:21.797Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T18:12:50.156Z"
+      "updated": "2026-04-06T18:12:55.028Z"
     }
   }
 }
