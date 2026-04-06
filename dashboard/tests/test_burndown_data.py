@@ -138,6 +138,39 @@ class TestCollectSnapshot:
         assert row[8] == 2   # done
 
     @pytest.mark.asyncio
+    async def test_symlinked_root_deduplicates_with_orchestrator(self, tmp_path):
+        """Symlinked project_root and orchestrator resolving to real path produce only 1 row."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        from dashboard.config import DashboardConfig
+        config = DashboardConfig(project_root=link)
+
+        # Orchestrator resolves the same project via _resolve_project_root to the real path
+        fake_orchestrators = [{'prd': 'fake_prd.md', 'config_path': None}]
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
+                patch('dashboard.data.burndown._resolve_project_root', return_value=real_dir.resolve()),
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+                row = await cur.fetchone()
+                assert row is not None
+                count = row[0]
+
+        # Only 1 row — symlink and real path should deduplicate
+        assert count == 1
+
+    @pytest.mark.asyncio
     async def test_deduplicates_main_project_from_orchestrators(self, tmp_path):
         """If an orchestrator targets the same root, only one row is inserted."""
         db_path = tmp_path / 'burndown.db'
