@@ -10134,6 +10134,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 526,
+        "title": "Add test and fix for O(E) edge-fetch waste in force=False dry_run=True path",
+        "description": "In fused-memory/fused_memory/backends/graphiti_client.py and fused-memory/tests/test_graphiti_quality_433.py:\n\n1. Add a test (parametrised or standalone in TestRebuildEntitySummariesDataFlow) for force=False, dry_run=True that does NOT mock _detect_stale_summaries_with_edges and instead asserts that get_all_valid_edges is NOT called. This test should currently FAIL, exposing the inefficiency.\n\n2. Fix the production code: before calling _detect_stale_summaries_with_edges, check if dry_run=True and use a cheaper staleness probe that does not pre-fetch the full edge map when the results will never be consumed.\n\nBackground: The force=True path correctly guards get_all_valid_edges behind `if not dry_run`, but the force=False path calls `_detect_stale_summaries_with_edges` which unconditionally fetches the full edge map — wasted O(E) I/O when dry_run=True means the edges are never consumed.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10146,7 +10157,7 @@
       ],
       "created": "2026-04-06T22:41:59.729Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:42:12.959Z"
+      "updated": "2026-04-06T22:42:19.610Z"
     }
   }
 }
