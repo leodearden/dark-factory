@@ -8557,7 +8557,17 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "fused-memory/src/fused_memory/backends/graphiti_client.py",
+            "fused-memory/tests/test_refresh_entity_summary.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/tests"
+          ]
+        }
       },
       {
         "id": 430,
@@ -8568,7 +8578,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "fused-memory/src/fused_memory/backends/graphiti_client.py"
+          ],
+          "modules": [
+            "fused-memory/src/fused_memory/backends"
+          ]
+        }
       },
       {
         "id": 431,
