@@ -10417,6 +10417,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 544,
+        "title": "Improve error-propagation test: fixture reuse, ordering comment, main-project sibling",
+        "description": "Three independent improvements to the new test_propagates_load_task_tree_error_for_known_root test in dashboard/tests/test_burndown_data.py (~lines 289-336):\n\n1. Use the existing burndown_env / db setup fixture instead of repeating db_path/_create_burndown_db/DashboardConfig setup boilerplate that already appears in 4+ other tests in TestCollectSnapshot. Optionally extract a `burndown_conn` pytest fixture mirroring the session-scoped pattern in TestGetBurndownSeries.\n\n2. Add an inline comment above `side_effect=[[], PermissionError(...)]` documenting that index 0 is the main-project call and index 1 is the known-root call, and reference the specific lines in burndown.py (~74 main-project, ~134 known-root). Alternatively, assert `mock.call_args_list` after the exception to verify the second call targeted the known-root tasks.json path, making the ordering dependency explicit.\n\n3. Add a sibling test `test_propagates_load_task_tree_error_for_main_project` that patches `load_task_tree` with `side_effect=PermissionError(...)` (raises on the very first call), asserting both the exception propagation and zero committed rows via a fresh connection. This covers the atomicity guarantee on the first-call failure path.\n\nSource: review suggestions on task 472 (reviewers reuse_auditor, robustness, test_analyst).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10429,7 +10440,7 @@
       ],
       "created": "2026-04-06T23:18:09.379Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T23:18:18.063Z"
+      "updated": "2026-04-06T23:18:28.415Z"
     }
   }
 }
