@@ -9186,7 +9186,7 @@
         "description": "The fused-memory dead letter queue (DLQ) has grown monotonically from 6 (pre-Task 401) → 37 (during Task 401) → 30 (2026-04-02 baseline, run baed7766) → 55 (2026-04-06, run 94151a78). Task 401 (Fix Mem0 search regression) is marked done, but post-fix DLQ replay was never confirmed. No active task tracks the DLQ backlog.\n\n## Investigation steps\n1. Call `get_queue_stats` to inspect current DLQ contents and patterns\n2. Call `replay_dead_letters` to attempt replay of valid dead letters\n3. Examine replay outcomes — track success vs persistent failure\n4. For persistently-failing dead letters: inspect error patterns, determine if purgeable\n5. Call `replay_dead_letters` again or `purge` genuinely invalid entries\n6. Confirm post-remediation DLQ count drops\n7. Write a memory recording the final DLQ count and any patterns found\n\n## Context\n- DLQ grew during Mem0 search regression period — dead letters may be failed Mem0 writes\n- Mem0 search is now operational (search returns results), so replayed writes should succeed\n- If DLQ entries are Graphiti writes, check if entities already exist (idempotent replay)\n- The fused-memory MCP exposes `replay_dead_letters` and `get_queue_stats` tools\n\n## memory_hints\n- search: \\\"dead letter queue DLQ growth Mem0 write failures\\\"\n- search: \\\"DLQ baseline 55 dead letters 2026-04-06\\\"\n- search: \\\"replay dead letters DurableWriteQueue fused-memory\\\"\n- entity: \\\"DurableWriteQueue\\\" — write queue implementation details\n- task: 401 — Mem0 search fix context (DLQ grew during this period)",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -9223,7 +9223,7 @@
           "reconciliation_note": "stage2 (run 4eddd6c4): outer priority field is still medium — PERPLEXITY_API_KEY not set, blocking prompt-based update_task; metadata.priority correctly=high; inline SAFETY note for step 2 also blocked by same missing key; manual fix required: set outer priority=high and prepend to step 2: 'SAFETY: Inspect error types before bulk replay — Vector dimension mismatch 1536→1024 entries were generated before task 88 rebuilt the FalkorDB index (done 2026-03-21+). Verify current index dimension before bulk-replaying these entries.'",
           "stage2_blocker": "PERPLEXITY_API_KEY not set; prompt-based update_task unavailable; outer priority and description edits require manual intervention or API key setup"
         },
-        "updatedAt": "2026-04-06T17:59:02.424Z"
+        "updatedAt": "2026-04-06T18:31:40.498Z"
       },
       {
         "id": "457",
@@ -9416,9 +9416,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T18:13:10.083Z",
+      "lastModified": "2026-04-06T18:31:40.499Z",
       "taskCount": 452,
-      "completedCount": 400,
+      "completedCount": 401,
       "tags": [
         "master"
       ]
