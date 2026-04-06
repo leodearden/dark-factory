@@ -325,11 +325,11 @@ class TestCollectSnapshot:
         # uncommitted in-flight transaction state (SQLite read-your-own-writes).
         # conn.commit() was never reached, so the implicit transaction is rolled back
         # when the connection closes.
-        async with aiosqlite.connect(str(db_path)) as fresh_conn:
-            async with fresh_conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
-                row = await cur.fetchone()
-                assert row is not None
-                assert row[0] == 0
+        async with aiosqlite.connect(str(db_path)) as fresh_conn, \
+                fresh_conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+            row = await cur.fetchone()
+            assert row is not None
+            assert row[0] == 0
 
     @pytest.mark.asyncio
     async def test_discovers_config_flag_orchestrator(self, tmp_path):
