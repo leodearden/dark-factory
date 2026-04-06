@@ -92,7 +92,7 @@ class TestRebuildEntitySummariesNamedAccess:
     async def test_rebuild_entity_summaries_named_access(self, mock_config, make_backend):
         """rebuild_entity_summaries routes per-entity edges from result.all_edges correctly."""
         backend = make_backend(mock_config)
-        stale_list = [{'uuid': 'u1', 'name': 'A', 'summary': 'old'}]
+        stale_list = [{'uuid': 'u1', 'name': 'A', 'summary': 'old', 'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 1, 'summary_line_count': 1}]
         per_entity_edges = [{'fact': 'new'}]
         all_edges = {'u1': per_entity_edges}
 
