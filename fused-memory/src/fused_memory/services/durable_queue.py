@@ -410,6 +410,63 @@ class DurableWriteQueue:
             'oldest_pending_age_seconds': oldest_pending_age,
         }
 
+    async def purge_dead(
+        self,
+        *,
+        group_id: str | None = None,
+        error_pattern: str | None = None,
+        ids: list[int] | None = None,
+        confirm_purge_all: bool = False,
+    ) -> int:
+        """Permanently delete dead-lettered items. Returns count deleted.
+
+        Requires at least one filter (group_id, error_pattern, or ids) unless
+        confirm_purge_all=True is explicitly passed (safety rail against mass-delete).
+
+        Args:
+            group_id: Delete only dead items with this group_id.
+            error_pattern: Delete only dead items whose error matches this SQL
+                LIKE pattern (e.g. 'NodeNotFoundError%').
+            ids: Delete only dead items with these specific row ids.
+            confirm_purge_all: When True, bypass the filter requirement and
+                delete ALL dead items.
+
+        Returns:
+            Number of rows deleted.
+
+        Raises:
+            ValueError: When no filter is supplied and confirm_purge_all is False.
+        """
+        assert self._db is not None
+        has_filter = group_id is not None or error_pattern is not None or ids is not None
+        if not has_filter and not confirm_purge_all:
+            raise ValueError(
+                'purge_dead requires at least one filter or confirm_purge_all=True'
+            )
+
+        sql = "DELETE FROM write_queue WHERE status = 'dead'"
+        params: list[Any] = []
+
+        if group_id is not None:
+            sql += ' AND group_id = ?'
+            params.append(group_id)
+        if error_pattern is not None:
+            sql += ' AND error LIKE ?'
+            params.append(error_pattern)
+        if ids is not None:
+            placeholders = ','.join('?' * len(ids))
+            sql += f' AND id IN ({placeholders})'
+            params.extend(ids)
+
+        cursor = await self._db.execute(sql, params)
+        await self._db.commit()
+        count = cursor.rowcount or 0
+        logger.info(
+            'purge_dead deleted %d item(s) [group_id=%r, error_pattern=%r, ids=%r]',
+            count, group_id, error_pattern, ids,
+        )
+        return count
+
     async def get_dead_items(self, group_id: str | None = None) -> list[dict[str, Any]]:
         """Return dead-lettered items."""
         assert self._db is not None
