@@ -416,6 +416,7 @@ class TestRebuildEntitySummariesErrorHandling:
 
         assert result['errors'] == 1
         assert result['rebuilt'] == 0
+        assert result['skipped'] == 0
         assert result['total_entities'] == 1
         assert result['stale_entities'] == 1
         assert len(result['details']) == 1
@@ -443,7 +444,7 @@ class TestRebuildEntitySummariesErrorHandling:
         backend._rebuild_entity_from_edges = AsyncMock(
             side_effect=[
                 RuntimeError('boom'),
-                {'uuid': 'u2', 'name': 'Bob', 'old_summary': '', 'new_summary': 'rebuilt', 'edge_count': 0},
+                {'uuid': 'u2', 'name': 'Bob', 'old_summary': 'stale summary 2', 'new_summary': 'Bob summary v2', 'edge_count': 3},
             ]
         )
 
@@ -453,6 +454,7 @@ class TestRebuildEntitySummariesErrorHandling:
 
         assert result['errors'] == 1
         assert result['rebuilt'] == 1
+        assert result['skipped'] == 0
         assert result['total_entities'] == 2
         assert result['stale_entities'] == 2
         assert len(result['details']) == 2
@@ -467,6 +469,120 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['status'] == 'rebuilt'
         assert ok_detail['uuid'] == 'u2'
         assert ok_detail['name'] == 'Bob'
+        assert ok_detail['old_summary'] == 'stale summary 2'
+        assert ok_detail['new_summary'] == 'Bob summary v2'
+        assert ok_detail['edge_count'] == 3
+
+        # Verify the implementation forwards the entity's summary as old_summary
+        # into _rebuild_entity_from_edges (not just trusting the mock return value).
+        # This pins down the entity→target→helper data-forwarding path.
+        backend._rebuild_entity_from_edges.assert_any_call(
+            'u2', 'Bob', [], group_id='test', old_summary='stale summary 2'
+        )
+
+    @pytest.mark.asyncio
+    async def test_force_false_partial_error_uses_detect_total(self, mock_config, make_backend):
+        """force=False error path: total_entities flows from StaleSummaryResult.total_count.
+
+        This exercises the force=False bookkeeping path where total_entities comes
+        from _detect_stale_summaries_with_edges (result.total_count=5), which is
+        independent of stale_entities (=len(targets)=2). This path is not reachable
+        via force=True — in that branch total_entities = len(list_entity_nodes()).
+
+        With two stale entities and _rebuild_entity_from_edges raising for the first
+        and succeeding for the second, the gather/zip accumulator must record
+        errors=1 and rebuilt=1, with details in target order (u1 first, u2 second).
+        """
+        from fused_memory.backends.graphiti_client import StaleSummaryResult
+
+        backend = make_backend(mock_config)
+        stale_list = [
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'old A'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'old B'},
+        ]
+        detect_result = StaleSummaryResult(
+            stale=stale_list,
+            all_edges={'u1': [], 'u2': []},
+            total_count=5,
+        )
+        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
+        backend._rebuild_entity_from_edges = AsyncMock(
+            side_effect=[
+                RuntimeError('boom'),
+                {'uuid': 'u2', 'name': 'Bob', 'old_summary': 'old B', 'new_summary': 'rebuilt B', 'edge_count': 0},
+            ]
+        )
+
+        result = await backend.rebuild_entity_summaries(group_id='test', force=False)
+
+        assert result['total_entities'] == 5   # flows from total_count=5, not len(stale)
+        assert result['stale_entities'] == 2   # len(targets) = len(stale_list)
+        assert result['errors'] == 1
+        assert result['rebuilt'] == 1
+        assert result['skipped'] == 0
+        assert len(result['details']) == 2
+
+        err_detail = result['details'][0]
+        assert err_detail['status'] == 'error'
+        assert err_detail['uuid'] == 'u1'
+        assert err_detail['name'] == 'Alice'
+        assert err_detail['error'] == 'boom'
+
+        ok_detail = result['details'][1]
+        assert ok_detail['status'] == 'rebuilt'
+        assert ok_detail['uuid'] == 'u2'
+        assert ok_detail['name'] == 'Bob'
+        assert ok_detail['new_summary'] == 'rebuilt B'
+
+    @pytest.mark.asyncio
+    async def test_dry_run_partition_invariant_skips_rebuild_and_edges(self, mock_config, make_backend):
+        """dry_run=True path (force=True): all entities are skipped, none rebuilt, no edges fetched.
+
+        Pins two production-code guards simultaneously:
+          - graphiti_client.py line 1031: ``if not dry_run: all_edges = await self.get_all_valid_edges(...)``
+            — edges are NOT fetched when dry_run=True, even in the force path.
+          - graphiti_client.py lines 1046-1049: the dry_run branch sets
+            ``skipped = stale_entities`` and appends ``{'status': 'skipped_dry_run'}``
+            for each entity without ever calling ``_rebuild_entity_from_edges``.
+
+        This completes the counter partition invariant coverage alongside the
+        existing error-handling and partial-success tests in this class:
+            errors + rebuilt + skipped == stale_entities == total_entities
+        is now verified for the dry_run cell (skipped=N, errors=0, rebuilt=0).
+        """
+        backend = make_backend(mock_config)
+        entities = [
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
+            {'uuid': 'u3', 'name': 'Carol', 'summary': 'summary C'},
+        ]
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        backend._rebuild_entity_from_edges = AsyncMock()
+
+        result = await backend.rebuild_entity_summaries(
+            group_id='test', force=True, dry_run=True
+        )
+
+        # (a) all entities counted as skipped
+        assert result['skipped'] == len(entities)
+        # (b) no rebuilds, no errors
+        assert result['rebuilt'] == 0
+        assert result['errors'] == 0
+        # (c) aggregate counts
+        assert result['total_entities'] == 3
+        assert result['stale_entities'] == 3  # force=True treats all as stale
+        # (d) per-entity detail status
+        assert len(result['details']) == 3
+        for detail in result['details']:
+            assert detail['status'] == 'skipped_dry_run'
+        # (e) _rebuild_entity_from_edges must NEVER be called (dry_run branch, lines 1046-1049)
+        backend._rebuild_entity_from_edges.assert_not_awaited()
+        # (f) get_all_valid_edges must NEVER be called (edge-fetch guard, line 1031)
+        backend.get_all_valid_edges.assert_not_awaited()
+        # (g) partition invariant: errors + rebuilt + skipped == stale_entities == total_entities
+        assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
+        assert result['stale_entities'] == result['total_entities']
 
 
 # ---------------------------------------------------------------------------

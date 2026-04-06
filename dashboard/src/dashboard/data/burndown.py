@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import aiosqlite
 
@@ -68,27 +69,18 @@ async def collect_snapshot(
 ) -> None:
     """Discover projects and insert one snapshot row per project."""
     now = datetime.now(UTC).isoformat()
+    resolved_root = str(config.project_root.resolve())
 
-    # Always snapshot the main project.
-    seen_roots: set[str] = {str(config.project_root)}
-    tasks = await asyncio.to_thread(load_task_tree, config.tasks_json)
-    counts = _count_statuses(tasks)
-    await conn.execute(
-        'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        (
-            str(config.project_root),
-            now,
-            counts['pending'],
-            counts['in_progress'],
-            counts['blocked'],
-            counts['deferred'],
-            counts['cancelled'],
-            counts['done'],
-        ),
-    )
+    # Phase 1 — Discovery (sequential, in-memory):
+    # Build the ordered list of (project_id_str, tasks_json_path) tuples to snapshot.
+    # Main project is always first; seen_roots dedup is preserved exactly.
+    # Use the resolved (symlink-canonical) path so a symlinked project_root
+    # deduplicates correctly against orchestrator / known_project_roots entries
+    # that surface the real path.
+    roots_to_snapshot: list[tuple[str, Path]] = []
+    seen_roots: set[str] = {resolved_root}
+    roots_to_snapshot.append((resolved_root, config.tasks_json))
 
-    # Snapshot any additional projects discovered from running orchestrators.
     orchestrators = await asyncio.to_thread(find_running_orchestrators)
     for proc in orchestrators:
         if proc.get('prd'):
@@ -100,51 +92,42 @@ async def collect_snapshot(
             project_root = resolved
         else:
             continue
-        root_str = str(project_root)
+        root_str = str(project_root.resolve())
         if root_str in seen_roots:
             continue
         seen_roots.add(root_str)
-        tasks_json = project_root / '.taskmaster' / 'tasks' / 'tasks.json'
-        extra_tasks = await asyncio.to_thread(load_task_tree, tasks_json)
-        extra_counts = _count_statuses(extra_tasks)
-        await conn.execute(
-            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            (
-                root_str,
-                now,
-                extra_counts['pending'],
-                extra_counts['in_progress'],
-                extra_counts['blocked'],
-                extra_counts['deferred'],
-                extra_counts['cancelled'],
-                extra_counts['done'],
-            ),
-        )
+        roots_to_snapshot.append((root_str, project_root / '.taskmaster' / 'tasks' / 'tasks.json'))
 
-    # Snapshot any additional projects from the configured known_project_roots list.
-    # This handles projects whose orchestrators are not currently running.
     for known_root in config.known_project_roots:
         resolved = known_root.resolve()
         root_str = str(resolved)
         if root_str in seen_roots:
             continue
         seen_roots.add(root_str)
-        tasks_json = resolved / '.taskmaster' / 'tasks' / 'tasks.json'
-        extra_tasks = await asyncio.to_thread(load_task_tree, tasks_json)
-        extra_counts = _count_statuses(extra_tasks)
+        roots_to_snapshot.append((root_str, resolved / '.taskmaster' / 'tasks' / 'tasks.json'))
+
+    # Phase 2 — Parallel read:
+    # All load_task_tree calls are independent (separate files), so run them concurrently.
+    all_tasks = await asyncio.gather(
+        *(asyncio.to_thread(load_task_tree, tasks_json) for _, tasks_json in roots_to_snapshot)
+    )
+
+    # Phase 3 — Sequential insert:
+    # aiosqlite serialises writes on a single connection; keep inserts sequential.
+    for (root_str, _), tasks in zip(roots_to_snapshot, all_tasks, strict=True):
+        counts = _count_statuses(tasks)
         await conn.execute(
             'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 root_str,
                 now,
-                extra_counts['pending'],
-                extra_counts['in_progress'],
-                extra_counts['blocked'],
-                extra_counts['deferred'],
-                extra_counts['cancelled'],
-                extra_counts['done'],
+                counts['pending'],
+                counts['in_progress'],
+                counts['blocked'],
+                counts['deferred'],
+                counts['cancelled'],
+                counts['done'],
             ),
         )
 

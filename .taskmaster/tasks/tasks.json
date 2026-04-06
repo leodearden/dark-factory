@@ -5319,13 +5319,13 @@
         "description": "Add a 2-step speculative pipeline to the merge queue: while Worker B verifies merge N, Worker A speculatively merges N+1 against N's merge SHA. If N succeeds, N+1 is already a descendant and CAS works immediately (~2-3x throughput when queue depth >3). Cap speculation depth at 1.",
         "details": "BLOCKED: Waiting for merge queue (task 292) to be implemented and stable, with real metrics on queue depth and merge cycle time.\n\nUnblock condition: sustained queue depth >3 and merge cycle time dominating task throughput.\n\nDesign notes:\n- Worker A (merger): dequeue, create merge_wt, git merge --no-ff, scrub .task/\n- Worker B (verifier): run_scoped_verification, CAS update-ref, notify task Future\n- Speculative base: merge N+1 against N's merge commit, not current main\n- If N succeeds: N+1 is descendant, CAS works\n- If N fails: discard N+1, re-merge against actual main (one wasted merge ~2s)\n- Key risk: verification validity — N+1 verified against tree containing N's changes; if N rejected, N+1's verify was against non-existent state. Mitigated by scoped verification (task_files only) and depth-1 cap.\n- See comment block above advance_main() in git_ops.py for full rationale",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [
           "403"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T17:19:18.147Z",
+        "updatedAt": "2026-04-06T22:12:10.879Z",
         "metadata": {
           "memory_hints": {
             "entities": [
@@ -5825,7 +5825,7 @@
         "description": "Add a re-summarize entity MCP tool that triggers Graphiti to regenerate an entity node's summary from its current edges. Currently, entity summaries can only be updated when a new episode touches the entity. This means stale or aspirational summaries (e.g., from PRD ingestion) persist indefinitely if no new episodes arrive. The tool should accept an entity UUID or name and force summary regeneration from the existing edge set.\n\nMemory hints:\n- Search: 'entity summary stale aspirational PRD content'\n- Search: 'Graphiti entity node re-summarization'\n- Entities: UsageGate, Graphiti",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [
           "158"
         ],
@@ -5861,7 +5861,7 @@
             "fused-memory/tests/test_refresh_entity_summary.py"
           ]
         },
-        "updatedAt": "2026-04-06T17:26:24.612Z"
+        "updatedAt": "2026-04-06T20:10:49.549Z"
       },
       {
         "id": "310",
@@ -9086,20 +9086,20 @@
         "description": "Stream 3 of the vLLM coding-agent eval is in progress with RunPod volume obxma9bf1b provisioned. Remaining work before eval results are valid:\n\n1. Add self-hosted backend configs to EVAL_CONFIGS in orchestrator/src/orchestrator/evals/configs.py for the models being evaluated in Stream 3\n2. Run evals: `python -m orchestrator.evals.runner --trials 3 --max-parallel <N> --vllm-url <endpoint>` against each model config\n3. Run judge: `python -m orchestrator.evals.runner --judge` to produce Elo rankings across all trial results\n\n**memory_hints:**\n- search: \"vLLM eval Stream 3 RunPod self-hosted backend configs EVAL_CONFIGS\"\n- search: \"eval infrastructure stream 3 models evaluated\"\n- search: \"env_overrides implementer debugger roles vLLM\"\n- entity: \"vLLM eval\"\n- See docs/vllm-eval-status.md for current stream state and model list",
         "details": "Stream 1 (dark-factory eval plumbing) and Stream 2 (runpod-toolkit Docker image) are complete. Stream 3 is the actual self-hosted eval run.\n\nKey files:\n- orchestrator/src/orchestrator/evals/configs.py — EVAL_CONFIGS dict, add entries for self-hosted models\n- orchestrator/src/orchestrator/evals/tasks/ — eval task JSON files (df_task_12/13/18, reify_task_27 — plan.task_id values fixed in commit 53486e8023)\n- docs/vllm-eval-status.md — current stream status and next steps\n\nenv_overrides constraint: only implementer and debugger roles may use vLLM endpoint; architect and reviewer must use real Claude OAuth (enforced in workflow.py since commit 53486e8023).\n\nModels: 6 active (Qwen2.5-Coder-32B dropped). See memory \"Evaluating vLLM plan with 6 active models\".",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "done",
         "dependencies": [
           "457"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T17:16:00.978Z",
+        "updatedAt": "2026-04-06T22:50:16.442Z",
         "metadata": {
           "model_count": 5,
           "devstral_parked": true,
           "devstral_park_reason": "inconsistent tool-call format: emits prose/XML/partial-mistral",
           "devstral_park_date": "2026-04-06",
-          "bridge_bug_confirmed": true,
-          "primary_blocker": "tool_format_bridge_bug_cli_invoke_vllm_messages_shim",
+          "bridge_bug_confirmed": false,
+          "primary_blocker": null,
           "next_steps": "debug cli_invoke.py + /v1/messages shim; alternative: try reap-139b-nvfp4-new as gate eval candidate",
           "_causation_id": "575fd7e6-9c9d-401e-9ef8-39f0159ffd6d",
           "memory_hints": {
@@ -9107,17 +9107,14 @@
               "vLLM eval Stream 3",
               "RunPod"
             ],
-            "episodes": [
-              "ec966325-39a2-48e3-a846-11a1b0fe381c",
-              "99a05c0d-78b1-4994-babc-e81ae07533c5"
-            ],
-            "searches": [
-              "US-NC-1 GPU unavailability Stream 3 stalled 2026-04-06",
-              "vLLM tool format bridge bug cli_invoke messages shim",
-              "alternative datacenter 80GB GPU availability RunPod"
+            "queries": [
+              "first successful vLLM eval reap-139b-nvfp4 minimax_m2 parser EUR-IS-1",
+              "vLLM eval configs.py self-hosted backend EVAL_CONFIGS",
+              "env_overrides implementer debugger roles vLLM",
+              "Qwen3-Coder-Next vLLM startup hang health timeout"
             ]
           },
-          "blocker": "US-NC-1 GPU unavailability: zero 80GB+ GPU stock on 2026-04-05/06. Tool format bridge bug (cli_invoke.py + /v1/messages shim) also unresolved.",
+          "blocker": null,
           "resume_condition": "80GB+ GPU stock confirmed at alternative datacenter OR RunPod volume migrated OR tool_format_bridge_bug fixed",
           "stage1_finding_id": "1",
           "files": [
@@ -9127,7 +9124,10 @@
           "modules": [
             "orchestrator/src/orchestrator/evals",
             "docs"
-          ]
+          ],
+          "unblocked_by": "task_457_done_plus_eval_success_2026-04-06",
+          "preferred_datacenter": "EUR-IS-1",
+          "qwen3_hang_blocker_task": 515
         }
       },
       {
@@ -9155,19 +9155,23 @@
         "description": "Task 394 (done 2026-04-02) identified the fix for the false-empty task tree bug: modify reconciliation harness (harness.py) to filter the get_tasks response before injecting into Stage 1/Stage 2 prompts. However, as of 2026-04-06 (recon run 94151a78), Stage 2 is STILL receiving 0 active tasks — the filter was never implemented.\n\nThe symptom: get_tasks returns 701k+ characters (370+ tasks, 85% done/cancelled), which overflows the Claude context. The fix recommended by task 394 was to strip done/cancelled tasks from the injected payload, keeping only active (pending/in-progress/blocked/deferred) tasks plus a summary of done/cancelled counts.\n\n## Required changes in harness.py (reconciliation harness)\n1. After calling get_tasks, filter the response to exclude done/cancelled tasks\n2. Keep full details only for active tasks (pending, in-progress, blocked, deferred)\n3. Inject a compact summary of done/cancelled counts (e.g. \"385 done, 12 cancelled — omitted\")\n4. Verify the injected payload fits within context limits (target: <50k chars)\n5. Test by running a reconciliation cycle and confirming Stage 1 + Stage 2 receive non-empty active task lists\n\n## memory_hints\n- entity: \\\"reconciliation harness\\\" — current harness.py structure and injection point\n- search: \\\"false-empty task tree Stage 1 Stage 2 recurring bug\\\"\n- search: \\\"get_tasks context window overflow 600K filter done cancelled\\\"\n- search: \\\"reconciliation harness task tree injection\\\"\n- task: 394 — original analysis and recommended fix approaches",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "done",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
         "metadata": {
-          "human_review_recommended": true,
+          "human_review_recommended": false,
           "recon_unreliable_until_fixed": true,
           "confirmed_affected_run": "94151a78",
           "zero_active_tasks_since": "2026-04-02",
           "memory_hints": {
-            "entities": [],
+            "entities": [
+              "reconciliation harness"
+            ],
             "queries": [
-              "resolution for: Implement harness-level task filtering: inject only active tasks into recon Stage 1/Stage 2 prompts"
+              "false-empty task tree Stage 1 Stage 2 recurring bug",
+              "get_tasks context window overflow 600K filter done cancelled",
+              "reconciliation harness task tree injection task_filter.py"
             ]
           },
           "_causation_id": "575fd7e6-9c9d-401e-9ef8-39f0159ffd6d",
@@ -9179,9 +9183,19 @@
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
             "fused-memory/tests"
+          ],
+          "unblocked_by": "recon_stage2_2026-04-06_all_steps_confirmed_complete",
+          "implementation_confirmed": true,
+          "follow_on_quality_tasks": [
+            476,
+            477,
+            478,
+            479,
+            480,
+            481
           ]
         },
-        "updatedAt": "2026-04-06T19:17:50.926Z"
+        "updatedAt": "2026-04-06T22:27:43.061Z"
       },
       {
         "id": "456",
@@ -9365,11 +9379,11 @@
         "description": "Move all deferred `from dashboard.config import DashboardConfig` imports to module top-level in both `dashboard/tests/test_scaffold.py` and `dashboard/tests/test_burndown_data.py`. In test_burndown_data.py, also add a `@pytest.fixture` (or `@pytest.fixture` async) that provides the common `(db_path, config, conn)` setup shared by all five `TestCollectSnapshot` methods — each currently repeats `_create_burndown_db`, `DashboardConfig(project_root=tmp_path)`, `aiosqlite.connect`, and the two-patch block inline.\n\nFiles:\n- dashboard/tests/test_burndown_data.py\n- dashboard/tests/test_scaffold.py\n\nSource: review suggestions on task 450 (burndown known_project_roots feature).",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T19:39:10.185Z",
+        "updatedAt": "2026-04-06T20:00:11.049Z",
         "metadata": {
           "modules": [
             "dashboard/tests/test_burndown_data.py",
@@ -9395,11 +9409,11 @@
         "description": "In `dashboard/src/dashboard/data/burndown.py` line 73, change `seen_roots: set[str] = {str(config.project_root)}` to `seen_roots: set[str] = {str(config.project_root.resolve())}`. Also use this resolved string as the `project_id` in the main-project INSERT (line 80). This ensures deduplication is consistent with both the orchestrator loop (which calls `.resolve()` internally via `_resolve_project_root`/`_read_project_root_from_config`) and the known_project_roots loop (line 129).\n\nOptionally, pre-resolve `known_project_roots` at `DashboardConfig` construction time in `config.py` `from_env()` (line 73) to avoid repeated `lstat` syscalls on every snapshot cycle.\n\nFiles:\n- dashboard/src/dashboard/config.py\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 450 — without this, a symlinked `config.project_root` will silently produce duplicate snapshot rows.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T19:39:10.104Z",
+        "updatedAt": "2026-04-06T22:13:30.145Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/config.py",
@@ -9415,11 +9429,11 @@
         "description": "In `dashboard/src/dashboard/data/burndown.py`, replace the sequential `asyncio.to_thread` dispatches in the `known_project_roots` loop (lines 127-149) — and optionally the orchestrator loop (lines 92-123) — with a single `asyncio.gather(...)` collecting all independent `asyncio.to_thread(load_task_tree, ...)` calls before iterating results. The roots are fully enumerated before the loop, so all reads are independent.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 450 (reviewer_performance).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T19:44:25.790Z",
+        "updatedAt": "2026-04-06T22:40:56.491Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data",
@@ -9433,16 +9447,22 @@
         "description": "In `dashboard/src/dashboard/data/burndown.py`, extract a private coroutine `async def _insert_snapshot_for_root(conn, root_str: str, tasks_json: Path, now: str) -> None` that calls `load_task_tree`, `_count_statuses`, and executes the INSERT. Hoist the INSERT SQL to a module-level constant. Replace the three inline copy-pasted INSERT blocks (lines 76-89, 110-122, 136-148) with calls to this helper.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 450 (reviewer_reuse_auditor).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "cancelled",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T19:46:07.167Z",
+        "updatedAt": "2026-04-06T22:55:47.219Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data",
             "dashboard/tests/test_burndown_data.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Extract _insert_snapshot_for_root helper to remove INSERT duplication in collect_snapshot"
+            ]
+          }
         }
       },
       {
@@ -9451,10 +9471,17 @@
         "description": "Three test improvements in `dashboard/tests/test_burndown_data.py`:\n\n1. `test_snapshots_known_project_roots_when_no_orchestrators` (lines 193-200): change `SELECT project_id` to `SELECT *` and add assertions on count columns for the reify row (done==2) and autopilot row (in_progress==1). As written, a bug zeroing out counts for known roots would go undetected.\n\n2. `test_dedupes_known_root_against_main_project` (lines 221-226): replace `SELECT COUNT(*) FROM snapshots WHERE project_id = ?` with `SELECT COUNT(*) FROM snapshots` (no WHERE) to catch the case where two rows with different project_id strings are inserted for the same physical directory (symlink-based false negative).\n\n3. Add a new test that patches `load_task_tree` to raise `PermissionError` on the known-root call and asserts either: (a) `collect_snapshot` propagates the exception, or (b) if per-root error handling is added (see robustness task), that the main-project row is still committed and the failing root is skipped.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n- dashboard/tests/test_burndown_data.py\n\nSource: review suggestions on task 450 (reviewer_test_analyst).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:58:04.346Z",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard/data",
+            "dashboard/tests/test_burndown_data.py"
+          ]
+        }
       },
       {
         "id": "473",
@@ -9465,7 +9492,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T19:53:28.866Z",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard/data",
+            "dashboard/tests/test_burndown_data.py",
+            "dashboard/tests/test_orchestrator.py"
+          ]
+        }
       },
       {
         "id": "474",
@@ -9473,11 +9508,11 @@
         "description": "task_filter.py has four correctness bugs that all need fixing together:\n1. trimmed_count inflation: change `trimmed_count = total_active - len(kept_lines)` to `trimmed_count = len(active) - len(kept_lines)` where `active = tree.active_tasks[:max_tasks]`. The current code double-counts tasks already dropped by max_tasks cap.\n2. Budget reserve undersized: replace magic `- 50` with `- len(f'\\n... and {total_active} more active (truncated for budget)\\n')` or compute lazily, since the actual notice string can exceed 50 chars.\n3. Negative budget not guarded: add `if budget <= 0: return header + summary_line` guard before the line-accumulation loop to prevent max_chars contract violation.\n4. None-safe deps: change `deps = t.get('dependencies', [])` to `deps = t.get('dependencies') or []` to handle explicit None values from taskmaster.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-06T19:21:59.414Z",
+        "updatedAt": "2026-04-06T19:55:35.781Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
@@ -9491,10 +9526,17 @@
         "description": "In task_filter.py line 181, the deps list is rendered as a raw Python repr. Tasks with many dependencies produce lines that exhaust the char budget before other tasks are shown. Fix: `deps_str = str(deps[:5]) + ('...' if len(deps) > 5 else '')` and use `deps_str` in the f-string instead of `deps`. This prevents a single task with hundreds of deps from consuming the entire budget.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:04:10.431Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_task_filter.py"
+          ]
+        }
       },
       {
         "id": "476",
@@ -9513,10 +9555,18 @@
         "description": "When FilteredTaskTree is injected by the harness, Stage 2's 'Recently Completed Tasks' section is silently empty. Two complementary fixes:\n1. Low-cost: in task_knowledge_sync.py line 62, instead of `done_tasks_for_display = []`, emit a summary line: `done_tasks_for_display = [{'title': f'{tree.done_count} tasks completed (details omitted to save context)'}]` so the LLM agent understands the omission is intentional.\n2. Higher-fidelity: add `done_tasks: list[dict] = field(default_factory=list)` to FilteredTaskTree in task_filter.py, populate it with up to 30 done tasks in `filter_task_tree()`, and pass `tree.done_tasks` as `done_tasks_for_display` in task_knowledge_sync.py.\n\n## memory_hints\n- search: \"done_tasks_for_display Recently Completed Tasks Stage 2 empty\"\n- search: \"FilteredTaskTree data model fields\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:32:26.543Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_stages.py",
+            "fused-memory/tests/test_task_filter.py"
+          ]
+        }
       },
       {
         "id": "478",
@@ -9524,10 +9574,24 @@
         "description": "Three related harness.py improvements:\n1. Inject filtered_task_tree for Stage 2 through _configure_consolidator() or a new _configure_task_sync() counterpart, rather than naked attribute assignment. The current asymmetry (structured helper for S1, naked assignment for S2) makes configuration logic hard to trace.\n2. At minimum, rename the parameter or add a docstring to _configure_consolidator clarifying that filtered_task_tree is Stage-1-only and Stage 2 injection is separate.\n3. Add `filtered_task_tree: FilteredTaskTree | None = None` parameter to `_run_remediation_pass()` and pass the pre-fetched `filtered_tree` from `run_full_cycle()`. Inside the method: `remediation_tree = filtered_task_tree or await self._fetch_filtered_task_tree(project_root)` to skip the redundant get_tasks call that currently happens during remediation.\n\n## memory_hints\n- search: \"harness _configure_consolidator _run_remediation_pass filtered_task_tree\"\n- search: \"redundant get_tasks call remediation pass\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "blocked",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T23:04:34.074Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_harness.py",
+            "fused-memory/tests/test_stages.py"
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Unify filtered_task_tree injection pattern in harness.py and avoid redundant fetch"
+            ]
+          }
+        }
       },
       {
         "id": "479",
@@ -9549,7 +9613,21 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:58:04.228Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_harness.py",
+            "fused-memory/tests/test_task_filter.py"
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Fill test coverage gaps in task_filter and harness tests"
+            ]
+          }
+        }
       },
       {
         "id": "481",
@@ -9560,7 +9638,14 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T20:13:39.563Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_stages.py"
+          ]
+        }
       },
       {
         "id": "482",
@@ -9568,10 +9653,11 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py, test_partial_success_one_error_one_rebuilt (lines 440-444):\n1. Add `assert ok_detail['old_summary'] == ''`, `assert ok_detail['new_summary'] == 'rebuilt'`, `assert ok_detail['edge_count'] == 0` to mirror the completeness of err_detail assertions and verify the accumulator loop plumbs the _rebuild_entity_from_edges return value correctly.\n2. Add `assert result['skipped'] == 0` to both the existing single-error test (~line 398) and the partial-success test (~line 431) to constrain the counter partition invariant errors+rebuilt+skipped==total_entities.\n\nMemory hints: search for \"rebuild_entity_summaries return contract\" and \"counter partition invariant\".",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T20:31:13.038Z"
       },
       {
         "id": "483",
@@ -9579,10 +9665,11 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py, add a new test method to TestRebuildEntitySummariesErrorHandling that uses force=False. Mock `_detect_stale_summaries_with_edges` to return a result with total_count=5 but only 2 stale targets, then make _rebuild_entity_from_edges raise for one of them. Assert `result['total_entities'] == 5`, `result['stale_entities'] == 2`, `result['errors'] == 1`, `result['rebuilt'] == 1`. This exercises the bookkeeping path not reachable via force=True.\n\nMemory hints: search for \"_detect_stale_summaries_with_edges return shape\" and \"rebuild_entity_summaries force parameter\".",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:07:34.605Z"
       },
       {
         "id": "484",
@@ -9590,10 +9677,11 @@
         "description": "In fused-memory/src/fused_memory/backends/graphiti_client.py line 1059, the accumulator loop uses `isinstance(r, BaseException)` which catches `asyncio.CancelledError` (a BaseException subclass in Python 3.8+). When rebuild_entity_summaries is called during graceful shutdown and tasks are cancelled, the method silently converts CancelledError into error detail entries instead of propagating.\n\nFix: Change `isinstance(r, BaseException)` to `isinstance(r, Exception)` so CancelledError propagates naturally. Alternatively, add an explicit re-raise after the gather loop for any CancelledError results. Add a test documenting the chosen behavior.\n\nMemory hints: search for \"rebuild_entity_summaries gather pattern\" and \"CancelledError handling convention\".",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:18:54.976Z"
       },
       {
         "id": "485",
@@ -9612,10 +9700,19 @@
         "description": "Task 448 established the convention 'Uses ro_query since no writes are performed' for get_valid_edges_for_node and get_all_valid_edges_bulk. Five other pure-read methods still call graph.query() instead of graph.ro_query():\n\n1. get_node_text (line ~727) — MATCH read\n2. resolve_entity_by_name (line ~751) — MATCH read\n3. delete_entity_node pre-check (line ~704) — the MATCH check before the DETACH DELETE (only the pre-check, not the delete itself)\n4. get_edge_text (line ~1128) — MATCH read\n5. list_indices (line ~1158) — CALL db.indexes() read\n\nUpdate each to use ro_query and add the docstring convention comment. Update corresponding test mock assertions to assert ro_query is called (not query) for the read paths.\n\nmemory_hint: search \"ro_query convention read-only graphiti\" for context on this pattern.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:44:54.881Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/tests/test_merge_entities.py",
+            "fused-memory/tests/test_refresh_entity_summary.py",
+            "fused-memory/tests/test_reindex.py"
+          ]
+        }
       },
       {
         "id": "487",
@@ -9715,13 +9812,563 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": "496",
+        "title": "Wire task_filter into task_knowledge_sync (eliminate dead module + duplicate logic)",
+        "description": "task_filter.py is currently never imported — task_knowledge_sync.py still maintains its own copies of: active_tasks filtering (lines 61-64), _STATUS_PRIORITY dict (lines 212-218, diverging from task_filter's version), sort_key closure (lines 234-243, near-verbatim copy), and _format_tasks (lines 198-208, same format string).\n\nFix:\n1. In task_knowledge_sync.py, replace the inline active_tasks/done_tasks derivation with calls to filter_task_tree() and format_filtered_task_tree().\n2. Delete _STATUS_PRIORITY from task_knowledge_sync.py and import from task_filter.\n3. Replace _select_proactive_sample's sort_key closure with the shared logic from task_filter.\n4. Remove _format_tasks from task_knowledge_sync.py or delegate to _render_task_line helper in task_filter.py.\n\nMemory hints: search for \"_STATUS_PRIORITY\" and \"task_filter\" to find prior decisions about the filter module.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:25:53.286Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_stages.py",
+            "fused-memory/tests/test_task_filter.py"
+          ]
+        }
+      },
+      {
+        "id": "497",
+        "title": "Fix task_filter.py code quality issues (constant usage, priority gap, round-trip, validation)",
+        "description": "Four independent issues in fused-memory/src/fused_memory/reconciliation/task_filter.py:\n\n1. INACTIVE_TASK_STATUSES not used in filter_task_tree — replace explicit `elif status == 'done'` / `elif status == 'cancelled'` branches with `elif status in INACTIVE_TASK_STATUSES`, counting into done_count/cancelled_count accordingly (or split set into two named constants).\n2. _STATUS_PRIORITY gap: change 'deferred': 5 to 'deferred': 4 so values are contiguous (0-4) and len(_STATUS_PRIORITY)=5 no longer collides with 'deferred'.\n3. Eliminate body.rstrip('\\n').split('\\n') round-trip at line 188 — use `task_lines = lines` directly since `lines` is in scope.\n4. Document (or enforce) that max_chars is best-effort when header+summary alone exceeds the budget — add a docstring note or add final `[:max_chars]` clamp with a truncation marker.\n5. Guard against negative max_tasks at the start of format_filtered_task_tree: `max_tasks = max(0, max_tasks)`.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "498",
+        "title": "Rewrite misleading 'Bug:' test docstrings as regression guard descriptions",
+        "description": "Four tests in fused-memory/tests/test_task_filter.py describe bugs in present tense as if they still exist, when the implementation already has the correct code:\n\n1. test_trimmed_count_relative_to_max_tasks_cap (line 202): docstring says 'Bug: trimmed_count = total_active - len(kept_lines) yields ~197' — implementation uses len(active). Rewrite as: 'Regression: trimmed_count must be bounded by max_tasks cap, not total_active.'\n2. test_budget_reserve_matches_actual_notice_length (lines 293-343): docstring/comments describe fictional -50 reserve and compute budget with wrong formula. Actual implementation uses `max_chars - len(header) - len(summary_line)`. Rewrite analytical comments to match actual code. Also reduce max_tasks from 1,000,001 to ~10,000 to avoid ~150 MB intermediate allocation in CI.\n3. test_negative_budget_returns_header_plus_summary (line 260): says 'Bug: missing early-return guard' — guard exists at line 192. Rewrite as: 'When header+summary exceeds max_chars, the budget<=0 early-return must prevent truncation notice.'\n4. test_caps_at_max_tasks_and_under_budget (line 173): weaken assertion `... or len(output) < 50_000` is trivially satisfied. Replace with: `assert len(output) <= 50_000` and `assert '450 more active omitted by max_tasks cap' in output`.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "499",
+        "title": "Add missing filter_task_tree tests and fix resource-heavy test",
+        "description": "Two test coverage gaps in fused-memory/tests/test_task_filter.py:\n\n1. test_handles_empty_and_malformed_inputs (line 51) does not cover non-dict top-level input. Add: filter_task_tree(None), filter_task_tree([{'id':1,'status':'pending'}]), and filter_task_tree('bad') — each should return a zero-count empty FilteredTaskTree.\n2. test_budget_reserve_matches_actual_notice_length uses max_tasks=1_000_001 causing ~150 MB of intermediate allocations. The test only requires trimmed_count to have 7+ digits (≥1,000,000). Use max_tasks=10,000 with carefully chosen max_chars so that all but ~0-1 lines are trimmed, yielding trimmed_count≥1,000,000 via the lazy while-loop. This keeps peak memory below 1 MB.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "500",
+        "title": "Fix unused variable bindings in burndown tests",
+        "description": "In `dashboard/tests/test_burndown_data.py`, replace `db_path` with `_` in the five test methods that destructure it from `burndown_env` but never reference it: `test_deduplicates_main_project_from_orchestrators` (line 154), `test_snapshots_known_project_roots_when_no_orchestrators` (line 175), `test_dedupes_known_root_against_main_project` (line 208), `test_dedupes_known_root_against_running_orchestrator` (line 232), `test_discovers_config_flag_orchestrator` (line 265). Change each `db_path, config, conn = burndown_env` or `db_path, base_config, conn = burndown_env` to use `_` in the first position.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "501",
+        "title": "Remove redundant list() wrappers around fetchall() in burndown tests",
+        "description": "In `dashboard/tests/test_burndown_data.py`, replace the three occurrences of `list(await cur.fetchall())` with `await cur.fetchall()` directly. Locations: line 138 in `test_inserts_main_project`, line 197 in `test_snapshots_known_project_roots_when_no_orchestrators`, and line 281 in `test_discovers_config_flag_orchestrator`. aiosqlite's fetchall() already returns a list; the extra list() call allocates a needless copy.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "502",
+        "title": "Fix assertion placement inside async context manager blocks in burndown tests",
+        "description": "In `dashboard/tests/test_burndown_data.py`, move assertions inside their enclosing `async with conn.execute(...)` blocks so that failures produce clear AssertionErrors rather than misleading NameErrors.\n\n1. In `test_deduplicates_main_project_from_orchestrators` (lines 165-170): move `assert count == 1` inside the `async with` block alongside `assert row is not None` and the `count = row[0]` binding.\n\n2. In `test_dedupes_known_root_against_main_project` (lines 221-227): same pattern — move `assert count == 1` inside the block.\n\n3. In `TestBurndownEnvFixture.test_yields_valid_triple` (lines 505-508): move `assert row is not None` and `assert row[0] == 0` inside the `async with conn.execute(...)` block where `row` is fetched.\n\nFor all three cases the `COUNT(*)` query always returns a row so the NameError path can't trigger today, but keeping assertions inside the context manager is unambiguous and consistent with the rest of the file.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "503",
+        "title": "Strengthen mock values and call-args assertions in rebuild error-handling tests",
+        "description": "In test_graphiti_quality_433.py's TestRebuildEntitySummariesErrorHandling.test_partial_success_one_error_one_rebuilt:\n\n1. Change the mock return dict for the successful entity (Bob) to use non-default values that match the entity fixture:\n   - `old_summary: 'stale summary 2'` (matches Bob's entity `summary` field, instead of `''`)\n   - `new_summary: 'Bob summary v2'` (distinctive, avoids confusion with status string `'rebuilt'`)\n   - `edge_count: 3` (non-zero, distinguishes 'key present' from `.get()` fallback)\n\n2. Update the assertions on `ok_detail` to expect these non-default values.\n\n3. Add a call-args assertion to verify the implementation correctly forwards the real entity's old_summary to `_rebuild_entity_from_edges`:\n   ```python\n   backend._rebuild_entity_from_edges.assert_any_call(\n       'u2', 'Bob', [], group_id='test', old_summary='stale summary 2'\n   )\n   ```\n\nThis ensures the test catches bugs where `.get()` defaults mask missing keys, and verifies the caller correctly passes entity data through.\n\nMemory hints: search \"rebuild_entity_summaries return contract\", get_entity \"test_graphiti_quality_433\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "done",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:29:13.898Z"
+      },
+      {
+        "id": "504",
+        "title": "Add dry_run path test for rebuild_entity_summaries",
+        "description": "The dry_run branch of rebuild_entity_summaries (graphiti_client.py lines 1046-1049) sets `skipped = stale_entities` and appends `status='skipped_dry_run'` details, but has no dedicated test coverage.\n\nAdd a test in TestRebuildEntitySummariesErrorHandling (or a new class) that:\n1. Calls `rebuild_entity_summaries(group_id='test', force=True, dry_run=True)` with multiple entities\n2. Asserts `result['skipped'] == len(entities)` (i.e. stale_entities)\n3. Asserts `result['rebuilt'] == 0` and `result['errors'] == 0`\n4. Asserts each detail entry has `status == 'skipped_dry_run'`\n5. Verifies `_rebuild_entity_from_edges` was NOT called (since dry_run skips actual rebuilds)\n6. Verifies edges were NOT fetched (line 1031: `if not dry_run` guards the edge fetch)\n\nThis completes the counter partition invariant coverage: errors+rebuilt+skipped==total is now tested for the dry_run path.\n\nMemory hints: search \"rebuild_entity_summaries dry_run\", search \"counter partition invariant\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "done",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:42:41.637Z"
+      },
+      {
+        "id": "505",
+        "title": "Extract make_rebuild_detail shared test fixture to conftest.py",
+        "description": "The inline rebuild detail dict `{'uuid': ..., 'name': ..., 'old_summary': '', 'new_summary': ..., 'edge_count': 0}` appears in at least three test files without a shared factory:\n- fused-memory/tests/test_graphiti_quality_433.py\n- fused-memory/tests/test_rebuild_entity_summaries.py (lines ~920, ~979, ~1022, ~1078, ~1107)\n- fused-memory/tests/test_merge_entities.py (line ~226)\n\nCreate a `make_rebuild_detail(uuid, name, *, old_summary='', new_summary='', edge_count=0, status='rebuilt')` factory function in `fused-memory/tests/conftest.py` and replace inline dict literals across all affected test files. This makes schema changes (e.g. adding a new key to the detail dict) a single-point edit.\n\nMemory hints: search \"rebuild detail dict test fixture\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "506",
+        "title": "Clean up test_graphiti_quality_433.py: dedupe imports, complete assertions, verify mocks",
+        "description": "Post-merge review follow-up for task 483 test file `fused-memory/tests/test_graphiti_quality_433.py`. Three related cleanups flagged by multiple reviewers (reviewer_performance, reviewer_reuse_auditor, reviewer_robustness, reviewer_test_analyst):\n\n1. **Remove redundant inline imports of `StaleSummaryResult`** (lines 340, 366, 489). The symbol is already imported at module scope on line 18. Delete the three inline imports so the module-level import is the single source of truth.\n\n2. **Complete ok_detail assertions in `test_force_false_partial_error_uses_detect_total`** (lines 524-528). The mock return value includes `'old_summary': 'old B'` and `'edge_count': 0`, but the test only asserts `status`, `uuid`, `name`, and `new_summary`. Mirror the assertion style of the analogous `test_partial_success_one_error_one_rebuilt` (lines 468-474):\n   - Add `assert ok_detail['old_summary'] == 'old B'`\n   - Add `assert ok_detail['edge_count'] == 0`\n\n3. **Add mock verification in `test_force_false_partial_error_uses_detect_total`** (after line 516). The mocks for `_detect_stale_summaries_with_edges` and `_rebuild_entity_from_edges` are never verified, so a regression that double-calls detect or skips an entity would still pass because `total_entities` comes from the mock return value. Add:\n   - `backend._detect_stale_summaries_with_edges.assert_awaited_once_with(group_id='test')`\n   - `assert backend._rebuild_entity_from_edges.await_count == 2`\n\nAll three changes are localized to a single test file and should be verified by running `pytest fused-memory/tests/test_graphiti_quality_433.py::TestRebuildEntitySummariesErrorHandling`.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "507",
+        "title": "Extract shared Alice/Bob stale-entity fixture in test_graphiti_quality_433.py",
+        "description": "Post-merge review follow-up for task 483 (reviewer_reuse_auditor). The Alice/Bob stale-entity dict shape `[{'uuid', 'name', 'summary'}]` is repeated across at least four test methods in `fused-memory/tests/test_graphiti_quality_433.py` (lines 343, 370, 439-441, 494-497) without a shared fixture.\n\nExtract a `make_stale_list` pytest fixture or helper that produces the standard `[{uuid, name, summary}]` entity dicts for Alice and Bob. Tests that need the standard shape should consume the fixture; tests with unique shapes keep their inline definitions.\n\nUnique assertions (e.g. `total_entities == 5` in `test_force_false_partial_error_uses_detect_total`) should remain inline — only the setup boilerplate moves to the fixture.\n\nThis is a nice-to-have refactor; it does not affect correctness or coverage, but reduces copy-paste surface area for future entity-shape changes. Verify with `pytest fused-memory/tests/test_graphiti_quality_433.py` after refactoring.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "508",
+        "title": "Enforce path normalization invariant in DashboardConfig via __post_init__",
+        "description": "Add a `__post_init__` method to `DashboardConfig` in `dashboard/src/dashboard/config.py` that resolves all Path fields:\n```python\ndef __post_init__(self) -> None:\n    self.project_root = self.project_root.resolve()\n    self.known_project_roots = [p.resolve() for p in self.known_project_roots]\n```\nThen:\n1. Remove the eager `.resolve()` from `from_env()` line 73 (it becomes a no-op but can stay as a defensive call or be cleaned up).\n2. Remove the ad-hoc `resolved_root = str(config.project_root.resolve())` from `collect_snapshot()` (burndown.py:71) — just use `str(config.project_root)` since it's already resolved.\n3. Remove the redundant `.resolve()` call in the known_project_roots loop (burndown.py:129) for the same reason.\n\nThis makes every construction path — `from_env()`, direct `DashboardConfig(...)`, tests — produce already-resolved paths, fixing: (a) the unresolved-path footgun on all path-derived properties like `tasks_json`/`burndown_db`, (b) the split-ownership double-resolve, (c) the asymmetry between project_root and known_project_roots normalization.\n\nFiles: dashboard/src/dashboard/config.py, dashboard/src/dashboard/data/burndown.py, dashboard/tests/test_burndown_data.py\n\nSource: review suggestions on task 469 (suggestions 1, 2, 5, 6, 7, 11, 13 from reviewers architect_reviewer, performance, reuse_auditor, test_analyst, robustness).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:50:47.785Z",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard/config.py",
+            "dashboard/src/dashboard/data",
+            "dashboard/tests/test_burndown_data.py",
+            "dashboard/tests/test_scaffold.py"
+          ]
+        }
+      },
+      {
+        "id": "509",
+        "title": "Resolve project_root in find_running_orchestrators result dict",
+        "description": "In `dashboard/src/dashboard/data/orchestrator.py` line 346, change:\n```python\n'project_root': str(project_root),\n```\nto:\n```python\n'project_root': str(project_root.resolve()),\n```\nOptionally also have `_resolve_project_root` return `.resolve()` at its return sites so callers receive a resolved Path by contract. This ensures any downstream consumer that joins orchestrator result `project_root` values against burndown DB `project_id` (which is always the resolved path) gets a consistent match.\n\nWithout this, if a symlink appears anywhere in the PRD's ancestor chain, the `project_root` field in the orchestrator result will differ from the resolved `project_id` stored in the burndown DB, breaking any downstream component that joins the two.\n\nFiles: dashboard/src/dashboard/data/orchestrator.py\n\nSource: review suggestions on task 469 (suggestion 3 from reviewer_architect_reviewer).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:52:52.040Z",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard/data",
+            "dashboard/tests/test_orchestrator.py"
+          ]
+        }
+      },
+      {
+        "id": "510",
+        "title": "Test quality: fixture extraction, comment fix, assertion completeness, and fragility fix in test_burndown_data",
+        "description": "In `dashboard/tests/test_burndown_data.py`:\n\n1. **Extract shared fixture** (suggestion 7): The 8-line setup block (create `real_dir`, symlink `link`, create `db_path`, call `_create_burndown_db`) is duplicated verbatim in `test_symlinked_root_deduplicates_with_orchestrator` (line 154), `test_symlinked_root_deduplicates_with_known_roots` (line 262), `test_main_project_id_is_resolved_path` (line 328), and `test_orchestrator_fallback_deduplicates_against_resolved_root` (line 385). Extract a `@pytest.fixture` (e.g. `symlink_project_setup`) that yields `(real_dir, link, db_path)`.\n\n2. **Fix misleading comment** (suggestion 8): In `test_symlinked_root_deduplicates_with_known_roots` (~line 276), change `known_project_roots=[real_dir],  # same underlying dir, unresolved` to something like `known_project_roots=[real_dir],  # real path; project_root is the symlink pointing here`.\n\n3. **Add project_id assertion** (suggestion 9): In `test_symlinked_root_deduplicates_with_orchestrator` (line 175), after the `assert count == 1` add: `async with conn.execute('SELECT project_id FROM snapshots') as cur: rows = list(await cur.fetchall()); assert rows[0][0] == str(real_dir.resolve())`.\n\n4. **Fix test fragility** (suggestion 12): In `test_orchestrator_fallback_deduplicates_against_resolved_root` (line 385), either mock `_resolve_project_root` explicitly or isolate the PRD path in a subtree guaranteed to have no `.taskmaster` ancestor (e.g. a `no_taskmaster/` subdir inside `tmp_path`, after asserting no ancestor outside `tmp_path` has one). `_resolve_project_root` walks up the directory tree looking for `.taskmaster`; if `tmp_path` or any ancestor happens to contain one, the fallback branch never fires and the test silently tests the wrong code path.\n\nFiles: dashboard/tests/test_burndown_data.py\n\nSource: review suggestions on task 469 (suggestions 7, 8, 9, 12 from reviewers reuse_auditor, test_analyst, robustness).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "511",
+        "title": "Replace bare assert with explicit TypeError guard + add non-dict test",
+        "description": "At graphiti_client.py:1095, replace `assert isinstance(r, dict)` with an explicit `if not isinstance(r, dict): raise TypeError(f'rebuild_entity_summaries: _rebuild_entity_from_edges returned unexpected type {type(r).__name__!r} for node={t[\"uuid\"]} name={t[\"name\"]!r}')`. This guard is currently stripped by Python's -O/PYTHONOPTIMIZE flags. Also add a test in test_rebuild_entity_summaries.py that patches `_rebuild_entity_from_edges` to return None and asserts the TypeError is raised, so the guard cannot be silently removed.\n\nSource: review suggestions from task 484 (CancelledError fix PR). Rationale: assert is disabled under Python optimizer flags, leaving a production footgun. Explicit raise preserves the contract check unconditionally.\n\nFiles:\n- fused-memory/src/fused_memory/backends/graphiti_client.py\n- fused-memory/src/fused_memory/reconciliation/context_assembler.py\n- fused-memory/tests/test_rebuild_entity_summaries.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:55:47.866Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_rebuild_entity_summaries.py"
+          ]
+        }
+      },
+      {
+        "id": "512",
+        "title": "Apply two-tier CancelledError guard to context_assembler.py gather site",
+        "description": "At context_assembler.py:125, the existing `if isinstance(ctx_result, BaseException): ctx_result = []` silently converts CancelledError into empty context and lets execution continue. Apply the same two-tier pattern: add a pre-scan pass that re-raises any result where `isinstance(r, BaseException) and not isinstance(r, Exception)`, then narrow the accumulator guard to `isinstance(ctx_result, Exception)`. This is the same fix applied to graphiti_client in task 484's diff.\n\nSource: review suggestions from task 484. Rationale: structured-concurrency cancellation must propagate; converting CancelledError into empty lists breaks graceful shutdown.\n\nFiles:\n- fused-memory/src/fused_memory/reconciliation/context_assembler.py\n- fused-memory/tests/test_rebuild_entity_summaries.py (or a new context_assembler test file)",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:55:24.156Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_context_assembler.py"
+          ]
+        }
+      },
+      {
+        "id": "513",
+        "title": "Extract propagate_cancellations() shared utility and migrate all gather sites",
+        "description": "There are now 3 gather(return_exceptions=True) sites that need the two-tier CancelledError guard: memory_service.py:1004, graphiti_client.py:1072, and context_assembler.py:125 (after the sibling fix task). Create `fused_memory/utils/async_utils.py` with a `propagate_cancellations(results: Sequence) -> None` helper. Update all three sites to call it. This also resolves the comment accuracy issue at graphiti_client.py:1065-1066 (stale line reference and the divergence between the two pattern implementations: memory_service raises any BaseException while graphiti_client only raises non-Exception BaseExceptions).\n\nSource: review suggestions from task 484. Rationale: DRY + prevents future drift between copies of the pattern as new gather sites are added (task_interceptor, harness already use gather with return_exceptions).\n\nDepends on: context_assembler two-tier guard task (should land first or be merged into this extraction).\n\nFiles:\n- fused-memory/src/fused_memory/utils/async_utils.py (new)\n- fused-memory/src/fused_memory/backends/graphiti_client.py\n- fused-memory/src/fused_memory/services/memory_service.py\n- fused-memory/src/fused_memory/reconciliation/context_assembler.py\n- fused-memory/tests/test_rebuild_entity_summaries.py\n- fused-memory/tests/test_async_utils.py (new)",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-04-06T23:01:14.014Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/src/fused_memory/services",
+            "fused-memory/src/fused_memory/utils",
+            "fused-memory/tests/test_async_utils.py",
+            "fused-memory/tests/test_context_assembler.py",
+            "fused-memory/tests/test_rebuild_entity_summaries.py"
+          ]
+        }
+      },
+      {
+        "id": "514",
+        "title": "Fill test coverage gaps for cancellation and Exception accumulation in rebuild_entity_summaries",
+        "description": "In test_rebuild_entity_summaries.py, add three tests:\n1. `test_cancelled_error_propagates_force_false` — mock `_detect_stale_summaries_with_edges` to return stale entities, mock `update_node_summary` to raise CancelledError, assert propagation. Currently both cancellation tests use force=True, leaving the force=False code path untested for this bug class.\n2. A test asserting that a plain RuntimeError still produces `errors==1` and `rebuilt==1` in the post-fix code path (regression guard for the BaseException→Exception narrowing, ensuring Exception subclasses still accumulate into per-entity errors).\n3. Strengthen `test_cancelled_error_propagates_alongside_other_errors` with an inline comment or companion assertion clarifying that RuntimeError in slot 1 was NOT counted before CancelledError propagated (since Pass 1 runs before Pass 2 bookkeeping).\n\nAlso extract the shared mock setup (list_entity_nodes, get_all_valid_edges, backend instantiation) into a class-level fixture to eliminate the boilerplate duplication across both existing tests.\n\nSource: review suggestions from task 484. Rationale: close coverage gaps left by the initial CancelledError fix.\n\nFiles:\n- fused-memory/tests/test_rebuild_entity_summaries.py\n- fused-memory/src/fused_memory/backends/graphiti_client.py (reference only)",
+        "details": "",
+        "testStrategy": "",
+        "status": "in-progress",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:55:47.947Z"
+      },
+      {
+        "id": "515",
+        "title": "Investigate and fix Qwen3-Coder-Next-FP8 vLLM startup hang (health timeout)",
+        "description": "Qwen3-Coder-Next-FP8 (config: qwen3-coder-next-fp8-new) has a persistent vLLM startup hang that causes health-check timeout before the server becomes ready. This is NOT a memory issue — reproduced on both RTX PRO 6000 (96GB, EUR-IS-1) and H200 SXM (141GB). Config was migrated to H200 as a mitigation but the hang root cause remains unknown, blocking Qwen3 from being evaluated in the vLLM eval pipeline.",
+        "details": "Known context:\n- Tool-call parser for Qwen3-Coder must be qwen3_coder (hermes was prior misconfiguration, now fixed)\n- Config is in orchestrator/src/orchestrator/evals/configs.py (qwen3-coder-next-fp8-new entry)\n- Graphiti edge 85c34b19 records config migration to H200\n- Episodes from 2026-04-06 session ~20:42 document the hang\n\nInvestigation steps:\n1. Launch qwen3-coder-next-fp8-new config on an H200 pod and observe vLLM startup logs\n2. Identify exact hang point (tokenizer init / model load / CUDA graph build / etc.)\n3. Verify HF model variant compatibility with installed vLLM version\n4. Try --max-model-len, --enforce-eager, or --disable-custom-all-reduce flags as needed\n5. Fix config or add vLLM startup flags; rerun gate eval to confirm server becomes ready\n\nmemory_hints:\n- search: \"Qwen3-Coder-Next vLLM startup hang health timeout H200 RTX\"\n- search: \"vLLM eval configs.py qwen3_coder tool-call parser\"\n- entity: \"qwen3-coder-next-fp8-new\"",
+        "testStrategy": "",
+        "status": "in-progress",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:56:32.120Z"
+      },
+      {
+        "id": "516",
+        "title": "Add structured warning log before propagating CancelledError in rebuild_entity_summaries",
+        "description": "At graphiti_client.py:1072-1074 (Pass 1 loop), add a `logger.warning` call before `raise r` that records `group_id`, `rebuilt` (so far), and `errors` (so far). When a large batch is cancelled mid-flight, the current code skips the summary log entirely and operators have no record of partial progress. The `rebuilt` and `errors` counters are already in scope at that point (initialized at the top of the method and incremented by Pass 2, but the values from any previously completed batches/groups are meaningful context).\n\nExample:\n```python\nlogger.warning(\n    'rebuild_entity_summaries: cancellation signal received group=%s '\n    'rebuilt_so_far=%d errors_so_far=%d; propagating',\n    group_id, rebuilt, errors,\n)\nraise r\n```\n\nSource: review suggestions from task 484. Rationale: operational visibility during graceful shutdowns.\n\nFiles:\n- fused-memory/src/fused_memory/backends/graphiti_client.py\n- fused-memory/tests/test_rebuild_entity_summaries.py (log assertion)",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "517",
+        "title": "Strengthen call-arg forwarding assertions in rebuild error-handling tests",
+        "description": "Three gaps from post-merge review of task 503, all in fused-memory/tests/test_graphiti_quality_433.py (TestRebuildEntitySummariesErrorHandling):\n\n1) In test_partial_success_one_error_one_rebuilt (after existing assert_any_call at lines 479-481): add a companion assertion pinning Alice/u1's data-forwarding path. Alice's _rebuild_entity_from_edges call still happens before it raises RuntimeError('boom'). Add:\n   backend._rebuild_entity_from_edges.assert_any_call('u1', 'Alice', [], group_id='test', old_summary='stale summary')\nThis closes the gap where the error path's entity['summary']→old_summary kwarg forwarding is untested.\n\n2) In sibling test test_force_false_partial_error_uses_detect_total (after line 535): add the symmetrical assertions for the force=False branch. Bob has summary='old B' and Alice has summary='old A'. Add:\n   backend._rebuild_entity_from_edges.assert_any_call('u2', 'Bob', [], group_id='test', old_summary='old B')\n   backend._rebuild_entity_from_edges.assert_any_call('u1', 'Alice', [], group_id='test', old_summary='old A')\n\n3) Revise the misleading comment at lines 476-478. The current text says the assertion verifies forwarding 'not just trusting the mock return value', but ok_detail['old_summary'] at line 472 IS sourced from the mock return (graphiti_client.py:1100 uses r.get('old_summary', '')). Rewrite as:\n   # Verify the implementation reads old_summary from the entity dict and forwards\n   # it as the old_summary kwarg to _rebuild_entity_from_edges. The ok_detail['old_summary']\n   # assertion above reflects the mock return value; this assertion independently pins\n   # the input forwarding path.\n\nVerify: pytest fused-memory/tests/test_graphiti_quality_433.py::TestRebuildEntitySummariesErrorHandling -x\n\nReviewers: reviewer_reuse_auditor, reviewer_test_analyst, reviewer_robustness. Source: steward triage of escalation esc-503-45.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "518",
+        "title": "Fix mock/fixture coherence in test_partial_success_one_error_one_rebuilt",
+        "description": "Two related readability/coherence issues from post-merge review of task 503 in fused-memory/tests/test_graphiti_quality_433.py::TestRebuildEntitySummariesErrorHandling::test_partial_success_one_error_one_rebuilt:\n\n1) Fixture inconsistency (line 443 vs 447): get_all_valid_edges is mocked to return {} but the mock result dict claims edge_count=3. Because _rebuild_entity_from_edges is fully mocked the test passes, but a reader tracing the data flow sees a mismatch — a real call would derive edges=[] and produce edge_count=0. Task 503 deliberately chose non-zero to distinguish 'key present' from .get() fallback. The better fix is to populate get_all_valid_edges with three real edge dicts for u2, e.g.:\n   backend.get_all_valid_edges = AsyncMock(return_value={\n       'u2': [\n           {'uuid': 'e1', 'fact': 'fact1'},\n           {'uuid': 'e2', 'fact': 'fact2'},\n           {'uuid': 'e3', 'fact': 'fact3'},\n       ]\n   })\nThen update the assert_any_call for u2 (line 479-481) to pass the actual edges list instead of [], which also strengthens end-to-end forwarding coverage of the edges kwarg. Alice/u1 still gets [] since she is not in the dict.\n\n2) Visual ambiguity (lines 441, 447, 480): entity summary 'stale summary 2', mock-return 'old_summary' 'stale summary 2', and assert_any_call's old_summary='stale summary 2' are all the same string. A reader can't tell at a glance whether the assert_any_call is anchored to the entity setup (intent) or is accidentally re-asserting the mock output. Change the mock-return's old_summary to a clearly distinct sentinel (e.g., '<echoed-old-summary>'). Then the three values (entity summary, mock return old_summary, assert_any_call old_summary) differ except where the test intends to assert equality:\n   - assert_any_call old_summary must equal the entity fixture's summary ('stale summary 2') — this is the forwarding invariant.\n   - ok_detail['old_summary'] asserts the mock return's distinct sentinel, proving it flows from mock → detail.\n\nVerify: pytest fused-memory/tests/test_graphiti_quality_433.py::TestRebuildEntitySummariesErrorHandling::test_partial_success_one_error_one_rebuilt -x\n\nReviewers: reviewer_architect_reviewer, reviewer_robustness. Source: steward triage of escalation esc-503-45.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "519",
+        "title": "Fix asyncio.gather error handling in collect_snapshot",
+        "description": "In dashboard/src/dashboard/data/burndown.py lines 111-113, change `asyncio.gather(...)` to use `return_exceptions=True`. In the Phase 3 loop (lines 117-132), check `isinstance(result, BaseException)` before calling `_count_statuses`, log a warning with the project root path, and `continue` to skip failed entries. This restores partial-success semantics: healthy projects are still snapshotted when one tasks.json is unreadable. Add a logger.warning call at the per-project error site (not at the gather call site). See suggestions [4] and [9] from the original review for the full code pattern.\n\nSource: review suggestions on task 470 (reviewer_performance, reviewer_robustness).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "520",
+        "title": "Harden concurrency test: DB assertion, barrier timeout, exception test",
+        "description": "In dashboard/tests/test_burndown_data.py, make three changes to test_load_task_tree_calls_run_concurrently and add a new test:\n\n1. (line 478) Increase `threading.Barrier(n_roots, timeout=2.0)` to `timeout=10.0` and update the failure message to mention both 'sequential execution' and 'severe scheduler latency' as possible causes — addresses suggestions [7] and [10].\n\n2. After `await collect_snapshot(conn, config)` (line 495), add:\n```python\nasync with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:\n    row = await cur.fetchone()\n    assert row[0] == 3\n```\naddresses suggestion [6].\n\n3. Add a new test `test_gather_partial_failure_skips_bad_project` where fake_load raises OSError for one root and succeeds for others, asserting collect_snapshot either raises or skips gracefully (depending on which fix from the production-code task lands first) — addresses suggestion [8].\n\nSource: review suggestions on task 470 (reviewer_test_analyst, reviewer_robustness).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "521",
+        "title": "Improve test code quality: portable paths, key-consistency comment, extract _fake_load helper",
+        "description": "In dashboard/tests/test_burndown_data.py, make three targeted improvements:\n\n1. In test_load_task_tree_calls_run_concurrently (lines 468-469), replace `Path('/home/leo/src/reify')` and `Path('/home/leo/src/autopilot-video')` with `tmp_path / 'reify'` and `tmp_path / 'autopilot'` (load_task_tree is mocked so the paths don't need to exist) — addresses suggestion [0].\n\n2. In test_dedupes_known_root_against_running_orchestrator (around line 325), add a comment above `_tasks_map` explaining that the orchestrator entry intentionally omits `.resolve()` because `_read_project_root_from_config` returns the raw (unresolved) path, matching production code at burndown.py line 99 — addresses suggestion [1].\n\n3. Add a module-level helper after `_insert_snapshot`:\n```python\ndef _fake_load(tasks_map):\n    return lambda path: tasks_map[path]\n```\nReplace the three inline `fake_load` function definitions (lines 229-231, 331-333, 393-395) with `side_effect=_fake_load(_tasks_map)` — addresses suggestion [5].\n\nSource: review suggestions on task 470 (reviewer_architect_reviewer, reviewer_reuse_auditor).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "522",
+        "title": "Relocate dry_run test to correct class and eliminate duplication",
+        "description": "In fused-memory/tests/test_graphiti_quality_433.py:\n1. Remove `test_dry_run_partition_invariant_skips_rebuild_and_edges` from `TestRebuildEntitySummariesErrorHandling` (line 538).\n2. Add `backend._rebuild_entity_from_edges.assert_not_awaited()` to `test_force_dry_run_does_not_call_get_all_valid_edges` (after line 275).\n3. Add the partition invariant assertion `assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']` to `test_force_dry_run_returns_correct_aggregate` (after line 300).\n\nThis consolidates all force=True dry_run=True coverage in `TestRebuildEntitySummariesForceDryRun` without duplicating the scenario.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "523",
+        "title": "Fix docstring accuracy: semantic anchors and narrow edge-fetch scope claim",
+        "description": "In fused-memory/tests/test_graphiti_quality_433.py, update the docstring of `test_dry_run_partition_invariant_skips_rebuild_and_edges` (lines 539–551):\n\n1. Replace line-number references ('line 1031', 'lines 1046-1049') with semantic descriptions like 'the edge-fetch guard in the force branch' and 'the dry_run early-return block before the semaphore loop'.\n2. Narrow the claim 'edges are NOT fetched when dry_run=True, even in the force path' to make clear this only applies to the force=True code path. Add a note that force=False uses _detect_stale_summaries_with_edges which fetches edges for staleness detection regardless of dry_run.\n\nNote: if task \"Relocate dry_run test to correct class\" removes this test, apply equivalent docstring cleanup to its replacement location.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "524",
+        "title": "Strengthen per-entity detail assertions: verify uuid and name in dry_run test",
+        "description": "In fused-memory/tests/test_graphiti_quality_433.py, replace the status-only loop at lines 576–578 with a full-dict comparison:\n\n```python\nexpected_details = [{'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities]\nassert result['details'] == expected_details\n```\n\nThis matches the style already used in the error-path tests (lines 525–534) and catches regressions where uuid/name are accidentally dropped from the dry_run detail records.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "525",
+        "title": "Standardize async mock assertion style for edge-fetch guard tests",
+        "description": "In fused-memory/tests/test_graphiti_quality_433.py:\n\n- Update line 275 in `test_force_dry_run_does_not_call_get_all_valid_edges` from `backend.get_all_valid_edges.assert_not_called()` to `backend.get_all_valid_edges.assert_not_awaited()` to match the style used in the new test at line 582 and to use the more semantically precise AsyncMock assertion throughout.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "526",
+        "title": "Add test and fix for O(E) edge-fetch waste in force=False dry_run=True path",
+        "description": "In fused-memory/fused_memory/backends/graphiti_client.py and fused-memory/tests/test_graphiti_quality_433.py:\n\n1. Add a test (parametrised or standalone in TestRebuildEntitySummariesDataFlow) for force=False, dry_run=True that does NOT mock _detect_stale_summaries_with_edges and instead asserts that get_all_valid_edges is NOT called. This test should currently FAIL, exposing the inefficiency.\n\n2. Fix the production code: before calling _detect_stale_summaries_with_edges, check if dry_run=True and use a cheaper staleness probe that does not pre-fetch the full edge map when the results will never be consumed.\n\nBackground: The force=True path correctly guards get_all_valid_edges behind `if not dry_run`, but the force=False path calls `_detect_stale_summaries_with_edges` which unconditionally fetches the full edge map — wasted O(E) I/O when dry_run=True means the edges are never consumed.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "527",
+        "title": "Migrate remaining read-only methods to ro_query",
+        "description": "Two pure-read Cypher calls were missed in the Task 486 migration:\n\n1. `query_edges_by_time_range()` at `graphiti_client.py` ~line 422 still calls `await graph.query(cypher, {'start': start, 'end': end})` on a plain MATCH/RETURN — change to `ro_query` and add docstring convention comment.\n\n2. `node_count()` at `graphiti_client.py` ~line 1230 still calls `await graph.query('MATCH (n) RETURN count(n) as count')` — same fix.\n\nAdd corresponding test mock assertions (ro_query called, query not called) for both methods, matching the pattern applied to `get_node_text`, `get_edge_text`, `resolve_entity_by_name`, and `list_indices` in Task 486.\n\nFiles: fused-memory/src/fused_memory/backends/graphiti_client.py\n\nSource: steward-triage follow-up from Task 486 (esc-486-49).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "528",
+        "title": "Strengthen and deduplicate delete_entity_node and list_indices tests",
+        "description": "Four targeted test fixes from the Task 486 review:\n\n1. Remove `test_precheck_uses_ro_query` from `test_merge_entities.py` (~line 150) — its assertions are a strict subset of `test_executes_detach_delete` which already covers `await_count` for both `ro_query` and `query` plus verifies `'DETACH DELETE'`. Three reviewers flagged this duplication.\n\n2. Add `graph.query.assert_not_awaited()` after the `pytest.raises` block in `test_raises_node_not_found_when_missing` (~line 132) to verify DETACH DELETE never fires when the pre-check finds nothing. This is the critical negative assertion — without it, a regression could allow DETACH DELETE on the missing path.\n\n3. In the list_indices `test_uses_ro_query_not_query` (~line 313 in `test_reindex.py`), inspect `graph.ro_query.call_args[0][0]` and assert it contains `'db.indexes'`. Current test uses `make_graph_mock([])`, so the loop body never runs and only call-count is verified.\n\n4. Add `graph.query.assert_not_awaited()` to `test_passes_name_as_param` in `test_refresh_entity_summary.py` (~line 80) to make the test self-sufficient.\n\nFiles: fused-memory/tests/test_merge_entities.py, fused-memory/tests/test_reindex.py, fused-memory/tests/test_refresh_entity_summary.py\n\nSource: steward-triage follow-up from Task 486 (esc-486-49).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "529",
+        "title": "Refactor test boilerplate for ro_query assertion pattern",
+        "description": "Two complementary refactors to eliminate copy-paste in the test suite (Task 486 follow-up):\n\n1. Extract a shared helper or use `@pytest.mark.parametrize` for the 5 identical `test_uses_ro_query_not_query` methods in `test_reindex.py` (lines 148, 196, 313) and `test_refresh_entity_summary.py` (lines 89, 189). The only variation is the method under test and its args; structure is identical 6-line boilerplate (make_backend → make_graph_mock → set _get_graph → call method → ro_query.assert_awaited_once() → query.assert_not_awaited()).\n\n2. Extend `make_graph_mock` in `conftest.py` to accept separate optional `ro_rows` and `q_rows` parameters (default both to `rows` for backwards compatibility). This lets `TestDeleteEntityNode` tests in `test_merge_entities.py` use the fixture (`make_graph_mock(ro_rows=[['NodeName', 'summary']], q_rows=[])`) instead of manually constructing MagicMock + AsyncMock pairs in each test method.\n\nFiles: fused-memory/tests/conftest.py, fused-memory/tests/test_merge_entities.py, fused-memory/tests/test_reindex.py, fused-memory/tests/test_refresh_entity_summary.py\n\nSource: steward-triage follow-up from Task 486 (esc-486-49).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "530",
+        "title": "Verify CALL db.indexes() is accepted by FalkorDB over GRAPH.RO_QUERY",
+        "description": "Compatibility risk raised by reviewer_robustness on Task 486:\n\n`list_indices` now calls `await graph.ro_query('CALL db.indexes()')` in `graphiti_client.py` (~line 1185). Stored procedure calls (`CALL ...`) are sometimes classified as write-capable by the DB engine and may be rejected over the read-only command path (GRAPH.RO_QUERY), depending on FalkorDB version and configuration. All other `ro_query` callers in this file use plain MATCH queries, making this the only procedure call sent through the read-only path.\n\nAction: Empirically test against the target FalkorDB version (ideally with a live integration test).\n- If GRAPH.RO_QUERY rejects `CALL db.indexes()`: revert `list_indices` to `graph.query` and add a docstring explaining the exception, plus a tracking note for future FalkorDB upgrades.\n- If accepted: add a comment confirming the procedure is safe on the read-only path so future readers understand the exception.\n\nFiles: fused-memory/src/fused_memory/backends/graphiti_client.py\n\nSource: steward-triage follow-up from Task 486 (esc-486-49).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "531",
+        "title": "Fix run_eval_matrix exception handling and add coverage",
+        "description": "In orchestrator/src/orchestrator/evals/runner.py lines 313-315, replace `isinstance(r, BaseException)` with handling that explicitly re-raises asyncio.CancelledError (or separates it from ordinary eval failures) so graceful shutdown propagates correctly. Add a test that gathers a coroutine raising asyncio.CancelledError and verifies the correct behavior (absorbed vs re-raised, per the chosen design). Also add a test that calls run_eval_matrix with a task raising asyncio.CancelledError and verifies the error is logged but the matrix call handles it gracefully.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "532",
+        "title": "Refactor TestVllmUrlInjection test fixtures for isolation and deduplication",
+        "description": "In orchestrator/tests/test_eval_configs.py, refactor TestVllmUrlInjection (lines 175-240): (1) extract the save/restore env_overrides scaffolding into a shared pytest fixture using monkeypatch or contextmanager, eliminating the 45-line copy-paste across 3 test methods; (2) use deepcopy or monkeypatch.setattr to avoid mutating module-level singletons directly. Also add at least one test that exercises the actual CLI injection path: invoke _run_single_eval or _run_matrix_cmd from cli.py with a vllm_url argument (mocked runner) and assert ANTHROPIC_BASE_URL is injected into each vLLM config's env_overrides.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "533",
+        "title": "Fix stale config list references and hardcoded data in tests",
+        "description": "In orchestrator/tests/test_eval_configs.py: (1) line 115 — change `for cfg in EVAL_CONFIGS + VLLM_EVAL_CONFIGS:` to `for cfg in EVAL_CONFIGS:` since VLLM_EVAL_CONFIGS is already spread into EVAL_CONFIGS; (2) lines 179-183 — replace the hardcoded _CLOUD_BASELINE_NAMES set with a derived expression: `{cfg.name for cfg in EVAL_CONFIGS} - {cfg.name for cfg in VLLM_EVAL_CONFIGS}` so it stays in sync automatically when baselines are added or renamed.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "534",
+        "title": "Remove redundant tests from test_eval_configs.py",
+        "description": "In orchestrator/tests/test_eval_configs.py: (1) remove the entire TestRunnerDefaultIncludesVllm class (lines 158-172) — it is fully subsumed by TestEvalConfigsIncludesVllm since runner_module.EVAL_CONFIGS is configs.EVAL_CONFIGS; (2) remove test_vllm_config_count_is_six (lines 84-89) — the count is implied by test_vllm_config_names_are_exact_set which already fails with a descriptive diff on any mismatch.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "535",
+        "title": "Add missing test coverage for create_eval_worktree API contract and runner help output",
+        "description": "Three gaps to address: (1) orchestrator/tests/ — add a test for create_eval_worktree in snapshots.py that asserts the result is a 2-tuple of (Path, str) and that run_id is an 8-character hex string; (2) orchestrator/tests/test_runner_main.py line 28 — change the weak `or` assertion to `and` and add `--vllm-url` to the checked flags; (3) orchestrator/tests/test_runner_main.py line 15 — add `timeout=30` to the subprocess.run call and catch subprocess.TimeoutExpired with a clear failure message.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "536",
+        "title": "Move runner.py __main__ entry-point to evals/__main__.py",
+        "description": "In orchestrator/src/orchestrator/evals/runner.py, remove the `if __name__ == '__main__':` block (lines 383-385). Create a new file orchestrator/src/orchestrator/evals/__main__.py containing only `from orchestrator.cli import eval_cmd; eval_cmd()`. This preserves `python -m orchestrator.evals.runner` invocability while eliminating the reverse runner→cli dependency edge and keeping runner.py a pure library module.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "537",
+        "title": "Hoist INSERT SQL to module-level constant in burndown.py",
+        "description": "In `dashboard/src/dashboard/data/burndown.py`, hoist the INSERT SQL literal in `collect_snapshot`'s Phase 3 loop (around lines 119-121) to a module-level constant `_INSERT_SNAPSHOT_SQL` (single string literal, no concatenation). No helper extraction, no signature changes, no behavior changes. Source: remaining sub-goal of superseded task 471; review suggestion #5 from reviewer_performance.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "538",
+        "title": "Extract _tasks_json_for helper to remove path duplication in burndown.py",
+        "description": "In `dashboard/src/dashboard/data/burndown.py`, extract a small module-level helper `def _tasks_json_for(root: Path) -> Path: return root / '.taskmaster' / 'tasks' / 'tasks.json'` and use it at the two call sites in `collect_snapshot` where the path is currently built inline (the orchestrator loop around line 99 and the `known_project_roots` loop around line 107). Mirrors how `DashboardConfig.tasks_json` centralizes this path for the primary project root. Pure refactor; no behavior change.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 471 from two independent reviewers (reviewer_architect_reviewer #2, reviewer_reuse_auditor #6).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "539",
+        "title": "Harden collect_snapshot against partial-failure cascades",
+        "description": "Harden `collect_snapshot` in `dashboard/src/dashboard/data/burndown.py` against partial failures in secondary projects so a transient error does not forfeit the primary project's snapshot.\n\nThree related robustness concerns from review of task 471:\n\n1. Transaction atomicity (#11): All project inserts currently share a single commit at the end. A DB error on any secondary project rolls back the main project's row too. Consider per-project savepoints, or commit the main insert first then treat extras as best-effort.\n\n2. Orchestrator-discovery failure (#12): `find_running_orchestrators()` (and `_read_project_root_from_config`) can raise (subprocess failures, OS errors). That currently aborts the whole snapshot. Wrap the orchestrator-discovery block in a try/except that logs and degrades to skip extras.\n\n3. Missing explicit rollback + docstring contract (#13): The error path relies on aiosqlite's implicit rollback-on-close. Add an explicit `await conn.rollback()` in an except around the body, or document the implicit behavior.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n- dashboard/tests/test_burndown_data.py (add tests covering each failure mode)\n\nSource: review suggestions #11, #12, #13 from reviewer_robustness on task 471. The target code shape is main's 3-phase parallel `collect_snapshot` (post-task-470).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "540",
+        "title": "Apply task 480 items 3-4 after task/455 merges to main",
+        "description": "Follow-up from task 480. Items 3 and 4 reference tests in fused-memory/tests/test_harness.py that exist only on the unmerged task/455 branch. Once task/455 lands on main, apply these two fixes:\n\nItem 3: In `test_stage1_and_stage2_receive_filtered_tree_before_run` and the budget integration test, add `harness.taskmaster.get_tasks.assert_called_once()` after `await harness.run_full_cycle(...)` to verify the single-fetch invariant.\n\nItem 4: In `test_handles_fetch_exception`, change the `or` to `and`:\n`assert any('connection refused' in r.message and '/abs/path' in r.message for r in caplog.records if r.levelno >= logging.WARNING)`\n\nItems 1 and 2 of task 480 were completed directly on the task/480 branch in commit 2203f758df.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T19:46:07.167Z",
-      "taskCount": 474,
-      "completedCount": 416,
+      "lastModified": "2026-04-06T23:04:34.074Z",
+      "taskCount": 519,
+      "completedCount": 432,
       "tags": [
         "master"
       ]

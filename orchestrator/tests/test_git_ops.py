@@ -2,6 +2,7 @@
 
 import asyncio
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -192,6 +193,51 @@ class TestWorktreeLifecycle:
         worktree, _ = await git_ops.create_worktree('feature-7')
         branch = await git_ops.get_current_branch(worktree)
         assert branch == 'task/feature-7'
+
+    async def test_merge_to_main_cleans_worktree_on_cancellation(
+        self, git_ops: GitOps,
+    ):
+        """merge_to_main must clean up the merge worktree on CancelledError.
+
+        Covers review issue [resource_leak_on_cancellation] at git_ops.py:495.
+        The cleanup guard uses ``except Exception:`` which does NOT catch
+        ``asyncio.CancelledError`` (a BaseException subclass).  This test
+        fails with the old guard and passes with ``except BaseException:``.
+        """
+        # Set up a feature branch with a committed file.
+        worktree, _ = await git_ops.create_worktree('feature-cancel')
+        (worktree / 'cancel_test.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add cancel test file')
+
+        # Patch _scrub_task_dir_from_tree to raise CancelledError, simulating
+        # task cancellation at the point where the merge commit already exists
+        # but cleanup has not yet been called.
+        with patch(
+            'orchestrator.git_ops._scrub_task_dir_from_tree',
+            side_effect=asyncio.CancelledError,
+        ), pytest.raises(asyncio.CancelledError):
+            await git_ops.merge_to_main(worktree, 'feature-cancel')
+
+        # After CancelledError, no _merge-* worktrees should be registered.
+        _, worktree_list, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        leak_lines = [
+            line for line in worktree_list.splitlines()
+            if '_merge-' in line
+        ]
+        assert not leak_lines, (
+            f'Leaked merge worktrees still registered: {leak_lines}'
+        )
+
+        # Also confirm no _merge-* directories exist on disk.
+        worktree_base = git_ops.worktree_base
+        if worktree_base.exists():
+            leak_dirs = list(worktree_base.glob('_merge-*'))
+            assert not leak_dirs, (
+                f'Leaked merge worktree directories on disk: {leak_dirs}'
+            )
 
 
 @pytest.mark.asyncio
