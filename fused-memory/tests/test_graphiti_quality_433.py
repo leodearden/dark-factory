@@ -469,6 +469,9 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['status'] == 'rebuilt'
         assert ok_detail['uuid'] == 'u2'
         assert ok_detail['name'] == 'Bob'
+        assert ok_detail['old_summary'] == ''
+        assert ok_detail['new_summary'] == 'rebuilt'
+        assert ok_detail['edge_count'] == 0
 
 
 # ---------------------------------------------------------------------------
