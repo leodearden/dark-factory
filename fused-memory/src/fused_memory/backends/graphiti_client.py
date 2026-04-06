@@ -1077,6 +1077,11 @@ class GraphitiBackend:
             # contract and prevents callers from silently ignoring shutdown signals.
             for r in results:
                 if isinstance(r, BaseException) and not isinstance(r, Exception):
+                    logger.warning(
+                        'rebuild_entity_summaries: cancellation signal received '
+                        'group=%s rebuilt_so_far=%d errors_so_far=%d; propagating',
+                        group_id, rebuilt, errors,
+                    )
                     raise r
 
             # Pass 2: per-entity accumulation.  Using isinstance(r, Exception) instead
