@@ -9568,11 +9568,11 @@
         "description": "Three related harness.py improvements:\n1. Inject filtered_task_tree for Stage 2 through _configure_consolidator() or a new _configure_task_sync() counterpart, rather than naked attribute assignment. The current asymmetry (structured helper for S1, naked assignment for S2) makes configuration logic hard to trace.\n2. At minimum, rename the parameter or add a docstring to _configure_consolidator clarifying that filtered_task_tree is Stage-1-only and Stage 2 injection is separate.\n3. Add `filtered_task_tree: FilteredTaskTree | None = None` parameter to `_run_remediation_pass()` and pass the pre-fetched `filtered_tree` from `run_full_cycle()`. Inside the method: `remediation_tree = filtered_task_tree or await self._fetch_filtered_task_tree(project_root)` to skip the redundant get_tasks call that currently happens during remediation.\n\n## memory_hints\n- search: \"harness _configure_consolidator _run_remediation_pass filtered_task_tree\"\n- search: \"redundant get_tasks call remediation pass\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T20:00:53.240Z",
+        "updatedAt": "2026-04-06T22:40:56.728Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
@@ -10094,7 +10094,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T22:40:56.492Z",
+      "lastModified": "2026-04-06T22:40:56.728Z",
       "taskCount": 500,
       "completedCount": 429,
       "tags": [
