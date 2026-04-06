@@ -492,7 +492,7 @@ class GitOps:
                 merge_worktree=merge_wt,
             )
 
-        except Exception:
+        except BaseException:
             if merge_wt:
                 await self.cleanup_merge_worktree(merge_wt)
             raise
