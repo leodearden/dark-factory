@@ -9256,10 +9256,11 @@
         "description": "Improve test_rebuild_entity_error_recorded_in_result (lines 370-396) in fused-memory/tests/test_graphiti_quality_433.py with three additions:\n\n1. Assert `detail['uuid'] == 'u1'` and `detail['name'] == 'Alice'` — the implementation at graphiti_client.py:1062-1067 sets both fields in the error branch from t['uuid']/t['name']; not asserting them means wrong-entity bugs go undetected.\n\n2. Assert `result['total_entities'] == 1` and `result['stale_entities'] == 1` to confirm counting logic is not disturbed by the error path. The implementation sets these from list_entity_nodes and the targets list respectively.\n\n3. Add a second test with two entities using `side_effect=[RuntimeError('boom'), {'uuid': 'u2', 'name': 'Bob', 'old_summary': '', 'new_summary': '', 'edge_count': 0}]` to exercise the partial-success path (rebuilt==1, errors==1) — this is the core value of `asyncio.gather(return_exceptions=True)` and could hide a bug where one exception poisons the accumulator loop.\n\nFiles: fused-memory/tests/test_graphiti_quality_433.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T18:54:14.649Z"
       },
       {
         "id": "460",
@@ -9418,7 +9419,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T18:54:14.423Z",
+      "lastModified": "2026-04-06T18:54:14.649Z",
       "taskCount": 452,
       "completedCount": 405,
       "tags": [
