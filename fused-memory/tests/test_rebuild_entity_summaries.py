@@ -883,6 +883,42 @@ class TestRebuildEntitySummariesParallel:
         assert result['rebuilt'] == 2
 
     @pytest.mark.asyncio
+    async def test_force_list_entity_nodes_called_exactly_once(
+        self, mock_config, make_backend
+    ):
+        """Force path: list_entity_nodes is awaited exactly once (single bulk fetch).
+
+        Uses three distinct entities with distinct facts so a regression that returns
+        uuid-1 data for every call would produce incorrect per-entity summaries and
+        fail the final per-uuid assertions.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'summary-1'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'summary-2'},
+            {'uuid': 'uuid-3', 'name': 'Carol', 'summary': 'summary-3'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'fact-1', 'name': 'rel-1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'fact-2', 'name': 'rel-2'}],
+            'uuid-3': [{'uuid': 'e3', 'fact': 'fact-3', 'name': 'rel-3'}],
+        })
+        backend.update_node_summary = AsyncMock()
+
+        result = await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+        # list_entity_nodes must be called exactly once — no per-entity re-fetch
+        backend.list_entity_nodes.assert_awaited_once()
+        assert result['total_entities'] == 3
+        assert result['rebuilt'] == 3
+
+        # Each entity must carry its own edge data, not uuid-1's data for every entry
+        by_uuid = {d['uuid']: d for d in result['details']}
+        assert by_uuid['uuid-1']['new_summary'] == 'fact-1'
+        assert by_uuid['uuid-2']['new_summary'] == 'fact-2'
+        assert by_uuid['uuid-3']['new_summary'] == 'fact-3'
+
+    @pytest.mark.asyncio
     async def test_concurrent_all_five_entities_processed(self, mock_config, make_backend):
         """With 5 target entities, all 5 get update_node_summary calls (parallel processing)."""
         n = 5
