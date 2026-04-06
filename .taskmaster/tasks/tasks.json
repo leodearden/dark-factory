@@ -10178,6 +10178,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 530,
+        "title": "Verify CALL db.indexes() is accepted by FalkorDB over GRAPH.RO_QUERY",
+        "description": "Compatibility risk raised by reviewer_robustness on Task 486:\n\n`list_indices` now calls `await graph.ro_query('CALL db.indexes()')` in `graphiti_client.py` (~line 1185). Stored procedure calls (`CALL ...`) are sometimes classified as write-capable by the DB engine and may be rejected over the read-only command path (GRAPH.RO_QUERY), depending on FalkorDB version and configuration. All other `ro_query` callers in this file use plain MATCH queries, making this the only procedure call sent through the read-only path.\n\nAction: Empirically test against the target FalkorDB version (ideally with a live integration test).\n- If GRAPH.RO_QUERY rejects `CALL db.indexes()`: revert `list_indices` to `graph.query` and add a docstring explaining the exception, plus a tracking note for future FalkorDB upgrades.\n- If accepted: add a comment confirming the procedure is safe on the read-only path so future readers understand the exception.\n\nFiles: fused-memory/src/fused_memory/backends/graphiti_client.py\n\nSource: steward-triage follow-up from Task 486 (esc-486-49).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10190,7 +10201,7 @@
       ],
       "created": "2026-04-06T22:44:13.261Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:44:30.015Z"
+      "updated": "2026-04-06T22:44:35.961Z"
     }
   }
 }
