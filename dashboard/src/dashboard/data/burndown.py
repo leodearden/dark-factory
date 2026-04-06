@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import aiosqlite
 
@@ -72,7 +73,7 @@ async def collect_snapshot(
     # Phase 1 — Discovery (sequential, in-memory):
     # Build the ordered list of (project_id_str, tasks_json_path) tuples to snapshot.
     # Main project is always first; seen_roots dedup is preserved exactly.
-    roots_to_snapshot: list[tuple[str, object]] = []
+    roots_to_snapshot: list[tuple[str, Path]] = []
     seen_roots: set[str] = {str(config.project_root)}
     roots_to_snapshot.append((str(config.project_root), config.tasks_json))
 
@@ -109,7 +110,7 @@ async def collect_snapshot(
 
     # Phase 3 — Sequential insert:
     # aiosqlite serialises writes on a single connection; keep inserts sequential.
-    for (root_str, _), tasks in zip(roots_to_snapshot, all_tasks):
+    for (root_str, _), tasks in zip(roots_to_snapshot, all_tasks, strict=True):
         counts = _count_statuses(tasks)
         await conn.execute(
             'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
