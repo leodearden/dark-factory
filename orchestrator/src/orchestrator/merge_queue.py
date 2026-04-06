@@ -634,10 +634,18 @@ class SpeculativeMergeWorker:
         When N's verification/advance fails and N+1 was speculatively merged,
         the Verifier discards N+1's stale worktree and re-merges it against
         actual main before re-verifying.
+
+        Chain invalidation: if N+1 was re-merged (because N failed), N+2 was
+        speculatively built on N+1's stale commit — it must ALSO be re-merged.
+        ``remerge_occurred`` propagates this through the chain automatically.
         """
         # True when the previous non-speculative item failed verification
         # or CAS, meaning any following speculative item is invalid.
         n_failed = False
+        # True when the previous iteration performed a discard+re-merge.
+        # Causes subsequent speculative items to also be discarded and re-merged,
+        # because they were built on the stale pre-re-merge commit chain.
+        remerge_occurred = False
 
         while True:
             item = await self._verifier_queue.get()
@@ -645,21 +653,31 @@ class SpeculativeMergeWorker:
                 break  # shutdown sentinel
 
             req = item.request
+            # Track whether THIS iteration performs a re-merge so we can
+            # propagate the chain-invalidation flag to the next iteration.
+            iteration_did_remerge = False
 
             try:
-                # ── Discard stale speculative merge when N failed ──────────
-                if item.speculative and n_failed:
-                    # Clean up the stale merge worktree (merged against N's commit
-                    # which never reached main).
+                # ── Discard stale speculative merge when chain is invalidated ─
+                # Two cases: (1) N failed directly (n_failed=True); (2) a prior
+                # iteration re-merged, meaning the Merger's spec_base for this
+                # item descended from a commit that never reached main.
+                if item.speculative and (n_failed or remerge_occurred):
+                    # Set flag early so an exception during cleanup/_remerge still
+                    # propagates chain invalidation to the next iteration.
+                    iteration_did_remerge = True
+                    # Clean up the stale merge worktree (merged against a commit
+                    # that never reached main).
                     if item.merge_wt:
                         await self._git_ops.cleanup_merge_worktree(item.merge_wt)
+                    discard_reason = 'previous_failed' if n_failed else 'chain_invalidated'
                     self._emit_speculative(
                         EventType.speculative_discard, req.task_id,
-                        reason='previous_failed',
+                        reason=discard_reason,
                     )
                     logger.info(
-                        f'Task {req.task_id}: discarding stale speculative merge, '
-                        f're-merging against actual main'
+                        f'Task {req.task_id}: discarding stale speculative merge '
+                        f'({discard_reason}), re-merging against actual main'
                     )
                     item = await self._remerge(req)
 
@@ -692,6 +710,9 @@ class SpeculativeMergeWorker:
                     ))
                 raise
             finally:
+                # Propagate chain-invalidation state BEFORE releasing the slot
+                # so the Merger's next speculative item sees the updated flag.
+                remerge_occurred = iteration_did_remerge
                 self._speculation_slot.set()
 
     async def _remerge(self, req: MergeRequest) -> SpeculativeItem:

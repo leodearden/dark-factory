@@ -1316,6 +1316,102 @@ class TestSpeculativeMergeWorker:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=15)
 
+    async def test_speculative_chain_invalidation_propagates(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Chain invalidation must propagate: if N fails and N+1 is re-merged,
+        N+2 (built speculatively on N+1's stale commit) must ALSO be re-merged.
+
+        Scenario (depth-1 cap):
+          - Queue has N, N+1, N+2 pre-loaded before worker starts.
+          - Merger: merges N (non-spec), speculatively merges N+1 against N's
+            merge commit, then awaits spec slot.
+          - Verifier: N fails (has file_chain_n.py) → n_failed=True, releases slot.
+          - Merger: grabs N+2, speculatively merges against N+1's STALE commit.
+          - Verifier: N+1 discarded (n_failed=True), re-merged against actual main
+            (no file_chain_n.py) → passes.  n_failed=False.  remerge_occurred=True.
+          - Verifier: N+2 (speculative=True).
+              WITHOUT FIX: n_failed=False → no discard → verification sees
+              file_chain_n.py in speculative worktree → blocked.
+              WITH FIX: remerge_occurred=True → discard → re-merge against actual
+              main (only N+1, no N) → passes → done.
+
+        Covers review issue [correctness_bug_in_speculative_chain_invalidation].
+        """
+        wt_n = await _make_branch_with_file(
+            git_ops, 'chain-n', 'file_chain_n.py', 'n = 1\n',
+        )
+        wt_n1 = await _make_branch_with_file(
+            git_ops, 'chain-n1', 'file_chain_n1.py', 'n1 = 2\n',
+        )
+        wt_n2 = await _make_branch_with_file(
+            git_ops, 'chain-n2', 'file_chain_n2.py', 'n2 = 3\n',
+        )
+
+        # Pre-load all three so the Merger builds a 3-deep speculative chain:
+        # N (non-spec), N+1 (spec against N's commit), N+2 (spec against N+1's
+        # stale commit once the Verifier releases the slot after N fails).
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req_n = _make_request('chain-n', 'chain-n', wt_n, config)
+        req_n1 = _make_request('chain-n1', 'chain-n1', wt_n1, config)
+        req_n2 = _make_request('chain-n2', 'chain-n2', wt_n2, config)
+        await queue.put(req_n)
+        await queue.put(req_n1)
+        await queue.put(req_n2)
+
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        # Fail verification whenever file_chain_n.py is present (N's tainted code).
+        # N's merge is non-spec → fail; N+2's speculative worktree descends from
+        # N's commit → also has file_chain_n.py → would fail unless discarded first.
+        async def _verify_chain(merge_wt, cfg, module_configs, task_files=None):
+            result = AsyncMock()
+            if (merge_wt / 'file_chain_n.py').exists():
+                result.passed = False
+                result.summary = 'N tainted: file_chain_n.py present'
+            else:
+                result.passed = True
+                result.summary = ''
+            return result
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=_verify_chain,
+        ):
+            worker_task = asyncio.create_task(worker.run())
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
+            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=60)
+
+        assert outcome_n.status == 'blocked', (
+            f'N: expected blocked, got {outcome_n}'
+        )
+        assert outcome_n1.status == 'done', (
+            f'N+1: expected done after re-merge against actual main, got {outcome_n1}'
+        )
+        assert outcome_n2.status == 'done', (
+            f'N+2: expected done after chain-invalidation re-merge, got {outcome_n2}. '
+            f'Without fix, N+2 is blocked because it was speculatively built on '
+            f"N+1's stale commit (which contains file_chain_n.py from N)."
+        )
+
+        # Verify git state: N's tainted file must not be on main; N+1 and N+2 must be.
+        _, ls_files, _ = await _run(
+            ['git', 'ls-tree', '--name-only', 'main'], cwd=git_ops.project_root,
+        )
+        assert 'file_chain_n.py' not in ls_files, (
+            'N (tainted) must not appear on main'
+        )
+        assert 'file_chain_n1.py' in ls_files, (
+            'N+1 must appear on main after re-merge'
+        )
+        assert 'file_chain_n2.py' in ls_files, (
+            'N+2 must appear on main after re-merge'
+        )
+
+        await worker.stop()
+        await worker_task
+
 
 # ---------------------------------------------------------------------------
 # TestSpeculativeBackwardCompat — step-17
