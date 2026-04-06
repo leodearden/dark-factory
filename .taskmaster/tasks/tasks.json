@@ -9270,10 +9270,11 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py at TestRebuildEntitySummariesForceDryRun.test_force_no_dry_run_calls_get_all_valid_edges (line 278), add after the existing get_all_valid_edges assertion:\n\n```python\nassert backend._rebuild_entity_from_edges.await_count == 2\n```\n\nThis guards the O(N) gather fan-out — a regression silently dropping one entity (e.g. off-by-one in the gather targets list) would not be caught by the current single-call assertion on get_all_valid_edges alone.\n\nFiles: fused-memory/tests/test_graphiti_quality_433.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T19:05:01.812Z"
       },
       {
         "id": "461",
@@ -9560,7 +9561,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T19:05:01.699Z",
+      "lastModified": "2026-04-06T19:05:01.812Z",
       "taskCount": 464,
       "completedCount": 407,
       "tags": [
