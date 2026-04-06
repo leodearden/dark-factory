@@ -910,8 +910,10 @@ class TestRebuildEntitySummariesParallel:
 
         # list_entity_nodes must be called exactly once — no per-entity re-fetch
         backend.list_entity_nodes.assert_awaited_once()
+        backend.get_all_valid_edges.assert_awaited_once()
         assert result['total_entities'] == 3
         assert result['rebuilt'] == 3
+        assert backend.update_node_summary.await_count == 3
 
         # Each entity must carry its own edge data, not uuid-1's data for every entry
         by_uuid = {d['uuid']: d for d in result['details']}
