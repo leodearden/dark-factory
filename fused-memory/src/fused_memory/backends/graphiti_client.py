@@ -28,12 +28,12 @@ class StaleSummaryResult(NamedTuple):
     """Structured return type for _detect_stale_summaries_with_edges.
 
     Inherits from tuple for full backward-compatibility: callers using
-    ``stale, edges, total = await self._detect_stale_summaries_with_edges(...)``
+    ``stale, all_edges, total = await self._detect_stale_summaries_with_edges(...)``
     continue to work unchanged.
     """
 
     stale: list[dict]
-    edges: dict[str, list[dict]]
+    all_edges: dict[str, list[dict]]
     total_count: int
 
 
@@ -904,7 +904,7 @@ class GraphitiBackend:
                 'valid_fact_count': len(valid_facts),
                 'summary_line_count': len(summary_lines),
             })
-        return StaleSummaryResult(stale=stale, edges=all_edges, total_count=len(entities))
+        return StaleSummaryResult(stale=stale, all_edges=all_edges, total_count=len(entities))
 
     async def detect_stale_summaries(self, *, group_id: str) -> list[dict]:
         """Identify Entity nodes whose summary is out of sync with valid edge facts.
