@@ -28,12 +28,6 @@ class TestConfigDefaults:
         cfg = DashboardConfig()
         assert cfg.known_project_roots == []
 
-    def test_known_project_roots_is_list_not_tuple(self):
-        from dashboard.config import DashboardConfig
-
-        cfg = DashboardConfig()
-        assert isinstance(cfg.known_project_roots, list)
-
     def test_config_derived_paths(self):
         from dashboard.config import DashboardConfig
 
