@@ -9898,10 +9898,11 @@
         "description": "The dry_run branch of rebuild_entity_summaries (graphiti_client.py lines 1046-1049) sets `skipped = stale_entities` and appends `status='skipped_dry_run'` details, but has no dedicated test coverage.\n\nAdd a test in TestRebuildEntitySummariesErrorHandling (or a new class) that:\n1. Calls `rebuild_entity_summaries(group_id='test', force=True, dry_run=True)` with multiple entities\n2. Asserts `result['skipped'] == len(entities)` (i.e. stale_entities)\n3. Asserts `result['rebuilt'] == 0` and `result['errors'] == 0`\n4. Asserts each detail entry has `status == 'skipped_dry_run'`\n5. Verifies `_rebuild_entity_from_edges` was NOT called (since dry_run skips actual rebuilds)\n6. Verifies edges were NOT fetched (line 1031: `if not dry_run` guards the edge fetch)\n\nThis completes the counter partition invariant coverage: errors+rebuilt+skipped==total is now tested for the dry_run path.\n\nMemory hints: search \"rebuild_entity_summaries dry_run\", search \"counter partition invariant\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:32:26.818Z"
       },
       {
         "id": "505",
@@ -10060,7 +10061,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T22:32:26.543Z",
+      "lastModified": "2026-04-06T22:32:26.818Z",
       "taskCount": 497,
       "completedCount": 428,
       "tags": [
