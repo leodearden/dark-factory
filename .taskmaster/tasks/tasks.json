@@ -9160,14 +9160,18 @@
         "priority": "high",
         "subtasks": [],
         "metadata": {
-          "human_review_recommended": true,
+          "human_review_recommended": false,
           "recon_unreliable_until_fixed": true,
           "confirmed_affected_run": "94151a78",
           "zero_active_tasks_since": "2026-04-02",
           "memory_hints": {
-            "entities": [],
+            "entities": [
+              "reconciliation harness"
+            ],
             "queries": [
-              "resolution for: Implement harness-level task filtering: inject only active tasks into recon Stage 1/Stage 2 prompts"
+              "false-empty task tree Stage 1 Stage 2 recurring bug",
+              "get_tasks context window overflow 600K filter done cancelled",
+              "reconciliation harness task tree injection task_filter.py"
             ]
           },
           "_causation_id": "575fd7e6-9c9d-401e-9ef8-39f0159ffd6d",
@@ -9179,6 +9183,16 @@
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
             "fused-memory/tests"
+          ],
+          "unblocked_by": "recon_stage2_2026-04-06_all_steps_confirmed_complete",
+          "implementation_confirmed": true,
+          "follow_on_quality_tasks": [
+            476,
+            477,
+            478,
+            479,
+            480,
+            481
           ]
         },
         "updatedAt": "2026-04-06T22:17:45.681Z"
