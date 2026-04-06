@@ -341,3 +341,91 @@ class TestFormatFilteredTaskTree:
             f'bug: magic -50 reserve is insufficient when trimmed_count has 7+ digits '
             f'(notice is 52 chars, not ≤ 50)'
         )
+
+    def test_deps_more_than_5_renders_truncated(self):
+        """Task with >5 deps renders first 5 items with '...' suffix, not the full list.
+
+        When a task has deps=[1,2,3,4,5,6,7,8], the formatter must emit
+        'deps=[1, 2, 3, 4, 5]...' and must NOT emit the full list.
+        Bug: current code uses `deps={deps}` which renders the full list repr.
+        """
+        task = {
+            'id': 42,
+            'title': 'Many deps task',
+            'status': 'pending',
+            'dependencies': [1, 2, 3, 4, 5, 6, 7, 8],
+        }
+        tree = FilteredTaskTree(
+            active_tasks=[task],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=1,
+        )
+        output = format_filtered_task_tree(tree)
+
+        # Must show first 5 items with '...' suffix
+        assert 'deps=[1, 2, 3, 4, 5]...' in output, (
+            f'Expected truncated deps repr in output, got: {output!r}'
+        )
+        # Must NOT show the full list
+        assert 'deps=[1, 2, 3, 4, 5, 6, 7, 8]' not in output, (
+            f'Found full deps list (not truncated) in output: {output!r}'
+        )
+
+    def test_deps_exactly_5_renders_full_list_without_ellipsis(self):
+        """Task with exactly 5 deps renders the full list without trailing '...'.
+
+        When a task has deps=[10,20,30,40,50], the formatter must emit
+        'deps=[10, 20, 30, 40, 50]' with no trailing '...'.
+        """
+        task = {
+            'id': 99,
+            'title': 'Five deps task',
+            'status': 'pending',
+            'dependencies': [10, 20, 30, 40, 50],
+        }
+        tree = FilteredTaskTree(
+            active_tasks=[task],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=1,
+        )
+        output = format_filtered_task_tree(tree)
+
+        # Must show full list
+        assert 'deps=[10, 20, 30, 40, 50]' in output, (
+            f'Expected full deps repr in output, got: {output!r}'
+        )
+        # Must NOT have trailing '...' after the closing bracket
+        assert 'deps=[10, 20, 30, 40, 50]...' not in output, (
+            f'Found unexpected ellipsis in output: {output!r}'
+        )
+
+    def test_many_deps_per_task_stays_under_budget(self):
+        """Tasks with many deps (200) do not exhaust the char budget.
+
+        With 50 tasks each having 200 deps, and max_chars=5000, the output
+        must stay under budget. Bug: unbounded deps repr inflates each line
+        by hundreds of chars, blowing through the budget before other tasks
+        are shown.
+        """
+        big_deps = list(range(1, 201))  # 200 deps per task
+        active = [
+            _make_task(i, 'pending', f'Task {i}', deps=big_deps)
+            for i in range(1, 51)
+        ]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=50,
+        )
+        output = format_filtered_task_tree(tree, max_chars=5000)
+
+        assert len(output) <= 5000, (
+            f'Output length {len(output)} exceeds max_chars=5000; '
+            f'deps display is not being truncated'
+        )
