@@ -177,7 +177,7 @@ def format_filtered_task_tree(
             tid = t.get('id', '?')
             title = t.get('title', '?')
             status = t.get('status', '?')
-            deps = t.get('dependencies', [])
+            deps = t.get('dependencies') or []
             lines.append(f'- [{tid}] ({status}) {title} deps={deps}')
         body = '\n'.join(lines) + '\n'
 
