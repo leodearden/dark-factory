@@ -122,6 +122,32 @@ async def collect_snapshot(
             ),
         )
 
+    # Snapshot any additional projects from the configured known_project_roots list.
+    # This handles projects whose orchestrators are not currently running.
+    for known_root in config.known_project_roots:
+        resolved = known_root.resolve()
+        root_str = str(resolved)
+        if root_str in seen_roots:
+            continue
+        seen_roots.add(root_str)
+        tasks_json = resolved / '.taskmaster' / 'tasks' / 'tasks.json'
+        extra_tasks = await asyncio.to_thread(load_task_tree, tasks_json)
+        extra_counts = _count_statuses(extra_tasks)
+        await conn.execute(
+            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                root_str,
+                now,
+                extra_counts['pending'],
+                extra_counts['in_progress'],
+                extra_counts['blocked'],
+                extra_counts['deferred'],
+                extra_counts['cancelled'],
+                extra_counts['done'],
+            ),
+        )
+
     await conn.commit()
 
 
