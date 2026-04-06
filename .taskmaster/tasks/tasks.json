@@ -9244,10 +9244,11 @@
         "description": "Two related fixes in fused-memory/tests/test_graphiti_quality_433.py around test_is_tuple_subclass (line 57):\n\n1. Rename the method from `test_is_tuple_subclass` to `test_value_equal_to_plain_tuple` (or `test_equals_plain_tuple`) to match the actual value-equality assertion. The current name contradicts the assertion which was changed from `isinstance(result, tuple)` to `result == (stale_list, edges, 1)`.\n\n2. Replace the inline comment at line 62-63 — 'only actual tuple subclasses compare equal to plain tuples this way' — with something accurate like: '# NamedTuple is a tuple subclass, so value-equality with a plain tuple holds — this confirms the backward-compat contract is in place.' The current comment is misleading because any Python object can implement __eq__ to compare equal to a tuple.\n\nFiles: fused-memory/tests/test_graphiti_quality_433.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T18:37:13.721Z"
       },
       {
         "id": "459",
@@ -9417,7 +9418,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T18:37:13.467Z",
+      "lastModified": "2026-04-06T18:37:13.721Z",
       "taskCount": 452,
       "completedCount": 402,
       "tags": [
