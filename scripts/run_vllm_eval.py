@@ -77,7 +77,7 @@ def run_eval(model_key, task_name, local_port, datacenter="US-NC-1", use_volume=
     # HF model ID for MODEL_NAME env var
     HF_MODELS = {
         "devstral-small": "mistralai/Devstral-Small-2505",
-        "qwen3-coder-next": "Qwen/Qwen3-Coder-Next",
+        "qwen3-coder-next": "Qwen/Qwen3-Coder-Next-FP8",  # official FP8 quant (~80GB, block-128)
         "reap-139b": "cerebras/MiniMax-M2.5-REAP-139B-A10B",
         "reap-172b": "cerebras/MiniMax-M2.5-REAP-172B-A10B",
         "minimax-m25": "MiniMaxAI/MiniMax-M2.5",
