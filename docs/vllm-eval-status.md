@@ -3,6 +3,29 @@
 **Last updated:** 2026-04-06 06:40 BST
 **Plan:** `~/.claude/plans/zany-dancing-yeti.md`
 
+## Bridge fix (Task 457)
+
+**Merged in Task 457.** The eval pipeline previously sent Claude CLI directly to the vLLM
+`/v1/messages` endpoint, whose tool_use response format differs from what Claude CLI expects
+(OpenAI-style `tool_calls`, JSON-string `input`, wrong `stop_reason`, non-Anthropic IDs).
+This caused every tool_use response to error the CLI parser; no vLLM eval ever reached
+`outcome=done`.
+
+The fix adds `shared/src/shared/vllm_bridge.py` — a local aiohttp HTTP proxy that:
+- Starts on `127.0.0.1:0` (OS-assigned port) per invocation
+- Translates POST `/v1/messages` responses: converts `tool_calls` → Anthropic content blocks,
+  normalises tool_use IDs to `toolu_` prefix, parses JSON-string `input` fields, fixes
+  `stop_reason` to `'tool_use'` when tool_use blocks are present
+- Forces `stream=false` on forwarded requests (buffered translation — simpler than SSE)
+- Pipes all other paths straight through to the upstream vLLM endpoint
+
+**Auto-activation:** The bridge is wired into `shared/src/shared/cli_invoke.py`. Whenever
+`env_overrides` contains `ANTHROPIC_BASE_URL`, `_invoke_claude` starts a per-invocation
+bridge pointing at that URL, rewrites the subprocess env to point at the bridge's local
+URL, and tears the bridge down in a `finally` block (success, failure, or exception).
+No API changes — existing callers that set `env_overrides['ANTHROPIC_BASE_URL']` gain the
+bridge transparently.
+
 ## TL;DR for next session
 
 **The pipeline works end-to-end except for two vLLM-level blockers:**

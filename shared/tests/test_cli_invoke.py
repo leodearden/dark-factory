@@ -823,7 +823,12 @@ class TestEnvOverrides:
     """Verify env_overrides are merged into the subprocess env without mutating os.environ."""
 
     async def test_env_overrides_merged_into_subprocess_env(self, tmp_path):
-        """env_overrides keys appear in the env dict passed to create_subprocess_exec."""
+        """env_overrides keys appear in the env dict passed to create_subprocess_exec.
+
+        When ANTHROPIC_BASE_URL is present, the bridge is started and the URL in
+        the subprocess env is the bridge's local URL (not the raw upstream value).
+        Other overrides are merged verbatim.
+        """
         captured_kwargs = {}
 
         async def fake_exec(*args, **kwargs):
@@ -845,7 +850,12 @@ class TestEnvOverrides:
             'ANTHROPIC_DEFAULT_SONNET_MODEL': 'Qwen/Qwen3-Coder-Next',
         }
 
-        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+        MockVllmBridge, mock_bridge = _make_mock_bridge('http://127.0.0.1:54321')
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.VllmBridge', MockVllmBridge),
+        ):
             await invoke_claude_agent(
                 prompt='hello',
                 system_prompt='sys',
@@ -854,7 +864,8 @@ class TestEnvOverrides:
             )
 
         env = captured_kwargs['env']
-        assert env['ANTHROPIC_BASE_URL'] == 'http://vllm:8000/v1'
+        # ANTHROPIC_BASE_URL is rewritten to the bridge's local URL
+        assert env['ANTHROPIC_BASE_URL'] == 'http://127.0.0.1:54321'
         assert env['ANTHROPIC_API_KEY'] == 'dummy'
         assert env['ANTHROPIC_DEFAULT_SONNET_MODEL'] == 'Qwen/Qwen3-Coder-Next'
 
@@ -1070,14 +1081,14 @@ class TestVllmBridgeActivation:
             patch('shared.cli_invoke.asyncio.create_subprocess_exec',
                   side_effect=fake_exec_raises),
             patch('shared.cli_invoke.VllmBridge', MockVllmBridge, create=True),
+            pytest.raises(RuntimeError, match='subprocess failed'),
         ):
-            with pytest.raises(RuntimeError, match='subprocess failed'):
-                await invoke_claude_agent(
-                    prompt='hello',
-                    system_prompt='sys',
-                    cwd=tmp_path,
-                    env_overrides={'ANTHROPIC_BASE_URL': 'http://upstream:8000'},
-                )
+            await invoke_claude_agent(
+                prompt='hello',
+                system_prompt='sys',
+                cwd=tmp_path,
+                env_overrides={'ANTHROPIC_BASE_URL': 'http://upstream:8000'},
+            )
 
         # stop() awaited exactly once despite the exception
         mock_bridge.stop.assert_awaited_once()

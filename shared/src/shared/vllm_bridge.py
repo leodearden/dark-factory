@@ -17,7 +17,6 @@ import uuid
 from aiohttp import web
 from aiohttp.client import ClientSession
 
-
 # ── pure translation helpers ─────────────────────────────────────────────────
 
 
@@ -170,7 +169,7 @@ class VllmBridge:
             runner, self._runner = self._runner, None
             await runner.cleanup()
 
-    async def __aenter__(self) -> 'VllmBridge':
+    async def __aenter__(self) -> VllmBridge:
         await self.start()
         return self
 
@@ -187,14 +186,13 @@ class VllmBridge:
             k: v for k, v in request.headers.items()
             if k.lower() not in _HOP_BY_HOP
         }
-        async with ClientSession() as session:
-            async with session.post(
-                self.upstream_url + '/v1/messages',
-                json=body,
-                headers=headers,
-            ) as upstream:
-                upstream_body = await upstream.json(content_type=None)
-                status = upstream.status
+        async with ClientSession() as session, session.post(
+            self.upstream_url + '/v1/messages',
+            json=body,
+            headers=headers,
+        ) as upstream:
+            upstream_body = await upstream.json(content_type=None)
+            status = upstream.status
 
         translated = _translate_messages_response(upstream_body)
         return web.json_response(translated, status=status)
@@ -213,17 +211,15 @@ class VllmBridge:
         }
         data = await request.read()
 
-        async with ClientSession() as session:
-            async with session.request(
-                method=request.method,
-                url=upstream_url,
-                headers=headers,
-                data=data,
-            ) as upstream:
-                upstream_body = await upstream.read()
-                resp = web.Response(
-                    status=upstream.status,
-                    body=upstream_body,
-                    content_type=upstream.content_type,
-                )
-        return resp
+        async with ClientSession() as session, session.request(
+            method=request.method,
+            url=upstream_url,
+            headers=headers,
+            data=data,
+        ) as upstream:
+            upstream_body = await upstream.read()
+            return web.Response(
+                status=upstream.status,
+                body=upstream_body,
+                content_type=upstream.content_type,
+            )

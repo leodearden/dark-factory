@@ -328,24 +328,24 @@ class TestVllmBridgeIntegration:
 
     async def test_passthrough_non_messages_path(self, mock_upstream_models):
         """Non-/v1/messages paths are proxied verbatim."""
-        async with VllmBridge(upstream_url=mock_upstream_models) as bridge:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(bridge.url + '/v1/models') as resp:
-                    assert resp.status == 200
-                    data = await resp.json()
-                    assert data == {'data': [{'id': 'test'}]}
+        async with VllmBridge(upstream_url=mock_upstream_models) as bridge, aiohttp.ClientSession() as session, session.get(bridge.url + '/v1/models') as resp:
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {'data': [{'id': 'test'}]}
 
     async def test_messages_translates_tool_calls(self, mock_upstream_messages):
         """POST /v1/messages translates vLLM tool_calls to Anthropic content blocks."""
         upstream_url, _ = mock_upstream_messages
-        async with VllmBridge(upstream_url=upstream_url) as bridge:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    bridge.url + '/v1/messages',
-                    json={'model': 'x', 'messages': []},
-                ) as resp:
-                    assert resp.status == 200
-                    data = await resp.json()
+        async with (
+            VllmBridge(upstream_url=upstream_url) as bridge,
+            aiohttp.ClientSession() as session,
+            session.post(
+                bridge.url + '/v1/messages',
+                json={'model': 'x', 'messages': []},
+            ) as resp,
+        ):
+            assert resp.status == 200
+            data = await resp.json()
 
         # tool_calls key is gone
         assert 'tool_calls' not in data
@@ -363,26 +363,30 @@ class TestVllmBridgeIntegration:
     async def test_forces_stream_false(self, mock_upstream_stream_capture):
         """Bridge sets stream=False on forwarded request body."""
         upstream_url, received = mock_upstream_stream_capture
-        async with VllmBridge(upstream_url=upstream_url) as bridge:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    bridge.url + '/v1/messages',
-                    json={'model': 'x', 'stream': True, 'messages': []},
-                ) as _resp:
-                    pass
+        async with (
+            VllmBridge(upstream_url=upstream_url) as bridge,
+            aiohttp.ClientSession() as session,
+            session.post(
+                bridge.url + '/v1/messages',
+                json={'model': 'x', 'stream': True, 'messages': []},
+            ) as _resp,
+        ):
+            pass
 
         assert len(received) == 1
         assert received[0].get('stream') is False
 
     async def test_forwards_upstream_error_status(self, mock_upstream_error):
         """Bridge forwards upstream error status and passes error body through unchanged."""
-        async with VllmBridge(upstream_url=mock_upstream_error) as bridge:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    bridge.url + '/v1/messages',
-                    json={'model': 'x', 'messages': []},
-                ) as resp:
-                    assert resp.status == 500
-                    data = await resp.json()
-                    assert data['type'] == 'error'
-                    assert data['error']['message'] == 'boom'
+        async with (
+            VllmBridge(upstream_url=mock_upstream_error) as bridge,
+            aiohttp.ClientSession() as session,
+            session.post(
+                bridge.url + '/v1/messages',
+                json={'model': 'x', 'messages': []},
+            ) as resp,
+        ):
+            assert resp.status == 500
+            data = await resp.json()
+            assert data['type'] == 'error'
+            assert data['error']['message'] == 'boom'
