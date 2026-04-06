@@ -14,6 +14,9 @@ from __future__ import annotations
 import json
 import uuid
 
+from aiohttp import web
+from aiohttp.client import ClientSession
+
 
 # ── pure translation helpers ─────────────────────────────────────────────────
 
@@ -112,3 +115,115 @@ def _translate_messages_response(body: dict) -> dict:
         result['stop_reason'] = 'tool_use'
 
     return result
+
+
+# ── VllmBridge server ────────────────────────────────────────────────────────
+
+# Hop-by-hop headers that must not be forwarded
+_HOP_BY_HOP = frozenset({
+    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+    'te', 'trailer', 'transfer-encoding', 'upgrade', 'content-length',
+})
+
+
+class VllmBridge:
+    """Local aiohttp HTTP proxy that translates vLLM /v1/messages responses.
+
+    Usage::
+
+        async with VllmBridge(upstream_url='http://vllm-host:8000') as bridge:
+            # bridge.url is e.g. 'http://127.0.0.1:54321'
+            env['ANTHROPIC_BASE_URL'] = bridge.url
+            ...  # run subprocess
+
+    The bridge starts an aiohttp server on a random local port.  POST
+    /v1/messages requests are forwarded to the upstream, the response is
+    translated via ``_translate_messages_response``, and the corrected body
+    is returned to the caller.  All other requests are piped through verbatim.
+    """
+
+    def __init__(self, upstream_url: str) -> None:
+        self.upstream_url = upstream_url.rstrip('/')
+        self.url: str = ''
+        self._runner: web.AppRunner | None = None
+
+    async def start(self) -> None:
+        """Start the bridge server and bind to a random local port."""
+        app = web.Application()
+        # Specific route must be registered before catch-all
+        app.router.add_post('/v1/messages', self._handle_messages)
+        app.router.add_route('*', '/{tail:.*}', self._proxy_catchall)
+
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, '127.0.0.1', 0)
+        await site.start()
+
+        # Retrieve the OS-assigned port
+        sockets = site._server.sockets  # type: ignore[union-attr]
+        port = sockets[0].getsockname()[1]
+        self.url = f'http://127.0.0.1:{port}'
+
+    async def stop(self) -> None:
+        """Stop the bridge server.  Idempotent — safe to call multiple times."""
+        if self._runner is not None:
+            runner, self._runner = self._runner, None
+            await runner.cleanup()
+
+    async def __aenter__(self) -> 'VllmBridge':
+        await self.start()
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.stop()
+
+    async def _handle_messages(self, request: web.Request) -> web.Response:
+        """Forward POST /v1/messages, translate the response body."""
+        body = await request.json()
+        # Force non-streaming so we can buffer and translate the full response
+        body['stream'] = False
+
+        headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in _HOP_BY_HOP
+        }
+        async with ClientSession() as session:
+            async with session.post(
+                self.upstream_url + '/v1/messages',
+                json=body,
+                headers=headers,
+            ) as upstream:
+                upstream_body = await upstream.json(content_type=None)
+                status = upstream.status
+
+        translated = _translate_messages_response(upstream_body)
+        return web.json_response(translated, status=status)
+
+    async def _proxy_catchall(self, request: web.Request) -> web.StreamResponse:
+        """Pipe all other requests straight through to the upstream."""
+        path = request.path
+        query = request.query_string
+        upstream_url = self.upstream_url + path
+        if query:
+            upstream_url += '?' + query
+
+        headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in _HOP_BY_HOP
+        }
+        data = await request.read()
+
+        async with ClientSession() as session:
+            async with session.request(
+                method=request.method,
+                url=upstream_url,
+                headers=headers,
+                data=data,
+            ) as upstream:
+                upstream_body = await upstream.read()
+                resp = web.Response(
+                    status=upstream.status,
+                    body=upstream_body,
+                    content_type=upstream.content_type,
+                )
+        return resp
