@@ -9368,6 +9368,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 470,
+        "title": "Parallelize load_task_tree calls with asyncio.gather in collect_snapshot",
+        "description": "In `dashboard/src/dashboard/data/burndown.py`, replace the sequential `asyncio.to_thread` dispatches in the `known_project_roots` loop (lines 127-149) — and optionally the orchestrator loop (lines 92-123) — with a single `asyncio.gather(...)` collecting all independent `asyncio.to_thread(load_task_tree, ...)` calls before iterating results. The roots are fully enumerated before the loop, so all reads are independent.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 450 (reviewer_performance).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9380,7 +9391,7 @@
       ],
       "created": "2026-04-06T18:12:21.797Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T18:12:32.703Z"
+      "updated": "2026-04-06T18:12:36.795Z"
     }
   }
 }
