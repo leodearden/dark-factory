@@ -36,7 +36,6 @@ VLLM_EVAL_CONFIGS = [
     # 3090 tier (workstation)
     _vllm_config('qwen3-coder-30b-q4',    'Qwen/Qwen3-Coder-30B-A3B-Instruct'),
     _vllm_config('devstral-small-2505-q6', 'mistralai/Devstral-Small-2505'),
-    _vllm_config('qwen25-coder-32b-q4',   'Qwen/Qwen2.5-Coder-32B-Instruct'),
 ]
 
 EVAL_CONFIGS = [
