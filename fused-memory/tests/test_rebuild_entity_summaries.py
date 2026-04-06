@@ -12,6 +12,7 @@ Covers:
 """
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1106,3 +1107,88 @@ class TestRebuildEntityFromEdgesOldSummary:
 
         assert result['edge_count'] == 3
         assert result['new_summary'] == 'Alice knows Bob\nAlice works at Acme'
+
+
+# ---------------------------------------------------------------------------
+# task-484: CancelledError must propagate, not be swallowed as per-entity error
+# ---------------------------------------------------------------------------
+
+class TestRebuildEntitySummariesCancellation:
+    """CancelledError raised inside gather must propagate, not be silently captured.
+
+    asyncio.gather(return_exceptions=True) captures *all* BaseException subclasses as
+    result values — including asyncio.CancelledError, which is a BaseException but NOT
+    an Exception in Python 3.8+. The current (buggy) guard ``isinstance(r, BaseException)``
+    therefore treats cancellation signals as ordinary per-entity failures and converts them
+    into ``{'status': 'error'}`` detail entries, silently swallowing the shutdown signal.
+
+    The fix mirrors the 'two-tier check' convention already documented in
+    MemoryService.get_entity (memory_service.py:1000-1013):
+      - A propagation pass scans results first and re-raises any value that is a
+        BaseException but NOT an Exception (CancelledError, KeyboardInterrupt, SystemExit).
+      - The per-entity accumulator loop then uses ``isinstance(r, Exception)`` so only
+        application-level failures are recorded as error detail entries.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates(self, mock_config, make_backend):
+        """CancelledError raised by one entity must propagate out of rebuild_entity_summaries.
+
+        If asyncio.CancelledError is captured by gather(return_exceptions=True) and the
+        accumulator treats it as a per-entity error (the current bug), the method returns a
+        dict and pytest.raises will report DID NOT RAISE — confirming the test fails before
+        the fix and passes after.
+
+        Uses force=True (simpler mock surface: list_entity_nodes + get_all_valid_edges)
+        matching the pattern from TestRebuildEntitySummariesParallel.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
+        })
+        # First entity's rebuild raises CancelledError; second would succeed
+        backend.update_node_summary = AsyncMock(
+            side_effect=[asyncio.CancelledError(), None]
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates_alongside_other_errors(
+        self, mock_config, make_backend
+    ):
+        """CancelledError must take precedence over per-entity RuntimeErrors in the same batch.
+
+        When gather(return_exceptions=True) returns a mix of Exception subclasses and
+        CancelledError, the propagation pass (which runs before per-entity accumulation)
+        must still re-raise the CancelledError even if a RuntimeError appears first in
+        the results list. This guards against a regression where someone reorders the
+        guard branches and accidentally promotes RuntimeError accounting before the
+        cancellation check.
+
+        The propagation pass scans *all* results before any per-entity bookkeeping, so
+        even if RuntimeError occupies the first slot, CancelledError in the second slot
+        is still detected and re-raised.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
+        })
+        # First entity raises a normal RuntimeError; second raises CancelledError
+        backend.update_node_summary = AsyncMock(
+            side_effect=[RuntimeError('per-entity failure'), asyncio.CancelledError()]
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await backend.rebuild_entity_summaries(group_id='test', force=True)
