@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import aiosqlite
 
@@ -38,6 +39,11 @@ CREATE TABLE IF NOT EXISTS snapshots (
 CREATE INDEX IF NOT EXISTS idx_snapshots_project_ts ON snapshots(project_id, ts);
 """
 
+_INSERT_SNAPSHOT_SQL = (
+    'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+)
+
 # Maps raw task statuses to the 6 display zones.
 _STATUS_MAP: dict[str, str] = {
     'pending': 'pending',
@@ -60,6 +66,33 @@ def _count_statuses(tasks: list[dict]) -> dict[str, int]:
         zone = _STATUS_MAP.get(raw, 'pending')
         counts[zone] += 1
     return counts
+
+
+async def _insert_snapshot_for_root(
+    conn: aiosqlite.Connection,
+    root_str: str,
+    tasks_json: Path,
+    now: str,
+) -> None:
+    """Load tasks from *tasks_json* and insert one snapshot row for *root_str*.
+
+    The caller is responsible for committing the transaction.
+    """
+    tasks = await asyncio.to_thread(load_task_tree, tasks_json)
+    counts = _count_statuses(tasks)
+    await conn.execute(
+        _INSERT_SNAPSHOT_SQL,
+        (
+            root_str,
+            now,
+            counts['pending'],
+            counts['in_progress'],
+            counts['blocked'],
+            counts['deferred'],
+            counts['cancelled'],
+            counts['done'],
+        ),
+    )
 
 
 async def collect_snapshot(
