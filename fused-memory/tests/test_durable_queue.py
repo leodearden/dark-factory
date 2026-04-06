@@ -559,6 +559,7 @@ class TestPurgeDead:
             (id1, id2),
         )
         row = await cursor.fetchone()
+        assert row is not None
         assert row[0] == 0, f'Expected 0 rows for purged ids, got {row[0]}'
 
         await q.close()
