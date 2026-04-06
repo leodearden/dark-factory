@@ -215,9 +215,8 @@ class TestWorktreeLifecycle:
         with patch(
             'orchestrator.git_ops._scrub_task_dir_from_tree',
             side_effect=asyncio.CancelledError,
-        ):
-            with pytest.raises(asyncio.CancelledError):
-                await git_ops.merge_to_main(worktree, 'feature-cancel')
+        ), pytest.raises(asyncio.CancelledError):
+            await git_ops.merge_to_main(worktree, 'feature-cancel')
 
         # After CancelledError, no _merge-* worktrees should be registered.
         _, worktree_list, _ = await _run(
