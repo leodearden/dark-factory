@@ -293,8 +293,7 @@ class TestRebuildEntitySummaries:
     async def test_returns_aggregate_result(self, mock_config, make_backend):
         """Returns dict with total_entities, stale_entities, rebuilt, skipped, errors, details."""
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[])
-        backend.get_all_valid_edges = AsyncMock(return_value={})
+        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=([], {}, 0))
         result = await backend.rebuild_entity_summaries(group_id='test')
         assert set(result.keys()) == {'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors', 'details'}
 
