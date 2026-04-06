@@ -390,12 +390,36 @@ class SpeculativeMergeWorker:
 
         # Allow worker tasks to exit gracefully via sentinels before the
         # harness cancels them, preventing unresolved mid-flight Futures.
+        # _shutdown_timeout can be overridden in tests for fast shutdown.
         tasks_to_wait = [
             t for t in (self._merger_task, self._verifier_task)
             if t is not None and not t.done()
         ]
         if tasks_to_wait:
-            await asyncio.wait(tasks_to_wait, timeout=5.0)
+            timeout = getattr(self, '_shutdown_timeout', 5.0)
+            await asyncio.wait(tasks_to_wait, timeout=timeout)
+
+        # Re-drain the verifier queue: the merger may have pushed SpeculativeItems
+        # after the initial drain above (e.g., after completing its in-flight merge
+        # while asyncio.wait() was running). Use the same suppress pattern so
+        # cleanup failures don't prevent Future resolution.
+        while not self._verifier_queue.empty():
+            try:
+                item = self._verifier_queue.get_nowait()
+                if item is not None:
+                    if item.merge_wt is not None:
+                        with contextlib.suppress(Exception):
+                            await self._git_ops.cleanup_merge_worktree(item.merge_wt)
+                    if not item.request.result.done():
+                        item.request.result.set_result(shutdown)
+            except asyncio.QueueEmpty:
+                break
+
+        # Check _inflight_req: if the merger was still blocked inside merge_to_main
+        # when asyncio.wait() timed out, it still holds _inflight_req.  Resolve the
+        # Future now so the caller doesn't hang forever.
+        if self._inflight_req is not None and not self._inflight_req.result.done():
+            self._inflight_req.result.set_result(shutdown)
 
     # ------------------------------------------------------------------
     # Event helpers

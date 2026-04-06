@@ -1239,6 +1239,70 @@ class TestSpeculativeMergeWorker:
             f'Expected 2 cleanup calls, got {len(cleanup_calls)}'
         )
 
+    async def test_stop_race_resolves_inflight_merger_future(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """stop() must resolve Future for a request the merger is currently processing.
+
+        Race condition: stop() drains both queues (empty), sends sentinels,
+        asyncio.wait() times out while merger is still blocked inside merge_to_main.
+        Verifier received its sentinel and has already exited.  When the merger
+        eventually resumes and pushes a SpeculativeItem, the verifier is gone —
+        the caller's Future is never resolved.
+
+        With fix (step-35): after asyncio.wait() returns, stop() checks
+        self._inflight_req.  If set and Future not done, resolves it as 'blocked'.
+        The caller's Future is guaranteed to be resolved even if the merger was
+        mid-operation when stop() was called.
+
+        Covers review issue [race_condition_unresolved_future] at stop() ~line 350.
+        """
+        block_event = asyncio.Event()   # released after stop() returns
+        merge_started = asyncio.Event() # set when merger enters merge_to_main
+
+        original_merge = git_ops.merge_to_main
+
+        async def blocking_merge(worktree: Path, branch: str, **kwargs: object) -> object:
+            merge_started.set()
+            await block_event.wait()  # simulates long-running merge
+            return await original_merge(worktree, branch, **kwargs)
+
+        wt = await _make_branch_with_file(
+            git_ops, 'race-1', 'race_file.py', 'race = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        # Use a very short shutdown timeout so the test doesn't take 5 seconds.
+        worker._shutdown_timeout = 0.1  # type: ignore[attr-defined]
+        worker_task = asyncio.create_task(worker.run())
+
+        req = _make_request('race-1', 'race-1', wt, config)
+
+        with (
+            patch.object(git_ops, 'merge_to_main', new=blocking_merge),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            await queue.put(req)
+            # Wait until the merger is definitely blocked inside merge_to_main.
+            await asyncio.wait_for(merge_started.wait(), timeout=10)
+
+            # stop() will time out (asyncio.wait) since merger is blocked.
+            # Without fix: req.result is NOT done after stop() returns.
+            # With fix: stop() checks _inflight_req and resolves it.
+            await worker.stop()
+
+        assert req.result.done(), (
+            'Future must be resolved by stop() via _inflight_req check, '
+            'even when merger was mid-operation'
+        )
+        assert req.result.result().status == 'blocked'
+
+        # Release the merger so it can finish and worker_task can exit cleanly.
+        block_event.set()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=15)
+
 
 # ---------------------------------------------------------------------------
 # TestSpeculativeBackwardCompat — step-17
