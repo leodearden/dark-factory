@@ -9576,6 +9576,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 487,
+        "title": "Add EdgeDict TypedDict and robustness improvements to _edge_dict",
+        "description": "Three related improvements to GraphitiBackend._edge_dict (line ~762 in graphiti_client.py):\n\n1. **TypedDict**: Define `class EdgeDict(TypedDict): uuid: str; fact: str; name: str` and update the return annotation from `-> dict` to `-> EdgeDict`. Update downstream type hints (list[dict] → list[EdgeDict]) where edge lists are used.\n\n2. **UUID None guard**: Add `if uuid is None: raise ValueError('edge uuid must not be None')` — if the graph ever returns a NULL uuid, downstream callers should fail clearly rather than propagating None silently.\n\n3. **Explicit None checks**: Change `fact or ''` to `fact if fact is not None else ''` (same for name). The `or` coercion is over-broad — it would coerce any falsy value, not just None. Use explicit None checks to match the documented contract.\n\nmemory_hint: search \"EdgeDict _edge_dict type safety\" for context.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9588,7 +9599,7 @@
       ],
       "created": "2026-04-06T19:14:04.302Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T19:14:04.306Z"
+      "updated": "2026-04-06T19:14:10.360Z"
     }
   }
 }
