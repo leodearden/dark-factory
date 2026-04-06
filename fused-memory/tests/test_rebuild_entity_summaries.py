@@ -1041,3 +1041,33 @@ class TestRebuildEntityFromEdgesOldSummary:
         assert result['uuid'] == 'uuid-1'
         assert result['name'] == 'Alice'
         backend.get_node_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prefetched_edges_produce_correct_summary(
+        self, mock_config, make_backend
+    ):
+        """edge_count == len(raw edges) while new_summary deduplicates facts via _canonical_facts.
+
+        3 raw edges with 1 duplicate → edge_count=3, but only 2 unique facts in new_summary.
+        This documents that edge_count and unique-fact count are intentionally different
+        concepts so future maintainers do not misread edge_count as a deduplicated count.
+        """
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock()
+        backend.update_node_summary = AsyncMock()
+
+        edges = [
+            {'uuid': 'e1', 'fact': 'Alice knows Bob', 'name': 'knows'},
+            {'uuid': 'e2', 'fact': 'Alice knows Bob', 'name': 'knows'},   # duplicate
+            {'uuid': 'e3', 'fact': 'Alice works at Acme', 'name': 'works_at'},
+        ]
+        result = await backend._rebuild_entity_from_edges(
+            'uuid-1', 'Alice', edges, group_id='test', old_summary='prior'
+        )
+
+        assert result['edge_count'] == 3
+        unique_facts = result['new_summary'].split('\n')
+        assert len(unique_facts) == 2
+        assert set(unique_facts) == {'Alice knows Bob', 'Alice works at Acme'}
+        # Explicitly document that these are intentionally different values
+        assert result['edge_count'] != len(unique_facts)
