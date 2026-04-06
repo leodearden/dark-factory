@@ -10219,6 +10219,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 533,
+        "title": "Fix stale config list references and hardcoded data in tests",
+        "description": "In orchestrator/tests/test_eval_configs.py: (1) line 115 — change `for cfg in EVAL_CONFIGS + VLLM_EVAL_CONFIGS:` to `for cfg in EVAL_CONFIGS:` since VLLM_EVAL_CONFIGS is already spread into EVAL_CONFIGS; (2) lines 179-183 — replace the hardcoded _CLOUD_BASELINE_NAMES set with a derived expression: `{cfg.name for cfg in EVAL_CONFIGS} - {cfg.name for cfg in VLLM_EVAL_CONFIGS}` so it stays in sync automatically when baselines are added or renamed.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10231,7 +10242,7 @@
       ],
       "created": "2026-04-06T22:49:21.157Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:49:26.117Z"
+      "updated": "2026-04-06T22:49:30.686Z"
     }
   }
 }
