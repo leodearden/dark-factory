@@ -188,6 +188,60 @@ The `orchestrator eval` subcommand was missing from `--help` because Python was 
 
 **Fix:** `cd orchestrator/` before running `uv run orchestrator eval ...`. The eval script does this automatically.
 
+### Blocker 4 (mitigated): Qwen3-Coder-Next-FP8 startup hang
+
+**Symptom:** vLLM container starts, SSH is available, but the `/health` endpoint never
+becomes reachable. The health-check timeout fires after 15–80 minutes. The pod shows
+`RUNNING` but is stuck in CUDA-graph capture or pre-flight model warm-up. Reproduced on
+both 96GB RTX PRO 6000 Blackwell and 141GB H200.
+
+**Root cause (compound):** Four compounding issues, all documented in upstream vLLM bugs:
+
+1. **CUDA-graph capture hang** — vLLM 0.18.x enables CUDA graphs by default; Qwen3-Coder-Next
+   FP8 graph capture is a known hang point ([vllm#35504](https://github.com/vllm-project/vllm/issues/35504)).
+   The primary workaround is `--enforce-eager` (disables CUDA-graph capture entirely).
+2. **FP8 overflow in mixed-precision paths** ([vllm#34437](https://github.com/vllm-project/vllm/issues/34437)) —
+   manifests as NaN/inf during warm-up on the FP8 kernel path.
+3. **seq_len / num_heads format mismatch** — slow first-request + hang at warm-up
+   ([vllm#24865](https://github.com/vllm-project/vllm/issues/24865)).
+4. **Wrong HF model id** — `configs.py` and `run_vllm_eval.py` were using
+   `Qwen/Qwen3-Coder-Next` (149GB unquantized) instead of the `Qwen/Qwen3-Coder-Next-FP8`
+   (~80GB official block-128 FP8 quant) that all bug reports test against.
+5. **Wrong tool-call parser** — entrypoint defaults to `TOOL_CALL_PARSER=hermes`; Qwen3-Coder
+   requires `qwen3_coder` ([graph edge 3095db10](https://github.com/vllm-project/vllm/issues/35704)).
+6. **Too-large context window** — `MAX_MODEL_LEN=131072` + `GPU_MEMORY_UTIL=0.95` left
+   minimal KV-cache headroom, exacerbating warm-up OOMs on the FP8 path.
+
+**In-tree fixes applied by Task 515** (all in `scripts/run_vllm_eval.py` and `configs.py`):
+
+| Fix | What changed |
+|-----|-------------|
+| Config renamed | `qwen3-coder-next-fp8` → `qwen3-coder-next-fp8-new` (buckets new results separately) |
+| FP8 HF model id | `Qwen/Qwen3-Coder-Next` → `Qwen/Qwen3-Coder-Next-FP8` in both files |
+| Correct parser | `TOOL_CALL_PARSER=qwen3_coder` added to `MODELS` extra_env |
+| Reduced context | `MAX_MODEL_LEN=65536` added to `MODELS` extra_env |
+| GPU memory headroom | `GPU_MEMORY_UTIL=0.90` added to `MODELS` extra_env |
+| H200 priority | `NVIDIA H200 SXM` and `NVIDIA H200 NVL` prepended to `GPU_TYPES` |
+
+**Remaining out-of-tree follow-up (blocking for full resolution):**
+
+`--enforce-eager` is the most important known workaround for the CUDA-graph hang, but
+`entrypoint-vllm.sh` (in `/home/leo/src/runpod-toolkit/docker/entrypoint-vllm.sh`) has no
+`ENFORCE_EAGER` env hook. Adding one is a one-line change:
+
+```bash
+# In entrypoint-vllm.sh, near the other env-var blocks:
+if [ -n "${ENFORCE_EAGER}" ]; then CMD="$CMD --enforce-eager"; fi
+```
+
+Once that lands, add `"ENFORCE_EAGER": "1"` to `MODELS["qwen3-coder-next"][4]` in
+`scripts/run_vllm_eval.py` — no other changes needed.
+
+**Related vLLM issues:** [#35504](https://github.com/vllm-project/vllm/issues/35504),
+[#34437](https://github.com/vllm-project/vllm/issues/34437),
+[#24865](https://github.com/vllm-project/vllm/issues/24865),
+[#35704](https://github.com/vllm-project/vllm/issues/35704).
+
 ## Critical learnings (don't repeat the mistakes)
 
 1. **Container crashes silently** — RunPod's pod-status API shows `RUNNING` even when the container's PID 1 has died. Check `runtime.uptimeInSeconds` in `runpod.get_pods()` — `0s` after several minutes means the container is dead.
@@ -226,12 +280,12 @@ The `orchestrator eval` subcommand was missing from `--help` because Python was 
 
 ```python
 VLLM_EVAL_CONFIGS = [
-    _vllm_config('minimax-m25-fp8', 'MiniMaxAI/MiniMax-M2.5'),
-    _vllm_config('qwen3-coder-next-fp8', 'Qwen/Qwen3-Coder-Next'),
-    _vllm_config('reap-139b-nvfp4', 'cerebras/MiniMax-M2.5-REAP-139B-A10B'),
-    _vllm_config('reap-172b-nvfp4', 'cerebras/MiniMax-M2.5-REAP-172B-A10B'),
-    _vllm_config('qwen3-coder-30b-q4', 'Qwen/Qwen3-Coder-30B-A3B-Instruct'),
-    _vllm_config('devstral-small-2505-q6', 'mistralai/Devstral-Small-2505'),
+    _vllm_config('minimax-m25-fp8',          'MiniMaxAI/MiniMax-M2.5'),
+    _vllm_config('qwen3-coder-next-fp8-new', 'Qwen/Qwen3-Coder-Next-FP8'),  # renamed + FP8 HF id (Task 515)
+    _vllm_config('reap-139b-nvfp4',          'cerebras/MiniMax-M2.5-REAP-139B-A10B'),
+    _vllm_config('reap-172b-nvfp4',          'cerebras/MiniMax-M2.5-REAP-172B-A10B'),
+    _vllm_config('qwen3-coder-30b-q4',       'Qwen/Qwen3-Coder-30B-A3B-Instruct'),
+    _vllm_config('devstral-small-2505-q6',   'mistralai/Devstral-Small-2505'),
 ]
 ```
 
