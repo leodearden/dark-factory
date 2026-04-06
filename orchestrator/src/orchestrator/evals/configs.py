@@ -36,10 +36,10 @@ VLLM_EVAL_CONFIGS = [
     # 3090 tier (workstation)
     _vllm_config('qwen3-coder-30b-q4',    'Qwen/Qwen3-Coder-30B-A3B-Instruct'),
     _vllm_config('devstral-small-2505-q6', 'mistralai/Devstral-Small-2505'),
-    _vllm_config('qwen25-coder-32b-q4',   'Qwen/Qwen2.5-Coder-32B-Instruct'),
 ]
 
 EVAL_CONFIGS = [
+    # Cloud baselines
     EvalConfig('claude-opus-high', 'claude', 'opus', 'high'),
     EvalConfig('claude-opus-max', 'claude', 'opus', 'max'),
     EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max'),
@@ -47,12 +47,14 @@ EVAL_CONFIGS = [
     EvalConfig('codex-gpt54mini-xhigh', 'codex', 'gpt-5.4-mini', 'xhigh'),
     EvalConfig('gemini-31-pro-high', 'gemini', 'gemini-3.1-pro-preview', 'high'),
     EvalConfig('gemini-3-flash-high', 'gemini', 'gemini-3-flash-preview', 'high'),
+    # Self-hosted vLLM backends
+    *VLLM_EVAL_CONFIGS,
 ]
 
 
 def get_config_by_name(name: str) -> EvalConfig | None:
     """Look up an eval config by name."""
-    for cfg in EVAL_CONFIGS + VLLM_EVAL_CONFIGS:
+    for cfg in EVAL_CONFIGS:
         if cfg.name == name:
             return cfg
     return None
