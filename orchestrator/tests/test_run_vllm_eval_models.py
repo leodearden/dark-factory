@@ -13,7 +13,7 @@ import pathlib
 
 import pytest
 
-from orchestrator.evals.configs import VLLM_EVAL_CONFIGS, get_config_by_name
+from orchestrator.evals.configs import get_config_by_name
 
 SCRIPT_PATH = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "run_vllm_eval.py"
 
