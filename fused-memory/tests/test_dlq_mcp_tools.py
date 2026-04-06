@@ -105,3 +105,26 @@ class TestPurgeDeadLetters:
         assert isinstance(result, dict)
         assert result['error_type'] == 'ValidationError'
         assert 'confirm_purge_all' in result['error']
+
+    @pytest.mark.asyncio
+    async def test_purge_dead_letters_with_empty_ids_list(self):
+        """purge_dead_letters normalises ids=[] to None before delegating."""
+        mock_service = AsyncMock()
+        mock_service.durable_queue.purge_dead = AsyncMock(return_value=3)
+
+        server = create_mcp_server(mock_service)
+        result = await server._tool_manager.call_tool(
+            'purge_dead_letters',
+            {'ids': [], 'project_id': 'dark_factory'},
+        )
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}: {result!r}'
+        assert result == {'status': 'purged', 'items_purged': 3}, f'Unexpected result: {result!r}'
+
+        # ids=[] should be normalised to None at the MCP layer
+        mock_service.durable_queue.purge_dead.assert_awaited_once_with(
+            group_id='dark_factory',
+            error_pattern=None,
+            ids=None,
+            confirm_purge_all=False,
+        )

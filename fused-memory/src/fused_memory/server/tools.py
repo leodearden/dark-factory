@@ -943,6 +943,7 @@ def create_mcp_server(
         try:
             if memory_service.durable_queue is None:
                 return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
+            ids = ids or None  # normalise empty list to None (defence-in-depth at MCP boundary)
             count = await memory_service.durable_queue.purge_dead(
                 group_id=project_id,
                 error_pattern=error_pattern,
