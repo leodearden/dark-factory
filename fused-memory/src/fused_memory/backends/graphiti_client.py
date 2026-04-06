@@ -783,7 +783,7 @@ class GraphitiBackend:
         Returns:
             List of unique non-empty fact strings in their first-seen order.
         """
-        return list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
+        return list(dict.fromkeys(e['fact'] for e in edges if (e.get('fact') or '').strip()))
 
     async def refresh_entity_summary(
         self,
