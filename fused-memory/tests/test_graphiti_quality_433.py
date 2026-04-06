@@ -137,23 +137,19 @@ class TestCanonicalFacts:
         assert isinstance(result, list)
         assert result == ['A', 'B']
 
-    def test_whitespace_only_fact_is_kept(self):
-        """Whitespace-only facts are KEPT, not filtered.
+    def test_whitespace_only_fact_is_filtered(self):
+        """Whitespace-only facts are filtered out, not included in results.
 
-        The filter is ``if e.get('fact')`` which tests Python truthiness.
-        A non-empty string like '   ' is truthy even though it contains only
-        spaces, so it passes the filter and is included in the result.
-
-        This test documents *current* behavior. Any future decision to strip
-        whitespace-only facts would be a deliberate change and would require
-        updating this test explicitly.
+        The filter uses ``if e.get('fact', '').strip()`` so that a string like
+        '   ' strips to '' (falsy) and is excluded.  Only facts with real
+        non-whitespace content pass through.
         """
         edges = [
-            {'fact': '   '},    # whitespace-only — truthy, so kept
+            {'fact': '   '},    # whitespace-only — filtered out
             {'fact': 'A knows B'},
         ]
         result = GraphitiBackend._canonical_facts(edges)
-        assert result == ['   ', 'A knows B']
+        assert result == ['A knows B']
 
 
 # ---------------------------------------------------------------------------
