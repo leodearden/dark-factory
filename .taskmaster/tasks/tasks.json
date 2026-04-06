@@ -10034,10 +10034,11 @@
         "description": "There are now 3 gather(return_exceptions=True) sites that need the two-tier CancelledError guard: memory_service.py:1004, graphiti_client.py:1072, and context_assembler.py:125 (after the sibling fix task). Create `fused_memory/utils/async_utils.py` with a `propagate_cancellations(results: Sequence) -> None` helper. Update all three sites to call it. This also resolves the comment accuracy issue at graphiti_client.py:1065-1066 (stale line reference and the divergence between the two pattern implementations: memory_service raises any BaseException while graphiti_client only raises non-Exception BaseExceptions).\n\nSource: review suggestions from task 484. Rationale: DRY + prevents future drift between copies of the pattern as new gather sites are added (task_interceptor, harness already use gather with return_exceptions).\n\nDepends on: context_assembler two-tier guard task (should land first or be merged into this extraction).\n\nFiles:\n- fused-memory/src/fused_memory/utils/async_utils.py (new)\n- fused-memory/src/fused_memory/backends/graphiti_client.py\n- fused-memory/src/fused_memory/services/memory_service.py\n- fused-memory/src/fused_memory/reconciliation/context_assembler.py\n- fused-memory/tests/test_rebuild_entity_summaries.py\n- fused-memory/tests/test_async_utils.py (new)",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:55:24.232Z"
       },
       {
         "id": "514",
@@ -10306,7 +10307,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T22:55:24.156Z",
+      "lastModified": "2026-04-06T22:55:24.232Z",
       "taskCount": 516,
       "completedCount": 432,
       "tags": [
