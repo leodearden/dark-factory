@@ -910,6 +910,7 @@ class TestRebuildEntitySummariesParallel:
 
         # list_entity_nodes must be called exactly once — no per-entity re-fetch
         backend.list_entity_nodes.assert_awaited_once()
+        backend.get_all_valid_edges.assert_awaited_once()
         assert result['total_entities'] == 3
         assert result['rebuilt'] == 3
 
