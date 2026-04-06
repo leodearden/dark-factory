@@ -9603,10 +9603,11 @@
         "description": "In test_stages.py TestTaskKnowledgeSyncFilteredTaskTree: extend `test_uses_harness_filtered_tree_when_set` to assert that when `done_count > 0` in the FilteredTaskTree, the '### Recently Completed Tasks' section either (a) contains a summary line mentioning the done count, or (b) is absent — and that no individual done-task titles appear in the payload body. Add a companion test for the fallback path (no filtered_task_tree set) asserting that done tasks DO appear in the recently-completed section when get_tasks returns them.\n\nNote: coordinate with the \"Preserve done_tasks visibility in Stage 2\" task — these tests should verify the behavior chosen in that task.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T20:09:59.987Z"
       },
       {
         "id": "482",
@@ -9842,7 +9843,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T20:09:59.867Z",
+      "lastModified": "2026-04-06T20:09:59.987Z",
       "taskCount": 481,
       "completedCount": 418,
       "tags": [
