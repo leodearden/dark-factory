@@ -13,7 +13,7 @@ import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
@@ -1554,6 +1554,115 @@ class TestSpeculativeMergeWorker:
         )
         # _cas_retries should be clean
         assert branch_name not in worker._cas_retries
+
+        await worker.stop()
+        await worker_task
+
+    async def test_merger_post_merge_exception_cleans_worktree(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Post-merge exception (inside the success path) must clean up merge worktree.
+
+        After merge_to_main succeeds, a live merge worktree exists.  An exception
+        raised between lines 568-583 (assert, skip_verify calc, verifier queue put)
+        is caught by the inner except Exception handler.  Without the fix the handler
+        resolves the Future but never calls cleanup_merge_worktree — the worktree leaks.
+
+        With the fix: cleanup is called (guarded by contextlib.suppress(Exception))
+        before the Future is resolved.
+
+        Scenario A: merge_commit=None triggers AssertionError at line 570.
+        Scenario B: valid merge_commit but verifier-queue put raises RuntimeError.
+
+        Covers review issue [resource_leak] at _merger_loop lines 568-614.
+        """
+        wt_a = await _make_branch_with_file(
+            git_ops, 'pme-a', 'file_pme_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'pme-b', 'file_pme_b.py', 'b = 1\n',
+        )
+        wt_ok = await _make_branch_with_file(
+            git_ops, 'pme-ok', 'file_pme_ok.py', 'ok = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        fake_wt_a = git_ops.project_root / '.worktrees' / '_merge-pme-a-fake'
+        fake_wt_b = git_ops.project_root / '.worktrees' / '_merge-pme-b-fake'
+
+        cleanup_calls: list[object] = []
+
+        async def tracking_cleanup(wt: object) -> None:
+            cleanup_calls.append(wt)
+
+        # ── Scenario A: AssertionError from merge_commit=None ──────────────────
+        a_result = MergeResult(success=True, merge_commit=None, merge_worktree=fake_wt_a)
+
+        with (
+            patch.object(git_ops, 'merge_to_main', AsyncMock(return_value=a_result)),
+            patch.object(git_ops, 'cleanup_merge_worktree', new=tracking_cleanup),
+        ):
+            req_a = _make_request('pme-a', 'pme-a', wt_a, config)
+            await queue.put(req_a)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=30)
+
+        assert outcome_a.status == 'blocked', f'Scenario A: expected blocked, got {outcome_a}'
+        assert 'Merger error' in outcome_a.reason, (
+            f'Scenario A: expected "Merger error" in reason, got: {outcome_a.reason!r}'
+        )
+        # The merge worktree must have been cleaned up despite the exception
+        assert fake_wt_a in cleanup_calls, (
+            f'Scenario A: cleanup_merge_worktree not called for fake_wt_a; '
+            f'cleanup_calls={cleanup_calls}'
+        )
+
+        # ── Scenario B: RuntimeError from verifier-queue put ───────────────────
+        # A valid merge_commit passes the assert; the put raises instead.
+        b_merge_commit = 'ab' * 20  # 40-char fake SHA
+        b_result = MergeResult(
+            success=True, merge_commit=b_merge_commit, merge_worktree=fake_wt_b,
+        )
+
+        original_put = worker._verifier_queue.put
+        b_put_count = 0
+
+        async def sometimes_failing_put(item: object) -> None:
+            nonlocal b_put_count
+            b_put_count += 1
+            if b_put_count == 1 and isinstance(item, SpeculativeItem):
+                raise RuntimeError('queue broken')
+            await original_put(item)
+
+        with (
+            patch.object(git_ops, 'merge_to_main', AsyncMock(return_value=b_result)),
+            patch.object(git_ops, 'cleanup_merge_worktree', new=tracking_cleanup),
+            patch.object(worker._verifier_queue, 'put', new=sometimes_failing_put),
+        ):
+            req_b = _make_request('pme-b', 'pme-b', wt_b, config)
+            await queue.put(req_b)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=30)
+
+        assert outcome_b.status == 'blocked', f'Scenario B: expected blocked, got {outcome_b}'
+        assert 'Merger error' in outcome_b.reason, (
+            f'Scenario B: expected "Merger error" in reason, got: {outcome_b.reason!r}'
+        )
+        assert fake_wt_b in cleanup_calls, (
+            f'Scenario B: cleanup_merge_worktree not called for fake_wt_b; '
+            f'cleanup_calls={cleanup_calls}'
+        )
+
+        # ── Merger loop continues after both exceptions ──────────────────────
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req_ok = _make_request('pme-ok', 'pme-ok', wt_ok, config)
+            await queue.put(req_ok)
+            outcome_ok = await asyncio.wait_for(req_ok.result, timeout=30)
+
+        assert outcome_ok.status == 'done', (
+            f'Merger loop should continue after exceptions, got {outcome_ok}'
+        )
 
         await worker.stop()
         await worker_task

@@ -477,6 +477,7 @@ class SpeculativeMergeWorker:
                     spec_base = None  # fresh dequeue resets speculation chain
 
                 self._inflight_req = req  # track for stop() race resolution
+                merge_result_local: MergeResult | None = None
                 try:
                     speculative = spec_base is not None
                     actual_main = await self._git_ops.get_main_sha()
@@ -527,6 +528,7 @@ class SpeculativeMergeWorker:
                     merge_result = await self._git_ops.merge_to_main(
                         req.worktree, req.branch, base_sha=base_for_merge if speculative else None,
                     )
+                    merge_result_local = merge_result  # track for cleanup on post-merge exception
 
                     # ── Step 3: conflict or non-conflict failure ───────────────
                     if merge_result.conflicts:
@@ -606,6 +608,23 @@ class SpeculativeMergeWorker:
                     logger.exception(
                         f'Task {req.task_id}: unexpected merger error: {exc}'
                     )
+                    # Clean up any merge worktree created by merge_to_main
+                    # before the exception was raised (e.g. AssertionError on
+                    # merge_commit or queue.put failure).  Use suppress so a
+                    # cleanup failure never masks the original exception or
+                    # prevents Future resolution.
+                    if (
+                        merge_result_local is not None
+                        and merge_result_local.merge_worktree
+                    ):
+                        logger.debug(
+                            f'Task {req.task_id}: cleaning up merge worktree after post-merge error'
+                        )
+                        with contextlib.suppress(Exception):
+                            await self._git_ops.cleanup_merge_worktree(
+                                merge_result_local.merge_worktree
+                            )
+                    merge_result_local = None
                     if self._inflight_req is not None and not self._inflight_req.result.done():
                         self._inflight_req.result.set_result(
                             MergeOutcome('blocked', reason=f'Merger error: {exc}')
