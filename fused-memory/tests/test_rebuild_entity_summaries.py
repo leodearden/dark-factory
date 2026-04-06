@@ -1259,3 +1259,36 @@ class TestRebuildEntitySummariesCancellation:
 
         with pytest.raises(asyncio.CancelledError):
             await backend.rebuild_entity_summaries(group_id='test', force=False)
+
+    @pytest.mark.asyncio
+    async def test_runtime_error_still_accumulates_in_errors(self, two_entity_backend):
+        """Regression guard: Exception subclasses must still accumulate after the BaseException→Exception narrowing.
+
+        The task-484 fix changed the per-entity accumulator guard from
+        ``isinstance(r, BaseException)`` to ``isinstance(r, Exception)`` so that
+        CancelledError (a BaseException but NOT an Exception) is excluded from the
+        per-entity error bookkeeper and handled only by Pass 1 (the propagation pass).
+
+        This narrowing is intentional but must not accidentally exclude ordinary
+        application-level failures (RuntimeError, ValueError, etc.) from Pass 2
+        (graphiti_client.py:1086-1098).  If someone over-narrows the guard — e.g. to
+        ``isinstance(r, RuntimeError)`` — ordinary failures from other Exception subclasses
+        would silently disappear from the result dict.
+
+        Uses force=True (same mock surface as the other tests in this class) because
+        both branches converge on the same Pass 2 accumulator.  The force=False branch's
+        RuntimeError accumulation is already covered by test_partial_failure_continues
+        (TestRebuildEntitySummaries class).
+        """
+        backend = two_entity_backend
+        # First entity's rebuild raises RuntimeError; second succeeds
+        backend.update_node_summary = AsyncMock(
+            side_effect=[RuntimeError('per-entity boom'), None]
+        )
+
+        result = await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+        assert result['errors'] == 1
+        assert result['rebuilt'] == 1
+        error_detail = next(d for d in result['details'] if d['status'] == 'error')
+        assert 'per-entity boom' in error_detail['error']
