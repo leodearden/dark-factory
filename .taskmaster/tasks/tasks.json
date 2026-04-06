@@ -5825,7 +5825,7 @@
         "description": "Add a re-summarize entity MCP tool that triggers Graphiti to regenerate an entity node's summary from its current edges. Currently, entity summaries can only be updated when a new episode touches the entity. This means stale or aspirational summaries (e.g., from PRD ingestion) persist indefinitely if no new episodes arrive. The tool should accept an entity UUID or name and force summary regeneration from the existing edge set.\n\nMemory hints:\n- Search: 'entity summary stale aspirational PRD content'\n- Search: 'Graphiti entity node re-summarization'\n- Entities: UsageGate, Graphiti",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [
           "158"
         ],
@@ -5861,7 +5861,7 @@
             "fused-memory/tests/test_refresh_entity_summary.py"
           ]
         },
-        "updatedAt": "2026-04-06T17:26:24.612Z"
+        "updatedAt": "2026-04-06T20:10:49.549Z"
       },
       {
         "id": "310",
@@ -9365,11 +9365,11 @@
         "description": "Move all deferred `from dashboard.config import DashboardConfig` imports to module top-level in both `dashboard/tests/test_scaffold.py` and `dashboard/tests/test_burndown_data.py`. In test_burndown_data.py, also add a `@pytest.fixture` (or `@pytest.fixture` async) that provides the common `(db_path, config, conn)` setup shared by all five `TestCollectSnapshot` methods — each currently repeats `_create_burndown_db`, `DashboardConfig(project_root=tmp_path)`, `aiosqlite.connect`, and the two-patch block inline.\n\nFiles:\n- dashboard/tests/test_burndown_data.py\n- dashboard/tests/test_scaffold.py\n\nSource: review suggestions on task 450 (burndown known_project_roots feature).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T19:35:11.690Z",
+        "updatedAt": "2026-04-06T20:00:11.049Z",
         "metadata": {
           "modules": [
             "dashboard/tests/test_burndown_data.py",
@@ -9383,11 +9383,11 @@
         "description": "Delete `test_known_project_roots_is_list_not_tuple` from `dashboard/tests/test_scaffold.py` (lines 31-35). The adjacent `test_known_project_roots_default_empty_list` asserts `cfg.known_project_roots == []`, which already proves the list type (a tuple can never equal `[]`).\n\nFiles:\n- dashboard/tests/test_scaffold.py\n\nSource: review suggestions on task 450.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T19:32:58.791Z"
+        "updatedAt": "2026-04-06T19:36:37.763Z"
       },
       {
         "id": "469",
@@ -9395,10 +9395,19 @@
         "description": "In `dashboard/src/dashboard/data/burndown.py` line 73, change `seen_roots: set[str] = {str(config.project_root)}` to `seen_roots: set[str] = {str(config.project_root.resolve())}`. Also use this resolved string as the `project_id` in the main-project INSERT (line 80). This ensures deduplication is consistent with both the orchestrator loop (which calls `.resolve()` internally via `_resolve_project_root`/`_read_project_root_from_config`) and the known_project_roots loop (line 129).\n\nOptionally, pre-resolve `known_project_roots` at `DashboardConfig` construction time in `config.py` `from_env()` (line 73) to avoid repeated `lstat` syscalls on every snapshot cycle.\n\nFiles:\n- dashboard/src/dashboard/config.py\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 450 — without this, a symlinked `config.project_root` will silently produce duplicate snapshot rows.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T20:00:53.323Z",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard/config.py",
+            "dashboard/src/dashboard/data",
+            "dashboard/tests/test_burndown_data.py",
+            "dashboard/tests/test_scaffold.py"
+          ]
+        }
       },
       {
         "id": "470",
@@ -9409,7 +9418,14 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T19:44:25.790Z",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard/data",
+            "dashboard/tests/test_burndown_data.py"
+          ]
+        }
       },
       {
         "id": "471",
@@ -9420,7 +9436,14 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T19:46:07.167Z",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard/data",
+            "dashboard/tests/test_burndown_data.py"
+          ]
+        }
       },
       {
         "id": "472",
@@ -9431,7 +9454,14 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T19:50:45.987Z",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard/data",
+            "dashboard/tests/test_burndown_data.py"
+          ]
+        }
       },
       {
         "id": "473",
@@ -9442,7 +9472,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T19:53:28.866Z",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard/data",
+            "dashboard/tests/test_burndown_data.py",
+            "dashboard/tests/test_orchestrator.py"
+          ]
+        }
       },
       {
         "id": "474",
@@ -9450,11 +9488,11 @@
         "description": "task_filter.py has four correctness bugs that all need fixing together:\n1. trimmed_count inflation: change `trimmed_count = total_active - len(kept_lines)` to `trimmed_count = len(active) - len(kept_lines)` where `active = tree.active_tasks[:max_tasks]`. The current code double-counts tasks already dropped by max_tasks cap.\n2. Budget reserve undersized: replace magic `- 50` with `- len(f'\\n... and {total_active} more active (truncated for budget)\\n')` or compute lazily, since the actual notice string can exceed 50 chars.\n3. Negative budget not guarded: add `if budget <= 0: return header + summary_line` guard before the line-accumulation loop to prevent max_chars contract violation.\n4. None-safe deps: change `deps = t.get('dependencies', [])` to `deps = t.get('dependencies') or []` to handle explicit None values from taskmaster.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-06T19:21:59.414Z",
+        "updatedAt": "2026-04-06T19:55:35.781Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
@@ -9468,10 +9506,17 @@
         "description": "In task_filter.py line 181, the deps list is rendered as a raw Python repr. Tasks with many dependencies produce lines that exhaust the char budget before other tasks are shown. Fix: `deps_str = str(deps[:5]) + ('...' if len(deps) > 5 else '')` and use `deps_str` in the f-string instead of `deps`. This prevents a single task with hundreds of deps from consuming the entire budget.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:04:10.431Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_task_filter.py"
+          ]
+        }
       },
       {
         "id": "476",
@@ -9493,7 +9538,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T20:03:14.408Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_stages.py",
+            "fused-memory/tests/test_task_filter.py"
+          ]
+        }
       },
       {
         "id": "478",
@@ -9504,7 +9557,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T20:00:53.240Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_harness.py",
+            "fused-memory/tests/test_stages.py"
+          ]
+        }
       },
       {
         "id": "479",
@@ -9526,7 +9587,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T20:09:59.867Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_harness.py",
+            "fused-memory/tests/test_task_filter.py"
+          ]
+        }
       },
       {
         "id": "481",
@@ -9537,7 +9606,14 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T20:13:39.563Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_stages.py"
+          ]
+        }
       },
       {
         "id": "482",
@@ -9545,10 +9621,11 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py, test_partial_success_one_error_one_rebuilt (lines 440-444):\n1. Add `assert ok_detail['old_summary'] == ''`, `assert ok_detail['new_summary'] == 'rebuilt'`, `assert ok_detail['edge_count'] == 0` to mirror the completeness of err_detail assertions and verify the accumulator loop plumbs the _rebuild_entity_from_edges return value correctly.\n2. Add `assert result['skipped'] == 0` to both the existing single-error test (~line 398) and the partial-success test (~line 431) to constrain the counter partition invariant errors+rebuilt+skipped==total_entities.\n\nMemory hints: search for \"rebuild_entity_summaries return contract\" and \"counter partition invariant\".",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T20:31:13.038Z"
       },
       {
         "id": "483",
@@ -9556,10 +9633,11 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py, add a new test method to TestRebuildEntitySummariesErrorHandling that uses force=False. Mock `_detect_stale_summaries_with_edges` to return a result with total_count=5 but only 2 stale targets, then make _rebuild_entity_from_edges raise for one of them. Assert `result['total_entities'] == 5`, `result['stale_entities'] == 2`, `result['errors'] == 1`, `result['rebuilt'] == 1`. This exercises the bookkeeping path not reachable via force=True.\n\nMemory hints: search for \"_detect_stale_summaries_with_edges return shape\" and \"rebuild_entity_summaries force parameter\".",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T20:31:13.298Z"
       },
       {
         "id": "484",
@@ -9567,10 +9645,11 @@
         "description": "In fused-memory/src/fused_memory/backends/graphiti_client.py line 1059, the accumulator loop uses `isinstance(r, BaseException)` which catches `asyncio.CancelledError` (a BaseException subclass in Python 3.8+). When rebuild_entity_summaries is called during graceful shutdown and tasks are cancelled, the method silently converts CancelledError into error detail entries instead of propagating.\n\nFix: Change `isinstance(r, BaseException)` to `isinstance(r, Exception)` so CancelledError propagates naturally. Alternatively, add an explicit re-raise after the gather loop for any CancelledError results. Add a test documenting the chosen behavior.\n\nMemory hints: search for \"rebuild_entity_summaries gather pattern\" and \"CancelledError handling convention\".",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:04:10.748Z"
       },
       {
         "id": "485",
@@ -9692,13 +9771,123 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": "496",
+        "title": "Wire task_filter into task_knowledge_sync (eliminate dead module + duplicate logic)",
+        "description": "task_filter.py is currently never imported — task_knowledge_sync.py still maintains its own copies of: active_tasks filtering (lines 61-64), _STATUS_PRIORITY dict (lines 212-218, diverging from task_filter's version), sort_key closure (lines 234-243, near-verbatim copy), and _format_tasks (lines 198-208, same format string).\n\nFix:\n1. In task_knowledge_sync.py, replace the inline active_tasks/done_tasks derivation with calls to filter_task_tree() and format_filtered_task_tree().\n2. Delete _STATUS_PRIORITY from task_knowledge_sync.py and import from task_filter.\n3. Replace _select_proactive_sample's sort_key closure with the shared logic from task_filter.\n4. Remove _format_tasks from task_knowledge_sync.py or delegate to _render_task_line helper in task_filter.py.\n\nMemory hints: search for \"_STATUS_PRIORITY\" and \"task_filter\" to find prior decisions about the filter module.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "497",
+        "title": "Fix task_filter.py code quality issues (constant usage, priority gap, round-trip, validation)",
+        "description": "Four independent issues in fused-memory/src/fused_memory/reconciliation/task_filter.py:\n\n1. INACTIVE_TASK_STATUSES not used in filter_task_tree — replace explicit `elif status == 'done'` / `elif status == 'cancelled'` branches with `elif status in INACTIVE_TASK_STATUSES`, counting into done_count/cancelled_count accordingly (or split set into two named constants).\n2. _STATUS_PRIORITY gap: change 'deferred': 5 to 'deferred': 4 so values are contiguous (0-4) and len(_STATUS_PRIORITY)=5 no longer collides with 'deferred'.\n3. Eliminate body.rstrip('\\n').split('\\n') round-trip at line 188 — use `task_lines = lines` directly since `lines` is in scope.\n4. Document (or enforce) that max_chars is best-effort when header+summary alone exceeds the budget — add a docstring note or add final `[:max_chars]` clamp with a truncation marker.\n5. Guard against negative max_tasks at the start of format_filtered_task_tree: `max_tasks = max(0, max_tasks)`.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "498",
+        "title": "Rewrite misleading 'Bug:' test docstrings as regression guard descriptions",
+        "description": "Four tests in fused-memory/tests/test_task_filter.py describe bugs in present tense as if they still exist, when the implementation already has the correct code:\n\n1. test_trimmed_count_relative_to_max_tasks_cap (line 202): docstring says 'Bug: trimmed_count = total_active - len(kept_lines) yields ~197' — implementation uses len(active). Rewrite as: 'Regression: trimmed_count must be bounded by max_tasks cap, not total_active.'\n2. test_budget_reserve_matches_actual_notice_length (lines 293-343): docstring/comments describe fictional -50 reserve and compute budget with wrong formula. Actual implementation uses `max_chars - len(header) - len(summary_line)`. Rewrite analytical comments to match actual code. Also reduce max_tasks from 1,000,001 to ~10,000 to avoid ~150 MB intermediate allocation in CI.\n3. test_negative_budget_returns_header_plus_summary (line 260): says 'Bug: missing early-return guard' — guard exists at line 192. Rewrite as: 'When header+summary exceeds max_chars, the budget<=0 early-return must prevent truncation notice.'\n4. test_caps_at_max_tasks_and_under_budget (line 173): weaken assertion `... or len(output) < 50_000` is trivially satisfied. Replace with: `assert len(output) <= 50_000` and `assert '450 more active omitted by max_tasks cap' in output`.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "499",
+        "title": "Add missing filter_task_tree tests and fix resource-heavy test",
+        "description": "Two test coverage gaps in fused-memory/tests/test_task_filter.py:\n\n1. test_handles_empty_and_malformed_inputs (line 51) does not cover non-dict top-level input. Add: filter_task_tree(None), filter_task_tree([{'id':1,'status':'pending'}]), and filter_task_tree('bad') — each should return a zero-count empty FilteredTaskTree.\n2. test_budget_reserve_matches_actual_notice_length uses max_tasks=1_000_001 causing ~150 MB of intermediate allocations. The test only requires trimmed_count to have 7+ digits (≥1,000,000). Use max_tasks=10,000 with carefully chosen max_chars so that all but ~0-1 lines are trimmed, yielding trimmed_count≥1,000,000 via the lazy while-loop. This keeps peak memory below 1 MB.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "500",
+        "title": "Fix unused variable bindings in burndown tests",
+        "description": "In `dashboard/tests/test_burndown_data.py`, replace `db_path` with `_` in the five test methods that destructure it from `burndown_env` but never reference it: `test_deduplicates_main_project_from_orchestrators` (line 154), `test_snapshots_known_project_roots_when_no_orchestrators` (line 175), `test_dedupes_known_root_against_main_project` (line 208), `test_dedupes_known_root_against_running_orchestrator` (line 232), `test_discovers_config_flag_orchestrator` (line 265). Change each `db_path, config, conn = burndown_env` or `db_path, base_config, conn = burndown_env` to use `_` in the first position.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "501",
+        "title": "Remove redundant list() wrappers around fetchall() in burndown tests",
+        "description": "In `dashboard/tests/test_burndown_data.py`, replace the three occurrences of `list(await cur.fetchall())` with `await cur.fetchall()` directly. Locations: line 138 in `test_inserts_main_project`, line 197 in `test_snapshots_known_project_roots_when_no_orchestrators`, and line 281 in `test_discovers_config_flag_orchestrator`. aiosqlite's fetchall() already returns a list; the extra list() call allocates a needless copy.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "502",
+        "title": "Fix assertion placement inside async context manager blocks in burndown tests",
+        "description": "In `dashboard/tests/test_burndown_data.py`, move assertions inside their enclosing `async with conn.execute(...)` blocks so that failures produce clear AssertionErrors rather than misleading NameErrors.\n\n1. In `test_deduplicates_main_project_from_orchestrators` (lines 165-170): move `assert count == 1` inside the `async with` block alongside `assert row is not None` and the `count = row[0]` binding.\n\n2. In `test_dedupes_known_root_against_main_project` (lines 221-227): same pattern — move `assert count == 1` inside the block.\n\n3. In `TestBurndownEnvFixture.test_yields_valid_triple` (lines 505-508): move `assert row is not None` and `assert row[0] == 0` inside the `async with conn.execute(...)` block where `row` is fetched.\n\nFor all three cases the `COUNT(*)` query always returns a row so the NameError path can't trigger today, but keeping assertions inside the context manager is unambiguous and consistent with the rest of the file.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "503",
+        "title": "Strengthen mock values and call-args assertions in rebuild error-handling tests",
+        "description": "In test_graphiti_quality_433.py's TestRebuildEntitySummariesErrorHandling.test_partial_success_one_error_one_rebuilt:\n\n1. Change the mock return dict for the successful entity (Bob) to use non-default values that match the entity fixture:\n   - `old_summary: 'stale summary 2'` (matches Bob's entity `summary` field, instead of `''`)\n   - `new_summary: 'Bob summary v2'` (distinctive, avoids confusion with status string `'rebuilt'`)\n   - `edge_count: 3` (non-zero, distinguishes 'key present' from `.get()` fallback)\n\n2. Update the assertions on `ok_detail` to expect these non-default values.\n\n3. Add a call-args assertion to verify the implementation correctly forwards the real entity's old_summary to `_rebuild_entity_from_edges`:\n   ```python\n   backend._rebuild_entity_from_edges.assert_any_call(\n       'u2', 'Bob', [], group_id='test', old_summary='stale summary 2'\n   )\n   ```\n\nThis ensures the test catches bugs where `.get()` defaults mask missing keys, and verifies the caller correctly passes entity data through.\n\nMemory hints: search \"rebuild_entity_summaries return contract\", get_entity \"test_graphiti_quality_433\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "504",
+        "title": "Add dry_run path test for rebuild_entity_summaries",
+        "description": "The dry_run branch of rebuild_entity_summaries (graphiti_client.py lines 1046-1049) sets `skipped = stale_entities` and appends `status='skipped_dry_run'` details, but has no dedicated test coverage.\n\nAdd a test in TestRebuildEntitySummariesErrorHandling (or a new class) that:\n1. Calls `rebuild_entity_summaries(group_id='test', force=True, dry_run=True)` with multiple entities\n2. Asserts `result['skipped'] == len(entities)` (i.e. stale_entities)\n3. Asserts `result['rebuilt'] == 0` and `result['errors'] == 0`\n4. Asserts each detail entry has `status == 'skipped_dry_run'`\n5. Verifies `_rebuild_entity_from_edges` was NOT called (since dry_run skips actual rebuilds)\n6. Verifies edges were NOT fetched (line 1031: `if not dry_run` guards the edge fetch)\n\nThis completes the counter partition invariant coverage: errors+rebuilt+skipped==total is now tested for the dry_run path.\n\nMemory hints: search \"rebuild_entity_summaries dry_run\", search \"counter partition invariant\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "505",
+        "title": "Extract make_rebuild_detail shared test fixture to conftest.py",
+        "description": "The inline rebuild detail dict `{'uuid': ..., 'name': ..., 'old_summary': '', 'new_summary': ..., 'edge_count': 0}` appears in at least three test files without a shared factory:\n- fused-memory/tests/test_graphiti_quality_433.py\n- fused-memory/tests/test_rebuild_entity_summaries.py (lines ~920, ~979, ~1022, ~1078, ~1107)\n- fused-memory/tests/test_merge_entities.py (line ~226)\n\nCreate a `make_rebuild_detail(uuid, name, *, old_summary='', new_summary='', edge_count=0, status='rebuilt')` factory function in `fused-memory/tests/conftest.py` and replace inline dict literals across all affected test files. This makes schema changes (e.g. adding a new key to the detail dict) a single-point edit.\n\nMemory hints: search \"rebuild detail dict test fixture\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T19:35:11.690Z",
-      "taskCount": 474,
-      "completedCount": 415,
+      "lastModified": "2026-04-06T22:04:10.748Z",
+      "taskCount": 484,
+      "completedCount": 421,
       "tags": [
         "master"
       ]

@@ -416,6 +416,7 @@ class TestRebuildEntitySummariesErrorHandling:
 
         assert result['errors'] == 1
         assert result['rebuilt'] == 0
+        assert result['skipped'] == 0
         assert result['total_entities'] == 1
         assert result['stale_entities'] == 1
         assert len(result['details']) == 1
@@ -453,6 +454,7 @@ class TestRebuildEntitySummariesErrorHandling:
 
         assert result['errors'] == 1
         assert result['rebuilt'] == 1
+        assert result['skipped'] == 0
         assert result['total_entities'] == 2
         assert result['stale_entities'] == 2
         assert len(result['details']) == 2
@@ -467,6 +469,63 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['status'] == 'rebuilt'
         assert ok_detail['uuid'] == 'u2'
         assert ok_detail['name'] == 'Bob'
+        assert ok_detail['old_summary'] == ''
+        assert ok_detail['new_summary'] == 'rebuilt'
+        assert ok_detail['edge_count'] == 0
+
+    @pytest.mark.asyncio
+    async def test_force_false_partial_error_uses_detect_total(self, mock_config, make_backend):
+        """force=False error path: total_entities flows from StaleSummaryResult.total_count.
+
+        This exercises the force=False bookkeeping path where total_entities comes
+        from _detect_stale_summaries_with_edges (result.total_count=5), which is
+        independent of stale_entities (=len(targets)=2). This path is not reachable
+        via force=True — in that branch total_entities = len(list_entity_nodes()).
+
+        With two stale entities and _rebuild_entity_from_edges raising for the first
+        and succeeding for the second, the gather/zip accumulator must record
+        errors=1 and rebuilt=1, with details in target order (u1 first, u2 second).
+        """
+        from fused_memory.backends.graphiti_client import StaleSummaryResult
+
+        backend = make_backend(mock_config)
+        stale_list = [
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'old A'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'old B'},
+        ]
+        detect_result = StaleSummaryResult(
+            stale=stale_list,
+            all_edges={'u1': [], 'u2': []},
+            total_count=5,
+        )
+        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
+        backend._rebuild_entity_from_edges = AsyncMock(
+            side_effect=[
+                RuntimeError('boom'),
+                {'uuid': 'u2', 'name': 'Bob', 'old_summary': 'old B', 'new_summary': 'rebuilt B', 'edge_count': 0},
+            ]
+        )
+
+        result = await backend.rebuild_entity_summaries(group_id='test', force=False)
+
+        assert result['total_entities'] == 5   # flows from total_count=5, not len(stale)
+        assert result['stale_entities'] == 2   # len(targets) = len(stale_list)
+        assert result['errors'] == 1
+        assert result['rebuilt'] == 1
+        assert result['skipped'] == 0
+        assert len(result['details']) == 2
+
+        err_detail = result['details'][0]
+        assert err_detail['status'] == 'error'
+        assert err_detail['uuid'] == 'u1'
+        assert err_detail['name'] == 'Alice'
+        assert err_detail['error'] == 'boom'
+
+        ok_detail = result['details'][1]
+        assert ok_detail['status'] == 'rebuilt'
+        assert ok_detail['uuid'] == 'u2'
+        assert ok_detail['name'] == 'Bob'
+        assert ok_detail['new_summary'] == 'rebuilt B'
 
 
 # ---------------------------------------------------------------------------

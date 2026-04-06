@@ -418,12 +418,21 @@ class GitOps:
         )
         return [f for f in output.strip().splitlines() if f.strip()]
 
-    async def merge_to_main(self, worktree: Path, branch: str) -> MergeResult:
+    async def merge_to_main(
+        self,
+        worktree: Path,
+        branch: str,
+        base_sha: str | None = None,
+    ) -> MergeResult:
         """Merge a task branch into main using a temporary merge worktree.
 
         Creates a disposable worktree, performs the merge there, and returns
         the result.  The caller is responsible for calling :meth:`advance_main`
         after verification and :meth:`cleanup_merge_worktree` when done.
+
+        When *base_sha* is provided the merge worktree is created at that
+        commit rather than current main HEAD.  This supports speculative
+        merges where N+1 is merged against N's merge commit SHA.
 
         Never touches ``project_root``'s working tree or index.
         Called by the MergeWorker (serialized via the merge queue).
@@ -432,7 +441,7 @@ class GitOps:
         merge_wt: Path | None = None
 
         try:
-            merge_wt, pre_merge_sha = await self._create_merge_worktree()
+            merge_wt, pre_merge_sha = await self._create_merge_worktree(base_sha)
 
             # Pre-merge cleanup: remove .task/ from filesystem if inherited
             # from a contaminated main.  This is NOT sufficient on its own
@@ -483,40 +492,52 @@ class GitOps:
                 merge_worktree=merge_wt,
             )
 
-        except Exception:
+        except BaseException:
             if merge_wt:
                 await self.cleanup_merge_worktree(merge_wt)
             raise
 
-    async def _create_merge_worktree(self) -> tuple[Path, str]:
-        """Create a temporary detached worktree at main HEAD for merging."""
+    async def _create_merge_worktree(
+        self, base_sha: str | None = None,
+    ) -> tuple[Path, str]:
+        """Create a temporary detached worktree at *base_sha* (or main HEAD).
+
+        When *base_sha* is None the worktree is created at current main HEAD
+        (normal case).  When *base_sha* is provided the worktree is created
+        at that exact commit, supporting speculative merges where N+1 is
+        merged against N's merge commit.
+        """
         import uuid
         merge_id = uuid.uuid4().hex[:8]
         merge_wt = self.worktree_base / f'_merge-{merge_id}'
         merge_wt.parent.mkdir(parents=True, exist_ok=True)
 
-        # Fetch latest (best-effort — no remote in tests)
-        await _run(
-            ['git', 'fetch', self.config.remote, self.config.main_branch],
-            cwd=self.project_root,
-        )
-
-        # Capture current main SHA
-        _, pre_merge_sha, _ = await _run(
-            ['git', 'rev-parse', self.config.main_branch],
-            cwd=self.project_root,
-        )
+        if base_sha is None:
+            # Fetch latest (best-effort — no remote in tests)
+            await _run(
+                ['git', 'fetch', self.config.remote, self.config.main_branch],
+                cwd=self.project_root,
+            )
+            # Capture current main SHA
+            _, pre_merge_sha, _ = await _run(
+                ['git', 'rev-parse', self.config.main_branch],
+                cwd=self.project_root,
+            )
+            checkout_ref = self.config.main_branch
+        else:
+            pre_merge_sha = base_sha
+            checkout_ref = base_sha.strip()
 
         # Detached worktree avoids "branch already checked out" error
         rc, _, err = await _run(
-            ['git', 'worktree', 'add', '--detach', str(merge_wt), self.config.main_branch],
+            ['git', 'worktree', 'add', '--detach', str(merge_wt), checkout_ref],
             cwd=self.project_root,
         )
         if rc != 0:
             raise RuntimeError(f'Failed to create merge worktree: {err}')
 
         logger.info(f'Created merge worktree at {merge_wt} (HEAD={pre_merge_sha[:8]})')
-        return merge_wt, pre_merge_sha
+        return merge_wt, pre_merge_sha.strip()
 
     async def cleanup_merge_worktree(self, merge_wt: Path) -> None:
         """Remove a temporary merge worktree."""
