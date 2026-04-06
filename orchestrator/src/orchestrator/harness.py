@@ -165,8 +165,8 @@ class Harness:
         import uuid
 
         run_id = f'run-{uuid.uuid4().hex[:12]}'
+        db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
         try:
-            db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
             self.event_store = EventStore(db_path, run_id)
             self.scheduler.event_store = self.event_store
         except Exception:

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import sqlite3
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -1274,7 +1275,7 @@ class TestSpeculativeMergeWorker:
 
         original_merge = git_ops.merge_to_main
 
-        async def blocking_merge(worktree: Path, branch: str, **kwargs: object) -> object:
+        async def blocking_merge(worktree: Path, branch: str, **kwargs: Any) -> Any:
             merge_started.set()
             await block_event.wait()  # simulates long-running merge
             return await original_merge(worktree, branch, **kwargs)
