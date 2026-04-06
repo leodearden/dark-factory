@@ -13,12 +13,11 @@ Any accidental reversion of the ``edges`` → ``all_edges`` rename would break t
 """
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock
 
 import pytest
 
 from fused_memory.backends.graphiti_client import (
-    GraphitiBackend,
     StaleSummaryResult,
 )
 
