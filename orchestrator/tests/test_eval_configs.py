@@ -97,6 +97,27 @@ class TestVllmConfigSet:
         )
 
 
+class TestDroppedQwen25Regression:
+    """Regression guard: Qwen2.5-Coder-32B must not reappear in any config list."""
+
+    def test_qwen25_32b_not_in_vllm_configs(self):
+        """qwen25-coder-32b-q4 must not be in VLLM_EVAL_CONFIGS."""
+        names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+        assert 'qwen25-coder-32b-q4' not in names
+
+    def test_qwen25_32b_not_found_by_name_lookup(self):
+        """get_config_by_name must return None for the dropped model."""
+        assert get_config_by_name('qwen25-coder-32b-q4') is None
+
+    def test_qwen25_hf_model_not_in_any_config(self):
+        """No config should reference Qwen/Qwen2.5-Coder-32B-Instruct as its model."""
+        dropped_hf_id = 'Qwen/Qwen2.5-Coder-32B-Instruct'
+        for cfg in EVAL_CONFIGS + VLLM_EVAL_CONFIGS:
+            assert cfg.env_overrides.get('ANTHROPIC_DEFAULT_SONNET_MODEL') != dropped_hf_id, (
+                f'{cfg.name} still references the dropped HF model'
+            )
+
+
 class TestNoNameCollisions:
     """vLLM and standard config names must not collide."""
 
