@@ -49,3 +49,66 @@ def _normalize_tool_use_block(block: dict) -> dict:
         result['id'] = 'toolu_' + existing_id
 
     return result
+
+
+def _translate_messages_response(body: dict) -> dict:
+    """Return a normalised copy of a /v1/messages response body.
+
+    Handles the following vLLM malformations:
+    - OpenAI-style top-level ``tool_calls`` list → Anthropic content[] blocks
+    - ``stop_reason='tool_calls'`` → ``'tool_use'`` when content has tool_use blocks
+    - tool_use blocks with JSON-string ``input`` or non-Anthropic ``id``
+
+    The function is idempotent: a well-formed Anthropic response body is
+    returned unchanged.  Error bodies and non-assistant responses are passed
+    through unchanged.  The input dict is never mutated; a new dict is returned.
+    """
+    # ── pass through non-assistant / error bodies ────────────────────────────
+    if body.get('type') == 'error' or body.get('role') != 'assistant':
+        return dict(body)
+
+    result = dict(body)
+
+    # ── convert OpenAI-style top-level tool_calls ────────────────────────────
+    if 'tool_calls' in result:
+        raw_content = result.get('content', '')
+        content_list: list[dict] = []
+
+        # Wrap any existing string content into a text block
+        if isinstance(raw_content, str) and raw_content:
+            content_list.append({'type': 'text', 'text': raw_content})
+        elif isinstance(raw_content, list):
+            content_list.extend(raw_content)
+
+        # Convert each OpenAI tool_call to an Anthropic tool_use block
+        for tc in result['tool_calls']:
+            fn = tc.get('function', {})
+            block = {
+                'type': 'tool_use',
+                'id': tc.get('id', ''),
+                'name': fn.get('name', ''),
+                'input': fn.get('arguments', '{}'),
+            }
+            content_list.append(_normalize_tool_use_block(block))
+
+        result['content'] = content_list
+        del result['tool_calls']
+
+    # ── normalise any tool_use blocks already in content[] ───────────────────
+    if isinstance(result.get('content'), list):
+        normalised: list[dict] = []
+        for block in result['content']:
+            if block.get('type') == 'tool_use':
+                normalised.append(_normalize_tool_use_block(block))
+            else:
+                normalised.append(block)
+        result['content'] = normalised
+
+    # ── fix stop_reason ──────────────────────────────────────────────────────
+    has_tool_use = isinstance(result.get('content'), list) and any(
+        b.get('type') == 'tool_use' for b in result['content']
+    )
+    if has_tool_use:
+        result['stop_reason'] = 'tool_use'
+
+    return result
