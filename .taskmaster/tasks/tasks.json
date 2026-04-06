@@ -9437,6 +9437,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 476,
+        "title": "Fix _STATUS_PRIORITY gap and eliminate duplicate constant",
+        "description": "Two related cleanup items in task_filter.py and task_knowledge_sync.py:\n1. In task_filter.py line 42-43, renumber `deferred` from 5 to 4 for a gapless sequence (currently skips priority value 4).\n2. In task_knowledge_sync.py lines 226-232, delete the local `_STATUS_PRIORITY` dict and instead `from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY`. The `'done': 4` entry in the local copy is now dead code since `_select_proactive_sample` receives `filtered.active_tasks` which never contains done tasks.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9449,7 +9460,7 @@
       ],
       "created": "2026-04-06T18:58:00.750Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T18:58:04.447Z"
+      "updated": "2026-04-06T18:58:10.687Z"
     }
   }
 }
