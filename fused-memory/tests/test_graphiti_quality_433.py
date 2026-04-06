@@ -416,6 +416,7 @@ class TestRebuildEntitySummariesErrorHandling:
 
         assert result['errors'] == 1
         assert result['rebuilt'] == 0
+        assert result['skipped'] == 0
         assert result['total_entities'] == 1
         assert result['stale_entities'] == 1
         assert len(result['details']) == 1
@@ -453,6 +454,7 @@ class TestRebuildEntitySummariesErrorHandling:
 
         assert result['errors'] == 1
         assert result['rebuilt'] == 1
+        assert result['skipped'] == 0
         assert result['total_entities'] == 2
         assert result['stale_entities'] == 2
         assert len(result['details']) == 2
@@ -467,6 +469,9 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['status'] == 'rebuilt'
         assert ok_detail['uuid'] == 'u2'
         assert ok_detail['name'] == 'Bob'
+        assert ok_detail['old_summary'] == ''
+        assert ok_detail['new_summary'] == 'rebuilt'
+        assert ok_detail['edge_count'] == 0
 
 
 # ---------------------------------------------------------------------------
