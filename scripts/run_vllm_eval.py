@@ -32,8 +32,13 @@ MODELS = {
     "minimax-m25":      ("minimax-m25",      "minimax-m25-fp8",       2, 570, {"DTYPE": "float8"}),
 }
 
-# GPU types to try in order (96GB → 80GB, cheapest viable first)
+# GPU types to try in order.
+# H200 SXM/NVL listed first: 141GB HBM pool is the documented mitigation host
+# for the qwen3-coder-next-fp8-new CUDA-graph startup hang (graph edge 85c34b19).
+# RTX PRO 6000 Blackwell variants kept as fallback for other models + availability.
 GPU_TYPES = [
+    "NVIDIA H200 SXM",   # 141GB HBM3e — preferred for qwen3-coder-next-fp8-new
+    "NVIDIA H200 NVL",   # 141GB HBM3e — alternative H200 form factor
     "NVIDIA RTX PRO 6000 Blackwell Server Edition",
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
     "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
