@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import aiohttp
 import pytest
+from aiohttp import web
 
 from shared.vllm_bridge import VllmBridge, _normalize_tool_use_block, _translate_messages_response
 
@@ -218,3 +220,169 @@ class TestVllmBridgeLifecycle:
             assert bridge.url.startswith('http://127.0.0.1:')
         # stop() after context exit should be a no-op (no raise)
         await bridge.stop()
+
+
+# ── Integration tests (mock upstream server) ─────────────────────────────────
+
+
+@pytest.fixture
+async def mock_upstream_models():
+    """Start a mock upstream server with /v1/models returning a fixed response."""
+    app = web.Application()
+
+    async def models_handler(request):
+        return web.json_response({'data': [{'id': 'test'}]})
+
+    app.router.add_route('*', '/v1/models', models_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    url = f'http://127.0.0.1:{port}'
+    yield url
+    await runner.cleanup()
+
+
+@pytest.fixture
+async def mock_upstream_messages():
+    """Start a mock upstream server for /v1/messages with vLLM-style tool_calls response."""
+    app = web.Application()
+    received_bodies = []
+
+    async def messages_handler(request):
+        body = await request.json()
+        received_bodies.append(body)
+        response_body = {
+            'role': 'assistant',
+            'content': 'Using tool.',
+            'tool_calls': [
+                {
+                    'id': 'call_1',
+                    'type': 'function',
+                    'function': {'name': 'Read', 'arguments': '{"path": "/tmp/x"}'},
+                }
+            ],
+            'stop_reason': 'tool_calls',
+        }
+        return web.json_response(response_body)
+
+    app.router.add_post('/v1/messages', messages_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    url = f'http://127.0.0.1:{port}'
+    yield url, received_bodies
+    await runner.cleanup()
+
+
+@pytest.fixture
+async def mock_upstream_stream_capture():
+    """Start a mock upstream that captures the stream field in the request body."""
+    app = web.Application()
+    received_bodies = []
+
+    async def messages_handler(request):
+        body = await request.json()
+        received_bodies.append(body)
+        return web.json_response({'role': 'assistant', 'content': [], 'stop_reason': 'end_turn'})
+
+    app.router.add_post('/v1/messages', messages_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    url = f'http://127.0.0.1:{port}'
+    yield url, received_bodies
+    await runner.cleanup()
+
+
+@pytest.fixture
+async def mock_upstream_error():
+    """Start a mock upstream that returns status 500 with an error body."""
+    app = web.Application()
+
+    async def messages_handler(request):
+        error_body = {
+            'type': 'error',
+            'error': {'type': 'internal_error', 'message': 'boom'},
+        }
+        return web.json_response(error_body, status=500)
+
+    app.router.add_post('/v1/messages', messages_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    url = f'http://127.0.0.1:{port}'
+    yield url
+    await runner.cleanup()
+
+
+@pytest.mark.asyncio
+class TestVllmBridgeIntegration:
+
+    async def test_passthrough_non_messages_path(self, mock_upstream_models):
+        """Non-/v1/messages paths are proxied verbatim."""
+        async with VllmBridge(upstream_url=mock_upstream_models) as bridge:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(bridge.url + '/v1/models') as resp:
+                    assert resp.status == 200
+                    data = await resp.json()
+                    assert data == {'data': [{'id': 'test'}]}
+
+    async def test_messages_translates_tool_calls(self, mock_upstream_messages):
+        """POST /v1/messages translates vLLM tool_calls to Anthropic content blocks."""
+        upstream_url, _ = mock_upstream_messages
+        async with VllmBridge(upstream_url=upstream_url) as bridge:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    bridge.url + '/v1/messages',
+                    json={'model': 'x', 'messages': []},
+                ) as resp:
+                    assert resp.status == 200
+                    data = await resp.json()
+
+        # tool_calls key is gone
+        assert 'tool_calls' not in data
+        # content is a list
+        assert isinstance(data['content'], list)
+        # has a tool_use block with toolu_-prefixed id and dict input
+        tool_blocks = [b for b in data['content'] if b.get('type') == 'tool_use']
+        assert len(tool_blocks) == 1
+        tb = tool_blocks[0]
+        assert tb['id'].startswith('toolu_')
+        assert isinstance(tb['input'], dict)
+        # stop_reason is 'tool_use'
+        assert data['stop_reason'] == 'tool_use'
+
+    async def test_forces_stream_false(self, mock_upstream_stream_capture):
+        """Bridge sets stream=False on forwarded request body."""
+        upstream_url, received = mock_upstream_stream_capture
+        async with VllmBridge(upstream_url=upstream_url) as bridge:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    bridge.url + '/v1/messages',
+                    json={'model': 'x', 'stream': True, 'messages': []},
+                ) as _resp:
+                    pass
+
+        assert len(received) == 1
+        assert received[0].get('stream') is False
+
+    async def test_forwards_upstream_error_status(self, mock_upstream_error):
+        """Bridge forwards upstream error status and passes error body through unchanged."""
+        async with VllmBridge(upstream_url=mock_upstream_error) as bridge:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    bridge.url + '/v1/messages',
+                    json={'model': 'x', 'messages': []},
+                ) as resp:
+                    assert resp.status == 500
+                    data = await resp.json()
+                    assert data['type'] == 'error'
+                    assert data['error']['message'] == 'boom'
