@@ -9084,7 +9084,9 @@
         "details": "Stream 1 (dark-factory eval plumbing) and Stream 2 (runpod-toolkit Docker image) are complete. Stream 3 is the actual self-hosted eval run.\n\nKey files:\n- orchestrator/src/orchestrator/evals/configs.py — EVAL_CONFIGS dict, add entries for self-hosted models\n- orchestrator/src/orchestrator/evals/tasks/ — eval task JSON files (df_task_12/13/18, reify_task_27 — plan.task_id values fixed in commit 53486e8023)\n- docs/vllm-eval-status.md — current stream status and next steps\n\nenv_overrides constraint: only implementer and debugger roles may use vLLM endpoint; architect and reviewer must use real Claude OAuth (enforced in workflow.py since commit 53486e8023).\n\nModels: 6 active (Qwen2.5-Coder-32B dropped). See memory \"Evaluating vLLM plan with 6 active models\".",
         "testStrategy": "",
         "status": "blocked",
-        "dependencies": [],
+        "dependencies": [
+          "457"
+        ],
         "priority": "medium",
         "subtasks": [],
         "updatedAt": "2026-04-06T17:16:00.978Z",
