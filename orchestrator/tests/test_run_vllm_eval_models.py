@@ -80,3 +80,23 @@ class TestQwen3CoderNextModelsConfigName:
             f"Expected 'qwen3-coder-next-fp8-new', got {config_name!r}. "
             "Update MODELS['qwen3-coder-next'][1] in scripts/run_vllm_eval.py."
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-7 test: TOOL_CALL_PARSER env var in extra_env
+# ---------------------------------------------------------------------------
+
+
+class TestQwen3CoderNextExtraEnv:
+    """MODELS['qwen3-coder-next'][4] extra_env must contain the documented vLLM workarounds."""
+
+    def test_tool_call_parser_is_qwen3_coder(self, _parsed_models):
+        """extra_env must set TOOL_CALL_PARSER=qwen3_coder (documented fix, graph edge 3095db10).
+
+        The entrypoint-vllm.sh reads TOOL_CALL_PARSER and forwards it as --tool-call-parser
+        to vLLM. 'hermes' (the entrypoint default) is wrong for Qwen3-Coder-Next.
+        """
+        extra_env = _parsed_models["qwen3-coder-next"][4]
+        assert extra_env.get("TOOL_CALL_PARSER") == "qwen3_coder", (
+            f"TOOL_CALL_PARSER not set to 'qwen3_coder' in extra_env: {extra_env!r}"
+        )
