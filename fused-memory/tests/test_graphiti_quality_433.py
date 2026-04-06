@@ -398,3 +398,46 @@ class TestRebuildEntitySummariesErrorHandling:
         assert detail['error'] == 'boom'
         assert detail['uuid'] == 'u1'
         assert detail['name'] == 'Alice'
+
+    @pytest.mark.asyncio
+    async def test_partial_success_one_error_one_rebuilt(self, mock_config, make_backend):
+        """asyncio.gather returns a mix of exceptions and successes without aborting.
+
+        With two entities, the first raising and the second succeeding, the result
+        should record errors=1 and rebuilt=1 with details in target order (u1 first,
+        u2 second). This exercises the zip(targets, results, strict=True) accumulator
+        loop that is the core value of return_exceptions=True.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'stale summary'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'stale summary 2'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        backend._rebuild_entity_from_edges = AsyncMock(
+            side_effect=[
+                RuntimeError('boom'),
+                {'uuid': 'u2', 'name': 'Bob', 'old_summary': '', 'new_summary': 'rebuilt', 'edge_count': 0},
+            ]
+        )
+
+        result = await backend.rebuild_entity_summaries(
+            group_id='test', force=True, dry_run=False
+        )
+
+        assert result['errors'] == 1
+        assert result['rebuilt'] == 1
+        assert result['total_entities'] == 2
+        assert result['stale_entities'] == 2
+        assert len(result['details']) == 2
+
+        err_detail = result['details'][0]
+        assert err_detail['status'] == 'error'
+        assert err_detail['uuid'] == 'u1'
+        assert err_detail['name'] == 'Alice'
+        assert err_detail['error'] == 'boom'
+
+        ok_detail = result['details'][1]
+        assert ok_detail['status'] == 'rebuilt'
+        assert ok_detail['uuid'] == 'u2'
+        assert ok_detail['name'] == 'Bob'
