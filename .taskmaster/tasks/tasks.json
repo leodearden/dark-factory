@@ -8896,13 +8896,25 @@
           "bridge_bug_confirmed": true,
           "primary_blocker": "tool_format_bridge_bug_cli_invoke_vllm_messages_shim",
           "next_steps": "debug cli_invoke.py + /v1/messages shim; alternative: try reap-139b-nvfp4-new as gate eval candidate",
-          "_causation_id": "94151a78-19d8-4bc5-99a7-22da02728872",
+          "_causation_id": "575fd7e6-9c9d-401e-9ef8-39f0159ffd6d",
           "memory_hints": {
-            "entities": [],
-            "queries": [
-              "resolution for: Complete vLLM eval Stream 3: add self-hosted backend configs and run trials"
+            "entities": [
+              "vLLM eval Stream 3",
+              "RunPod"
+            ],
+            "episodes": [
+              "ec966325-39a2-48e3-a846-11a1b0fe381c",
+              "99a05c0d-78b1-4994-babc-e81ae07533c5"
+            ],
+            "searches": [
+              "US-NC-1 GPU unavailability Stream 3 stalled 2026-04-06",
+              "vLLM tool format bridge bug cli_invoke messages shim",
+              "alternative datacenter 80GB GPU availability RunPod"
             ]
-          }
+          },
+          "blocker": "US-NC-1 GPU unavailability: zero 80GB+ GPU stock on 2026-04-05/06. Tool format bridge bug (cli_invoke.py + /v1/messages shim) also unresolved.",
+          "resume_condition": "80GB+ GPU stock confirmed at alternative datacenter OR RunPod volume migrated OR tool_format_bridge_bug fixed",
+          "stage1_finding_id": "1"
         }
       },
       {
