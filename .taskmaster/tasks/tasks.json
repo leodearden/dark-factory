@@ -9926,6 +9926,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 510,
+        "title": "Test quality: fixture extraction, comment fix, assertion completeness, and fragility fix in test_burndown_data",
+        "description": "In `dashboard/tests/test_burndown_data.py`:\n\n1. **Extract shared fixture** (suggestion 7): The 8-line setup block (create `real_dir`, symlink `link`, create `db_path`, call `_create_burndown_db`) is duplicated verbatim in `test_symlinked_root_deduplicates_with_orchestrator` (line 154), `test_symlinked_root_deduplicates_with_known_roots` (line 262), `test_main_project_id_is_resolved_path` (line 328), and `test_orchestrator_fallback_deduplicates_against_resolved_root` (line 385). Extract a `@pytest.fixture` (e.g. `symlink_project_setup`) that yields `(real_dir, link, db_path)`.\n\n2. **Fix misleading comment** (suggestion 8): In `test_symlinked_root_deduplicates_with_known_roots` (~line 276), change `known_project_roots=[real_dir],  # same underlying dir, unresolved` to something like `known_project_roots=[real_dir],  # real path; project_root is the symlink pointing here`.\n\n3. **Add project_id assertion** (suggestion 9): In `test_symlinked_root_deduplicates_with_orchestrator` (line 175), after the `assert count == 1` add: `async with conn.execute('SELECT project_id FROM snapshots') as cur: rows = list(await cur.fetchall()); assert rows[0][0] == str(real_dir.resolve())`.\n\n4. **Fix test fragility** (suggestion 12): In `test_orchestrator_fallback_deduplicates_against_resolved_root` (line 385), either mock `_resolve_project_root` explicitly or isolate the PRD path in a subtree guaranteed to have no `.taskmaster` ancestor (e.g. a `no_taskmaster/` subdir inside `tmp_path`, after asserting no ancestor outside `tmp_path` has one). `_resolve_project_root` walks up the directory tree looking for `.taskmaster`; if `tmp_path` or any ancestor happens to contain one, the fallback branch never fires and the test silently tests the wrong code path.\n\nFiles: dashboard/tests/test_burndown_data.py\n\nSource: review suggestions on task 469 (suggestions 7, 8, 9, 12 from reviewers reuse_auditor, test_analyst, robustness).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9938,7 +9949,7 @@
       ],
       "created": "2026-04-06T22:12:52.146Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:12:58.872Z"
+      "updated": "2026-04-06T22:13:09.141Z"
     }
   }
 }
