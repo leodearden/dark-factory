@@ -9587,6 +9587,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 488,
+        "title": "Improve _edge_dict test coverage: full assertions, both-None case, remove redundant test",
+        "description": "Three improvements to TestEdgeDict in test_refresh_entity_summary.py (line ~193):\n\n1. **Full dict assertions in None-coercion tests**: test_none_fact_coerced_to_empty_string and test_none_name_coerced_to_empty_string each assert only the targeted field. Change to assert the full dict so corruption of other keys is caught. E.g.: `assert result == {'uuid': 'e-1', 'fact': '', 'name': 'knows'}`.\n\n2. **Add both-None test**: No test covers the case where both fact and name are None simultaneously. Add: `result = GraphitiBackend._edge_dict('e-null', None, None); assert result == {'uuid': 'e-null', 'fact': '', 'name': ''}`.\n\n3. **Remove redundant test**: test_preserves_non_none_values tests the same scenario as test_returns_dict_with_correct_keys (all non-None, dict equality). Remove it or repurpose it as the both-None test.\n\nAlso: replace the task-reference comment `# step-3 (task-448): GraphitiBackend._edge_dict static helper` with a behavior description like `# GraphitiBackend._edge_dict: edge dict normalisation helper`.\n\nmemory_hint: search \"_edge_dict test coverage\" for context.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9599,7 +9610,7 @@
       ],
       "created": "2026-04-06T19:14:04.302Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T19:14:10.360Z"
+      "updated": "2026-04-06T19:14:19.890Z"
     }
   }
 }
