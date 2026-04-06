@@ -323,6 +323,52 @@ async def mock_upstream_error():
     await runner.cleanup()
 
 
+@pytest.fixture
+async def mock_upstream_text_error():
+    """Start a mock upstream that returns a plain-text 503 (non-JSON) error."""
+    app = web.Application()
+
+    async def messages_handler(request):
+        return web.Response(
+            status=503,
+            text='Service Unavailable: backend down',
+            content_type='text/plain',
+        )
+
+    app.router.add_post('/v1/messages', messages_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    url = f'http://127.0.0.1:{port}'
+    yield url
+    await runner.cleanup()
+
+
+@pytest.fixture
+async def mock_upstream_truncated_json():
+    """Start a mock upstream that returns a truncated JSON body (unparseable)."""
+    app = web.Application()
+
+    async def messages_handler(request):
+        return web.Response(
+            status=200,
+            body=b'{"role": "assistant", "content":',
+            content_type='application/json',
+        )
+
+    app.router.add_post('/v1/messages', messages_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    url = f'http://127.0.0.1:{port}'
+    yield url
+    await runner.cleanup()
+
+
 @pytest.mark.asyncio
 class TestVllmBridgeIntegration:
 
@@ -390,3 +436,31 @@ class TestVllmBridgeIntegration:
             data = await resp.json()
             assert data['type'] == 'error'
             assert data['error']['message'] == 'boom'
+
+    async def test_handles_non_json_upstream_response(self, mock_upstream_text_error):
+        """Bridge forwards non-JSON upstream response verbatim, preserving status."""
+        async with (
+            VllmBridge(upstream_url=mock_upstream_text_error) as bridge,
+            aiohttp.ClientSession() as session,
+            session.post(
+                bridge.url + '/v1/messages',
+                json={'model': 'x', 'messages': []},
+            ) as resp,
+        ):
+            assert resp.status == 503
+            body = await resp.read()
+            assert body.startswith(b'Service Unavailable')
+
+    async def test_handles_truncated_json_upstream_response(self, mock_upstream_truncated_json):
+        """Bridge forwards truncated/malformed JSON body verbatim, preserving status."""
+        async with (
+            VllmBridge(upstream_url=mock_upstream_truncated_json) as bridge,
+            aiohttp.ClientSession() as session,
+            session.post(
+                bridge.url + '/v1/messages',
+                json={'model': 'x', 'messages': []},
+            ) as resp,
+        ):
+            assert resp.status == 200
+            body = await resp.read()
+            assert body == b'{"role": "assistant", "content":'
