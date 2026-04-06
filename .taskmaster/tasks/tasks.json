@@ -10208,6 +10208,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 532,
+        "title": "Refactor TestVllmUrlInjection test fixtures for isolation and deduplication",
+        "description": "In orchestrator/tests/test_eval_configs.py, refactor TestVllmUrlInjection (lines 175-240): (1) extract the save/restore env_overrides scaffolding into a shared pytest fixture using monkeypatch or contextmanager, eliminating the 45-line copy-paste across 3 test methods; (2) use deepcopy or monkeypatch.setattr to avoid mutating module-level singletons directly. Also add at least one test that exercises the actual CLI injection path: invoke _run_single_eval or _run_matrix_cmd from cli.py with a vllm_url argument (mocked runner) and assert ANTHROPIC_BASE_URL is injected into each vLLM config's env_overrides.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10220,7 +10231,7 @@
       ],
       "created": "2026-04-06T22:49:21.157Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:49:21.161Z"
+      "updated": "2026-04-06T22:49:26.117Z"
     }
   }
 }
