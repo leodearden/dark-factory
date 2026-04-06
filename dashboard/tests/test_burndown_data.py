@@ -391,6 +391,45 @@ class TestCollectSnapshot:
         assert reify_row[3] == 1  # pending
         assert reify_row[8] == 1  # done
 
+    @pytest.mark.asyncio
+    async def test_orchestrator_fallback_deduplicates_against_resolved_root(self, tmp_path):
+        """When _resolve_project_root falls back to the symlinked config.project_root, it still deduplicates."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        from dashboard.config import DashboardConfig
+        config = DashboardConfig(project_root=link)
+
+        # PRD path lives directly under tmp_path (not under real_dir), so
+        # _resolve_project_root will walk up from tmp_path, find no .taskmaster,
+        # and fall back to config.project_root (the unresolved symlink).
+        prd_path = str(tmp_path / 'fake_prd.md')
+        fake_orchestrators = [{'prd': prd_path, 'config_path': None}]
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
+                # _resolve_project_root is NOT mocked — it runs for real and falls
+                # back to config.project_root (the symlink) because prd_path has no
+                # .taskmaster in its ancestor chain.
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+                row = await cur.fetchone()
+                assert row is not None
+                count = row[0]
+
+        # Only 1 row — the orchestrator fallback targets the same project as the
+        # main project_root; resolved and unresolved paths must deduplicate.
+        assert count == 1
+
 
 # ---------------------------------------------------------------------------
 # downsample
