@@ -63,6 +63,16 @@ class TestStaleSummaryResult:
         # only actual tuple subclasses compare equal to plain tuples this way.
         assert result == (stale_list, edges, 1)
 
+    def test_no_legacy_edges_attribute(self):
+        """StaleSummaryResult must NOT expose the old 'edges' field name.
+
+        The rename edges → all_edges was applied in task 438. This test locks
+        in that the old alias is truly absent, so any accidental re-exposure
+        would be caught immediately.
+        """
+        result = StaleSummaryResult(stale=[], all_edges={}, total_count=0)
+        assert not hasattr(result, 'edges')
+
     @pytest.mark.asyncio
     async def test_detect_stale_summaries_returns_named_result(self, mock_config, make_backend):
         """_detect_stale_summaries_with_edges returns StaleSummaryResult with named access."""
