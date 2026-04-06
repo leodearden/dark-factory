@@ -153,3 +153,20 @@ class TestEvalConfigsIncludesVllm:
             f'Expected {expected} configs, got {len(EVAL_CONFIGS)}: '
             f'{[c.name for c in EVAL_CONFIGS]}'
         )
+
+
+class TestRunnerDefaultIncludesVllm:
+    """run_eval_matrix must receive vLLM configs when called with its default EVAL_CONFIGS."""
+
+    def test_runner_module_eval_configs_includes_vllm(self):
+        """The EVAL_CONFIGS bound in runner.py must include all vLLM config names."""
+        from orchestrator.evals import runner as runner_module
+        from orchestrator.evals.configs import VLLM_EVAL_CONFIGS
+
+        # The runner imports EVAL_CONFIGS at module level from .configs
+        # After step-6 this should include all vLLM entries.
+        runner_eval_names = {cfg.name for cfg in runner_module.EVAL_CONFIGS}
+        vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+        assert vllm_names.issubset(runner_eval_names), (
+            f'Runner EVAL_CONFIGS missing vLLM configs: {vllm_names - runner_eval_names}'
+        )
