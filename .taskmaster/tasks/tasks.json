@@ -9312,11 +9312,16 @@
         "description": "In fused-memory/tests/test_rebuild_entity_summaries.py, test `test_force_list_entity_nodes_called_exactly_once` (around line 886):\n1. After line 911 (`backend.list_entity_nodes.assert_awaited_once()`), add `backend.get_all_valid_edges.assert_awaited_once()` to fully guard the single bulk-fetch guarantee.\n2. After `result['rebuilt'] == 3`, add `assert backend.update_node_summary.await_count == 3` to verify all three summary writes were dispatched.\n\nFiles: fused-memory/tests/test_rebuild_entity_summaries.py",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T19:14:30.542Z"
+        "updatedAt": "2026-04-06T19:15:39.564Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/tests/test_rebuild_entity_summaries.py"
+          ]
+        }
       },
       {
         "id": "464",
@@ -9603,7 +9608,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T19:14:30.543Z",
+      "lastModified": "2026-04-06T19:15:39.564Z",
       "taskCount": 467,
       "completedCount": 409,
       "tags": [
