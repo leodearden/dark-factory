@@ -693,6 +693,9 @@ class SpeculativeMergeWorker:
 
             except Exception as exc:
                 logger.exception(f'Task {req.task_id}: unexpected verifier error')
+                if item.merge_wt is not None:
+                    with contextlib.suppress(Exception):
+                        await self._git_ops.cleanup_merge_worktree(item.merge_wt)
                 if not req.result.done():
                     req.result.set_result(MergeOutcome(
                         'blocked', reason=f'Verifier error: {exc}',

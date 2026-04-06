@@ -1412,6 +1412,152 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
+    async def test_speculative_cas_failure_retries_until_advanced(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """CAS failure in SpeculativeMergeWorker retries and eventually succeeds.
+
+        Mirrors MergeWorker.test_cas_failure_reenqueues_at_front but exercises
+        the _verify_and_advance CAS-retry loop (which rebuilds SpeculativeItem
+        with updated base_sha and tracks cumulative retries in _cas_retries).
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'scas-ok', 'file_scas_ok.py', 'cas_ok = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        original_advance = git_ops.advance_main
+        call_count = 0
+
+        async def _fail_twice_then_succeed(*args: Any, **kwargs: Any):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                return 'cas_failed'
+            return await original_advance(*args, **kwargs)
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_fail_twice_then_succeed),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('scas-ok', 'scas-ok', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done', f'Expected done, got {outcome}'
+        assert call_count == 3, f'Expected 3 advance_main calls (2 CAS fail + 1 success), got {call_count}'
+        # _cas_retries should be cleaned up after success
+        assert 'scas-ok' not in worker._cas_retries, (
+            '_cas_retries not cleaned up after successful advance'
+        )
+
+        # File must appear on main
+        _, content, _ = await _run(
+            ['git', 'show', 'main:file_scas_ok.py'], cwd=git_ops.project_root,
+        )
+        assert 'cas_ok = 1' in content
+
+        await worker.stop()
+        await worker_task
+
+    async def test_speculative_cas_retry_limit_exhausted(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """CAS failures beyond MAX_CAS_RETRIES resolve as blocked.
+
+        Mirrors MergeWorker.test_cas_retry_limit_exhausted but exercises the
+        SpeculativeMergeWorker's _verify_and_advance loop, which tracks retries
+        in self._cas_retries (a per-task dict shared across calls).
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'scas-lim', 'file_scas_lim.py', 'cas_lim = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        async def _always_cas_fail(*args: Any, **kwargs: Any):
+            return 'cas_failed'
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_always_cas_fail),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('scas-lim', 'scas-lim', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked', f'Expected blocked, got {outcome}'
+        assert 'cas retry limit' in outcome.reason.lower(), (
+            f'Expected CAS retry limit message, got: {outcome.reason}'
+        )
+        # _cas_retries should be cleaned up after exhaustion
+        assert 'scas-lim' not in worker._cas_retries, (
+            '_cas_retries not cleaned up after retry limit exhausted'
+        )
+
+        await worker.stop()
+        await worker_task
+
+    @pytest.mark.parametrize('failure_code', ['not_descendant', 'contaminated', 'stash_failed'])
+    async def test_speculative_permanent_failure_returns_blocked(
+        self, git_ops: GitOps, config: OrchestratorConfig, failure_code: str,
+    ):
+        """Permanent advance_main failure codes block without retry.
+
+        Mirrors MergeWorker.test_not_descendant_returns_blocked_immediately but
+        exercises the SpeculativeMergeWorker's _verify_and_advance path (lines
+        816-824 of merge_queue.py), which also cleans up merge worktree and
+        resolves the Future.  Parameterized over all three permanent codes.
+        """
+        branch_name = f'sperm-{failure_code}'
+        filename = f'file_sperm_{failure_code}.py'
+        wt = await _make_branch_with_file(
+            git_ops, branch_name, filename, f'{failure_code} = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        call_count = 0
+
+        async def _return_failure(*args: Any, **kwargs: Any):
+            nonlocal call_count
+            call_count += 1
+            return failure_code
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_return_failure),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+            patch.object(git_ops, 'cleanup_merge_worktree', wraps=git_ops.cleanup_merge_worktree) as mock_cleanup,
+        ):
+            req = _make_request(branch_name, branch_name, wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked', f'Expected blocked for {failure_code}, got {outcome}'
+        assert failure_code in outcome.reason, (
+            f'Expected {failure_code} in reason, got: {outcome.reason}'
+        )
+        # Should only be called once — no retry for permanent failures
+        assert call_count == 1, (
+            f'Expected 1 advance_main call for permanent failure, got {call_count}'
+        )
+        # Worktree must have been cleaned up
+        assert mock_cleanup.call_count >= 1, (
+            f'cleanup_merge_worktree not called for {failure_code}'
+        )
+        # _cas_retries should be clean
+        assert branch_name not in worker._cas_retries
+
+        await worker.stop()
+        await worker_task
+
 
 # ---------------------------------------------------------------------------
 # TestSpeculativeBackwardCompat — step-17
