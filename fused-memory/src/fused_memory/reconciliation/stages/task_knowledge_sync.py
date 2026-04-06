@@ -21,6 +21,11 @@ from fused_memory.reconciliation.prompts import (
 )
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.task_filter import (
+    FilteredTaskTree,
+    filter_task_tree,
+    format_filtered_task_tree,
+)
 
 
 class TaskKnowledgeSync(BaseStage):
@@ -31,6 +36,10 @@ class TaskKnowledgeSync(BaseStage):
 
     # Minimum number of tasks to proactively spot-check each run
     MIN_TASK_SAMPLE: int = 5
+
+    # Pre-filtered task tree — set by harness before run() (task 455).
+    # When set, skips taskmaster.get_tasks() call and uses this tree directly.
+    filtered_task_tree: FilteredTaskTree | None = None
 
     def get_system_prompt(self) -> str:
         return STAGE2_SYSTEM_PROMPT
@@ -46,25 +55,42 @@ class TaskKnowledgeSync(BaseStage):
     ) -> str:
         stage1_report = prior_reports[0] if prior_reports else None
 
-        # Get task tree
-        tasks_data: dict = {}
-        if self.taskmaster:
-            try:
-                tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
-            except Exception:
-                tasks_data = {}
+        # --- Task tree: prefer harness-injected tree, fall back to self-fetch (task 455) ---
+        if self.filtered_task_tree is not None:
+            # Harness pre-fetched the tree — use it directly, skip get_tasks()
+            filtered = self.filtered_task_tree
+            # FilteredTaskTree doesn't retain done task objects (by design, to save memory).
+            # Render a lightweight summary so the LLM agent knows how many tasks completed
+            # rather than seeing a silently empty "Recently Completed Tasks" section.
+            if filtered.done_count > 0:
+                done_tasks_for_display: list[dict] = [
+                    {
+                        'id': '-',
+                        'title': f'{filtered.done_count} completed tasks (details omitted to save context)',
+                        'status': 'done',
+                    }
+                ]
+            else:
+                done_tasks_for_display = []
+        else:
+            # Fallback: self-fetch using the shared filter (fixes blocked/deferred regression)
+            tasks_data: dict = {}
+            if self.taskmaster:
+                try:
+                    tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
+                except Exception:
+                    tasks_data = {}
+            filtered = filter_task_tree(tasks_data)
+            # Keep done tasks for the 'Recently Completed' section (backward-compat)
+            all_tasks_raw = tasks_data.get('tasks', [])
+            if not isinstance(all_tasks_raw, list):
+                all_tasks_raw = []
+            done_tasks_for_display = [
+                t for t in all_tasks_raw
+                if isinstance(t, dict) and t.get('status') == 'done'
+            ]
 
-        all_tasks = tasks_data.get('tasks', [])
-        if not isinstance(all_tasks, list):
-            all_tasks = []
-
-        active_tasks = [
-            t for t in all_tasks
-            if isinstance(t, dict) and t.get('status') in ('pending', 'in-progress', 'review')
-        ]
-        done_tasks = [
-            t for t in all_tasks if isinstance(t, dict) and t.get('status') == 'done'
-        ]
+        active_task_tree_text = format_filtered_task_tree(filtered)
 
         remediation_note = ''
         if self.remediation_mode:
@@ -76,7 +102,8 @@ class TaskKnowledgeSync(BaseStage):
 
         proactive_sample_section = ''
         if not self.remediation_mode:
-            sample = _select_proactive_sample(all_tasks, self.MIN_TASK_SAMPLE)
+            # Derive proactive sample from filtered.active_tasks (task 455)
+            sample = _select_proactive_sample(filtered.active_tasks, self.MIN_TASK_SAMPLE)
             proactive_sample_section = (
                 f'\n### Proactive Task Sample ({len(sample)} tasks)\n'
                 f'{_format_tasks(sample)}\n'
@@ -91,11 +118,10 @@ class TaskKnowledgeSync(BaseStage):
 ### Stage 1 Flagged Items (Task-Relevant)
 {_format_flagged(stage1_report.items_flagged if stage1_report else [])}
 
-### Active Task Tree ({len(active_tasks)} active, {len(done_tasks)} done, {len(all_tasks)} total)
-{_format_tasks(active_tasks[:50])}
+{active_task_tree_text}
 
 ### Recently Completed Tasks
-{_format_tasks(done_tasks[:30])}{proactive_sample_section}
+{_format_tasks(done_tasks_for_display[:30])}{proactive_sample_section}
 
 ## Your Task
 Reconcile task state against memory:
