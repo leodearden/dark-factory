@@ -10177,10 +10177,11 @@
         "description": "In dashboard/tests/test_burndown_data.py, make three changes to test_load_task_tree_calls_run_concurrently and add a new test:\n\n1. (line 478) Increase `threading.Barrier(n_roots, timeout=2.0)` to `timeout=10.0` and update the failure message to mention both 'sequential execution' and 'severe scheduler latency' as possible causes — addresses suggestions [7] and [10].\n\n2. After `await collect_snapshot(conn, config)` (line 495), add:\n```python\nasync with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:\n    row = await cur.fetchone()\n    assert row[0] == 3\n```\naddresses suggestion [6].\n\n3. Add a new test `test_gather_partial_failure_skips_bad_project` where fake_load raises OSError for one root and succeeds for others, asserting collect_snapshot either raises or skips gracefully (depending on which fix from the production-code task lands first) — addresses suggestion [8].\n\nSource: review suggestions on task 470 (reviewer_test_analyst, reviewer_robustness).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T23:27:46.299Z"
       },
       {
         "id": "521",
@@ -10493,7 +10494,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T23:27:46.183Z",
+      "lastModified": "2026-04-06T23:27:46.299Z",
       "taskCount": 527,
       "completedCount": 432,
       "tags": [
