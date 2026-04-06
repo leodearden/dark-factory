@@ -178,7 +178,8 @@ def format_filtered_task_tree(
             title = t.get('title', '?')
             status = t.get('status', '?')
             deps = t.get('dependencies') or []
-            lines.append(f'- [{tid}] ({status}) {title} deps={deps}')
+            deps_str = str(deps[:5]) + ('...' if len(deps) > 5 else '')
+            lines.append(f'- [{tid}] ({status}) {title} deps={deps_str}')
         body = '\n'.join(lines) + '\n'
 
     result = header + body + summary_line
