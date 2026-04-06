@@ -120,6 +120,15 @@ def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
 
     active.sort(key=sort_key)
 
+    # Sort done tasks by ID descending (higher id ≈ more recently created/completed)
+    def _id_for_sort(t: dict) -> int:
+        try:
+            return int(t.get('id', 0))
+        except (TypeError, ValueError):
+            return 0
+
+    done.sort(key=_id_for_sort, reverse=True)
+
     total = len(active) + done_count + cancelled_count + other_count
     return FilteredTaskTree(
         active_tasks=active,

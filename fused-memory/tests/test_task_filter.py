@@ -128,6 +128,34 @@ class TestFilterTaskTree:
             'Consumers should detect overflow via len(done_tasks) < done_count'
         )
 
+    def test_filter_task_tree_done_tasks_sorted_by_id_desc(self):
+        """filter_task_tree returns done_tasks sorted by id desc, highest-30 retained."""
+        import random
+        ids = list(range(1, 51))
+        random.shuffle(ids)
+        tasks_data = {
+            'tasks': [_make_task(i, 'done') for i in ids]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert len(result.done_tasks) == 30
+        result_ids = [t['id'] for t in result.done_tasks]
+        assert result_ids == list(range(50, 20, -1)), (
+            f'Expected ids 50..21 descending, got {result_ids}'
+        )
+
+        # Non-int id must not crash sorting (fallback to 0 in sort key)
+        tasks_with_bad_id = {
+            'tasks': [
+                _make_task(5, 'done'),
+                {'id': '5x', 'title': 'Bad id task', 'status': 'done', 'dependencies': []},
+                _make_task(3, 'done'),
+            ]
+        }
+        result2 = filter_task_tree(tasks_with_bad_id)
+        assert len(result2.done_tasks) == 3  # All three retained (under cap)
+        # Must not raise — just verify it ran without error
+
     def test_sorts_active_by_priority_and_id_desc(self):
         """filter_task_tree sorts active tasks by _STATUS_PRIORITY then ID descending."""
         tasks_data = {
