@@ -487,3 +487,25 @@ class TestGetBurndownSeries:
 
         # done values should be in timestamp order (oldest first)
         assert result['done'] == [3, 2, 1]
+
+
+# ---------------------------------------------------------------------------
+# burndown_env fixture validation
+# ---------------------------------------------------------------------------
+
+
+class TestBurndownEnvFixture:
+    @pytest.mark.asyncio
+    async def test_yields_valid_triple(self, burndown_env):
+        db_path, config, conn = burndown_env
+        # (a) db_path is a Path and exists on disk
+        assert isinstance(db_path, Path)
+        assert db_path.exists()
+        # (b) config is a DashboardConfig whose project_root is a tmp directory
+        assert isinstance(config, DashboardConfig)
+        assert db_path.parent == config.project_root
+        # (c) conn is a usable aiosqlite connection
+        async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 0
