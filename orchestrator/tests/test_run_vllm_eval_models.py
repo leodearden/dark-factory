@@ -123,3 +123,50 @@ class TestQwen3CoderNextExtraEnv:
         assert extra_env.get("GPU_MEMORY_UTIL") == "0.90", (
             f"GPU_MEMORY_UTIL not set to '0.90' in extra_env: {extra_env!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-11 tests: H200 GPU type priority
+# ---------------------------------------------------------------------------
+
+
+class TestGpuTypesPriority:
+    """H200 SXM/NVL must appear in GPU_TYPES before RTX PRO 6000 Blackwell.
+
+    The qwen3-coder-next-fp8-new hang reproduced on 96GB RTX PRO 6000 but
+    is mitigated on H200 (141GB HBM) — see graph edge 85c34b19.
+    H200 should be tried first; Blackwell remains as fallback.
+    """
+
+    _H200_SXM = "NVIDIA H200 SXM"
+    _H200_NVL = "NVIDIA H200 NVL"
+    _RTX_PRO_6000 = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+
+    def test_h200_sxm_in_priority_list(self, _parsed_gpu_types):
+        """'NVIDIA H200 SXM' must be in GPU_TYPES."""
+        assert self._H200_SXM in _parsed_gpu_types, (
+            f"'NVIDIA H200 SXM' not found in GPU_TYPES: {_parsed_gpu_types}"
+        )
+
+    def test_h200_nvl_in_priority_list(self, _parsed_gpu_types):
+        """'NVIDIA H200 NVL' must be in GPU_TYPES."""
+        assert self._H200_NVL in _parsed_gpu_types, (
+            f"'NVIDIA H200 NVL' not found in GPU_TYPES: {_parsed_gpu_types}"
+        )
+
+    def test_h200_appears_before_rtx_pro_6000(self, _parsed_gpu_types):
+        """Both H200 entries must appear before 'NVIDIA RTX PRO 6000 Blackwell Server Edition'.
+
+        H200's 141GB pool is the documented mitigation host for the startup hang.
+        """
+        assert self._RTX_PRO_6000 in _parsed_gpu_types, (
+            f"RTX PRO 6000 not in GPU_TYPES (needed as fallback): {_parsed_gpu_types}"
+        )
+        h200_sxm_idx = _parsed_gpu_types.index(self._H200_SXM)
+        h200_nvl_idx = _parsed_gpu_types.index(self._H200_NVL)
+        rtx_idx = _parsed_gpu_types.index(self._RTX_PRO_6000)
+        h200_first = min(h200_sxm_idx, h200_nvl_idx)
+        assert h200_first < rtx_idx, (
+            f"H200 (idx {h200_first}) must come before RTX PRO 6000 (idx {rtx_idx}) "
+            f"in GPU_TYPES. Current order: {_parsed_gpu_types}"
+        )
