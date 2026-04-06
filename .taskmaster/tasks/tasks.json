@@ -10230,6 +10230,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 534,
+        "title": "Remove redundant tests from test_eval_configs.py",
+        "description": "In orchestrator/tests/test_eval_configs.py: (1) remove the entire TestRunnerDefaultIncludesVllm class (lines 158-172) — it is fully subsumed by TestEvalConfigsIncludesVllm since runner_module.EVAL_CONFIGS is configs.EVAL_CONFIGS; (2) remove test_vllm_config_count_is_six (lines 84-89) — the count is implied by test_vllm_config_names_are_exact_set which already fails with a descriptive diff on any mismatch.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10242,7 +10253,7 @@
       ],
       "created": "2026-04-06T22:49:21.157Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:49:30.686Z"
+      "updated": "2026-04-06T22:49:35.287Z"
     }
   }
 }
