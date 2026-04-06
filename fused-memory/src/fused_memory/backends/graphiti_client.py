@@ -1137,6 +1137,8 @@ class GraphitiBackend:
     async def get_edge_text(self, uuid: str, *, group_id: str) -> tuple[str, str]:
         """Return (name, fact) for the RELATES_TO edge with the given UUID.
 
+        Uses ro_query since no writes are performed.
+
         Raises:
             EdgeNotFoundError: if no edge with that UUID exists.
         """
@@ -1145,7 +1147,7 @@ class GraphitiBackend:
             'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
             'RETURN e.name, e.fact'
         )
-        result = await graph.query(cypher, {'uuid': uuid})
+        result = await graph.ro_query(cypher, {'uuid': uuid})
         if not result.result_set:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
         row = result.result_set[0]
