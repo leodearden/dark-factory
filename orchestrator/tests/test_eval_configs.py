@@ -69,6 +69,34 @@ class TestGetConfigByName:
         assert get_config_by_name('nonexistent-config-xyz') is None
 
 
+class TestVllmConfigSet:
+    """VLLM_EVAL_CONFIGS must contain exactly the 6 active self-hosted models."""
+
+    EXPECTED_VLLM_NAMES = {
+        'minimax-m25-fp8',
+        'qwen3-coder-next-fp8',
+        'reap-139b-nvfp4',
+        'reap-172b-nvfp4',
+        'qwen3-coder-30b-q4',
+        'devstral-small-2505-q6',
+    }
+
+    def test_vllm_config_count_is_six(self):
+        """VLLM_EVAL_CONFIGS must have exactly 6 active entries (qwen25 was dropped)."""
+        assert len(VLLM_EVAL_CONFIGS) == 6, (
+            f'Expected 6 vLLM configs, got {len(VLLM_EVAL_CONFIGS)}: '
+            f'{[c.name for c in VLLM_EVAL_CONFIGS]}'
+        )
+
+    def test_vllm_config_names_are_exact_set(self):
+        """VLLM_EVAL_CONFIGS names must match the canonical active set exactly."""
+        actual = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+        assert actual == self.EXPECTED_VLLM_NAMES, (
+            f'Extra: {actual - self.EXPECTED_VLLM_NAMES}  '
+            f'Missing: {self.EXPECTED_VLLM_NAMES - actual}'
+        )
+
+
 class TestNoNameCollisions:
     """vLLM and standard config names must not collide."""
 
