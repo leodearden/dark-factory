@@ -13,7 +13,13 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeOutcome, MergeRequest, MergeWorker, SpeculativeItem, SpeculativeMergeWorker
+from orchestrator.merge_queue import (
+    MergeOutcome,
+    MergeRequest,
+    MergeWorker,
+    SpeculativeItem,
+    SpeculativeMergeWorker,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1026,12 +1032,10 @@ class TestSpeculativeMergeWorker:
     ):
         """_merger_loop must put None sentinel into verifier queue even when it crashes.
 
-        Without the try/finally fix: if merge_to_main raises, the exception propagates
-        out of the while-loop and the sentinel (previously only at the end of the
-        function body) is never sent. The verifier hangs on queue.get() forever.
-
-        With fix: try/finally wraps the while-loop; finally always puts None so the
-        verifier exits cleanly regardless of how the merger terminates.
+        The inner try/except (step-31) catches Exception, resolves the Future as
+        'blocked', and continues the loop (rather than propagating the exception).
+        The loop then exits cleanly via a shutdown sentinel. The try/finally wrapping
+        the entire while-loop guarantees the verifier sentinel is always sent.
 
         We test _merger_loop() directly to isolate this from the run() subtask
         cancellation logic (step-24), which also terminates the verifier.
@@ -1048,14 +1052,22 @@ class TestSpeculativeMergeWorker:
 
         req = _make_request('mes-n', 'mes-n', wt, config)
         await queue.put(req)
+        # Shutdown sentinel so the loop exits after handling the exception —
+        # the inner except catches RuntimeError and continues, so without this
+        # the loop would block on queue.get() forever.
+        await queue.put(None)  # type: ignore[arg-type]
 
-        with (
-            patch.object(git_ops, 'merge_to_main', new=crash_merge),
-            contextlib.suppress(RuntimeError),
-        ):
+        with patch.object(git_ops, 'merge_to_main', new=crash_merge):
             await worker._merger_loop()
 
-        # The verifier queue must contain the sentinel (None).
+        # (1) Future must be resolved as 'blocked' by the inner exception handler.
+        assert req.result.done(), (
+            'Future must be resolved when merger catches an unexpected exception'
+        )
+        assert req.result.result().status == 'blocked'
+        assert 'Merger error' in req.result.result().reason
+
+        # (2) The verifier queue must contain the sentinel (None).
         # Without the try/finally fix, the queue would be empty here.
         assert not worker._verifier_queue.empty(), (
             'Verifier queue is empty — sentinel was never sent by dying merger'
