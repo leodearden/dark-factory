@@ -13,7 +13,7 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeOutcome, MergeRequest, MergeWorker, SpeculativeMergeWorker
+from orchestrator.merge_queue import MergeOutcome, MergeRequest, MergeWorker, SpeculativeItem, SpeculativeMergeWorker
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1122,6 +1122,122 @@ class TestSpeculativeMergeWorker:
 
         await worker.stop()
         await worker_task
+
+    async def test_merger_exception_resolves_inflight_future(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Unexpected exception in merger loop must resolve in-flight Future and continue.
+
+        Without fix: if get_main_sha() raises after req is dequeued but before the
+        SpeculativeItem is pushed to the verifier queue, the exception propagates to
+        the outer try/finally which sends the sentinel but never resolves req.result.
+        The caller hangs forever and the merger loop terminates.
+
+        With fix: inner try/except Exception in the loop body resolves the in-flight
+        req.result as 'blocked' (with the error message) and continues to the next
+        request, keeping the merger loop alive.
+        """
+        wt_n = await _make_branch_with_file(
+            git_ops, 'mef-n', 'file_mef_n.py', 'n = 1\n',
+        )
+        wt_ok = await _make_branch_with_file(
+            git_ops, 'mef-ok', 'file_mef_ok.py', 'ok = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # get_main_sha raises RuntimeError on the first call, succeeds after
+        original_get_main_sha = git_ops.get_main_sha
+        call_count = 0
+
+        async def failing_get_main_sha():  # type: ignore[no-untyped-def]
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError('Simulated get_main_sha failure')
+            return await original_get_main_sha()
+
+        with (
+            patch.object(git_ops, 'get_main_sha', new=failing_get_main_sha),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req_n = _make_request('mef-n', 'mef-n', wt_n, config)
+            req_ok = _make_request('mef-ok', 'mef-ok', wt_ok, config)
+            await queue.put(req_n)
+            await queue.put(req_ok)
+
+            # mef-n must resolve as 'blocked' with reason mentioning the error
+            # (not hang forever — that's the regression without the fix)
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            assert outcome_n.status == 'blocked', f'mef-n: {outcome_n}'
+            assert 'Simulated get_main_sha failure' in outcome_n.reason, (
+                f'Expected error message in reason, got: {outcome_n.reason}'
+            )
+
+            # mef-ok must succeed — merger loop continues after the per-request error
+            outcome_ok = await asyncio.wait_for(req_ok.result, timeout=30)
+            assert outcome_ok.status == 'done', f'mef-ok: {outcome_ok}'
+
+        await worker.stop()
+        await worker_task
+
+    async def test_stop_drain_survives_cleanup_exception(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Cleanup exception during stop() verifier-queue drain must not orphan Futures.
+
+        Without fix: if cleanup_merge_worktree raises for item1, the exception
+        propagates out of the drain loop body, so item2's Future is never resolved —
+        the caller hangs forever.
+
+        With fix: cleanup is wrapped in contextlib.suppress(Exception), so the drain
+        loop continues to item2 and resolves both Futures as 'blocked'.
+        Covers review issue [exception_aborts_drain] at stop() ~line 367-376.
+        """
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        # Do NOT start worker.run() — we test stop()'s drain logic directly.
+
+        # Build two requests whose Futures we will check after stop().
+        req1 = _make_request('drain-1', 'drain-1', git_ops.project_root, config)
+        req2 = _make_request('drain-2', 'drain-2', git_ops.project_root, config)
+
+        dummy_wt1 = git_ops.project_root / '.worktrees' / 'dummy1'
+        dummy_wt2 = git_ops.project_root / '.worktrees' / 'dummy2'
+
+        item1 = SpeculativeItem(
+            request=req1, merge_result=None, merge_wt=dummy_wt1,
+            base_sha='aaa', speculative=False, skip_verify=False,
+        )
+        item2 = SpeculativeItem(
+            request=req2, merge_result=None, merge_wt=dummy_wt2,
+            base_sha='bbb', speculative=False, skip_verify=False,
+        )
+        await worker._verifier_queue.put(item1)
+        await worker._verifier_queue.put(item2)
+
+        # First cleanup raises OSError; second succeeds.
+        cleanup_calls: list[object] = []
+
+        async def mock_cleanup(wt: object) -> None:
+            cleanup_calls.append(wt)
+            if len(cleanup_calls) == 1:
+                raise OSError('disk full')
+
+        with patch.object(git_ops, 'cleanup_merge_worktree', new=mock_cleanup):
+            await worker.stop()
+
+        # Both Futures must be resolved — cleanup failure must not abort the drain.
+        assert req1.result.done(), 'req1 Future not resolved despite cleanup exception'
+        assert req2.result.done(), 'req2 Future orphaned because drain loop aborted'
+        assert req1.result.result().status == 'blocked'
+        assert req2.result.result().status == 'blocked'
+        # Second cleanup was still attempted despite first failure.
+        assert len(cleanup_calls) == 2, (
+            f'Expected 2 cleanup calls, got {len(cleanup_calls)}'
+        )
 
 
 # ---------------------------------------------------------------------------
