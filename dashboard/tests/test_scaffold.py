@@ -3,7 +3,7 @@
 import re
 from pathlib import Path
 
-from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
+from dashboard.config import DEFAULT_FUSED_MEMORY_URLS, DashboardConfig
 
 
 class TestConfigDefaults:
@@ -14,8 +14,6 @@ class TestConfigDefaults:
         assert DEFAULT_FUSED_MEMORY_URLS == ('http://localhost:8002',)
 
     def test_config_defaults(self):
-        from dashboard.config import DashboardConfig
-
         cfg = DashboardConfig()
         assert cfg.host == '127.0.0.1'
         assert cfg.port == 8080
@@ -23,14 +21,14 @@ class TestConfigDefaults:
         assert cfg.fused_memory_urls == list(DEFAULT_FUSED_MEMORY_URLS)
 
     def test_known_project_roots_default_empty_list(self):
-        from dashboard.config import DashboardConfig
-
         cfg = DashboardConfig()
         assert cfg.known_project_roots == []
 
-    def test_config_derived_paths(self):
-        from dashboard.config import DashboardConfig
+    def test_known_project_roots_is_list_not_tuple(self):
+        cfg = DashboardConfig()
+        assert isinstance(cfg.known_project_roots, list)
 
+    def test_config_derived_paths(self):
         cfg = DashboardConfig()
         root = cfg.project_root
         assert (
@@ -48,8 +46,6 @@ class TestConfigDefaults:
 
 class TestConfigEnvOverrides:
     def test_env_overrides(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_HOST', '0.0.0.0')
         monkeypatch.setenv('DASHBOARD_PORT', '9090')
         monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', '/tmp/test')
@@ -62,64 +58,46 @@ class TestConfigEnvOverrides:
         assert cfg.fused_memory_urls == list(DEFAULT_FUSED_MEMORY_URLS)
 
     def test_fused_memory_urls_comma_separated(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_FUSED_MEMORY_URLS', 'http://a:1, http://b:2 ')
         cfg = DashboardConfig.from_env()
         assert cfg.fused_memory_urls == ['http://a:1', 'http://b:2']
 
     def test_fused_memory_urls_single(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_FUSED_MEMORY_URLS', 'http://localhost:9000')
         cfg = DashboardConfig.from_env()
         assert cfg.fused_memory_urls == ['http://localhost:9000']
 
     def test_fused_memory_urls_empty_string(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_FUSED_MEMORY_URLS', '')
         cfg = DashboardConfig.from_env()
         assert cfg.fused_memory_urls == []
 
     def test_fused_memory_urls_extra_commas(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_FUSED_MEMORY_URLS', ',http://a:1,,http://b:2,')
         cfg = DashboardConfig.from_env()
         assert cfg.fused_memory_urls == ['http://a:1', 'http://b:2']
 
     def test_known_project_roots_single(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', '/home/leo/src/reify')
         cfg = DashboardConfig.from_env()
         assert cfg.known_project_roots == [Path('/home/leo/src/reify')]
 
     def test_known_project_roots_comma_separated(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', '/a,/b')
         cfg = DashboardConfig.from_env()
         assert cfg.known_project_roots == [Path('/a'), Path('/b')]
 
     def test_known_project_roots_extra_commas_and_whitespace(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', ' ,/a, , /b , ')
         cfg = DashboardConfig.from_env()
         assert cfg.known_project_roots == [Path('/a'), Path('/b')]
 
     def test_known_project_roots_empty_string(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', '')
         cfg = DashboardConfig.from_env()
         assert cfg.known_project_roots == []
 
     def test_known_project_roots_unset_preserves_default(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_HOST', '0.0.0.0')
         # DASHBOARD_KNOWN_PROJECT_ROOTS is intentionally NOT set
         cfg = DashboardConfig.from_env()
@@ -128,8 +106,6 @@ class TestConfigEnvOverrides:
         assert cfg.host == '0.0.0.0'
 
     def test_env_derived_paths_update(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', '/tmp/test')
         cfg = DashboardConfig.from_env()
         assert cfg.reconciliation_db == Path(
