@@ -195,7 +195,7 @@ def format_filtered_task_tree(
             kept_lines.append(line)
             used += len(line) + 1
 
-        trimmed_count = total_active - len(kept_lines)
+        trimmed_count = len(active) - len(kept_lines)
         trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
         body = '\n'.join(kept_lines) + trunc_notice
         result = header + body + summary_line
