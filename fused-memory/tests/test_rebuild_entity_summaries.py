@@ -1203,3 +1203,13 @@ class TestRebuildEntitySummariesCancellation:
 
         with pytest.raises(asyncio.CancelledError):
             await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+        # After CancelledError propagated, verify both update_node_summary calls were
+        # attempted by gather.  Pass 1 of the two-tier check (graphiti_client.py:1078-1080)
+        # scans the full results list before any per-entity bookkeeping, so the RuntimeError
+        # in slot 1 is captured by gather(return_exceptions=True) but NEVER reaches the
+        # per-entity error accumulator (Pass 2 at graphiti_client.py:1086-1098) — Pass 1
+        # raises first.  The await_count==2 assertion proves gather scheduled both
+        # coroutines and that we are testing the post-gather propagation path, not a
+        # pre-gather short-circuit.
+        assert backend.update_node_summary.await_count == 2
