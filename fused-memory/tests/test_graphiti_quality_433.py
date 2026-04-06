@@ -299,6 +299,7 @@ class TestRebuildEntitySummariesForceDryRun:
         )
 
         backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
+        assert backend._rebuild_entity_from_edges.await_count == 2
 
 
 # ---------------------------------------------------------------------------
