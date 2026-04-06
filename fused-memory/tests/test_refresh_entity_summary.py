@@ -365,6 +365,7 @@ class TestRefreshEntitySummary:
         assert result['uuid'] == 'node-uuid-1'
         assert result['new_summary'] == 'Alice knows Bob'
         assert result['edge_count'] == 1
+        backend.update_node_summary.assert_awaited_once_with('node-uuid-1', 'Alice knows Bob', group_id='test')
 
 
 # ---------------------------------------------------------------------------
