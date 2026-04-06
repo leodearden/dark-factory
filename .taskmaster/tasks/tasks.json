@@ -9471,11 +9471,11 @@
         "description": "Three test improvements in `dashboard/tests/test_burndown_data.py`:\n\n1. `test_snapshots_known_project_roots_when_no_orchestrators` (lines 193-200): change `SELECT project_id` to `SELECT *` and add assertions on count columns for the reify row (done==2) and autopilot row (in_progress==1). As written, a bug zeroing out counts for known roots would go undetected.\n\n2. `test_dedupes_known_root_against_main_project` (lines 221-226): replace `SELECT COUNT(*) FROM snapshots WHERE project_id = ?` with `SELECT COUNT(*) FROM snapshots` (no WHERE) to catch the case where two rows with different project_id strings are inserted for the same physical directory (symlink-based false negative).\n\n3. Add a new test that patches `load_task_tree` to raise `PermissionError` on the known-root call and asserts either: (a) `collect_snapshot` propagates the exception, or (b) if per-root error handling is added (see robustness task), that the main-project row is still committed and the failing root is skipped.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n- dashboard/tests/test_burndown_data.py\n\nSource: review suggestions on task 450 (reviewer_test_analyst).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T19:50:45.987Z",
+        "updatedAt": "2026-04-06T22:58:04.346Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data",
@@ -10355,7 +10355,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T22:58:04.228Z",
+      "lastModified": "2026-04-06T22:58:04.346Z",
       "taskCount": 519,
       "completedCount": 432,
       "tags": [
