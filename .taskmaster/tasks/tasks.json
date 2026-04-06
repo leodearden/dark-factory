@@ -9341,10 +9341,11 @@
         "description": "Follow-up from task 438 review. The NamedTuple named-attribute migration was applied almost everywhere, but two loose ends remain:\n\n1. **fused-memory/tests/test_rebuild_entity_summaries.py:829** — sole surviving positional unpack in the codebase: `stale, _, _ = await backend._detect_stale_summaries_with_edges(group_id='test')`. The NamedTuple backward-compat guarantee keeps it working, but every other call site was migrated and this single holdout will confuse future readers who see both styles side by side in the same file. Replace with:\n   ```python\n   result = await backend._detect_stale_summaries_with_edges(group_id='test')\n   stale = result.stale\n   ```\n\n2. **fused-memory/src/fused_memory/backends/graphiti_client.py:864,873** — the `_detect_stale_summaries_with_edges` docstring still describes the return value as a positional `Tuple of (stale_list, all_edges_dict, total_entity_count)`. Update the summary line and the `Returns:` section to describe the NamedTuple shape so docstring matches the caller convention. Suggested:\n   ```\n   Returns:\n       StaleSummaryResult with fields:\n         .stale        - list of stale entity dicts\n         .all_edges    - dict[uuid, list[dict]] of valid edges for all entities\n         .total_count  - total number of entity nodes scanned\n   ```\n\nVerify by running: `pytest fused-memory/tests/test_rebuild_entity_summaries.py fused-memory/tests/test_graphiti_quality_433.py fused-memory/tests/test_stale_summary_named_access_438.py -x`\n\nMemory hints: search for \"StaleSummaryResult named-attribute access refactor\" and \"graphiti_client _detect_stale_summaries_with_edges\".",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T19:23:41.853Z"
       },
       {
         "id": "466",
@@ -9620,7 +9621,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T19:23:41.560Z",
+      "lastModified": "2026-04-06T19:23:41.853Z",
       "taskCount": 468,
       "completedCount": 412,
       "tags": [
