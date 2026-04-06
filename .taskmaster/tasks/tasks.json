@@ -10167,6 +10167,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 529,
+        "title": "Refactor test boilerplate for ro_query assertion pattern",
+        "description": "Two complementary refactors to eliminate copy-paste in the test suite (Task 486 follow-up):\n\n1. Extract a shared helper or use `@pytest.mark.parametrize` for the 5 identical `test_uses_ro_query_not_query` methods in `test_reindex.py` (lines 148, 196, 313) and `test_refresh_entity_summary.py` (lines 89, 189). The only variation is the method under test and its args; structure is identical 6-line boilerplate (make_backend → make_graph_mock → set _get_graph → call method → ro_query.assert_awaited_once() → query.assert_not_awaited()).\n\n2. Extend `make_graph_mock` in `conftest.py` to accept separate optional `ro_rows` and `q_rows` parameters (default both to `rows` for backwards compatibility). This lets `TestDeleteEntityNode` tests in `test_merge_entities.py` use the fixture (`make_graph_mock(ro_rows=[['NodeName', 'summary']], q_rows=[])`) instead of manually constructing MagicMock + AsyncMock pairs in each test method.\n\nFiles: fused-memory/tests/conftest.py, fused-memory/tests/test_merge_entities.py, fused-memory/tests/test_reindex.py, fused-memory/tests/test_refresh_entity_summary.py\n\nSource: steward-triage follow-up from Task 486 (esc-486-49).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10179,7 +10190,7 @@
       ],
       "created": "2026-04-06T22:44:13.261Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:44:22.338Z"
+      "updated": "2026-04-06T22:44:30.015Z"
     }
   }
 }
