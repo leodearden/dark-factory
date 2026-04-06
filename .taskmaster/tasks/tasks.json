@@ -10148,10 +10148,11 @@
         "description": "In dashboard/src/dashboard/data/burndown.py lines 111-113, change `asyncio.gather(...)` to use `return_exceptions=True`. In the Phase 3 loop (lines 117-132), check `isinstance(result, BaseException)` before calling `_count_statuses`, log a warning with the project root path, and `continue` to skip failed entries. This restores partial-success semantics: healthy projects are still snapshotted when one tasks.json is unreadable. Add a logger.warning call at the per-project error site (not at the gather call site). See suggestions [4] and [9] from the original review for the full code pattern.\n\nSource: review suggestions on task 470 (reviewer_performance, reviewer_robustness).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T23:18:02.185Z"
       },
       {
         "id": "520",
@@ -10398,7 +10399,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T23:18:02.106Z",
+      "lastModified": "2026-04-06T23:18:02.186Z",
       "taskCount": 520,
       "completedCount": 432,
       "tags": [
