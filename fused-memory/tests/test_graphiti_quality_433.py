@@ -55,12 +55,13 @@ class TestStaleSummaryResult:
         assert c == 7
 
     def test_is_tuple_subclass(self):
-        """StaleSummaryResult IS a tuple — plain tuple equality works."""
+        """StaleSummaryResult compares value-equal to a plain 3-tuple (backward-compat promise)."""
         stale_list = [{'uuid': 'u1'}]
         edges: dict = {}
         result = StaleSummaryResult(stale=stale_list, edges=edges, total_count=1)
-        # Plain tuple comparison (existing mock code uses this implicitly)
-        assert isinstance(result, tuple)
+        # Value-equality with a plain tuple proves the NamedTuple backward-compat promise:
+        # only actual tuple subclasses compare equal to plain tuples this way.
+        assert result == (stale_list, edges, 1)
 
     @pytest.mark.asyncio
     async def test_detect_stale_summaries_returns_named_result(self, mock_config, make_backend):
