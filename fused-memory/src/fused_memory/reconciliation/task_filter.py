@@ -186,7 +186,9 @@ def format_filtered_task_tree(
     # Secondary max_chars clamp
     if len(result) > max_chars and active:
         task_lines = body.rstrip('\n').split('\n')
-        budget = max_chars - len(header) - len(summary_line) - 50  # 50 chars for truncation notice
+        # Use the full remaining budget — no fixed reserve.  The actual truncation
+        # notice length is computed lazily after line accumulation and verified below.
+        budget = max_chars - len(header) - len(summary_line)
         if budget <= 0:
             return header + summary_line
         kept_lines: list[str] = []
@@ -197,9 +199,19 @@ def format_filtered_task_tree(
             kept_lines.append(line)
             used += len(line) + 1
 
+        # Lazy: compute the real notice length and verify the max_chars contract.
+        # Pop task lines until result fits or kept_lines is exhausted.
         trimmed_count = len(active) - len(kept_lines)
         trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
         body = '\n'.join(kept_lines) + trunc_notice
         result = header + body + summary_line
+        while len(result) > max_chars and kept_lines:
+            kept_lines.pop()
+            trimmed_count = len(active) - len(kept_lines)
+            trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
+            body = '\n'.join(kept_lines) + trunc_notice
+            result = header + body + summary_line
+        if len(result) > max_chars:
+            return header + summary_line
 
     return result
