@@ -9771,6 +9771,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 499,
+        "title": "Add missing filter_task_tree tests and fix resource-heavy test",
+        "description": "Two test coverage gaps in fused-memory/tests/test_task_filter.py:\n\n1. test_handles_empty_and_malformed_inputs (line 51) does not cover non-dict top-level input. Add: filter_task_tree(None), filter_task_tree([{'id':1,'status':'pending'}]), and filter_task_tree('bad') — each should return a zero-count empty FilteredTaskTree.\n2. test_budget_reserve_matches_actual_notice_length uses max_tasks=1_000_001 causing ~150 MB of intermediate allocations. The test only requires trimmed_count to have 7+ digits (≥1,000,000). Use max_tasks=10,000 with carefully chosen max_chars so that all but ~0-1 lines are trimmed, yielding trimmed_count≥1,000,000 via the lazy while-loop. This keeps peak memory below 1 MB.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9783,7 +9794,7 @@
       ],
       "created": "2026-04-06T19:55:06.617Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T19:55:17.156Z"
+      "updated": "2026-04-06T19:55:23.866Z"
     }
   }
 }
