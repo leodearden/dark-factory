@@ -8838,7 +8838,22 @@
             "parentId": "undefined"
           }
         ],
-        "updatedAt": "2026-04-05T11:18:33.279Z"
+        "updatedAt": "2026-04-05T11:18:33.279Z",
+        "metadata": {
+          "memory_hints": {
+            "entities": [
+              "burndown",
+              "DashboardConfig",
+              "collect_snapshot"
+            ],
+            "queries": [
+              "burndown multi-project registered project roots configuration",
+              "dashboard collect_snapshot config_path _read_project_root_from_config",
+              "DashboardConfig known project roots list"
+            ]
+          },
+          "_causation_id": "347b678f-6a5b-474b-b763-45ae8f820c64"
+        }
       },
       {
         "id": 451,
