@@ -378,3 +378,8 @@ class _EvalMcpStub:
 
     def mcp_config_json(self, escalation_url: str | None = None) -> dict:
         return {}
+
+
+if __name__ == '__main__':
+    from orchestrator.cli import eval_cmd
+    eval_cmd()
