@@ -9232,11 +9232,11 @@
         "description": "The vLLM eval tool-format bridge is broken: every tool_use response from a vLLM-backed model errors in the Claude CLI, making all vLLM-backed evals impossible. This is the primary blocker for Task 453 (Complete vLLM eval Stream 3).\n\n## Problem\ncli_invoke.py passes tool_use responses through a /v1/messages shim that Claude CLI cannot parse correctly. Every eval attempt with any self-hosted model fails at the tool_use response boundary. No vLLM-backed eval has ever produced outcome=done.\n\n## Confirmed Evidence\n- Graphiti entity: 4919b7e2-02a5-4bed-b0ee-3fe459adeff4 (tool_format_bridge_bug)\n- Graphiti edges: d6208d0e-b5e8-49f6-bbde-2bc6f6503787, a37383d4-3008-42ac-a8a0-468e3067e181\n- Episodes: 544fd5f8 (session 2026-04-06 diagnosis), 99a05c0d (bridge bug confirmation)\n- Documented in MEMORY.md: project_vllm_eval_tool_format_bridge_bug.md\n\n## Investigation Steps\n1. Read cli_invoke.py — find where tool_use responses from /v1/messages are translated\n2. Reproduce: run a minimal eval against any vLLM endpoint with a simple tool-calling task\n3. Capture the exact error from Claude CLI on tool_use response\n4. Fix the shim translation layer so tool_use blocks are formatted correctly for Claude CLI\n5. Re-run the gate eval (e.g. reap-139b-nvfp4-new) to verify outcome=done is achievable\n6. Update Task 453 status once confirmed working\n\n## memory_hints\n- entity: \"4919b7e2-02a5-4bed-b0ee-3fe459adeff4\" — tool_format_bridge_bug entity\n- search: \"vLLM tool format bridge bug cli_invoke messages shim\"\n- search: \"tool_use response Claude CLI error vLLM eval\"\n- episode: \"544fd5f8\" — session 2026-04-06 diagnosis\n- episode: \"99a05c0d\" — bridge bug confirmation",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-06T17:40:35.455Z"
+        "updatedAt": "2026-04-06T18:45:54.219Z"
       },
       {
         "id": "458",
@@ -9418,9 +9418,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T18:38:43.478Z",
+      "lastModified": "2026-04-06T18:45:54.219Z",
       "taskCount": 452,
-      "completedCount": 403,
+      "completedCount": 404,
       "tags": [
         "master"
       ]
