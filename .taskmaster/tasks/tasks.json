@@ -8966,7 +8966,26 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "priority": "high",
+          "dlq_count_confirmed": 55,
+          "dlq_confirmed_at": "2026-04-06",
+          "dlq_growth_rate_per_day": 6,
+          "purge_eligible_from": "2026-04-09",
+          "memory_hints": {
+            "entities": [
+              "DurableWriteQueue"
+            ],
+            "searches": [
+              "dead letter queue DLQ growth Mem0 write failures",
+              "DLQ baseline 55 dead letters 2026-04-06",
+              "replay dead letters DurableWriteQueue fused-memory"
+            ]
+          },
+          "_causation_id": "575fd7e6-9c9d-401e-9ef8-39f0159ffd6d",
+          "stage1_finding_id": "3"
+        }
       }
     ],
     "metadata": {
