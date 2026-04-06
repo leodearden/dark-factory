@@ -9205,17 +9205,24 @@
             "searches": [
               "dead letter queue DLQ growth Mem0 write failures",
               "DLQ baseline 55 dead letters 2026-04-06",
-              "replay dead letters DurableWriteQueue fused-memory"
-            ]
+              "replay dead letters DurableWriteQueue fused-memory",
+              "vector dimension mismatch DLQ replay failure modes",
+              "FalkorDB vector index rebuild dimension mismatch 1536 1024"
+            ],
+            "memories": [
+              "85603be3-ddcf-4bc8-80a6-3dcacd0e236d"
+            ],
+            "safety_warning": "inspect_error_types_before_replay_vector_dimension_mismatch_1536_1024_not_safe_for_bulk_replay"
           },
-          "_causation_id": "575fd7e6-9c9d-401e-9ef8-39f0159ffd6d",
+          "_causation_id": "81d6631c-8fd7-4f4d-a1af-5e070bf2543a",
           "stage1_finding_id": "3",
           "files": [
             "fused-memory/src/fused_memory/services/durable_queue.py"
           ],
           "modules": [
             "fused-memory/src/fused_memory/services"
-          ]
+          ],
+          "reconciliation_note": "stage2: priority corrected from medium→high (outer field now matches metadata.priority); safety warning added: vector dimension mismatch entries (1536→1024) must NOT be bulk-replayed without FalkorDB vector index rebuild first — see memory 85603be3-ddcf-4bc8-80a6-3dcacd0e236d"
         }
       },
       {
