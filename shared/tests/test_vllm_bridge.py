@@ -42,6 +42,35 @@ class TestTranslateMessagesResponseConvertsOpenAIToolCalls:
         assert 'tool_calls' not in result
 
 
+class TestTranslateMessagesResponsePassthrough:
+
+    def test_passthrough_for_error_body(self):
+        """Error bodies (type='error') are returned unchanged."""
+        body = {
+            'type': 'error',
+            'error': {'type': 'rate_limit_error', 'message': 'Rate limit exceeded'},
+        }
+        result = _translate_messages_response(body)
+        assert result == body
+
+    def test_passthrough_for_body_missing_role(self):
+        """Bodies missing a 'role' key are returned unchanged."""
+        body = {'some_key': 'some_value'}
+        result = _translate_messages_response(body)
+        assert result == body
+
+    def test_no_key_error_on_passthrough(self):
+        """No KeyError is raised for error or incomplete bodies."""
+        bodies = [
+            {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'bad'}},
+            {},
+            {'role': 'user'},
+        ]
+        for body in bodies:
+            result = _translate_messages_response(body)
+            assert isinstance(result, dict)
+
+
 class TestTranslateMessagesResponseIdempotent:
 
     def test_idempotent_for_native_anthropic_response(self):
