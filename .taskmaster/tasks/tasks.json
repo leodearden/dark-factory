@@ -10406,6 +10406,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 543,
+        "title": "Eliminate positional column-index fragility in burndown snapshot assertions",
+        "description": "In dashboard/tests/test_burndown_data.py, test_snapshots_known_project_roots_when_no_orchestrators (lines ~193-228) uses `SELECT * FROM snapshots` plus positional column-index access (`row[3]`…`row[8]`) for 24+ assertions. The schema is `id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done`; any column insertion or reorder would silently corrupt every assertion without raising a query error (small integer values can match coincidentally).\n\nFix (one of):\n(a) Set `conn.row_factory = aiosqlite.Row` and use `row['pending']`, `row['done']`, etc.\n(b) Use an explicit named projection: `SELECT project_id, pending, in_progress, blocked, deferred, cancelled, done FROM snapshots`.\n\nAdditionally, add a `_assert_snapshot_counts(row, *, pending=0, in_progress=0, blocked=0, deferred=0, cancelled=0, done=0)` helper alongside the existing `_insert_snapshot` helper. Replace each 6-line assertion block with a single call (e.g. `_assert_snapshot_counts(reify_row, done=2)`). The kwargs naturally eliminate positional coupling.\n\nSource: review suggestions on task 472 (reviewers architect_reviewer, test_analyst, robustness, performance, reuse_auditor — five reviewers flagged variants).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10418,7 +10429,7 @@
       ],
       "created": "2026-04-06T23:18:09.379Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T23:18:09.381Z"
+      "updated": "2026-04-06T23:18:18.063Z"
     }
   }
 }
