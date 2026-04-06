@@ -1629,7 +1629,7 @@ class TestSpeculativeMergeWorker:
         original_put = worker._verifier_queue.put
         b_put_count = 0
 
-        async def sometimes_failing_put(item: object) -> None:
+        async def sometimes_failing_put(item: SpeculativeItem | None) -> None:
             nonlocal b_put_count
             b_put_count += 1
             if b_put_count == 1 and isinstance(item, SpeculativeItem):
