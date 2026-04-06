@@ -1062,8 +1062,23 @@ class GraphitiBackend:
                 *(_rebuild_one(t) for t in targets), return_exceptions=True
             )
 
+            # Two-tier check — mirrors the convention in MemoryService.get_entity
+            # (memory_service.py:1000-1013).
+            # Pass 1: propagate structured-cancellation signals immediately.
+            # asyncio.gather(return_exceptions=True) captures *all* BaseException
+            # subclasses, including CancelledError (a BaseException but NOT an Exception
+            # in Python 3.8+).  Re-raising here preserves the structured-cancellation
+            # contract and prevents callers from silently ignoring shutdown signals.
+            for r in results:
+                if isinstance(r, BaseException) and not isinstance(r, Exception):
+                    raise r
+
+            # Pass 2: per-entity accumulation.  Using isinstance(r, Exception) instead
+            # of BaseException ensures that only application-level failures (RuntimeError,
+            # etc.) are recorded as error detail entries.  CancelledError is already
+            # handled above.
             for t, r in zip(targets, results, strict=True):
-                if isinstance(r, BaseException):
+                if isinstance(r, Exception):
                     errors += 1
                     logger.error(
                         'rebuild_entity_summaries: failed to rebuild node=%s name=%r: %s',
@@ -1077,6 +1092,7 @@ class GraphitiBackend:
                     })
                 else:
                     rebuilt += 1
+                    assert isinstance(r, dict)
                     details.append({
                         'uuid': t['uuid'],
                         'name': t['name'],
