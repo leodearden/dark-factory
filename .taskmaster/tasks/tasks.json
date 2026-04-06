@@ -10252,6 +10252,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 536,
+        "title": "Move runner.py __main__ entry-point to evals/__main__.py",
+        "description": "In orchestrator/src/orchestrator/evals/runner.py, remove the `if __name__ == '__main__':` block (lines 383-385). Create a new file orchestrator/src/orchestrator/evals/__main__.py containing only `from orchestrator.cli import eval_cmd; eval_cmd()`. This preserves `python -m orchestrator.evals.runner` invocability while eliminating the reverse runner→cli dependency edge and keeping runner.py a pure library module.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10264,7 +10275,7 @@
       ],
       "created": "2026-04-06T22:49:21.157Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:49:39.957Z"
+      "updated": "2026-04-06T22:49:43.202Z"
     }
   }
 }
