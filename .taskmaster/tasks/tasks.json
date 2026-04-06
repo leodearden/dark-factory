@@ -8724,11 +8724,11 @@
         "description": "Two call sites in graphiti_client.py still use positional tuple unpacking instead of named StaleSummaryResult attribute access:\n1. `detect_stale_summaries` (line 933): change `stale, _, _ = await self._detect_stale_summaries_with_edges(...)` to `result = await ...; return result.stale`\n2. `rebuild_entity_summaries` (line 1023): change `stale, all_edges, total_entities = await ...` to `result = await ...; stale = result.stale; all_edges = result.edges; total_entities = result.total_count`\n3. Consider renaming the StaleSummaryResult field `edges` → `all_edges` (line 36) to match the usage variable name and signal that it is the full graph-wide edge dict, not per-entity edges. If renamed, update all field references accordingly.\n\nMemory hints: search for \"StaleSummaryResult\" entity, search \"NamedTuple positional unpacking graphiti\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-04T23:17:19.235Z",
+        "updatedAt": "2026-04-06T17:19:17.862Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/backends",
@@ -8981,7 +8981,7 @@
         "id": "450",
         "title": "Burndown view: show all registered projects, not just dark-factory",
         "description": "The burndown page only displays dark-factory despite orchestrators running for reify and autopilot-video. Two bugs in collect_snapshot() (dashboard/src/dashboard/data/burndown.py:64-119):\n\n**Bug 1 — config-launched orchestrators silently skipped (lines 92-95):**\ncollect_snapshot tries `proc.get('project_root') or proc.get('prd')` but find_running_orchestrators() returns dicts with keys {pid, prd, config_path, running, started} — there is no 'project_root' key. For orchestrators launched with `--config` (reify, autopilot-video), 'prd' is None, so `if not root: continue` drops them entirely. Only --prd-launched orchestrators survive.\n\n**Bug 2 — _read_project_root_from_config never called:**\norchestrator.py:41 has _read_project_root_from_config() which extracts project_root from a config YAML, but collect_snapshot never calls it. When config_path is present, it should use _read_project_root_from_config(config_path) to resolve the project root.\n\n**Fix:** In collect_snapshot's orchestrator loop, when prd is None but config_path is present, call _read_project_root_from_config(config_path) to get the project root. Also import _read_project_root_from_config from orchestrator.py into burndown.py.\n\n**Separate issue (task 450 original scope):** Even with this fix, projects whose orchestrators are not running at snapshot time will still be missed. A configured list of known project roots in DashboardConfig would address that, but fixing the config_path resolution bug is the immediate priority.\n\nKey files:\n- dashboard/src/dashboard/data/burndown.py: collect_snapshot() lines 64-119\n- dashboard/src/dashboard/data/orchestrator.py: find_running_orchestrators (line 102), _read_project_root_from_config (line 41)\n- dashboard/src/dashboard/config.py: DashboardConfig",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "tags": [
@@ -9012,7 +9012,7 @@
             "parentId": "undefined"
           }
         ],
-        "updatedAt": "2026-04-05T11:18:33.279Z",
+        "updatedAt": "2026-04-06T17:19:17.893Z",
         "metadata": {
           "memory_hints": {
             "entities": [
@@ -9220,7 +9220,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T17:19:17.832Z",
+      "lastModified": "2026-04-06T17:19:17.893Z",
       "taskCount": 435,
       "completedCount": 396,
       "tags": [
