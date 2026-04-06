@@ -74,7 +74,7 @@ class TestVllmConfigSet:
 
     EXPECTED_VLLM_NAMES = {
         'minimax-m25-fp8',
-        'qwen3-coder-next-fp8',
+        'qwen3-coder-next-fp8-new',  # renamed in Task 515: post-fix variant
         'reap-139b-nvfp4',
         'reap-172b-nvfp4',
         'qwen3-coder-30b-q4',
