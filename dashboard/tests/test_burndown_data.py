@@ -182,10 +182,18 @@ class TestCollectSnapshot:
         reify_tasks = [{'status': 'done'}, {'status': 'done'}]
         autopilot_tasks = [{'status': 'in-progress'}]
 
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            reify_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': reify_tasks,
+            autopilot_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': autopilot_tasks,
+        }
+
+        def fake_load(path):
+            return _tasks_map[path]
+
         async with aiosqlite.connect(str(db_path)) as conn:
             with (
-                patch('dashboard.data.burndown.load_task_tree',
-                      side_effect=[main_tasks, reify_tasks, autopilot_tasks]),
+                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
                 await collect_snapshot(conn, config)
@@ -245,10 +253,19 @@ class TestCollectSnapshot:
             {'prd': None, 'config_path': '/home/leo/src/reify/orchestrator.yaml'},
         ]
 
+        # Orchestrator discovery returns reify_root (un-resolved); dedup prevents a second
+        # load_task_tree call for the known_project_roots entry that resolves to the same root.
+        _tasks_map = {
+            config.tasks_json: [],
+            reify_root / '.taskmaster' / 'tasks' / 'tasks.json': [{'status': 'done'}],
+        }
+
+        def fake_load(path):
+            return _tasks_map[path]
+
         async with aiosqlite.connect(str(db_path)) as conn:
             with (
-                patch('dashboard.data.burndown.load_task_tree',
-                      side_effect=[[], [{'status': 'done'}]]),
+                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
                 patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
             ):
@@ -277,9 +294,17 @@ class TestCollectSnapshot:
         ]
         reify_tasks = [{'status': 'done'}, {'status': 'pending'}]
 
+        _tasks_map = {
+            config.tasks_json: [],
+            reify_root / '.taskmaster' / 'tasks' / 'tasks.json': reify_tasks,
+        }
+
+        def fake_load(path):
+            return _tasks_map[path]
+
         async with aiosqlite.connect(str(db_path)) as conn:
             with (
-                patch('dashboard.data.burndown.load_task_tree', side_effect=[[], reify_tasks]),
+                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
                 patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
             ):
