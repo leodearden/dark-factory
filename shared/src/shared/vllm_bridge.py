@@ -191,8 +191,19 @@ class VllmBridge:
             json=body,
             headers=headers,
         ) as upstream:
-            upstream_body = await upstream.json(content_type=None)
+            # Read raw bytes first so we can forward them verbatim on parse failure
+            raw = await upstream.read()
             status = upstream.status
+            upstream_content_type = upstream.content_type
+
+        # Attempt JSON parsing; fall back to forwarding raw bytes if it fails.
+        # This preserves the upstream status code and error body when the upstream
+        # returns a non-JSON response (HTML error page, plain-text 503, truncated
+        # body), rather than swallowing failures as a generic 500.
+        try:
+            upstream_body = json.loads(raw.decode('utf-8', errors='replace'))
+        except (json.JSONDecodeError, ValueError):
+            return web.Response(status=status, body=raw, content_type=upstream_content_type)
 
         translated = _translate_messages_response(upstream_body)
         return web.json_response(translated, status=status)
