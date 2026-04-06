@@ -9407,10 +9407,11 @@
         "description": "In `dashboard/src/dashboard/data/burndown.py`, replace the sequential `asyncio.to_thread` dispatches in the `known_project_roots` loop (lines 127-149) — and optionally the orchestrator loop (lines 92-123) — with a single `asyncio.gather(...)` collecting all independent `asyncio.to_thread(load_task_tree, ...)` calls before iterating results. The roots are fully enumerated before the loop, so all reads are independent.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 450 (reviewer_performance).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T19:36:37.981Z"
       },
       {
         "id": "471",
@@ -9697,7 +9698,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T19:36:37.763Z",
+      "lastModified": "2026-04-06T19:36:37.981Z",
       "taskCount": 474,
       "completedCount": 416,
       "tags": [
