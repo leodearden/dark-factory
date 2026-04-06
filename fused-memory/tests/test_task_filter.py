@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     filter_task_tree,
@@ -196,3 +198,35 @@ class TestFormatFilteredTaskTree:
         # Summary line should still be present
         assert '10 done, 3 cancelled \u2014 omitted' in output2
         assert 'No active tasks.' in output2
+
+    def test_trimmed_count_relative_to_max_tasks_cap(self):
+        """trimmed_count in truncation notice must reflect tasks after max_tasks cap, not total_active.
+
+        With 200 total active tasks, max_tasks=50, and max_chars=300 (tiny budget), the
+        truncation notice must show a count <= 50 (tasks dropped from the 50-task cap),
+        NOT close to 200 (total_active). Bug: `trimmed_count = total_active - len(kept_lines)`
+        yields ~197 instead of the correct ~47.
+        """
+        active = [_make_task(i, 'pending', f'Task {i}') for i in range(1, 201)]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=200,
+        )
+        output = format_filtered_task_tree(tree, max_tasks=50, max_chars=300)
+
+        # The truncation notice must appear because max_chars=300 is tiny
+        assert 'truncated for budget' in output, 'Expected truncation notice in output'
+
+        # Extract the trimmed_count from '... and N more active (truncated for budget)'
+        match = re.search(r'\.\.\. and (\d+) more active \(truncated for budget\)', output)
+        assert match is not None, f'Could not find truncation notice in: {output!r}'
+        trimmed_count = int(match.group(1))
+
+        # Must be <= max_tasks (50), not inflated to ~200
+        assert trimmed_count <= 50, (
+            f'trimmed_count={trimmed_count} exceeds max_tasks=50; '
+            f'bug: using total_active instead of len(active[:max_tasks])'
+        )
