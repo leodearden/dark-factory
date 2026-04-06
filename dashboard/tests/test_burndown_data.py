@@ -53,6 +53,21 @@ def _insert_snapshot(
 
 
 # ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def burndown_env(tmp_path):
+    """Yield (db_path, config, conn) with a fresh burndown DB and open connection."""
+    db_path = tmp_path / 'burndown.db'
+    _create_burndown_db(db_path)
+    config = DashboardConfig(project_root=tmp_path)
+    async with aiosqlite.connect(str(db_path)) as conn:
+        yield db_path, config, conn
+
+
+# ---------------------------------------------------------------------------
 # _count_statuses
 # ---------------------------------------------------------------------------
 
