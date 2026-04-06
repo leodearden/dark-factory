@@ -9300,10 +9300,11 @@
         "description": "In fused-memory/tests/test_rebuild_entity_summaries.py, test `test_prefetched_edges_produce_correct_summary` (around line 1082):\n1. Remove the tautological line `assert result['edge_count'] != len(unique_facts)` (line 1109) — already proven by the two concrete equality assertions.\n2. Rename the test to `test_duplicate_edges_deduplicated_in_summary_but_counted_in_edge_count` (or similar) so the invariant is scannable from the test index.\n3. Replace `result['new_summary'].split('\\n')` (line 1105) with a full-string assertion: `assert result['new_summary'] == 'Alice knows Bob\\nAlice works at Acme'` (then derive unique_facts from the known expected string, or just drop the split entirely since the set/count checks are superseded by the string equality).\n\nFiles: fused-memory/tests/test_rebuild_entity_summaries.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T19:11:58.914Z"
       },
       {
         "id": "463",
@@ -9568,7 +9569,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T19:11:58.798Z",
+      "lastModified": "2026-04-06T19:11:58.914Z",
       "taskCount": 464,
       "completedCount": 408,
       "tags": [
