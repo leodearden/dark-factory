@@ -10059,10 +10059,11 @@
         "description": "In test_rebuild_entity_summaries.py, add three tests:\n1. `test_cancelled_error_propagates_force_false` — mock `_detect_stale_summaries_with_edges` to return stale entities, mock `update_node_summary` to raise CancelledError, assert propagation. Currently both cancellation tests use force=True, leaving the force=False code path untested for this bug class.\n2. A test asserting that a plain RuntimeError still produces `errors==1` and `rebuilt==1` in the post-fix code path (regression guard for the BaseException→Exception narrowing, ensuring Exception subclasses still accumulate into per-entity errors).\n3. Strengthen `test_cancelled_error_propagates_alongside_other_errors` with an inline comment or companion assertion clarifying that RuntimeError in slot 1 was NOT counted before CancelledError propagated (since Pass 1 runs before Pass 2 bookkeeping).\n\nAlso extract the shared mock setup (list_entity_nodes, get_all_valid_edges, backend instantiation) into a class-level fixture to eliminate the boilerplate duplication across both existing tests.\n\nSource: review suggestions from task 484. Rationale: close coverage gaps left by the initial CancelledError fix.\n\nFiles:\n- fused-memory/tests/test_rebuild_entity_summaries.py\n- fused-memory/src/fused_memory/backends/graphiti_client.py (reference only)",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:55:47.947Z"
       },
       {
         "id": "515",
@@ -10342,7 +10343,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T22:55:47.866Z",
+      "lastModified": "2026-04-06T22:55:47.947Z",
       "taskCount": 518,
       "completedCount": 432,
       "tags": [
