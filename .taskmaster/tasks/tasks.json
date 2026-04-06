@@ -9615,10 +9615,11 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py, test_partial_success_one_error_one_rebuilt (lines 440-444):\n1. Add `assert ok_detail['old_summary'] == ''`, `assert ok_detail['new_summary'] == 'rebuilt'`, `assert ok_detail['edge_count'] == 0` to mirror the completeness of err_detail assertions and verify the accumulator loop plumbs the _rebuild_entity_from_edges return value correctly.\n2. Add `assert result['skipped'] == 0` to both the existing single-error test (~line 398) and the partial-success test (~line 431) to constrain the counter partition invariant errors+rebuilt+skipped==total_entities.\n\nMemory hints: search for \"rebuild_entity_summaries return contract\" and \"counter partition invariant\".",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T20:10:54.377Z"
       },
       {
         "id": "483",
@@ -9843,7 +9844,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T20:10:49.549Z",
+      "lastModified": "2026-04-06T20:10:54.377Z",
       "taskCount": 481,
       "completedCount": 419,
       "tags": [
