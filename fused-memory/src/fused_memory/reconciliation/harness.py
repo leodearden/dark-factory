@@ -142,10 +142,14 @@ class ReconciliationHarness:
         remediation_findings: list[dict] | None = None,
         filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
-        """Apply tier limits and mode-specific attributes to MemoryConsolidator.
+        """Apply tier limits and mode-specific attributes to MemoryConsolidator (Stage 1).
 
         Shared between run_full_cycle and _run_remediation_pass to prevent
         attribute-configuration divergence.
+
+        ``filtered_task_tree`` here configures the Stage 1 (MemoryConsolidator)
+        instance only. Stage 2 (TaskKnowledgeSync) injection is handled
+        separately by ``_configure_task_sync``.
         """
         stage.episode_limit = tier.episode_limit
         stage.memory_limit = tier.memory_limit
@@ -154,6 +158,23 @@ class ReconciliationHarness:
         stage.assembled_payload = assembled_payload
         stage.remediation_findings = remediation_findings
         stage.filtered_task_tree = filtered_task_tree
+
+    @staticmethod
+    def _configure_task_sync(
+        stage: TaskKnowledgeSync,
+        *,
+        filtered_task_tree: FilteredTaskTree | None = None,
+        remediation_mode: bool = False,
+    ) -> None:
+        """Apply mode-specific attributes to TaskKnowledgeSync (Stage 2).
+
+        Counterpart to ``_configure_consolidator``: groups Stage 2 attribute
+        configuration in one place so the harness's stage-setup logic stays
+        symmetric and traceable, instead of relying on naked attribute
+        assignments at the call site.
+        """
+        stage.filtered_task_tree = filtered_task_tree
+        stage.remediation_mode = remediation_mode
 
     async def _fetch_filtered_task_tree(self, project_root: str) -> FilteredTaskTree:
         """Fetch the task tree once and return a filtered subset of active tasks.
@@ -535,7 +556,10 @@ class ReconciliationHarness:
 
                 # Inject filtered task tree into Stage 2 (task 455)
                 if isinstance(stage, TaskKnowledgeSync):
-                    stage.filtered_task_tree = filtered_tree
+                    self._configure_task_sync(
+                        stage,
+                        filtered_task_tree=filtered_tree,
+                    )
 
                 report = await stage.run(
                     events, watermark, reports, run_id, model=tier.model,
@@ -563,8 +587,13 @@ class ReconciliationHarness:
             if self.judge:
                 asyncio.create_task(self._run_judge(run_id))
 
-            # Remediation pass: extract S3 findings and trigger second pass
-            await self._maybe_remediate(project_id, project_root, run_id, run, tier)
+            # Remediation pass: extract S3 findings and trigger second pass.
+            # Pass the pre-fetched task tree so remediation reuses it instead of
+            # re-fetching (task 478).
+            await self._maybe_remediate(
+                project_id, project_root, run_id, run, tier,
+                filtered_task_tree=filtered_tree,
+            )
 
             logger.info(
                 'reconciliation.run_completed',
@@ -656,8 +685,15 @@ class ReconciliationHarness:
         parent_run_id: str,
         parent_run: ReconciliationRun,
         tier: TierConfig,
+        *,
+        filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
-        """Extract Stage 3 findings from the parent run and trigger remediation if needed."""
+        """Extract Stage 3 findings from the parent run and trigger remediation if needed.
+
+        ``filtered_task_tree`` is the pre-fetched task tree from the parent
+        cycle. Forwarded to ``_run_remediation_pass`` so the remediation pass
+        does not re-fetch (task 478).
+        """
         try:
             s3_report = parent_run.stage_reports.get('integrity_check')
             if s3_report is None:
@@ -693,6 +729,7 @@ class ReconciliationHarness:
             )
             await self._run_remediation_pass(
                 project_id, project_root, parent_run_id, actionable, tier,
+                filtered_task_tree=filtered_task_tree,
             )
         except Exception as e:
             logger.error(f'Remediation check failed for run {parent_run_id}: {e}')
@@ -709,8 +746,15 @@ class ReconciliationHarness:
         parent_run_id: str,
         findings: list[dict],
         tier: TierConfig,
+        *,
+        filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
-        """Run a focused S1→S2→S3 pass to remediate actionable findings."""
+        """Run a focused S1→S2→S3 pass to remediate actionable findings.
+
+        ``filtered_task_tree`` is the pre-fetched task tree from the parent
+        cycle. When provided, it is reused instead of re-fetching, avoiding
+        a redundant ``get_tasks`` call (task 478).
+        """
         run_id = str(uuid4())
         run = ReconciliationRun(
             id=run_id,
@@ -734,8 +778,10 @@ class ReconciliationHarness:
             },
         )
 
-        # Pre-fetch filtered task tree for remediation pass (task 455)
-        remediation_tree = await self._fetch_filtered_task_tree(project_root)
+        # Reuse the parent cycle's pre-fetched tree when available; otherwise
+        # fetch fresh (e.g., when remediation is triggered outside a full cycle).
+        # (task 478: skip the redundant get_tasks call)
+        remediation_tree = filtered_task_tree or await self._fetch_filtered_task_tree(project_root)
 
         current_stage_name: str | None = None
         stages = self._make_stages()
@@ -750,8 +796,11 @@ class ReconciliationHarness:
                 remediation_findings=findings,
                 filtered_task_tree=remediation_tree,
             )
-            stage2.remediation_mode = True
-            stage2.filtered_task_tree = remediation_tree
+            self._configure_task_sync(
+                stage2,
+                filtered_task_tree=remediation_tree,
+                remediation_mode=True,
+            )
 
             watermark = await self.journal.get_watermark(project_id)
             reports = []

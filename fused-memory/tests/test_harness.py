@@ -1695,6 +1695,90 @@ class TestRunRemediationInjectsFilteredTaskTree:
         assert len(s2_tree.active_tasks) == 3
 
 
+# ── Tests for task 478: avoid redundant fetch in remediation ──────────────────
+
+
+class TestRunRemediationReusesPrefetchedTree:
+    """_run_remediation_pass() reuses a parent-cycle FilteredTaskTree when supplied."""
+
+    @pytest.mark.asyncio
+    async def test_remediation_skips_fetch_when_tree_provided(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """When the harness passes filtered_task_tree=, remediation must NOT call get_tasks."""
+        from fused_memory.reconciliation.harness import TierConfig
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        # Reset the get_tasks mock so any prior interactions don't pollute the count.
+        harness.taskmaster.get_tasks.reset_mock()  # type: ignore[union-attr,attr-defined]
+
+        prefetched = FilteredTaskTree(
+            active_tasks=[],
+            done_count=42,
+            cancelled_count=7,
+            other_count=0,
+            total_count=49,
+        )
+
+        captured_trees: dict[str, FilteredTaskTree | None] = {}
+
+        async def capture_s1(s):
+            captured_trees['stage1'] = getattr(s, 'filtered_task_tree', None)
+
+        async def capture_s2(s):
+            captured_trees['stage2'] = getattr(s, 'filtered_task_tree', None)
+
+        _mock_stage_run(harness.stages[0], before_return=capture_s1)
+        _mock_stage_run(harness.stages[1], before_return=capture_s2)
+        _mock_stage_run(harness.stages[2])
+
+        findings = _make_s3_findings()[:1]
+        tier = TierConfig()
+
+        await harness._run_remediation_pass(
+            'test-project', '/tmp/test', 'parent-run-id', findings, tier,
+            filtered_task_tree=prefetched,
+        )
+
+        # Both remediation stages must receive the *same* prefetched object
+        # (identity, not just equality) — proves no re-fetch happened.
+        assert captured_trees['stage1'] is prefetched
+        assert captured_trees['stage2'] is prefetched
+
+        # The redundant get_tasks call must be gone.
+        harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_remediation_falls_back_to_fetch_when_tree_missing(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """When filtered_task_tree= is None, remediation still fetches (backstop for ad-hoc calls)."""
+        from fused_memory.reconciliation.harness import TierConfig
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.taskmaster.get_tasks.reset_mock()  # type: ignore[union-attr,attr-defined]
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+            'tasks': [
+                {'id': 1, 'title': 'T1', 'status': 'in-progress', 'dependencies': []}
+            ]
+        }
+
+        _mock_stage_run(harness.stages[0])
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        findings = _make_s3_findings()[:1]
+        tier = TierConfig()
+
+        await harness._run_remediation_pass(
+            'test-project', '/tmp/test', 'parent-run-id', findings, tier,
+        )
+
+        # No prefetched tree → remediation must fetch its own.
+        harness.taskmaster.get_tasks.assert_called_once()  # type: ignore[union-attr,attr-defined]
+
+
 # ── Tests for task 455: budget integration test ───────────────────────────────
 
 
