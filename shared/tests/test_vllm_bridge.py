@@ -4,7 +4,42 @@ from __future__ import annotations
 
 import pytest
 
-from shared.vllm_bridge import _normalize_tool_use_block
+from shared.vllm_bridge import _normalize_tool_use_block, _translate_messages_response
+
+
+class TestTranslateMessagesResponseConvertsOpenAIToolCalls:
+
+    def test_converts_openai_tool_calls_to_anthropic_content_list(self):
+        """OpenAI-style top-level tool_calls are converted to Anthropic content blocks."""
+        body = {
+            'role': 'assistant',
+            'content': 'I will look.',
+            'tool_calls': [
+                {
+                    'id': 'call_1',
+                    'type': 'function',
+                    'function': {'name': 'Read', 'arguments': '{"path": "/x"}'},
+                }
+            ],
+            'stop_reason': 'tool_calls',
+        }
+        result = _translate_messages_response(body)
+        # content is a list
+        assert isinstance(result['content'], list)
+        # contains a text block
+        text_blocks = [b for b in result['content'] if b.get('type') == 'text']
+        assert len(text_blocks) == 1
+        assert text_blocks[0]['text'] == 'I will look.'
+        # contains a tool_use block with normalised fields
+        tool_blocks = [b for b in result['content'] if b.get('type') == 'tool_use']
+        assert len(tool_blocks) == 1
+        tb = tool_blocks[0]
+        assert tb['name'] == 'Read'
+        assert tb['id'].startswith('toolu_')
+        assert isinstance(tb['input'], dict)
+        assert tb['input'] == {'path': '/x'}
+        # top-level tool_calls is gone
+        assert 'tool_calls' not in result
 
 
 class TestNormalizeToolUseBlockIdempotent:
