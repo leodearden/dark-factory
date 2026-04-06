@@ -450,7 +450,7 @@ class GraphitiBackend:
             'WHERE e.invalid_at IS NULL '
             'RETURN DISTINCT e.uuid, e.fact, e.name'
         )
-        result = await graph.query(cypher, {'uuid': node_uuid})
+        result = await graph.ro_query(cypher, {'uuid': node_uuid})
         return [
             {
                 'uuid': row[0],

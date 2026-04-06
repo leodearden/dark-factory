@@ -158,8 +158,8 @@ class TestGetValidEdgesForNode:
         backend._driver._get_graph = MagicMock(return_value=graph)
         node_uuid = 'my-node-uuid'
         await backend.get_valid_edges_for_node(node_uuid, group_id='test')
-        call_args = graph.query.call_args
-        assert call_args is not None, "graph.query was not called"
+        call_args = graph.ro_query.call_args
+        assert call_args is not None, "graph.ro_query was not called"
         cypher_params = call_args.args[1]
         assert cypher_params.get('uuid') == node_uuid
 
@@ -170,8 +170,8 @@ class TestGetValidEdgesForNode:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
-        call_args = graph.query.call_args
-        assert call_args is not None, "graph.query was not called"
+        call_args = graph.ro_query.call_args
+        assert call_args is not None, "graph.ro_query was not called"
         cypher = call_args.args[0]
         assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
 
