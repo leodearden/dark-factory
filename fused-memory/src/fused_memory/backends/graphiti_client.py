@@ -1092,6 +1092,7 @@ class GraphitiBackend:
                     })
                 else:
                     rebuilt += 1
+                    assert isinstance(r, dict)
                     details.append({
                         'uuid': t['uuid'],
                         'name': t['name'],
