@@ -562,3 +562,53 @@ class TestPurgeDead:
         assert row[0] == 0, f'Expected 0 rows for purged ids, got {row[0]}'
 
         await q.close()
+
+    @pytest.mark.asyncio
+    async def test_purge_dead_by_error_pattern(self, tmp_path):
+        """purge_dead(error_pattern=...) removes only dead rows matching the LIKE pattern."""
+        call_count = 0
+
+        async def patterned_execute(op, payload):
+            nonlocal call_count
+            call_count += 1
+            name = payload.get('name', '')
+            if name.startswith('node'):
+                raise RuntimeError('NodeNotFoundError: node abc123 not found')
+            raise RuntimeError('Query timed out')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=patterned_execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+
+        # 2 items with NodeNotFoundError, 3 items with Query timed out
+        for i in range(2):
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': f'node{i}', 'group_id': 'proj1', 'name': f'node{i}'},
+            )
+        for i in range(3):
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': f'timeout{i}', 'group_id': 'proj1', 'name': f'timeout{i}'},
+            )
+        await asyncio.sleep(1.0)
+
+        dead_before = await q.get_dead_items()
+        assert len(dead_before) == 5
+
+        purged = await q.purge_dead(error_pattern='%NodeNotFoundError%')
+        assert purged == 2
+
+        dead_after = await q.get_dead_items()
+        assert len(dead_after) == 3
+        for item in dead_after:
+            assert 'Query timed out' in item['error']
+
+        await q.close()
