@@ -357,3 +357,40 @@ class TestRebuildEntitySummariesDataFlow:
         assert result['stale_entities'] == 2
         assert result['skipped'] == 2
         assert result['rebuilt'] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-5 (task 443): error-accumulation path in rebuild_entity_summaries
+# ---------------------------------------------------------------------------
+
+class TestRebuildEntitySummariesErrorHandling:
+    """rebuild_entity_summaries records per-entity errors without raising."""
+
+    @pytest.mark.asyncio
+    async def test_rebuild_entity_error_recorded_in_result(self, mock_config, make_backend):
+        """When _rebuild_entity_from_edges raises, errors counter increments and details record it.
+
+        rebuild_entity_summaries uses asyncio.gather(return_exceptions=True) so a
+        per-entity failure does not abort the whole batch. Each exception is captured
+        into result['errors'] and result['details'] with status='error'.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'stale summary'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        # Simulate _rebuild_entity_from_edges failing for this entity
+        backend._rebuild_entity_from_edges = AsyncMock(
+            side_effect=RuntimeError('boom')
+        )
+
+        result = await backend.rebuild_entity_summaries(
+            group_id='test', force=True, dry_run=False
+        )
+
+        assert result['errors'] == 1
+        assert result['rebuilt'] == 0
+        assert len(result['details']) == 1
+        detail = result['details'][0]
+        assert detail['status'] == 'error'
+        assert detail['error'] == 'boom'
