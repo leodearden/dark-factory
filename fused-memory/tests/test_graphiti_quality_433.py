@@ -29,26 +29,26 @@ class TestStaleSummaryResult:
         """StaleSummaryResult.stale holds the stale list."""
         stale_list = [{'uuid': 'u1', 'name': 'Alice'}]
         edges = {'u1': [{'fact': 'fact1'}]}
-        result = StaleSummaryResult(stale=stale_list, edges=edges, total_count=5)
+        result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=5)
         assert result.stale is stale_list
 
-    def test_named_attribute_edges(self):
-        """StaleSummaryResult.edges holds the edges dict."""
+    def test_named_attribute_all_edges(self):
+        """StaleSummaryResult.all_edges holds the edges dict."""
         stale_list: list[dict] = []
         edges = {'u1': [{'fact': 'fact1'}]}
-        result = StaleSummaryResult(stale=stale_list, edges=edges, total_count=3)
-        assert result.edges is edges
+        result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=3)
+        assert result.all_edges is edges
 
     def test_named_attribute_total_count(self):
         """StaleSummaryResult.total_count holds the total entity count."""
-        result = StaleSummaryResult(stale=[], edges={}, total_count=42)
+        result = StaleSummaryResult(stale=[], all_edges={}, total_count=42)
         assert result.total_count == 42
 
     def test_tuple_unpacking_backward_compat(self):
         """StaleSummaryResult supports 3-tuple unpacking (backward compat)."""
         stale_list = [{'uuid': 'u1'}]
         edges = {'u1': []}
-        result = StaleSummaryResult(stale=stale_list, edges=edges, total_count=7)
+        result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=7)
         a, b, c = result
         assert a is stale_list
         assert b is edges
@@ -58,7 +58,7 @@ class TestStaleSummaryResult:
         """StaleSummaryResult compares value-equal to a plain 3-tuple (backward-compat promise)."""
         stale_list = [{'uuid': 'u1'}]
         edges: dict = {}
-        result = StaleSummaryResult(stale=stale_list, edges=edges, total_count=1)
+        result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=1)
         # Value-equality with a plain tuple proves the NamedTuple backward-compat promise:
         # only actual tuple subclasses compare equal to plain tuples this way.
         assert result == (stale_list, edges, 1)
@@ -79,7 +79,7 @@ class TestStaleSummaryResult:
         assert isinstance(result, StaleSummaryResult)
         assert result.total_count == 1
         assert isinstance(result.stale, list)
-        assert isinstance(result.edges, dict)
+        assert isinstance(result.all_edges, dict)
 
         # Positional (backward compat)
         stale, edges, total = result
@@ -318,7 +318,7 @@ class TestRebuildEntitySummariesDataFlow:
         all_edges = {'u1': [{'fact': 'Alice knows Bob'}]}
         # total_count=10 means 10 entities exist but only 1 is stale
         detect_result = StaleSummaryResult(
-            stale=stale_list, edges=all_edges, total_count=10
+            stale=stale_list, all_edges=all_edges, total_count=10
         )
         backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
         backend._rebuild_entity_from_edges = AsyncMock(return_value={
@@ -345,7 +345,7 @@ class TestRebuildEntitySummariesDataFlow:
             {'uuid': 'u2', 'name': 'Bob', 'summary': 'old B'},
         ]
         detect_result = StaleSummaryResult(
-            stale=stale_list, edges={}, total_count=7
+            stale=stale_list, all_edges={}, total_count=7
         )
         backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
 
