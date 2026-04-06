@@ -8755,13 +8755,13 @@
         "description": "_rebuild_entity_from_edges at line 962 calls get_node_text per entity for old_summary, emitting N extra RPCs inside the asyncio.gather fan-out (semaphore=20). The name/old_summary optional params were added to refresh_entity_summary explicitly to fix this, but _rebuild_entity_from_edges was never updated.\n\nPreferred fix (option a): have _rebuild_entity_from_edges accept an optional `old_summary: str | None = None` parameter. When provided, skip get_node_text. Thread pre-fetched data from rebuild_entity_summaries callers — for force=True entities, all_entities[i]['summary'] is available; for stale entities, add summary to the stale dict in _detect_stale_summaries_with_edges.\n\nAlternative (option b): have _rebuild_entity_from_edges delegate entirely to refresh_entity_summary(uuid, group_id=group_id, name=name, old_summary=old_summary) and remove the structural duplication.\n\nAlso consider making get_node_text failure non-fatal to the summary write path.\n\nMemory hints: search \"refresh_entity_summary name old_summary optimization\", get_entity \"GraphitiClient\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [
           "432"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T18:45:54.364Z",
+        "updatedAt": "2026-04-06T18:54:14.422Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/backends",
@@ -9418,9 +9418,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T18:53:59.728Z",
+      "lastModified": "2026-04-06T18:54:14.423Z",
       "taskCount": 452,
-      "completedCount": 404,
+      "completedCount": 405,
       "tags": [
         "master"
       ]
