@@ -9323,6 +9323,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 466,
+        "title": "Consolidate and harden test_stale_summary_named_access_438.py",
+        "description": "Follow-up from task 438 review. Five test-quality improvements for fused-memory/tests/test_stale_summary_named_access_438.py:\n\n1. **Remove duplicate TestStaleSummaryResultAllEdgesField class (lines 26-57).** All three tests in this class duplicate coverage already present in fused-memory/tests/test_graphiti_quality_433.py::TestStaleSummaryResult after the rename was applied in the same diff:\n   - `test_stale_summary_result_has_all_edges_field` duplicates `test_named_attribute_all_edges`\n   - `test_all_edges_holds_per_entity_map` is a minor variant of the same\n   - `test_tuple_unpacking_still_works_after_rename` duplicates `test_tuple_unpacking_backward_compat`\n   Delete the class entirely. The genuine value of this file is `TestDetectStaleSummariesNamedAccess` and `TestRebuildEntitySummariesNamedAccess`, which exercise the two public callers — keep those.\n\n2. **Strengthen assertion from equality to identity (line 67).** In `test_detect_stale_summaries_named_access`, change `assert returned == stale_list` to `assert returned is stale_list`. The production code does `return result.stale` — a direct attribute read with no copy — so identity is the correct, stronger check and locks in the no-copy contract. Value equality would still pass if the implementation accidentally returned a shallow copy.\n\n3. **Add negative hasattr test for removed `edges` field.** Nothing currently asserts that the old `edges` attribute name is absent from `StaleSummaryResult`. Add a test:\n   ```python\n   result = StaleSummaryResult(stale=[], all_edges={}, total_count=0)\n   assert not hasattr(result, 'edges')\n   ```\n   This closes the gap against a stale positional-only construction path silently re-exposing an `edges` alias. Add it either in test_graphiti_quality_433.py::TestStaleSummaryResult or in the remaining test file after step 1.\n\n4. **Fix fixture shape inconsistency (line 78).** In `test_rebuild_entity_summaries_named_access`, the stale dict uses only `{uuid, name, summary}`. Every other stale-entity fixture across the suite includes the diagnostic keys. Use the full shape:\n   ```python\n   {'uuid': 'u1', 'name': 'A', 'summary': 'old', 'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 1, 'summary_line_count': 1}\n   ```\n\n5. **Add empty-stale-list coverage in TestDetectStaleSummariesNamedAccess (lines 50-68).** The class currently has only the non-empty case. Add a second test that mocks `_detect_stale_summaries_with_edges` to return `StaleSummaryResult(stale=[], all_edges={}, total_count=0)` and asserts `await backend.detect_stale_summaries(group_id='t') == []`. Documents that the function makes no non-empty assumption and guards against a future filter-before-return refactor.\n\nVerify by running: `pytest fused-memory/tests/test_stale_summary_named_access_438.py fused-memory/tests/test_graphiti_quality_433.py -x`\n\nMemory hints: search for \"test_stale_summary_named_access_438\" and \"StaleSummaryResult\".",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9335,7 +9346,7 @@
       ],
       "created": "2026-04-06T17:58:20.857Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T17:58:20.860Z"
+      "updated": "2026-04-06T17:58:40.473Z"
     }
   }
 }
