@@ -8924,7 +8924,7 @@
         "description": "In fused-memory/src/fused_memory/backends/graphiti_client.py around lines 488-495: (1) Add `if not entity_uuid: logger.warning(...); continue` before grouped.setdefault to prevent None dict keys from partially-corrupt nodes; (2) Change `'uuid': row[1]` to skip (or log+skip) when row[1] is None, consistent with the or-'' guard on fact/name — an edge without a UUID is not actionable by callers like bulk_remove_edges.\n\nmemory_hint: search \"get_all_valid_edges null safety\" for context.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -8936,7 +8936,7 @@
             "fused-memory/src/fused_memory/backends"
           ]
         },
-        "updatedAt": "2026-04-06T18:59:29.301Z"
+        "updatedAt": "2026-04-06T19:01:43.080Z"
       },
       {
         "id": "448",
@@ -9508,9 +9508,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T18:59:29.302Z",
+      "lastModified": "2026-04-06T19:01:43.080Z",
       "taskCount": 460,
-      "completedCount": 405,
+      "completedCount": 406,
       "tags": [
         "master"
       ]
