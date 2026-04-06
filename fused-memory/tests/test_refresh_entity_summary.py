@@ -303,6 +303,29 @@ class TestRefreshEntitySummary:
         result = await backend.refresh_entity_summary('node-uuid-2', group_id='test')
         assert result['old_summary'] == 'prior summary text'
 
+    @pytest.mark.asyncio
+    async def test_refresh_entity_summary_with_empty_old_summary_and_name(
+        self, mock_config, make_backend
+    ):
+        """Empty-string old_summary is a valid production value (list_entity_nodes normalizes
+        NULL→'') and must not trigger the guard that raises ValueError.  When name and
+        old_summary are both provided, get_node_text is skipped entirely."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock()
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e1', 'fact': 'Alice knows Bob', 'name': 'knows'},
+        ])
+        backend.update_node_summary = AsyncMock()
+        result = await backend.refresh_entity_summary(
+            'node-uuid-1', group_id='test', name='Alice', old_summary=''
+        )
+        backend.get_node_text.assert_not_awaited()
+        assert result['old_summary'] == ''
+        assert result['name'] == 'Alice'
+        assert result['uuid'] == 'node-uuid-1'
+        assert result['new_summary'] == 'Alice knows Bob'
+        assert result['edge_count'] == 1
+
 
 # ---------------------------------------------------------------------------
 # step-7: MemoryService.refresh_entity_summary
