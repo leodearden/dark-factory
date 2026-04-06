@@ -136,9 +136,7 @@ class MemoryConsolidator(BaseStage):
             )
 
         # 7. Active task tree (task 455)
-        task_tree_section = ''
-        if self.filtered_task_tree is not None:
-            task_tree_section = '\n' + format_filtered_task_tree(self.filtered_task_tree) + '\n'
+        task_tree_section = self._build_task_tree_section()
 
         # 8. Format
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
@@ -205,9 +203,7 @@ Review the above data and perform memory consolidation:
             )
 
         # Active task tree (task 455)
-        task_tree_section = ''
-        if self.filtered_task_tree is not None:
-            task_tree_section = '\n' + format_filtered_task_tree(self.filtered_task_tree) + '\n'
+        task_tree_section = self._build_task_tree_section()
 
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}
@@ -234,6 +230,16 @@ Review the above data and perform memory consolidation:
 
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
 """
+
+    def _build_task_tree_section(self) -> str:
+        """Return the Active Task Tree prompt section, or empty string if no tree set.
+
+        Eliminates the 3-line block duplicated in assemble_payload and
+        _format_assembled_payload. (task 455 DRY cleanup)
+        """
+        if self.filtered_task_tree is None:
+            return ''
+        return '\n' + format_filtered_task_tree(self.filtered_task_tree) + '\n'
 
     def _assemble_remediation_payload(self) -> str:
         """Focused payload for remediation runs — findings only, no full data."""
