@@ -9892,6 +9892,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 507,
+        "title": "Extract shared Alice/Bob stale-entity fixture in test_graphiti_quality_433.py",
+        "description": "Post-merge review follow-up for task 483 (reviewer_reuse_auditor). The Alice/Bob stale-entity dict shape `[{'uuid', 'name', 'summary'}]` is repeated across at least four test methods in `fused-memory/tests/test_graphiti_quality_433.py` (lines 343, 370, 439-441, 494-497) without a shared fixture.\n\nExtract a `make_stale_list` pytest fixture or helper that produces the standard `[{uuid, name, summary}]` entity dicts for Alice and Bob. Tests that need the standard shape should consume the fixture; tests with unique shapes keep their inline definitions.\n\nUnique assertions (e.g. `total_entities == 5` in `test_force_false_partial_error_uses_detect_total`) should remain inline — only the setup boilerplate moves to the fixture.\n\nThis is a nice-to-have refactor; it does not affect correctness or coverage, but reduces copy-paste surface area for future entity-shape changes. Verify with `pytest fused-memory/tests/test_graphiti_quality_433.py` after refactoring.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9904,7 +9915,7 @@
       ],
       "created": "2026-04-06T22:06:59.634Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:06:59.637Z"
+      "updated": "2026-04-06T22:07:08.220Z"
     }
   }
 }
