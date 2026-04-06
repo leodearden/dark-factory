@@ -1080,10 +1080,10 @@ class TestRebuildEntityFromEdgesOldSummary:
         backend.get_node_text.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_prefetched_edges_produce_correct_summary(
+    async def test_duplicate_edges_deduplicated_in_summary_but_counted_in_edge_count(
         self, mock_config, make_backend
     ):
-        """edge_count == len(raw edges) while new_summary deduplicates facts via _canonical_facts.
+        """edge_count reflects raw edge count; new_summary deduplicates via _canonical_facts.
 
         3 raw edges with 1 duplicate → edge_count=3, but only 2 unique facts in new_summary.
         This documents that edge_count and unique-fact count are intentionally different
@@ -1103,8 +1103,4 @@ class TestRebuildEntityFromEdgesOldSummary:
         )
 
         assert result['edge_count'] == 3
-        unique_facts = result['new_summary'].split('\n')
-        assert len(unique_facts) == 2
-        assert set(unique_facts) == {'Alice knows Bob', 'Alice works at Acme'}
-        # Explicitly document that these are intentionally different values
-        assert result['edge_count'] != len(unique_facts)
+        assert result['new_summary'] == 'Alice knows Bob\nAlice works at Acme'
