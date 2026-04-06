@@ -23,6 +23,7 @@ class DashboardConfig:
     port: int = 8080
     project_root: Path = field(default_factory=lambda: Path('/home/leo/src/dark-factory'))
     fused_memory_urls: list[str] = field(default_factory=lambda: list(DEFAULT_FUSED_MEMORY_URLS))
+    known_project_roots: list[Path] = field(default_factory=list)
 
     @property
     def reconciliation_db(self) -> Path:
