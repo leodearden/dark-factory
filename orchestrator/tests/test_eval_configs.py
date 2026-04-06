@@ -97,6 +97,16 @@ class TestVllmConfigSet:
         )
 
 
+class TestQwen3CoderNextFp8NewVariant:
+    """The post-fix qwen3-coder-next-fp8-new config must use the official FP8 HF model."""
+
+    def test_uses_official_fp8_hf_model(self):
+        """qwen3-coder-next-fp8-new must reference Qwen/Qwen3-Coder-Next-FP8 (not the 149GB unquantized)."""
+        cfg = get_config_by_name('qwen3-coder-next-fp8-new')
+        assert cfg is not None, 'qwen3-coder-next-fp8-new config not found'
+        assert cfg.env_overrides['ANTHROPIC_DEFAULT_SONNET_MODEL'] == 'Qwen/Qwen3-Coder-Next-FP8'
+
+
 class TestDroppedQwen25Regression:
     """Regression guard: Qwen2.5-Coder-32B must not reappear in any config list."""
 
