@@ -10464,6 +10464,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 547,
+        "title": "Decouple vLLM health timeout from container_disk; guard against Qwen3 hang window",
+        "description": "In scripts/run_vllm_eval.py line 172, `health_timeout = max(900, container_disk * 12)` gives only 900s (15 min) when use_volume=True (the default) because container_disk is overridden to 50. The documented Qwen3 CUDA-graph hang lasts 15-80 min, so the current default timeout exactly matches the lower bound and will spuriously kill legitimate slow startups.\n\nFix by decoupling timeout from disk size: either (a) track the original pre-volume-override disk size for the timeout calculation, (b) add a per-model health_timeout_override field to EvalConfig, or (c) apply a higher floor specifically for configs with known startup hang risk (qwen3-coder-next-fp8-new). Also note that even with --no-volume (container_disk=240 → 2880s = 48 min), the 80-min upper bound of the hang window is not covered.\n\nFiles: scripts/run_vllm_eval.py\n\nSource: review follow-up from task 515 (esc-515-67)",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10476,7 +10487,7 @@
       ],
       "created": "2026-04-06T23:21:11.284Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T23:23:42.739Z"
+      "updated": "2026-04-06T23:23:49.321Z"
     }
   }
 }
