@@ -10428,6 +10428,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 545,
+        "title": "Replace stale docstring mutation instruction with tracked TODO reference",
+        "description": "In dashboard/tests/test_burndown_data.py, the new test_propagates_load_task_tree_error_for_known_root docstring contains a forward-declaration \"When the deferred robustness task lands (option (b)), this test's assertions should flip to…\". This is a maintenance hazard — open-ended prose with no concrete reference becomes stale, and there is no task number or link tracking when the flip should happen.\n\nFix: replace the open-ended prose with a `# TODO(task-NNN):` comment marker referencing the actual Taskmaster task for the deferred per-root error-handling robustness work. Keep the architectural rationale (option (a) propagate vs option (b) per-root skip-and-continue) in the docstring body, but move the forward-looking mutation instruction to a trackable ticket reference.\n\nSource: review suggestion on task 472 (reviewer architect_reviewer).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10440,7 +10451,7 @@
       ],
       "created": "2026-04-06T23:18:09.379Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T23:18:28.415Z"
+      "updated": "2026-04-06T23:18:35.036Z"
     }
   }
 }
