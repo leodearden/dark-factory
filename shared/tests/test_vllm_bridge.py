@@ -7,6 +7,20 @@ import pytest
 from shared.vllm_bridge import _normalize_tool_use_block
 
 
+class TestNormalizeToolUseBlockIdempotent:
+
+    def test_idempotent_for_correct_block(self):
+        """A well-formed Anthropic tool_use block is returned value-equal (no-op)."""
+        block = {
+            'type': 'tool_use',
+            'id': 'toolu_abc',
+            'name': 'Read',
+            'input': {'path': '/tmp/x'},
+        }
+        result = _normalize_tool_use_block(block)
+        assert result == block
+
+
 class TestNormalizeToolUseBlockIdHandling:
 
     def test_generates_toolu_id_when_missing(self):
