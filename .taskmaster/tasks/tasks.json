@@ -8937,7 +8937,25 @@
         "status": "pending",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "human_review_recommended": true,
+          "recon_unreliable_until_fixed": true,
+          "confirmed_affected_run": "94151a78",
+          "zero_active_tasks_since": "2026-04-02",
+          "memory_hints": {
+            "entities": [
+              "reconciliation harness"
+            ],
+            "searches": [
+              "false-empty task tree Stage 1 Stage 2 recurring bug",
+              "get_tasks context window overflow 600K filter done cancelled",
+              "reconciliation harness task tree injection"
+            ]
+          },
+          "_causation_id": "575fd7e6-9c9d-401e-9ef8-39f0159ffd6d",
+          "stage1_finding_id": "2"
+        }
       },
       {
         "id": 456,
