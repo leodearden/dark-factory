@@ -119,24 +119,17 @@ class TestDroppedQwen25Regression:
 
 
 class TestNoNameCollisions:
-    """vLLM and standard config names must not collide."""
+    """Config names within the canonical list must be unique."""
 
     def test_vllm_names_are_unique_among_themselves(self):
         """No duplicate names within VLLM_EVAL_CONFIGS."""
         names = [cfg.name for cfg in VLLM_EVAL_CONFIGS]
         assert len(names) == len(set(names)), f'Duplicate vLLM config names: {names}'
 
-    def test_vllm_names_do_not_collide_with_eval_configs(self):
-        """No vLLM config name appears in EVAL_CONFIGS."""
-        eval_names = {cfg.name for cfg in EVAL_CONFIGS}
-        vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
-        overlap = eval_names & vllm_names
-        assert not overlap, f'Name collision between EVAL_CONFIGS and VLLM_EVAL_CONFIGS: {overlap}'
-
-    def test_all_eval_config_names_unique(self):
-        """All names across both config lists are unique."""
-        all_names = [cfg.name for cfg in EVAL_CONFIGS + VLLM_EVAL_CONFIGS]
-        assert len(all_names) == len(set(all_names)), f'Duplicate names: {all_names}'
+    def test_eval_configs_names_unique(self):
+        """All names in the canonical EVAL_CONFIGS list are unique."""
+        all_names = [cfg.name for cfg in EVAL_CONFIGS]
+        assert len(all_names) == len(set(all_names)), f'Duplicate names in EVAL_CONFIGS: {all_names}'
 
 
 class TestEvalConfigsIncludesVllm:
