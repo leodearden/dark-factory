@@ -61,6 +61,8 @@ class EventType(StrEnum):
     lock_acquired = 'lock_acquired'
     lock_released = 'lock_released'
     merge_attempt = 'merge_attempt'
+    speculative_merge = 'speculative_merge'
+    speculative_discard = 'speculative_discard'
 
     # Task lifecycle
     task_started = 'task_started'
