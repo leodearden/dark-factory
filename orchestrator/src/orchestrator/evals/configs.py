@@ -39,6 +39,7 @@ VLLM_EVAL_CONFIGS = [
 ]
 
 EVAL_CONFIGS = [
+    # Cloud baselines
     EvalConfig('claude-opus-high', 'claude', 'opus', 'high'),
     EvalConfig('claude-opus-max', 'claude', 'opus', 'max'),
     EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max'),
@@ -46,12 +47,14 @@ EVAL_CONFIGS = [
     EvalConfig('codex-gpt54mini-xhigh', 'codex', 'gpt-5.4-mini', 'xhigh'),
     EvalConfig('gemini-31-pro-high', 'gemini', 'gemini-3.1-pro-preview', 'high'),
     EvalConfig('gemini-3-flash-high', 'gemini', 'gemini-3-flash-preview', 'high'),
+    # Self-hosted vLLM backends
+    *VLLM_EVAL_CONFIGS,
 ]
 
 
 def get_config_by_name(name: str) -> EvalConfig | None:
     """Look up an eval config by name."""
-    for cfg in EVAL_CONFIGS + VLLM_EVAL_CONFIGS:
+    for cfg in EVAL_CONFIGS:
         if cfg.name == name:
             return cfg
     return None
