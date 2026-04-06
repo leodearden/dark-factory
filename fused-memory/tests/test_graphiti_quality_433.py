@@ -457,3 +457,41 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['status'] == 'rebuilt'
         assert ok_detail['uuid'] == 'u2'
         assert ok_detail['name'] == 'Bob'
+
+
+# ---------------------------------------------------------------------------
+# step-4: regression — whitespace-only fact must not cause false stale detection
+# ---------------------------------------------------------------------------
+
+class TestCanonicalFactsStalenessRegression:
+    """Whitespace-only facts must not make a current entity appear stale."""
+
+    @pytest.mark.asyncio
+    async def test_whitespace_fact_does_not_cause_false_stale_detection(
+        self, mock_config, make_backend
+    ):
+        """Entity with summary 'A knows B' and edges ['   ', 'A knows B'] is not stale.
+
+        Before the fix, _canonical_facts(['   ', 'A knows B']) returned
+        ['   ', 'A knows B'], so the canonical string became '   \nA knows B',
+        which does not match the stored summary 'A knows B' and the entity was
+        falsely flagged as stale.
+
+        After the fix, _canonical_facts filters out '   ', returns ['A knows B'],
+        and the joined canonical string 'A knows B' matches the stored summary —
+        so the entity is NOT stale.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'A knows B'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'u1': [{'fact': '   '}, {'fact': 'A knows B'}],
+        })
+
+        result = await backend._detect_stale_summaries_with_edges(group_id='test')
+
+        assert result.stale == [], (
+            "Entity should NOT be flagged stale when its only non-whitespace "
+            "fact matches the stored summary."
+        )
