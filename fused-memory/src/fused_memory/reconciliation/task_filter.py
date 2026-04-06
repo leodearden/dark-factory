@@ -32,6 +32,11 @@ INACTIVE_TASK_STATUSES: frozenset[str] = frozenset({
     'cancelled',
 })
 
+# Maximum number of done task dicts to retain in FilteredTaskTree.done_tasks.
+# 30 matches the existing done_tasks[:30] cap in the legacy task_knowledge_sync.py
+# prompt renderer, so switching consumers over later is a no-op for output budget.
+MAX_DONE_TASKS_RETAINED: int = 30
+
 # Status priority for sorting: lower value = higher priority.
 # Matches _select_proactive_sample in task_knowledge_sync.py, with 'deferred'
 # added at priority 5 (below 'pending') since it was missing there.
@@ -53,6 +58,7 @@ class FilteredTaskTree:
     """Result of filter_task_tree(): active tasks plus aggregate counts."""
 
     active_tasks: list[dict] = field(default_factory=list)
+    done_tasks: list[dict] = field(default_factory=list)
     done_count: int = 0
     cancelled_count: int = 0
     other_count: int = 0
@@ -79,6 +85,7 @@ def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
         return FilteredTaskTree()
 
     active: list[dict] = []
+    done: list[dict] = []
     done_count = 0
     cancelled_count = 0
     other_count = 0
@@ -93,6 +100,7 @@ def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
             active.append(task)
         elif status == 'done':
             done_count += 1
+            done.append(task)
         elif status == 'cancelled':
             cancelled_count += 1
         else:
@@ -112,9 +120,19 @@ def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
 
     active.sort(key=sort_key)
 
+    # Sort done tasks by ID descending (higher id ≈ more recently created/completed)
+    def _id_for_sort(t: dict) -> int:
+        try:
+            return int(t.get('id', 0))
+        except (TypeError, ValueError):
+            return 0
+
+    done.sort(key=_id_for_sort, reverse=True)
+
     total = len(active) + done_count + cancelled_count + other_count
     return FilteredTaskTree(
         active_tasks=active,
+        done_tasks=done[:MAX_DONE_TASKS_RETAINED],
         done_count=done_count,
         cancelled_count=cancelled_count,
         other_count=other_count,
