@@ -394,3 +394,5 @@ class TestRebuildEntitySummariesErrorHandling:
         detail = result['details'][0]
         assert detail['status'] == 'error'
         assert detail['error'] == 'boom'
+        assert detail['uuid'] == 'u1'
+        assert detail['name'] == 'Alice'
