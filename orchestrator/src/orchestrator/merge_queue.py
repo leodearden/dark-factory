@@ -694,7 +694,7 @@ class SpeculativeMergeWorker:
             except Exception as exc:
                 logger.exception(f'Task {req.task_id}: unexpected verifier error')
                 if item.merge_wt is not None:
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(BaseException):
                         await self._git_ops.cleanup_merge_worktree(item.merge_wt)
                 if not req.result.done():
                     req.result.set_result(MergeOutcome(
@@ -705,7 +705,7 @@ class SpeculativeMergeWorker:
                 # CancelledError or other fatal — resolve the in-flight Future
                 # and clean up the merge worktree so callers don't hang forever.
                 if item.merge_wt is not None:
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(BaseException):
                         await self._git_ops.cleanup_merge_worktree(item.merge_wt)
                 if not req.result.done():
                     req.result.set_result(MergeOutcome(
