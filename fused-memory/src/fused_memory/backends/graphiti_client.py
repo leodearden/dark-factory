@@ -452,11 +452,7 @@ class GraphitiBackend:
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid})
         return [
-            {
-                'uuid': row[0],
-                'fact': row[1] or '',
-                'name': row[2] or '',
-            }
+            self._edge_dict(row[0], row[1], row[2])
             for row in (result.result_set or [])
         ]
 
@@ -487,12 +483,7 @@ class GraphitiBackend:
         grouped: dict[str, list[dict]] = {}
         for row in (result.result_set or []):
             entity_uuid = row[0]
-            edge = {
-                'uuid': row[1],
-                'fact': row[2] or '',
-                'name': row[3] or '',
-            }
-            grouped.setdefault(entity_uuid, []).append(edge)
+            grouped.setdefault(entity_uuid, []).append(self._edge_dict(row[1], row[2], row[3]))
         return grouped
 
     async def bulk_remove_edges(self, uuids: list[str], *, group_id: str) -> int:
@@ -767,6 +758,20 @@ class GraphitiBackend:
                 f'Multiple entities found with name {name!r}: {uuids}'
             )
         return rows[0][0]
+
+    @staticmethod
+    def _edge_dict(uuid: str, fact: str | None, name: str | None) -> dict:
+        """Build a normalised edge dict, coercing NULL fact/name to empty string.
+
+        Args:
+            uuid: Edge UUID.
+            fact: Edge fact text, or None when the property is NULL in the graph.
+            name: Edge name, or None when the property is NULL in the graph.
+
+        Returns:
+            Dict with keys: uuid, fact, name. fact and name default to '' when None.
+        """
+        return {'uuid': uuid, 'fact': fact or '', 'name': name or ''}
 
     @staticmethod
     def _canonical_facts(edges: list[dict]) -> list[str]:
