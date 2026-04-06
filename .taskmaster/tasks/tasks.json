@@ -5319,13 +5319,13 @@
         "description": "Add a 2-step speculative pipeline to the merge queue: while Worker B verifies merge N, Worker A speculatively merges N+1 against N's merge SHA. If N succeeds, N+1 is already a descendant and CAS works immediately (~2-3x throughput when queue depth >3). Cap speculation depth at 1.",
         "details": "BLOCKED: Waiting for merge queue (task 292) to be implemented and stable, with real metrics on queue depth and merge cycle time.\n\nUnblock condition: sustained queue depth >3 and merge cycle time dominating task throughput.\n\nDesign notes:\n- Worker A (merger): dequeue, create merge_wt, git merge --no-ff, scrub .task/\n- Worker B (verifier): run_scoped_verification, CAS update-ref, notify task Future\n- Speculative base: merge N+1 against N's merge commit, not current main\n- If N succeeds: N+1 is descendant, CAS works\n- If N fails: discard N+1, re-merge against actual main (one wasted merge ~2s)\n- Key risk: verification validity — N+1 verified against tree containing N's changes; if N rejected, N+1's verify was against non-existent state. Mitigated by scoped verification (task_files only) and depth-1 cap.\n- See comment block above advance_main() in git_ops.py for full rationale",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [
           "403"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T17:19:17.786Z",
+        "updatedAt": "2026-04-06T17:19:18.147Z",
         "metadata": {
           "memory_hints": {
             "entities": [
@@ -9221,7 +9221,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T17:19:18.058Z",
+      "lastModified": "2026-04-06T17:19:18.148Z",
       "taskCount": 435,
       "completedCount": 396,
       "tags": [
