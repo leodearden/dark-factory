@@ -9357,6 +9357,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 469,
+        "title": "Fix path-normalization consistency bug in collect_snapshot deduplication",
+        "description": "In `dashboard/src/dashboard/data/burndown.py` line 73, change `seen_roots: set[str] = {str(config.project_root)}` to `seen_roots: set[str] = {str(config.project_root.resolve())}`. Also use this resolved string as the `project_id` in the main-project INSERT (line 80). This ensures deduplication is consistent with both the orchestrator loop (which calls `.resolve()` internally via `_resolve_project_root`/`_read_project_root_from_config`) and the known_project_roots loop (line 129).\n\nOptionally, pre-resolve `known_project_roots` at `DashboardConfig` construction time in `config.py` `from_env()` (line 73) to avoid repeated `lstat` syscalls on every snapshot cycle.\n\nFiles:\n- dashboard/src/dashboard/config.py\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 450 — without this, a symlinked `config.project_root` will silently produce duplicate snapshot rows.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9369,7 +9380,7 @@
       ],
       "created": "2026-04-06T18:12:21.797Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T18:12:25.285Z"
+      "updated": "2026-04-06T18:12:32.703Z"
     }
   }
 }
