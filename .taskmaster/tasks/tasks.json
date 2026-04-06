@@ -10512,6 +10512,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 550,
+        "title": "Strengthen cancellation test coverage in test_rebuild_entity_summaries",
+        "description": "Fix four gaps in the cancellation test suite added by task 516: misleading docstring, missing caplog assertion in mixed-error test, missing coverage for CancelledError in second slot, and a weak group_id assertion.",
+        "details": "Several gaps and inaccuracies remain in the cancellation test suite added by task 516 (fused-memory/tests/test_rebuild_entity_summaries.py).\n\nISSUE 1 — Misleading docstring (test:1201-1207)\nThe docstring for test_cancelled_error_logs_warning_before_propagating says \"rebuilt_so_far=0 and errors_so_far=0 because Pass 2 has not yet executed for this batch\". The phrase \"for this batch\" implies a per-batch counter reset, but the implementation has a single flat asyncio.gather with no batching loop — counters are initialized once and can only be non-zero after Pass 2 completes. A future maintainer adding batching might believe the counters reset each batch.\nFIX: Change to \"rebuilt_so_far=0 and errors_so_far=0 because counters are only incremented in Pass 2, which never executes when CancelledError is found in Pass 1.\"\n\nISSUE 2 — Missing caplog assertion in mixed-error test (test:1163-1195)\ntest_cancelled_error_propagates_alongside_other_errors (RuntimeError first, CancelledError second) verifies CancelledError is still raised but does not assert the WARNING is emitted exactly once. A regression that drops the warning from the mixed-error path would not be caught.\nFIX: Add a caplog assertion verifying len(warning_records) == 1 and basic message content.\n\nISSUE 3 — Missing coverage for CancelledError in second slot (test:1217-1219)\nThe existing test only exercises CancelledError in the first results slot. There is no test for side_effect=[None, asyncio.CancelledError()] where the first entity succeeds and CancelledError is raised for the second. In that ordering, Pass 1 scans index 0 (success — skip), then index 1 (CancelledError — warn and raise). The warning should still fire exactly once.\nFIX: Add a parameterized variant or separate test covering CancelledError in position 1.\n\nISSUE 4 — Weak assertion (test:1236)\nassert 'test' in msg checks for the bare string 'test' rather than verifying the group_id is logged with its key. A group_id like 'testing-group' would satisfy the check vacuously.\nFIX: Replace with assert 'group=test' in msg.\n\nFILES:\n- fused-memory/tests/test_rebuild_entity_summaries.py (lines 1163-1238)\n\nNOTE: This task may need to coordinate with the sibling observability task that renames the warning log keys — if that task lands first, update the new key names here accordingly.\n\nSource: review suggestions from task 516 (#5 weak_assertion, #6 misleading_docstring, #7 missing_coverage mixed-error, #8 missing_coverage second-slot).",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10524,7 +10535,7 @@
       ],
       "created": "2026-04-06T23:31:28.812Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T23:31:28.816Z"
+      "updated": "2026-04-06T23:31:45.869Z"
     }
   }
 }
