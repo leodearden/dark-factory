@@ -59,7 +59,19 @@ class TaskKnowledgeSync(BaseStage):
         if self.filtered_task_tree is not None:
             # Harness pre-fetched the tree — use it directly, skip get_tasks()
             filtered = self.filtered_task_tree
-            done_tasks_for_display: list[dict] = []  # done tasks not separately available
+            # FilteredTaskTree doesn't retain done task objects (by design, to save memory).
+            # Render a lightweight summary so the LLM agent knows how many tasks completed
+            # rather than seeing a silently empty "Recently Completed Tasks" section.
+            if filtered.done_count > 0:
+                done_tasks_for_display: list[dict] = [
+                    {
+                        'id': '-',
+                        'title': f'{filtered.done_count} completed tasks (details omitted to save context)',
+                        'status': 'done',
+                    }
+                ]
+            else:
+                done_tasks_for_display = []
         else:
             # Fallback: self-fetch using the shared filter (fixes blocked/deferred regression)
             tasks_data: dict = {}

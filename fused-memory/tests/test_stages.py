@@ -1500,3 +1500,71 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         # Proactive Task Sample section must be present
         assert '### Proactive Task Sample' in payload
 
+    @pytest.mark.asyncio
+    async def test_recently_completed_shows_summary_when_harness_tree_used(self, mock_deps, watermark):
+        """When filtered_task_tree is set with done_count > 0, Recently Completed shows a summary."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        stage.filtered_task_tree = self._make_tree(
+            [self._make_task(10, 'in-progress')],
+            done_count=15,
+        )
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # Extract the Recently Completed Tasks section text
+        lines = payload.split('\n')
+        rc_start = None
+        for i, line in enumerate(lines):
+            if '### Recently Completed Tasks' in line:
+                rc_start = i
+                break
+        assert rc_start is not None, 'Expected ### Recently Completed Tasks section in payload'
+
+        # Get a few lines after the section header (before the next section)
+        rc_lines = []
+        for line in lines[rc_start + 1:]:
+            if line.startswith('###') or line.startswith('## '):
+                break
+            rc_lines.append(line)
+        rc_content = '\n'.join(rc_lines)
+
+        # Must NOT be silently empty ("No tasks." only)
+        assert rc_content.strip() != 'No tasks.', (
+            'Recently Completed Tasks section must show a summary when harness tree has done_count=15, '
+            f'but got only: {rc_content!r}'
+        )
+        # Must mention the done count (15)
+        assert '15' in rc_content, (
+            f'Expected "15" (done_count) to appear in Recently Completed section, got: {rc_content!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_recently_completed_populated_on_fallback(self, mock_deps, watermark):
+        """When filtered_task_tree is None, fallback path populates recently completed tasks."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        stage.filtered_task_tree = None  # no harness-provided tree — use fallback
+
+        # Return 3 done tasks and 2 active tasks
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'done'),
+                self._make_task(2, 'done'),
+                self._make_task(3, 'done'),
+                self._make_task(4, 'pending'),
+                self._make_task(5, 'in-progress'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # Fallback path must still populate done tasks
+        assert '### Recently Completed Tasks' in payload
+        # At least one of the done task titles must appear
+        assert 'Task 1' in payload or 'Task 2' in payload or 'Task 3' in payload, (
+            'Expected at least one done task title in Recently Completed Tasks section'
+        )
+
