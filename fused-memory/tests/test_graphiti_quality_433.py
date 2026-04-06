@@ -137,23 +137,38 @@ class TestCanonicalFacts:
         assert isinstance(result, list)
         assert result == ['A', 'B']
 
-    def test_whitespace_only_fact_is_kept(self):
-        """Whitespace-only facts are KEPT, not filtered.
+    def test_whitespace_only_fact_is_filtered(self):
+        """Whitespace-only facts are filtered out, not included in results.
 
-        The filter is ``if e.get('fact')`` which tests Python truthiness.
-        A non-empty string like '   ' is truthy even though it contains only
-        spaces, so it passes the filter and is included in the result.
-
-        This test documents *current* behavior. Any future decision to strip
-        whitespace-only facts would be a deliberate change and would require
-        updating this test explicitly.
+        The filter uses ``if e.get('fact', '').strip()`` so that a string like
+        '   ' strips to '' (falsy) and is excluded.  Only facts with real
+        non-whitespace content pass through.
         """
         edges = [
-            {'fact': '   '},    # whitespace-only — truthy, so kept
+            {'fact': '   '},    # whitespace-only — filtered out
             {'fact': 'A knows B'},
         ]
         result = GraphitiBackend._canonical_facts(edges)
-        assert result == ['   ', 'A knows B']
+        assert result == ['A knows B']
+
+    def test_whitespace_variants_all_filtered(self):
+        """All whitespace-only variants are filtered; content with surrounding whitespace is kept.
+
+        Tabs, newlines, mixed whitespace, and single spaces are all falsy after
+        .strip() and must be excluded.  A fact with real content but leading/
+        trailing whitespace (e.g. '  hello  ') is truthy after strip and must
+        be preserved with its original value.
+        """
+        edges = [
+            {'fact': '\t\t'},          # tabs only — filtered
+            {'fact': '\n'},            # newline only — filtered
+            {'fact': '  \t\n  '},     # mixed whitespace — filtered
+            {'fact': ' '},             # single space — filtered
+            {'fact': '  hello  '},    # real content with surrounding space — kept (raw value)
+            {'fact': 'A knows B'},    # plain fact — kept
+        ]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == ['  hello  ', 'A knows B']
 
 
 # ---------------------------------------------------------------------------
@@ -442,3 +457,41 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['status'] == 'rebuilt'
         assert ok_detail['uuid'] == 'u2'
         assert ok_detail['name'] == 'Bob'
+
+
+# ---------------------------------------------------------------------------
+# step-4: regression — whitespace-only fact must not cause false stale detection
+# ---------------------------------------------------------------------------
+
+class TestCanonicalFactsStalenessRegression:
+    """Whitespace-only facts must not make a current entity appear stale."""
+
+    @pytest.mark.asyncio
+    async def test_whitespace_fact_does_not_cause_false_stale_detection(
+        self, mock_config, make_backend
+    ):
+        """Entity with summary 'A knows B' and edges ['   ', 'A knows B'] is not stale.
+
+        Before the fix, _canonical_facts(['   ', 'A knows B']) returned
+        ['   ', 'A knows B'], so the canonical string became '   \nA knows B',
+        which does not match the stored summary 'A knows B' and the entity was
+        falsely flagged as stale.
+
+        After the fix, _canonical_facts filters out '   ', returns ['A knows B'],
+        and the joined canonical string 'A knows B' matches the stored summary —
+        so the entity is NOT stale.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'A knows B'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'u1': [{'fact': '   '}, {'fact': 'A knows B'}],
+        })
+
+        result = await backend._detect_stale_summaries_with_edges(group_id='test')
+
+        assert result.stale == [], (
+            "Entity should NOT be flagged stale when its only non-whitespace "
+            "fact matches the stored summary."
+        )
