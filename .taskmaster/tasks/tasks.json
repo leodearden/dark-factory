@@ -8649,11 +8649,11 @@
         "description": "Review suggestions from task 419 reviewers (deferred as non-blocking). All in test files:\n\n1. Stale mock: test_returns_aggregate_result mocks list_entity_nodes but non-force path now routes through _detect_stale_summaries_with_edges — mock the private method consistently (test_analyst)\n2. Missing edge case: no test for old_summary=empty-string with name provided — valid production path from force-path optimization (test_analyst)\n3. Assertion clarity: test_prefetched_edges_produce_correct_summary should assert unique fact count differs from edge_count (test_analyst)\n4. Misleading mock: test_force_list_entity_nodes_called_exactly_once uses uuid-1 data for all calls — use generic return values (test_analyst)\n\nFiles: fused-memory/tests/test_rebuild_entity_summaries.py, fused-memory/tests/test_refresh_entity_summary.py",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-04T13:10:50.742Z",
+        "updatedAt": "2026-04-06T17:19:18.439Z",
         "metadata": {
           "modules": [
             "fused-memory/tests/test_rebuild_entity_summaries.py",
@@ -9221,7 +9221,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T17:19:18.250Z",
+      "lastModified": "2026-04-06T17:19:18.439Z",
       "taskCount": 435,
       "completedCount": 396,
       "tags": [
