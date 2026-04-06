@@ -192,3 +192,38 @@ class TestHfModelIdConsistency:
             f"HF_MODELS['qwen3-coder-next'] should be 'Qwen/Qwen3-Coder-Next-FP8', "
             f"got {hf_id!r}. Update HF_MODELS in run_eval() in scripts/run_vllm_eval.py."
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-15 tests: cross-coupling regression guards
+# ---------------------------------------------------------------------------
+
+
+class TestModelsConfigNameCrossCoupling:
+    """Every MODELS[*][1] config_name must resolve via get_config_by_name.
+
+    Guards against the rename drifting in only one of the two files
+    (scripts/run_vllm_eval.py and orchestrator/evals/configs.py).
+    """
+
+    def test_every_models_config_name_resolves(self, _parsed_models):
+        """Each config_name in MODELS must map to a real EvalConfig via get_config_by_name."""
+        missing = []
+        for model_key, entry in _parsed_models.items():
+            config_name = entry[1]
+            if get_config_by_name(config_name) is None:
+                missing.append(f"{model_key!r} → {config_name!r}")
+        assert not missing, (
+            "MODELS entries whose config_name is not in VLLM_EVAL_CONFIGS/EVAL_CONFIGS:\n"
+            + "\n".join(f"  {m}" for m in missing)
+        )
+
+    def test_qwen3_coder_next_old_name_is_gone(self):
+        """get_config_by_name('qwen3-coder-next-fp8') must return None after the rename.
+
+        Symmetric to TestDroppedQwen25Regression — ensures the old name is not accessible.
+        """
+        assert get_config_by_name("qwen3-coder-next-fp8") is None, (
+            "Old config name 'qwen3-coder-next-fp8' still resolves — "
+            "the rename in configs.py may have been reverted."
+        )
