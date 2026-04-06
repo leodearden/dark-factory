@@ -263,7 +263,7 @@ class TestRebuildEntitySummariesDataFlow:
         from fused_memory.backends.graphiti_client import StaleSummaryResult
 
         backend = make_backend(mock_config)
-        stale_list = [{'uuid': 'u1', 'name': 'Alice'}]
+        stale_list = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'old'}]
         all_edges = {'u1': [{'fact': 'Alice knows Bob'}]}
         # total_count=10 means 10 entities exist but only 1 is stale
         detect_result = StaleSummaryResult(
@@ -290,8 +290,8 @@ class TestRebuildEntitySummariesDataFlow:
 
         backend = make_backend(mock_config)
         stale_list = [
-            {'uuid': 'u1', 'name': 'Alice'},
-            {'uuid': 'u2', 'name': 'Bob'},
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'old-a'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'old-b'},
         ]
         detect_result = StaleSummaryResult(
             stale=stale_list, edges={}, total_count=7
