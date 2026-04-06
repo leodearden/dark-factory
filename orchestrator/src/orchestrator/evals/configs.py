@@ -30,7 +30,7 @@ def _vllm_config(name: str, hf_model: str, effort: str = 'high') -> EvalConfig:
 VLLM_EVAL_CONFIGS = [
     # Spark tier (RunPod H100s)
     _vllm_config('minimax-m25-fp8',       'MiniMaxAI/MiniMax-M2.5'),
-    _vllm_config('qwen3-coder-next-fp8',  'Qwen/Qwen3-Coder-Next'),
+    _vllm_config('qwen3-coder-next-fp8-new',  'Qwen/Qwen3-Coder-Next'),  # renamed Task 515: post-fix variant
     _vllm_config('reap-139b-nvfp4',       'cerebras/MiniMax-M2.5-REAP-139B-A10B'),
     _vllm_config('reap-172b-nvfp4',       'cerebras/MiniMax-M2.5-REAP-172B-A10B'),
     # 3090 tier (workstation)
