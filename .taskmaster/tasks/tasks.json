@@ -9662,6 +9662,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 494,
+        "title": "Align StaleSummaryResult class docstring with named-access convention",
+        "description": "The `StaleSummaryResult` class docstring (graphiti_client.py:28-33) actively advertises backward-compatible positional unpacking (`stale, all_edges, total = await ...`) while the completed task 438/465 migration moved all call sites to named access. This creates a design tension: the type simultaneously endorses the old pattern the project moved away from.\n\n**Required changes:**\n\nUpdate the class docstring at `fused-memory/src/fused_memory/backends/graphiti_client.py:28-33` to:\n- Remove or deprecate the positional-unpacking example\n- Document the canonical named-access pattern instead (e.g., `result.stale`, `result.all_edges`, `result.total_count`)\n- Optionally add a note that positional unpacking still works (NamedTuple guarantee) but named access is preferred\n\nThe test `test_tuple_unpacking_still_works_after_rename` in `test_stale_summary_named_access_438.py:39-47` should remain — it verifies the NamedTuple contract. But the class docstring shouldn't actively promote the pattern.\n\nVerify: `pytest fused-memory/tests/test_stale_summary_named_access_438.py -x`\n\nMemory hints: search for \"StaleSummaryResult\" and \"graphiti_client _detect_stale_summaries_with_edges docstring\".",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9674,7 +9685,7 @@
       ],
       "created": "2026-04-06T19:31:47.524Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T19:31:47.527Z"
+      "updated": "2026-04-06T19:31:54.299Z"
     }
   }
 }
