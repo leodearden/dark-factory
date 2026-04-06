@@ -309,6 +309,16 @@ class TestListIndices:
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.list_indices(group_id='test')
 
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """list_indices uses ro_query (read-only path) and never calls graph.query."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.list_indices(group_id='test')
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
+
 
 class TestDropIndex:
     """GraphitiBackend.drop_index(label, field) generates correct DROP Cypher."""

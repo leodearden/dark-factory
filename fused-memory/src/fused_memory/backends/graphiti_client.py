@@ -1176,10 +1176,12 @@ class GraphitiBackend:
     async def list_indices(self, *, group_id: str) -> list[dict]:
         """Return parsed index records from the graph.
 
+        Uses ro_query since no writes are performed.
+
         Each record is a dict with keys: label, field, type, entity_type.
         """
         graph = self._graph_for(group_id)
-        result = await graph.query('CALL db.indexes()')
+        result = await graph.ro_query('CALL db.indexes()')
         indices = []
         for row in (result.result_set or []):
             indices.append({
