@@ -826,10 +826,10 @@ class TestDetectStaleSummariesBulk:
         backend.get_all_valid_edges = AsyncMock(return_value={
             'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
         })
-        stale, _, _ = await backend._detect_stale_summaries_with_edges(group_id='test')
-        assert len(stale) == 1
-        assert 'summary' in stale[0]
-        assert stale[0]['summary'] == original_summary
+        result = await backend._detect_stale_summaries_with_edges(group_id='test')
+        assert len(result.stale) == 1
+        assert 'summary' in result.stale[0]
+        assert result.stale[0]['summary'] == original_summary
 
 
 # ---------------------------------------------------------------------------

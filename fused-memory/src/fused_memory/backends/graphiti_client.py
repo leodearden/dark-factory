@@ -866,7 +866,7 @@ class GraphitiBackend:
     async def _detect_stale_summaries_with_edges(
         self, *, group_id: str
     ) -> StaleSummaryResult:
-        """Internal: detect stale summaries and return (stale_list, all_edges_dict, total_count).
+        """Internal: detect stale summaries and return a StaleSummaryResult.
 
         Shared by detect_stale_summaries (public API) and rebuild_entity_summaries
         to avoid a duplicate bulk edge fetch when both are needed.
@@ -875,8 +875,10 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            Tuple of (stale_list, all_edges_dict, total_entity_count) where
-            all_edges_dict is keyed by entity UUID.
+            StaleSummaryResult with fields:
+              .stale       - list of stale entity dicts
+              .all_edges   - dict[uuid, list[dict]] of valid edges for all entities
+              .total_count - total number of entity nodes scanned
         """
         entities = await self.list_entity_nodes(group_id=group_id)
         all_edges = await self.get_all_valid_edges(group_id=group_id)

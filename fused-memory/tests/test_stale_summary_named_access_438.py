@@ -67,6 +67,32 @@ class TestDetectStaleSummariesNamedAccess:
         assert returned == stale_list
         backend._detect_stale_summaries_with_edges.assert_awaited_once_with(group_id='t')
 
+    @pytest.mark.asyncio
+    async def test_detect_stale_summaries_includes_summary_field_named_access(
+        self, mock_config, make_backend
+    ):
+        """Stale entity dicts from _detect_stale_summaries_with_edges include a 'summary'
+        key, accessible via result.stale (named attribute access, not positional unpacking).
+
+        Regression lock: this test guards against reversion to positional unpacking
+        for the summary-field scenario originally at line 829 of
+        test_rebuild_entity_summaries.py.
+        """
+        backend = make_backend(mock_config)
+        original_summary = 'old stale fact'
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': original_summary},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
+        })
+
+        result = await backend._detect_stale_summaries_with_edges(group_id='test')
+
+        assert len(result.stale) == 1
+        assert 'summary' in result.stale[0]
+        assert result.stale[0]['summary'] == original_summary
+
 
 class TestRebuildEntitySummariesNamedAccess:
     """rebuild_entity_summaries uses named attribute access on StaleSummaryResult."""
