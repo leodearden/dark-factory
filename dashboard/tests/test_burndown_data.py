@@ -263,6 +263,34 @@ class TestCollectSnapshot:
         assert count == 1  # only one row for reify, not two
 
     @pytest.mark.asyncio
+    async def test_main_project_id_is_resolved_path(self, tmp_path):
+        """project_id in snapshot must be the resolved path even when project_root is a symlink."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        from dashboard.config import DashboardConfig
+        config = DashboardConfig(project_root=link)
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+
+        assert len(rows) == 1
+        # project_id must be the resolved real path, not the symlink path
+        assert rows[0][0] == str(real_dir.resolve())
+
+    @pytest.mark.asyncio
     async def test_discovers_config_flag_orchestrator(self, tmp_path):
         """Orchestrators launched with --config (no --prd) are snapshotted."""
         db_path = tmp_path / 'burndown.db'
