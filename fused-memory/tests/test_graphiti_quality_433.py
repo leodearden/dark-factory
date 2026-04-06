@@ -444,7 +444,7 @@ class TestRebuildEntitySummariesErrorHandling:
         backend._rebuild_entity_from_edges = AsyncMock(
             side_effect=[
                 RuntimeError('boom'),
-                {'uuid': 'u2', 'name': 'Bob', 'old_summary': '', 'new_summary': 'rebuilt', 'edge_count': 0},
+                {'uuid': 'u2', 'name': 'Bob', 'old_summary': 'stale summary 2', 'new_summary': 'Bob summary v2', 'edge_count': 3},
             ]
         )
 
@@ -469,9 +469,16 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['status'] == 'rebuilt'
         assert ok_detail['uuid'] == 'u2'
         assert ok_detail['name'] == 'Bob'
-        assert ok_detail['old_summary'] == ''
-        assert ok_detail['new_summary'] == 'rebuilt'
-        assert ok_detail['edge_count'] == 0
+        assert ok_detail['old_summary'] == 'stale summary 2'
+        assert ok_detail['new_summary'] == 'Bob summary v2'
+        assert ok_detail['edge_count'] == 3
+
+        # Verify the implementation forwards the entity's summary as old_summary
+        # into _rebuild_entity_from_edges (not just trusting the mock return value).
+        # This pins down the entity→target→helper data-forwarding path.
+        backend._rebuild_entity_from_edges.assert_any_call(
+            'u2', 'Bob', [], group_id='test', old_summary='stale summary 2'
+        )
 
     @pytest.mark.asyncio
     async def test_force_false_partial_error_uses_detect_total(self, mock_config, make_backend):
