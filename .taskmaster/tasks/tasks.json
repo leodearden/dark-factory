@@ -9238,6 +9238,17 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 458,
+        "title": "Fix naming and comment accuracy in TestStaleSummaryResult",
+        "description": "Two related fixes in fused-memory/tests/test_graphiti_quality_433.py around test_is_tuple_subclass (line 57):\n\n1. Rename the method from `test_is_tuple_subclass` to `test_value_equal_to_plain_tuple` (or `test_equals_plain_tuple`) to match the actual value-equality assertion. The current name contradicts the assertion which was changed from `isinstance(result, tuple)` to `result == (stale_list, edges, 1)`.\n\n2. Replace the inline comment at line 62-63 — 'only actual tuple subclasses compare equal to plain tuples this way' — with something accurate like: '# NamedTuple is a tuple subclass, so value-equality with a plain tuple holds — this confirms the backward-compat contract is in place.' The current comment is misleading because any Python object can implement __eq__ to compare equal to a tuple.\n\nFiles: fused-memory/tests/test_graphiti_quality_433.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9249,7 +9260,8 @@
         "master"
       ],
       "created": "2026-04-06T17:32:54.928Z",
-      "description": "Tasks for master context"
+      "description": "Tasks for master context",
+      "updated": "2026-04-06T17:39:24.269Z"
     }
   }
 }
