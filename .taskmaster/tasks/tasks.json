@@ -9957,6 +9957,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 512,
+        "title": "Apply two-tier CancelledError guard to context_assembler.py gather site",
+        "description": "At context_assembler.py:125, the existing `if isinstance(ctx_result, BaseException): ctx_result = []` silently converts CancelledError into empty context and lets execution continue. Apply the same two-tier pattern: add a pre-scan pass that re-raises any result where `isinstance(r, BaseException) and not isinstance(r, Exception)`, then narrow the accumulator guard to `isinstance(ctx_result, Exception)`. This is the same fix applied to graphiti_client in task 484's diff.\n\nSource: review suggestions from task 484. Rationale: structured-concurrency cancellation must propagate; converting CancelledError into empty lists breaks graceful shutdown.\n\nFiles:\n- fused-memory/src/fused_memory/reconciliation/context_assembler.py\n- fused-memory/tests/test_rebuild_entity_summaries.py (or a new context_assembler test file)",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9969,7 +9980,7 @@
       ],
       "created": "2026-04-06T22:18:01.715Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:18:01.718Z"
+      "updated": "2026-04-06T22:18:07.438Z"
     }
   }
 }
