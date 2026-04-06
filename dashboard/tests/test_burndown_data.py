@@ -10,6 +10,7 @@ from unittest.mock import patch
 import aiosqlite
 import pytest
 
+from dashboard.config import DashboardConfig
 from dashboard.data.burndown import (
     BURNDOWN_SCHEMA,
     _count_statuses,
@@ -106,7 +107,6 @@ class TestCollectSnapshot:
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
-        from dashboard.config import DashboardConfig
         config = DashboardConfig(project_root=tmp_path)
 
         fake_tasks = [
@@ -143,7 +143,6 @@ class TestCollectSnapshot:
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
-        from dashboard.config import DashboardConfig
         config = DashboardConfig(project_root=tmp_path)
 
         fake_orchestrators = [{'prd': str(tmp_path / 'prd.md'), 'project_root': str(tmp_path)}]
@@ -172,7 +171,6 @@ class TestCollectSnapshot:
         reify_root = Path('/home/leo/src/reify')
         autopilot_root = Path('/home/leo/src/autopilot-video')
 
-        from dashboard.config import DashboardConfig
         config = DashboardConfig(
             project_root=tmp_path,
             known_project_roots=[reify_root, autopilot_root],
@@ -205,7 +203,6 @@ class TestCollectSnapshot:
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
-        from dashboard.config import DashboardConfig
         config = DashboardConfig(
             project_root=tmp_path,
             known_project_roots=[tmp_path],  # same as project_root
@@ -234,7 +231,6 @@ class TestCollectSnapshot:
 
         reify_root = Path('/home/leo/src/reify')
 
-        from dashboard.config import DashboardConfig
         config = DashboardConfig(
             project_root=tmp_path,
             known_project_roots=[reify_root],
@@ -268,7 +264,6 @@ class TestCollectSnapshot:
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
-        from dashboard.config import DashboardConfig
         config = DashboardConfig(project_root=tmp_path)
 
         reify_root = Path('/home/leo/src/reify')
