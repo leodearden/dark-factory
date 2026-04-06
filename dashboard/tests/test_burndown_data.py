@@ -322,6 +322,51 @@ class TestCollectSnapshot:
         assert reify_row[3] == 1  # pending
         assert reify_row[8] == 1  # done
 
+    @pytest.mark.asyncio
+    async def test_load_task_tree_calls_run_concurrently(self, tmp_path):
+        """All load_task_tree calls must run concurrently via asyncio.gather.
+
+        Uses a threading.Barrier(N) to detect concurrency: all N threads must
+        reach the barrier simultaneously. With sequential awaits, only one thread
+        is alive at a time so barrier.wait() times out (BrokenBarrierError).
+        With asyncio.gather, all N threads are live simultaneously and the
+        barrier succeeds.
+        """
+        import threading
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        reify_root = Path('/home/leo/src/reify')
+        autopilot_root = Path('/home/leo/src/autopilot-video')
+
+        from dashboard.config import DashboardConfig
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[reify_root, autopilot_root],
+        )
+
+        # 3 distinct roots: main project + 2 known roots (no orchestrators)
+        n_roots = 3
+        barrier = threading.Barrier(n_roots, timeout=2.0)
+
+        def fake_load(path):
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pytest.fail(
+                    'load_task_tree calls did not run concurrently '
+                    '(barrier timed out — calls appear to be sequential)'
+                )
+            return []
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                await collect_snapshot(conn, config)
+
 
 # ---------------------------------------------------------------------------
 # downsample
