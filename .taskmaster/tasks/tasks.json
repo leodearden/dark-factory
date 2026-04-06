@@ -9805,6 +9805,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 502,
+        "title": "Fix assertion placement inside async context manager blocks in burndown tests",
+        "description": "In `dashboard/tests/test_burndown_data.py`, move assertions inside their enclosing `async with conn.execute(...)` blocks so that failures produce clear AssertionErrors rather than misleading NameErrors.\n\n1. In `test_deduplicates_main_project_from_orchestrators` (lines 165-170): move `assert count == 1` inside the `async with` block alongside `assert row is not None` and the `count = row[0]` binding.\n\n2. In `test_dedupes_known_root_against_main_project` (lines 221-227): same pattern — move `assert count == 1` inside the block.\n\n3. In `TestBurndownEnvFixture.test_yields_valid_triple` (lines 505-508): move `assert row is not None` and `assert row[0] == 0` inside the `async with conn.execute(...)` block where `row` is fetched.\n\nFor all three cases the `COUNT(*)` query always returns a row so the NameError path can't trigger today, but keeping assertions inside the context manager is unambiguous and consistent with the rest of the file.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9817,7 +9828,7 @@
       ],
       "created": "2026-04-06T19:59:52.592Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T19:59:55.740Z"
+      "updated": "2026-04-06T20:00:01.113Z"
     }
   }
 }
