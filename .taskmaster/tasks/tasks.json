@@ -9915,6 +9915,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 509,
+        "title": "Resolve project_root in find_running_orchestrators result dict",
+        "description": "In `dashboard/src/dashboard/data/orchestrator.py` line 346, change:\n```python\n'project_root': str(project_root),\n```\nto:\n```python\n'project_root': str(project_root.resolve()),\n```\nOptionally also have `_resolve_project_root` return `.resolve()` at its return sites so callers receive a resolved Path by contract. This ensures any downstream consumer that joins orchestrator result `project_root` values against burndown DB `project_id` (which is always the resolved path) gets a consistent match.\n\nWithout this, if a symlink appears anywhere in the PRD's ancestor chain, the `project_root` field in the orchestrator result will differ from the resolved `project_id` stored in the burndown DB, breaking any downstream component that joins the two.\n\nFiles: dashboard/src/dashboard/data/orchestrator.py\n\nSource: review suggestions on task 469 (suggestion 3 from reviewer_architect_reviewer).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9927,7 +9938,7 @@
       ],
       "created": "2026-04-06T22:12:52.146Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:12:52.148Z"
+      "updated": "2026-04-06T22:12:58.872Z"
     }
   }
 }
