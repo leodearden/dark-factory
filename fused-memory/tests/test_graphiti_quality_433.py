@@ -274,6 +274,32 @@ class TestRebuildEntitySummariesForceDryRun:
         for detail in result['details']:
             assert detail['status'] == 'skipped_dry_run'
 
+    @pytest.mark.asyncio
+    async def test_force_no_dry_run_calls_get_all_valid_edges(self, mock_config, make_backend):
+        """Positive complement: force=True, dry_run=False calls get_all_valid_edges exactly once.
+
+        This is the paired positive case for test_force_dry_run_does_not_call_get_all_valid_edges.
+        When dry_run=False the edges ARE needed for the actual rebuild, so
+        get_all_valid_edges must be called before processing entities.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        # Mock the inner rebuild to avoid touching real write path
+        backend._rebuild_entity_from_edges = AsyncMock(return_value={
+            'uuid': 'u1', 'name': 'Alice',
+            'old_summary': '', 'new_summary': '', 'edge_count': 0,
+        })
+
+        await backend.rebuild_entity_summaries(
+            group_id='test', force=True, dry_run=False
+        )
+
+        backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
+
 
 # ---------------------------------------------------------------------------
 # step-9: regression – rebuild_entity_summaries(force=False) data flow
