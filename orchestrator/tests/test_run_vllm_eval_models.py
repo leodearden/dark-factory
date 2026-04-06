@@ -170,3 +170,25 @@ class TestGpuTypesPriority:
             f"H200 (idx {h200_first}) must come before RTX PRO 6000 (idx {rtx_idx}) "
             f"in GPU_TYPES. Current order: {_parsed_gpu_types}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-13 test: HF_MODELS consistency
+# ---------------------------------------------------------------------------
+
+
+class TestHfModelIdConsistency:
+    """HF_MODELS inside run_eval() must use the FP8 variant, matching configs.py."""
+
+    def test_qwen3_coder_next_uses_fp8_variant(self, _parsed_hf_models):
+        """HF_MODELS['qwen3-coder-next'] must be 'Qwen/Qwen3-Coder-Next-FP8'.
+
+        The script downloads this as MODEL_NAME env var to the vLLM container.
+        Switching from the 149GB unquantized model halves disk pressure and matches
+        the FP8 variant tested in all relevant vLLM bug reports.
+        """
+        hf_id = _parsed_hf_models.get("qwen3-coder-next")
+        assert hf_id == "Qwen/Qwen3-Coder-Next-FP8", (
+            f"HF_MODELS['qwen3-coder-next'] should be 'Qwen/Qwen3-Coder-Next-FP8', "
+            f"got {hf_id!r}. Update HF_MODELS in run_eval() in scripts/run_vllm_eval.py."
+        )
