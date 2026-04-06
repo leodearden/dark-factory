@@ -9794,6 +9794,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 501,
+        "title": "Remove redundant list() wrappers around fetchall() in burndown tests",
+        "description": "In `dashboard/tests/test_burndown_data.py`, replace the three occurrences of `list(await cur.fetchall())` with `await cur.fetchall()` directly. Locations: line 138 in `test_inserts_main_project`, line 197 in `test_snapshots_known_project_roots_when_no_orchestrators`, and line 281 in `test_discovers_config_flag_orchestrator`. aiosqlite's fetchall() already returns a list; the extra list() call allocates a needless copy.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9806,7 +9817,7 @@
       ],
       "created": "2026-04-06T19:59:52.592Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T19:59:52.595Z"
+      "updated": "2026-04-06T19:59:55.740Z"
     }
   }
 }
