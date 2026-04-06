@@ -230,3 +230,29 @@ class TestFormatFilteredTaskTree:
             f'trimmed_count={trimmed_count} exceeds max_tasks=50; '
             f'bug: using total_active instead of len(active[:max_tasks])'
         )
+
+    def test_deps_none_normalized_to_empty_list(self):
+        """deps=None (explicitly set) must render as [] not None.
+
+        When a task dict has 'dependencies': None (key present, value None), the formatter
+        must treat it as an empty list. Bug: `t.get('dependencies', [])` returns None
+        when the key is present with value None; should use `t.get('dependencies') or []`.
+        """
+        task_with_none_deps = {
+            'id': 1,
+            'title': 'Task with None deps',
+            'status': 'pending',
+            'dependencies': None,  # explicit None, not missing
+        }
+        tree = FilteredTaskTree(
+            active_tasks=[task_with_none_deps],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=1,
+        )
+        output = format_filtered_task_tree(tree)
+
+        # Must render deps as empty list, not None
+        assert 'deps=[]' in output, f'Expected deps=[] in output, got: {output!r}'
+        assert 'deps=None' not in output, f'Found deps=None in output: {output!r}'
