@@ -297,6 +297,121 @@ class TestCollectSnapshot:
         assert reify_row[3] == 1  # pending
         assert reify_row[8] == 1  # done
 
+    @pytest.mark.asyncio
+    async def test_continues_when_known_root_unreadable(self, tmp_path):
+        """PermissionError on one known root is skipped; other roots are still snapshotted."""
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        root_a = Path('/fake/project/root_a')
+        root_b = Path('/fake/project/root_b')
+        root_c = Path('/fake/project/root_c')
+
+        from dashboard.config import DashboardConfig
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[root_a, root_b, root_c],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        root_a_tasks = [{'status': 'done'}]
+        root_c_tasks = [{'status': 'in-progress'}]
+
+        # 4 calls: main, root_a, root_b (raises), root_c
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree',
+                      side_effect=[main_tasks, root_a_tasks, PermissionError('Permission denied'), root_c_tasks]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+
+        project_ids = {row[0] for row in rows}
+        # main + root_a + root_c should be present
+        assert len(rows) == 3
+        assert str(tmp_path) in project_ids
+        assert str(root_a.resolve()) in project_ids
+        assert str(root_c.resolve()) in project_ids
+        # root_b should NOT be present
+        assert str(root_b.resolve()) not in project_ids
+
+    @pytest.mark.asyncio
+    async def test_logs_warning_when_known_root_unreadable(self, tmp_path, caplog):
+        """A WARNING is logged naming the failing root when PermissionError occurs."""
+        import logging
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        bad_root = Path('/fake/project/bad_root')
+
+        from dashboard.config import DashboardConfig
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[bad_root],
+        )
+
+        main_tasks: list = []
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree',
+                      side_effect=[main_tasks, PermissionError('Permission denied')]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                await collect_snapshot(conn, config)
+
+        # At least one WARNING record should name the failing root
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'Expected at least one WARNING log record'
+        combined = ' '.join(r.getMessage() for r in warning_records)
+        assert 'bad_root' in combined or str(bad_root) in combined
+        # exc_info must be populated on the warning record
+        assert any(r.exc_info for r in warning_records)
+
+    @pytest.mark.asyncio
+    async def test_first_root_failure_does_not_block_subsequent_inserts(self, tmp_path):
+        """If the very first known root fails, subsequent roots still get snapshotted."""
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        bad_root = Path('/fake/project/bad_root')
+        good_root = Path('/fake/project/good_root')
+
+        from dashboard.config import DashboardConfig
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[bad_root, good_root],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        good_tasks = [{'status': 'done'}, {'status': 'done'}]
+
+        # 3 calls: main, bad_root (raises), good_root
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree',
+                      side_effect=[main_tasks, PermissionError('denied'), good_tasks]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT project_id, done FROM snapshots ORDER BY project_id') as cur:
+                rows = list(await cur.fetchall())
+
+        assert len(rows) == 2
+        project_ids = {row[0] for row in rows}
+        assert str(tmp_path) in project_ids          # (a) main project row
+        assert str(good_root.resolve()) in project_ids  # (b) good_root row
+        assert str(bad_root.resolve()) not in project_ids  # (c) no bad_root row
+
+        good_row = next(r for r in rows if r[0] == str(good_root.resolve()))
+        assert good_row[1] == 2  # done=2 for good_root
+
 
 # ---------------------------------------------------------------------------
 # downsample
