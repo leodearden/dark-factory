@@ -111,6 +111,23 @@ class TestFilterTaskTree:
         done_ids = {t['id'] for t in result.done_tasks}
         assert done_ids == {6, 7, 8}
 
+    def test_filter_task_tree_caps_done_tasks_at_max_retained(self):
+        """filter_task_tree caps done_tasks at MAX_DONE_TASKS_RETAINED (30) while preserving done_count."""
+        tasks_data = {
+            'tasks': [_make_task(i, 'done') for i in range(1, 51)]  # 50 done tasks
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert len(result.done_tasks) == 30, (
+            f'Expected 30 done tasks retained, got {len(result.done_tasks)}'
+        )
+        assert result.done_count == 50, (
+            f'done_count must reflect full input count (50), got {result.done_count}'
+        )
+        assert len(result.done_tasks) < result.done_count, (
+            'Consumers should detect overflow via len(done_tasks) < done_count'
+        )
+
     def test_sorts_active_by_priority_and_id_desc(self):
         """filter_task_tree sorts active tasks by _STATUS_PRIORITY then ID descending."""
         tasks_data = {

@@ -32,6 +32,11 @@ INACTIVE_TASK_STATUSES: frozenset[str] = frozenset({
     'cancelled',
 })
 
+# Maximum number of done task dicts to retain in FilteredTaskTree.done_tasks.
+# 30 matches the existing done_tasks[:30] cap in the legacy task_knowledge_sync.py
+# prompt renderer, so switching consumers over later is a no-op for output budget.
+MAX_DONE_TASKS_RETAINED: int = 30
+
 # Status priority for sorting: lower value = higher priority.
 # Matches _select_proactive_sample in task_knowledge_sync.py, with 'deferred'
 # added at priority 5 (below 'pending') since it was missing there.
@@ -118,7 +123,7 @@ def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
     total = len(active) + done_count + cancelled_count + other_count
     return FilteredTaskTree(
         active_tasks=active,
-        done_tasks=done,
+        done_tasks=done[:MAX_DONE_TASKS_RETAINED],
         done_count=done_count,
         cancelled_count=cancelled_count,
         other_count=other_count,
