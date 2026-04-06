@@ -260,6 +260,39 @@ class TestCollectSnapshot:
         assert count == 1
 
     @pytest.mark.asyncio
+    async def test_symlinked_root_deduplicates_with_known_roots(self, tmp_path):
+        """If known_project_roots includes the resolved real path, it deduplicates with a symlinked project_root."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        from dashboard.config import DashboardConfig
+        # project_root is the symlink; known_project_roots contains the resolved real path
+        config = DashboardConfig(
+            project_root=link,
+            known_project_roots=[real_dir],  # same underlying dir, unresolved
+        )
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+                row = await cur.fetchone()
+                assert row is not None
+                count = row[0]
+
+        # Only 1 row — symlink project_root and known real path deduplicate
+        assert count == 1
+
+    @pytest.mark.asyncio
     async def test_dedupes_known_root_against_running_orchestrator(self, tmp_path):
         """If known_project_roots includes a root already discovered via orchestrator, no duplicate."""
         db_path = tmp_path / 'burndown.db'
