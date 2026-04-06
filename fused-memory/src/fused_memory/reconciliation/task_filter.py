@@ -80,6 +80,7 @@ def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
         return FilteredTaskTree()
 
     active: list[dict] = []
+    done: list[dict] = []
     done_count = 0
     cancelled_count = 0
     other_count = 0
@@ -94,6 +95,7 @@ def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
             active.append(task)
         elif status == 'done':
             done_count += 1
+            done.append(task)
         elif status == 'cancelled':
             cancelled_count += 1
         else:
@@ -116,6 +118,7 @@ def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
     total = len(active) + done_count + cancelled_count + other_count
     return FilteredTaskTree(
         active_tasks=active,
+        done_tasks=done,
         done_count=done_count,
         cancelled_count=cancelled_count,
         other_count=other_count,

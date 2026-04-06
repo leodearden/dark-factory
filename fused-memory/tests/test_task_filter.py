@@ -88,6 +88,29 @@ class TestFilterTaskTree:
             'Mutable default arg regression: tree2.done_tasks was affected by tree1 mutation'
         )
 
+    def test_filter_task_tree_populates_done_tasks(self):
+        """filter_task_tree captures done task dicts in done_tasks (not just counted)."""
+        done6 = _make_task(6, 'done', 'Done task 6')
+        done7 = _make_task(7, 'done', 'Done task 7')
+        done8 = _make_task(8, 'done', 'Done task 8')
+        tasks_data = {
+            'tasks': [
+                _make_task(1, 'pending'),
+                _make_task(2, 'in-progress'),
+                done6,
+                done7,
+                done8,
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert len(result.done_tasks) == 3
+        assert result.done_count == 3
+
+        # Verify original dict objects are retained (identity-preserving, no copies)
+        done_ids = {t['id'] for t in result.done_tasks}
+        assert done_ids == {6, 7, 8}
+
     def test_sorts_active_by_priority_and_id_desc(self):
         """filter_task_tree sorts active tasks by _STATUS_PRIORITY then ID descending."""
         tasks_data = {
