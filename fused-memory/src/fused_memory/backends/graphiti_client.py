@@ -932,8 +932,8 @@ class GraphitiBackend:
             duplicate_count, stale_line_count, valid_fact_count,
             summary_line_count.
         """
-        stale, _, _ = await self._detect_stale_summaries_with_edges(group_id=group_id)
-        return stale
+        result = await self._detect_stale_summaries_with_edges(group_id=group_id)
+        return result.stale
 
     async def _rebuild_entity_from_edges(
         self, uuid: str, name: str, edges: list[dict], *, group_id: str,
