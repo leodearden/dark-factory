@@ -612,3 +612,103 @@ class TestPurgeDead:
             assert 'Query timed out' in item['error']
 
         await q.close()
+
+    @pytest.mark.asyncio
+    async def test_purge_dead_by_group_id(self, tmp_path):
+        """purge_dead(group_id=...) removes only dead rows for the given group."""
+        execute = AsyncMock(side_effect=RuntimeError('always fails'))
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute,
+            workers_per_group=2,
+            semaphore_limit=10,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+
+        for i in range(2):
+            await q.enqueue(
+                group_id='alpha', operation='add_episode',
+                payload={'content': f'alpha{i}', 'group_id': 'alpha', 'name': f'ep{i}'},
+            )
+        for i in range(3):
+            await q.enqueue(
+                group_id='beta', operation='add_episode',
+                payload={'content': f'beta{i}', 'group_id': 'beta', 'name': f'ep{i}'},
+            )
+        await asyncio.sleep(1.0)
+
+        dead_before = await q.get_dead_items()
+        assert len(dead_before) == 5
+
+        purged = await q.purge_dead(group_id='alpha')
+        assert purged == 2
+
+        dead_after = await q.get_dead_items()
+        assert len(dead_after) == 3
+        for item in dead_after:
+            assert item['group_id'] == 'beta'
+
+        await q.close()
+
+    @pytest.mark.asyncio
+    async def test_purge_dead_combined_filters(self, tmp_path):
+        """purge_dead(group_id=..., error_pattern=...) ANDs the two filters."""
+        call_count = 0
+
+        async def patterned_execute(op, payload):
+            nonlocal call_count
+            call_count += 1
+            name = payload.get('name', '')
+            if name.startswith('node'):
+                raise RuntimeError('NodeNotFoundError: node xyz not found')
+            raise RuntimeError('Query timed out')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=patterned_execute,
+            workers_per_group=2,
+            semaphore_limit=10,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+
+        # alpha: 1 NodeNotFoundError + 1 timeout
+        await q.enqueue(
+            group_id='alpha', operation='add_episode',
+            payload={'content': 'node-alpha', 'group_id': 'alpha', 'name': 'node-alpha'},
+        )
+        await q.enqueue(
+            group_id='alpha', operation='add_episode',
+            payload={'content': 'timeout-alpha', 'group_id': 'alpha', 'name': 'timeout-alpha'},
+        )
+        # beta: 1 NodeNotFoundError + 1 timeout
+        await q.enqueue(
+            group_id='beta', operation='add_episode',
+            payload={'content': 'node-beta', 'group_id': 'beta', 'name': 'node-beta'},
+        )
+        await q.enqueue(
+            group_id='beta', operation='add_episode',
+            payload={'content': 'timeout-beta', 'group_id': 'beta', 'name': 'timeout-beta'},
+        )
+        await asyncio.sleep(1.0)
+
+        dead_before = await q.get_dead_items()
+        assert len(dead_before) == 4
+
+        # Purge only alpha NodeNotFoundError items
+        purged = await q.purge_dead(group_id='alpha', error_pattern='%NodeNotFoundError%')
+        assert purged == 1
+
+        dead_after = await q.get_dead_items()
+        assert len(dead_after) == 3
+        # alpha timeout + both beta items remain
+        remaining_groups = [item['group_id'] for item in dead_after]
+        assert remaining_groups.count('alpha') == 1
+        assert remaining_groups.count('beta') == 2
+
+        await q.close()
