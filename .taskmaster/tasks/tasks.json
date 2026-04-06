@@ -9760,6 +9760,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 498,
+        "title": "Rewrite misleading 'Bug:' test docstrings as regression guard descriptions",
+        "description": "Four tests in fused-memory/tests/test_task_filter.py describe bugs in present tense as if they still exist, when the implementation already has the correct code:\n\n1. test_trimmed_count_relative_to_max_tasks_cap (line 202): docstring says 'Bug: trimmed_count = total_active - len(kept_lines) yields ~197' — implementation uses len(active). Rewrite as: 'Regression: trimmed_count must be bounded by max_tasks cap, not total_active.'\n2. test_budget_reserve_matches_actual_notice_length (lines 293-343): docstring/comments describe fictional -50 reserve and compute budget with wrong formula. Actual implementation uses `max_chars - len(header) - len(summary_line)`. Rewrite analytical comments to match actual code. Also reduce max_tasks from 1,000,001 to ~10,000 to avoid ~150 MB intermediate allocation in CI.\n3. test_negative_budget_returns_header_plus_summary (line 260): says 'Bug: missing early-return guard' — guard exists at line 192. Rewrite as: 'When header+summary exceeds max_chars, the budget<=0 early-return must prevent truncation notice.'\n4. test_caps_at_max_tasks_and_under_budget (line 173): weaken assertion `... or len(output) < 50_000` is trivially satisfied. Replace with: `assert len(output) <= 50_000` and `assert '450 more active omitted by max_tasks cap' in output`.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9772,7 +9783,7 @@
       ],
       "created": "2026-04-06T19:55:06.617Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T19:55:06.620Z"
+      "updated": "2026-04-06T19:55:17.156Z"
     }
   }
 }
