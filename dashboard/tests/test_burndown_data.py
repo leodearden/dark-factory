@@ -129,7 +129,7 @@ class TestCollectSnapshot:
         assert len(rows) == 1
         row = rows[0]
         # row: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
-        assert row[1] == str(tmp_path)  # project_id
+        assert row[1] == str(tmp_path.resolve())  # project_id
         assert row[3] == 1   # pending
         assert row[4] == 1   # in_progress
         assert row[5] == 0   # blocked
@@ -228,7 +228,7 @@ class TestCollectSnapshot:
 
         assert len(rows) == 3
         project_ids = {row[0] for row in rows}
-        assert str(tmp_path) in project_ids
+        assert str(tmp_path.resolve()) in project_ids
         assert str(reify_root.resolve()) in project_ids
         assert str(autopilot_root.resolve()) in project_ids
 
@@ -252,7 +252,7 @@ class TestCollectSnapshot:
                 await collect_snapshot(conn, config)
 
             async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
-                                    (str(tmp_path),)) as cur:
+                                    (str(tmp_path.resolve()),)) as cur:
                 row = await cur.fetchone()
                 assert row is not None
                 count = row[0]

@@ -68,16 +68,17 @@ async def collect_snapshot(
 ) -> None:
     """Discover projects and insert one snapshot row per project."""
     now = datetime.now(UTC).isoformat()
+    resolved_root = str(config.project_root.resolve())
 
     # Always snapshot the main project.
-    seen_roots: set[str] = {str(config.project_root)}
+    seen_roots: set[str] = {resolved_root}
     tasks = await asyncio.to_thread(load_task_tree, config.tasks_json)
     counts = _count_statuses(tasks)
     await conn.execute(
         'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
         'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         (
-            str(config.project_root),
+            resolved_root,
             now,
             counts['pending'],
             counts['in_progress'],
