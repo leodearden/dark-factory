@@ -10108,11 +10108,11 @@
         "description": "At graphiti_client.py:1072-1074 (Pass 1 loop), add a `logger.warning` call before `raise r` that records `group_id`, `rebuilt` (so far), and `errors` (so far). When a large batch is cancelled mid-flight, the current code skips the summary log entirely and operators have no record of partial progress. The `rebuilt` and `errors` counters are already in scope at that point (initialized at the top of the method and incremented by Pass 2, but the values from any previously completed batches/groups are meaningful context).\n\nExample:\n```python\nlogger.warning(\n    'rebuild_entity_summaries: cancellation signal received group=%s '\n    'rebuilt_so_far=%d errors_so_far=%d; propagating',\n    group_id, rebuilt, errors,\n)\nraise r\n```\n\nSource: review suggestions from task 484. Rationale: operational visibility during graceful shutdowns.\n\nFiles:\n- fused-memory/src/fused_memory/backends/graphiti_client.py\n- fused-memory/tests/test_rebuild_entity_summaries.py (log assertion)",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T23:17:13.391Z",
+        "updatedAt": "2026-04-06T23:19:18.755Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/backends",
@@ -10443,7 +10443,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T23:19:18.659Z",
+      "lastModified": "2026-04-06T23:19:18.755Z",
       "taskCount": 524,
       "completedCount": 432,
       "tags": [
