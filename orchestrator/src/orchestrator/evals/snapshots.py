@@ -30,7 +30,7 @@ async def create_eval_worktree(
     task_id: str,
     pre_task_commit: str,
     setup_commands: list[str] | None = None,
-) -> Path:
+) -> tuple[Path, str]:
     """Create an isolated worktree at the pre-task commit for an eval run.
 
     After checkout, runs any setup_commands (e.g. 'uv sync') to create

@@ -227,7 +227,7 @@ async def run_eval(
         outcome = await asyncio.wait_for(
             workflow.run(), timeout=timeout_minutes * 60,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.error(
             f'Eval {task_id} × {config.name} timed out after {timeout_minutes}m'
         )
@@ -311,7 +311,7 @@ async def run_eval_matrix(
 
     results: list[EvalResult] = []
     for r in raw:
-        if isinstance(r, Exception):
+        if isinstance(r, BaseException):
             logger.error(f'Eval failed: {r}')
         elif r is not None:
             results.append(r)
