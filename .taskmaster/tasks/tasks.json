@@ -9365,11 +9365,11 @@
         "description": "Move all deferred `from dashboard.config import DashboardConfig` imports to module top-level in both `dashboard/tests/test_scaffold.py` and `dashboard/tests/test_burndown_data.py`. In test_burndown_data.py, also add a `@pytest.fixture` (or `@pytest.fixture` async) that provides the common `(db_path, config, conn)` setup shared by all five `TestCollectSnapshot` methods — each currently repeats `_create_burndown_db`, `DashboardConfig(project_root=tmp_path)`, `aiosqlite.connect`, and the two-patch block inline.\n\nFiles:\n- dashboard/tests/test_burndown_data.py\n- dashboard/tests/test_scaffold.py\n\nSource: review suggestions on task 450 (burndown known_project_roots feature).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T19:35:11.690Z",
+        "updatedAt": "2026-04-06T19:39:10.185Z",
         "metadata": {
           "modules": [
             "dashboard/tests/test_burndown_data.py",
@@ -9706,7 +9706,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T19:39:10.104Z",
+      "lastModified": "2026-04-06T19:39:10.185Z",
       "taskCount": 474,
       "completedCount": 416,
       "tags": [
