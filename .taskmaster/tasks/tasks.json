@@ -9152,7 +9152,7 @@
         "description": "Task 394 (done 2026-04-02) identified the fix for the false-empty task tree bug: modify reconciliation harness (harness.py) to filter the get_tasks response before injecting into Stage 1/Stage 2 prompts. However, as of 2026-04-06 (recon run 94151a78), Stage 2 is STILL receiving 0 active tasks — the filter was never implemented.\n\nThe symptom: get_tasks returns 701k+ characters (370+ tasks, 85% done/cancelled), which overflows the Claude context. The fix recommended by task 394 was to strip done/cancelled tasks from the injected payload, keeping only active (pending/in-progress/blocked/deferred) tasks plus a summary of done/cancelled counts.\n\n## Required changes in harness.py (reconciliation harness)\n1. After calling get_tasks, filter the response to exclude done/cancelled tasks\n2. Keep full details only for active tasks (pending, in-progress, blocked, deferred)\n3. Inject a compact summary of done/cancelled counts (e.g. \"385 done, 12 cancelled — omitted\")\n4. Verify the injected payload fits within context limits (target: <50k chars)\n5. Test by running a reconciliation cycle and confirming Stage 1 + Stage 2 receive non-empty active task lists\n\n## memory_hints\n- entity: \\\"reconciliation harness\\\" — current harness.py structure and injection point\n- search: \\\"false-empty task tree Stage 1 Stage 2 recurring bug\\\"\n- search: \\\"get_tasks context window overflow 600K filter done cancelled\\\"\n- search: \\\"reconciliation harness task tree injection\\\"\n- task: 394 — original analysis and recommended fix approaches",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "blocked",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
@@ -9182,7 +9182,7 @@
             "fused-memory/tests"
           ]
         },
-        "updatedAt": "2026-04-06T17:19:18.058Z"
+        "updatedAt": "2026-04-06T17:50:09.304Z"
       },
       {
         "id": "456",
@@ -9320,7 +9320,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T17:41:07.178Z",
+      "lastModified": "2026-04-06T17:50:09.304Z",
       "taskCount": 443,
       "completedCount": 398,
       "tags": [
