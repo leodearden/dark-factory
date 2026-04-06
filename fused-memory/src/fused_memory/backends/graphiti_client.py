@@ -735,6 +735,8 @@ class GraphitiBackend:
     async def resolve_entity_by_name(self, name: str, *, group_id: str) -> str:
         """Resolve an entity name to its UUID via an exact Cypher lookup.
 
+        Uses ro_query since no writes are performed.
+
         Args:
             name: Exact name of the Entity node to resolve.
             group_id: Project graph to query.
@@ -750,7 +752,7 @@ class GraphitiBackend:
         """
         graph = self._graph_for(group_id)
         cypher = 'MATCH (n:Entity {name: $name}) RETURN n.uuid, n.name'
-        result = await graph.query(cypher, {'name': name})
+        result = await graph.ro_query(cypher, {'name': name})
         rows = result.result_set
         if not rows:
             raise NodeNotFoundError(f'No entity found with name: {name!r}')
