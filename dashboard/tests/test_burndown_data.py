@@ -164,6 +164,105 @@ class TestCollectSnapshot:
         assert count == 1
 
     @pytest.mark.asyncio
+    async def test_snapshots_known_project_roots_when_no_orchestrators(self, tmp_path):
+        """Known roots are snapshotted even when no orchestrators are running."""
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        reify_root = Path('/home/leo/src/reify')
+        autopilot_root = Path('/home/leo/src/autopilot-video')
+
+        from dashboard.config import DashboardConfig
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[reify_root, autopilot_root],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        reify_tasks = [{'status': 'done'}, {'status': 'done'}]
+        autopilot_tasks = [{'status': 'in-progress'}]
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree',
+                      side_effect=[main_tasks, reify_tasks, autopilot_tasks]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+
+        assert len(rows) == 3
+        project_ids = {row[0] for row in rows}
+        assert str(tmp_path) in project_ids
+        assert str(reify_root.resolve()) in project_ids
+        assert str(autopilot_root.resolve()) in project_ids
+
+    @pytest.mark.asyncio
+    async def test_dedupes_known_root_against_main_project(self, tmp_path):
+        """If known_project_roots includes main project_root, only one row is inserted."""
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        from dashboard.config import DashboardConfig
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[tmp_path],  # same as project_root
+        )
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
+                                    (str(tmp_path),)) as cur:
+                row = await cur.fetchone()
+                assert row is not None
+                count = row[0]
+
+        assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_dedupes_known_root_against_running_orchestrator(self, tmp_path):
+        """If known_project_roots includes a root already discovered via orchestrator, no duplicate."""
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        reify_root = Path('/home/leo/src/reify')
+
+        from dashboard.config import DashboardConfig
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[reify_root],
+        )
+
+        # Orchestrator also points to reify via config_path
+        fake_orchestrators = [
+            {'prd': None, 'config_path': '/home/leo/src/reify/orchestrator.yaml'},
+        ]
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree',
+                      side_effect=[[], [{'status': 'done'}]]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
+                patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
+                                    (str(reify_root.resolve()),)) as cur:
+                row = await cur.fetchone()
+                assert row is not None
+                count = row[0]
+
+        assert count == 1  # only one row for reify, not two
+
+    @pytest.mark.asyncio
     async def test_discovers_config_flag_orchestrator(self, tmp_path):
         """Orchestrators launched with --config (no --prd) are snapshotted."""
         db_path = tmp_path / 'burndown.db'
