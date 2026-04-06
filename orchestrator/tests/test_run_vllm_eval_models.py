@@ -100,3 +100,26 @@ class TestQwen3CoderNextExtraEnv:
         assert extra_env.get("TOOL_CALL_PARSER") == "qwen3_coder", (
             f"TOOL_CALL_PARSER not set to 'qwen3_coder' in extra_env: {extra_env!r}"
         )
+
+    def test_max_model_len_is_reduced(self, _parsed_models):
+        """extra_env must set MAX_MODEL_LEN=65536 to halve the default context window.
+
+        The entrypoint default MAX_MODEL_LEN=131072 leaves too little KV-cache headroom
+        on the FP8 path and exacerbates CUDA-graph warm-up hangs. 65536 is sufficient
+        for code completion and gives the sampler/CUDA-graph profiler room to breathe.
+        """
+        extra_env = _parsed_models["qwen3-coder-next"][4]
+        assert extra_env.get("MAX_MODEL_LEN") == "65536", (
+            f"MAX_MODEL_LEN not set to '65536' in extra_env: {extra_env!r}"
+        )
+
+    def test_gpu_memory_util_leaves_headroom(self, _parsed_models):
+        """extra_env must set GPU_MEMORY_UTIL=0.90 (back off from 0.95 default).
+
+        A lower GPU_MEMORY_UTIL gives the sampler/CUDA-graph profiler more headroom
+        on the FP8 path, reducing KV/CUDA-graph warm-up OOM risk.
+        """
+        extra_env = _parsed_models["qwen3-coder-next"][4]
+        assert extra_env.get("GPU_MEMORY_UTIL") == "0.90", (
+            f"GPU_MEMORY_UTIL not set to '0.90' in extra_env: {extra_env!r}"
+        )
