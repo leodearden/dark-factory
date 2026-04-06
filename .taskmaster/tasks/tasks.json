@@ -9538,6 +9538,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 485,
+        "title": "Move aiohttp to optional extras in dark-factory-shared",
+        "description": "In shared/pyproject.toml, move `aiohttp>=3.9` from `[project.dependencies]` to `[project.optional-dependencies]` under a `vllm` extra. Update any downstream consumers that use VllmBridge (e.g., eval scripts) to depend on `dark-factory-shared[vllm]`. This prevents the full aiohttp transitive stack (6 packages: aiohappyeyeballs, aiosignal, frozenlist, multidict, propcache, yarl) from being installed in subprojects that never use the vLLM bridge.\n\nMemory hints: search for \"VllmBridge consumers\" and \"dark-factory-shared dependency graph\".",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9550,7 +9561,7 @@
       ],
       "created": "2026-04-06T19:03:36.083Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T19:03:46.818Z"
+      "updated": "2026-04-06T19:03:52.142Z"
     }
   }
 }
