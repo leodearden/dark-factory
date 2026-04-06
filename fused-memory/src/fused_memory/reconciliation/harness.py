@@ -38,8 +38,8 @@ from fused_memory.services.memory_service import MemoryService
 try:
     from escalation.models import Escalation  # noqa: F811  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # noqa: F811  # type: ignore[import-untyped]
-    from escalation.server import (
-        create_server as create_escalation_server,  # noqa: F811  # type: ignore[import-untyped]
+    from escalation.server import (  # type: ignore[import-untyped]
+        create_server as create_escalation_server,  # noqa: F811
     )
     HAS_ESCALATION = True
 except ImportError:
