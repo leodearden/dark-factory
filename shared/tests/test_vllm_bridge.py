@@ -42,6 +42,24 @@ class TestTranslateMessagesResponseConvertsOpenAIToolCalls:
         assert 'tool_calls' not in result
 
 
+class TestTranslateMessagesResponseIdempotent:
+
+    def test_idempotent_for_native_anthropic_response(self):
+        """A well-formed Anthropic response body is returned value-equal (no-op)."""
+        body = {
+            'type': 'message',
+            'role': 'assistant',
+            'content': [
+                {'type': 'text', 'text': 'Let me read that file.'},
+                {'type': 'tool_use', 'id': 'toolu_x', 'name': 'Read', 'input': {'path': '/x'}},
+            ],
+            'stop_reason': 'tool_use',
+            'model': 'claude-sonnet',
+        }
+        result = _translate_messages_response(body)
+        assert result == body
+
+
 class TestTranslateMessagesResponseStopReason:
 
     def test_rewrites_stop_reason_tool_calls_when_tool_use_in_content(self):
