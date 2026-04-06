@@ -53,6 +53,7 @@ class FilteredTaskTree:
     """Result of filter_task_tree(): active tasks plus aggregate counts."""
 
     active_tasks: list[dict] = field(default_factory=list)
+    done_tasks: list[dict] = field(default_factory=list)
     done_count: int = 0
     cancelled_count: int = 0
     other_count: int = 0

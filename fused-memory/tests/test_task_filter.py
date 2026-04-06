@@ -74,6 +74,20 @@ class TestFilterTaskTree:
         assert result.other_count == 1
         assert result.total_count == 1
 
+    def test_done_tasks_field_defaults_to_empty_list(self):
+        """FilteredTaskTree.done_tasks defaults to [] and is independent per instance."""
+        tree1 = FilteredTaskTree()
+        tree2 = FilteredTaskTree()
+
+        assert hasattr(tree1, 'done_tasks')
+        assert tree1.done_tasks == []
+
+        # Mutating one instance's done_tasks must not affect the other
+        tree1.done_tasks.append({'id': 99, 'status': 'done'})
+        assert tree2.done_tasks == [], (
+            'Mutable default arg regression: tree2.done_tasks was affected by tree1 mutation'
+        )
+
     def test_sorts_active_by_priority_and_id_desc(self):
         """filter_task_tree sorts active tasks by _STATUS_PRIORITY then ID descending."""
         tasks_data = {
