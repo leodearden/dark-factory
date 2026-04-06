@@ -8944,7 +8944,7 @@
         "description": "In fused-memory/src/fused_memory/backends/graphiti_client.py: (1) Change get_valid_edges_for_node (line ~453) from `await graph.query(cypher, {'uuid': node_uuid})` to `await graph.ro_query(cypher, ...)` to match the correct pattern introduced in get_all_valid_edges — check ro_query signature for param passing; (2) Optionally extract a private `_edge_dict(uuid, fact, name)` helper to remove the verbatim dict-building duplication between the two methods. Update TestGetValidEdgesForNode mock assertions accordingly.\n\nmemory_hint: search \"ro_query get_valid_edges_for_node\" for context on the inconsistency.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -8957,7 +8957,8 @@
             "fused-memory/src/fused_memory/backends",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-06T19:04:27.754Z"
       },
       {
         "id": "449",
@@ -9553,7 +9554,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T19:04:07.427Z",
+      "lastModified": "2026-04-06T19:04:27.754Z",
       "taskCount": 464,
       "completedCount": 407,
       "tags": [
