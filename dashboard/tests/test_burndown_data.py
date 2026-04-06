@@ -246,13 +246,12 @@ class TestCollectSnapshot:
             ):
                 await collect_snapshot(conn, config)
 
-            async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
-                                    (str(tmp_path),)) as cur:
+            async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
                 count = row[0]
 
-        assert count == 1
+        assert count == 1  # total row count — catches both same-id and different-id duplicates
 
     @pytest.mark.asyncio
     async def test_dedupes_known_root_against_running_orchestrator(self, tmp_path):
