@@ -175,6 +175,16 @@ class TestGetValidEdgesForNode:
         cypher = call_args.args[0]
         assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
 
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """Uses ro_query (read-only) — graph.query must NOT be called."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # step-3: GraphitiBackend.update_node_summary
