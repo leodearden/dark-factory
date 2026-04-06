@@ -187,6 +187,36 @@ class TestGetValidEdgesForNode:
 
 
 # ---------------------------------------------------------------------------
+# step-3 (task-448): GraphitiBackend._edge_dict static helper
+# ---------------------------------------------------------------------------
+
+class TestEdgeDict:
+    """GraphitiBackend._edge_dict(uuid, fact, name) returns a normalised edge dict."""
+
+    def test_returns_dict_with_correct_keys(self):
+        """Returns dict with keys uuid, fact, name for normal (non-None) values."""
+        result = GraphitiBackend._edge_dict('e-1', 'Alice knows Bob', 'knows')
+        assert result == {'uuid': 'e-1', 'fact': 'Alice knows Bob', 'name': 'knows'}
+
+    def test_none_fact_coerced_to_empty_string(self):
+        """None fact is coerced to '' in the returned dict."""
+        result = GraphitiBackend._edge_dict('e-1', None, 'knows')
+        assert result['fact'] == ''
+
+    def test_none_name_coerced_to_empty_string(self):
+        """None name is coerced to '' in the returned dict."""
+        result = GraphitiBackend._edge_dict('e-1', 'Alice knows Bob', None)
+        assert result['name'] == ''
+
+    def test_preserves_non_none_values(self):
+        """Non-None fact and name values are kept as-is."""
+        result = GraphitiBackend._edge_dict('e-42', 'some fact', 'some_name')
+        assert result['uuid'] == 'e-42'
+        assert result['fact'] == 'some fact'
+        assert result['name'] == 'some_name'
+
+
+# ---------------------------------------------------------------------------
 # step-3: GraphitiBackend.update_node_summary
 # ---------------------------------------------------------------------------
 
