@@ -10099,11 +10099,11 @@
         "description": "Qwen3-Coder-Next-FP8 (config: qwen3-coder-next-fp8-new) has a persistent vLLM startup hang that causes health-check timeout before the server becomes ready. This is NOT a memory issue — reproduced on both RTX PRO 6000 (96GB, EUR-IS-1) and H200 SXM (141GB). Config was migrated to H200 as a mitigation but the hang root cause remains unknown, blocking Qwen3 from being evaluated in the vLLM eval pipeline.",
         "details": "Known context:\n- Tool-call parser for Qwen3-Coder must be qwen3_coder (hermes was prior misconfiguration, now fixed)\n- Config is in orchestrator/src/orchestrator/evals/configs.py (qwen3-coder-next-fp8-new entry)\n- Graphiti edge 85c34b19 records config migration to H200\n- Episodes from 2026-04-06 session ~20:42 document the hang\n\nInvestigation steps:\n1. Launch qwen3-coder-next-fp8-new config on an H200 pod and observe vLLM startup logs\n2. Identify exact hang point (tokenizer init / model load / CUDA graph build / etc.)\n3. Verify HF model variant compatibility with installed vLLM version\n4. Try --max-model-len, --enforce-eager, or --disable-custom-all-reduce flags as needed\n5. Fix config or add vLLM startup flags; rerun gate eval to confirm server becomes ready\n\nmemory_hints:\n- search: \"Qwen3-Coder-Next vLLM startup hang health timeout H200 RTX\"\n- search: \"vLLM eval configs.py qwen3_coder tool-call parser\"\n- entity: \"qwen3-coder-next-fp8-new\"",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T23:24:21.973Z",
+        "updatedAt": "2026-04-06T23:30:50.536Z",
         "metadata": {
           "memory_hints": {
             "entities": [],
@@ -10505,7 +10505,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T23:30:50.433Z",
+      "lastModified": "2026-04-06T23:30:50.536Z",
       "taskCount": 527,
       "completedCount": 432,
       "tags": [
