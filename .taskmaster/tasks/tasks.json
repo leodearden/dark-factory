@@ -9114,7 +9114,15 @@
           },
           "blocker": "US-NC-1 GPU unavailability: zero 80GB+ GPU stock on 2026-04-05/06. Tool format bridge bug (cli_invoke.py + /v1/messages shim) also unresolved.",
           "resume_condition": "80GB+ GPU stock confirmed at alternative datacenter OR RunPod volume migrated OR tool_format_bridge_bug fixed",
-          "stage1_finding_id": "1"
+          "stage1_finding_id": "1",
+          "files": [
+            "orchestrator/src/orchestrator/evals/configs.py",
+            "docs/vllm-eval-status.md"
+          ],
+          "modules": [
+            "orchestrator/src/orchestrator/evals",
+            "docs"
+          ]
         }
       },
       {
@@ -9126,7 +9134,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "fused-memory/uv.lock"
+          ],
+          "modules": [
+            "fused-memory"
+          ]
+        }
       },
       {
         "id": 455,
