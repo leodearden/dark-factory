@@ -184,22 +184,20 @@ def format_filtered_task_tree(
     result = header + body + summary_line
 
     # Secondary max_chars clamp
-    if len(result) > max_chars:
-        # Trim body lines one by one until we fit
-        if active:
-            task_lines = body.rstrip('\n').split('\n')
-            budget = max_chars - len(header) - len(summary_line) - 50  # 50 chars for truncation notice
-            kept_lines: list[str] = []
-            used = 0
-            for line in task_lines:
-                if used + len(line) + 1 > budget:
-                    break
-                kept_lines.append(line)
-                used += len(line) + 1
+    if len(result) > max_chars and active:
+        task_lines = body.rstrip('\n').split('\n')
+        budget = max_chars - len(header) - len(summary_line) - 50  # 50 chars for truncation notice
+        kept_lines: list[str] = []
+        used = 0
+        for line in task_lines:
+            if used + len(line) + 1 > budget:
+                break
+            kept_lines.append(line)
+            used += len(line) + 1
 
-            trimmed_count = total_active - len(kept_lines)
-            trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
-            body = '\n'.join(kept_lines) + trunc_notice
-            result = header + body + summary_line
+        trimmed_count = total_active - len(kept_lines)
+        trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
+        body = '\n'.join(kept_lines) + trunc_notice
+        result = header + body + summary_line
 
     return result
