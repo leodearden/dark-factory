@@ -28,11 +28,13 @@ class TestRemediateDlqPlan:
         """execute() replays dead items, drains, then purges NodeNotFoundError items."""
         mock_queue = AsyncMock()
 
-        # get_stats returns dead=5 initially, then dead=2 after replay drains
+        # get_stats: baseline=5, then drain polls show 5→3→2→2 (stabilised), then final=0 after purge
         stats_responses = [
             {'counts': {'dead': 5}, 'oldest_pending_age_seconds': None},  # baseline
-            {'counts': {'dead': 5}, 'oldest_pending_age_seconds': None},  # during drain (pre-drain)
-            {'counts': {'dead': 2}, 'oldest_pending_age_seconds': None},  # during drain (stabilised)
+            {'counts': {'dead': 3}, 'oldest_pending_age_seconds': None},  # drain poll 1 (improving)
+            {'counts': {'dead': 2}, 'oldest_pending_age_seconds': None},  # drain poll 2 (improving)
+            {'counts': {'dead': 2}, 'oldest_pending_age_seconds': None},  # drain poll 3 (stabilised → break)
+            {'counts': {'dead': 0}, 'oldest_pending_age_seconds': None},  # final stats after purge
         ]
         mock_queue.get_stats = AsyncMock(side_effect=stats_responses)
         mock_queue.replay_dead = AsyncMock(return_value=5)
