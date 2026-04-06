@@ -13,6 +13,7 @@ import pytest
 from dashboard.data.burndown import (
     BURNDOWN_SCHEMA,
     _count_statuses,
+    _insert_snapshot_for_root,
     collect_snapshot,
     downsample,
     get_burndown_projects,
@@ -492,3 +493,80 @@ class TestGetBurndownSeries:
 
         # done values should be in timestamp order (oldest first)
         assert result['done'] == [3, 2, 1]
+
+
+# ---------------------------------------------------------------------------
+# _insert_snapshot_for_root
+# ---------------------------------------------------------------------------
+
+
+class TestInsertSnapshotForRoot:
+    @pytest.mark.asyncio
+    async def test_inserts_single_row_with_correct_values(self, tmp_path):
+        """Helper inserts exactly one row keyed by root_str/now with correct zone counts."""
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        root_str = '/some/project/root'
+        tasks_json = tmp_path / 'tasks.json'
+        now = datetime.now(UTC).isoformat()
+
+        # Mix of statuses including review→in_progress mapping
+        fake_tasks = [
+            {'status': 'pending'},
+            {'status': 'in-progress'},
+            {'status': 'review'},       # maps to in_progress
+            {'status': 'blocked'},
+            {'status': 'deferred'},
+            {'status': 'cancelled'},
+            {'status': 'done'},
+            {'status': 'done'},
+        ]
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with patch('dashboard.data.burndown.load_task_tree', return_value=fake_tasks) as mock_ltt:
+                await _insert_snapshot_for_root(conn, root_str, tasks_json, now)
+
+            # Read back WITHOUT committing — row must be visible in the same connection
+            async with conn.execute('SELECT * FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+
+        # (a) Exactly one row
+        assert len(rows) == 1
+        row = rows[0]
+        # row columns: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
+        # (b) project_id == root_str
+        assert row[1] == root_str
+        # (c) ts == now
+        assert row[2] == now
+        # (d) per-zone counts: pending=1, in_progress=2 (in-progress + review), blocked=1,
+        #     deferred=1, cancelled=1, done=2
+        assert row[3] == 1   # pending
+        assert row[4] == 2   # in_progress (in-progress + review)
+        assert row[5] == 1   # blocked
+        assert row[6] == 1   # deferred
+        assert row[7] == 1   # cancelled
+        assert row[8] == 2   # done
+        # (e) load_task_tree was called with the supplied tasks_json path
+        mock_ltt.assert_called_once_with(tasks_json)
+
+    @pytest.mark.asyncio
+    async def test_does_not_commit(self, tmp_path):
+        """Helper does NOT call conn.commit(); caller is responsible for atomicity."""
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        root_str = '/no/commit/root'
+        tasks_json = tmp_path / 'tasks.json'
+        now = datetime.now(UTC).isoformat()
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with patch('dashboard.data.burndown.load_task_tree', return_value=[]):
+                await _insert_snapshot_for_root(conn, root_str, tasks_json, now)
+            # Intentionally do NOT call conn.commit()
+
+        # A fresh connection to the same file should see NO rows (transaction rolled back)
+        sync_conn = sqlite3.connect(str(db_path))
+        count = sync_conn.execute('SELECT COUNT(*) FROM snapshots').fetchone()[0]
+        sync_conn.close()
+        assert count == 0
