@@ -8518,7 +8518,16 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/src/dashboard/templates/partials/recon.html",
+            "dashboard/src/dashboard/templates/partials/recon_run_detail.html"
+          ],
+          "modules": [
+            "dashboard/src/dashboard/templates/partials"
+          ]
+        }
       },
       {
         "id": 428,
@@ -8529,7 +8538,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
+        "subtasks": [],
+        "metadata": {
+          "files": [
+            "dashboard/tests/test_recon_panel.py"
+          ],
+          "modules": [
+            "dashboard/tests"
+          ]
+        }
       },
       {
         "id": 429,
