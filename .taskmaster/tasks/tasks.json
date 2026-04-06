@@ -10101,6 +10101,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 523,
+        "title": "Fix docstring accuracy: semantic anchors and narrow edge-fetch scope claim",
+        "description": "In fused-memory/tests/test_graphiti_quality_433.py, update the docstring of `test_dry_run_partition_invariant_skips_rebuild_and_edges` (lines 539–551):\n\n1. Replace line-number references ('line 1031', 'lines 1046-1049') with semantic descriptions like 'the edge-fetch guard in the force branch' and 'the dry_run early-return block before the semaphore loop'.\n2. Narrow the claim 'edges are NOT fetched when dry_run=True, even in the force path' to make clear this only applies to the force=True code path. Add a note that force=False uses _detect_stale_summaries_with_edges which fetches edges for staleness detection regardless of dry_run.\n\nNote: if task \"Relocate dry_run test to correct class\" removes this test, apply equivalent docstring cleanup to its replacement location.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10113,7 +10124,7 @@
       ],
       "created": "2026-04-06T22:41:59.729Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:41:59.733Z"
+      "updated": "2026-04-06T22:42:05.454Z"
     }
   }
 }
