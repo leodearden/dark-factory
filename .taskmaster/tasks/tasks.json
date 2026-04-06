@@ -9346,6 +9346,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 468,
+        "title": "Remove redundant test_known_project_roots_is_list_not_tuple",
+        "description": "Delete `test_known_project_roots_is_list_not_tuple` from `dashboard/tests/test_scaffold.py` (lines 31-35). The adjacent `test_known_project_roots_default_empty_list` asserts `cfg.known_project_roots == []`, which already proves the list type (a tuple can never equal `[]`).\n\nFiles:\n- dashboard/tests/test_scaffold.py\n\nSource: review suggestions on task 450.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9358,7 +9369,7 @@
       ],
       "created": "2026-04-06T18:12:21.797Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T18:12:21.800Z"
+      "updated": "2026-04-06T18:12:25.285Z"
     }
   }
 }
