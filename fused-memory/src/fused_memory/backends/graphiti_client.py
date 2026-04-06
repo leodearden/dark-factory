@@ -716,6 +716,8 @@ class GraphitiBackend:
     async def get_node_text(self, uuid: str, *, group_id: str) -> tuple[str, str]:
         """Return (name, summary) for the Entity node with the given UUID.
 
+        Uses ro_query since no writes are performed.
+
         Raises:
             NodeNotFoundError: if no node with that UUID exists.
         """
@@ -724,7 +726,7 @@ class GraphitiBackend:
             'MATCH (n:Entity {uuid: $uuid}) '
             'RETURN n.name, n.summary'
         )
-        result = await graph.query(cypher, {'uuid': uuid})
+        result = await graph.ro_query(cypher, {'uuid': uuid})
         if not result.result_set:
             raise NodeNotFoundError(f'Entity node not found: {uuid}')
         row = result.result_set[0]

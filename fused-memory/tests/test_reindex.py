@@ -139,10 +139,20 @@ class TestGetNodeText:
         graph = make_graph_mock([['Node', 'Summary']])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_node_text('specific-uuid', group_id='test')
-        call_kwargs = graph.query.call_args
+        call_kwargs = graph.ro_query.call_args
         args, kwargs = call_kwargs
         params = args[1] if len(args) > 1 else kwargs.get('params', {})
         assert params.get('uuid') == 'specific-uuid'
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """get_node_text uses ro_query (read-only path) and never calls graph.query."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([['Node', 'Summary']])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_node_text('uuid-1', group_id='test')
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
 
 
 class TestGetEdgeText:
