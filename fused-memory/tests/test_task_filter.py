@@ -289,3 +289,55 @@ class TestFormatFilteredTaskTree:
         assert 'truncated for budget' not in output, (
             f'Found "truncated for budget" in output when budget was exhausted: {output!r}'
         )
+
+    def test_budget_reserve_matches_actual_notice_length(self):
+        """Output length must not exceed max_chars regardless of truncation notice length.
+
+        The magic -50 reserve fails when trimmed_count has 7+ digits (≥ 1,000,000).
+        The actual notice '\n... and NNNNNNN more active (truncated for budget)\n' is
+        52+ chars, exceeding the 50-char reserve by 1+, causing an off-by-one violation.
+
+        With 1,000,001 tasks all having title='T', budget=25, exactly 1 task line fits
+        (used=budget). trimmed_count = 1,000,000, notice = 52 chars > 50 reserve.
+        len(result) = 195 > max_chars=194. Bug confirmed.
+
+        Uses repeated-reference trick ([same_dict]*N) to keep memory at ~8 MB instead
+        of creating N full task dicts (~200 MB).
+        """
+        # Compute max_chars so that exactly 1 task line fits and used == budget exactly.
+        # Task line for title='T', id=1: "- [1] (pending) T deps=[]" = 24 chars.
+        # Loop condition: used + len(line) + 1 ≤ budget.
+        # For 1 line to fit: 0 + 24 + 1 = 25 ≤ budget → budget ≥ 25.
+        # For 2nd line to not fit: 25 + 24 + 1 = 50 > budget → budget < 50. So budget = 25.
+        #
+        # With 1_000_001 tasks shown, header is:
+        # "### Active Task Tree\n(1000001 active shown, 0 done, 0 cancelled, 0 other, 1000001 total)\n"
+        # = 90 chars. summary_line = "0 done, 0 cancelled — omitted" = 29 chars.
+        # budget = max_chars - 90 - 29 - 50 = max_chars - 169.
+        # For budget = 25: max_chars = 25 + 169 = 194.
+        #
+        # trimmed_count = 1_000_001 - 1 = 1_000_000 (7 digits).
+        # notice = "\n... and 1000000 more active (truncated for budget)\n" = 52 chars.
+        # len(result) = 90 + (25-1) + 52 + 29 = 195 > 194 = max_chars. BUG!
+
+        single_task = {'id': 1, 'title': 'T', 'status': 'pending', 'dependencies': []}
+        n = 1_000_001
+        # Repeated-reference trick: list of n pointers to same dict — uses ~8 MB, not ~200 MB.
+        active_large = [single_task] * n
+        tree_large = FilteredTaskTree(
+            active_tasks=active_large,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=n,
+        )
+
+        max_chars = 194  # Precisely computed to make used == budget == 25, notice 52 chars
+        output = format_filtered_task_tree(tree_large, max_tasks=n, max_chars=max_chars)
+
+        # With the magic -50 reserve, len(output) = 195 > 194 = max_chars.
+        assert len(output) <= max_chars, (
+            f'Output length {len(output)} exceeds max_chars={max_chars}; '
+            f'bug: magic -50 reserve is insufficient when trimmed_count has 7+ digits '
+            f'(notice is 52 chars, not ≤ 50)'
+        )
