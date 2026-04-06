@@ -10112,6 +10112,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 524,
+        "title": "Strengthen per-entity detail assertions: verify uuid and name in dry_run test",
+        "description": "In fused-memory/tests/test_graphiti_quality_433.py, replace the status-only loop at lines 576–578 with a full-dict comparison:\n\n```python\nexpected_details = [{'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities]\nassert result['details'] == expected_details\n```\n\nThis matches the style already used in the error-path tests (lines 525–534) and catches regressions where uuid/name are accidentally dropped from the dry_run detail records.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10124,7 +10135,7 @@
       ],
       "created": "2026-04-06T22:41:59.729Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:42:05.454Z"
+      "updated": "2026-04-06T22:42:09.471Z"
     }
   }
 }
