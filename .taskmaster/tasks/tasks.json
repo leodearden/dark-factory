@@ -10241,6 +10241,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 535,
+        "title": "Add missing test coverage for create_eval_worktree API contract and runner help output",
+        "description": "Three gaps to address: (1) orchestrator/tests/ — add a test for create_eval_worktree in snapshots.py that asserts the result is a 2-tuple of (Path, str) and that run_id is an 8-character hex string; (2) orchestrator/tests/test_runner_main.py line 28 — change the weak `or` assertion to `and` and add `--vllm-url` to the checked flags; (3) orchestrator/tests/test_runner_main.py line 15 — add `timeout=30` to the subprocess.run call and catch subprocess.TimeoutExpired with a clear failure message.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10253,7 +10264,7 @@
       ],
       "created": "2026-04-06T22:49:21.157Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:49:35.287Z"
+      "updated": "2026-04-06T22:49:39.957Z"
     }
   }
 }
