@@ -9616,11 +9616,11 @@
         "description": "Four test quality fixes:\n1. In test_task_filter.py: add a test with ~10 active tasks, `max_chars=200`, `max_tasks=50` that forces the char-budget clamp branch. Assert `len(output) <= max_chars` and that `trimmed_count` reflects only tasks surviving the max_tasks cap (not the full list).\n2. Fix existing `test_caps_at_max_tasks_and_under_budget` — replace the vacuous `or len(output) < 50_000` with `assert 'Task title 51' not in output` and `assert '450 more active omitted by max_tasks cap' in output`.\n3. In test_harness.py `test_stage1_and_stage2_receive_filtered_tree_before_run` and the budget test, add `harness.taskmaster.get_tasks.assert_called_once()` after `await harness.run_full_cycle(...)` to verify the single-fetch invariant.\n4. In `test_handles_fetch_exception`, change the `or` to `and`: `assert any('connection refused' in r.message and '/abs/path' in r.message for r in caplog.records if r.levelno >= logging.WARNING)`.",
         "details": "",
         "testStrategy": "",
-        "status": "blocked",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T23:27:24.172Z",
+        "updatedAt": "2026-04-06T23:42:24.239Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
@@ -10528,7 +10528,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T23:36:23.443Z",
+      "lastModified": "2026-04-06T23:42:24.240Z",
       "taskCount": 529,
       "completedCount": 432,
       "tags": [
