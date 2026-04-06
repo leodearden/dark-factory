@@ -8887,7 +8887,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T00:33:30.389Z"
+        "updatedAt": "2026-04-06T00:33:30.389Z",
+        "metadata": {
+          "model_count": 5,
+          "devstral_parked": true,
+          "devstral_park_reason": "inconsistent tool-call format: emits prose/XML/partial-mistral",
+          "devstral_park_date": "2026-04-06",
+          "bridge_bug_confirmed": true,
+          "primary_blocker": "tool_format_bridge_bug_cli_invoke_vllm_messages_shim",
+          "next_steps": "debug cli_invoke.py + /v1/messages shim; alternative: try reap-139b-nvfp4-new as gate eval candidate",
+          "_causation_id": "94151a78-19d8-4bc5-99a7-22da02728872"
+        }
       },
       {
         "id": 454,
