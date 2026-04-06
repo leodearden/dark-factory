@@ -177,7 +177,7 @@ def format_filtered_task_tree(
             tid = t.get('id', '?')
             title = t.get('title', '?')
             status = t.get('status', '?')
-            deps = t.get('dependencies', [])
+            deps = t.get('dependencies') or []
             lines.append(f'- [{tid}] ({status}) {title} deps={deps}')
         body = '\n'.join(lines) + '\n'
 
@@ -187,6 +187,8 @@ def format_filtered_task_tree(
     if len(result) > max_chars and active:
         task_lines = body.rstrip('\n').split('\n')
         budget = max_chars - len(header) - len(summary_line) - 50  # 50 chars for truncation notice
+        if budget <= 0:
+            budget = 0
         kept_lines: list[str] = []
         used = 0
         for line in task_lines:
@@ -195,7 +197,7 @@ def format_filtered_task_tree(
             kept_lines.append(line)
             used += len(line) + 1
 
-        trimmed_count = total_active - len(kept_lines)
+        trimmed_count = len(active) - len(kept_lines)
         trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
         body = '\n'.join(kept_lines) + trunc_notice
         result = header + body + summary_line

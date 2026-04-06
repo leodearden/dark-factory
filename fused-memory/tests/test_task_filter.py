@@ -165,10 +165,95 @@ class TestFormatFilteredTaskTree:
         # Output must be under budget
         assert len(output) <= 50_000
 
-        # Must contain at least the first (highest-priority) tasks
-        # With max_tasks=50, we expect only 50 tasks rendered
-        # Check truncation notice
-        assert '450 more active' in output or 'truncated' in output.lower() or len(output) < 50_000
+        # Task 51+ must NOT appear (max_tasks=50 cap)
+        assert 'task number 51' not in output, 'task number 51 should be excluded by max_tasks=50 cap'
+        assert 'task number 100' not in output, 'task number 100 should be excluded by max_tasks=50 cap'
+
+        # Task 1 MUST appear (first tasks are included)
+        assert 'task number 1' in output, 'task number 1 should be present in the output'
+
+        # The header must mention the max_tasks omission
+        assert '450 more active omitted by max_tasks cap' in output, (
+            'Expected "450 more active omitted by max_tasks cap" in header'
+        )
+
+    def test_max_chars_clamp_truncation_count(self):
+        """trimmed_count in truncation notice uses len(active-after-max_tasks) not total_active."""
+        # 200 tasks in tree, but max_tasks=50 will cap to first 50.
+        # With max_chars=300 (tiny), only a few lines will fit.
+        # trimmed_count must be relative to the 50-task cap, NOT 200.
+        active = [
+            _make_task(i, 'pending', 'A' * 80)  # ~80-char title per task
+            for i in range(1, 201)
+        ]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            done_count=10,
+            cancelled_count=5,
+            other_count=0,
+            total_count=215,
+        )
+        output = format_filtered_task_tree(tree, max_tasks=50, max_chars=300)
+
+        # Output must be within the char budget
+        assert len(output) <= 300, f'Output length {len(output)} exceeds 300 chars'
+
+        # The truncation notice must say 'N more active (truncated for budget)'
+        # where N is relative to the 50-task slice, NOT all 200 tasks.
+        # Since max_chars=300 is tiny, 0 or very few task lines will fit,
+        # so trimmed_count should be close to 50 (e.g., '50 more' or '49 more').
+        # The WRONG value would be close to 200 (e.g., '198 more active' or '200 more active').
+        assert 'truncated for budget' in output, 'Expected truncation notice in output'
+        # Extract the trimmed count from the notice
+        import re
+        match = re.search(r'and (\d+) more active \(truncated for budget\)', output)
+        assert match is not None, f'Could not find truncation notice in: {output!r}'
+        trimmed_count = int(match.group(1))
+        assert trimmed_count <= 50, (
+            f'trimmed_count={trimmed_count} should be <= 50 (the max_tasks cap), '
+            f'not based on total_active=200'
+        )
+
+    def test_deps_none_normalized_to_empty_list(self):
+        """format_filtered_task_tree renders deps=[] when dependencies key is explicitly None."""
+        task_with_none_deps = {
+            'id': 42,
+            'title': 'Task with null deps',
+            'status': 'pending',
+            'dependencies': None,  # Explicitly None (not missing)
+        }
+        tree = FilteredTaskTree(
+            active_tasks=[task_with_none_deps],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=1,
+        )
+        output = format_filtered_task_tree(tree)
+
+        # Must render deps=[] not deps=None
+        assert 'deps=[]' in output, f'Expected deps=[] in output, got: {output!r}'
+        assert 'deps=None' not in output, f'Unexpected deps=None in output: {output!r}'
+
+    def test_max_chars_smaller_than_header_does_not_crash(self):
+        """format_filtered_task_tree does not crash when max_chars is smaller than the header."""
+        active = [_make_task(i, 'pending') for i in range(1, 6)]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            done_count=2,
+            cancelled_count=1,
+            other_count=0,
+            total_count=8,
+        )
+        # max_chars=50 is smaller than any realistic header+summary
+        output = format_filtered_task_tree(tree, max_chars=50)
+
+        # Must not raise; output must be a string
+        assert isinstance(output, str)
+        # Must contain the header marker
+        assert '### Active Task Tree' in output
+        # Must contain the summary line
+        assert '\u2014 omitted' in output
 
     def test_empty_active_and_empty_tree(self):
         """format_filtered_task_tree handles empty FilteredTaskTree gracefully."""
