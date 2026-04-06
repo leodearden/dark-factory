@@ -151,6 +151,25 @@ class TestCanonicalFacts:
         result = GraphitiBackend._canonical_facts(edges)
         assert result == ['A knows B']
 
+    def test_whitespace_variants_all_filtered(self):
+        """All whitespace-only variants are filtered; content with surrounding whitespace is kept.
+
+        Tabs, newlines, mixed whitespace, and single spaces are all falsy after
+        .strip() and must be excluded.  A fact with real content but leading/
+        trailing whitespace (e.g. '  hello  ') is truthy after strip and must
+        be preserved with its original value.
+        """
+        edges = [
+            {'fact': '\t\t'},          # tabs only — filtered
+            {'fact': '\n'},            # newline only — filtered
+            {'fact': '  \t\n  '},     # mixed whitespace — filtered
+            {'fact': ' '},             # single space — filtered
+            {'fact': '  hello  '},    # real content with surrounding space — kept (raw value)
+            {'fact': 'A knows B'},    # plain fact — kept
+        ]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == ['  hello  ', 'A knows B']
+
 
 # ---------------------------------------------------------------------------
 # step-5: refresh_entity_summary optional name/old_summary params
