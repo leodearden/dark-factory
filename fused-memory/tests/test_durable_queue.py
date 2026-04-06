@@ -712,3 +712,41 @@ class TestPurgeDead:
         assert remaining_groups.count('beta') == 2
 
         await q.close()
+
+    @pytest.mark.asyncio
+    async def test_purge_dead_requires_filter_or_confirmation(self, tmp_path):
+        """purge_dead() with no args raises ValueError; confirm_purge_all=True bypasses guard."""
+        execute = AsyncMock(side_effect=RuntimeError('always fails'))
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+
+        for i in range(2):
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': f'item{i}', 'group_id': 'proj1', 'name': f'ep{i}'},
+            )
+        await asyncio.sleep(1.0)
+
+        dead_before = await q.get_dead_items()
+        assert len(dead_before) == 2
+
+        # Calling with no filters should raise
+        with pytest.raises(ValueError, match='confirm_purge_all'):
+            await q.purge_dead()
+
+        # confirm_purge_all=True bypasses the guard and deletes all dead rows
+        purged = await q.purge_dead(confirm_purge_all=True)
+        assert purged == 2
+
+        dead_after = await q.get_dead_items()
+        assert len(dead_after) == 0
+
+        await q.close()
