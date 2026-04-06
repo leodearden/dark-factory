@@ -8554,7 +8554,7 @@
         "description": "In graphiti_client.py refresh_entity_summary: (1) Invert `if name is not None and old_summary is not None: pass else:` to `if name is None or old_summary is None:`. (2) Add ValueError when exactly one of name/old_summary is provided (must be both or neither). (3) Add test for old_summary='' edge case in test_refresh_entity_summary.py.",
         "details": "Files: fused-memory/src/fused_memory/backends/graphiti_client.py (lines 718-722), fused-memory/tests/test_refresh_entity_summary.py. Source: review suggestions from task 419 (esc-419-25).",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
@@ -8567,7 +8567,8 @@
             "fused-memory/src/fused_memory/backends",
             "fused-memory/tests"
           ]
-        }
+        },
+        "updatedAt": "2026-04-06T18:34:11.738Z"
       },
       {
         "id": "430",
@@ -9416,7 +9417,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T18:34:11.648Z",
+      "lastModified": "2026-04-06T18:34:11.738Z",
       "taskCount": 452,
       "completedCount": 401,
       "tags": [
