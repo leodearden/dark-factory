@@ -690,6 +690,8 @@ class GraphitiBackend:
         """Delete an Entity node and all remaining relationships.
 
         Validates that the node exists first, then issues DETACH DELETE.
+        Pre-check uses ro_query since it performs no writes; the DETACH DELETE
+        itself uses graph.query.
 
         Args:
             uuid: UUID of the Entity node to delete.
@@ -700,8 +702,8 @@ class GraphitiBackend:
             RuntimeError: if the backend is not initialized.
         """
         graph = self._graph_for(group_id)
-        # Pre-check: verify node exists before deleting
-        check_result = await graph.query(
+        # Pre-check: verify node exists before deleting (read-only)
+        check_result = await graph.ro_query(
             'MATCH (n:Entity {uuid: $uuid}) RETURN n.name, n.summary',
             {'uuid': uuid},
         )
