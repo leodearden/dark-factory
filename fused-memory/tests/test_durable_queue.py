@@ -507,3 +507,58 @@ class TestStats:
         assert stats['counts'].get('completed', 0) == 2
         assert stats['counts'].get('dead', 0) == 1
         await q.close()
+
+
+class TestPurgeDead:
+    """Tests for DurableWriteQueue.purge_dead()."""
+
+    @pytest.mark.asyncio
+    async def test_purge_dead_by_ids(self, tmp_path):
+        """purge_dead(ids=[...]) removes only the specified dead rows."""
+        execute = AsyncMock(side_effect=RuntimeError('always fails'))
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+
+        id1 = await q.enqueue(
+            group_id='proj1', operation='add_episode',
+            payload={'content': 'item1', 'group_id': 'proj1', 'name': 'ep1'},
+        )
+        id2 = await q.enqueue(
+            group_id='proj1', operation='add_episode',
+            payload={'content': 'item2', 'group_id': 'proj1', 'name': 'ep2'},
+        )
+        id3 = await q.enqueue(
+            group_id='proj1', operation='add_episode',
+            payload={'content': 'item3', 'group_id': 'proj1', 'name': 'ep3'},
+        )
+        # Wait for all three to dead-letter (max_attempts=1)
+        await asyncio.sleep(1.0)
+
+        dead_before = await q.get_dead_items()
+        assert len(dead_before) == 3
+
+        purged = await q.purge_dead(ids=[id1, id2])
+        assert purged == 2
+
+        dead_after = await q.get_dead_items()
+        assert len(dead_after) == 1
+        assert dead_after[0]['id'] == id3
+
+        # Verify rows are physically gone from DB
+        assert q._db is not None
+        cursor = await q._db.execute(
+            'SELECT COUNT(*) FROM write_queue WHERE id IN (?, ?)',
+            (id1, id2),
+        )
+        row = await cursor.fetchone()
+        assert row[0] == 0, f'Expected 0 rows for purged ids, got {row[0]}'
+
+        await q.close()
