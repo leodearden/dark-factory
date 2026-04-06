@@ -1024,7 +1024,10 @@ class GraphitiBackend:
             if not dry_run:
                 all_edges = await self.get_all_valid_edges(group_id=group_id)
         else:
-            stale, all_edges, total_entities = await self._detect_stale_summaries_with_edges(group_id=group_id)
+            result = await self._detect_stale_summaries_with_edges(group_id=group_id)
+            stale = result.stale
+            all_edges = result.all_edges
+            total_entities = result.total_count
             targets = [{'uuid': s['uuid'], 'name': s['name'], 'old_summary': s['summary']} for s in stale]
 
         stale_entities = len(targets)
