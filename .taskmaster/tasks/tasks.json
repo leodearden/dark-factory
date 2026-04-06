@@ -9516,6 +9516,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 483,
+        "title": "Add force=False error-path test to TestRebuildEntitySummariesErrorHandling",
+        "description": "In fused-memory/tests/test_graphiti_quality_433.py, add a new test method to TestRebuildEntitySummariesErrorHandling that uses force=False. Mock `_detect_stale_summaries_with_edges` to return a result with total_count=5 but only 2 stale targets, then make _rebuild_entity_from_edges raise for one of them. Assert `result['total_entities'] == 5`, `result['stale_entities'] == 2`, `result['errors'] == 1`, `result['rebuilt'] == 1`. This exercises the bookkeeping path not reachable via force=True.\n\nMemory hints: search for \"_detect_stale_summaries_with_edges return shape\" and \"rebuild_entity_summaries force parameter\".",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9528,7 +9539,7 @@
       ],
       "created": "2026-04-06T19:03:36.083Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T19:03:36.086Z"
+      "updated": "2026-04-06T19:03:41.417Z"
     }
   }
 }
