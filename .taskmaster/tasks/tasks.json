@@ -9426,6 +9426,17 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 475,
+        "title": "Cap per-task deps display in task_filter.py format line",
+        "description": "In task_filter.py line 181, the deps list is rendered as a raw Python repr. Tasks with many dependencies produce lines that exhaust the char budget before other tasks are shown. Fix: `deps_str = str(deps[:5]) + ('...' if len(deps) > 5 else '')` and use `deps_str` in the f-string instead of `deps`. This prevents a single task with hundreds of deps from consuming the entire budget.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -9438,7 +9449,7 @@
       ],
       "created": "2026-04-06T18:58:00.750Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T18:58:00.754Z"
+      "updated": "2026-04-06T18:58:04.447Z"
     }
   }
 }
