@@ -3,7 +3,11 @@
 import json
 import logging
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
+
+if TYPE_CHECKING:
+    from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
 import pytest
 from shared.cli_invoke import AgentResult
@@ -1304,7 +1308,7 @@ class TestMemoryConsolidatorFilteredTaskTree:
     def watermark(self):
         return Watermark(project_id='test_project')
 
-    def _make_active_tree(self, count: int = 3) -> 'FilteredTaskTree':  # noqa: F821
+    def _make_active_tree(self, count: int = 3) -> 'FilteredTaskTree':
         from fused_memory.reconciliation.task_filter import FilteredTaskTree
         active = [
             {'id': i, 'title': f'Active task {i}', 'status': 'pending', 'dependencies': []}
@@ -1416,7 +1420,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
     def _make_task(self, tid: int, status: str) -> dict:
         return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': []}
 
-    def _make_tree(self, tasks: list[dict], done_count: int = 0, cancelled_count: int = 0) -> 'FilteredTaskTree':  # noqa: F821
+    def _make_tree(self, tasks: list[dict], done_count: int = 0, cancelled_count: int = 0) -> 'FilteredTaskTree':
         from fused_memory.reconciliation.task_filter import FilteredTaskTree
         return FilteredTaskTree(
             active_tasks=tasks,

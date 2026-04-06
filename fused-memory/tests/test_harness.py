@@ -1477,7 +1477,7 @@ class TestHarnessFetchFilteredTaskTree:
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
         # Mock taskmaster to return a mix of active + done + cancelled tasks
-        harness.taskmaster.get_tasks.return_value = {
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
             'tasks': [
                 {'id': 1, 'title': 'T1', 'status': 'in-progress', 'dependencies': []},
                 {'id': 2, 'title': 'T2', 'status': 'pending', 'dependencies': []},
@@ -1495,7 +1495,7 @@ class TestHarnessFetchFilteredTaskTree:
         assert len(result.active_tasks) == 4
         assert result.done_count == 2
         assert result.cancelled_count == 1
-        harness.taskmaster.get_tasks.assert_called_once_with(project_root='/abs/path')
+        harness.taskmaster.get_tasks.assert_called_once_with(project_root='/abs/path')  # type: ignore[union-attr,attr-defined]
 
     @pytest.mark.asyncio
     async def test_handles_fetch_exception(self, journal, event_buffer, mock_memory_service, caplog):
@@ -1505,7 +1505,7 @@ class TestHarnessFetchFilteredTaskTree:
         from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        harness.taskmaster.get_tasks.side_effect = RuntimeError('connection refused')
+        harness.taskmaster.get_tasks.side_effect = RuntimeError('connection refused')  # type: ignore[union-attr,attr-defined]
 
         with caplog.at_level(logging.WARNING):
             result = await harness._fetch_filtered_task_tree('/abs/path')
@@ -1558,7 +1558,7 @@ class TestHarnessFetchFilteredTaskTree:
 
         assert isinstance(result, FilteredTaskTree)
         assert result.active_tasks == []
-        harness.taskmaster.get_tasks.assert_not_called()
+        harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
 
 
 # ── Tests for task 455: run_full_cycle injects filtered task tree ──────────────
@@ -1573,7 +1573,6 @@ class TestRunFullCycleInjectsFilteredTaskTree:
     ):
         """Stage 1 and Stage 2 both have filtered_task_tree set before their run() is called."""
         from fused_memory.reconciliation.task_filter import FilteredTaskTree
-        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
@@ -1582,7 +1581,7 @@ class TestRunFullCycleInjectsFilteredTaskTree:
         await event_buffer.push(_make_event_with_root(project_root='/tmp/proj'))
 
         # Mock taskmaster to return 3 active + 5 done tasks
-        harness.taskmaster.get_tasks.return_value = {
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
             'tasks': [
                 {'id': i, 'title': f'T{i}', 'status': 'pending', 'dependencies': []}
                 for i in range(1, 4)
@@ -1596,13 +1595,13 @@ class TestRunFullCycleInjectsFilteredTaskTree:
         captured_trees: dict[str, FilteredTaskTree | None] = {}
 
         async def capture_stage1(s):
-            captured_trees['stage1'] = getattr(s, 'filtered_task_tree', 'MISSING')
+            captured_trees['stage1'] = getattr(s, 'filtered_task_tree', None)
 
         async def capture_stage2(s):
-            captured_trees['stage2'] = getattr(s, 'filtered_task_tree', 'MISSING')
+            captured_trees['stage2'] = getattr(s, 'filtered_task_tree', None)
 
         async def capture_stage3(s):
-            captured_trees['stage3'] = getattr(s, 'filtered_task_tree', 'MISSING')
+            captured_trees['stage3'] = getattr(s, 'filtered_task_tree', None)
 
         _mock_stage_run(harness.stages[0], before_return=capture_stage1)
         _mock_stage_run(harness.stages[1], before_return=capture_stage2)
@@ -1643,13 +1642,13 @@ class TestRunRemediationInjectsFilteredTaskTree:
         self, journal, event_buffer, mock_memory_service,
     ):
         """Both remediation stages receive filtered_task_tree from the harness."""
-        from fused_memory.reconciliation.task_filter import FilteredTaskTree
         from fused_memory.reconciliation.harness import TierConfig
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
         # Mock taskmaster to return a non-empty tree
-        harness.taskmaster.get_tasks.return_value = {
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
             'tasks': [
                 {'id': i, 'title': f'T{i}', 'status': 'in-progress', 'dependencies': []}
                 for i in range(1, 4)
@@ -1662,10 +1661,10 @@ class TestRunRemediationInjectsFilteredTaskTree:
         captured_trees: dict[str, FilteredTaskTree | None] = {}
 
         async def capture_s1(s):
-            captured_trees['stage1'] = getattr(s, 'filtered_task_tree', 'MISSING')
+            captured_trees['stage1'] = getattr(s, 'filtered_task_tree', None)
 
         async def capture_s2(s):
-            captured_trees['stage2'] = getattr(s, 'filtered_task_tree', 'MISSING')
+            captured_trees['stage2'] = getattr(s, 'filtered_task_tree', None)
 
         _mock_stage_run(harness.stages[0], before_return=capture_s1)
         _mock_stage_run(harness.stages[1], before_return=capture_s2)
@@ -1704,10 +1703,6 @@ class TestRunFullCycleBudget:
         self, journal, event_buffer, mock_memory_service,
     ):
         """With 400 tasks (340 done, 20 cancelled, 40 active), payloads contain task tree and stay under 50k chars."""
-        from fused_memory.models.reconciliation import Watermark
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
-        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
-
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
         # Push events with _project_root
@@ -1726,15 +1721,13 @@ class TestRunFullCycleBudget:
             {'id': i + 380, 'title': f'Cancelled task {i}', 'status': 'cancelled', 'dependencies': []}
             for i in range(1, 21)
         ]
-        harness.taskmaster.get_tasks.return_value = {
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
             'tasks': active_tasks + done_tasks + cancelled_tasks
         }
 
         # Capture stage payloads by letting stages call their real assemble_payload
         # but wrapping stage.run to intercept the payload text
         captured_payloads: dict[str, str] = {}
-
-        watermark = Watermark(project_id='dark_factory')
 
         async def make_stage_run_capturing(stage_idx, stage):
             """Run assemble_payload on stage and capture the result before faking .run()."""

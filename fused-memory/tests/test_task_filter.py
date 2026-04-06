@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
 from fused_memory.reconciliation.task_filter import (
-    ACTIVE_TASK_STATUSES,
-    INACTIVE_TASK_STATUSES,
     FilteredTaskTree,
     filter_task_tree,
     format_filtered_task_tree,
