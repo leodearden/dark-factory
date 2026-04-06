@@ -876,6 +876,87 @@ def create_mcp_server(
             logger.error(f'replay_dead_letters error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
+    @mcp.tool()
+    async def get_dead_letters(
+        project_id: str | None = None,
+        limit: int = 100,
+        include_full_payload: bool = False,
+    ) -> dict[str, Any]:
+        """Inspect dead-lettered queue items — writes that exhausted all retry attempts.
+
+        Returns items with id, error, operation, attempts, and a payload preview.
+        Use this to diagnose DLQ buildup before deciding to replay or purge.
+
+        Args:
+            project_id: Filter to a specific project (optional — all if omitted)
+            limit: Max items to return (default 100)
+            include_full_payload: When True, include full payload instead of preview
+        """
+        try:
+            if memory_service.durable_queue is None:
+                return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
+            items = await memory_service.durable_queue.get_dead_items(group_id=project_id)
+            items = items[:limit]
+            dead_letters = []
+            for item in items:
+                import json as _json
+                if include_full_payload:
+                    payload_preview = item.get('payload')
+                else:
+                    raw = _json.dumps(item.get('payload', {}))
+                    payload_preview = raw[:200] + ('...' if len(raw) > 200 else '')
+                dead_letters.append({
+                    'id': item['id'],
+                    'group_id': item['group_id'],
+                    'operation': item['operation'],
+                    'attempts': item['attempts'],
+                    'error': item['error'],
+                    'created_at': item['created_at'],
+                    'payload_preview': payload_preview,
+                })
+            return {'dead_letters': dead_letters, 'total': len(dead_letters)}
+        except Exception as e:
+            logger.error(f'get_dead_letters error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def purge_dead_letters(
+        project_id: str | None = None,
+        error_pattern: str | None = None,
+        ids: list[int] | None = None,
+        confirm_purge_all: bool = False,
+    ) -> dict[str, Any]:
+        """Permanently delete non-recoverable dead-lettered queue items.
+
+        Use after inspecting dead letters via get_dead_letters. Requires at least
+        one filter (project_id, error_pattern, or ids) unless confirm_purge_all=True.
+
+        WARNING: purged items cannot be recovered. Only purge items that are
+        genuinely non-recoverable (e.g. NodeNotFoundError — target node deleted).
+        Timeout failures should be replayed via replay_dead_letters instead.
+
+        Args:
+            project_id: Delete only dead items for this project (optional)
+            error_pattern: SQL LIKE pattern to match error messages (e.g. 'NodeNotFoundError%')
+            ids: Explicit list of item ids to purge
+            confirm_purge_all: When True, purge ALL dead items regardless of filters
+        """
+        try:
+            if memory_service.durable_queue is None:
+                return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
+            count = await memory_service.durable_queue.purge_dead(
+                group_id=project_id,
+                error_pattern=error_pattern,
+                ids=ids,
+                confirm_purge_all=confirm_purge_all,
+            )
+            return {'status': 'purged', 'items_purged': count}
+        except ValueError as e:
+            return {'error': str(e), 'error_type': 'ValidationError'}
+        except Exception as e:
+            logger.error(f'purge_dead_letters error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
     # ------------------------------------------------------------------
     # Reconciliation tools
     # ------------------------------------------------------------------
