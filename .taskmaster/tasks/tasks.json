@@ -9423,10 +9423,11 @@
         "description": "task_filter.py has four correctness bugs that all need fixing together:\n1. trimmed_count inflation: change `trimmed_count = total_active - len(kept_lines)` to `trimmed_count = len(active) - len(kept_lines)` where `active = tree.active_tasks[:max_tasks]`. The current code double-counts tasks already dropped by max_tasks cap.\n2. Budget reserve undersized: replace magic `- 50` with `- len(f'\\n... and {total_active} more active (truncated for budget)\\n')` or compute lazily, since the actual notice string can exceed 50 chars.\n3. Negative budget not guarded: add `if budget <= 0: return header + summary_line` guard before the line-accumulation loop to prevent max_chars contract violation.\n4. None-safe deps: change `deps = t.get('dependencies', [])` to `deps = t.get('dependencies') or []` to handle explicit None values from taskmaster.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T19:01:43.347Z"
       },
       {
         "id": "475",
@@ -9508,7 +9509,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T19:01:43.080Z",
+      "lastModified": "2026-04-06T19:01:43.347Z",
       "taskCount": 460,
       "completedCount": 406,
       "tags": [
