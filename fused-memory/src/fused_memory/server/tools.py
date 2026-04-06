@@ -899,11 +899,10 @@ def create_mcp_server(
             items = items[:limit]
             dead_letters = []
             for item in items:
-                import json as _json
                 if include_full_payload:
                     payload_preview = item.get('payload')
                 else:
-                    raw = _json.dumps(item.get('payload', {}))
+                    raw = json.dumps(item.get('payload', {}))
                     payload_preview = raw[:200] + ('...' if len(raw) > 200 else '')
                 dead_letters.append({
                     'id': item['id'],
