@@ -1630,6 +1630,9 @@ class TestRunFullCycleInjectsFilteredTaskTree:
         # Stage 3 doesn't need the tree (but test it's still runnable)
         assert 'stage3' in captured_trees
 
+        # PRIMARY DESIGN CONTRACT: get_tasks called exactly once per cycle, not per stage
+        harness.taskmaster.get_tasks.assert_called_once()  # type: ignore[union-attr,attr-defined]
+
 
 # ── Tests for task 455: remediation pass injects filtered task tree ───────────
 
