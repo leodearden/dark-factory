@@ -202,6 +202,12 @@ class TestRefreshEntitySummaryOptionalParams:
         backend.get_node_text.assert_not_called()
         assert result['name'] == 'Alice'
         assert result['old_summary'] == 'stale summary'
+        # Verify the summary actually written matches the joined canonical facts.
+        # _canonical_facts([{'fact': 'Alice knows Bob'}]) == ['Alice knows Bob'],
+        # joined with '\n' gives 'Alice knows Bob'.
+        backend.update_node_summary.assert_awaited_once_with(
+            'u1', 'Alice knows Bob', group_id='test'
+        )
 
     @pytest.mark.asyncio
     async def test_get_node_text_called_when_neither_provided(self, mock_config, make_backend):
