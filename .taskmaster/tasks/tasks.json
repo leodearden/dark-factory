@@ -9879,10 +9879,11 @@
         "description": "In test_graphiti_quality_433.py's TestRebuildEntitySummariesErrorHandling.test_partial_success_one_error_one_rebuilt:\n\n1. Change the mock return dict for the successful entity (Bob) to use non-default values that match the entity fixture:\n   - `old_summary: 'stale summary 2'` (matches Bob's entity `summary` field, instead of `''`)\n   - `new_summary: 'Bob summary v2'` (distinctive, avoids confusion with status string `'rebuilt'`)\n   - `edge_count: 3` (non-zero, distinguishes 'key present' from `.get()` fallback)\n\n2. Update the assertions on `ok_detail` to expect these non-default values.\n\n3. Add a call-args assertion to verify the implementation correctly forwards the real entity's old_summary to `_rebuild_entity_from_edges`:\n   ```python\n   backend._rebuild_entity_from_edges.assert_any_call(\n       'u2', 'Bob', [], group_id='test', old_summary='stale summary 2'\n   )\n   ```\n\nThis ensures the test catches bugs where `.get()` defaults mask missing keys, and verifies the caller correctly passes entity data through.\n\nMemory hints: search \"rebuild_entity_summaries return contract\", get_entity \"test_graphiti_quality_433\"",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:18:55.298Z"
       },
       {
         "id": "504",
@@ -10030,7 +10031,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T22:18:54.976Z",
+      "lastModified": "2026-04-06T22:18:55.299Z",
       "taskCount": 495,
       "completedCount": 425,
       "tags": [
