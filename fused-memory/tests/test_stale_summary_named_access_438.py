@@ -67,6 +67,23 @@ class TestDetectStaleSummariesNamedAccess:
         assert returned == stale_list
         backend._detect_stale_summaries_with_edges.assert_awaited_once_with(group_id='t')
 
+    @pytest.mark.asyncio
+    async def test_detect_stale_summaries_empty_stale_list(self, mock_config, make_backend):
+        """detect_stale_summaries returns [] when no stale entities exist.
+
+        Documents that the function makes no non-empty assumption: it simply
+        returns result.stale regardless of length, so an empty list is a
+        valid and expected return value.
+        """
+        backend = make_backend(mock_config)
+        detect_result = StaleSummaryResult(stale=[], all_edges={}, total_count=0)
+        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
+
+        returned = await backend.detect_stale_summaries(group_id='t')
+
+        assert returned == []
+        backend._detect_stale_summaries_with_edges.assert_awaited_once_with(group_id='t')
+
 
 class TestRebuildEntitySummariesNamedAccess:
     """rebuild_entity_summaries uses named attribute access on StaleSummaryResult."""
