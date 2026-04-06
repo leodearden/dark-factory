@@ -1213,3 +1213,49 @@ class TestRebuildEntitySummariesCancellation:
         # coroutines and that we are testing the post-gather propagation path, not a
         # pre-gather short-circuit.
         assert backend.update_node_summary.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates_force_false(self, two_entity_backend):
+        """CancelledError must propagate through the force=False code path.
+
+        The two existing cancellation tests (test_cancelled_error_propagates and
+        test_cancelled_error_propagates_alongside_other_errors) both use force=True
+        (simpler mock surface: list_entity_nodes + get_all_valid_edges).  This test
+        exercises the force=False branch, which routes through
+        _detect_stale_summaries_with_edges instead, to confirm that both code paths
+        share the same gather + two-tier propagation guarantee.
+
+        Even though both branches converge on the same asyncio.gather + two-tier check,
+        an explicit test guards against future divergence — e.g. if the force=False path
+        were ever refactored to bypass gather entirely.
+
+        _detect_stale_summaries_with_edges is mocked directly (rather than relying on
+        the natural detection path through the fixture's list_entity_nodes / get_all_valid_edges)
+        to isolate the test surface to the gather + two-tier check, mirroring the pattern
+        in TestRebuildEntitySummaries.test_rebuilds_only_stale_entities (line ~259).
+        """
+        backend = two_entity_backend
+        backend._detect_stale_summaries_with_edges = AsyncMock(
+            return_value=StaleSummaryResult(
+                stale=[
+                    {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1',
+                     'duplicate_count': 0, 'stale_line_count': 1,
+                     'valid_fact_count': 1, 'summary_line_count': 1},
+                    {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2',
+                     'duplicate_count': 0, 'stale_line_count': 1,
+                     'valid_fact_count': 1, 'summary_line_count': 1},
+                ],
+                all_edges={
+                    'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
+                    'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
+                },
+                total_count=2,
+            )
+        )
+        # First entity's rebuild raises CancelledError; second would succeed
+        backend.update_node_summary = AsyncMock(
+            side_effect=[asyncio.CancelledError(), None]
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await backend.rebuild_entity_summaries(group_id='test', force=False)
