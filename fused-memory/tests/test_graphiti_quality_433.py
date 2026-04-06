@@ -416,6 +416,7 @@ class TestRebuildEntitySummariesErrorHandling:
 
         assert result['errors'] == 1
         assert result['rebuilt'] == 0
+        assert result['skipped'] == 0
         assert result['total_entities'] == 1
         assert result['stale_entities'] == 1
         assert len(result['details']) == 1
