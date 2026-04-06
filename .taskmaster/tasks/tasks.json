@@ -10123,6 +10123,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 525,
+        "title": "Standardize async mock assertion style for edge-fetch guard tests",
+        "description": "In fused-memory/tests/test_graphiti_quality_433.py:\n\n- Update line 275 in `test_force_dry_run_does_not_call_get_all_valid_edges` from `backend.get_all_valid_edges.assert_not_called()` to `backend.get_all_valid_edges.assert_not_awaited()` to match the style used in the new test at line 582 and to use the more semantically precise AsyncMock assertion throughout.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10135,7 +10146,7 @@
       ],
       "created": "2026-04-06T22:41:59.729Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-06T22:42:09.471Z"
+      "updated": "2026-04-06T22:42:12.959Z"
     }
   }
 }
