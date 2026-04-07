@@ -10960,6 +10960,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 582,
+        "title": "Strengthen shared-reference invariant test precondition",
+        "description": "In orchestrator/tests/test_eval_configs.py, test_injection_propagates_to_eval_configs_via_shared_references (lines 209-223):\n\nAdd an identity precondition assertion at the top of the test to guard the shared-reference assumption: verify that each object in VLLM_EVAL_CONFIGS that also appears in EVAL_CONFIGS is the same Python object (identity check via id()). This prevents future fixture changes from silently making the test vacuous.\n\nExample: `vllm_cfg_set = {id(c) for c in VLLM_EVAL_CONFIGS}; assert all(id(c) in vllm_cfg_set for c in EVAL_CONFIGS if c in VLLM_EVAL_CONFIGS)`\n\nFiles: orchestrator/tests/test_eval_configs.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10972,7 +10983,7 @@
       ],
       "created": "2026-04-07T04:35:02.870Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T04:35:14.316Z"
+      "updated": "2026-04-07T04:35:19.039Z"
     }
   }
 }
