@@ -135,7 +135,7 @@ class ContextAssembler:
                     raise ctx_result
 
             for event, ctx_result in zip(batch, batch_contexts, strict=True):
-                if isinstance(ctx_result, Exception):
+                if isinstance(ctx_result, BaseException):
                     logger.warning(
                         f'Context fetch failed for event {event.id}: {ctx_result}'
                     )
