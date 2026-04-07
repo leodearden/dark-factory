@@ -258,3 +258,47 @@ class TestStaticFiles:
         resp = client.get('/static/tailwind.css')
         assert resp.status_code == 200
         assert 'text/css' in resp.headers['content-type']
+
+
+class TestPostInit:
+    """Unit tests for DashboardConfig.__post_init__ path normalization invariant.
+
+    These tests exercise the invariant directly on DashboardConfig construction
+    (not through burndown consumer logic), so they remain valid even if consumer
+    code is later refactored.
+    """
+
+    def test_resolves_project_root_symlink(self, tmp_path):
+        """DashboardConfig must resolve a symlinked project_root in __post_init__."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        cfg = DashboardConfig(project_root=link)
+        assert cfg.project_root == real_dir.resolve()
+
+    def test_resolves_known_project_roots_symlinks(self, tmp_path):
+        """DashboardConfig must resolve symlinks in known_project_roots in __post_init__."""
+        real1 = tmp_path / 'real1'
+        real1.mkdir()
+        link1 = tmp_path / 'link1'
+        link1.symlink_to(real1)
+
+        real2 = tmp_path / 'real2'
+        real2.mkdir()
+        link2 = tmp_path / 'link2'
+        link2.symlink_to(real2)
+
+        cfg = DashboardConfig(project_root=tmp_path, known_project_roots=[link1, link2])
+        assert cfg.known_project_roots == [real1.resolve(), real2.resolve()]
+
+    def test_tasks_json_derived_from_resolved_root(self, tmp_path):
+        """tasks_json must be derived from the resolved project_root, not the symlink path."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        cfg = DashboardConfig(project_root=link)
+        assert cfg.tasks_json == real_dir.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
