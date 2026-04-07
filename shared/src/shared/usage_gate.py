@@ -43,6 +43,7 @@ __all__ = [
 CAP_HIT_PREFIXES = [
     "You've hit your",
     "You've used",
+    "You're out of extra usage",
 ]
 # Secondary confirmation — must also appear in the same text
 CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade"]

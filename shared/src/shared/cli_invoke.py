@@ -247,6 +247,44 @@ async def invoke_with_cap_retry(
             await asyncio.sleep(cooldown)
             continue
 
+        # Heuristic safety net: a zero-cost, near-instant, ≤1-turn result
+        # that wasn't caught by pattern matching is almost certainly a cap
+        # hit with an unrecognised message format.  Treat it as a cap hit so
+        # the retry loop can wait / fail over instead of silently returning a
+        # useless "success" to the caller.
+        if (
+            usage_gate
+            and not result.success  # is_error=true → success=False after fix 2
+            and result.cost_usd == 0
+            and result.turns <= 1
+            and result.duration_ms < 5000
+        ):
+            logger.warning(
+                f'{label}: suspicious zero-cost instant exit (turns={result.turns}, '
+                f'duration={result.duration_ms}ms) — treating as cap hit. '
+                f'Output: {result.output[:200]!r}',
+            )
+            usage_gate._handle_cap_detected(
+                f'Heuristic cap: zero-cost instant exit — {result.output[:120]}',
+                None,
+                oauth_token,
+            )
+            consecutive_cap_hits += 1
+            full_cycles = (consecutive_cap_hits - 1) // num_accounts
+            cooldown = min(
+                _CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles),
+                _MAX_CAP_COOLDOWN_SECS,
+            )
+            # Cannot resume a session that never ran
+            invoke_kwargs.pop('resume_session_id', None)
+            invoke_kwargs['prompt'] = original_prompt
+            acct_name = usage_gate.active_account_name
+            logger.warning(
+                f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
+            )
+            await asyncio.sleep(cooldown)
+            continue
+
         # Non-cap-hit failure while resuming → fall back to fresh invocation
         if not result.success and invoke_kwargs.get('resume_session_id'):
             logger.warning(
@@ -435,7 +473,10 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
                         parts.append(block)
         output_text = '\n'.join(parts)
 
-    is_success = subtype == 'success' or result.returncode == 0
+    # The CLI may report subtype='success' even when is_error is true (e.g.
+    # usage cap hit).  Trust is_error as an authoritative override.
+    is_error = data.get('is_error', False)
+    is_success = (subtype == 'success' or result.returncode == 0) and not is_error
 
     return AgentResult(
         success=is_success,
