@@ -11120,6 +11120,17 @@
         "dependencies": [],
         "priority": "high",
         "subtasks": []
+      },
+      {
+        "id": 590,
+        "title": "Reviewer panel restructuring trial: run 5-variant × 15-diff evaluation and apply winning config",
+        "description": "The reviewer panel restructuring trial was approved 2026-04-07. Trial plan is at /home/leo/.claude/plans/streamed-baking-meteor.md. The trial is underway as of 2026-04-07T15:20 BST with 4 variants defined and being tested.\\n\\n## Trial Design\\n- **Corpus**: 15 real-world first-pass diffs (mutation/seeded-bug ground truth)\\n- **Runner**: ThreadPoolExecutor calling invoke_agent() directly (not full orchestrator)\\n- **Reviewer prompt**: Simplified from BriefingAssembler.build_reviewer_prompt\\n- **Variants**:\\n  - Variant A: 1× opus generalist\\n  - Variant B: 2× opus (bug_hunter + design_critic)\\n  - Variant C: 1× opus + 2× sonnet (opus_strategic + sonnet_test_analyst + sonnet_robustness)\\n  - Variant D: 3× sonnet data-driven consolidation (splits architect_reviewer along runtime/structure seam, affects reuse auditor)\\n  - Variant E: TBD (5th variant per plan)\\n\\n## Work Remaining\\n1. Complete trial runs for all 5 variants × 15 diffs\\n2. Collect scores, compute per-variant accuracy vs ground truth\\n3. Select winning variant based on bug detection rate, false-positive rate, cost\\n4. Implement winning reviewer configuration in the orchestrator\\n5. Update reviewer panel config and merge to main\\n\\n## memory_hints\\n- search: \\\"reviewer trial variants A B C D E results scores accuracy\\\"\\n- search: \\\"reviewer panel restructuring trial plan streamed-baking-meteor\\\"\\n- search: \\\"invoke_agent ThreadPoolExecutor reviewer trial runner\\\"\\n- entity: \\\"Reviewer panel\\\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -11132,7 +11143,7 @@
       ],
       "created": "2026-04-07T06:15:47.627Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T19:12:06.687Z"
+      "updated": "2026-04-07T19:12:36.742Z"
     }
   }
 }
