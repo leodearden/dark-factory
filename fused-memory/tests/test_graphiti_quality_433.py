@@ -257,7 +257,35 @@ class TestRefreshEntitySummaryOptionalParams:
 # ---------------------------------------------------------------------------
 
 class TestRebuildEntitySummariesForceDryRun:
-    """rebuild_entity_summaries(force=True, dry_run=True) skips get_all_valid_edges."""
+    """Pins the force=True, dry_run=True skip behaviour in rebuild_entity_summaries.
+
+    Narrowed scope claim
+    --------------------
+    get_all_valid_edges is NOT awaited when rebuild_entity_summaries is called
+    with force=True AND dry_run=True. This skip only applies to the force=True
+    code path (the force branch); it does NOT apply to the force=False path.
+
+    Two production-code guards in graphiti_client.rebuild_entity_summaries
+    protect this behaviour (referenced by semantic role, not by line number):
+
+    1. **edge-fetch guard in the force branch** — inside the ``if force:`` block,
+       an inner ``if not dry_run:`` gate controls whether
+       ``get_all_valid_edges(...)`` is awaited. When dry_run=True that gate is
+       closed, so no edges are fetched at all.
+
+    2. **dry_run early-return block before the semaphore loop** — after the
+       edge-fetch guard, a subsequent ``if dry_run:`` block marks every target
+       entity as ``'skipped_dry_run'`` and returns immediately, before the
+       ``asyncio.Semaphore``-based rebuild loop executes. This is why
+       ``_rebuild_entity_from_edges`` is also never awaited.
+
+    force=False contrast
+    --------------------
+    The force=False path delegates to ``_detect_stale_summaries_with_edges``,
+    which unconditionally calls ``get_all_valid_edges`` for staleness detection
+    regardless of ``dry_run``. Therefore the edge-fetch skip behaviour pinned by
+    this class only applies to the force=True path.
+    """
 
     @pytest.mark.asyncio
     async def test_force_dry_run_does_not_call_get_all_valid_edges(self, mock_config, make_backend):
