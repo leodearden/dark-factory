@@ -10305,10 +10305,11 @@
         "description": "Two pure-read Cypher calls were missed in the Task 486 migration:\n\n1. `query_edges_by_time_range()` at `graphiti_client.py` ~line 422 still calls `await graph.query(cypher, {'start': start, 'end': end})` on a plain MATCH/RETURN — change to `ro_query` and add docstring convention comment.\n\n2. `node_count()` at `graphiti_client.py` ~line 1230 still calls `await graph.query('MATCH (n) RETURN count(n) as count')` — same fix.\n\nAdd corresponding test mock assertions (ro_query called, query not called) for both methods, matching the pattern applied to `get_node_text`, `get_edge_text`, `resolve_entity_by_name`, and `list_indices` in Task 486.\n\nFiles: fused-memory/src/fused_memory/backends/graphiti_client.py\n\nSource: steward-triage follow-up from Task 486 (esc-486-49).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T04:07:55.341Z"
       },
       {
         "id": "528",
@@ -10878,7 +10879,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T04:07:55.223Z",
+      "lastModified": "2026-04-07T04:07:55.341Z",
       "taskCount": 555,
       "completedCount": 441,
       "tags": [
