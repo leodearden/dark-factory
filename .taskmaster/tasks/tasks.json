@@ -9660,7 +9660,17 @@
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
             "fused-memory/tests/test_stages.py"
-          ]
+          ],
+          "_causation_id": "7027ea16-3021-4775-9460-2c6506f6cfee",
+          "blocker_context": "task_455_unmerged_to_main",
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "task 455 task_filter.py harness filtered_task_tree done_tasks integration",
+              "task 477 done_tasks FilteredTaskTree field",
+              "done_tasks_for_display harness Stage 2 inject fallback path"
+            ]
+          }
         }
       },
       {
