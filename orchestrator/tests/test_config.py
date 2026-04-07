@@ -1,12 +1,13 @@
 """Tests for configuration loading."""
 
-import logging
 from importlib import resources as pkg_resources
 from pathlib import Path
 
+import pytest
 import yaml
 
 from orchestrator.config import (
+    ConfigRequiredError,
     ModuleConfig,
     OrchestratorConfig,
     _deep_merge,
@@ -78,33 +79,31 @@ class TestDefaults:
 
 
 class TestYamlLoading:
-    def test_load_config_logs_when_no_config_file(self, tmp_path: Path, caplog):
+    def test_load_config_raises_when_explicit_path_nonexistent(self, tmp_path: Path):
+        """Explicit --config pointing at a missing file raises ConfigRequiredError."""
         nonexistent = tmp_path / 'nonexistent.yaml'
-        with caplog.at_level(logging.INFO, logger='orchestrator.config'):
+        with pytest.raises(ConfigRequiredError, match='Config file not found'):
             load_config(nonexistent)
-        assert any(
-            'No project config file found' in r.message or 'package defaults' in r.message.lower()
-            for r in caplog.records
-        )
 
-    def test_load_config_discovers_orchestrator_subdir(self, tmp_path: Path, monkeypatch):
-        # Create orchestrator/config.yaml under tmp_path
-        orch_dir = tmp_path / 'orchestrator'
-        orch_dir.mkdir()
-        (orch_dir / 'config.yaml').write_text(yaml.dump({'max_concurrent_tasks': 7}))
-        # Change cwd to tmp_path and clear ORCH_CONFIG_PATH
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+    def test_load_config_uses_orch_config_path_env_var(self, tmp_path: Path, monkeypatch):
+        """ORCH_CONFIG_PATH alone (no --config flag) loads the right config."""
+        cfg = tmp_path / 'config.yaml'
+        cfg.write_text(yaml.dump({'max_concurrent_tasks': 13}))
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(cfg))
         config = load_config(None)
-        assert config.max_concurrent_tasks == 7
+        assert config.max_concurrent_tasks == 13
 
-    def test_load_config_logs_when_no_project_config_found(self, tmp_path: Path, monkeypatch, caplog):
-        # Empty dir with no config files and no ORCH_CONFIG_PATH
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
-        with caplog.at_level(logging.INFO, logger='orchestrator.config'):
-            load_config(None)
-        assert any('No project config file found' in r.message for r in caplog.records)
+    def test_load_config_explicit_flag_overrides_env_var(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """When both --config and ORCH_CONFIG_PATH are set, --config wins."""
+        env_cfg = tmp_path / 'env.yaml'
+        env_cfg.write_text(yaml.dump({'max_concurrent_tasks': 1}))
+        flag_cfg = tmp_path / 'flag.yaml'
+        flag_cfg.write_text(yaml.dump({'max_concurrent_tasks': 99}))
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(env_cfg))
+        config = load_config(flag_cfg)
+        assert config.max_concurrent_tasks == 99
 
     def test_load_from_yaml(self, tmp_path: Path):
         config_data = {
@@ -218,16 +217,12 @@ class TestLayeredConfig:
         _deep_merge(base, override)
         assert base == {'a': {'x': 1}}
 
-    def test_defaults_applied_when_no_project_config(self, tmp_path, monkeypatch):
-        """With no project config file, package defaults should apply."""
+    def test_load_config_raises_when_no_config_and_no_env(self, tmp_path, monkeypatch):
+        """Without --config or ORCH_CONFIG_PATH, load_config refuses to start."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
-        config = load_config(None)
-        defaults = _load_package_defaults()
-        # Package defaults define effort.architect = 'max' (pydantic default is 'high')
-        assert config.effort.architect == defaults['effort']['architect']
-        assert config.backends.architect == defaults['backends']['architect']
-        assert config.max_concurrent_tasks == defaults['max_concurrent_tasks']
+        with pytest.raises(ConfigRequiredError, match='--config is required'):
+            load_config(None)
 
     def test_project_config_overrides_defaults(self, tmp_path, monkeypatch):
         """Project config values should override package defaults."""

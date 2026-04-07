@@ -9,7 +9,7 @@ from pathlib import Path
 import click
 from dotenv import load_dotenv
 
-from orchestrator.config import load_config
+from orchestrator.config import ConfigRequiredError, load_config
 
 load_dotenv()  # loads .env into os.environ (e.g. CLAUDE_OAUTH_TOKEN_A/B)
 
@@ -34,7 +34,10 @@ def main(verbose: bool):
 @click.option('--prd', type=click.Path(exists=True, path_type=Path), default=None,
               help='Path to PRD markdown file (omit to run existing tasks)')
 @click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None, help='Path to config YAML')
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                   'is set). Selects the target project — sets project_root and '
+                   'fused_memory.project_id.')
 @click.option('--dry-run', is_flag=True, help='Populate tasks only, do not execute')
 @click.option('--delay', default=None,
               help='Delay before executing tasks (e.g. 4h, 30m, 90s). '
@@ -44,7 +47,11 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
     from orchestrator.harness import Harness
 
     delay_secs = _parse_duration(delay) if delay else 0
-    config = load_config(config_path)
+    try:
+        config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
     harness = Harness(config)
     report = asyncio.run(harness.run(prd, dry_run=dry_run, delay_secs=delay_secs))
 
@@ -56,12 +63,19 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
 
 @main.command()
 @click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None, help='Path to config YAML')
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                   'is set). Selects the target project — sets project_root and '
+                   'fused_memory.project_id.')
 def status(config_path: Path | None):
     """Show current task tree and status."""
     from orchestrator.scheduler import Scheduler
 
-    config = load_config(config_path)
+    try:
+        config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
     scheduler = Scheduler(config)
 
     async def _show():
@@ -89,7 +103,10 @@ def status(config_path: Path | None):
 @click.option('--judge', is_flag=True, help='Run Elo-based LLM judge on existing results')
 @click.option('--plan-only', is_flag=True, help='Generate plans for tasks (no execution)')
 @click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
-              default=None, help='Path to orchestrator config YAML')
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                   'is set). Selects the target project — sets project_root and '
+                   'fused_memory.project_id.')
 @click.option('--max-parallel', type=int, default=None,
               help='Max concurrent eval runs (default: unlimited)')
 @click.option('--trials', type=int, default=1,
@@ -123,7 +140,11 @@ def eval_cmd(
     vllm_url: str | None,
 ):
     """Run multi-provider implementor evaluations."""
-    base_config = load_config(config_path)
+    try:
+        base_config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
 
     # Inject ANTHROPIC_BASE_URL into vLLM configs when --vllm-url is set
     if vllm_url:
