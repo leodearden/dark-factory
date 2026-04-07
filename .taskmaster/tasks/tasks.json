@@ -9086,13 +9086,13 @@
         "description": "Stream 3 of the vLLM coding-agent eval is in progress with RunPod volume obxma9bf1b provisioned. Remaining work before eval results are valid:\n\n1. Add self-hosted backend configs to EVAL_CONFIGS in orchestrator/src/orchestrator/evals/configs.py for the models being evaluated in Stream 3\n2. Run evals: `python -m orchestrator.evals.runner --trials 3 --max-parallel <N> --vllm-url <endpoint>` against each model config\n3. Run judge: `python -m orchestrator.evals.runner --judge` to produce Elo rankings across all trial results\n\n**memory_hints:**\n- search: \"vLLM eval Stream 3 RunPod self-hosted backend configs EVAL_CONFIGS\"\n- search: \"eval infrastructure stream 3 models evaluated\"\n- search: \"env_overrides implementer debugger roles vLLM\"\n- entity: \"vLLM eval\"\n- See docs/vllm-eval-status.md for current stream state and model list",
         "details": "Stream 1 (dark-factory eval plumbing) and Stream 2 (runpod-toolkit Docker image) are complete. Stream 3 is the actual self-hosted eval run.\n\nKey files:\n- orchestrator/src/orchestrator/evals/configs.py — EVAL_CONFIGS dict, add entries for self-hosted models\n- orchestrator/src/orchestrator/evals/tasks/ — eval task JSON files (df_task_12/13/18, reify_task_27 — plan.task_id values fixed in commit 53486e8023)\n- docs/vllm-eval-status.md — current stream status and next steps\n\nenv_overrides constraint: only implementer and debugger roles may use vLLM endpoint; architect and reviewer must use real Claude OAuth (enforced in workflow.py since commit 53486e8023).\n\nModels: 6 active (Qwen2.5-Coder-32B dropped). See memory \"Evaluating vLLM plan with 6 active models\".",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [
           "457"
         ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T22:25:53.491Z",
+        "updatedAt": "2026-04-06T22:50:16.442Z",
         "metadata": {
           "model_count": 5,
           "devstral_parked": true,
@@ -9447,16 +9447,22 @@
         "description": "In `dashboard/src/dashboard/data/burndown.py`, extract a private coroutine `async def _insert_snapshot_for_root(conn, root_str: str, tasks_json: Path, now: str) -> None` that calls `load_task_tree`, `_count_statuses`, and executes the INSERT. Hoist the INSERT SQL to a module-level constant. Replace the three inline copy-pasted INSERT blocks (lines 76-89, 110-122, 136-148) with calls to this helper.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 450 (reviewer_reuse_auditor).",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "cancelled",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T22:42:41.926Z",
+        "updatedAt": "2026-04-06T22:55:47.219Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data",
             "dashboard/tests/test_burndown_data.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Extract _insert_snapshot_for_root helper to remove INSERT duplication in collect_snapshot"
+            ]
+          }
         }
       },
       {
@@ -9465,16 +9471,22 @@
         "description": "Three test improvements in `dashboard/tests/test_burndown_data.py`:\n\n1. `test_snapshots_known_project_roots_when_no_orchestrators` (lines 193-200): change `SELECT project_id` to `SELECT *` and add assertions on count columns for the reify row (done==2) and autopilot row (in_progress==1). As written, a bug zeroing out counts for known roots would go undetected.\n\n2. `test_dedupes_known_root_against_main_project` (lines 221-226): replace `SELECT COUNT(*) FROM snapshots WHERE project_id = ?` with `SELECT COUNT(*) FROM snapshots` (no WHERE) to catch the case where two rows with different project_id strings are inserted for the same physical directory (symlink-based false negative).\n\n3. Add a new test that patches `load_task_tree` to raise `PermissionError` on the known-root call and asserts either: (a) `collect_snapshot` propagates the exception, or (b) if per-root error handling is added (see robustness task), that the main-project row is still committed and the failing root is skipped.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n- dashboard/tests/test_burndown_data.py\n\nSource: review suggestions on task 450 (reviewer_test_analyst).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "blocked",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T19:50:45.987Z",
+        "updatedAt": "2026-04-07T03:28:56.459Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data",
             "dashboard/tests/test_burndown_data.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Improve burndown test coverage: count columns, dedup assertion, error-mode tests"
+            ]
+          }
         }
       },
       {
@@ -9483,11 +9495,11 @@
         "description": "In `dashboard/src/dashboard/data/burndown.py` lines 127-149, wrap each known root's `asyncio.to_thread(load_task_tree, ...)` call and INSERT in a `try/except OSError` block that logs a warning and `continue`s to the next root. This prevents a single unreadable `tasks.json` from unwinding the entire `collect_snapshot` coroutine and dropping all snapshots for the cycle before `conn.commit()` (line 151).\n\nAlternatively, broaden the `except` inside `load_task_tree` itself to catch all `OSError` so all callers benefit. Match the graceful-degradation pattern already used by `get_burndown_projects` and `get_burndown_series`.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 450 (reviewer_robustness). Risk grows linearly with the number of configured known roots.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T19:53:28.866Z",
+        "updatedAt": "2026-04-07T03:10:28.057Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data",
@@ -9568,17 +9580,28 @@
         "description": "Three related harness.py improvements:\n1. Inject filtered_task_tree for Stage 2 through _configure_consolidator() or a new _configure_task_sync() counterpart, rather than naked attribute assignment. The current asymmetry (structured helper for S1, naked assignment for S2) makes configuration logic hard to trace.\n2. At minimum, rename the parameter or add a docstring to _configure_consolidator clarifying that filtered_task_tree is Stage-1-only and Stage 2 injection is separate.\n3. Add `filtered_task_tree: FilteredTaskTree | None = None` parameter to `_run_remediation_pass()` and pass the pre-fetched `filtered_tree` from `run_full_cycle()`. Inside the method: `remediation_tree = filtered_task_tree or await self._fetch_filtered_task_tree(project_root)` to skip the redundant get_tasks call that currently happens during remediation.\n\n## memory_hints\n- search: \"harness _configure_consolidator _run_remediation_pass filtered_task_tree\"\n- search: \"redundant get_tasks call remediation pass\"",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
-        "dependencies": [],
+        "status": "pending",
+        "dependencies": [
+          "552"
+        ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T22:40:56.728Z",
+        "updatedAt": "2026-04-07T03:06:44.940Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
             "fused-memory/tests/test_harness.py",
             "fused-memory/tests/test_stages.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Unify filtered_task_tree injection pattern in harness.py and avoid redundant fetch"
+            ]
+          },
+          "_causation_id": "7027ea16-3021-4775-9460-2c6506f6cfee",
+          "blocker_context": "task_455_unmerged_to_main",
+          "status_anomaly_note": "briefly set done 23:14:26 then reverted 23:14:37; implementation exists in worktree, review found issues"
         }
       },
       {
@@ -9599,16 +9622,28 @@
         "details": "",
         "testStrategy": "",
         "status": "pending",
-        "dependencies": [],
+        "dependencies": [
+          "552"
+        ],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T20:09:59.867Z",
+        "updatedAt": "2026-04-06T23:42:24.239Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
             "fused-memory/tests/test_harness.py",
             "fused-memory/tests/test_task_filter.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "task 455 task_filter.py harness filtered_task_tree integration",
+              "task_filter.py done_tasks field task 477",
+              "test_task_filter.py char-budget clamp max_tasks cap tests"
+            ]
+          },
+          "_causation_id": "7027ea16-3021-4775-9460-2c6506f6cfee",
+          "blocker_context": "task_455_unmerged_to_main"
         }
       },
       {
@@ -9618,7 +9653,9 @@
         "details": "",
         "testStrategy": "",
         "status": "pending",
-        "dependencies": [],
+        "dependencies": [
+          "552"
+        ],
         "priority": "medium",
         "subtasks": [],
         "updatedAt": "2026-04-06T20:13:39.563Z",
@@ -9626,7 +9663,17 @@
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
             "fused-memory/tests/test_stages.py"
-          ]
+          ],
+          "_causation_id": "7027ea16-3021-4775-9460-2c6506f6cfee",
+          "blocker_context": "task_455_unmerged_to_main",
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "task 455 task_filter.py harness filtered_task_tree done_tasks integration",
+              "task 477 done_tasks FilteredTaskTree field",
+              "done_tasks_for_display harness Stage 2 inject fallback path"
+            ]
+          }
         }
       },
       {
@@ -9801,11 +9848,11 @@
         "description": "task_filter.py is currently never imported — task_knowledge_sync.py still maintains its own copies of: active_tasks filtering (lines 61-64), _STATUS_PRIORITY dict (lines 212-218, diverging from task_filter's version), sort_key closure (lines 234-243, near-verbatim copy), and _format_tasks (lines 198-208, same format string).\n\nFix:\n1. In task_knowledge_sync.py, replace the inline active_tasks/done_tasks derivation with calls to filter_task_tree() and format_filtered_task_tree().\n2. Delete _STATUS_PRIORITY from task_knowledge_sync.py and import from task_filter.\n3. Replace _select_proactive_sample's sort_key closure with the shared logic from task_filter.\n4. Remove _format_tasks from task_knowledge_sync.py or delegate to _render_task_line helper in task_filter.py.\n\nMemory hints: search for \"_STATUS_PRIORITY\" and \"task_filter\" to find prior decisions about the filter module.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T22:25:53.286Z",
+        "updatedAt": "2026-04-07T03:44:31.583Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
@@ -9943,10 +9990,19 @@
         "description": "Add a `__post_init__` method to `DashboardConfig` in `dashboard/src/dashboard/config.py` that resolves all Path fields:\n```python\ndef __post_init__(self) -> None:\n    self.project_root = self.project_root.resolve()\n    self.known_project_roots = [p.resolve() for p in self.known_project_roots]\n```\nThen:\n1. Remove the eager `.resolve()` from `from_env()` line 73 (it becomes a no-op but can stay as a defensive call or be cleaned up).\n2. Remove the ad-hoc `resolved_root = str(config.project_root.resolve())` from `collect_snapshot()` (burndown.py:71) — just use `str(config.project_root)` since it's already resolved.\n3. Remove the redundant `.resolve()` call in the known_project_roots loop (burndown.py:129) for the same reason.\n\nThis makes every construction path — `from_env()`, direct `DashboardConfig(...)`, tests — produce already-resolved paths, fixing: (a) the unresolved-path footgun on all path-derived properties like `tasks_json`/`burndown_db`, (b) the split-ownership double-resolve, (c) the asymmetry between project_root and known_project_roots normalization.\n\nFiles: dashboard/src/dashboard/config.py, dashboard/src/dashboard/data/burndown.py, dashboard/tests/test_burndown_data.py\n\nSource: review suggestions on task 469 (suggestions 1, 2, 5, 6, 7, 11, 13 from reviewers architect_reviewer, performance, reuse_auditor, test_analyst, robustness).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:36:14.402Z",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard/config.py",
+            "dashboard/src/dashboard/data",
+            "dashboard/tests/test_burndown_data.py",
+            "dashboard/tests/test_scaffold.py"
+          ]
+        }
       },
       {
         "id": "509",
@@ -9957,7 +10013,14 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:52:52.040Z",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard/data",
+            "dashboard/tests/test_orchestrator.py"
+          ]
+        }
       },
       {
         "id": "510",
@@ -9979,7 +10042,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T22:55:47.866Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_rebuild_entity_summaries.py"
+          ]
+        }
       },
       {
         "id": "512",
@@ -9987,10 +10058,17 @@
         "description": "At context_assembler.py:125, the existing `if isinstance(ctx_result, BaseException): ctx_result = []` silently converts CancelledError into empty context and lets execution continue. Apply the same two-tier pattern: add a pre-scan pass that re-raises any result where `isinstance(r, BaseException) and not isinstance(r, Exception)`, then narrow the accumulator guard to `isinstance(ctx_result, Exception)`. This is the same fix applied to graphiti_client in task 484's diff.\n\nSource: review suggestions from task 484. Rationale: structured-concurrency cancellation must propagate; converting CancelledError into empty lists breaks graceful shutdown.\n\nFiles:\n- fused-memory/src/fused_memory/reconciliation/context_assembler.py\n- fused-memory/tests/test_rebuild_entity_summaries.py (or a new context_assembler test file)",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:49:39.909Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_context_assembler.py"
+          ]
+        }
       },
       {
         "id": "513",
@@ -10001,7 +10079,19 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T23:01:14.014Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/src/fused_memory/services",
+            "fused-memory/src/fused_memory/utils",
+            "fused-memory/tests/test_async_utils.py",
+            "fused-memory/tests/test_context_assembler.py",
+            "fused-memory/tests/test_rebuild_entity_summaries.py"
+          ]
+        }
       },
       {
         "id": "514",
@@ -10009,10 +10099,22 @@
         "description": "In test_rebuild_entity_summaries.py, add three tests:\n1. `test_cancelled_error_propagates_force_false` — mock `_detect_stale_summaries_with_edges` to return stale entities, mock `update_node_summary` to raise CancelledError, assert propagation. Currently both cancellation tests use force=True, leaving the force=False code path untested for this bug class.\n2. A test asserting that a plain RuntimeError still produces `errors==1` and `rebuilt==1` in the post-fix code path (regression guard for the BaseException→Exception narrowing, ensuring Exception subclasses still accumulate into per-entity errors).\n3. Strengthen `test_cancelled_error_propagates_alongside_other_errors` with an inline comment or companion assertion clarifying that RuntimeError in slot 1 was NOT counted before CancelledError propagated (since Pass 1 runs before Pass 2 bookkeeping).\n\nAlso extract the shared mock setup (list_entity_nodes, get_all_valid_edges, backend instantiation) into a class-level fixture to eliminate the boilerplate duplication across both existing tests.\n\nSource: review suggestions from task 484. Rationale: close coverage gaps left by the initial CancelledError fix.\n\nFiles:\n- fused-memory/tests/test_rebuild_entity_summaries.py\n- fused-memory/src/fused_memory/backends/graphiti_client.py (reference only)",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:28:16.599Z",
+        "metadata": {
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Fill test coverage gaps for cancellation and Exception accumulation in rebuild_entity_summaries"
+            ]
+          },
+          "modules": [
+            "fused-memory/tests/test_rebuild_entity_summaries.py"
+          ]
+        }
       },
       {
         "id": "515",
@@ -10020,10 +10122,19 @@
         "description": "Qwen3-Coder-Next-FP8 (config: qwen3-coder-next-fp8-new) has a persistent vLLM startup hang that causes health-check timeout before the server becomes ready. This is NOT a memory issue — reproduced on both RTX PRO 6000 (96GB, EUR-IS-1) and H200 SXM (141GB). Config was migrated to H200 as a mitigation but the hang root cause remains unknown, blocking Qwen3 from being evaluated in the vLLM eval pipeline.",
         "details": "Known context:\n- Tool-call parser for Qwen3-Coder must be qwen3_coder (hermes was prior misconfiguration, now fixed)\n- Config is in orchestrator/src/orchestrator/evals/configs.py (qwen3-coder-next-fp8-new entry)\n- Graphiti edge 85c34b19 records config migration to H200\n- Episodes from 2026-04-06 session ~20:42 document the hang\n\nInvestigation steps:\n1. Launch qwen3-coder-next-fp8-new config on an H200 pod and observe vLLM startup logs\n2. Identify exact hang point (tokenizer init / model load / CUDA graph build / etc.)\n3. Verify HF model variant compatibility with installed vLLM version\n4. Try --max-model-len, --enforce-eager, or --disable-custom-all-reduce flags as needed\n5. Fix config or add vLLM startup flags; rerun gate eval to confirm server becomes ready\n\nmemory_hints:\n- search: \"Qwen3-Coder-Next vLLM startup hang health timeout H200 RTX\"\n- search: \"vLLM eval configs.py qwen3_coder tool-call parser\"\n- entity: \"qwen3-coder-next-fp8-new\"",
         "testStrategy": "",
-        "status": "pending",
+        "status": "blocked",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:02:45.892Z",
+        "metadata": {
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Investigate and fix Qwen3-Coder-Next-FP8 vLLM startup hang (health timeout)"
+            ]
+          }
+        }
       },
       {
         "id": "516",
@@ -10034,7 +10145,20 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T23:36:23.320Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/tests/test_rebuild_entity_summaries.py"
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Add structured warning log before propagating CancelledError in rebuild_entity_summaries"
+            ]
+          }
+        }
       },
       {
         "id": "517",
@@ -10067,7 +10191,14 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T23:20:53.122Z",
+        "metadata": {
+          "modules": [
+            "dashboard/src/dashboard/data",
+            "dashboard/tests/test_burndown_data.py"
+          ]
+        }
       },
       {
         "id": "520",
@@ -10078,7 +10209,13 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-06T23:30:50.433Z",
+        "metadata": {
+          "modules": [
+            "dashboard/tests/test_burndown_data.py"
+          ]
+        }
       },
       {
         "id": "521",
@@ -10089,7 +10226,13 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:03:54.045Z",
+        "metadata": {
+          "modules": [
+            "dashboard/tests/test_burndown_data.py"
+          ]
+        }
       },
       {
         "id": "522",
@@ -10097,10 +10240,11 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py:\n1. Remove `test_dry_run_partition_invariant_skips_rebuild_and_edges` from `TestRebuildEntitySummariesErrorHandling` (line 538).\n2. Add `backend._rebuild_entity_from_edges.assert_not_awaited()` to `test_force_dry_run_does_not_call_get_all_valid_edges` (after line 275).\n3. Add the partition invariant assertion `assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']` to `test_force_dry_run_returns_correct_aggregate` (after line 300).\n\nThis consolidates all force=True dry_run=True coverage in `TestRebuildEntitySummariesForceDryRun` without duplicating the scenario.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:17:00.914Z"
       },
       {
         "id": "523",
@@ -10108,10 +10252,11 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py, update the docstring of `test_dry_run_partition_invariant_skips_rebuild_and_edges` (lines 539–551):\n\n1. Replace line-number references ('line 1031', 'lines 1046-1049') with semantic descriptions like 'the edge-fetch guard in the force branch' and 'the dry_run early-return block before the semaphore loop'.\n2. Narrow the claim 'edges are NOT fetched when dry_run=True, even in the force path' to make clear this only applies to the force=True code path. Add a note that force=False uses _detect_stale_summaries_with_edges which fetches edges for staleness detection regardless of dry_run.\n\nNote: if task \"Relocate dry_run test to correct class\" removes this test, apply equivalent docstring cleanup to its replacement location.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:36:14.065Z"
       },
       {
         "id": "524",
@@ -10119,10 +10264,16 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py, replace the status-only loop at lines 576–578 with a full-dict comparison:\n\n```python\nexpected_details = [{'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities]\nassert result['details'] == expected_details\n```\n\nThis matches the style already used in the error-path tests (lines 525–534) and catches regressions where uuid/name are accidentally dropped from the dry_run detail records.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:44:31.896Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/tests/test_graphiti_quality_433.py"
+          ]
+        }
       },
       {
         "id": "525",
@@ -10189,13 +10340,410 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": "531",
+        "title": "Fix run_eval_matrix exception handling and add coverage",
+        "description": "In orchestrator/src/orchestrator/evals/runner.py lines 313-315, replace `isinstance(r, BaseException)` with handling that explicitly re-raises asyncio.CancelledError (or separates it from ordinary eval failures) so graceful shutdown propagates correctly. Add a test that gathers a coroutine raising asyncio.CancelledError and verifies the correct behavior (absorbed vs re-raised, per the chosen design). Also add a test that calls run_eval_matrix with a task raising asyncio.CancelledError and verifies the error is logged but the matrix call handles it gracefully.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "532",
+        "title": "Refactor TestVllmUrlInjection test fixtures for isolation and deduplication",
+        "description": "In orchestrator/tests/test_eval_configs.py, refactor TestVllmUrlInjection (lines 175-240): (1) extract the save/restore env_overrides scaffolding into a shared pytest fixture using monkeypatch or contextmanager, eliminating the 45-line copy-paste across 3 test methods; (2) use deepcopy or monkeypatch.setattr to avoid mutating module-level singletons directly. Also add at least one test that exercises the actual CLI injection path: invoke _run_single_eval or _run_matrix_cmd from cli.py with a vllm_url argument (mocked runner) and assert ANTHROPIC_BASE_URL is injected into each vLLM config's env_overrides.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "533",
+        "title": "Fix stale config list references and hardcoded data in tests",
+        "description": "In orchestrator/tests/test_eval_configs.py: (1) line 115 — change `for cfg in EVAL_CONFIGS + VLLM_EVAL_CONFIGS:` to `for cfg in EVAL_CONFIGS:` since VLLM_EVAL_CONFIGS is already spread into EVAL_CONFIGS; (2) lines 179-183 — replace the hardcoded _CLOUD_BASELINE_NAMES set with a derived expression: `{cfg.name for cfg in EVAL_CONFIGS} - {cfg.name for cfg in VLLM_EVAL_CONFIGS}` so it stays in sync automatically when baselines are added or renamed.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "534",
+        "title": "Remove redundant tests from test_eval_configs.py",
+        "description": "In orchestrator/tests/test_eval_configs.py: (1) remove the entire TestRunnerDefaultIncludesVllm class (lines 158-172) — it is fully subsumed by TestEvalConfigsIncludesVllm since runner_module.EVAL_CONFIGS is configs.EVAL_CONFIGS; (2) remove test_vllm_config_count_is_six (lines 84-89) — the count is implied by test_vllm_config_names_are_exact_set which already fails with a descriptive diff on any mismatch.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "535",
+        "title": "Add missing test coverage for create_eval_worktree API contract and runner help output",
+        "description": "Three gaps to address: (1) orchestrator/tests/ — add a test for create_eval_worktree in snapshots.py that asserts the result is a 2-tuple of (Path, str) and that run_id is an 8-character hex string; (2) orchestrator/tests/test_runner_main.py line 28 — change the weak `or` assertion to `and` and add `--vllm-url` to the checked flags; (3) orchestrator/tests/test_runner_main.py line 15 — add `timeout=30` to the subprocess.run call and catch subprocess.TimeoutExpired with a clear failure message.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "536",
+        "title": "Move runner.py __main__ entry-point to evals/__main__.py",
+        "description": "In orchestrator/src/orchestrator/evals/runner.py, remove the `if __name__ == '__main__':` block (lines 383-385). Create a new file orchestrator/src/orchestrator/evals/__main__.py containing only `from orchestrator.cli import eval_cmd; eval_cmd()`. This preserves `python -m orchestrator.evals.runner` invocability while eliminating the reverse runner→cli dependency edge and keeping runner.py a pure library module.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "537",
+        "title": "Hoist INSERT SQL to module-level constant in burndown.py",
+        "description": "In `dashboard/src/dashboard/data/burndown.py`, hoist the INSERT SQL literal in `collect_snapshot`'s Phase 3 loop (around lines 119-121) to a module-level constant `_INSERT_SNAPSHOT_SQL` (single string literal, no concatenation). No helper extraction, no signature changes, no behavior changes. Source: remaining sub-goal of superseded task 471; review suggestion #5 from reviewer_performance.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "538",
+        "title": "Extract _tasks_json_for helper to remove path duplication in burndown.py",
+        "description": "In `dashboard/src/dashboard/data/burndown.py`, extract a small module-level helper `def _tasks_json_for(root: Path) -> Path: return root / '.taskmaster' / 'tasks' / 'tasks.json'` and use it at the two call sites in `collect_snapshot` where the path is currently built inline (the orchestrator loop around line 99 and the `known_project_roots` loop around line 107). Mirrors how `DashboardConfig.tasks_json` centralizes this path for the primary project root. Pure refactor; no behavior change.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 471 from two independent reviewers (reviewer_architect_reviewer #2, reviewer_reuse_auditor #6).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "539",
+        "title": "Harden collect_snapshot against partial-failure cascades",
+        "description": "Harden `collect_snapshot` in `dashboard/src/dashboard/data/burndown.py` against partial failures in secondary projects so a transient error does not forfeit the primary project's snapshot.\n\nThree related robustness concerns from review of task 471:\n\n1. Transaction atomicity (#11): All project inserts currently share a single commit at the end. A DB error on any secondary project rolls back the main project's row too. Consider per-project savepoints, or commit the main insert first then treat extras as best-effort.\n\n2. Orchestrator-discovery failure (#12): `find_running_orchestrators()` (and `_read_project_root_from_config`) can raise (subprocess failures, OS errors). That currently aborts the whole snapshot. Wrap the orchestrator-discovery block in a try/except that logs and degrades to skip extras.\n\n3. Missing explicit rollback + docstring contract (#13): The error path relies on aiosqlite's implicit rollback-on-close. Add an explicit `await conn.rollback()` in an except around the body, or document the implicit behavior.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n- dashboard/tests/test_burndown_data.py (add tests covering each failure mode)\n\nSource: review suggestions #11, #12, #13 from reviewer_robustness on task 471. The target code shape is main's 3-phase parallel `collect_snapshot` (post-task-470).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "540",
+        "title": "Apply task 480 items 3-4 after task/455 merges to main",
+        "description": "Follow-up from task 480. Items 3 and 4 reference tests in fused-memory/tests/test_harness.py that exist only on the unmerged task/455 branch. Once task/455 lands on main, apply these two fixes:\n\nItem 3: In `test_stage1_and_stage2_receive_filtered_tree_before_run` and the budget integration test, add `harness.taskmaster.get_tasks.assert_called_once()` after `await harness.run_full_cycle(...)` to verify the single-fetch invariant.\n\nItem 4: In `test_handles_fetch_exception`, change the `or` to `and`:\n`assert any('connection refused' in r.message and '/abs/path' in r.message for r in caplog.records if r.levelno >= logging.WARNING)`\n\nItems 1 and 2 of task 480 were completed directly on the task/480 branch in commit 2203f758df.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "541",
+        "title": "Address review suggestions for task 514 test fixture and assertions",
+        "description": "Follow-up improvements to fused-memory/tests/test_rebuild_entity_summaries.py from task 514 review pass. All suggestions cluster around the new TestRebuildEntitySummariesCancellation class and its two_entity_backend fixture.\n\nGROUP A — Clarify fixture contract for force=False consumer:\n- The two_entity_backend fixture pre-configures list_entity_nodes and get_all_valid_edges, but test_cancelled_error_propagates_force_false stubs _detect_stale_summaries_with_edges directly, bypassing those mocks. Add an inline comment in test_cancelled_error_propagates_force_false noting that the fixture's lower-level mocks are intentionally superseded by the _detect_stale_summaries_with_edges override, and update the fixture docstring to note that list_entity_nodes/get_all_valid_edges are only exercised by force=True consumers. (Reviewers: architect_reviewer, test_analyst, robustness — three convergent reports.)\n\nGROUP B — Strengthen force=False propagation assertions:\n- After the pytest.raises block in test_cancelled_error_propagates_force_false (line ~1261), add:\n    assert backend._detect_stale_summaries_with_edges.await_count == 1\n    assert backend.update_node_summary.await_count == 2\n  with a comment mirroring the rationale in test_cancelled_error_propagates_alongside_other_errors. This proves both the stale-detection mock and the gather path were exercised, guarding against a future refactor where CancelledError could escape from a different code path while the test still passes. (Reviewers: test_analyst, robustness.)\n\nGROUP C — Test quality improvements in test_runtime_error_still_accumulates_in_errors (line ~1264-1294):\n- Replace RuntimeError with ValueError (or parametrize over both) so the test actually distinguishes isinstance(r, Exception) from isinstance(r, RuntimeError) — currently an over-narrowed guard would still pass.\n- Add `assert result['total'] == 2` and `assert result['skipped'] == 0` to fully pin down the result shape (currently `errors==1` and `rebuilt==1` would pass even if both counters incremented for the same entity).\n- Replace `next(d for d in result['details'] if d['status'] == 'error')` with a None-default fallback and explicit assertion to avoid bare StopIteration on test failure. (Reviewer: test_analyst.)\n\nGROUP D — Promote fixture for reuse across test classes:\n- TestRebuildEntitySummariesParallel.test_partial_failure_in_update_does_not_cancel_others (line ~1036-1044) duplicates the same Alice/Bob/stale1/stale2/current1/current2 setup that two_entity_backend now encapsulates. Move two_entity_backend to a module-level fixture (or conftest.py) so both classes can consume it. The function-scope justification (fresh await_count counters) applies equally to the parallel class. (Reviewers: architect_reviewer, reuse_auditor.)\n\nSource: review suggestions captured in esc-514-62 from the 2026-04-06 review cycle on task 514.\nFiles: fused-memory/tests/test_rebuild_entity_summaries.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "542",
+        "title": "Restore dedup test assertion specificity (WHERE clause)",
+        "description": "In dashboard/tests/test_burndown_data.py, test_dedupes_known_root_against_main_project (lines ~249-269) had its assertion narrowed from `SELECT COUNT(*) FROM snapshots WHERE project_id = ?` to `SELECT COUNT(*) FROM snapshots`. The WHERE clause is the direct statement of the deduplication invariant (\"this specific project_id has exactly one row\"). The unscoped query loses diagnostic power: a hypothetical bug where the main-project row is omitted but the known-root row is inserted under a slightly different key (e.g., resolved vs. non-resolved path string) would still produce total count=1 and pass.\n\nFix: keep the project-scoped `SELECT COUNT(*) WHERE project_id = ?` as the primary assertion. Optionally add a secondary global count check for additional coverage, but the project-scoped assertion is the canonical statement of the invariant.\n\nSource: review suggestions on task 472 (reviewers architect_reviewer, test_analyst, robustness — independently identified the same issue).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "543",
+        "title": "Eliminate positional column-index fragility in burndown snapshot assertions",
+        "description": "In dashboard/tests/test_burndown_data.py, test_snapshots_known_project_roots_when_no_orchestrators (lines ~193-228) uses `SELECT * FROM snapshots` plus positional column-index access (`row[3]`…`row[8]`) for 24+ assertions. The schema is `id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done`; any column insertion or reorder would silently corrupt every assertion without raising a query error (small integer values can match coincidentally).\n\nFix (one of):\n(a) Set `conn.row_factory = aiosqlite.Row` and use `row['pending']`, `row['done']`, etc.\n(b) Use an explicit named projection: `SELECT project_id, pending, in_progress, blocked, deferred, cancelled, done FROM snapshots`.\n\nAdditionally, add a `_assert_snapshot_counts(row, *, pending=0, in_progress=0, blocked=0, deferred=0, cancelled=0, done=0)` helper alongside the existing `_insert_snapshot` helper. Replace each 6-line assertion block with a single call (e.g. `_assert_snapshot_counts(reify_row, done=2)`). The kwargs naturally eliminate positional coupling.\n\nSource: review suggestions on task 472 (reviewers architect_reviewer, test_analyst, robustness, performance, reuse_auditor — five reviewers flagged variants).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "544",
+        "title": "Improve error-propagation test: fixture reuse, ordering comment, main-project sibling",
+        "description": "Three independent improvements to the new test_propagates_load_task_tree_error_for_known_root test in dashboard/tests/test_burndown_data.py (~lines 289-336):\n\n1. Use the existing burndown_env / db setup fixture instead of repeating db_path/_create_burndown_db/DashboardConfig setup boilerplate that already appears in 4+ other tests in TestCollectSnapshot. Optionally extract a `burndown_conn` pytest fixture mirroring the session-scoped pattern in TestGetBurndownSeries.\n\n2. Add an inline comment above `side_effect=[[], PermissionError(...)]` documenting that index 0 is the main-project call and index 1 is the known-root call, and reference the specific lines in burndown.py (~74 main-project, ~134 known-root). Alternatively, assert `mock.call_args_list` after the exception to verify the second call targeted the known-root tasks.json path, making the ordering dependency explicit.\n\n3. Add a sibling test `test_propagates_load_task_tree_error_for_main_project` that patches `load_task_tree` with `side_effect=PermissionError(...)` (raises on the very first call), asserting both the exception propagation and zero committed rows via a fresh connection. This covers the atomicity guarantee on the first-call failure path.\n\nSource: review suggestions on task 472 (reviewers reuse_auditor, robustness, test_analyst).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "545",
+        "title": "Replace stale docstring mutation instruction with tracked TODO reference",
+        "description": "In dashboard/tests/test_burndown_data.py, the new test_propagates_load_task_tree_error_for_known_root docstring contains a forward-declaration \"When the deferred robustness task lands (option (b)), this test's assertions should flip to…\". This is a maintenance hazard — open-ended prose with no concrete reference becomes stale, and there is no task number or link tracking when the flip should happen.\n\nFix: replace the open-ended prose with a `# TODO(task-NNN):` comment marker referencing the actual Taskmaster task for the deferred per-root error-handling robustness work. Keep the architectural rationale (option (a) propagate vs option (b) per-root skip-and-continue) in the docstring body, but move the forward-looking mutation instruction to a trackable ticket reference.\n\nSource: review suggestion on task 472 (reviewer architect_reviewer).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "546",
+        "title": "Rename qwen3-coder-next-fp8-new to a stable config name",
+        "description": "In orchestrator/src/orchestrator/evals/configs.py line 103, rename 'qwen3-coder-next-fp8-new' to a semantically stable alternative (e.g. 'qwen3-coder-next-fp8-v2', or simply 'qwen3-coder-next-fp8' once the old baked-image entry is retired). Update the name in test_eval_configs.py TestVllmConfigSet.EXPECTED_VLLM_NAMES and any docs or scripts that reference the old name. The two configs ('qwen3-coder-next-fp8' baked/bf16 and 'qwen3-coder-next-fp8-new' HF-FP8) should have names that describe the technical distinction, not the temporal order of introduction.\n\nFiles: orchestrator/src/orchestrator/evals/configs.py\n\nSource: review follow-up from task 515 (esc-515-67)",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "547",
+        "title": "Decouple vLLM health timeout from container_disk; guard against Qwen3 hang window",
+        "description": "In scripts/run_vllm_eval.py line 172, `health_timeout = max(900, container_disk * 12)` gives only 900s (15 min) when use_volume=True (the default) because container_disk is overridden to 50. The documented Qwen3 CUDA-graph hang lasts 15-80 min, so the current default timeout exactly matches the lower bound and will spuriously kill legitimate slow startups.\n\nFix by decoupling timeout from disk size: either (a) track the original pre-volume-override disk size for the timeout calculation, (b) add a per-model health_timeout_override field to EvalConfig, or (c) apply a higher floor specifically for configs with known startup hang risk (qwen3-coder-next-fp8-new). Also note that even with --no-volume (container_disk=240 → 2880s = 48 min), the 80-min upper bound of the hang window is not covered.\n\nFiles: scripts/run_vllm_eval.py\n\nSource: review follow-up from task 515 (esc-515-67)",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "548",
+        "title": "Fix unclosed file handle for SSH_PUBKEY in run_vllm_eval.py",
+        "description": "In scripts/run_vllm_eval.py line 25, replace `SSH_PUBKEY = open(SSH_KEY + '.pub').read().strip()` with a context manager:\n\n```python\nwith open(SSH_KEY + '.pub') as fh:\n    SSH_PUBKEY = fh.read().strip()\n```\n\nOne-line fix; makes the code idiomatic and lint-clean.\n\nFiles: scripts/run_vllm_eval.py\n\nSource: review follow-up from task 515 (esc-515-67)",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "549",
+        "title": "Improve cancellation observability in rebuild_entity_summaries warning log",
+        "description": "Fix observability gaps in the WARNING log added by task 516 at graphiti_client.py:1080-1084: counters are always 0, multiple concurrent CancelledErrors are silently dropped, and key naming is inconsistent with the summary info log.",
+        "details": "The current WARNING log added in task 516 (fused-memory/src/fused_memory/backends/graphiti_client.py:1080-1084) has three observability gaps:\n\n1. MISLEADING COUNTERS — `rebuilt_so_far=%d errors_so_far=%d` are ALWAYS 0 at the time the warning fires. There is no outer batching loop and Pass 2 (which increments these counters) has never run when Pass 1 raises CancelledError. Operators reading `rebuilt_so_far=0` could incorrectly conclude no entity summaries were persisted, when in fact some coroutines may have already committed writes to the DB before the cancellation was captured.\n\n2. SILENT LOSS OF CONCURRENT CANCELLATIONS — If `asyncio.gather(return_exceptions=True)` returns multiple CancelledError results, only the first is logged and re-raised; the rest are silently dropped. The new warning fires exactly once even when N tasks were cancelled.\n\n3. INCONSISTENT KEY NAMING — The warning uses `rebuilt_so_far=` and `errors_so_far=` while the summary info log at line 1117 uses `rebuilt=` and `errors=` for the same counters. This makes log aggregation / grep correlation harder.\n\nSUGGESTED FIX:\nBefore raising the first CancelledError, scan results to compute:\n  committed = sum(1 for x in results if isinstance(x, dict))\n  cancel_count = sum(1 for x in results if isinstance(x, BaseException) and not isinstance(x, Exception))\n\nRewrite the warning as:\n  logger.warning(\n      'rebuild_entity_summaries: cancellation signal received group=%s '\n      'committed_before_cancel=%d cancel_count=%d status=partial; propagating',\n      group_id, committed, cancel_count,\n  )\n\nUpdate the existing test test_cancelled_error_logs_warning_before_propagating in fused-memory/tests/test_rebuild_entity_summaries.py:1197-1238 to:\n- Assert presence of new key names (committed_before_cancel=, cancel_count=)\n- Use warning_records[0].args for exact numeric values rather than coupling to literal '=N' substrings\n- Use warning_records[0].message instead of getMessage() (project convention)\n\nFILES:\n- fused-memory/src/fused_memory/backends/graphiti_client.py (lines 1078-1085)\n- fused-memory/tests/test_rebuild_entity_summaries.py (lines 1197-1238)\n\nSource: review suggestions from task 516 (#1 naming_consistency, #2 test_coupling_to_log_format, #9 misleading_observability, #10 silent_loss_of_concurrent_cancellations).",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "550",
+        "title": "Strengthen cancellation test coverage in test_rebuild_entity_summaries",
+        "description": "Fix four gaps in the cancellation test suite added by task 516: misleading docstring, missing caplog assertion in mixed-error test, missing coverage for CancelledError in second slot, and a weak group_id assertion.",
+        "details": "Several gaps and inaccuracies remain in the cancellation test suite added by task 516 (fused-memory/tests/test_rebuild_entity_summaries.py).\n\nISSUE 1 — Misleading docstring (test:1201-1207)\nThe docstring for test_cancelled_error_logs_warning_before_propagating says \"rebuilt_so_far=0 and errors_so_far=0 because Pass 2 has not yet executed for this batch\". The phrase \"for this batch\" implies a per-batch counter reset, but the implementation has a single flat asyncio.gather with no batching loop — counters are initialized once and can only be non-zero after Pass 2 completes. A future maintainer adding batching might believe the counters reset each batch.\nFIX: Change to \"rebuilt_so_far=0 and errors_so_far=0 because counters are only incremented in Pass 2, which never executes when CancelledError is found in Pass 1.\"\n\nISSUE 2 — Missing caplog assertion in mixed-error test (test:1163-1195)\ntest_cancelled_error_propagates_alongside_other_errors (RuntimeError first, CancelledError second) verifies CancelledError is still raised but does not assert the WARNING is emitted exactly once. A regression that drops the warning from the mixed-error path would not be caught.\nFIX: Add a caplog assertion verifying len(warning_records) == 1 and basic message content.\n\nISSUE 3 — Missing coverage for CancelledError in second slot (test:1217-1219)\nThe existing test only exercises CancelledError in the first results slot. There is no test for side_effect=[None, asyncio.CancelledError()] where the first entity succeeds and CancelledError is raised for the second. In that ordering, Pass 1 scans index 0 (success — skip), then index 1 (CancelledError — warn and raise). The warning should still fire exactly once.\nFIX: Add a parameterized variant or separate test covering CancelledError in position 1.\n\nISSUE 4 — Weak assertion (test:1236)\nassert 'test' in msg checks for the bare string 'test' rather than verifying the group_id is logged with its key. A group_id like 'testing-group' would satisfy the check vacuously.\nFIX: Replace with assert 'group=test' in msg.\n\nFILES:\n- fused-memory/tests/test_rebuild_entity_summaries.py (lines 1163-1238)\n\nNOTE: This task may need to coordinate with the sibling observability task that renames the warning log keys — if that task lands first, update the new key names here accordingly.\n\nSource: review suggestions from task 516 (#5 weak_assertion, #6 misleading_docstring, #7 missing_coverage mixed-error, #8 missing_coverage second-slot).",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "551",
+        "title": "CRITICAL: Resolve main worktree git stash-pop conflict state to unblock advance_main",
+        "description": "The main worktree is stuck in a git stash-pop conflict state from failed pre-advance attempts for tasks 453 and 457. This blocks ALL advance_main operations for any subsequent tasks.\\n\\n## Current State\\n- Conflict markers in: docs/vllm-eval-status.md and orchestrator/src/orchestrator/evals/configs.py (labeled 'Stashed changes')\\n- Staged modification in: scripts/run_vllm_eval.py\\n- Two leftover stashes: 'pre-advance for 453', 'pre-advance for 457'\\n- tasks.json has an unstaged modification\\n\\n## Resolution Steps (requires human manual intervention)\\n1. `cd /home/leo/src/dark-factory && git status` — confirm current conflict state\\n2. Resolve conflict markers in docs/vllm-eval-status.md (keep appropriate version — tasks 453/457 are both done)\\n3. Resolve conflict markers in orchestrator/src/orchestrator/evals/configs.py\\n4. Review and stage/discard the scripts/run_vllm_eval.py staged change\\n5. `git stash list` — confirm two pre-advance stashes\\n6. `git stash drop stash@{1} && git stash drop stash@{0}` — drop both pre-advance stashes\\n7. `git status` — verify main worktree is clean\\n8. Commit any resolved files if needed, then verify orchestrator can run advance_main\\n\\n## memory_hints\\n- search: 'main worktree git stash-pop conflict advance_main blocker'\\n- search: 'task 453 task 457 vllm eval configs pre-advance stash'\\n- search: 'advance_main stuck conflict markers docs/vllm-eval-status.md'",
+        "details": "",
+        "testStrategy": "",
+        "status": "done",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:12:58.820Z"
+      },
+      {
+        "id": "552",
+        "title": "Manually resolve task 455 merge conflict and integrate to main (unblocks tasks 478, 480, 481)",
+        "description": "Task 455 (harness-level task filtering) is marked done but its branch is unmerged to main due to conflicts in task_filter.py and test_task_filter.py. Tasks 478, 480, and 481 are explicitly blocked on this integration.\\n\\n## Conflict Root Causes\\n1. **task_filter.py**: Main diverged after task 474 cherry-picked an older version without the harness.py integration. The task 455 branch has the full filtered_task_tree implementation that main lacks.\\n2. **test_task_filter.py**: Main gained a done_tasks field from task 477. The task 455 branch predates this addition.\\n\\n## Resolution Steps\\nPREREQUISITE: Task 551 (main worktree conflict) must be resolved first — advance_main is blocked until main is clean.\\n\\n1. Check out task/455 branch: `git checkout task/455`\\n2. Rebase onto current main: `git rebase main` (or merge main into 455 branch)\\n3. Resolve conflict in task_filter.py:\\n   - Keep task 455's harness.py filtered_task_tree integration\\n   - Ensure done_tasks field from task 477 is also present\\n4. Resolve conflict in test_task_filter.py:\\n   - Merge both sets of tests (task 455's filter tests + task 477's done_tasks tests)\\n5. Run tests: `pytest fused-memory/tests/test_task_filter.py -v`\\n6. Merge to main via merge queue or direct merge\\n7. Once merged, tasks 478, 480, 481 can proceed\\n\\n## memory_hints\\n- search: 'task 455 task_filter.py harness filtered_task_tree integration'\\n- search: 'task_filter.py done_tasks field task 477 diverged main'\\n- search: 'task 455 merge conflict task_filter test_task_filter'\\n- search: 'task 474 cherry-pick task_filter older version diverged'",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [
+          "551"
+        ],
+        "priority": "high",
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:49:39.794Z",
+        "metadata": {
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Manually resolve task 455 merge conflict and integrate to main (unblocks tasks 478, 480, 481)"
+            ]
+          }
+        }
+      },
+      {
+        "id": "553",
+        "title": "Fix OSError resilience gap in orchestrators discovery loop",
+        "description": "In `dashboard/src/dashboard/data/burndown.py` lines 85-99, wrap the per-orchestrator `project_root.resolve()` call (line 95) in a `try/except OSError` block that logs a warning and continues, matching the pattern already used for the `known_project_roots` loop (lines 101-114). This prevents a single unreachable PRD path or config-discovered root from unwinding the entire `collect_snapshot` coroutine.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 473 (reviewer_architect_reviewer - inconsistent_error_handling_pattern).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "554",
+        "title": "Improve test coverage and quality for burndown error handling",
+        "description": "Four test-quality fixes across two files:\n\n1. `dashboard/tests/test_burndown_data.py` line 282: remove the redundant local `from dashboard.config import DashboardConfig` import — it duplicates the module-level import at line 13.\n\n2. `dashboard/tests/test_burndown_data.py`: add a test that patches `Path.resolve` to raise `OSError` for one entry in `known_project_roots` and asserts the warning is logged and remaining roots are snapshotted — covering the Phase 1 resilience path that no current test exercises.\n\n3. `dashboard/tests/test_burndown_data.py` `test_continues_when_known_root_unreadable`: add `caplog` parameter and assert exactly one WARNING record referencing `root_b` is emitted while no WARNING references `root_a` or `root_c`.\n\n4. `dashboard/tests/test_orchestrator.py` line 390: replace `patch.object(Path, 'read_text', side_effect=PermissionError(...))` with either a real unreadable file via `tmp_path` + `chmod(0o000)`, or a module-scoped patch (`patch('dashboard.data.orchestrator.Path')`) to avoid unintentionally breaking unrelated Path.read_text calls during the test.\n\nFiles:\n- dashboard/tests/test_burndown_data.py\n- dashboard/tests/test_orchestrator.py\n\nSource: review suggestions on task 473 (reviewer_reuse_auditor, reviewer_test_analyst).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "555",
+        "title": "Tighten assertion style and mock isolation in TestRebuildEntitySummariesForceDryRun",
+        "description": "Post-merge review follow-ups from Task 522 (review cycle 2026-04-07). All three items live in `fused-memory/tests/test_graphiti_quality_433.py` within class `TestRebuildEntitySummariesForceDryRun`.\n\n1. **Uniform async-mock assertion style** (line 276): Change `backend.get_all_valid_edges.assert_not_called()` to `backend.get_all_valid_edges.assert_not_awaited()` so both guards in `test_force_dry_run_does_not_call_get_all_valid_edges` use the semantically-precise async form (matching the `_rebuild_entity_from_edges.assert_not_awaited()` added on line 277).\n\n2. **Mock isolation guard in sibling test** (around lines 288-303): `test_force_dry_run_returns_correct_aggregate` does not mock `_rebuild_entity_from_edges`. If a regression causes the dry_run branch to call it, the real backend method runs (potential I/O side effects, cryptic failure). Add `backend._rebuild_entity_from_edges = AsyncMock()` in the arrange block and `backend._rebuild_entity_from_edges.assert_not_awaited()` at the end of the test, mirroring the guard in the sibling test.\n\n3. **Explicit relational invariant** (after line 303): The deleted test contained `assert result['stale_entities'] == result['total_entities']` which is an explicit relational check that force=True treats every entity as stale. The current test only asserts both equal the literal 3, so a future refactor that changed the entity count could pass even if force=True stopped targeting all entities. Add the relational assertion `assert result['stale_entities'] == result['total_entities']` after the existing count assertions to restore this semantic guarantee.\n\nNote: Reviewer_test_analyst suggested the partition-sum invariant (`errors + rebuilt + skipped == stale_entities`) is redundant given the literal count assertions — DISMISSED because Task 522 explicitly required that invariant as part of consolidating the deleted test's coverage.\n\nScope: single file, additive/safe changes only. No production code touched.\n\nVerification: run `uv run pytest fused-memory/tests/test_graphiti_quality_433.py::TestRebuildEntitySummariesForceDryRun -v` from `fused-memory/` and confirm all tests still pass.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "556",
+        "title": "Remove or replace TestDocstringAccuracyForceDryRunClass meta-test",
+        "description": "The class at fused-memory/tests/test_graphiti_quality_433.py:612-673 violates SRP, is tautological (docstring was written to satisfy its own assertions), has no equivalent companions for any other test class, and hardcodes fragile per-word vocabulary contracts.\n\nOptions in priority order:\n(a) Delete the class entirely and rely on code review + project conventions, or\n(b) Replace with a single project-wide pre-commit/pydocstyle rule that checks all test docstrings for bare line-number references.\n\nIf kept: rename 'TestDocstringAccuracyForceDryRunClass' → 'TestDocstringAccuracyForceDryRun' (drop redundant 'Class' suffix, line 612) and replace the seven mandatory-literal assertions with at most two high-level structural checks (non-empty, no line-number refs).\n\nSource: review follow-up from Task 523 (2026-04-07 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "557",
+        "title": "Fix regex quality in line-number guards",
+        "description": "In fused-memory/tests/test_graphiti_quality_433.py:636-641, make the following improvements:\n\n1. Pre-compile both patterns at module scope with re.compile (lines 636, 639).\n2. Merge the two overlapping patterns into one — e.g. `re.compile(r'\\blines?[^\\S\\n]+\\d+(?:[^\\S\\n]*-[^\\S\\n]*\\d+)?', re.IGNORECASE)` — addressing:\n   - the duplicate-intent issue\n   - the `\\d{3,}` blind spot for short line numbers like 'line 42'\n   - the missing re.IGNORECASE (so 'Line 1031' is caught)\n   - the `\\s+` cross-line false-positive risk (use `[^\\S\\n]+` instead of `\\s+`)\n3. Document the case-sensitivity contract for the `'string' in doc` assertions at lines 644-672 (either add `.lower()` on both sides, or add a comment stating these are golden-vocabulary anchors).\n\nNote: if the parent task removes the meta-test class entirely, this task becomes obsolete.\n\nSource: review follow-up from Task 523 (2026-04-07 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "558",
+        "title": "Add behavioral test: force=False + dry_run=True calls get_all_valid_edges",
+        "description": "The class docstring at fused-memory/tests/test_graphiti_quality_433.py:282-287 claims force=False calls get_all_valid_edges 'regardless of dry_run', but no test exercises this.\n\nAdd a test in TestRebuildEntitySummariesDataFlow (or a new class) that calls `rebuild_entity_summaries(group_id='test', force=False, dry_run=True)` WITHOUT mocking `_detect_stale_summaries_with_edges`, and asserts `backend.get_all_valid_edges` was called — confirming the documented claim against actual production code.\n\nThis prevents a silent regression if the force=False path is later changed to gate the edge fetch on dry_run.\n\nSource: review follow-up from Task 523 (2026-04-07 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "559",
+        "title": "Fix incomplete refactoring: top-level import and public naming of STATUS_PRIORITY",
+        "description": "Two related cleanup items from the partial refactoring:\n1. In `task_knowledge_sync.py` line 210, remove the deferred `from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY  # noqa: PLC0415` and add `_STATUS_PRIORITY` to the existing top-level import block at lines 24-28.\n2. In `task_filter.py` line 45, rename `_STATUS_PRIORITY` → `STATUS_PRIORITY` (no leading underscore). Update all import sites: `task_knowledge_sync.py` top-level import, `test_task_filter.py` line 8, and the test assertions in `TestStatusPriorityIncludesDone`.\n\nFiles: fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py, fused-memory/src/fused_memory/reconciliation/task_filter.py, fused-memory/tests/test_task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "560",
+        "title": "Complete abstraction: eliminate raw tasks_data access and optimize _select_proactive_sample",
+        "description": "Two tightly coupled items:\n1. In `task_knowledge_sync.py` lines 64-66, remove the `all_tasks = tasks_data.get('tasks', [])` extraction block. Replace the call at line 78 with `_select_proactive_sample(filtered.active_tasks + filtered.done_tasks + filtered.cancelled_tasks, self.MIN_TASK_SAMPLE)`.\n2. In `_select_proactive_sample` (line 207), remove the `isinstance(t, dict)` filter since the input will now come from pre-validated FilteredTaskTree fields. Replace `sorted(tasks, key=sort_key)` (line 223) with `heapq.nlargest(n, tasks, key=sort_key)` to avoid a full O(n log n) sort for n=5.\n\nFiles: fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py, fused-memory/src/fused_memory/reconciliation/task_filter.py, fused-memory/tests/test_task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "561",
+        "title": "Promote _id_key to module-level helper in task_filter.py",
+        "description": "In `task_filter.py`, move the `_id_key` nested function (lines 120-126) from inside `filter_task_tree` to module level. This allows `_select_proactive_sample`'s sort_key closure (lines 216-220 in `task_knowledge_sync.py`) to call `_id_key` directly instead of re-implementing the same `int(tid)` try/except pattern. Export it as `_id_key` or `_task_id_int` at module scope.\n\nFiles: fused-memory/src/fused_memory/reconciliation/task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "562",
+        "title": "Optimize filter_task_tree allocations: heapq for done_tasks, resolve cancelled_tasks dead field",
+        "description": "Two allocation issues in `task_filter.py`:\n1. Lines 137/143: Replace `done.sort(key=_id_key, reverse=True); done[:MAX_DONE_TASKS_RETAINED]` with `heapq.nlargest(MAX_DONE_TASKS_RETAINED, done, key=_id_key)` — O(n) heap selection instead of O(n log n) sort.\n2. Lines 138/144: Either add a 'Recently Cancelled Tasks' section to the prompt in `format_filtered_task_tree` to give `cancelled_tasks` a real consumer, or remove the field and `cancelled.sort()` call, keeping only `cancelled_count` for the summary header. Document the decision in a comment.\n\nFiles: fused-memory/src/fused_memory/reconciliation/task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "563",
+        "title": "Harden task_filter.py against malformed input",
+        "description": "Two defensive guards:\n1. `_render_task_line` line 172: Replace `deps = task.get('dependencies') or []` with `deps = task.get('dependencies'); deps = list(deps) if isinstance(deps, list) else []` to handle truthy non-list values (int, dict) that would cause TypeError on `deps[:5]`.\n2. `format_task_list` line 191: Add an `isinstance(t, dict)` filter before calling `_render_task_line`: `return '\\n'.join(_render_task_line(t) for t in tasks if isinstance(t, dict)) or 'No tasks.'`\n\nFiles: fused-memory/src/fused_memory/reconciliation/task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "564",
+        "title": "Fill missing test coverage gaps in task_filter and stages",
+        "description": "Three test additions:\n1. In `test_stages.py` (TestTaskKnowledgeSyncUsesFilterTaskTree): add a test with 35 done tasks asserting task id=1 (oldest) does NOT appear in the 'Recently Completed Tasks' payload section while task id=35 does.\n2. In `test_task_filter.py` (TestFilterTaskTreeDoneAndCancelledLists): add a test with a mix of int and string task IDs in done/cancelled lists and assert their relative sort order — verify the non-int task lands where _id_key's fallback-to-0 places it.\n3. In `test_task_filter.py` (TestFilterTaskTree or TestFilterTaskTreeDoneAndCancelledLists): add a test with mixed pending/in-progress/done/cancelled/unknown tasks that asserts `active_tasks`, `done_tasks`, and `cancelled_tasks` are disjoint — no task ID appears in more than one list.\n\nFiles: fused-memory/tests/test_stages.py, fused-memory/tests/test_task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "565",
+        "title": "Fix fragile test assertion in test_render_task_line_truncates_deps_over_5",
+        "description": "In `test_task_filter.py` line 610, remove `assert '6' not in result`. The preceding assertion `assert 'deps=[1, 2, 3, 4, 5]...' in result` fully characterizes the expected output. The bare `'6' not in result` would spuriously fail if the task's id or title were changed to contain the digit '6', making it an invisible coupling to unrelated fields. If explicit exclusion is desired, scope the check to the deps substring: `assert '6' not in result.split('deps=')[1]`.\n\nFiles: fused-memory/tests/test_task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-06T22:44:54.881Z",
-      "taskCount": 509,
-      "completedCount": 431,
+      "lastModified": "2026-04-07T03:49:39.910Z",
+      "taskCount": 544,
+      "completedCount": 438,
       "tags": [
         "master"
       ]

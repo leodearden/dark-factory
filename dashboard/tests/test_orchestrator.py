@@ -376,6 +376,22 @@ class TestLoadTaskTree:
         result = load_task_tree(tasks_json)
         assert result[0]['dependencies'] == [1, 2]
 
+    def test_permission_error_returns_empty_list(self, tmp_path):
+        """PermissionError raised by Path.read_text is handled; returns empty list."""
+        import json
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from dashboard.data.orchestrator import load_task_tree
+
+        tasks_json = tmp_path / 'tasks.json'
+        tasks_json.write_text(json.dumps({'tasks': [{'id': '1', 'status': 'done'}]}))
+
+        with patch.object(Path, 'read_text', side_effect=PermissionError('Permission denied')):
+            result = load_task_tree(tasks_json)
+
+        assert result == []
+
 
 class TestReadTaskArtifacts:
     """Tests for read_task_artifacts — reads .task/ directory in a worktree."""
