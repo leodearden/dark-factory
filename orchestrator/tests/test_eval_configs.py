@@ -222,24 +222,18 @@ class TestVllmUrlInjection:
             f'  Got ANTHROPIC_BASE_URL via EVAL_CONFIGS: {eval_names_with_base_url}'
         )
 
-    def test_cloud_baselines_never_get_base_url(self):
+    def test_cloud_baselines_never_get_base_url(self, vllm_env_sandbox):
         """Cloud baseline configs must not have ANTHROPIC_BASE_URL after vllm injection."""
-        saved = {cfg.name: dict(cfg.env_overrides) for cfg in VLLM_EVAL_CONFIGS}
-        try:
-            for cfg in VLLM_EVAL_CONFIGS:
-                cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
-            cloud_configs_with_base_url = [
-                cfg.name for cfg in EVAL_CONFIGS
-                if cfg.name in self._CLOUD_BASELINE_NAMES
-                and 'ANTHROPIC_BASE_URL' in cfg.env_overrides
-            ]
-            assert not cloud_configs_with_base_url, (
-                f'Cloud baseline configs leaked ANTHROPIC_BASE_URL: {cloud_configs_with_base_url}'
-            )
-        finally:
-            for cfg in VLLM_EVAL_CONFIGS:
-                cfg.env_overrides.clear()
-                cfg.env_overrides.update(saved[cfg.name])
+        for cfg in VLLM_EVAL_CONFIGS:
+            cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
+        cloud_configs_with_base_url = [
+            cfg.name for cfg in EVAL_CONFIGS
+            if cfg.name in self._CLOUD_BASELINE_NAMES
+            and 'ANTHROPIC_BASE_URL' in cfg.env_overrides
+        ]
+        assert not cloud_configs_with_base_url, (
+            f'Cloud baseline configs leaked ANTHROPIC_BASE_URL: {cloud_configs_with_base_url}'
+        )
 
     def test_cli_eval_injects_vllm_url_into_all_vllm_configs(
         self, vllm_env_sandbox, monkeypatch
