@@ -404,7 +404,7 @@ def wait_for_vllm(port: int, timeout: int = 900) -> bool:
     """Poll vLLM /health until it returns 200 or *timeout* elapses."""
     import urllib.request
 
-    url = f"http://localhost:{port}/health"
+    url = f"http://127.0.0.1:{port}/health"
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -424,7 +424,7 @@ def vllm_healthy(port: int, timeout: int = 5) -> bool:
 
     try:
         resp = urllib.request.urlopen(
-            f"http://localhost:{port}/health", timeout=timeout
+            f"http://127.0.0.1:{port}/health", timeout=timeout
         )
         return resp.status == 200
     except Exception:
@@ -522,13 +522,22 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
         )
         log(f"SSH available: {pod.ssh_host}:{pod.ssh_port}")
 
-        log(f"Starting SSH tunnel (localhost:{args.port} → pod:8000)")
+        log(f"Starting SSH tunnel (127.0.0.1:{args.port} → pod:8000)")
         tunnel_proc = subprocess.Popen(
             [
                 "ssh",
                 "-N",
+                # Bind explicitly to 127.0.0.1 (IPv4) and forward to the
+                # pod's 127.0.0.1:8000 (also IPv4). Without explicit binds
+                # ssh's -L can fall back to ::1 if 127.0.0.1:<port> is
+                # already in use, but the launcher's wait_for_vllm uses
+                # urllib which resolves ``localhost`` to 127.0.0.1 first
+                # via /etc/hosts and never tries ::1. The mismatch silently
+                # routes the health probe to whatever else is listening on
+                # 127.0.0.1:<port> (e.g. the dark-factory escalation MCP
+                # server, which returns 404), making vLLM look hung.
                 "-L",
-                f"{args.port}:localhost:8000",
+                f"127.0.0.1:{args.port}:127.0.0.1:8000",
                 "-i",
                 SSH_KEY,
                 "-o",
@@ -586,7 +595,7 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
             pod=pod,
             tunnel_proc=tunnel_proc,
             client=client,
-            vllm_url=f"http://localhost:{args.port}",
+            vllm_url=f"http://127.0.0.1:{args.port}",
             local_port=args.port,
             config_name=cfg.name,
         )
@@ -597,7 +606,7 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
             pod=pod,
             tunnel_proc=tunnel_proc,
             client=client,
-            vllm_url=f"http://localhost:{args.port}",
+            vllm_url=f"http://127.0.0.1:{args.port}",
             local_port=args.port,
             config_name=cfg.name,
         )
@@ -960,7 +969,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run every df_task_*.json in evals/tasks/",
     )
 
-    p.add_argument("--port", type=int, default=8100)
+    # Default port avoids 8100 (dark-factory escalation MCP server) and
+    # 8002 (fused-memory). Per-pod port is collision-checked at SSH-tunnel
+    # bind time; pick a different --port if 8200 is in use.
+    p.add_argument("--port", type=int, default=8200)
     p.add_argument("--datacenter", default="US-NC-1")
     p.add_argument(
         "--no-volume",
