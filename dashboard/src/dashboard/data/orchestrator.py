@@ -168,7 +168,7 @@ def load_task_tree(tasks_json_path: Path) -> list[dict]:
     """
     try:
         raw = tasks_json_path.read_text()
-    except FileNotFoundError:
+    except OSError:
         return []
 
     try:

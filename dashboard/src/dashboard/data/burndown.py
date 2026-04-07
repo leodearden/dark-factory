@@ -99,22 +99,37 @@ async def collect_snapshot(
         roots_to_snapshot.append((root_str, project_root / '.taskmaster' / 'tasks' / 'tasks.json'))
 
     for known_root in config.known_project_roots:
-        resolved = known_root.resolve()
-        root_str = str(resolved)
-        if root_str in seen_roots:
+        # Per-root error isolation for the discovery phase: a single unreadable
+        # known_root (e.g. PermissionError on resolve() when a parent directory
+        # is inaccessible) must not unwind the entire collect_snapshot coroutine.
+        try:
+            resolved = known_root.resolve()
+            root_str = str(resolved)
+            if root_str in seen_roots:
+                continue
+            seen_roots.add(root_str)
+            roots_to_snapshot.append((root_str, resolved / '.taskmaster' / 'tasks' / 'tasks.json'))
+        except OSError:
+            logger.warning('Failed to resolve known root %s', known_root, exc_info=True)
             continue
-        seen_roots.add(root_str)
-        roots_to_snapshot.append((root_str, resolved / '.taskmaster' / 'tasks' / 'tasks.json'))
 
     # Phase 2 — Parallel read:
     # All load_task_tree calls are independent (separate files), so run them concurrently.
+    # load_task_tree catches OSError internally and returns [] for unreadable files,
+    # but we pass return_exceptions=True as defense-in-depth so a single failing read
+    # cannot sink the entire cycle and drop all snapshots before commit.
     all_tasks = await asyncio.gather(
-        *(asyncio.to_thread(load_task_tree, tasks_json) for _, tasks_json in roots_to_snapshot)
+        *(asyncio.to_thread(load_task_tree, tasks_json) for _, tasks_json in roots_to_snapshot),
+        return_exceptions=True,
     )
 
     # Phase 3 — Sequential insert:
     # aiosqlite serialises writes on a single connection; keep inserts sequential.
+    # Skip any roots whose load raised — log and continue so other snapshots commit.
     for (root_str, _), tasks in zip(roots_to_snapshot, all_tasks, strict=True):
+        if isinstance(tasks, BaseException):
+            logger.warning('Failed to load tasks for %s', root_str, exc_info=tasks)
+            continue
         counts = _count_statuses(tasks)
         await conn.execute(
             'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
