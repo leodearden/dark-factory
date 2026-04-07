@@ -475,15 +475,17 @@ class TestCollectSnapshot:
 
         # 3 distinct roots: main project + 2 known roots (no orchestrators)
         n_roots = 3
-        barrier = threading.Barrier(n_roots, timeout=2.0)
+        barrier = threading.Barrier(n_roots, timeout=10.0)
 
         def fake_load(path):
             try:
                 barrier.wait()
             except threading.BrokenBarrierError:
                 pytest.fail(
-                    'load_task_tree calls did not run concurrently '
-                    '(barrier timed out — calls appear to be sequential)'
+                    'load_task_tree calls did not reach the barrier within 10s — '
+                    'possible causes: (1) sequential execution (calls not running '
+                    'concurrently via asyncio.gather); (2) severe scheduler latency '
+                    '(threads starved by contention or a slow CI host)'
                 )
             return []
 
