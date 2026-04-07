@@ -139,6 +139,7 @@ class TestDeleteEntityNode:
         backend._driver._get_graph = MagicMock(return_value=graph)
         with pytest.raises(NodeNotFoundError):
             await backend.delete_entity_node('missing-uuid', group_id='test')
+        graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
@@ -146,18 +147,6 @@ class TestDeleteEntityNode:
         backend = GraphitiBackend(mock_config)  # client is None
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.delete_entity_node('node-uuid-1', group_id='test')
-
-    @pytest.mark.asyncio
-    async def test_precheck_uses_ro_query(self, mock_config, make_backend):
-        """Pre-check MATCH uses ro_query; DETACH DELETE still uses graph.query."""
-        backend = make_backend(mock_config)
-        graph = MagicMock()
-        graph.ro_query = AsyncMock(return_value=MagicMock(result_set=[['NodeName', 'summary']]))
-        graph.query = AsyncMock(return_value=MagicMock(result_set=[]))
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.delete_entity_node('some-uuid', group_id='test')
-        graph.ro_query.assert_awaited_once()
-        graph.query.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

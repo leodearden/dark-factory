@@ -84,6 +84,7 @@ class TestResolveEntityByName:
         args, kwargs = call_args
         cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
         assert cypher_params.get('name') == entity_name
+        graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
