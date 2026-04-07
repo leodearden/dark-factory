@@ -267,12 +267,14 @@ class TestRebuildEntitySummariesForceDryRun:
             {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
         ])
         backend.get_all_valid_edges = AsyncMock(return_value={})
+        backend._rebuild_entity_from_edges = AsyncMock()
 
         await backend.rebuild_entity_summaries(
             group_id='test', force=True, dry_run=True
         )
 
         backend.get_all_valid_edges.assert_not_called()
+        backend._rebuild_entity_from_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_force_dry_run_returns_correct_aggregate(self, mock_config, make_backend):
@@ -298,6 +300,7 @@ class TestRebuildEntitySummariesForceDryRun:
         assert len(result['details']) == 3
         for detail in result['details']:
             assert detail['status'] == 'skipped_dry_run'
+        assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
 
     @pytest.mark.asyncio
     async def test_force_no_dry_run_calls_get_all_valid_edges(self, mock_config, make_backend):
@@ -533,56 +536,6 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['uuid'] == 'u2'
         assert ok_detail['name'] == 'Bob'
         assert ok_detail['new_summary'] == 'rebuilt B'
-
-    @pytest.mark.asyncio
-    async def test_dry_run_partition_invariant_skips_rebuild_and_edges(self, mock_config, make_backend):
-        """dry_run=True path (force=True): all entities are skipped, none rebuilt, no edges fetched.
-
-        Pins two production-code guards simultaneously:
-          - graphiti_client.py line 1031: ``if not dry_run: all_edges = await self.get_all_valid_edges(...)``
-            — edges are NOT fetched when dry_run=True, even in the force path.
-          - graphiti_client.py lines 1046-1049: the dry_run branch sets
-            ``skipped = stale_entities`` and appends ``{'status': 'skipped_dry_run'}``
-            for each entity without ever calling ``_rebuild_entity_from_edges``.
-
-        This completes the counter partition invariant coverage alongside the
-        existing error-handling and partial-success tests in this class:
-            errors + rebuilt + skipped == stale_entities == total_entities
-        is now verified for the dry_run cell (skipped=N, errors=0, rebuilt=0).
-        """
-        backend = make_backend(mock_config)
-        entities = [
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
-            {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
-            {'uuid': 'u3', 'name': 'Carol', 'summary': 'summary C'},
-        ]
-        backend.list_entity_nodes = AsyncMock(return_value=entities)
-        backend.get_all_valid_edges = AsyncMock(return_value={})
-        backend._rebuild_entity_from_edges = AsyncMock()
-
-        result = await backend.rebuild_entity_summaries(
-            group_id='test', force=True, dry_run=True
-        )
-
-        # (a) all entities counted as skipped
-        assert result['skipped'] == len(entities)
-        # (b) no rebuilds, no errors
-        assert result['rebuilt'] == 0
-        assert result['errors'] == 0
-        # (c) aggregate counts
-        assert result['total_entities'] == 3
-        assert result['stale_entities'] == 3  # force=True treats all as stale
-        # (d) per-entity detail status
-        assert len(result['details']) == 3
-        for detail in result['details']:
-            assert detail['status'] == 'skipped_dry_run'
-        # (e) _rebuild_entity_from_edges must NEVER be called (dry_run branch, lines 1046-1049)
-        backend._rebuild_entity_from_edges.assert_not_awaited()
-        # (f) get_all_valid_edges must NEVER be called (edge-fetch guard, line 1031)
-        backend.get_all_valid_edges.assert_not_awaited()
-        # (g) partition invariant: errors + rebuilt + skipped == stale_entities == total_entities
-        assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
-        assert result['stale_entities'] == result['total_entities']
 
 
 # ---------------------------------------------------------------------------
