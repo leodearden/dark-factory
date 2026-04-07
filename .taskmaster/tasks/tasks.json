@@ -10384,10 +10384,11 @@
         "description": "In orchestrator/tests/test_eval_configs.py, refactor TestVllmUrlInjection (lines 175-240): (1) extract the save/restore env_overrides scaffolding into a shared pytest fixture using monkeypatch or contextmanager, eliminating the 45-line copy-paste across 3 test methods; (2) use deepcopy or monkeypatch.setattr to avoid mutating module-level singletons directly. Also add at least one test that exercises the actual CLI injection path: invoke _run_single_eval or _run_matrix_cmd from cli.py with a vllm_url argument (mocked runner) and assert ANTHROPIC_BASE_URL is injected into each vLLM config's env_overrides.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T04:19:40.693Z"
       },
       {
         "id": "533",
@@ -10924,7 +10925,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T04:19:40.347Z",
+      "lastModified": "2026-04-07T04:19:40.693Z",
       "taskCount": 557,
       "completedCount": 443,
       "tags": [
