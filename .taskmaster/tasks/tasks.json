@@ -10638,6 +10638,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 557,
+        "title": "Fix regex quality in line-number guards",
+        "description": "In fused-memory/tests/test_graphiti_quality_433.py:636-641, make the following improvements:\n\n1. Pre-compile both patterns at module scope with re.compile (lines 636, 639).\n2. Merge the two overlapping patterns into one — e.g. `re.compile(r'\\blines?[^\\S\\n]+\\d+(?:[^\\S\\n]*-[^\\S\\n]*\\d+)?', re.IGNORECASE)` — addressing:\n   - the duplicate-intent issue\n   - the `\\d{3,}` blind spot for short line numbers like 'line 42'\n   - the missing re.IGNORECASE (so 'Line 1031' is caught)\n   - the `\\s+` cross-line false-positive risk (use `[^\\S\\n]+` instead of `\\s+`)\n3. Document the case-sensitivity contract for the `'string' in doc` assertions at lines 644-672 (either add `.lower()` on both sides, or add a comment stating these are golden-vocabulary anchors).\n\nNote: if the parent task removes the meta-test class entirely, this task becomes obsolete.\n\nSource: review follow-up from Task 523 (2026-04-07 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10650,7 +10661,7 @@
       ],
       "created": "2026-04-07T03:35:36.595Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T03:35:36.600Z"
+      "updated": "2026-04-07T03:35:43.948Z"
     }
   }
 }
