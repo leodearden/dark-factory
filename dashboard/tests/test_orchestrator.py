@@ -898,6 +898,22 @@ class TestResolveProjectRoot:
         prd = str(tmp_path / 'docs' / '..' / 'docs' / 'prd.md')
         assert _resolve_project_root(prd, Path('/fallback')) == tmp_path
 
+    def test_fallback_returns_resolved_default_root(self, tmp_path):
+        """Fallback path returns the resolved (canonical) default_root, not a symlink."""
+        from dashboard.data.orchestrator import _resolve_project_root
+
+        real = tmp_path / 'real'
+        real.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real)
+
+        # No .taskmaster anywhere in the PRD's ancestor chain → falls back to default_root
+        result = _resolve_project_root('/nowhere/prd.md', link)
+
+        # Must return the resolved real path, not the symlink
+        assert result == real
+        assert result != link
+
 
 class TestScanWorktrees:
     """Tests for _scan_worktrees — reads worktree artifacts from a directory."""
@@ -1060,3 +1076,33 @@ class TestDiscoverOrchestratorsPerProject:
 
         assert len(result) == 1
         assert len(result[0]['tasks']) == 1
+
+    def test_project_root_in_result_is_resolved_when_config_root_is_symlink(self, tmp_path):
+        """project_root in result dict is canonicalised even when config.project_root is a symlink."""
+        import json
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        # Create tasks.json under the real directory so discover_orchestrators has data to read
+        (real_dir / '.taskmaster' / 'tasks').mkdir(parents=True)
+        (real_dir / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+            {'id': '1', 'title': 'T', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+        ]}))
+
+        config = DashboardConfig(project_root=link)
+
+        # PRD under /nonexistent — no .taskmaster ancestor found, falls back to config.project_root (=link)
+        mock_procs = [{'pid': 9999, 'prd': '/nonexistent/prd.md', 'config_path': None, 'running': True, 'started': 'Apr07'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        # project_root must be the resolved canonical path, not the symlink
+        assert result[0]['project_root'] == str(real_dir)
