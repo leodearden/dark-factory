@@ -10396,11 +10396,11 @@
         "description": "In orchestrator/tests/test_eval_configs.py: (1) line 115 — change `for cfg in EVAL_CONFIGS + VLLM_EVAL_CONFIGS:` to `for cfg in EVAL_CONFIGS:` since VLLM_EVAL_CONFIGS is already spread into EVAL_CONFIGS; (2) lines 179-183 — replace the hardcoded _CLOUD_BASELINE_NAMES set with a derived expression: `{cfg.name for cfg in EVAL_CONFIGS} - {cfg.name for cfg in VLLM_EVAL_CONFIGS}` so it stays in sync automatically when baselines are added or renamed.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-07T04:30:27.190Z",
+        "updatedAt": "2026-04-07T04:41:32.289Z",
         "metadata": {
           "modules": [
             "orchestrator/tests/test_eval_configs.py"
@@ -11019,7 +11019,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T04:41:32.077Z",
+      "lastModified": "2026-04-07T04:41:32.289Z",
       "taskCount": 565,
       "completedCount": 445,
       "tags": [
