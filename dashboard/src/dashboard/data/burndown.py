@@ -69,14 +69,15 @@ async def collect_snapshot(
 ) -> None:
     """Discover projects and insert one snapshot row per project."""
     now = datetime.now(UTC).isoformat()
-    resolved_root = str(config.project_root.resolve())
+    # config.project_root is already resolved by DashboardConfig.__post_init__
+    resolved_root = str(config.project_root)
 
     # Phase 1 — Discovery (sequential, in-memory):
     # Build the ordered list of (project_id_str, tasks_json_path) tuples to snapshot.
     # Main project is always first; seen_roots dedup is preserved exactly.
-    # Use the resolved (symlink-canonical) path so a symlinked project_root
-    # deduplicates correctly against orchestrator / known_project_roots entries
-    # that surface the real path.
+    # project_root is already canonical (symlink-resolved) so a symlinked
+    # project_root deduplicates correctly against orchestrator /
+    # known_project_roots entries that surface the real path.
     roots_to_snapshot: list[tuple[str, Path]] = []
     seen_roots: set[str] = {resolved_root}
     roots_to_snapshot.append((resolved_root, config.tasks_json))
