@@ -10649,6 +10649,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 558,
+        "title": "Add behavioral test: force=False + dry_run=True calls get_all_valid_edges",
+        "description": "The class docstring at fused-memory/tests/test_graphiti_quality_433.py:282-287 claims force=False calls get_all_valid_edges 'regardless of dry_run', but no test exercises this.\n\nAdd a test in TestRebuildEntitySummariesDataFlow (or a new class) that calls `rebuild_entity_summaries(group_id='test', force=False, dry_run=True)` WITHOUT mocking `_detect_stale_summaries_with_edges`, and asserts `backend.get_all_valid_edges` was called — confirming the documented claim against actual production code.\n\nThis prevents a silent regression if the force=False path is later changed to gate the edge fetch on dry_run.\n\nSource: review follow-up from Task 523 (2026-04-07 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10661,7 +10672,7 @@
       ],
       "created": "2026-04-07T03:35:36.595Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T03:35:43.948Z"
+      "updated": "2026-04-07T03:35:49.487Z"
     }
   }
 }
