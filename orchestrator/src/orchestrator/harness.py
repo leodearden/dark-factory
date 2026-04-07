@@ -152,6 +152,7 @@ class Harness:
         prd_path: Path | None = None,
         dry_run: bool = False,
         delay_secs: int = 0,
+        force_dirty_start: bool = False,
     ) -> HarnessReport:
         """Execute the full orchestration pipeline.
 
@@ -199,6 +200,19 @@ class Harness:
 
         # 1b2. Start merge worker
         await self._start_merge_worker()
+
+        # 1b3. Refuse to start with dirty working tree (unless forced)
+        if not force_dirty_start:
+            dirty = await self.git_ops.has_dirty_working_tree()
+            if dirty:
+                await self._stop_merge_worker()
+                await self._stop_escalation_server()
+                await self.mcp.stop()
+                raise RuntimeError(
+                    'Refusing to start: project_root has uncommitted tracked changes. '
+                    'Commit or stash your work first, or pass --force-dirty-start to override.\n'
+                    f'Dirty files:\n{dirty}'
+                )
 
         try:
             # 1c. Dismiss stale escalations from prior runs (non-fatal)
@@ -1021,3 +1035,12 @@ Output JSON matching the schema. Every task must appear in the output.
         event = self._escalation_events.get(escalation.task_id)
         if event:
             event.set()
+
+        # Un-halt merge queue when a wip_conflict escalation is resolved
+        if (
+            getattr(escalation, 'category', None) == 'wip_conflict'
+            and self._merge_worker is not None
+            and self._merge_worker.is_wip_halted
+        ):
+            self._merge_worker.unhalt_wip()
+            logger.info('Merge queue un-halted: wip_conflict escalation resolved')

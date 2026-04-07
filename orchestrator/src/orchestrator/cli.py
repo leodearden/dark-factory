@@ -42,7 +42,10 @@ def main(verbose: bool):
 @click.option('--delay', default=None,
               help='Delay before executing tasks (e.g. 4h, 30m, 90s). '
                    'Escalation server starts immediately.')
-def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | None):
+@click.option('--force-dirty-start', is_flag=True,
+              help='Start even if project_root has uncommitted changes (risky)')
+def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | None,
+        force_dirty_start: bool):
     """Run the orchestrator against a PRD, or execute existing tasks if no PRD given."""
     from orchestrator.harness import Harness
 
@@ -53,7 +56,10 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
     harness = Harness(config)
-    report = asyncio.run(harness.run(prd, dry_run=dry_run, delay_secs=delay_secs))
+    report = asyncio.run(harness.run(
+        prd, dry_run=dry_run, delay_secs=delay_secs,
+        force_dirty_start=force_dirty_start,
+    ))
 
     click.echo(report.summary())
 

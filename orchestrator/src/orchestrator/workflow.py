@@ -1085,6 +1085,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         result = await future
 
+        if result.status == 'wip_halted':
+            return await self._handle_wip_conflict(result, branch_name)
+        if result.status == 'done_wip_recovery':
+            return await self._handle_wip_recovery(result)
         if result.status == 'done':
             return WorkflowOutcome.DONE
         if result.status == 'already_merged':
@@ -1138,6 +1142,115 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         return await self._submit_to_merge_queue(
             branch_name, pre_rebased=False,
         )
+
+    async def _handle_wip_conflict(
+        self, result, branch_name: str,
+    ) -> WorkflowOutcome:
+        """Handle a wip_halted merge outcome: create level-1 escalation and wait.
+
+        The merge did NOT land — WIP in project_root overlaps the merge diff.
+        After the human resolves (commits/stashes WIP), the task retries the merge.
+        """
+        overlap = result.overlap_files or []
+        detail = (
+            f'Merge for task {self.task_id} (branch {branch_name}) was blocked '
+            f'because uncommitted work in project_root overlaps the merge diff.\n\n'
+            f'Overlapping files:\n'
+            + '\n'.join(f'  - {f}' for f in overlap)
+            + '\n\nAction required: commit or stash the WIP, then resolve this '
+            'escalation to un-halt the merge queue and retry.'
+        )
+        logger.warning(f'Task {self.task_id}: WIP overlap — creating level-1 escalation')
+
+        if self.escalation_queue:
+            from escalation.models import Escalation
+
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role='orchestrator',
+                severity='blocking',
+                category='wip_conflict',
+                summary=f'WIP overlaps merge diff: {", ".join(overlap[:5])}',
+                detail=detail,
+                suggested_action='manual_intervention',
+                level=1,
+                worktree=str(self.worktree) if self.worktree else None,
+                workflow_state=self.state.value,
+            )
+            self.escalation_queue.submit(esc)
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.escalation_created,
+                    task_id=self.task_id, phase=self.state.value,
+                    data={'escalation_id': esc.id, 'category': 'wip_conflict',
+                          'severity': 'blocking', 'summary': esc.summary[:200]},
+                )
+
+            # Wait for human resolution
+            if self._escalation_event is None:
+                self._escalation_event = asyncio.Event()
+            self._escalation_event.clear()
+            await self._escalation_event.wait()
+            logger.info(f'Task {self.task_id}: WIP conflict resolved — retrying merge')
+
+        return WorkflowOutcome.REQUEUED
+
+    async def _handle_wip_recovery(self, result) -> WorkflowOutcome:
+        """Handle a done_wip_recovery merge outcome: merge landed but WIP conflicted.
+
+        The merge IS on main, but the user's stashed WIP conflicted during pop.
+        WIP has been preserved on a recovery branch. Create a level-1 escalation
+        to inform the human, then return DONE (the task's merge succeeded).
+        """
+        recovery_branch = result.recovery_branch or '(unknown)'
+        detail = (
+            f'Merge for task {self.task_id} landed on main successfully, but '
+            f'the stash pop of your uncommitted WIP produced conflicts.\n\n'
+            f'Your WIP has been preserved on branch: {recovery_branch}\n\n'
+            f'To recover:\n'
+            f'  git checkout {recovery_branch}\n'
+            f'  # Review and cherry-pick or reapply your changes\n\n'
+            f'Resolve this escalation to un-halt the merge queue.'
+        )
+        logger.warning(
+            f'Task {self.task_id}: merge landed but stash pop conflicted — '
+            f'WIP on {recovery_branch}'
+        )
+
+        if self.escalation_queue:
+            from escalation.models import Escalation
+
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role='orchestrator',
+                severity='blocking',
+                category='wip_conflict',
+                summary=f'Stash pop conflict — WIP preserved on {recovery_branch}',
+                detail=detail,
+                suggested_action='manual_intervention',
+                level=1,
+                worktree=str(self.worktree) if self.worktree else None,
+                workflow_state=self.state.value,
+            )
+            self.escalation_queue.submit(esc)
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.escalation_created,
+                    task_id=self.task_id, phase=self.state.value,
+                    data={'escalation_id': esc.id, 'category': 'wip_conflict',
+                          'severity': 'blocking', 'summary': esc.summary[:200]},
+                )
+
+            # Wait for human resolution before returning DONE
+            if self._escalation_event is None:
+                self._escalation_event = asyncio.Event()
+            self._escalation_event.clear()
+            await self._escalation_event.wait()
+            logger.info(f'Task {self.task_id}: WIP recovery escalation resolved')
+
+        return WorkflowOutcome.DONE
 
     def _write_merge_failure_review(self, category: str, detail: str) -> None:
         """Write a review-format JSON describing a merge failure to .task/reviews/.

@@ -389,29 +389,176 @@ class TestWorkingTreeSync:
         assert 'synced = True' in (git_ops.project_root / 'synced.py').read_text()
 
     async def test_advance_stashes_and_restores_dirty_work(self, git_ops: GitOps):
-        """Uncommitted user work survives the merge advance."""
-        # Create dirty file in project_root (uncommitted)
-        (git_ops.project_root / 'wip.py').write_text('work_in_progress = True\n')
+        """Uncommitted tracked changes survive the merge advance."""
+        # Modify a TRACKED file in project_root (uncommitted) — triggers stash/pop
+        (git_ops.project_root / 'README.md').write_text('# work in progress\n')
 
         result = await self._merge_and_advance(git_ops, 'stash-restore', 'merged.py', 'merged = True\n')
         assert result == 'advanced'
 
         # Merged file should be in working tree
         assert (git_ops.project_root / 'merged.py').exists()
-        # User's dirty file should survive
-        assert (git_ops.project_root / 'wip.py').exists()
-        assert 'work_in_progress' in (git_ops.project_root / 'wip.py').read_text()
+        # User's dirty tracked change should survive (stash/pop restored it)
+        assert '# work in progress' in (git_ops.project_root / 'README.md').read_text()
 
-    async def test_advance_stash_pop_conflict_markers(self, git_ops: GitOps):
-        """Conflicting dirty changes produce git conflict markers."""
+    async def test_wip_overlap_blocks_advance(self, git_ops: GitOps):
+        """Dirty file overlapping merge diff returns 'wip_overlap' without moving ref."""
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
         # Create dirty change to README.md in project_root (don't commit)
         (git_ops.project_root / 'README.md').write_text('# Local WIP edit\n')
 
         # Merge a conflicting change to README.md
-        worktree, _ = await git_ops.create_worktree('conflict-readme')
+        worktree, _ = await git_ops.create_worktree('overlap-readme')
         (worktree / 'README.md').write_text('# Merged from branch\n')
         await git_ops.commit(worktree, 'Change README on branch')
-        merge_result = await git_ops.merge_to_main(worktree, 'conflict-readme')
+        merge_result = await git_ops.merge_to_main(worktree, 'overlap-readme')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+        assert result == 'wip_overlap'
+
+        # Main ref should NOT have moved
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip()
+
+        # Working tree should be unchanged (no stash happened)
+        assert (git_ops.project_root / 'README.md').read_text() == '# Local WIP edit\n'
+
+        # Overlap files should be recorded
+        assert hasattr(git_ops, '_last_overlap_files')
+        assert 'README.md' in git_ops._last_overlap_files
+
+    async def test_wip_overlap_with_staged_file(self, git_ops: GitOps):
+        """Staged change overlapping merge diff returns 'wip_overlap'."""
+        # Stage a change to README.md
+        (git_ops.project_root / 'README.md').write_text('# Local WIP edit\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+
+        # Merge a branch that also modifies README.md
+        worktree, _ = await git_ops.create_worktree('pop-recovery')
+        (worktree / 'new_file.py').write_text('x = 1\n')
+        (worktree / 'README.md').write_text('# Merged from branch\n')
+        await git_ops.commit(worktree, 'Change files on branch')
+        merge_result = await git_ops.merge_to_main(worktree, 'pop-recovery')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        # Overlap detected before stash — staged README.md overlaps merge diff
+        assert result == 'wip_overlap'
+
+    async def test_pop_conflict_recovery_via_mock(self, git_ops: GitOps):
+        """When stash pop fails, advance_main creates recovery branch and returns 'pop_conflict'."""
+        # Create a merge commit
+        worktree, _ = await git_ops.create_worktree('pop-mock')
+        (worktree / 'pop_file.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add pop file')
+        merge_result = await git_ops.merge_to_main(worktree, 'pop-mock')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Modify a tracked file (not overlapping merge diff) to trigger stash
+        (git_ops.project_root / 'README.md').write_text('# WIP edit\n')
+
+        # Mock _run: stash push succeeds, stash pop fails (simulating conflict)
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None):
+            if cmd[:3] == ['git', 'stash', 'pop']:
+                return (1, '', 'CONFLICT: merge conflict in README.md')
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await git_ops.advance_main(merge_result.merge_commit)
+
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+        assert result == 'pop_conflict'
+
+        # Recovery branch should be recorded
+        assert hasattr(git_ops, '_last_recovery_branch')
+        recovery = git_ops._last_recovery_branch
+        assert recovery.startswith('wip/recovery-')
+
+    async def test_consecutive_advance_after_pop_conflict(self, git_ops: GitOps):
+        """After pop_conflict recovery, a subsequent advance_main succeeds normally."""
+        # Merge first file
+        wt1, _ = await git_ops.create_worktree('consec-1')
+        (wt1 / 'first.py').write_text('first = True\n')
+        await git_ops.commit(wt1, 'Add first')
+        merge1 = await git_ops.merge_to_main(wt1, 'consec-1')
+        assert merge1.success
+        assert merge1.merge_commit is not None
+        assert merge1.merge_worktree is not None
+
+        # Modify a tracked file so stash is triggered, mock stash pop failure
+        (git_ops.project_root / 'README.md').write_text('# WIP edit\n')
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None):
+            if cmd[:3] == ['git', 'stash', 'pop']:
+                return (1, '', 'CONFLICT: merge conflict')
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result1 = await git_ops.advance_main(merge1.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge1.merge_worktree)
+        assert result1 == 'pop_conflict'
+
+        # Working tree should be clean after recovery (read-tree reset)
+        _, unstaged, _ = await _run(
+            ['git', 'diff', '--name-only'], cwd=git_ops.project_root,
+        )
+        _, staged, _ = await _run(
+            ['git', 'diff', '--name-only', '--cached'], cwd=git_ops.project_root,
+        )
+        assert not unstaged.strip(), f'Unstaged changes after recovery: {unstaged}'
+        assert not staged.strip(), f'Staged changes after recovery: {staged}'
+
+        # Second merge should succeed normally (no stash needed, tree is clean)
+        wt2, _ = await git_ops.create_worktree('consec-2')
+        (wt2 / 'second.py').write_text('second = True\n')
+        await git_ops.commit(wt2, 'Add second')
+        merge2 = await git_ops.merge_to_main(wt2, 'consec-2')
+        assert merge2.success
+        assert merge2.merge_commit is not None
+        assert merge2.merge_worktree is not None
+
+        result2 = await git_ops.advance_main(merge2.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge2.merge_worktree)
+        assert result2 == 'advanced'
+
+        # Both files should be on main
+        _, content, _ = await _run(
+            ['git', 'show', 'main:first.py'], cwd=git_ops.project_root,
+        )
+        assert 'first = True' in content
+        _, content2, _ = await _run(
+            ['git', 'show', 'main:second.py'], cwd=git_ops.project_root,
+        )
+        assert 'second = True' in content2
+
+    async def test_wip_overlap_disjoint_files_proceeds(self, git_ops: GitOps):
+        """Dirty file NOT overlapping merge diff proceeds normally."""
+        # Create dirty file in a different path than what will be merged
+        (git_ops.project_root / 'wip_unrelated.py').write_text('wip = True\n')
+
+        # Merge a different file
+        worktree, _ = await git_ops.create_worktree('disjoint')
+        (worktree / 'merged_file.py').write_text('merged = True\n')
+        await git_ops.commit(worktree, 'Add merged file')
+        merge_result = await git_ops.merge_to_main(worktree, 'disjoint')
         assert merge_result.success
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
@@ -420,9 +567,15 @@ class TestWorkingTreeSync:
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
         assert result == 'advanced'
 
-        # README.md should have conflict markers
-        readme_content = (git_ops.project_root / 'README.md').read_text()
-        assert '<<<<<<<' in readme_content
+        # Merged file appears on main
+        _, content, _ = await _run(
+            ['git', 'show', 'main:merged_file.py'], cwd=git_ops.project_root,
+        )
+        assert 'merged = True' in content
+
+        # User's dirty file should survive
+        assert (git_ops.project_root / 'wip_unrelated.py').exists()
+        assert 'wip = True' in (git_ops.project_root / 'wip_unrelated.py').read_text()
 
     async def test_advance_no_stash_when_clean(self, git_ops: GitOps):
         """Clean working tree: no stash, but read-tree still syncs files."""
@@ -482,8 +635,9 @@ class TestWorkingTreeSync:
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
 
-        # Make working tree dirty
-        (git_ops.project_root / 'dirty.py').write_text('dirty = True\n')
+        # Make working tree dirty with a TRACKED file (untracked files no longer
+        # trigger stash — only tracked modifications do)
+        (git_ops.project_root / 'README.md').write_text('# dirty tracked edit\n')
 
         # Sabotage git stash by making .git/refs/stash unwritable
         # Instead, use a simpler approach: lock the index
@@ -519,8 +673,8 @@ class TestWorkingTreeSync:
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
 
-        # Make working tree dirty
-        (git_ops.project_root / 'user_wip.py').write_text('wip = True\n')
+        # Make working tree dirty with a TRACKED file modification
+        (git_ops.project_root / 'README.md').write_text('# WIP edit\n')
 
         # Force CAS failure by passing a wrong expected_main
         result = await git_ops.advance_main(
@@ -532,9 +686,8 @@ class TestWorkingTreeSync:
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
         assert result == 'cas_failed'
 
-        # Dirty file should be restored (stash popped)
-        assert (git_ops.project_root / 'user_wip.py').exists()
-        assert 'wip = True' in (git_ops.project_root / 'user_wip.py').read_text()
+        # Dirty tracked file should be restored (stash popped)
+        assert '# WIP edit' in (git_ops.project_root / 'README.md').read_text()
 
         # No leftover stash entries
         _, stash_list, _ = await _run(
