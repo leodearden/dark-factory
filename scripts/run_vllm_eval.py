@@ -45,7 +45,6 @@ from orchestrator.evals.configs import (
 # Constants
 # ---------------------------------------------------------------------------
 
-RUNPOD_KEY = "rpa_VLRVNJ8HB5CH7MQZL9WW2XPQBQO18V3PMA1H1BSM11niy2"
 SSH_KEY = os.path.expanduser("~/.ssh/id_runpod")
 SSH_PUBKEY = open(SSH_KEY + ".pub").read().strip()
 
@@ -58,6 +57,29 @@ RESULTS_DIR = ORCHESTRATOR_DIR / "src/orchestrator/evals/results"
 # (unlike /tmp which is tmpfs); chosen so a mid-batch crash leaves logs
 # behind for forensics.
 EVAL_LOG_DIR = Path("/var/tmp/dark-factory-evals")
+
+
+def _load_runpod_api_key() -> str:
+    """Load RUNPOD_API_KEY from environment or PROJECT_ROOT/.env.
+
+    Never hardcode the key in this file — a previous version embedded it
+    as a constant and shipped it to a public GitHub repo, requiring a key
+    rotation. Always source from .env (gitignored).
+    """
+    key = os.environ.get("RUNPOD_API_KEY")
+    if key:
+        return key
+    dotenv_path = PROJECT_ROOT / ".env"
+    if dotenv_path.exists():
+        with open(dotenv_path) as f:
+            for raw in f:
+                line = raw.strip()
+                if line.startswith("RUNPOD_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+    raise RuntimeError(
+        "RUNPOD_API_KEY not found. Add `RUNPOD_API_KEY=rpa_...` to "
+        f"{PROJECT_ROOT}/.env or export it in your shell."
+    )
 
 # Fallback GPU types when neither the config nor --gpu-type provides one.
 GPU_TYPES = [
@@ -418,7 +440,7 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
     else:
         gpu_types_to_try = GPU_TYPES
 
-    config = RunPodConfig(api_key=RUNPOD_KEY)
+    config = RunPodConfig(api_key=_load_runpod_api_key())
     client = RunPodClient(config)
     pod = None
     tunnel_proc: subprocess.Popen | None = None
@@ -963,6 +985,14 @@ def main(argv: list[str] | None = None) -> int:
             f"{args.concurrency} concurrent tasks = "
             f"{args.concurrency * 5} simultaneous reviewer calls)"
         )
+
+    # Fail fast if RunPod credentials are missing — don't burn preflight time
+    # only to discover the key is unset right before pod creation.
+    try:
+        _load_runpod_api_key()
+    except RuntimeError as e:
+        log(f"ERROR: {e}")
+        return 1
 
     cfg = get_config_by_name(args.config)
     if cfg is None or cfg.image is None:

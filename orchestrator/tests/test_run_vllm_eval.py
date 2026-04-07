@@ -140,14 +140,20 @@ class TestResolveTaskIds:
     def test_all_tasks_globs_dir(self, tmp_path, monkeypatch):
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
-        for name in ("df_task_12.json", "df_task_18.json", "reify_task_27.json"):
+        for name in (
+            "df_task_12.json",
+            "df_task_18.json",
+            "reify_task_27.json",
+            "not_a_task.json",
+        ):
             (fake_tasks / name).write_text("{}")
         monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
 
         args = _make_args(all_tasks=True)
         result = resolve_task_ids(args)
-        # reify_task_27 is excluded; df_task_*.json only.
-        assert result == ["df_task_12", "df_task_18"]
+        # Both df_task_*.json and reify_task_*.json are picked up.
+        # Files not matching <project>_task_*.json are excluded.
+        assert result == ["df_task_12", "df_task_18", "reify_task_27"]
 
     def test_no_selection_raises(self):
         args = _make_args()
@@ -1355,6 +1361,11 @@ class TestPreflightBaseline:
         )
         monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
         monkeypatch.setattr(launcher, "PROJECT_ROOT", repo)
+        # main() fail-fasts on missing RUNPOD_API_KEY before preflight runs.
+        # PROJECT_ROOT is monkeypatched to a tmp dir without .env, so inject
+        # a fake key via env so we exercise the preflight logic, not the
+        # credential-loading guard.
+        monkeypatch.setenv("RUNPOD_API_KEY", "rpa_test_fake_key")
 
         fake_client = _FakeClient()
         monkeypatch.setattr(launcher, "RunPodClient", lambda config: fake_client)
@@ -1391,6 +1402,8 @@ class TestPreflightBaseline:
         )
         monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
         monkeypatch.setattr(launcher, "PROJECT_ROOT", repo)
+        # See test_strict_policy_aborts_before_pod for why this env var is set.
+        monkeypatch.setenv("RUNPOD_API_KEY", "rpa_test_fake_key")
 
         fake_client = _patch_pod_infra(monkeypatch)
         _patch_subprocess_run_success(monkeypatch, results)
