@@ -60,6 +60,47 @@ Recovery: `git fsck --unreachable` surfaced 88,871 unreachable commits and 72,31
 
 **Lesson:** Never leave significant uncommitted work in a worktree where the orchestrator could be running. Commit aggressively to a feature branch.
 
+### Current state (2026-04-07 morning)
+
+- **Recovery branch**: `recover/vllm-eval-session-2026-04-06` — 3 commits on top of main, all 130+ relevant tests pass:
+  1. `c4561692d1` recover: restore lost vLLM eval session work from unreachable git blobs
+  2. `5fa0f30751` test(eval-configs): update count regression guards for recovered _new variants
+  3. `71e9b1c5a1` docs(eval): update with 2026-04-07 root cause findings
+- **Orchestrator**: stopped (was running on dark-factory by mistake — should have been on reify)
+- **Docker image**: `leosiriusdawn/runpod-vllm:latest` digest `sha256:152e81f6...` includes the three entrypoint patches (trust-remote-code, GMU, max-num-seqs)
+- **RunPod credit**: ~$42 remaining
+- **Task 515 (qwen3 recovery)**: committed on branch `task/515`, 19 commits, **not merged**. Includes the `ENFORCE_EAGER=1` hypothesis for the qwen3 hang. Took a different code structure (kept the OLD MODELS-dict approach in run_vllm_eval.py) so cherry-pick will need conflict resolution.
+- **Memory files** in `~/.claude/projects/-home-leo-src-dark-factory/memory/` are intact (not in repo, separate filesystem):
+  - `project_vllm_eval_session_2026_04_06.md` — full evening session summary
+  - `project_vllm_eval_blockers.md` — detailed blocker writeup
+- **What still needs running**: A clean reap-139b end-to-end with a fresh Claude Max cap so reviewers can complete; qwen3 debug with container log capture.
+
+### Next actions
+
+1. **Merge `recover/vllm-eval-session-2026-04-06` to main** when satisfied. This should be done before any further orchestrator runs to avoid losing the recovery again.
+2. **Cherry-pick Task 515's ENFORCE_EAGER discovery** (the `--enforce-eager` flag for qwen3 startup hang). Task 515 used the OLD MODELS-dict approach in `run_vllm_eval.py` so the cherry-pick will conflict — the right move is to extract just the insight (entrypoint hook for `ENFORCE_EAGER` env var → `--enforce-eager` flag) and re-apply it manually to our recovered structure. Specific commits to look at on `task/515`:
+   - `9d34ccc155` impl(step-19): update Blocker 4 doc — ENFORCE_EAGER now in-tree
+   - `a980d8bf23` impl(step-18): add ENFORCE_EAGER=1 to qwen3-coder-next extra_env
+   - `38715f9fe0` test(step-17): assert ENFORCE_EAGER=1 in qwen3-coder-next extra_env
+3. **Add `ENFORCE_EAGER` env var support to entrypoint-vllm.sh** in the runpod-toolkit repo (if-set → append `--enforce-eager` to vLLM CMD), rebuild and push `:latest`.
+4. **Add `ENFORCE_EAGER='1'` to qwen3-coder-next-fp8-new env_overrides** in `configs.py` (and forward via `MAX_NUM_SEQS`-style whitelist in `run_vllm_eval.py`).
+5. **Rerun `reap-139b-nvfp4-new` end-to-end** when the Claude Max cap is fresh (the implementer phase already passed once; reviewers just need budget). Should produce the first true `outcome=done` for a vLLM-hosted config.
+6. **If qwen3 boots with `--enforce-eager`**, run that eval too. If it still hangs, capture container logs via SSH while the pod is running (RunPod doesn't preserve them after termination).
+7. **Then fire the post-gate eval matrix** for the remaining 3 MiniMax variants (reap-172b-nvfp4-gb10-new, minimax-m25-nvfp4-new, minimax-m25-fp8-new). All 4 have `tool_call_parser='minimax_m2'` set; the H200 ones don't have memory tuning (default 131k context fits).
+8. **Going forward: commit aggressively.** Any non-trivial work should land on a feature branch immediately. The orchestrator's stash/sync mechanism is not safe for preserving uncommitted state across long-running task processing. Memory files survive (different filesystem), but in-repo working tree state does not.
+
+### Learnings — institutional memory
+
+- vLLM 0.19 has a native Anthropic adapter; no external bridge is required for the protocol layer. The `vllm_bridge.py` from Task 457 provides residual format normalization and is complementary, not redundant.
+- vLLM 0.19's CUDA graph memory profiler changed the `gpu-memory-utilization` budget — 0.9 default is too low for tight large-model pods.
+- vLLM defaults `max-num-seqs=1024`, which pre-allocates sampler softmax buffers per slot during warm-up. On tight pods this OOMs. For single-request eval pods, 16 is enough.
+- All MiniMax M2.5 HF repos require `--trust-remote-code` (custom modeling code via auto_map).
+- vLLM 0.19 ships dedicated tool-call parsers for ~25 model families. Always check `vllm/tool_parsers/__init__.py` for the right parser when adding a new model.
+- RunPod GPU availability API is unreliable — `get_gpu_availability()` may report capacity that `create_pod()` then refuses with "no instances available." Retry with a delay or fall through alternate GPU types.
+- RunPod container logs are NOT preserved after pod termination. Capture from web console while running, or via SSH `docker logs` / `/proc/PID/fd/{1,2}` before the container restarts.
+- The eval runner does NOT support resume mid-workflow. If reviewers fail (e.g. cap hit), the entire eval must be rerun from scratch — implementer iterations re-execute, then reviewers run on fresh budget.
+- The orchestrator's `merge-queue stash/sync` mechanism can silently drop uncommitted working tree state on stash-pop conflicts. There is **no recovery mechanism** beyond `git fsck --unreachable` blob search, which only works if the lost content was ever committed to an object (e.g. via the failed stash itself).
+
 ---
 
 ## Bridge fix (Task 457)
