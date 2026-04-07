@@ -496,6 +496,11 @@ class TestCollectSnapshot:
             ):
                 await collect_snapshot(conn, config)
 
+            async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+                row = await cur.fetchone()
+                assert row is not None
+                assert row[0] == 3
+
 
 # ---------------------------------------------------------------------------
 # downsample
