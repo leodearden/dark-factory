@@ -518,7 +518,16 @@ async def _run_subprocess(
     if stderr_text:
         logger.info(f'Agent stderr (last 1000): {stderr_text[-1000:]}')
     logger.info(f'Agent exit code: {proc.returncode}')
-    logger.info(f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout.decode()[:500]}')
+    stdout_text_for_log = stdout.decode()
+    if proc.returncode != 0:
+        # On failure, dump the full stdout so downstream debugging can see
+        # the actual messages array (tool_use blocks, error details) instead
+        # of only the truncated result envelope.
+        logger.info(
+            f'Agent stdout length: {len(stdout)} bytes (full, returncode={proc.returncode}):\n{stdout_text_for_log}'
+        )
+    else:
+        logger.info(f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout_text_for_log[:500]}')
 
     return _SubprocessResult(
         stdout=stdout.decode(),

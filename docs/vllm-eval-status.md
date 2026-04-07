@@ -1,7 +1,7 @@
 # vLLM Local Model Evaluation — Status Report
 
-**Last updated:** 2026-04-06 06:40 BST
-**Plan:** `~/.claude/plans/zany-dancing-yeti.md`
+**Last updated:** 2026-04-06 ~16:05 BST
+**Session summary:** Survived two laptop reboots, refactored the eval config system, revealed a systemic `vLLM → Claude CLI` tool-format bridge bug that blocks all local-model evals.
 
 ## Bridge fix (Task 457)
 
@@ -28,203 +28,148 @@ bridge transparently.
 
 ## TL;DR for next session
 
-**The pipeline works end-to-end except for two vLLM-level blockers:**
-1. **Devstral** has a `Tekkenizer.encode() add_special_tokens` bug in vLLM 0.18.1 / mistral_common 1.10.0
-2. **Large models** (Qwen3-Coder-Next 149GB, REAP-139B 131GB) crash inside the container before HF download finishes — root cause unknown, needs container/system log inspection
+**The big find:** The **eval pipeline for vLLM-hosted models is systemically broken** — not an infrastructure problem, a format-bridging one. All 10 iterations of the gate eval hit:
+- Model responds fine (29 tok/s, 121-token tool call per turn)
+- Claude CLI errors with `stop_reason=tool_use` + `is_error=true` + `subtype=error_during_execution`
+- Historical check: **no vLLM-hosted config has ever produced `outcome=done`** in `orchestrator/src/orchestrator/evals/results/`
 
-**Next-session task list (in order):**
-1. Run option A in background: derive a new base image with `pip install -U mistral_common vllm`, push as `leosiriusdawn/runpod-vllm:upgraded`, then test devstral with it
-2. Start a Qwen3-Coder-Next pod with default settings so the user can SSH in and inspect logs (`journalctl`, `dmesg`, `/proc/1/fd/{1,2}`, `nvidia-smi`) to figure out why the container crashes
-3. Once one model works end-to-end, run all 5 evals in parallel on `df_task_12`
+The Qwen model emits hermes-format tool calls; vLLM's `--tool-call-parser hermes` converts them to OpenAI format; the Claude CLI then expects Anthropic `tool_use` blocks and fails. There must be a missing/broken adapter somewhere in the chain.
 
-## Infrastructure State
+**Infrastructure fully healed this session:**
+1. ✓ Disk recovered from 80 GB free → 734 GB free (moved 530 GB of OLD bf16 models to Leo_X10p_4TB_00, deleted 162 GB REAP-172B source)
+2. ✓ MiniMaxAI/MiniMax-M2.5 source (215 GB) moved to Leo_X10p_4TB_00 after second reboot — Internal-2nd now 948 GB free
+3. ✓ **`/etc/fstab` permanent fix applied** — Internal-2nd mounts by UUID on boot, no more bind-mount workaround; plus `docker.service` `RequiresMountsFor` dropin at `/etc/systemd/system/docker.service.d/wait-for-internal-2nd.conf`
+4. ✓ `configs.py` fully refactored: `EvalConfig` now has `image`, `gpu_type`, `gpu_count`, `container_disk_gb` fields; single source of truth; `run_vllm_eval.py` consumes via `get_config_by_name()`
+5. ✓ `container_disk_gb` bug fixed: original agent refactor used 50 GB (wrong — RunPod includes image in container disk), bumped to image-size + headroom
+6. ✓ `run_vllm_eval.py` `wait_for_pod` timeout bumped 30 min → 60 min
+7. ✓ **All 5 new configs pivoted to use `:latest` base + HF download** — abandoned the slow local push (30+ min push hangs observed), HF download on pod is faster end-to-end
 
-### dark-factory
-- **Branch:** `main`
-- **Commit `53486e8023`** (2026-04-05): env_overrides scoping (only implementer/debugger) + 4 task_id mismatches fixed
-- **Eval script:** `scripts/run_vllm_eval.py` (saved from `/tmp/run_eval.py`)
-- **No uncommitted changes**
+**Next session priorities (user directed — do 1 & 2 concurrently):**
+1. **Debug the vLLM → Claude CLI tool-format bridge** (slow; SSH into fresh pod, curl `/v1/messages` with tool-use prompt, inspect orchestrator/shared/cli_invoke.py and any Anthropic↔OpenAI shim; the error happens in the Claude CLI side after it gets the tool_use response)
+2. **Try `reap-139b-nvfp4-new` as alternative gate eval** — different model (MiniMax architecture, potentially different tool format) on 1× RTX PRO 6000 (~$1.79/hr, ~$2 test). If it passes → Qwen-specific. If it fails → confirms systemic.
 
-### runpod-toolkit
-- **Branch:** `main`
-- **Commit `d68d219`** (2026-04-06): TOKENIZER_MODE env var, Dockerfile.local-model, vllm_pod.py arg fixes
-- **No uncommitted changes**
+## Gate eval failure — full forensics
 
-### Local models — `/media/leo/Internal-2nd/leo/models/`
-All 5 models downloaded from RunPod volume:
-| Model | Size | HF cache dir |
-|-------|------|--------------|
-| Devstral-Small-2505 | 88 GB | `models--mistralai--Devstral-Small-2505/` |
-| Qwen3-Coder-Next | 149 GB | `models--Qwen--Qwen3-Coder-Next/` |
-| REAP-139B | 131 GB | `models--cerebras--MiniMax-M2.5-REAP-139B-A10B/` |
-| REAP-172B | 162 GB | `models--cerebras--MiniMax-M2.5-REAP-172B-A10B/` |
-| MiniMax-M2.5 | 215 GB | `models--MiniMaxAI--MiniMax-M2.5/` |
-
-### Docker images (in new data-root `/media/leo/Internal-2nd/leo/docker-data/`)
-| Tag | Built | Pushed | Size |
-|-----|-------|--------|------|
-| `leosiriusdawn/runpod-vllm:latest` | ✅ | ✅ | 22.4 GB (modified entrypoint w/ TOKENIZER_MODE) |
-| `leosiriusdawn/runpod-vllm:devstral-small` | ✅ | ✅ | 117 GB |
-| `leosiriusdawn/runpod-vllm:qwen3-coder-next` | ✅ | ✅ | ~170 GB |
-| `leosiriusdawn/runpod-vllm:reap-139b` | ✅ | ✅ | ~155 GB |
-| `leosiriusdawn/runpod-vllm:reap-172b` | ✅ | ⏳ in progress | ~185 GB |
-| `leosiriusdawn/runpod-vllm:minimax-m25` | ⏳ pending | ⏳ pending | (will start when build monitor sees minimax download done) |
-
-**Note:** Baked Docker images turned out to be **impractical for RunPod evals** — RunPod cannot finish pulling 100GB+ images (container `uptime=0s` after 20+ min). Use base image + HF download approach instead. The baked images may still be useful for other clouds or local Docker deployments.
-
-### Build monitor
-- **Script:** `/tmp/build-as-complete.sh` running as background bash process
-- **Output:** `/tmp/build-as-complete.out`
-- **PID:** check `pgrep -f build-as-complete`
-- **Behavior:** polls `/tmp/rsync-*.log` every 30s, builds + pushes Docker images as each download completes
-- Will pick up minimax-m25 once that download finishes (see below)
-
-### MiniMax download status
-- **DONE** as of 2026-04-06 ~05:30 — but check `grep "total size is" /tmp/rsync-minimax.log`
-- The build monitor will detect completion on its next 30s poll and start the build automatically
-
-### RunPod
-- **Credit remaining:** ~$55 of $65 (spent ~$10 total: ~$0.50 transfer pod over 9h, ~$9 on failed GPU pod attempts)
-- **Currently running pods:** none (transfer pod terminated 2026-04-06 06:37)
-- **API key:** `rpa_VLRVNJ8HB5CH7MQZL9WW2XPQBQO18V3PMA1H1BSM11niy2` (in `~/.secrets/runpod.env`)
-- **SSH key:** `~/.ssh/id_runpod` (passphrase-free ed25519)
-- **Volume `obxma9bf1b`** (US-NC-1, 900GB) still has all the models — keep it as backup for now
-
-## What Works (validated end-to-end)
-
-### The eval pipeline approach: base image + HF download
-**Don't use baked Docker images on RunPod.** Use the 22GB base image and let vLLM download the model from HuggingFace at startup. This is faster and reliable for at least Devstral.
-
-For Devstral specifically:
-- Pod creation → SSH available: ~30 seconds (sometimes 2-3 min if image cache is cold)
-- vLLM model download (88GB from HF) + load: ~4 minutes
-- Total time to healthy vLLM endpoint: **~5 minutes**
-
-### Eval script: `scripts/run_vllm_eval.py`
-Creates GPU pod → waits for SSH → SSH tunnel → waits for vLLM health → runs eval → **always terminates pod in finally block**.
-
-```bash
-python3 scripts/run_vllm_eval.py --model devstral-small --task df_task_12 --port 8100 --no-volume
+**Pod lifecycle (CLEAN):**
+```
+15:52:37  gate eval started (qwen3-coder-next-fp8-new, :latest base + HF download)
+15:52:39  Pod created: xyhyxucv1q41mc (RTX PRO 6000 Blackwell Server Edition, $1.69/hr)
+15:54:58  Pod RUNNING, SSH at 216.243.220.242:10847   (2m19s to pod ready — good)
+15:55:01  SSH tunnel up, waiting for vLLM
+16:01:16  vLLM healthy on port 8100                   (6m15s HF download + vLLM startup — good)
+16:01:54→16:03:20  10 iterations, all fail identically
+16:03:28  Pod terminated cleanly
 ```
 
-Key features:
-- `--no-volume` (default): use base image + HF download (works for Devstral)
-- `--use-volume`: mount volume `obxma9bf1b` in US-NC-1 (blocked: no GPU stock there as of 2026-04-05)
-- GPU type fallback list (tries 96GB Blackwell variants then 80GB H100/A100)
-- Pod always terminated on success, failure, or exception
-- Loads `CLAUDE_OAUTH_TOKEN_G` from `.env` automatically
-- Eval cwd is `/home/leo/src/dark-factory/orchestrator/` (must be — see "Stale eval-worktree shadowing" below)
-
-### GPU type
-**Use:** `NVIDIA RTX PRO 6000 Blackwell Server Edition` (~$1.89/hr secure)
-- Available consistently when datacenter is NOT specified
-- 96GB VRAM
-- The string `NVIDIA RTX PRO 6000` (without "Blackwell Server Edition") is **invalid** — caused first failed attempt
-
-**Fallbacks** (if Blackwell unavailable):
-- `NVIDIA RTX PRO 6000 Blackwell Workstation Edition`
-- `NVIDIA H100 80GB HBM3` (~$2.69/hr)
-- `NVIDIA A100-SXM4-80GB` (~$1.49/hr)
-
-### Datacenter
-**Don't specify a datacenter** — let RunPod auto-pick. Specifying EUR-IS-1 or US-NC-1 has resulted in "no instances available" errors.
-
-The volume `obxma9bf1b` is in US-NC-1, but US-NC-1 has had **no 80GB+ GPU stock** during all attempts. So volume-mount approach is currently blocked.
-
-## Blockers
-
-### Blocker 1: Devstral Tekkenizer bug
-**Symptom:** vLLM loads and serves health endpoint, but every Claude Code agent call returns:
+**Failure pattern (consistent across all 10 iterations):**
+```json
+{
+  "type": "result",
+  "subtype": "error_during_execution",
+  "duration_ms": 1500-3000,
+  "is_error": true,
+  "num_turns": 1,
+  "stop_reason": "tool_use",
+  "session_id": "...",
+  "total_cost_usd": 0.19-0.20,
+  "usage": {
+    "input_tokens": 38000-39000,
+    "output_tokens": 121-124,
+    ...
+  }
+}
 ```
-API Error: 500 {"type":"error","error":{"type":"internal_error",
-  "message":"Tekkenizer.encode() got an unexpected keyword argument 'add_special_tokens'"}}
+
+**Result file:** `orchestrator/src/orchestrator/evals/results/df_task_12__qwen3-coder-next-fp8-new__9d13dbb1.json`
+- `outcome: blocked`
+- `tokens_per_second: 29.06` — model was actually serving
+- `input_tokens: 390358` (10 × 39k)
+- `output_tokens: 1217` (10 × 121)
+- `is_local_model: true` — orchestrator correctly detected local routing
+- `composite_score: 0.0`
+
+**Interpretation:** The model is serving and responding with a tool call after each 39k-token prompt. The Claude CLI runs `claude --print --output-format json --model sonnet …` against the vLLM endpoint (via `ANTHROPIC_BASE_URL=http://localhost:8100`). Something in that chain — either vLLM's returned format, or the CLI's parsing — is mishandling the tool call response. The fact that the first iteration took 24s (real inference) and subsequent ones took 1.5-3s suggests the vLLM endpoint started returning cached responses fast, which is suspicious.
+
+**Where to look in next session:**
+- `orchestrator/shared/cli_invoke.py` — how it invokes Claude CLI and what env it passes
+- Whatever sets `ANTHROPIC_BASE_URL` — does it go direct to vLLM's `/v1/chat/completions` (OpenAI format), or is there a shim serving `/v1/messages` (Anthropic format)?
+- `/home/leo/src/runpod-toolkit/docker/entrypoint-vllm.sh` — does vLLM launch with `--api-server anthropic` or similar shim?
+- The full stdout of a failed iteration — the logs only captured first 500 bytes; the full error message (probably in stderr) would identify the exact failure point
+- Compare against a KNOWN-working 3090-tier config (e.g. `qwen3-coder-30b-q4`) — but also check prior results in `results/` to see if those ever passed
+
+## Infrastructure state (post-session)
+
+### Disk
 ```
-Each call takes ~3 min and the orchestrator marks each as `success=True` (because it got *a* response), then moves on. The eval will run forever without producing real code changes.
+/dev/nvme1n1p5 (was nvme0n1p5)  920G  ??  /     [root: ~95%]
+/dev/nvme0n1  (was nvme1n1)    1.8T  792G used  948G free  /media/leo/Internal-2nd
+/dev/sda2                      3.6T  2.6T used  823G free  /media/leo/Leo_X10p_4TB_00
+```
 
-**Root cause:** vLLM 0.18.1 + mistral_common 1.10.0 ship with a Tekkenizer that doesn't accept `add_special_tokens` kwarg. vLLM passes this kwarg unconditionally.
+Kernel re-enumerated nvme devices after second reboot (nvme0 and nvme1 swapped). UUID-based fstab entry handles it.
 
-**Failed fix:** Setting `TOKENIZER_MODE=slow` via the new entrypoint env var **crashes vLLM at startup**. The flag is added but vLLM 0.18.1 doesn't gracefully handle "slow" mode for Mistral models.
+### /etc/fstab (permanent fix applied this session)
+```
+UUID=8bd62e99-c02a-4ec0-a25a-30678a0e4398  /media/leo/Internal-2nd  ext4  defaults,nofail,x-systemd.device-timeout=10s  0  2
+```
 
-**Untested fixes (for next session):**
-1. **Option A (recommended)**: Build a derived image:
-   ```dockerfile
-   FROM leosiriusdawn/runpod-vllm:latest
-   RUN pip install -U mistral_common vllm
-   ```
-   Push as `leosiriusdawn/runpod-vllm:upgraded`. Test with Devstral.
-2. Try `--tokenizer hf-internal-testing/llama-tokenizer` to override with a non-Mistral tokenizer (probably won't work — model has its own tokenizer)
-3. Monkey-patch the Tekkenizer in a startup script
+Plus `/etc/systemd/system/docker.service.d/wait-for-internal-2nd.conf`:
+```
+[Unit]
+RequiresMountsFor=/media/leo/Internal-2nd
+```
 
-### Blocker 2: Large models crash before download completes
-**Models affected:** Qwen3-Coder-Next (149GB), REAP-139B (131GB). Devstral (88GB) is unaffected.
+Verified with `findmnt --verify`: 0 errors. Docker now waits for Internal-2nd mount on boot.
 
-**Symptom:**
-1. Pod created, RUNNING
-2. SSH becomes available within 2-4 min
-3. SSH works briefly — diagnostics show GPU=0MiB used, HF cache=15MB or less, disk almost empty
-4. ~5-10 min after creation, SSH stops responding (`Connection refused`)
-5. Container's `uptime=0s` (PID 1 exited)
-6. Eval script's vLLM health timeout eventually fires and pod is terminated
+### Local model files
 
-**Hypotheses (untested):**
-- vLLM crashes during pre-flight model architecture check before downloading
-- KV cache pre-allocation fails with default `MAX_MODEL_LEN=131072` on these large models
-- Container OOM (CPU memory, not GPU) during HF download for very large models — RunPod has limited container memory by default
-- Custom REAP/MiniMax model architecture not fully supported by vLLM 0.18.1
+**`/media/leo/Internal-2nd/leo/models/`** — EMPTY (all OLD bf16 moved out or deleted this session)
 
-**What we tried that didn't help:**
-- `MAX_MODEL_LEN=65536` reduced context — still crashed
-- `VLLM_LOGGING_LEVEL=DEBUG` — **made it crash faster** (don't use)
-- Container disk 350GB (way more than 2.5× model size) — still crashed
-- `DTYPE=float8` env var — needs more testing in clean environment
+**`/media/leo/Leo_X10p_4TB_00/leo/models/`:**
+```
+models--cerebras--MiniMax-M2.5-REAP-139B-A10B       131 G   OLD bf16, moved here
+models--lukealonso--MiniMax-M2.5-REAP-139B-A10B-NVFP4  70 G  NEW, not used this session
+models--MiniMaxAI--MiniMax-M2.5                     215 G   moved here (was on Internal-2nd)
+models--mistralai--Devstral-Small-2505               88 G   OLD, Devstral parked
+models--nvidia--MiniMax-M2.5-NVFP4                  131 G   NEW, not used this session
+models--Qwen--Qwen3-Coder-Next                      149 G   OLD bf16
+models--Qwen--Qwen3-Coder-Next-FP8                   75 G   NEW — this is what the pod downloads from HF
+models--saricles--MiniMax-M2.5-REAP-172B-A10B-NVFP4-GB10  93 G  NEW
+```
 
-**What needs investigation:**
-- **Get actual container/system logs while it's crashing.** SSH in immediately after pod creation, run `tail -f /proc/1/fd/{1,2}` and `journalctl -fk`, watch what happens
-- Maybe the new entrypoint with TOKENIZER_MODE block has a bug? It looked fine but worth re-checking
-- Try setting `container_disk_gb=600` and `min_memory_gb=128` to rule out memory pressure
+**Deleted this session:** `models--cerebras--MiniMax-M2.5-REAP-172B-A10B` (162 G) — the OLD baked image already on Hub, source no longer needed.
 
-### Blocker 3 (resolved): Stale eval-worktree shadowing
-The `orchestrator eval` subcommand was missing from `--help` because Python was importing `orchestrator.cli` from a stale `.eval-worktrees/df_task_13/run-25a0871e/` directory.
+### Local Docker images
 
-**Fix:** `cd orchestrator/` before running `uv run orchestrator eval ...`. The eval script does this automatically.
+```
+leosiriusdawn/runpod-vllm:reap-172b-nvfp4-gb10   123 GB  (built pre-session, NOT pushed — local only)
+leosiriusdawn/runpod-vllm:qwen3-coder-next-fp8   104 GB  (pushed to Hub pre-session)
+leosiriusdawn/runpod-vllm:latest / :upgraded      24 GB  (base, pushed, has entrypoint + TOOL_CALL_PARSER env var)
+```
 
-## Critical learnings (don't repeat the mistakes)
+**NOT built/pushed this session** (abandoned the local build path): `reap-139b-nvfp4`, `minimax-m25-nvfp4`, `minimax-m25-fp8`. The local `reap-172b-nvfp4-gb10` 123 GB image is the sole survivor; kept on disk in case a future session wants to push it.
 
-1. **Container crashes silently** — RunPod's pod-status API shows `RUNNING` even when the container's PID 1 has died. Check `runtime.uptimeInSeconds` in `runpod.get_pods()` — `0s` after several minutes means the container is dead.
+### Docker Hub state (`leosiriusdawn/runpod-vllm`)
 
-2. **Always terminate pods in `finally` blocks** — the eval script does this. Failed attempts so far have been cleaned up correctly. Check `runpod.get_pods()` after any error to verify nothing is leaking.
+| Tag | State | Notes |
+|---|---|---|
+| `:latest` / `:upgraded` | ✓ pushed | vllm 0.19.0 + mistral_common 1.11.0 + TOOL_CALL_PARSER env var |
+| `:qwen3-coder-next-fp8` | ✓ pushed | NEW 75 GB FP8, pushed pre-session — but NOT USED this session (switched to :latest + HF) |
+| `:qwen3-coder-next` | ✓ pushed | OLD bf16, vllm 0.18.1 |
+| `:reap-139b` | ✓ pushed | OLD bf16-labeled-actually-FP8 |
+| `:reap-172b` | ✓ pushed | OLD FP8 |
+| `:devstral-small` | ✓ pushed | OLD, broken (parked) |
+| `:reap-172b-nvfp4-gb10` | ✗ LOCAL ONLY | 123 GB, built pre-session, push hung repeatedly (30+ MB/s), abandoned |
+| `:reap-139b-nvfp4` | ✗ never built | abandoned; pivot to :latest + HF download |
+| `:minimax-m25-nvfp4` | ✗ never built | same |
+| `:minimax-m25-fp8` | ✗ never built | same |
 
-3. **`pkill -f run_eval.py` is unreliable** — the SIGTERM doesn't always trigger the script's cleanup logic, leaving orphaned pods. Better to call `client.terminate_pod(pod_id)` directly.
+## configs.py — current state
 
-4. **Don't specify datacenter** unless required by volume — RunPod has limited stock per DC.
-
-5. **Don't use `VLLM_LOGGING_LEVEL=DEBUG`** — confirmed via A/B test to cause crashes.
-
-6. **`TOKENIZER_MODE=slow` crashes vLLM 0.18.1** — added the env var hook in entrypoint for future use, but currently broken.
-
-7. **Baked Docker images don't work on RunPod** — pulling 100GB+ images never finishes. Use base image + HF download.
-
-## Where things are
-
-| Thing | Path |
-|-------|------|
-| Eval script | `/home/leo/src/dark-factory/scripts/run_vllm_eval.py` |
-| Eval script (working copy) | `/tmp/run_eval.py` |
-| Build monitor script | `/tmp/build-as-complete.sh` |
-| Build monitor output log | `/tmp/build-as-complete.out` |
-| Rsync logs | `/tmp/rsync-{devstral,qwen3,reap139,reap172,minimax}.log` |
-| Docker data-root | `/media/leo/Internal-2nd/leo/docker-data/` |
-| Local model cache | `/media/leo/Internal-2nd/leo/models/` |
-| RunPod toolkit | `/home/leo/src/runpod-toolkit/` |
-| Modified entrypoint | `/home/leo/src/runpod-toolkit/docker/entrypoint-vllm.sh` |
-| Local-model Dockerfile | `/home/leo/src/runpod-toolkit/docker/Dockerfile.local-model` |
-| Eval configs | `/home/leo/src/dark-factory/orchestrator/src/orchestrator/evals/configs.py` |
-| Eval task files | `/home/leo/src/dark-factory/orchestrator/src/orchestrator/evals/tasks/df_task_*.json` |
-| Memory: blockers note | `/home/leo/.claude/projects/-home-leo-src-dark-factory/memory/project_vllm_eval_blockers.md` |
-
-## Eval configs (from `orchestrator/src/orchestrator/evals/configs.py`)
+All 5 new configs now use `:latest` + HF download. The existing-image configs still use OLD baked Hub images on bigger H200 pods.
 
 ```python
+<<<<<<< Updated upstream
 VLLM_EVAL_CONFIGS = [
     _vllm_config('minimax-m25-fp8', 'MiniMaxAI/MiniMax-M2.5'),
     _vllm_config('qwen3-coder-next-fp8', 'Qwen/Qwen3-Coder-Next'),
@@ -233,70 +178,126 @@ VLLM_EVAL_CONFIGS = [
     _vllm_config('qwen3-coder-30b-q4', 'Qwen/Qwen3-Coder-30B-A3B-Instruct'),
     _vllm_config('devstral-small-2505-q6', 'mistralai/Devstral-Small-2505'),
 ]
+=======
+# New configs (5 — all use :latest + HF download)
+qwen3-coder-next-fp8-new        :latest  1× RTX PRO 6000  240G  Qwen/Qwen3-Coder-Next-FP8
+reap-139b-nvfp4-new             :latest  1× RTX PRO 6000  200G  lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4
+reap-172b-nvfp4-gb10-new        :latest  1× H200           260G  saricles/MiniMax-M2.5-REAP-172B-A10B-NVFP4-GB10
+minimax-m25-nvfp4-new           :latest  1× H200           320G  nvidia/MiniMax-M2.5-NVFP4
+minimax-m25-fp8-new             :latest  2× H200           600G  MiniMaxAI/MiniMax-M2.5
+
+# Existing-image configs (4 — OLD baked images, bigger pods)
+qwen3-coder-next-fp8            :qwen3-coder-next  2× H200  250G  Qwen/Qwen3-Coder-Next
+reap-139b-nvfp4                 :reap-139b         1× H200  220G  cerebras/MiniMax-M2.5-REAP-139B-A10B
+reap-172b-nvfp4                 :reap-172b         2× H200  260G  cerebras/MiniMax-M2.5-REAP-172B-A10B
+minimax-m25-fp8                 :latest            2× H200  600G  MiniMaxAI/MiniMax-M2.5  (HF download)
+
+# Workstation tier (unchanged)
+qwen3-coder-30b-q4, devstral-small-2505-q6, qwen25-coder-32b-q4
+>>>>>>> Stashed changes
 ```
 
-## Eval task files
+`devstral-small` remains PARKED — Devstral-Small-2505 emits 3 inconsistent tool-call formats, not a parser config problem.
 
-All 5 task files have embedded plans (task_id mismatches fixed in `53486e8023`):
-- `df_task_12.json` — Bug fix: verify.py shell issue (3 steps, "small" complexity) — **use this for canary**
-- `df_task_13.json` — Bug fix: empty diff in reviewers (8 steps)
-- `df_task_18.json` — Larger feature task ("medium")
-- `reify_task_12.json` — Reify project task ("high")
-- `reify_task_27.json` — Reify project task ("high")
+## run_vllm_eval.py — current state
 
-## Account for Evals
+- Imports from `orchestrator.evals.configs` via `sys.path.insert("/home/leo/src/dark-factory/orchestrator/src")`
+- `--config` replaces the old `--model`; choices are the 9 RunPod-targetable configs
+- Looks up image/gpu_type/gpu_count/container_disk_gb/env_overrides from `EvalConfig`
+- `wait_for_pod` timeout: **3600s (60 min)**, bumped from 1800s because 100+ GB baked images can take 30+ min to pull
+- `GPU_TYPES` fallback list trimmed to just `RTX PRO 6000 Blackwell Server Edition` and `H200`
+- `--image` and `--gpu-type` CLI overrides preserved
 
-Use account G (`CLAUDE_OAUTH_TOKEN_G` in `.env`) for architect/reviewer Claude calls. The eval script loads `.env` automatically.
+## Things that bit us this session
 
-## Concrete next-session commands
+1. **First reboot:** lost all local image state because of the Internal-2nd udisks mount race (known from previous session). FIXED permanently with fstab + systemd dropin.
 
-```bash
-# 1. Verify state
-cd /home/leo/src/dark-factory
-git log --oneline -3            # should show 53486e8023
-cd /home/leo/src/runpod-toolkit
-git log --oneline -3            # should show d68d219
-python3 -c "
-import sys; sys.path.insert(0, '/home/leo/src/runpod-toolkit')
-import runpod
-runpod.api_key = 'rpa_VLRVNJ8HB5CH7MQZL9WW2XPQBQO18V3PMA1H1BSM11niy2'
-print([p['id'] for p in runpod.get_pods()])  # should be empty
-"
-tail -5 /tmp/build-as-complete.out  # check if minimax build/push has started
+2. **Second reboot:** disk re-enumeration (nvme0 ↔ nvme1). UUID-based fstab handles it.
 
-# 2. Option A: build upgraded image (do this in background)
-mkdir -p /tmp/upgraded-image && cd /tmp/upgraded-image
-cat > Dockerfile <<EOF
-FROM leosiriusdawn/runpod-vllm:latest
-RUN pip install --no-cache-dir -U mistral_common vllm
-EOF
-docker build -t leosiriusdawn/runpod-vllm:upgraded . &
-# After build: docker push leosiriusdawn/runpod-vllm:upgraded
-# Then update scripts/run_vllm_eval.py to use the :upgraded tag
-# Test: python3 scripts/run_vllm_eval.py --model devstral-small --task df_task_12 --no-volume
+3. **`container_disk_gb=50` was too small** for baked images. RunPod's container disk includes the image itself (not just the writable layer). The first gate eval attempt hung at runtime=null for 23 min because RunPod couldn't fit a 104 GB image in 50 GB of container disk. Fixed: set each config's `container_disk_gb` to image_size + ~50 GB headroom.
 
-# 3. Start Qwen3-Coder-Next pod for the user to inspect
-# Use base image (not baked) so SSH comes up fast
-# Use defaults — no DTYPE, no MAX_MODEL_LEN, no debug logging
-python3 scripts/run_vllm_eval.py --model qwen3-coder-next --task df_task_12 --port 8101 --no-volume &
-# As soon as SSH is available, the user will SSH in to inspect logs:
-#   ssh -i ~/.ssh/id_runpod root@<ip> -p <port>
-#   tail -f /proc/1/fd/{1,2}    # vllm stdout/stderr
-#   journalctl -fk              # kernel ring buffer
-#   dmesg -wT                   # OOM kills, etc
-#   nvidia-smi -l 5             # GPU memory pressure
-#   df -h                       # disk usage
-```
+4. **Docker push of 98.9 GB unique layer hung** twice (pre- and post-reboot), each time ~22+ min without TCP activity but dockerd was computing layer hash at ~30 MB/s (I/O bound + slow). Root cause unclear — maybe legacy builder's layer layout isn't push-friendly. Workaround: pivoted to `:latest` + HF download (saves the whole push step).
 
-## Account costs (so far)
+5. **Gate eval "EVAL PASSED" log line is misleading** — it just checks `subprocess.returncode == 0`, which is 0 even when `outcome=blocked`. Always read the actual result file.
+
+6. **`docker build … 2>&1 | tail -20` in the v4 monitor script lost the build's exit code** because no `set -o pipefail` — v4 monitor logged "BUILD DONE: reap-139b-nvfp4" at 14:28:25 but the build had actually failed (no tag was created). Caused me to think progress was further along than it was.
+
+## Cost so far (session 2026-04-06)
 
 | Item | Cost |
-|------|------|
-| CPU transfer pod (~9h @ $0.13/hr) | ~$1.20 |
-| Failed GPU eval attempts (~6 pods, ~30 min total) | ~$2-3 |
-| Successful Devstral load + Tekkenizer-error eval loop | ~$3 |
-| Other GPU starts that crashed | ~$2-3 |
-| **Total spent** | **~$10** |
-| **Remaining** | **~$55** |
+|---|---|
+| Pre-reboot (from previous status doc) | ~$2.82 |
+| Gate eval attempt 1 (30 min hang, container_disk bug) | ~$0.85 |
+| Gate eval attempt 2 (killed after 30s, config pivot) | ~$0.01 |
+| Gate eval attempt 3 (HF download, ran 10 iterations, blocked) | ~$0.30 |
+| **Session total** | **~$3.98** |
+| **Remaining RunPod credit** | **~$48** |
 
-$55 is plenty for 5 successful evals (1 each model, ~$1-2 each on RTX PRO 6000 Blackwell).
+## Files changed this session (uncommitted)
+
+```
+orchestrator/src/orchestrator/evals/configs.py    [refactored + pivoted to :latest/HF]
+scripts/run_vllm_eval.py                          [config-driven, longer timeout]
+docs/vllm-eval-status.md                          [this doc]
+/etc/fstab                                         [UUID line added]
+/etc/systemd/system/docker.service.d/wait-for-internal-2nd.conf  [new]
+```
+
+No git commits made — next session should review and decide what to commit.
+
+## Background scripts written (may be useful or should be cleaned up)
+
+All in `/var/tmp/` (persistent across reboots):
+- `move-minimax-*.log` — MiniMaxAI/MiniMax-M2.5 move log (completed)
+- `rebuild-and-push-all.sh` + log — abandoned (pivot to HF)
+- `retry-push-after-build.sh` + log — abandoned
+- `restart-builds.sh` + log — abandoned
+- `launch-post-gate-evals.sh` + log — still valid, just needs a new gate result to trigger
+
+## Cheat sheet for next session
+
+```bash
+# Verify things look sane after reboot
+mount | grep Internal-2nd       # should show /dev/nvme0n1 on /media/leo/Internal-2nd
+docker images leosiriusdawn/runpod-vllm
+df -h /media/leo/Internal-2nd /media/leo/Leo_X10p_4TB_00
+
+# Dispatch 1 & 2 concurrently next session:
+
+# (1) Debug tool-format bridge — launch a fresh pod and poke at it
+cd /home/leo/src/dark-factory
+python3 scripts/run_vllm_eval.py --config qwen3-coder-next-fp8-new --task df_task_12 --port 8100 --no-volume &
+# While it's running, grab the SSH info from /var/tmp/gate-eval-*.log, SSH in:
+#   ssh -i ~/.ssh/id_runpod root@<host> -p <port>
+# Then on the pod:
+#   curl -s http://localhost:8000/v1/models | jq    # what does vLLM expose?
+#   curl -s http://localhost:8000/health
+#   curl -s http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{...minimal tool-use request...}'
+# Compare to what Claude CLI expects on ANTHROPIC_BASE_URL
+
+# (2) reap-139b-nvfp4-new as alternative gate
+python3 scripts/run_vllm_eval.py --config reap-139b-nvfp4-new --task df_task_12 --port 8101 --no-volume
+
+# Critical files to read in next session for (1):
+#   orchestrator/shared/cli_invoke.py
+#   orchestrator/src/orchestrator/evals/runner.py  (how --vllm-url becomes ANTHROPIC_BASE_URL)
+#   /home/leo/src/runpod-toolkit/docker/entrypoint-vllm.sh  (what server does vLLM launch?)
+
+# Read the full failed iteration stdout (only first 500 chars currently logged):
+#   The orchestrator logs are at /var/tmp/gate-eval-qwen3-coder-next-fp8-new-20260406-155237.log
+#   But to see the FULL agent stdout, probably need to rerun with more verbose logging, OR
+#   check if stdout was captured somewhere else (worktree dir, session files, etc.)
+```
+
+## Next session priority order
+
+1. **Read `orchestrator/shared/cli_invoke.py` + `orchestrator/src/orchestrator/evals/runner.py`** to understand how `--vllm-url` propagates and how the Claude CLI is invoked. The full command line is logged:
+   ```
+   claude --print --output-format json --model sonnet --max-budget-usd 20.0 \
+     --system-prompt-file /tmp/sysprompt_uvwq9dkz.txt --permission-mode bypassPermissions \
+     --max-turns 80 --effort...
+   ```
+2. **Capture a full failed-iteration stdout** (not just first 500 chars) to see the actual error message
+3. **Run `reap-139b-nvfp4-new` as alternative gate** (concurrent with debug) — quick data point
+4. **If bridge is fixable**, fix it, rerun gate, then the 4 post-gate evals fire automatically (`launch-post-gate-evals.sh` is already set up)
+5. **If not fixable quickly**, consider whether vLLM evals are worth continuing at all, or defer until a major refactor

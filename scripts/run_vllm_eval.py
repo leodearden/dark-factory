@@ -3,45 +3,36 @@
 
 Creates pod → waits for vLLM → runs eval → terminates pod.
 Pod is ALWAYS terminated in the finally block, even on errors.
+
+The eval config (image, GPU type, pod sizing, model env vars) comes from
+orchestrator.evals.configs.VLLM_EVAL_CONFIGS — single source of truth.
 """
 
 import argparse
-import json
 import os
-import signal
 import subprocess
 import sys
 import time
 
 sys.path.insert(0, "/home/leo/src/runpod-toolkit")
+sys.path.insert(0, "/home/leo/src/dark-factory/orchestrator/src")
 from runpod_toolkit.config import RunPodConfig
 from runpod_toolkit.compute import RunPodClient, PodStatus
+from orchestrator.evals.configs import get_config_by_name, VLLM_EVAL_CONFIGS, EvalConfig
 
 RUNPOD_KEY = "rpa_VLRVNJ8HB5CH7MQZL9WW2XPQBQO18V3PMA1H1BSM11niy2"
 SSH_KEY = os.path.expanduser("~/.ssh/id_runpod")
 SSH_PUBKEY = open(SSH_KEY + ".pub").read().strip()
 PROJECT_ROOT = "/home/leo/src/dark-factory"
 
-# Model → (docker_tag, eval_config_name, gpu_count, container_disk_gb, extra_env)
-# container_disk must be ≥ 2.5× model size (HF download uses temp + final copies)
-MODELS = {
-    "devstral-small":   ("devstral-small",   "devstral-small-2505-q6", 1, 250, {}),
-    "qwen3-coder-next": ("qwen3-coder-next", "qwen3-coder-next-fp8",  1, 400, {"DTYPE": "float8"}),
-    "reap-139b":        ("reap-139b",        "reap-139b-nvfp4",       1, 350, {}),
-    "reap-172b":        ("reap-172b",        "reap-172b-nvfp4",       1, 430, {}),
-    "minimax-m25":      ("minimax-m25",      "minimax-m25-fp8",       2, 570, {"DTYPE": "float8"}),
-}
-
-# GPU types to try in order (96GB → 80GB, cheapest viable first)
+# Fallback GPU types when neither the config nor --gpu-type provides one.
 GPU_TYPES = [
     "NVIDIA RTX PRO 6000 Blackwell Server Edition",
-    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
-    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
-    "NVIDIA A100-SXM4-80GB",
-    "NVIDIA A100 80GB PCIe",
-    "NVIDIA H100 80GB HBM3",
-    "NVIDIA H100 PCIe",
+    "NVIDIA H200",
 ]
+
+# RunPod-targetable config names: those with an image set in configs.py.
+RUNPOD_CONFIG_NAMES = [c.name for c in VLLM_EVAL_CONFIGS if c.image is not None]
 
 
 def log(msg):
@@ -65,33 +56,39 @@ def wait_for_vllm(port, timeout=900):
     return False
 
 
-def run_eval(model_key, task_name, local_port, datacenter="US-NC-1", use_volume=True):
-    docker_tag, config_name, gpu_count, container_disk, extra_env = MODELS[model_key]
+def run_eval(config_name, task_name, local_port, datacenter="US-NC-1",
+             use_volume=True, image_override=None, gpu_type_override=None):
+    cfg: EvalConfig | None = get_config_by_name(config_name)
+    if cfg is None:
+        log(f"ERROR: unknown eval config '{config_name}'")
+        return 1
+    if cfg.image is None and image_override is None:
+        log(f"ERROR: config '{config_name}' has no image — not a RunPod config")
+        return 1
+
     task_path = f"src/orchestrator/evals/tasks/{task_name}.json"
 
-    # HF model ID for MODEL_NAME env var
-    HF_MODELS = {
-        "devstral-small": "mistralai/Devstral-Small-2505",
-        "qwen3-coder-next": "Qwen/Qwen3-Coder-Next",
-        "reap-139b": "cerebras/MiniMax-M2.5-REAP-139B-A10B",
-        "reap-172b": "cerebras/MiniMax-M2.5-REAP-172B-A10B",
-        "minimax-m25": "MiniMaxAI/MiniMax-M2.5",
-    }
+    image = image_override or cfg.image
+    gpu_count = cfg.gpu_count
+    container_disk = cfg.container_disk_gb
+    hf_model = cfg.env_overrides["MODEL_NAME"]
+
+    # Build pod env vars from config env_overrides (filter to vLLM entrypoint vars)
+    extra_env = {}
+    for k in ("TOOL_CALL_PARSER", "QUANTIZATION", "TP_SIZE",
+              "MAX_MODEL_LEN", "GPU_MEMORY_UTIL", "MAX_NUM_SEQS"):
+        if k in cfg.env_overrides:
+            extra_env[k] = cfg.env_overrides[k]
 
     if use_volume:
         # Volume approach: base image + volume with pre-downloaded weights
-        image = "leosiriusdawn/runpod-vllm:latest"
         volume_id = "obxma9bf1b"
         datacenter = "US-NC-1"  # volume is in this DC
         container_disk = 50  # just need space for runtime, not weights
     else:
-        # Base image + HF download: container starts fast, model downloads inside
-        # Much faster than baked 100GB+ images which timeout on RunPod pull
-        image = "leosiriusdawn/runpod-vllm:latest"
+        # Baked image (or :latest with HF download): use config's image and disk sizing
         volume_id = None
         datacenter = None  # let RunPod auto-select
-        # Need enough container disk for model weights + runtime
-        container_disk = container_disk + 30  # extra headroom for download
 
     config = RunPodConfig(api_key=RUNPOD_KEY)
     client = RunPodClient(config)
@@ -104,18 +101,24 @@ def run_eval(model_key, task_name, local_port, datacenter="US-NC-1", use_volume=
         # 1. Create GPU pod
         env_vars = {
             "PUBLIC_KEY": SSH_PUBKEY,
-            "MODEL_NAME": HF_MODELS[model_key],
+            "MODEL_NAME": hf_model,
             **extra_env,
         }
-        if gpu_count > 1:
-            env_vars["TP_SIZE"] = str(gpu_count)
 
-        # Try GPU types in order until one is available
-        for gpu_type in GPU_TYPES:
+        # Resolve GPU type list:
+        #   --gpu-type override > config.gpu_type > GPU_TYPES fallback list
+        if gpu_type_override:
+            gpu_types_to_try = [gpu_type_override]
+        elif cfg.gpu_type:
+            gpu_types_to_try = [cfg.gpu_type]
+        else:
+            gpu_types_to_try = GPU_TYPES
+
+        for gpu_type in gpu_types_to_try:
             try:
                 log(f"Trying {gpu_count}× {gpu_type} in {datacenter}...")
                 pod = client.create_pod(
-                    name=f"eval-{model_key}",
+                    name=f"eval-{config_name}",
                     gpu_type=gpu_type,
                     image=image,
                     gpu_count=gpu_count,
@@ -140,7 +143,7 @@ def run_eval(model_key, task_name, local_port, datacenter="US-NC-1", use_volume=
         pod = client.wait_for_pod(
             pod_id=pod.id,
             status=PodStatus.RUNNING,
-            timeout=1800,  # 30 min — model loading can be slow
+            timeout=3600,  # 60 min — large baked images (100+ GB) can pull slowly
             poll_interval=15,
             wait_for_ssh=True,
         )
@@ -165,8 +168,7 @@ def run_eval(model_key, task_name, local_port, datacenter="US-NC-1", use_volume=
         time.sleep(3)
 
         # 4. Wait for vLLM health
-        # Timeout scales with model size: ~20 min download + ~10 min load
-        # container_disk is a rough proxy for model size
+        # Timeout scales with container_disk as a rough proxy for model size.
         health_timeout = max(900, container_disk * 12)  # ~12s per GB
         log(f"Waiting for vLLM to load model (timeout {health_timeout//60} min)...")
         if not wait_for_vllm(local_port, timeout=health_timeout):
@@ -220,12 +222,12 @@ def run_eval(model_key, task_name, local_port, datacenter="US-NC-1", use_volume=
 
         exit_code = result.returncode
         if exit_code == 0:
-            log(f"EVAL PASSED: {model_key} / {task_name}")
+            log(f"EVAL PASSED: {config_name} / {task_name}")
         else:
-            log(f"EVAL FAILED (exit {exit_code}): {model_key} / {task_name}")
+            log(f"EVAL FAILED (exit {exit_code}): {config_name} / {task_name}")
 
     except subprocess.TimeoutExpired:
-        log(f"EVAL TIMEOUT: {model_key} / {task_name}")
+        log(f"EVAL TIMEOUT: {config_name} / {task_name}")
     except Exception as e:
         log(f"ERROR: {e}")
     finally:
@@ -252,16 +254,23 @@ def run_eval(model_key, task_name, local_port, datacenter="US-NC-1", use_volume=
 
 def main():
     parser = argparse.ArgumentParser(description="Run vLLM eval on RunPod")
-    parser.add_argument("--model", required=True, choices=MODELS.keys())
+    parser.add_argument("--config", required=True, choices=RUNPOD_CONFIG_NAMES,
+                        help="vLLM eval config name from orchestrator.evals.configs")
     parser.add_argument("--task", default="df_task_12")
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument("--datacenter", default="US-NC-1")
     parser.add_argument("--no-volume", action="store_true",
                         help="Use baked Docker image instead of volume")
+    parser.add_argument("--image", default=None,
+                        help="Override Docker image (default: from config)")
+    parser.add_argument("--gpu-type", default=None,
+                        help="Force a specific RunPod GPU type id (e.g. 'NVIDIA H200 NVL'). "
+                             "When set, overrides the config's gpu_type and the GPU_TYPES fallback list.")
     args = parser.parse_args()
 
-    exit_code = run_eval(args.model, args.task, args.port, args.datacenter,
-                         use_volume=not args.no_volume)
+    exit_code = run_eval(args.config, args.task, args.port, args.datacenter,
+                         use_volume=not args.no_volume, image_override=args.image,
+                         gpu_type_override=args.gpu_type)
     sys.exit(exit_code)
 
 
