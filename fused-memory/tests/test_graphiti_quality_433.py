@@ -9,6 +9,7 @@ Task 433: 8 code-quality improvements deferred from task-419 review.
 """
 from __future__ import annotations
 
+import inspect
 import re
 from unittest.mock import AsyncMock
 
@@ -302,7 +303,7 @@ class TestRebuildEntitySummariesForceDryRun:
             group_id='test', force=True, dry_run=True
         )
 
-        backend.get_all_valid_edges.assert_not_called()
+        backend.get_all_valid_edges.assert_not_awaited()
         backend._rebuild_entity_from_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -670,4 +671,39 @@ class TestDocstringAccuracyForceDryRunClass:
         )
         assert 'regardless of' in doc, (
             "Docstring must state edges are fetched 'regardless of' dry_run on the force=False path"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Meta-test: assert_not_awaited style for edge-fetch guard assertions
+# ---------------------------------------------------------------------------
+
+class TestEdgeFetchGuardAssertionStyle:
+    """Meta-test: verifies that test_force_dry_run_does_not_call_get_all_valid_edges
+    uses assert_not_awaited() (not assert_not_called()) for the AsyncMock edge-fetch
+    guard assertion, keeping the style consistent with the adjacent assertion on
+    backend._rebuild_entity_from_edges.
+    """
+
+    def test_force_dry_run_uses_assert_not_awaited_for_edge_fetch(self) -> None:
+        """Introspect test_force_dry_run_does_not_call_get_all_valid_edges source.
+
+        Assertions:
+          (a) source contains 'backend.get_all_valid_edges.assert_not_awaited()'
+          (b) source does NOT contain 'backend.get_all_valid_edges.assert_not_called()'
+        """
+        fn = TestRebuildEntitySummariesForceDryRun.test_force_dry_run_does_not_call_get_all_valid_edges
+        src = inspect.getsource(fn)
+
+        # (a) must use assert_not_awaited for the AsyncMock edge-fetch guard
+        assert 'backend.get_all_valid_edges.assert_not_awaited()' in src, (
+            "test_force_dry_run_does_not_call_get_all_valid_edges must use "
+            "assert_not_awaited() for the get_all_valid_edges AsyncMock"
+        )
+
+        # (b) must NOT use the generic assert_not_called for this AsyncMock
+        assert 'backend.get_all_valid_edges.assert_not_called()' not in src, (
+            "test_force_dry_run_does_not_call_get_all_valid_edges must NOT use "
+            "assert_not_called() for the get_all_valid_edges AsyncMock; "
+            "use assert_not_awaited() instead"
         )
