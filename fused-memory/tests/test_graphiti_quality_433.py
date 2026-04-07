@@ -327,8 +327,8 @@ class TestRebuildEntitySummariesForceDryRun:
         assert result['rebuilt'] == 0
         assert result['errors'] == 0
         assert len(result['details']) == 3
-        for detail in result['details']:
-            assert detail['status'] == 'skipped_dry_run'
+        expected_details = [{'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities]
+        assert result['details'] == expected_details
         assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
 
     @pytest.mark.asyncio
