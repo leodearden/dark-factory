@@ -10333,7 +10333,18 @@
             "fused-memory/src/fused_memory/backends",
             "fused-memory/tests/test_cleanup_stale_edges.py",
             "fused-memory/tests/test_reindex.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "graphiti_client"
+            ],
+            "queries": [
+              "ro_query migration read-only methods graphiti_client task 486",
+              "FalkorDB GRAPH.RO_QUERY read-only Cypher query migration",
+              "query_edges_by_time_range node_count ro_query migration"
+            ]
+          },
+          "_causation_id": "2f2ac841-21ef-4bb6-ae6f-d98d538127ca"
         }
       },
       {
