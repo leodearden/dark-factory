@@ -10909,6 +10909,17 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": 578,
+        "title": "Fix fragile call_args indexing in test_reindex.py test_uses_ro_query_not_query",
+        "description": "In `fused-memory/tests/test_reindex.py` at line 321 (inside `TestListIndices.test_uses_ro_query_not_query`), the new cypher-content assertion uses the bare positional-index pattern:\n\n```python\ncypher = graph.ro_query.call_args[0][0]\nassert 'db.indexes' in cypher\n```\n\nThis deviates from the defensive extraction pattern established elsewhere in the suite (e.g., `test_refresh_entity_summary.py` lines 84-85 and `test_merge_entities.py` lines 124-125), which reads:\n\n```python\nargs, kwargs = graph.ro_query.call_args\ncypher = args[0] if args else kwargs.get('query', '')\n```\n\nThe current form raises an opaque `IndexError` if the implementation ever switches to keyword arguments, rather than producing a clear `AssertionError`. Replace with the defensive pattern for consistency and better failure diagnostics.\n\nNote: This is distinct from pending Task 435 which is scoped specifically to `test_refresh_entity_summary.py`.\n\nFiles: fused-memory/tests/test_reindex.py\n\nSource: steward-triage follow-up from Task 528 (esc-528-97). Suggestions from reviewer_architect_reviewer and reviewer_test_analyst (duplicate reports).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10921,7 +10932,7 @@
       ],
       "created": "2026-04-07T04:19:04.893Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T04:19:04.896Z"
+      "updated": "2026-04-07T04:19:12.276Z"
     }
   }
 }
