@@ -74,13 +74,12 @@ class TestRunEvalMatrixCancellation:
         monkeypatch.setattr(runner_mod, 'load_task', fake_load_task)
         monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
 
-        with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'):
-            with pytest.raises(asyncio.CancelledError):
-                await run_eval_matrix(
-                    [task_path],
-                    [_CFG],
-                    force=True,
-                )
+        with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'), pytest.raises(asyncio.CancelledError):
+            await run_eval_matrix(
+                [task_path],
+                [_CFG],
+                force=True,
+            )
 
         assert any(
             'cancelled' in record.message.lower()
