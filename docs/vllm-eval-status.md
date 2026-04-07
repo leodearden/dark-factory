@@ -1,7 +1,52 @@
 # vLLM Local Model Evaluation — Status Report
 
-**Last updated:** 2026-04-07 09:30 BST
-**Status:** First successful vLLM-hosted eval achieved (reap-139b-nvfp4-new with minimax_m2 parser, 2026-04-06 19:35).
+**Last updated:** 2026-04-07 12:15 BST
+**Status:** First true `outcome=done` for a vLLM-hosted config achieved 2026-04-07 11:11 BST (`reap-139b-nvfp4-new` on RTX PRO 6000 Blackwell, result `df_task_12__reap-139b-nvfp4-new__6838dea3.json`). Pipeline is fully validated end-to-end: bridge → parser → implementer → verify → debug → reviewers → merge. Caveat: the eval was run against current HEAD-of-main, not against a per-task baseline, so the 25 lines / 4 files changed are debug-cycle pyright asserts rather than real task implementation; the per-task baseline checkout work is preserved on `feat/multi-task-launcher-baseline-checkout` (commit `8ce354dc26`).
+
+## Update 2026-04-07 PM: full session results
+
+### Wins
+1. **First true `outcome=done`** on `reap-139b-nvfp4-new` (RTX PRO 6000 Blackwell, run-id `6838dea3`). Implementer + 3 debug cycles + reviewers + merge, 158 turns, 27.5 min wall clock. Real cost ~$1 (RunPod time only — the "$30.77 cost" reported in the result file is phantom Sonnet-equivalent from the Claude CLI's usage tracker; vLLM-hosted runs have no per-token API cost).
+2. **`ENFORCE_EAGER` env hook landed end-to-end**: dark-factory `feat(eval): add ENFORCE_EAGER workaround for qwen3 startup hang` (`315b5d4ffd`) + runpod-toolkit `feat(vllm): add ENFORCE_EAGER env hook for qwen3 startup hang` (`f909281`) + new `:latest` image (digest `sha256:d26fba20c254...`). Verified active in the running vLLM (cmdline `--enforce-eager`, V1 engine config `cudagraph_mode=NONE`, `compilation_mode=NONE`).
+3. **Recovery branch merged**: `recover/vllm-eval-session-2026-04-06` fast-forwarded to local main at `26ca8dd6fc`. Local main is now ~675 commits ahead of `origin/main` (the orchestrator's destructive overnight auto-commit stream); not yet pushed.
+4. **Orchestrate skill hardened against the "wrong project" bug** (`docs(orchestrate): add target-project identification guard`, `26ca8dd6fc`) — the bug that caused the data-loss incident is now flagged at the top of the skill instructions.
+5. **Multi-task launcher with per-task baseline checkout** preserved on `feat/multi-task-launcher-baseline-checkout` (`8ce354dc26`) — 1902 lines, includes test_run_vllm_eval.py and test_snapshots.py. Implements the design we sketched: one pod, N tasks, each task evaluated against its own pre-task commit, baseline preflighted before pod creation. Awaiting review + merge.
+
+### Failures / unresolved
+1. **`qwen3-coder-next-fp8-new` has a SECOND hang that `--enforce-eager` does NOT fix.** Two attempts:
+   - **Attempt 1** (1× H200 SXM, pod `1w3hrkojdmndyy`): stuck in image fetch (0% layers downloaded after 15+ min) — RunPod fleet-wide H200 SXM image-pull throughput problem, not config-specific. Confirmed by the baked diagnostic (below) hitting the same hang on the same DC. Terminated.
+   - **Attempt 2** (2× RTX PRO 6000 Blackwell Server Edition, pod `xhzdzqicuil2rq`, after `chore(eval): switch qwen3-coder-next-fp8-new to 2× RTX PRO 6000` `b8998b49ab`): pod started cleanly, image pulled cleanly (RTX PRO 6000 DC has fine throughput), vLLM workers spawned with all the right flags including `--enforce-eager`. But the workers then sat at **100% CPU for 25+ minutes** with **zero model weights downloaded** (HF cache stayed at 11 MB of tokenizer/config files only) and **only 868 MiB on each GPU**. Workers were `R (running)` with `wchan=0` — busy in user-space compute, not blocked on a syscall. `hf_transfer.abi3.so` and `tokenizers.abi3.so` were loaded but no shards arrived. Container logs (per user) hadn't moved on from the V1 engine init line. **Diagnosis**: this is a *different* hang from the morning's CUDA-graph hypothesis. ENFORCE_EAGER prevents the *post-load* CUDA-graph capture hang but qwen3-coder-next-fp8 has a *pre-download* Python init hang that ENFORCE_EAGER doesn't address. The fix is no longer "land --enforce-eager"; it's a deeper diagnosis (next session). Real cost ~$1.40 burned. Pod terminated by user.
+2. **Baked-image diagnostic** (`reap-139b-nvfp4`, pod `gg3t12tguiwhgm`): launched on H200 SXM as a parallel diagnostic to test whether image-pull issues were image-specific (`:latest` we just pushed) or DC-wide. Image pulled successfully (proving `:latest` push isn't broken), but the container then crashed twice on startup with `pydantic.ValidationError: Please pass the argument trust_remote_code=True` — the OLD `:reap-139b` baked image is **vLLM 0.18.1** and is missing every entrypoint patch added in this session (`--trust-remote-code`, GMU 0.95, `--max-num-seqs 16`, `--enforce-eager`, per-model `--tool-call-parser`). Pod was reaped (probably extraction filled the 220 GB container disk; root cause not fully confirmed). **Implication**: all `OLD :reap-139b/:reap-172b/:qwen3-coder-next/:qwen3-coder-next-fp8` baked images on Hub are stale and unusable until rebuilt with the new entrypoint. The 5 NEW configs (`-new` suffix) using `:latest` + HF download remain the canonical eval path. Memory: `project_old_baked_images_stale.md`.
+
+### What changed in main this session
+- `26ca8dd6fc` docs(orchestrate): add target-project identification guard
+- (recovery branch merge) — `1077779690`/`71e9b1c5a1`/`5fa0f30751`/`c4561692d1` from yesterday's recovery
+- `4e82e9369f` fix: clean up main lint and test failures (user)
+- `52f13fc43a` fix: resolve type errors in workflow.py (user)
+- `9c0c546081` fix: resolve type errors in verify.py, git_ops.py, mcp_lifecycle.py (user)
+- `315b5d4ffd` feat(eval): add ENFORCE_EAGER workaround for qwen3 startup hang
+- `b8998b49ab` chore(eval): switch qwen3-coder-next-fp8-new to 2× RTX PRO 6000
+
+### What changed in runpod-toolkit
+- `f909281` feat(vllm): add ENFORCE_EAGER env hook for qwen3 startup hang
+- New layer pushed to `leosiriusdawn/runpod-vllm:latest` and `:enforce-eager` (digest `sha256:d26fba20c254...`)
+
+### Cost
+- ~$1 (REAP-new successful eval, ~30 min on RTX PRO 6000 Blackwell)
+- ~$1.40 (qwen3 hang, ~25 min on 2× RTX PRO 6000 Blackwell)
+- ~$0.50 (qwen3 stuck H200 SXM + H100 NVL terminated, ~10 min total)
+- ~$2 (baked diagnostic, ~50 min on H200 SXM through extraction failure)
+- **Session total: ~$5**, leaving ~$37 in RunPod credit
+- Combined with previous sessions: ~$48 used out of original ~$50 + $90 added = ~$92 credit; ~$44 spent
+
+### Next-session priority order
+1. **Diagnose qwen3-coder-next-fp8 pre-download Python init hang.** What is the worker process actually doing for 25+ minutes? Likely paths: torch.compile despite `--enforce-eager` (some shape compilation passes still run), Qwen3-Coder-Next custom modeling.py code path (it requires `trust_remote_code=True`), or fp8 quantization config processing. SSH into a fresh pod with py-spy preinstalled in the image (or set `kernel.yama.ptrace_scope=0` somehow) and dump worker stack traces. Alternative: try a non-trust-remote-code Qwen3-Coder-Next variant if one exists, or downgrade vLLM to 0.18.1 specifically for qwen3 to test whether this is a vLLM 0.19 regression.
+2. **Review + merge the multi-task launcher** (`feat/multi-task-launcher-baseline-checkout`, `8ce354dc26`). Once merged, all subsequent evals can use it for the per-task baseline + multi-task-per-pod model.
+3. **Run a per-task-baseline eval of REAP-new** to validate the multi-task launcher and produce the first *fair* `outcome=done` score (current REAP-new score is 0.0 because the task was already done in the tree).
+4. **Fire the post-gate eval matrix** for the remaining 3 MiniMax variants (`reap-172b-nvfp4-gb10-new`, `minimax-m25-nvfp4-new`, `minimax-m25-fp8-new`) once the multi-task launcher is merged.
+5. **Optional**: rebuild the OLD baked images (`:reap-139b`, `:reap-172b`, `:qwen3-coder-next-fp8`, `:devstral-small`) with the new entrypoint, OR delete them from Hub since the NEW configs work end-to-end.
+
+---
 
 ## Update 2026-04-07: root cause identified + recovery
 
