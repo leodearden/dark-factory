@@ -10704,6 +10704,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 563,
+        "title": "Harden task_filter.py against malformed input",
+        "description": "Two defensive guards:\n1. `_render_task_line` line 172: Replace `deps = task.get('dependencies') or []` with `deps = task.get('dependencies'); deps = list(deps) if isinstance(deps, list) else []` to handle truthy non-list values (int, dict) that would cause TypeError on `deps[:5]`.\n2. `format_task_list` line 191: Add an `isinstance(t, dict)` filter before calling `_render_task_line`: `return '\\n'.join(_render_task_line(t) for t in tasks if isinstance(t, dict)) or 'No tasks.'`\n\nFiles: fused-memory/src/fused_memory/reconciliation/task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10716,7 +10727,7 @@
       ],
       "created": "2026-04-07T03:39:47.326Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T03:43:51.188Z"
+      "updated": "2026-04-07T03:43:55.072Z"
     }
   }
 }
