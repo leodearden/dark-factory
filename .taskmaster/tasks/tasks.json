@@ -10848,6 +10848,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 576,
+        "title": "Extract propagate_cancellations() shared utility and replace inline guards",
+        "description": "Create `fused-memory/src/fused_memory/utils/async_utils.py` (or add to an existing utils module) with a `propagate_cancellations(results)` helper that re-raises the first non-Exception BaseException found in asyncio.gather results.\n\n```python\ndef propagate_cancellations(results: Iterable[Any]) -> None:\n    \"\"\"Re-raise the first structured-cancellation signal found in gather() results.\n\n    asyncio.gather(return_exceptions=True) captures BaseException subclasses\n    (CancelledError, KeyboardInterrupt, SystemExit) as plain values. Callers\n    that want to honour structured-cancellation must scan results and re-raise\n    before doing per-item error accounting.\n    \"\"\"\n    for r in results:\n        if isinstance(r, BaseException) and not isinstance(r, Exception):\n            raise r\n```\n\nReplace the inline propagation loops at:\n- `context_assembler.py:133-135` (the Pass 1 loop introduced by task 512)\n- `graphiti_client.py:1079` (the `isinstance(r, BaseException) and not isinstance(r, Exception)` loop in rebuild_entity_summaries, task 484's diff)\n- Optionally normalise the structural variant in `memory_service.py:1004-1013` to call the helper as well — this would unify all three sites on the same two-pass pattern.\n\nThis removes three copies of the multi-line comment explaining the Python 3.8+ BaseException/Exception split and gives the pattern a canonical home to prevent the next caller from copy-pasting the comment block again.\n\nSource: review follow-up from task 512 (cycle 2026-04-07).\nRationale: deduplicates a subtle structured-cancellation guard that is easy to get wrong, and prevents drift between sister implementations.\n\nFiles:\n- fused-memory/src/fused_memory/utils/async_utils.py (new or existing)\n- fused-memory/src/fused_memory/reconciliation/context_assembler.py\n- fused-memory/src/fused_memory/graphiti_client.py\n- fused-memory/src/fused_memory/memory_service.py (optional normalisation)\n- fused-memory/tests/test_context_assembler.py (update for helper usage if needed)",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10860,7 +10871,7 @@
       ],
       "created": "2026-04-07T04:04:41.194Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T04:04:55.765Z"
+      "updated": "2026-04-07T04:05:08.578Z"
     }
   }
 }
