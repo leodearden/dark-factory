@@ -10413,11 +10413,16 @@
         "description": "In orchestrator/tests/test_eval_configs.py: (1) remove the entire TestRunnerDefaultIncludesVllm class (lines 158-172) — it is fully subsumed by TestEvalConfigsIncludesVllm since runner_module.EVAL_CONFIGS is configs.EVAL_CONFIGS; (2) remove test_vllm_config_count_is_six (lines 84-89) — the count is implied by test_vllm_config_names_are_exact_set which already fails with a descriptive diff on any mismatch.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-07T04:42:08.670Z"
+        "updatedAt": "2026-04-07T04:44:54.943Z",
+        "metadata": {
+          "modules": [
+            "orchestrator/tests/test_eval_configs.py"
+          ]
+        }
       },
       {
         "id": "535",
@@ -11042,7 +11047,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T04:42:08.670Z",
+      "lastModified": "2026-04-07T04:44:54.943Z",
       "taskCount": 567,
       "completedCount": 446,
       "tags": [
