@@ -10581,20 +10581,34 @@
         "description": "Task 455 (harness-level task filtering) is marked done but its branch is unmerged to main due to conflicts in task_filter.py and test_task_filter.py. Tasks 478, 480, and 481 are explicitly blocked on this integration.\\n\\n## Conflict Root Causes\\n1. **task_filter.py**: Main diverged after task 474 cherry-picked an older version without the harness.py integration. The task 455 branch has the full filtered_task_tree implementation that main lacks.\\n2. **test_task_filter.py**: Main gained a done_tasks field from task 477. The task 455 branch predates this addition.\\n\\n## Resolution Steps\\nPREREQUISITE: Task 551 (main worktree conflict) must be resolved first — advance_main is blocked until main is clean.\\n\\n1. Check out task/455 branch: `git checkout task/455`\\n2. Rebase onto current main: `git rebase main` (or merge main into 455 branch)\\n3. Resolve conflict in task_filter.py:\\n   - Keep task 455's harness.py filtered_task_tree integration\\n   - Ensure done_tasks field from task 477 is also present\\n4. Resolve conflict in test_task_filter.py:\\n   - Merge both sets of tests (task 455's filter tests + task 477's done_tasks tests)\\n5. Run tests: `pytest fused-memory/tests/test_task_filter.py -v`\\n6. Merge to main via merge queue or direct merge\\n7. Once merged, tasks 478, 480, 481 can proceed\\n\\n## memory_hints\\n- search: 'task 455 task_filter.py harness filtered_task_tree integration'\\n- search: 'task_filter.py done_tasks field task 477 diverged main'\\n- search: 'task 455 merge conflict task_filter test_task_filter'\\n- search: 'task 474 cherry-pick task_filter older version diverged'",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "pending",
         "dependencies": [
           "551"
         ],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-07T03:58:58.366Z",
+        "updatedAt": "2026-04-07T04:07:55.223Z",
         "metadata": {
           "memory_hints": {
             "entities": [],
             "queries": [
               "resolution for: Manually resolve task 455 merge conflict and integrate to main (unblocks tasks 478, 480, 481)"
             ]
-          }
+          },
+          "modules": [
+            ".taskmaster/tasks/tasks.json",
+            "dashboard/src/dashboard/config.py",
+            "dashboard/src/dashboard/data",
+            "dashboard/tests/test_burndown_data.py",
+            "dashboard/tests/test_scaffold.py",
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_context_assembler.py",
+            "fused-memory/tests/test_graphiti_quality_433.py",
+            "fused-memory/tests/test_harness.py",
+            "fused-memory/tests/test_judge.py",
+            "fused-memory/tests/test_stages.py",
+            "fused-memory/tests/test_task_filter.py"
+          ]
         }
       },
       {
@@ -10864,7 +10878,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T04:05:34.630Z",
+      "lastModified": "2026-04-07T04:07:55.223Z",
       "taskCount": 555,
       "completedCount": 441,
       "tags": [
