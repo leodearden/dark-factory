@@ -151,6 +151,7 @@ class TaskWorkflow:
 
     async def _plan(self) -> WorkflowOutcome:
         """Invoke the architect to produce a plan."""
+        assert self.worktree is not None and self.artifacts is not None
         prompt = await self.briefing.build_architect_prompt(self.task)
         result = await self._invoke(ARCHITECT, prompt, self.worktree)
 
@@ -226,6 +227,7 @@ class TaskWorkflow:
 
     async def _execute_iterations(self) -> WorkflowOutcome:
         """Run implementer iterations until plan is complete."""
+        assert self.worktree is not None and self.artifacts is not None
         while self.artifacts.get_pending_steps():
             if self.metrics.execute_iterations >= self.config.max_execute_iterations:
                 return WorkflowOutcome.BLOCKED
@@ -251,6 +253,7 @@ class TaskWorkflow:
 
     async def _verify_debugfix_loop(self) -> WorkflowOutcome:
         """Run verification, invoke debugger on failures."""
+        assert self.worktree is not None and self.artifacts is not None
         verify_attempt = 0
 
         while True:
@@ -279,6 +282,7 @@ class TaskWorkflow:
 
     async def _review(self):
         """Run all 5 reviewers in parallel, aggregate results."""
+        assert self.worktree is not None and self.artifacts is not None
         diff = await self.git_ops.get_diff_from_main(self.worktree)
 
         # Launch all reviewers concurrently
@@ -300,6 +304,7 @@ class TaskWorkflow:
 
     async def _run_reviewer(self, role: AgentRole, diff: str) -> dict:
         """Run a single reviewer and parse its JSON output."""
+        assert self.worktree is not None
         prompt = await self.briefing.build_reviewer_prompt(role.name, diff)
 
         # Use structured output for reviewers
@@ -348,6 +353,7 @@ class TaskWorkflow:
 
     async def _replan(self, reviews) -> None:
         """Feed review feedback back to architect for re-planning."""
+        assert self.worktree is not None and self.artifacts is not None
         feedback = reviews.format_for_replan()
         self.plan = self.artifacts.read_plan()
 
@@ -371,6 +377,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
     async def _merge(self, branch_name: str) -> WorkflowOutcome:
         """Merge task branch into main."""
+        assert self.worktree is not None
         merge_result = await self.git_ops.merge_to_main(self.worktree, branch_name)
 
         if merge_result.success:

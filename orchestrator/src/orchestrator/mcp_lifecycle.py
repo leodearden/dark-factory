@@ -79,8 +79,10 @@ class McpLifecycle:
         """Poll health endpoint until ready or timeout."""
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
+            assert self._process is not None  # started before _wait_for_health
             if self._process.returncode is not None:
-                stderr = await self._process.stderr.read() if self._process.stderr else b''
+                stderr_stream = self._process.stderr
+                stderr = await stderr_stream.read() if stderr_stream else b''
                 logger.error(f'Server exited prematurely: {stderr.decode()[-500:]}')
                 return False
             if await self.health_check():

@@ -40,6 +40,7 @@ async def _run_cmd(cmd: str, cwd: Path, timeout: float = 300) -> tuple[int, str]
             stderr=asyncio.subprocess.STDOUT,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        assert proc.returncode is not None  # set after communicate()
         return proc.returncode, stdout.decode()
     except TimeoutError:
         proc.kill()

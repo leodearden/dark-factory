@@ -27,6 +27,7 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await proc.communicate()
+    assert proc.returncode is not None  # set after communicate()
     return proc.returncode, stdout.decode().strip(), stderr.decode().strip()
 
 
