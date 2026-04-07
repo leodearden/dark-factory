@@ -35,27 +35,34 @@ CONFIGS="${CONFIGS:-qwen3-coder-next-fp8-new reap-139b-nvfp4-new reap-172b-nvfp4
 TASKS="${TASKS:-df_task_12,df_task_13,df_task_18,reify_task_12,reify_task_27}"
 CONCURRENCY="${CONCURRENCY:-5}"
 VERIFY="${VERIFY:-warn}"
-TIMEOUT_MIN="${TIMEOUT_MIN:-90}"
+# 120 min > orchestrator's own eval timeout (~60 min). The launcher's
+# per-task timeout is the outer boundary; the orchestrator has an inner
+# timeout of ~60 min. We keep the launcher generous so the inner timeout
+# is the binding one (gives a clean "timeout" result vs a hard kill).
+TIMEOUT_MIN="${TIMEOUT_MIN:-120}"
 
 mkdir -p /var/tmp/dark-factory-evals
 
 PIDS=()
 declare -A LOG_FOR_PID
+PORT=8200  # Each config gets its own port; incremented per launch.
 
 for cfg in $CONFIGS; do
     LOG="/var/tmp/dark-factory-evals/matrix-$cfg-$(date +%Y%m%d-%H%M%S).log"
-    echo "[$(date +%H:%M:%S)] LAUNCH $cfg → $LOG"
+    echo "[$(date +%H:%M:%S)] LAUNCH $cfg → $LOG (port $PORT)"
     python3 /home/leo/src/dark-factory/scripts/run_vllm_eval.py \
         --config "$cfg" \
         --tasks "$TASKS" \
         --concurrency "$CONCURRENCY" \
         --verify-baseline-clean "$VERIFY" \
         --task-timeout-min "$TIMEOUT_MIN" \
+        --port "$PORT" \
         --no-volume \
         > "$LOG" 2>&1 &
     pid=$!
     PIDS+=("$pid")
     LOG_FOR_PID[$pid]="$LOG"
+    PORT=$((PORT + 1))
     # Stagger pod creates by 5s so RunPod's API doesn't see a thundering herd.
     sleep 5
 done

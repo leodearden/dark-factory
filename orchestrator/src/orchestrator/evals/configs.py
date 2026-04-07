@@ -126,13 +126,13 @@ VLLM_EVAL_CONFIGS = [
         gpu_type=RTX_PRO_6000, gpu_count=1, container_disk_gb=180,
         max_model_len=80000, gpu_memory_util=0.97,
         tool_call_parser='minimax_m2'),
-    # REAP-172B NVFP4 GB10: ~93 GB on disk, baked. 1× H200 (96 GB VRAM
-    # too tight on RTX PRO 6000). H200 has 141 GB so default 131k context
-    # fits comfortably; no memory overrides needed.
+    # REAP-172B NVFP4 GB10: ~93 GB on disk, baked. Prefers 1× H200 (141 GB)
+    # but falls back to 2× RTX PRO 6000 (192 GB) when H200 fleet is sold
+    # out. TP_SIZE=2 is set automatically by _vllm_config for gpu_count>1.
     _vllm_config('reap-172b-nvfp4-gb10-new',
         hf_model='saricles/MiniMax-M2.5-REAP-172B-A10B-NVFP4-GB10',
         image='leosiriusdawn/runpod-vllm:reap-172b-nvfp4-gb10-baked',
-        gpu_type=H200, gpu_count=1, container_disk_gb=200,
+        gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=200,
         tool_call_parser='minimax_m2'),
     # MiniMax-M2.5 NVFP4 (nvidia): ~131 GB on disk, baked. 1× H200.
     _vllm_config('minimax-m25-nvfp4-new',
@@ -140,16 +140,24 @@ VLLM_EVAL_CONFIGS = [
         image='leosiriusdawn/runpod-vllm:minimax-m25-nvfp4-baked',
         gpu_type=H200, gpu_count=1, container_disk_gb=240,
         tool_call_parser='minimax_m2'),
-    # MiniMax-M2.5 FP8 (full): ~215 GB on disk, baked. Needs 2× H200.
+    # MiniMax-M2.5 FP8 (full): ~215 GB on disk, baked. Needs >192 GB VRAM.
+    # Prefers 2× H200 (282 GB); falls back to 4× RTX PRO 6000 (384 GB)
+    # when H200 fleet is sold out. Also trying B200 (192 GB single GPU)
+    # as a middle option.
     _vllm_config('minimax-m25-fp8-new',
         hf_model='MiniMaxAI/MiniMax-M2.5',
         image='leosiriusdawn/runpod-vllm:minimax-m25-fp8-baked',
-        gpu_type=H200, gpu_count=2, container_disk_gb=320,
+        gpu_type=RTX_PRO_6000, gpu_count=4, container_disk_gb=320,
         quantization='fp8',
         tool_call_parser='minimax_m2'),
 
     # ===== 3090 tier (workstation) — not RunPod, image/gpu_type left None =====
-    _vllm_config('qwen3-coder-30b-q4',    'Qwen/Qwen3-Coder-30B-A3B-Instruct'),
+    # leo-workstation RTX 3090 (24 GB). AWQ 4-bit quantization (compressed-
+    # tensors) fits in 24 GB. vLLM auto-detects the quantization format.
+    # Eval invoked via ``orchestrator eval --vllm-url http://leo-workstation:8000``.
+    _vllm_config('qwen3-coder-30b-q4',
+        'stelterlab/Qwen3-Coder-30B-A3B-Instruct-AWQ',
+        tool_call_parser='qwen3_coder'),
     _vllm_config('devstral-small-2505-q6', 'mistralai/Devstral-Small-2505',
         tool_call_parser='mistral'),
     # Dropped 2026-04-06 (Task 453): qwen25-coder-32b-q4 removed because its
