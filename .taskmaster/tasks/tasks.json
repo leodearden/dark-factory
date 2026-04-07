@@ -11026,6 +11026,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 588,
+        "title": "Test suite improvements for test_runner_matrix.py",
+        "description": "Targeted improvements to orchestrator/tests/test_runner_matrix.py:\n\n1. **Deduplicate fake_load_task** (lines 68, 110) — extract to a module-level `_stem_loader` function; optionally make it a fixture. Also extract the repeated `monkeypatch.setattr(runner_mod, 'load_task', ...)` into a shared fixture.\n\n2. **Add negative 'failed' assertion to cancellation test** (after line 90):\n   ```python\n   assert not any('failed' in r.message.lower() for r in caplog.records)\n   ```\n   so an accidental routing regression (e.g. `elif` → `if`) fails the test.\n\n3. **Add cancel-wins-over-partial-results test** — two task paths: one whose fake_run_eval raises CancelledError, one that returns a valid EvalResult. Assert CancelledError propagates and no results are returned, locking in the \"cancel discards partial results\" contract.\n\n4. **Document TestGatherContract ordering assertion** — add a comment in `test_gather_with_cancellederror_captures_in_results` noting that the two-coroutine form also verifies insertion-order preservation (i.e. `results[0]` corresponds to `_raise_cancel()` and `results[1]` to `_return_value()`), or simplify to single coroutine if ordering is not the intent.\n\n5. **Enrich or comment fake_load_task's minimal dict** — add comment explaining safety depends on `force=True`, or return `{'id': path.stem, 'project_root': str(tmp_path)}`.\n\nSource: pre-triaged review suggestions from Task 531 (esc-531-101). Reviewers: reviewer_reuse_auditor, reviewer_test_analyst.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -11038,7 +11049,7 @@
       ],
       "created": "2026-04-07T04:41:34.999Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T04:41:35.002Z"
+      "updated": "2026-04-07T04:41:46.987Z"
     }
   }
 }
