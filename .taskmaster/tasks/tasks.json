@@ -10281,10 +10281,11 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py:\n\n- Update line 275 in `test_force_dry_run_does_not_call_get_all_valid_edges` from `backend.get_all_valid_edges.assert_not_called()` to `backend.get_all_valid_edges.assert_not_awaited()` to match the style used in the new test at line 582 and to use the more semantically precise AsyncMock assertion throughout.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:52:44.918Z"
       },
       {
         "id": "526",
@@ -10752,7 +10753,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T03:52:44.623Z",
+      "lastModified": "2026-04-07T03:52:44.918Z",
       "taskCount": 545,
       "completedCount": 439,
       "tags": [
