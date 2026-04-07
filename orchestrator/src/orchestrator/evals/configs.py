@@ -96,58 +96,55 @@ VLLM_EVAL_CONFIGS = [
         quantization='fp8'),
 
     # ===== New-image configs: new HF FP8/NVFP4 model variants =====
-    # qwen3-coder-next-fp8-new uses the already-pushed baked image (gate eval).
-    # The other 4 use :latest base + HF download — faster than waiting for local push of 100+ GB layers.
-    # Qwen3-Coder-Next-FP8: ~80 GB on disk — GATE EVAL
-    # Switched from baked image to :latest + HF download — RunPod's pull of 100+ GB baked images
-    # consistently times out at 30+ min; HF download to pod is much faster.
+    # Qwen3-Coder-Next-FP8: ~75 GB on disk, baked into the image via the
+    # shard-per-layer Dockerfile (40 × 2 GB COPY layers — see
+    # runpod-toolkit/scripts/bake_model_image.py). The baked layout uses
+    # the standard HF cache shape under /models/hub/, so MODEL_NAME stays
+    # the HF name and the runtime resolves locally via TRANSFORMERS_OFFLINE.
+    # Switched 2026-04-07 PM after the :latest + HF download path hit a
+    # pre-download Python init hang that --enforce-eager did not fix.
     # Qwen3-Coder series emits <tool_call><function=name><parameter=name>val</parameter>
     # </function></tool_call> XML, not hermes JSON — must use qwen3_coder parser.
-    # Hardware history: 1× RTX PRO 6000 (96 GB) was too tight for 75 GB FP8 weights
-    # + KV cache; tried 1× H200 (141 GB) but H200 fleet has had zero capacity / slow
-    # image pulls (2026-04-07). Switched to 2× RTX PRO 6000 (192 GB total) — cheaper
-    # than H200 ($3.38/hr vs $3.59/hr) and more aggregate VRAM. TP_SIZE=2 is added
-    # automatically by _vllm_config when gpu_count > 1.
-    # ENFORCE_EAGER=1 disables CUDA-graph capture (workaround for the qwen3 startup
-    # hang on H200 — vLLM #35504); requires the entrypoint-vllm.sh hook landed in
-    # runpod-vllm:latest 2026-04-07 (digest sha256:d26fba20...).
+    # Hardware: 2× RTX PRO 6000 (192 GB aggregate); RunPod's per-DC layer
+    # cache makes second-pull TTFT ≪ HF download once warm.
+    # ENFORCE_EAGER=1 retained as a belt-and-braces against the
+    # CUDA-graph-capture hang (vLLM #35504).
     _vllm_config('qwen3-coder-next-fp8-new',
         hf_model='Qwen/Qwen3-Coder-Next-FP8',
-        image='leosiriusdawn/runpod-vllm:latest',
-        gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=240,
+        image='leosiriusdawn/runpod-vllm:qwen3-coder-next-fp8-baked',
+        gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=180,
         tool_call_parser='qwen3_coder',
         enforce_eager=True),
-    # REAP-139B NVFP4: ~70 GB on disk — fits 1x RTX PRO 6000 (96 GB VRAM).
-    # KV cache budget after 76 GB weights + ~6 GB CUDA graphs is tight; push
-    # GMU to 0.97 for ~10 GB KV pool, cap context at 80k. That leaves ~40k
-    # of slack after the 39k-token eval prompt for multiple tool turns.
-    # MiniMax M2.5 emits <minimax:tool_call><invoke name=...> XML, not hermes
-    # JSON — must use minimax_m2 parser.
+    # REAP-139B NVFP4: ~79 GB on disk, baked into the image. Fits 1× RTX
+    # PRO 6000 (96 GB VRAM). KV cache budget after weights + CUDA graphs
+    # is tight; GMU 0.97 → ~10 GB KV pool, cap context at 80k for
+    # 40k+ tool-turn slack on the 39k-token eval prompt.
+    # MiniMax M2.5 emits <minimax:tool_call> XML — must use minimax_m2 parser.
     _vllm_config('reap-139b-nvfp4-new',
         hf_model='lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4',
-        image='leosiriusdawn/runpod-vllm:latest',
-        gpu_type=RTX_PRO_6000, gpu_count=1, container_disk_gb=200,
+        image='leosiriusdawn/runpod-vllm:reap-139b-nvfp4-baked',
+        gpu_type=RTX_PRO_6000, gpu_count=1, container_disk_gb=180,
         max_model_len=80000, gpu_memory_util=0.97,
         tool_call_parser='minimax_m2'),
-    # REAP-172B NVFP4 GB10: ~93 GB on disk — needs 1x H200 (96 GB VRAM too
-    # tight on RTX PRO 6000). H200 has 141 GB so default 131k context fits
-    # comfortably; no memory overrides needed.
+    # REAP-172B NVFP4 GB10: ~93 GB on disk, baked. 1× H200 (96 GB VRAM
+    # too tight on RTX PRO 6000). H200 has 141 GB so default 131k context
+    # fits comfortably; no memory overrides needed.
     _vllm_config('reap-172b-nvfp4-gb10-new',
         hf_model='saricles/MiniMax-M2.5-REAP-172B-A10B-NVFP4-GB10',
-        image='leosiriusdawn/runpod-vllm:latest',
-        gpu_type=H200, gpu_count=1, container_disk_gb=260,
+        image='leosiriusdawn/runpod-vllm:reap-172b-nvfp4-gb10-baked',
+        gpu_type=H200, gpu_count=1, container_disk_gb=200,
         tool_call_parser='minimax_m2'),
-    # MiniMax-M2.5 NVFP4: ~115 GB on disk — needs 1x H200
+    # MiniMax-M2.5 NVFP4 (nvidia): ~131 GB on disk, baked. 1× H200.
     _vllm_config('minimax-m25-nvfp4-new',
         hf_model='nvidia/MiniMax-M2.5-NVFP4',
-        image='leosiriusdawn/runpod-vllm:latest',
-        gpu_type=H200, gpu_count=1, container_disk_gb=320,
+        image='leosiriusdawn/runpod-vllm:minimax-m25-nvfp4-baked',
+        gpu_type=H200, gpu_count=1, container_disk_gb=240,
         tool_call_parser='minimax_m2'),
-    # MiniMax-M2.5 FP8 NEW (full FP8): ~215 GB on disk — needs 2x H200
+    # MiniMax-M2.5 FP8 (full): ~215 GB on disk, baked. Needs 2× H200.
     _vllm_config('minimax-m25-fp8-new',
         hf_model='MiniMaxAI/MiniMax-M2.5',
-        image='leosiriusdawn/runpod-vllm:latest',
-        gpu_type=H200, gpu_count=2, container_disk_gb=600,
+        image='leosiriusdawn/runpod-vllm:minimax-m25-fp8-baked',
+        gpu_type=H200, gpu_count=2, container_disk_gb=320,
         quantization='fp8',
         tool_call_parser='minimax_m2'),
 

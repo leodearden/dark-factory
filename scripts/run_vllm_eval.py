@@ -213,6 +213,34 @@ def build_eval_env() -> dict[str, str]:
     return env
 
 
+def orchestrator_config_for_spec(spec: dict) -> Path | None:
+    """Locate the ``orchestrator eval --config`` YAML for a task spec.
+
+    The eval CLI requires ``--config`` (or ``ORCH_CONFIG_PATH``) so it
+    knows which project's ``project_root`` and ``fused_memory.project_id``
+    to use. Different task families target different projects:
+        df_task_*    → /home/leo/src/dark-factory/orchestrator/config.yaml
+        reify_task_* → /home/leo/src/reify/orchestrator.yaml
+
+    Resolves by checking known config-file names under ``spec['project_root']``.
+    Returns ``None`` if nothing matches; the caller should fall back to the
+    inherited ``ORCH_CONFIG_PATH`` env var.
+    """
+    project_root = spec.get("project_root")
+    if not project_root:
+        return None
+    root = Path(project_root)
+    candidates = [
+        root / "orchestrator.yaml",
+        root / "orchestrator" / "config.yaml",
+        root / "orchestrator" / "orchestrator.yaml",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def load_task_spec(task_id: str) -> dict:
     """Load an eval task spec by id (e.g. ``df_task_12``)."""
     path = TASKS_DIR / f"{task_id}.json"
@@ -266,7 +294,16 @@ def preflight_baseline(
     """
     task_id = spec["id"]
     sha = spec["pre_task_commit"]
-    verify = spec.get("verify_commands", {})
+    verify = spec.get("verify_commands")
+    if verify is None:
+        return BaselineStatus(
+            task_id=task_id,
+            pre_task_commit=sha,
+            head_matches=False,
+            lint_clean=False,
+            typecheck_clean=False,
+            error="spec is missing verify_commands",
+        )
     lint_cmd = verify.get("lint", "")
     type_cmd = verify.get("typecheck", "")
 
@@ -710,23 +747,32 @@ def run_one_task(
     else:
         log(f"Running eval: config={config_name} task={task_id}")
 
+    # Each task may target a different orchestrator config (df_* uses
+    # dark-factory's, reify_* uses reify's). Resolve per-task and pass via
+    # explicit --config so concurrent tasks for different projects don't
+    # race on a shared ORCH_CONFIG_PATH env var.
+    orch_config = orchestrator_config_for_spec(spec)
+    eval_cmd = [
+        "uv",
+        "run",
+        "orchestrator",
+        "eval",
+        "--task",
+        task_path,
+        "--config-name",
+        config_name,
+        "--vllm-url",
+        handle.vllm_url,
+        "--force",
+    ]
+    if orch_config is not None:
+        eval_cmd.extend(["--config", str(orch_config)])
+
     t0 = time.monotonic()
 
     try:
         result = subprocess.run(
-            [
-                "uv",
-                "run",
-                "orchestrator",
-                "eval",
-                "--task",
-                task_path,
-                "--config-name",
-                config_name,
-                "--vllm-url",
-                handle.vllm_url,
-                "--force",
-            ],
+            eval_cmd,
             cwd=str(ORCHESTRATOR_DIR),
             env=env,
             timeout=args.task_timeout_min * 60,
