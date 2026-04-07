@@ -9471,11 +9471,11 @@
         "description": "Three test improvements in `dashboard/tests/test_burndown_data.py`:\n\n1. `test_snapshots_known_project_roots_when_no_orchestrators` (lines 193-200): change `SELECT project_id` to `SELECT *` and add assertions on count columns for the reify row (done==2) and autopilot row (in_progress==1). As written, a bug zeroing out counts for known roots would go undetected.\n\n2. `test_dedupes_known_root_against_main_project` (lines 221-226): replace `SELECT COUNT(*) FROM snapshots WHERE project_id = ?` with `SELECT COUNT(*) FROM snapshots` (no WHERE) to catch the case where two rows with different project_id strings are inserted for the same physical directory (symlink-based false negative).\n\n3. Add a new test that patches `load_task_tree` to raise `PermissionError` on the known-root call and asserts either: (a) `collect_snapshot` propagates the exception, or (b) if per-root error handling is added (see robustness task), that the main-project row is still committed and the failing root is skipped.\n\nFiles:\n- dashboard/src/dashboard/data/burndown.py\n- dashboard/tests/test_burndown_data.py\n\nSource: review suggestions on task 450 (reviewer_test_analyst).",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "blocked",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-07T03:15:34.310Z",
+        "updatedAt": "2026-04-07T03:28:56.459Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/data",
@@ -9990,11 +9990,11 @@
         "description": "Add a `__post_init__` method to `DashboardConfig` in `dashboard/src/dashboard/config.py` that resolves all Path fields:\n```python\ndef __post_init__(self) -> None:\n    self.project_root = self.project_root.resolve()\n    self.known_project_roots = [p.resolve() for p in self.known_project_roots]\n```\nThen:\n1. Remove the eager `.resolve()` from `from_env()` line 73 (it becomes a no-op but can stay as a defensive call or be cleaned up).\n2. Remove the ad-hoc `resolved_root = str(config.project_root.resolve())` from `collect_snapshot()` (burndown.py:71) — just use `str(config.project_root)` since it's already resolved.\n3. Remove the redundant `.resolve()` call in the known_project_roots loop (burndown.py:129) for the same reason.\n\nThis makes every construction path — `from_env()`, direct `DashboardConfig(...)`, tests — produce already-resolved paths, fixing: (a) the unresolved-path footgun on all path-derived properties like `tasks_json`/`burndown_db`, (b) the split-ownership double-resolve, (c) the asymmetry between project_root and known_project_roots normalization.\n\nFiles: dashboard/src/dashboard/config.py, dashboard/src/dashboard/data/burndown.py, dashboard/tests/test_burndown_data.py\n\nSource: review suggestions on task 469 (suggestions 1, 2, 5, 6, 7, 11, 13 from reviewers architect_reviewer, performance, reuse_auditor, test_analyst, robustness).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T22:50:47.785Z",
+        "updatedAt": "2026-04-07T03:36:14.402Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/config.py",
@@ -10099,11 +10099,11 @@
         "description": "In test_rebuild_entity_summaries.py, add three tests:\n1. `test_cancelled_error_propagates_force_false` — mock `_detect_stale_summaries_with_edges` to return stale entities, mock `update_node_summary` to raise CancelledError, assert propagation. Currently both cancellation tests use force=True, leaving the force=False code path untested for this bug class.\n2. A test asserting that a plain RuntimeError still produces `errors==1` and `rebuilt==1` in the post-fix code path (regression guard for the BaseException→Exception narrowing, ensuring Exception subclasses still accumulate into per-entity errors).\n3. Strengthen `test_cancelled_error_propagates_alongside_other_errors` with an inline comment or companion assertion clarifying that RuntimeError in slot 1 was NOT counted before CancelledError propagated (since Pass 1 runs before Pass 2 bookkeeping).\n\nAlso extract the shared mock setup (list_entity_nodes, get_all_valid_edges, backend instantiation) into a class-level fixture to eliminate the boilerplate duplication across both existing tests.\n\nSource: review suggestions from task 484. Rationale: close coverage gaps left by the initial CancelledError fix.\n\nFiles:\n- fused-memory/tests/test_rebuild_entity_summaries.py\n- fused-memory/src/fused_memory/backends/graphiti_client.py (reference only)",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T23:42:24.316Z",
+        "updatedAt": "2026-04-07T03:28:16.599Z",
         "metadata": {
           "memory_hints": {
             "entities": [],
@@ -10252,10 +10252,11 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py, update the docstring of `test_dry_run_partition_invariant_skips_rebuild_and_edges` (lines 539–551):\n\n1. Replace line-number references ('line 1031', 'lines 1046-1049') with semantic descriptions like 'the edge-fetch guard in the force branch' and 'the dry_run early-return block before the semaphore loop'.\n2. Narrow the claim 'edges are NOT fetched when dry_run=True, even in the force path' to make clear this only applies to the force=True code path. Add a note that force=False uses _detect_stale_summaries_with_edges which fetches edges for staleness detection regardless of dry_run.\n\nNote: if task \"Relocate dry_run test to correct class\" removes this test, apply equivalent docstring cleanup to its replacement location.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:36:14.065Z"
       },
       {
         "id": "524",
@@ -10266,7 +10267,13 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:31:50.907Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/tests/test_graphiti_quality_433.py"
+          ]
+        }
       },
       {
         "id": "525",
@@ -10572,12 +10579,21 @@
         "description": "Task 455 (harness-level task filtering) is marked done but its branch is unmerged to main due to conflicts in task_filter.py and test_task_filter.py. Tasks 478, 480, and 481 are explicitly blocked on this integration.\\n\\n## Conflict Root Causes\\n1. **task_filter.py**: Main diverged after task 474 cherry-picked an older version without the harness.py integration. The task 455 branch has the full filtered_task_tree implementation that main lacks.\\n2. **test_task_filter.py**: Main gained a done_tasks field from task 477. The task 455 branch predates this addition.\\n\\n## Resolution Steps\\nPREREQUISITE: Task 551 (main worktree conflict) must be resolved first — advance_main is blocked until main is clean.\\n\\n1. Check out task/455 branch: `git checkout task/455`\\n2. Rebase onto current main: `git rebase main` (or merge main into 455 branch)\\n3. Resolve conflict in task_filter.py:\\n   - Keep task 455's harness.py filtered_task_tree integration\\n   - Ensure done_tasks field from task 477 is also present\\n4. Resolve conflict in test_task_filter.py:\\n   - Merge both sets of tests (task 455's filter tests + task 477's done_tasks tests)\\n5. Run tests: `pytest fused-memory/tests/test_task_filter.py -v`\\n6. Merge to main via merge queue or direct merge\\n7. Once merged, tasks 478, 480, 481 can proceed\\n\\n## memory_hints\\n- search: 'task 455 task_filter.py harness filtered_task_tree integration'\\n- search: 'task_filter.py done_tasks field task 477 diverged main'\\n- search: 'task 455 merge conflict task_filter test_task_filter'\\n- search: 'task 474 cherry-pick task_filter older version diverged'",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "blocked",
         "dependencies": [
           "551"
         ],
         "priority": "high",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:39:47.055Z",
+        "metadata": {
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "resolution for: Manually resolve task 455 merge conflict and integrate to main (unblocks tasks 478, 480, 481)"
+            ]
+          }
+        }
       },
       {
         "id": "553",
@@ -10611,13 +10627,46 @@
         "dependencies": [],
         "priority": "low",
         "subtasks": []
+      },
+      {
+        "id": "556",
+        "title": "Remove or replace TestDocstringAccuracyForceDryRunClass meta-test",
+        "description": "The class at fused-memory/tests/test_graphiti_quality_433.py:612-673 violates SRP, is tautological (docstring was written to satisfy its own assertions), has no equivalent companions for any other test class, and hardcodes fragile per-word vocabulary contracts.\n\nOptions in priority order:\n(a) Delete the class entirely and rely on code review + project conventions, or\n(b) Replace with a single project-wide pre-commit/pydocstyle rule that checks all test docstrings for bare line-number references.\n\nIf kept: rename 'TestDocstringAccuracyForceDryRunClass' → 'TestDocstringAccuracyForceDryRun' (drop redundant 'Class' suffix, line 612) and replace the seven mandatory-literal assertions with at most two high-level structural checks (non-empty, no line-number refs).\n\nSource: review follow-up from Task 523 (2026-04-07 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "557",
+        "title": "Fix regex quality in line-number guards",
+        "description": "In fused-memory/tests/test_graphiti_quality_433.py:636-641, make the following improvements:\n\n1. Pre-compile both patterns at module scope with re.compile (lines 636, 639).\n2. Merge the two overlapping patterns into one — e.g. `re.compile(r'\\blines?[^\\S\\n]+\\d+(?:[^\\S\\n]*-[^\\S\\n]*\\d+)?', re.IGNORECASE)` — addressing:\n   - the duplicate-intent issue\n   - the `\\d{3,}` blind spot for short line numbers like 'line 42'\n   - the missing re.IGNORECASE (so 'Line 1031' is caught)\n   - the `\\s+` cross-line false-positive risk (use `[^\\S\\n]+` instead of `\\s+`)\n3. Document the case-sensitivity contract for the `'string' in doc` assertions at lines 644-672 (either add `.lower()` on both sides, or add a comment stating these are golden-vocabulary anchors).\n\nNote: if the parent task removes the meta-test class entirely, this task becomes obsolete.\n\nSource: review follow-up from Task 523 (2026-04-07 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "558",
+        "title": "Add behavioral test: force=False + dry_run=True calls get_all_valid_edges",
+        "description": "The class docstring at fused-memory/tests/test_graphiti_quality_433.py:282-287 claims force=False calls get_all_valid_edges 'regardless of dry_run', but no test exercises this.\n\nAdd a test in TestRebuildEntitySummariesDataFlow (or a new class) that calls `rebuild_entity_summaries(group_id='test', force=False, dry_run=True)` WITHOUT mocking `_detect_stale_summaries_with_edges`, and asserts `backend.get_all_valid_edges` was called — confirming the documented claim against actual production code.\n\nThis prevents a silent regression if the force=False path is later changed to gate the edge fetch on dry_run.\n\nSource: review follow-up from Task 523 (2026-04-07 cycle).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T03:17:00.914Z",
-      "taskCount": 534,
-      "completedCount": 435,
+      "lastModified": "2026-04-07T03:39:47.055Z",
+      "taskCount": 537,
+      "completedCount": 437,
       "tags": [
         "master"
       ]
