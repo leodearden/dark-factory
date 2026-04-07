@@ -9848,11 +9848,11 @@
         "description": "task_filter.py is currently never imported — task_knowledge_sync.py still maintains its own copies of: active_tasks filtering (lines 61-64), _STATUS_PRIORITY dict (lines 212-218, diverging from task_filter's version), sort_key closure (lines 234-243, near-verbatim copy), and _format_tasks (lines 198-208, same format string).\n\nFix:\n1. In task_knowledge_sync.py, replace the inline active_tasks/done_tasks derivation with calls to filter_task_tree() and format_filtered_task_tree().\n2. Delete _STATUS_PRIORITY from task_knowledge_sync.py and import from task_filter.\n3. Replace _select_proactive_sample's sort_key closure with the shared logic from task_filter.\n4. Remove _format_tasks from task_knowledge_sync.py or delegate to _render_task_line helper in task_filter.py.\n\nMemory hints: search for \"_STATUS_PRIORITY\" and \"task_filter\" to find prior decisions about the filter module.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T22:25:53.286Z",
+        "updatedAt": "2026-04-07T03:10:28.311Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
@@ -10604,7 +10604,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T03:10:28.057Z",
+      "lastModified": "2026-04-07T03:10:28.311Z",
       "taskCount": 533,
       "completedCount": 433,
       "tags": [
