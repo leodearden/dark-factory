@@ -10982,6 +10982,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 584,
+        "title": "Add missing tests for bare-fallback branch, grouping deduplication, and ancestor-walk canonicalization",
+        "description": "In `dashboard/tests/test_orchestrator.py`, add three new tests: (1) A test where the mock process has neither `prd` nor `config_path` (bare bare-fallback branch), `config.project_root` is a symlink, and asserts `result[0]['project_root'] == str(real_dir)` — this is the load-bearing case for line 348 that the existing symlink test misses. (2) A test where two processes share the same logical project root but one has it as a symlink path and the other as the canonical path; verify they are merged into a single result entry (exposing the grouping-key bug and serving as a regression guard after the fix). (3) A test in `TestResolveProjectRoot` where `.taskmaster/` is found via the ancestor walk and the PRD path contains a symlink component; verify the returned path is the resolved canonical ancestor, not the symlink variant. Addresses suggestions 6, 7, 8.\n\nFiles: dashboard/tests/test_orchestrator.py\n\nSource: review suggestions on task 509 (reviewer_test_analyst).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10994,7 +11005,7 @@
       ],
       "created": "2026-04-07T04:41:11.658Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T04:41:11.663Z"
+      "updated": "2026-04-07T04:41:17.640Z"
     }
   }
 }
