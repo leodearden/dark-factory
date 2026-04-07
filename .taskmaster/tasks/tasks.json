@@ -10938,6 +10938,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 580,
+        "title": "Expand CLI vllm-url test coverage and diagnostic quality",
+        "description": "In orchestrator/tests/test_eval_configs.py, test_cli_eval_injects_vllm_url_into_all_vllm_configs (lines 258-268):\n1. After existing ANTHROPIC_BASE_URL assertions, add assertions that cloud baseline configs (names in _CLOUD_BASELINE_NAMES) do NOT appear in captured_state with ANTHROPIC_BASE_URL set — covering the CLI path gap that test_cloud_baselines_never_get_base_url misses\n2. Extend the exit_code failure message to include result.exception: `f'CLI exited {result.exit_code}.\\nOutput: {result.output}\\nException: {result.exception}'`\n\nFiles: orchestrator/tests/test_eval_configs.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10950,7 +10961,7 @@
       ],
       "created": "2026-04-07T04:35:02.870Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T04:35:02.873Z"
+      "updated": "2026-04-07T04:35:07.739Z"
     }
   }
 }
