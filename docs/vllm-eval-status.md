@@ -222,20 +222,25 @@ both 96GB RTX PRO 6000 Blackwell and 141GB H200.
 | Reduced context | `MAX_MODEL_LEN=65536` added to `MODELS` extra_env |
 | GPU memory headroom | `GPU_MEMORY_UTIL=0.90` added to `MODELS` extra_env |
 | H200 priority | `NVIDIA H200 SXM` and `NVIDIA H200 NVL` prepended to `GPU_TYPES` |
+| Eager mode flag | `ENFORCE_EAGER=1` added to `MODELS` extra_env (takes effect once entrypoint-vllm.sh hook lands) |
 
 **Remaining out-of-tree follow-up (blocking for full resolution):**
 
-`--enforce-eager` is the most important known workaround for the CUDA-graph hang, but
-`entrypoint-vllm.sh` (in `/home/leo/src/runpod-toolkit/docker/entrypoint-vllm.sh`) has no
-`ENFORCE_EAGER` env hook. Adding one is a one-line change:
+The in-tree env var `ENFORCE_EAGER=1` is now set in `MODELS["qwen3-coder-next"][4]` in
+`scripts/run_vllm_eval.py`. The ONLY remaining work is:
+
+1. Add the one-line env-var hook to `entrypoint-vllm.sh`
+   (in `/home/leo/src/runpod-toolkit/docker/entrypoint-vllm.sh`):
 
 ```bash
 # In entrypoint-vllm.sh, near the other env-var blocks:
 if [ -n "${ENFORCE_EAGER}" ]; then CMD="$CMD --enforce-eager"; fi
 ```
 
-Once that lands, add `"ENFORCE_EAGER": "1"` to `MODELS["qwen3-coder-next"][4]` in
-`scripts/run_vllm_eval.py` — no other changes needed.
+2. Rebuild and push the Docker image: `docker build ... && docker push leosiriusdawn/runpod-vllm:latest`
+
+Until the entrypoint hook lands and a new Docker image is built + pushed, the env var is
+set by the eval script but the vLLM container ignores it (no runtime effect).
 
 **Related vLLM issues:** [#35504](https://github.com/vllm-project/vllm/issues/35504),
 [#34437](https://github.com/vllm-project/vllm/issues/34437),
