@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,11 @@ PROJECT_ROOT = Path("/home/leo/src/dark-factory")
 ORCHESTRATOR_DIR = PROJECT_ROOT / "orchestrator"
 TASKS_DIR = ORCHESTRATOR_DIR / "src/orchestrator/evals/tasks"
 RESULTS_DIR = ORCHESTRATOR_DIR / "src/orchestrator/evals/results"
+
+# Per-task log files for concurrent runs land here. /var/tmp survives reboot
+# (unlike /tmp which is tmpfs); chosen so a mid-batch crash leaves logs
+# behind for forensics.
+EVAL_LOG_DIR = Path("/var/tmp/dark-factory-evals")
 
 # Fallback GPU types when neither the config nor --gpu-type provides one.
 GPU_TYPES = [
@@ -125,6 +131,7 @@ class EvalSummary:
     run_id: str | None
     result_path: Path | None
     error: str | None = None
+    log_path: Path | None = None  # set in concurrent mode; None when streaming to TTY
 
     @classmethod
     def crashed(
@@ -199,7 +206,13 @@ def load_task_spec(task_id: str) -> dict:
 def resolve_task_ids(args: argparse.Namespace) -> list[str]:
     """Collapse ``--task`` / ``--tasks`` / ``--all-tasks`` into a list."""
     if args.all_tasks:
-        return sorted(p.stem for p in TASKS_DIR.glob("df_task_*.json"))
+        # Glob both df_task_* (dark-factory project) and reify_task_*
+        # (reify project). Both spec families live in the same dir but
+        # carry their own ``project_root`` field.
+        return sorted(
+            p.stem
+            for p in TASKS_DIR.glob("*_task_*.json")
+        )
     if args.tasks:
         return [t.strip() for t in args.tasks.split(",") if t.strip()]
     if args.task:
@@ -213,7 +226,7 @@ def resolve_task_ids(args: argparse.Namespace) -> list[str]:
 
 
 def preflight_baseline(
-    spec: dict, *, repo_root: Path = PROJECT_ROOT
+    spec: dict, *, repo_root: Path | None = None
 ) -> BaselineStatus:
     """Verify a task's ``pre_task_commit`` is lint+typecheck clean.
 
@@ -221,22 +234,22 @@ def preflight_baseline(
     ``setup_commands`` (so the venv exists), then runs the spec's lint and
     typecheck commands. Tests are deliberately skipped (slow + flaky on dev
     box). The throwaway worktree is removed before returning even on error.
+
+    The worktree is created against ``spec['project_root']`` (e.g.
+    ``/home/leo/src/reify`` for reify_task_*), falling back to the
+    launcher's ``PROJECT_ROOT`` for backwards compatibility. An empty
+    ``lint`` or ``typecheck`` command is treated as "no such step" and
+    silently reported clean — reify tasks legitimately ship with an empty
+    typecheck command.
     """
     task_id = spec["id"]
     sha = spec["pre_task_commit"]
     verify = spec.get("verify_commands", {})
-    lint_cmd = verify.get("lint")
-    type_cmd = verify.get("typecheck")
+    lint_cmd = verify.get("lint", "")
+    type_cmd = verify.get("typecheck", "")
 
-    if not lint_cmd or not type_cmd:
-        return BaselineStatus(
-            task_id=task_id,
-            pre_task_commit=sha,
-            head_matches=False,
-            lint_clean=False,
-            typecheck_clean=False,
-            error="spec is missing verify_commands.lint or verify_commands.typecheck",
-        )
+    if repo_root is None:
+        repo_root = Path(spec.get("project_root", PROJECT_ROOT))
 
     wt = repo_root / ".eval-worktrees" / task_id / f"preflight-{uuid4().hex[:8]}"
     wt.parent.mkdir(parents=True, exist_ok=True)
@@ -280,30 +293,40 @@ def preflight_baseline(
                 check=False,
             )
 
-        log(f"  preflight lint: {lint_cmd}")
-        lint_rc = subprocess.run(
-            lint_cmd,
-            shell=True,
-            executable="/bin/bash",
-            cwd=str(wt),
-            timeout=300,
-        ).returncode
+        if lint_cmd:
+            log(f"  preflight lint: {lint_cmd}")
+            lint_rc = subprocess.run(
+                lint_cmd,
+                shell=True,
+                executable="/bin/bash",
+                cwd=str(wt),
+                timeout=300,
+            ).returncode
+            lint_clean = lint_rc == 0
+        else:
+            log("  preflight lint: <empty cmd, skipped>")
+            lint_clean = True
 
-        log(f"  preflight typecheck: {type_cmd}")
-        type_rc = subprocess.run(
-            type_cmd,
-            shell=True,
-            executable="/bin/bash",
-            cwd=str(wt),
-            timeout=900,
-        ).returncode
+        if type_cmd:
+            log(f"  preflight typecheck: {type_cmd}")
+            type_rc = subprocess.run(
+                type_cmd,
+                shell=True,
+                executable="/bin/bash",
+                cwd=str(wt),
+                timeout=900,
+            ).returncode
+            type_clean = type_rc == 0
+        else:
+            log("  preflight typecheck: <empty cmd, skipped>")
+            type_clean = True
 
         return BaselineStatus(
             task_id=task_id,
             pre_task_commit=sha,
             head_matches=head_ok,
-            lint_clean=(lint_rc == 0),
-            typecheck_clean=(type_rc == 0),
+            lint_clean=lint_clean,
+            typecheck_clean=type_clean,
         )
     finally:
         subprocess.run(
@@ -558,16 +581,23 @@ def find_new_result_file(
     task_id: str,
     config_name: str,
     since_mtime: float,
+    exclude_paths: set[Path] | None = None,
 ) -> Path | None:
     """Glob results/ for a result file newer than *since_mtime*.
 
     Returns the newest matching file, or None if no new file appeared.
+    Any path in *exclude_paths* is treated as pre-existing — useful when
+    multiple concurrent tasks share the same results directory and ext4's
+    1-second mtime granularity makes the watermark insufficient on its own.
     """
     if not RESULTS_DIR.exists():
         return None
+    excluded = exclude_paths or set()
     pattern = f"{task_id}__{config_name}__*.json"
     candidates = [
-        p for p in RESULTS_DIR.glob(pattern) if p.stat().st_mtime > since_mtime
+        p
+        for p in RESULTS_DIR.glob(pattern)
+        if p.stat().st_mtime > since_mtime and p not in excluded
     ]
     if not candidates:
         return None
@@ -583,6 +613,20 @@ def parse_result_file(path: Path) -> dict:
         "metrics": data.get("metrics", {}) or {},
         "run_id": data.get("run_id"),
     }
+
+
+def _open_task_log(task_id: str, config_name: str):
+    """Open a per-task log file under EVAL_LOG_DIR.
+
+    Returns ``(path, file_handle)``. The handle is opened for writing and the
+    caller is responsible for closing it. A 6-char uuid is appended to avoid
+    sub-second collisions when the same (config, task) pair is re-run.
+    """
+    EVAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    suffix = uuid4().hex[:6]
+    path = EVAL_LOG_DIR / f"eval-{config_name}-{task_id}-{timestamp}-{suffix}.log"
+    return path, open(path, "w")
 
 
 def run_one_task(
@@ -628,7 +672,22 @@ def run_one_task(
     pre_max_mtime = max(pre_files.values(), default=0.0)
 
     task_path = f"src/orchestrator/evals/tasks/{task_id}.json"
-    log(f"Running eval: config={config_name} task={task_id}")
+
+    # In concurrent mode redirect subprocess output to a per-task log file so
+    # the launcher TTY only carries one-liners. In sequential mode keep
+    # streaming live so single-task / gate runs are unchanged.
+    log_path: Path | None = None
+    log_fh = None
+    stdout_target = None
+    stderr_target = None
+    if args.concurrency > 1:
+        log_path, log_fh = _open_task_log(task_id, config_name)
+        stdout_target = log_fh
+        stderr_target = subprocess.STDOUT
+        log(f"START: task={task_id} → {log_path}")
+    else:
+        log(f"Running eval: config={config_name} task={task_id}")
+
     t0 = time.monotonic()
 
     try:
@@ -649,6 +708,8 @@ def run_one_task(
             cwd=str(ORCHESTRATOR_DIR),
             env=env,
             timeout=args.task_timeout_min * 60,
+            stdout=stdout_target,
+            stderr=stderr_target,
         )
         rc = result.returncode
     except subprocess.TimeoutExpired:
@@ -657,10 +718,18 @@ def run_one_task(
             f"{args.task_timeout_min} min subprocess limit"
         )
         rc = -1
+    finally:
+        if log_fh is not None:
+            log_fh.close()
 
     duration_s = time.monotonic() - t0
 
-    new_path = find_new_result_file(task_id, config_name, pre_max_mtime)
+    new_path = find_new_result_file(
+        task_id,
+        config_name,
+        pre_max_mtime,
+        exclude_paths=set(pre_files.keys()),
+    )
     if new_path is None:
         return EvalSummary(
             task_id=task_id,
@@ -678,6 +747,7 @@ def run_one_task(
                 f"orchestrator subprocess rc={rc} but no new result file "
                 f"under {RESULTS_DIR} matching {task_id}__{config_name}__*.json"
             ),
+            log_path=log_path,
         )
 
     data = parse_result_file(new_path)
@@ -695,6 +765,7 @@ def run_one_task(
         typecheck_clean=metrics.get("typecheck_clean"),
         run_id=data["run_id"],
         result_path=new_path,
+        log_path=log_path,
     )
 
 
@@ -732,8 +803,8 @@ def print_summary_table(summaries: list[EvalSummary]) -> None:
         log("No tasks ran.")
         return
 
-    bar = "=" * 78
-    sep = "-" * 78
+    bar = "=" * 110
+    sep = "-" * 110
     print()
     print(bar)
     config = summaries[0].config_name
@@ -741,7 +812,7 @@ def print_summary_table(summaries: list[EvalSummary]) -> None:
     print(sep)
     print(
         f"{'task_id':<22} {'outcome':<10} {'cost':>9} {'dur(s)':>8}  "
-        f"{'tests':<5} {'lint':<5} {'type':<5}"
+        f"{'tests':<5} {'lint':<5} {'type':<5}  {'log':<40}"
     )
     total_cost = 0.0
     total_dur = 0.0
@@ -762,9 +833,10 @@ def print_summary_table(summaries: list[EvalSummary]) -> None:
             else ("FAIL" if s.typecheck_clean is False else "?")
         )
         outcome = s.outcome or s.status
+        log_col = str(s.log_path) if s.log_path is not None else "(stdout)"
         print(
             f"{s.task_id:<22} {outcome:<10} {cost:>9} {dur:>8}  "
-            f"{tests:<5} {lint:<5} {typ:<5}"
+            f"{tests:<5} {lint:<5} {typ:<5}  {log_col}"
         )
         if s.cost_usd is not None:
             total_cost += s.cost_usd
@@ -842,8 +914,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--concurrency",
         type=int,
         default=1,
-        choices=[1],
-        help="v1 only supports 1; future: parallel task fanout",
+        help=(
+            "Number of tasks to run in parallel against the same pod (1-5 "
+            "typical, capped by vLLM's --max-num-seqs 16). NOTE: at high "
+            "concurrency the reviewer fanout (5 sonnet calls/task) becomes "
+            "the binding constraint, not vLLM. Concurrent mode redirects "
+            "per-task subprocess output to /var/tmp/dark-factory-evals/. "
+            "Ctrl-C waits for in-flight tasks to drain — use sparingly."
+        ),
     )
 
     p.add_argument(
@@ -874,6 +952,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    if args.concurrency < 1:
+        log(f"ERROR: --concurrency must be >= 1, got {args.concurrency}")
+        return 1
+    if args.concurrency > 5:
+        log(
+            f"WARN: --concurrency={args.concurrency} > 5 may exhaust the "
+            f"reviewer cap (each eval fires 5 sonnet reviewers; "
+            f"{args.concurrency} concurrent tasks = "
+            f"{args.concurrency * 5} simultaneous reviewer calls)"
+        )
 
     cfg = get_config_by_name(args.config)
     if cfg is None or cfg.image is None:
@@ -936,19 +1025,81 @@ def main(argv: list[str] | None = None) -> int:
             log(f"FATAL: pod bringup failed: {e}")
             return 1
 
-        for spec in specs:
-            try:
-                summary = run_one_task(spec, cfg, handle, env, args)
-            except Exception as e:
-                summary = EvalSummary.crashed(spec["id"], cfg.name, e)
-                log(f"CRASH in task {spec['id']}: {e}")
+        if args.concurrency == 1:
+            # Sequential path — preserves byte-identical behavior of the
+            # single-task gate-eval CI path. subprocess output streams live
+            # to the launcher TTY.
+            for spec in specs:
+                try:
+                    summary = run_one_task(spec, cfg, handle, env, args)
+                except Exception as e:
+                    summary = EvalSummary.crashed(spec["id"], cfg.name, e)
+                    log(f"CRASH in task {spec['id']}: {e}")
 
-            summaries.append(summary)
-            log_one_summary(summary)
+                summaries.append(summary)
+                log_one_summary(summary)
 
-            if args.stop_on_first_failure and summary.status != "done":
-                log("--stop-on-first-failure tripped; aborting remaining tasks")
-                break
+                if args.stop_on_first_failure and summary.status != "done":
+                    log(
+                        "--stop-on-first-failure tripped; "
+                        "aborting remaining tasks"
+                    )
+                    break
+        else:
+            # Concurrent path — windowed submission against a thread pool.
+            # In-flight tasks always drain naturally; --stop-on-first-failure
+            # just stops submitting NEW work, and KeyboardInterrupt is honored
+            # via the executor's wait=True shutdown semantics.
+            log(
+                f"Running {len(specs)} tasks at "
+                f"concurrency={args.concurrency} (per-task logs in "
+                f"{EVAL_LOG_DIR})"
+            )
+            remaining: list[dict] = list(specs)
+            in_flight: dict = {}  # Future → spec
+
+            with ThreadPoolExecutor(
+                max_workers=args.concurrency,
+                thread_name_prefix="eval-task",
+            ) as executor:
+                while remaining or in_flight:
+                    # Refill the window up to max concurrency.
+                    while remaining and len(in_flight) < args.concurrency:
+                        spec = remaining.pop(0)
+                        fut = executor.submit(
+                            run_one_task, spec, cfg, handle, env, args
+                        )
+                        in_flight[fut] = spec
+
+                    # Wait for at least one to finish.
+                    done, _ = wait(
+                        in_flight.keys(), return_when=FIRST_COMPLETED
+                    )
+                    for fut in done:
+                        spec = in_flight.pop(fut)
+                        try:
+                            summary = fut.result()
+                        except Exception as e:
+                            summary = EvalSummary.crashed(
+                                spec["id"], cfg.name, e
+                            )
+                            log(f"CRASH in task {spec['id']}: {e}")
+                        summaries.append(summary)
+                        log_one_summary(summary)
+
+                        if (
+                            args.stop_on_first_failure
+                            and summary.status != "done"
+                        ):
+                            log(
+                                "--stop-on-first-failure tripped; draining "
+                                f"queue ({len(remaining)} not yet submitted, "
+                                f"{len(in_flight)} still in flight will "
+                                "finish naturally)"
+                            )
+                            remaining = []
+                            # Do NOT break — keep collecting in_flight
+                            # completions so their summaries are recorded.
     finally:
         tear_down_pod(handle)
 

@@ -10,6 +10,7 @@ import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -262,6 +263,80 @@ class TestFindNewResultFile:
         assert find_new_result_file("df_task_12", "cfg", 0.0) is None
 
 
+class TestFindNewResultFileExclude:
+    """exclude_paths fixes the ext4 1s-mtime-granularity collision risk
+    that surfaces when multiple concurrent tasks write into the same
+    results dir.
+    """
+
+    def test_excludes_pre_files_paths(self, tmp_path, monkeypatch):
+        results = tmp_path / "results"
+        results.mkdir()
+        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+
+        a = _write_result(results, "df_task_12", "cfg", "aaaa0000")
+        watermark = a.stat().st_mtime - 1.0  # both files are above the watermark
+        time.sleep(0.05)
+        b = _write_result(results, "df_task_12", "cfg", "bbbb0000")
+
+        # Without exclude_paths, the newer file (b) wins.
+        assert find_new_result_file("df_task_12", "cfg", watermark) == b
+
+        # With a in exclude_paths, b still wins (same answer here, since b is
+        # newer). The interesting case is when a happens to have a *later*
+        # mtime — exclude_paths must still suppress it.
+        import os
+
+        os.utime(a, (a.stat().st_atime, b.stat().st_mtime + 1.0))
+        assert (
+            find_new_result_file(
+                "df_task_12", "cfg", watermark, exclude_paths={a}
+            )
+            == b
+        )
+
+    def test_exclude_paths_default_none(self, tmp_path, monkeypatch):
+        """Old 3-positional-arg call sites still work."""
+        results = tmp_path / "results"
+        results.mkdir()
+        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+
+        only = _write_result(results, "df_task_12", "cfg", "only00000")
+        # No exclude_paths arg at all — must still find the file.
+        assert find_new_result_file("df_task_12", "cfg", 0.0) == only
+
+    def test_concurrent_collision_simulation(self, tmp_path, monkeypatch):
+        """5 result files, all with the same mtime, each task isolated by
+        its own pre_files snapshot."""
+        import os
+
+        results = tmp_path / "results"
+        results.mkdir()
+        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+
+        # Write 5 files all with mtime = 1000.0
+        files = {}
+        for i in range(5):
+            tid = f"df_task_1{i}"
+            p = _write_result(results, tid, "cfg", f"r{i:08d}")
+            os.utime(p, (1000.0, 1000.0))
+            files[tid] = p
+
+        # Each "task" sees its own file as pre-existing-empty (i.e. nothing
+        # to exclude — it was the writer of its own file). The other 4 files
+        # were written before this task's watermark. Each must find ITS own
+        # result file even though all 5 share the same mtime.
+        for tid, expected in files.items():
+            other_files = {p for t, p in files.items() if t != tid}
+            found = find_new_result_file(
+                tid,
+                "cfg",
+                999.0,  # below 1000.0 so all candidates pass the mtime gate
+                exclude_paths=other_files,
+            )
+            assert found == expected, f"task {tid} got {found}, expected {expected}"
+
+
 class TestParseResultFile:
     def test_extracts_outcome_and_cost(self, tmp_path):
         p = tmp_path / "r.json"
@@ -394,9 +469,13 @@ def _patch_subprocess_run_success(monkeypatch, results_dir: Path):
 
 
 class TestPodLifecycle:
-    def test_multi_task_terminates_pod_once(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("concurrency", [1, 3])
+    def test_multi_task_terminates_pod_once(
+        self, monkeypatch, tmp_path, concurrency
+    ):
         results = tmp_path / "results"
         monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -424,6 +503,8 @@ class TestPodLifecycle:
                 "df_task_12,df_task_13,df_task_18",
                 "--verify-baseline-clean",
                 "skip",
+                "--concurrency",
+                str(concurrency),
             ]
         )
 
@@ -621,6 +702,553 @@ class TestPodLifecycle:
         assert rc == 0
         assert eval_calls["n"] == 1
         assert fake_client.terminate_calls == ["pod-fake-1"]
+
+
+# ---------------------------------------------------------------------------
+# Per-task log file plumbing
+# ---------------------------------------------------------------------------
+
+
+class TestPerTaskLogFiles:
+    """Concurrent mode redirects subprocess output to per-task log files;
+    sequential mode keeps streaming live to the launcher TTY.
+    """
+
+    def _setup_one_task(self, monkeypatch, tmp_path):
+        results = tmp_path / "results"
+        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+
+        fake_tasks = tmp_path / "tasks"
+        fake_tasks.mkdir()
+        (fake_tasks / "df_task_12.json").write_text(
+            json.dumps(
+                {
+                    "id": "df_task_12",
+                    "pre_task_commit": "deadbeef",
+                    "verify_commands": {"lint": "true", "typecheck": "true"},
+                }
+            )
+        )
+        monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
+
+        log_dir = tmp_path / "eval-logs"
+        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", log_dir)
+        return results, log_dir
+
+    def test_log_file_created_in_concurrent_mode(self, monkeypatch, tmp_path):
+        results, log_dir = self._setup_one_task(monkeypatch, tmp_path)
+
+        fake_client = _patch_pod_infra(monkeypatch)
+
+        captured_kwargs: list[dict] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            if (
+                isinstance(cmd, list)
+                and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
+            ):
+                captured_kwargs.append(kwargs)
+                # Write a fake "subprocess wrote to my stdout" line into the log fh.
+                fh = kwargs.get("stdout")
+                if fh is not None and hasattr(fh, "write"):
+                    fh.write("hello from fake subprocess\n")
+                    fh.flush()
+                task_arg = cmd[cmd.index("--task") + 1]
+                config_name = cmd[cmd.index("--config-name") + 1]
+                task_id = Path(task_arg).stem
+                results.mkdir(parents=True, exist_ok=True)
+                _write_result(results, task_id, config_name, "log00001")
+                return SimpleNamespace(returncode=0)
+            return subprocess.run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+
+        rc = launcher.main(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--task",
+                "df_task_12",
+                "--verify-baseline-clean",
+                "skip",
+                "--concurrency",
+                "2",
+            ]
+        )
+
+        assert rc == 0
+        assert fake_client.terminate_calls == ["pod-fake-1"]
+        # Concurrent path took the redirect branch
+        assert captured_kwargs and captured_kwargs[0]["stdout"] is not None
+        assert captured_kwargs[0]["stderr"] == subprocess.STDOUT
+        # Log file exists and contains the fake subprocess output
+        log_files = list(log_dir.glob("eval-*-df_task_12-*.log"))
+        assert len(log_files) == 1, f"expected 1 log file, got {log_files}"
+        assert "hello from fake subprocess" in log_files[0].read_text()
+
+    def test_no_log_file_in_sequential_mode(self, monkeypatch, tmp_path):
+        results, log_dir = self._setup_one_task(monkeypatch, tmp_path)
+        fake_client = _patch_pod_infra(monkeypatch)
+
+        captured_kwargs: list[dict] = []
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            if (
+                isinstance(cmd, list)
+                and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
+            ):
+                captured_kwargs.append(kwargs)
+                task_arg = cmd[cmd.index("--task") + 1]
+                config_name = cmd[cmd.index("--config-name") + 1]
+                task_id = Path(task_arg).stem
+                results.mkdir(parents=True, exist_ok=True)
+                _write_result(results, task_id, config_name, "seq00001")
+                return SimpleNamespace(returncode=0)
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+
+        rc = launcher.main(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--task",
+                "df_task_12",
+                "--verify-baseline-clean",
+                "skip",
+                # default concurrency=1
+            ]
+        )
+        assert rc == 0
+        assert fake_client.terminate_calls == ["pod-fake-1"]
+        # Sequential path: no redirect, so stdout/stderr kwargs should be None
+        assert captured_kwargs and captured_kwargs[0].get("stdout") is None
+        assert captured_kwargs[0].get("stderr") is None
+        # No log files created
+        assert not log_dir.exists() or not any(log_dir.glob("eval-*.log"))
+
+    def test_log_file_path_in_summary(self, monkeypatch, tmp_path):
+        results, log_dir = self._setup_one_task(monkeypatch, tmp_path)
+        _patch_pod_infra(monkeypatch)
+
+        captured: dict = {}
+        real_print = launcher.print_summary_table
+
+        def capture_print(summaries):
+            captured["summaries"] = summaries
+            return real_print(summaries)
+
+        monkeypatch.setattr(launcher, "print_summary_table", capture_print)
+        _patch_subprocess_run_success(monkeypatch, results)
+
+        # Concurrent mode: log_path populated.
+        launcher.main(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--task",
+                "df_task_12",
+                "--verify-baseline-clean",
+                "skip",
+                "--concurrency",
+                "2",
+            ]
+        )
+        assert len(captured["summaries"]) == 1
+        assert captured["summaries"][0].log_path is not None
+        assert captured["summaries"][0].log_path.parent == log_dir
+
+        # Sequential mode: log_path is None.
+        captured.clear()
+        launcher.main(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--task",
+                "df_task_12",
+                "--verify-baseline-clean",
+                "skip",
+            ]
+        )
+        assert len(captured["summaries"]) == 1
+        assert captured["summaries"][0].log_path is None
+
+    def test_log_dir_created_if_missing(self, monkeypatch, tmp_path):
+        log_dir = tmp_path / "deeply" / "nested" / "eval-logs"
+        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", log_dir)
+        assert not log_dir.exists()
+
+        path, fh = launcher._open_task_log("df_task_12", "cfg")
+        try:
+            assert log_dir.exists()
+            assert path.parent == log_dir
+            assert path.exists()
+        finally:
+            fh.close()
+
+
+# ---------------------------------------------------------------------------
+# Concurrent fanout (windowed ThreadPoolExecutor)
+# ---------------------------------------------------------------------------
+
+# Bind real time.sleep BEFORE _patch_pod_infra monkeypatches launcher.time.sleep,
+# so the delay helper actually blocks instead of being a no-op.
+_REAL_SLEEP = time.sleep
+
+
+def _patch_subprocess_run_with_delay(monkeypatch, results_dir: Path, delay_s: float):
+    """Like _patch_subprocess_run_success but adds a real sleep so worker
+    threads overlap in time. Used to verify parallelism via wall-clock.
+    """
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if (
+            isinstance(cmd, list)
+            and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
+        ):
+            _REAL_SLEEP(delay_s)  # noqa — intentional, exercises threading
+            task_arg = cmd[cmd.index("--task") + 1]
+            config_name = cmd[cmd.index("--config-name") + 1]
+            task_id = Path(task_arg).stem
+            results_dir.mkdir(parents=True, exist_ok=True)
+            run_id = uuid4().hex[:8]
+            _write_result(results_dir, task_id, config_name, run_id)
+            # Honor the redirect target so the per-task log file is non-empty.
+            fh = kwargs.get("stdout")
+            if fh is not None and hasattr(fh, "write"):
+                fh.write(f"fake subprocess for {task_id}\n")
+                fh.flush()
+            return SimpleNamespace(returncode=0)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+
+
+def _write_n_task_specs(fake_tasks: Path, task_ids: list[str]) -> None:
+    fake_tasks.mkdir(parents=True, exist_ok=True)
+    for tid in task_ids:
+        (fake_tasks / f"{tid}.json").write_text(
+            json.dumps(
+                {
+                    "id": tid,
+                    "pre_task_commit": "deadbeef",
+                    "verify_commands": {"lint": "true", "typecheck": "true"},
+                }
+            )
+        )
+
+
+class TestConcurrentLoop:
+    """Windowed-submission ThreadPoolExecutor path in main()."""
+
+    def test_concurrent_runs_three_tasks_in_parallel(self, monkeypatch, tmp_path):
+        """3 tasks at concurrency=3 with a 0.3s fake-subprocess delay should
+        finish in ~0.3s wall-clock, not ~0.9s."""
+        results = tmp_path / "results"
+        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
+
+        task_ids = ["df_task_12", "df_task_13", "df_task_18"]
+        fake_tasks = tmp_path / "tasks"
+        _write_n_task_specs(fake_tasks, task_ids)
+        monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
+
+        fake_client = _patch_pod_infra(monkeypatch)
+        _patch_subprocess_run_with_delay(monkeypatch, results, delay_s=0.3)
+
+        t0 = time.monotonic()
+        rc = launcher.main(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--tasks",
+                ",".join(task_ids),
+                "--verify-baseline-clean",
+                "skip",
+                "--concurrency",
+                "3",
+            ]
+        )
+        wall_clock = time.monotonic() - t0
+
+        assert rc == 0
+        assert len(fake_client.create_calls) == 1
+        assert fake_client.terminate_calls == ["pod-fake-1"]
+        # Parallel: ~0.3s; serial: ~0.9s. Allow 0.6s for thread spinup overhead.
+        assert wall_clock < 0.6, (
+            f"expected ~0.3s parallel wall-clock, got {wall_clock:.2f}s "
+            f"(serial would be ~0.9s)"
+        )
+        # All 3 result files written
+        result_files = sorted(p.name for p in results.glob("*.json"))
+        assert len(result_files) == 3
+
+    def test_concurrent_with_higher_count_than_concurrency(
+        self, monkeypatch, tmp_path
+    ):
+        """5 tasks, concurrency=2 → wall-clock ≈ ⌈5/2⌉ × 0.3s = 0.9s."""
+        results = tmp_path / "results"
+        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
+
+        task_ids = [f"df_task_{i}" for i in (12, 13, 14, 15, 18)]
+        fake_tasks = tmp_path / "tasks"
+        _write_n_task_specs(fake_tasks, task_ids)
+        monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
+
+        fake_client = _patch_pod_infra(monkeypatch)
+        _patch_subprocess_run_with_delay(monkeypatch, results, delay_s=0.3)
+
+        t0 = time.monotonic()
+        rc = launcher.main(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--tasks",
+                ",".join(task_ids),
+                "--verify-baseline-clean",
+                "skip",
+                "--concurrency",
+                "2",
+            ]
+        )
+        wall_clock = time.monotonic() - t0
+
+        assert rc == 0
+        assert len(fake_client.create_calls) == 1
+        assert len(list(results.glob("*.json"))) == 5
+        # 3 waves × 0.3s = 0.9s. Allow 1.5s for overhead.
+        assert wall_clock < 1.5, f"wall-clock {wall_clock:.2f}s too high"
+        # And > 0.6s — anything less means we somehow ran > 2 in parallel.
+        assert wall_clock > 0.6, (
+            f"wall-clock {wall_clock:.2f}s too low; concurrency cap "
+            f"may not be enforced"
+        )
+
+    def test_concurrent_no_result_collision(self, monkeypatch, tmp_path):
+        """4 result files written with the same mtime — each task must
+        find ITS own result, not a sibling's."""
+        import os
+
+        results = tmp_path / "results"
+        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
+
+        task_ids = ["df_task_12", "df_task_13", "df_task_14", "df_task_15"]
+        fake_tasks = tmp_path / "tasks"
+        _write_n_task_specs(fake_tasks, task_ids)
+        monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
+
+        _patch_pod_infra(monkeypatch)
+
+        # Force every result file to share an identical mtime, so the watermark
+        # alone is insufficient and exclude_paths must do the work.
+        forced_mtime = 1_700_000_000.0
+
+        def fake_run(cmd, *args, **kwargs):
+            if (
+                isinstance(cmd, list)
+                and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
+            ):
+                _REAL_SLEEP(0.05)
+                task_arg = cmd[cmd.index("--task") + 1]
+                config_name = cmd[cmd.index("--config-name") + 1]
+                task_id = Path(task_arg).stem
+                results.mkdir(parents=True, exist_ok=True)
+                p = _write_result(results, task_id, config_name, "collide00")
+                os.utime(p, (forced_mtime, forced_mtime))
+                return SimpleNamespace(returncode=0)
+            return subprocess.run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+
+        captured: dict = {}
+        real_print = launcher.print_summary_table
+
+        def capture_print(summaries):
+            captured["summaries"] = summaries
+            return real_print(summaries)
+
+        monkeypatch.setattr(launcher, "print_summary_table", capture_print)
+
+        rc = launcher.main(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--tasks",
+                ",".join(task_ids),
+                "--verify-baseline-clean",
+                "skip",
+                "--concurrency",
+                "4",
+            ]
+        )
+        assert rc == 0
+        # Each summary's result_path must reference its own task_id.
+        for s in captured["summaries"]:
+            assert s.result_path is not None
+            assert s.task_id in s.result_path.name, (
+                f"task {s.task_id} got result_path {s.result_path} "
+                f"belonging to a different task"
+            )
+
+    def test_concurrent_stop_on_first_failure_drains(self, monkeypatch, tmp_path):
+        """Failing task stops the queue but in-flight tasks finish."""
+        results = tmp_path / "results"
+        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
+
+        task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
+        fake_tasks = tmp_path / "tasks"
+        _write_n_task_specs(fake_tasks, task_ids)
+        monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
+
+        fake_client = _patch_pod_infra(monkeypatch)
+
+        attempted: list[str] = []
+        attempted_lock_marker: list[str] = []  # for assertion ordering
+
+        def fake_run(cmd, *args, **kwargs):
+            if (
+                isinstance(cmd, list)
+                and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
+            ):
+                task_arg = cmd[cmd.index("--task") + 1]
+                config_name = cmd[cmd.index("--config-name") + 1]
+                task_id = Path(task_arg).stem
+                attempted.append(task_id)
+                attempted_lock_marker.append(task_id)
+                _REAL_SLEEP(0.1)
+                if task_id == "df_task_11":
+                    # Simulate failure: write a "blocked" outcome.
+                    results.mkdir(parents=True, exist_ok=True)
+                    _write_result(
+                        results,
+                        task_id,
+                        config_name,
+                        "fail00001",
+                        outcome="blocked",
+                        metrics={"cost_usd": 5.0},
+                    )
+                    return SimpleNamespace(returncode=1)
+                results.mkdir(parents=True, exist_ok=True)
+                _write_result(results, task_id, config_name, f"r{len(attempted):08d}")
+                return SimpleNamespace(returncode=0)
+            return subprocess.run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+
+        captured: dict = {}
+        real_print = launcher.print_summary_table
+
+        def capture_print(summaries):
+            captured["summaries"] = summaries
+            return real_print(summaries)
+
+        monkeypatch.setattr(launcher, "print_summary_table", capture_print)
+
+        rc = launcher.main(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--tasks",
+                ",".join(task_ids),
+                "--verify-baseline-clean",
+                "skip",
+                "--concurrency",
+                "2",
+                "--stop-on-first-failure",
+            ]
+        )
+
+        assert rc == 1  # one task blocked → non-zero exit
+        assert fake_client.terminate_calls == ["pod-fake-1"]
+        # Tasks 10 and 11 were the initial wave; 11 failed. Task 12 may or
+        # may not have been picked up depending on scheduling, but 13 and 14
+        # must NOT have been submitted.
+        assert "df_task_10" in attempted
+        assert "df_task_11" in attempted
+        assert "df_task_13" not in attempted
+        assert "df_task_14" not in attempted
+        # Summaries cover whatever was attempted.
+        summary_ids = {s.task_id for s in captured["summaries"]}
+        assert summary_ids == set(attempted)
+        # The blocked task is in the summaries.
+        blocked = [s for s in captured["summaries"] if s.task_id == "df_task_11"]
+        assert blocked and blocked[0].status == "blocked"
+
+    def test_concurrent_keyboard_interrupt_lets_in_flight_finish(
+        self, monkeypatch, tmp_path
+    ):
+        """When the executor's wait() raises KeyboardInterrupt, the with-block's
+        shutdown(wait=True) drains in-flight tasks before re-raising.
+
+        Per plan risk #12, we test the *invariant* (pod terminated, KI
+        propagated) by injecting KI through a wait() patch instead of via
+        signal injection from another thread.
+        """
+        results = tmp_path / "results"
+        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
+
+        task_ids = ["df_task_12", "df_task_13", "df_task_18"]
+        fake_tasks = tmp_path / "tasks"
+        _write_n_task_specs(fake_tasks, task_ids)
+        monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
+
+        fake_client = _patch_pod_infra(monkeypatch)
+
+        completed_tasks: list[str] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            if (
+                isinstance(cmd, list)
+                and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
+            ):
+                task_arg = cmd[cmd.index("--task") + 1]
+                config_name = cmd[cmd.index("--config-name") + 1]
+                task_id = Path(task_arg).stem
+                _REAL_SLEEP(0.2)  # let executor.shutdown(wait=True) actually wait
+                results.mkdir(parents=True, exist_ok=True)
+                _write_result(results, task_id, config_name, "ki000001")
+                completed_tasks.append(task_id)
+                return SimpleNamespace(returncode=0)
+            return subprocess.run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+
+        # Make the FIRST call to launcher.wait raise KeyboardInterrupt.
+        real_wait = launcher.wait
+        wait_calls = {"n": 0}
+
+        def interrupt_on_first_wait(*args, **kwargs):
+            wait_calls["n"] += 1
+            if wait_calls["n"] == 1:
+                raise KeyboardInterrupt
+            return real_wait(*args, **kwargs)
+
+        monkeypatch.setattr(launcher, "wait", interrupt_on_first_wait)
+
+        with pytest.raises(KeyboardInterrupt):
+            launcher.main(
+                [
+                    "--config",
+                    "reap-139b-nvfp4-new",
+                    "--tasks",
+                    ",".join(task_ids),
+                    "--verify-baseline-clean",
+                    "skip",
+                    "--concurrency",
+                    "3",
+                ]
+            )
+
+        # Pod was still terminated by the outer finally
+        assert fake_client.terminate_calls == ["pod-fake-1"]
+        # All 3 in-flight tasks completed (executor.shutdown(wait=True) drained)
+        assert sorted(completed_tasks) == sorted(task_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -885,6 +1513,22 @@ class TestSummaryAndExit:
         assert "done" in out
         assert "blocked" in out
         assert "RUN SUMMARY" in out
+        # No log_path on either summary → both rows show "(stdout)"
+        assert out.count("(stdout)") == 2
+
+    def test_summary_table_shows_log_path(self, capsys):
+        summaries = [
+            _make_summary(
+                "done",
+                task_id="df_task_12",
+                log_path=Path("/var/tmp/dark-factory-evals/eval-cfg-df_task_12-x.log"),
+            ),
+            _make_summary("done", task_id="df_task_13"),  # log_path=None → (stdout)
+        ]
+        print_summary_table(summaries)
+        out = capsys.readouterr().out
+        assert "/var/tmp/dark-factory-evals/eval-cfg-df_task_12-x.log" in out
+        assert "(stdout)" in out
 
 
 # ---------------------------------------------------------------------------
