@@ -3,8 +3,8 @@
   "name": "Bug: verify.py fails with 'source: not found' on dash systems",
   "project": "dark-factory",
   "project_root": "/home/leo/src/dark-factory",
-  "pre_task_commit": "e53c9a555cf64117c19aa5834df269fc3e97d8a3",
-  "post_task_commit": "503b9d768296888befcedfc3f0c2135d6b031161",
+  "pre_task_commit": "0b741353c200e7885d0a7d5bf8d81d86939cf5df",
+  "post_task_commit": "34262c6a83c87a1d07657f16b1f291da4182b6d8",
   "task_definition": {
     "title": "Bug: verify.py fails with 'source: not found' on dash systems",
     "description": "The verify step fails with 'source: not found' on Ubuntu systems where /bin/sh is dash. Fix create_subprocess_shell in verify.py to use executable='/bin/bash' so shell builtins like 'source' work correctly."
