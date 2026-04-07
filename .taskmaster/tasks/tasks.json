@@ -11132,7 +11132,21 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-07T19:12:39.623Z"
+        "updatedAt": "2026-04-07T19:12:39.623Z",
+        "metadata": {
+          "memory_hints": {
+            "entities": [
+              "Reviewer panel"
+            ],
+            "queries": [
+              "reviewer trial variants A B C D E results scores accuracy",
+              "reviewer panel restructuring trial plan streamed-baking-meteor",
+              "invoke_agent ThreadPoolExecutor reviewer trial runner",
+              "reviewer 401 auth failures silent pass partial coverage orchestrator"
+            ]
+          },
+          "_causation_id": "50cd0596-7912-4809-b746-fbd02918aa1c"
+        }
       }
     ],
     "metadata": {
