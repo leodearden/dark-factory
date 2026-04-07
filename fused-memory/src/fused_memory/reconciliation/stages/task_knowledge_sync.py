@@ -21,6 +21,11 @@ from fused_memory.reconciliation.prompts import (
 )
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.task_filter import (
+    filter_task_tree,
+    format_filtered_task_tree,
+    format_task_list,
+)
 
 
 class TaskKnowledgeSync(BaseStage):
@@ -54,17 +59,11 @@ class TaskKnowledgeSync(BaseStage):
             except Exception:
                 tasks_data = {}
 
+        # Delegate all filtering, partitioning, and sorting to task_filter
+        filtered = filter_task_tree(tasks_data)
         all_tasks = tasks_data.get('tasks', [])
         if not isinstance(all_tasks, list):
             all_tasks = []
-
-        active_tasks = [
-            t for t in all_tasks
-            if isinstance(t, dict) and t.get('status') in ('pending', 'in-progress', 'review')
-        ]
-        done_tasks = [
-            t for t in all_tasks if isinstance(t, dict) and t.get('status') == 'done'
-        ]
 
         remediation_note = ''
         if self.remediation_mode:
@@ -79,7 +78,7 @@ class TaskKnowledgeSync(BaseStage):
             sample = _select_proactive_sample(all_tasks, self.MIN_TASK_SAMPLE)
             proactive_sample_section = (
                 f'\n### Proactive Task Sample ({len(sample)} tasks)\n'
-                f'{_format_tasks(sample)}\n'
+                f'{format_task_list(sample)}\n'
             )
 
         return f"""## Stage 2: Task-Knowledge Sync
@@ -91,11 +90,10 @@ class TaskKnowledgeSync(BaseStage):
 ### Stage 1 Flagged Items (Task-Relevant)
 {_format_flagged(stage1_report.items_flagged if stage1_report else [])}
 
-### Active Task Tree ({len(active_tasks)} active, {len(done_tasks)} done, {len(all_tasks)} total)
-{_format_tasks(active_tasks[:50])}
+{format_filtered_task_tree(filtered)}
 
 ### Recently Completed Tasks
-{_format_tasks(done_tasks[:30])}{proactive_sample_section}
+{format_task_list(filtered.done_tasks[:30])}{proactive_sample_section}
 
 ## Your Task
 Reconcile task state against memory:
@@ -195,29 +193,6 @@ def _format_flagged(items: list[dict]) -> str:
     return '\n'.join(lines)
 
 
-def _format_tasks(tasks: list[dict]) -> str:
-    if not tasks:
-        return 'No tasks.'
-    lines = []
-    for t in tasks:
-        tid = t.get('id', '?')
-        title = t.get('title', '?')
-        status = t.get('status', '?')
-        deps = t.get('dependencies', [])
-        lines.append(f'- [{tid}] ({status}) {title} deps={deps}')
-    return '\n'.join(lines)
-
-
-# Status priority for proactive sampling: lower value = higher priority
-_STATUS_PRIORITY: dict[str, int] = {
-    'in-progress': 0,
-    'blocked': 1,
-    'review': 2,
-    'pending': 3,
-    'done': 4,
-}
-
-
 def _select_proactive_sample(all_tasks: list[dict], n: int) -> list[dict]:
     """Select the top-N tasks for proactive spot-checking.
 
@@ -230,6 +205,9 @@ def _select_proactive_sample(all_tasks: list[dict], n: int) -> list[dict]:
     """
     # Filter out non-dict elements before sorting so sort_key never crashes
     tasks = [t for t in all_tasks if isinstance(t, dict)]
+
+    # Import from task_filter — the single source of truth for status priority
+    from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY  # noqa: PLC0415
 
     def sort_key(t: dict) -> tuple[int, int]:
         status = t.get('status', 'pending')

@@ -1284,3 +1284,140 @@ class TestStagePayloadProjectIdGuideline:
 
         assert 'project_root="/home/leo/src/test_proj"' in payload
 
+
+class TestTaskKnowledgeSyncDeduplication:
+    """Module-introspection tests: task_knowledge_sync must not define symbols owned by task_filter."""
+
+    def test_no_local_status_priority(self):
+        """task_knowledge_sync must NOT define _STATUS_PRIORITY at module level.
+        task_filter._STATUS_PRIORITY is the single source of truth.
+        """
+        import fused_memory.reconciliation.stages.task_knowledge_sync as mod
+        assert not hasattr(mod, '_STATUS_PRIORITY'), (
+            'task_knowledge_sync._STATUS_PRIORITY must be removed after step-8; '
+            'import from task_filter instead'
+        )
+
+    def test_no_local_format_tasks(self):
+        """task_knowledge_sync must NOT define _format_tasks at module level.
+        Use task_filter._render_task_line / format_task_list instead.
+        """
+        import fused_memory.reconciliation.stages.task_knowledge_sync as mod
+        assert not hasattr(mod, '_format_tasks'), (
+            'task_knowledge_sync._format_tasks must be removed after step-8; '
+            'use task_filter.format_task_list instead'
+        )
+
+
+class TestTaskKnowledgeSyncUsesFilterTaskTree:
+    """Integration tests: assemble_payload delegates active-tree logic to filter_task_tree."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='test_project')
+
+    def _make_task(self, tid: int, status: str, title: str | None = None) -> dict:
+        return {
+            'id': tid,
+            'title': title or f'Task {tid} ({status})',
+            'status': status,
+            'dependencies': [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_payload_active_task_tree_uses_filter_task_tree(self, mock_deps, watermark):
+        """assemble_payload uses filter_task_tree: payload contains em-dash summary, 'shown'
+        parenthetical, blocked task, and deferred task in the Active Task Tree section."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'pending'),
+                self._make_task(2, 'in-progress'),
+                self._make_task(3, 'blocked', 'Blocked Task'),
+                self._make_task(4, 'deferred', 'Deferred Task'),
+                self._make_task(5, 'review'),
+                self._make_task(6, 'done'),
+                self._make_task(7, 'cancelled'),
+                self._make_task(8, 'done'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # (a) em-dash summary line produced by format_filtered_task_tree
+        assert '\u2014 omitted' in payload, (
+            'Payload missing em-dash summary line from format_filtered_task_tree'
+        )
+
+        # (b) 'shown' parenthetical from format_filtered_task_tree header
+        assert 'active shown' in payload, (
+            "Payload missing 'active shown' parenthetical from filter_task_tree header"
+        )
+
+        # (c) blocked task appears in the Active Task Tree section
+        assert 'Blocked Task' in payload, (
+            'Blocked task title not found in payload; active set may not have been widened'
+        )
+
+        # (d) deferred task appears in the Active Task Tree section
+        assert 'Deferred Task' in payload, (
+            'Deferred task title not found in payload; active set may not have been widened'
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_recently_completed_tasks_sorted_desc(self, mock_deps, watermark):
+        """assemble_payload sorts recently completed tasks by id descending."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'in-progress'),
+                self._make_task(5, 'done', 'Done Five'),
+                self._make_task(10, 'done', 'Done Ten'),
+                self._make_task(3, 'done', 'Done Three'),
+                self._make_task(8, 'done', 'Done Eight'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # (a) Recently Completed Tasks header present
+        assert '### Recently Completed Tasks' in payload, (
+            "Payload missing '### Recently Completed Tasks' header"
+        )
+
+        # (b) done tasks appear in descending id order: 10, 8, 5, 3
+        recently_idx = payload.index('### Recently Completed Tasks')
+        # Find the next section after Recently Completed
+        next_section_idx = payload.find('\n#', recently_idx + 1)
+        if next_section_idx == -1:
+            next_section_idx = len(payload)
+        section_text = payload[recently_idx:next_section_idx]
+
+        pos_10 = section_text.find('[10]')
+        pos_8 = section_text.find('[8]')
+        pos_5 = section_text.find('[5]')
+        pos_3 = section_text.find('[3]')
+
+        assert pos_10 != -1, "Done task id=10 not found in Recently Completed section"
+        assert pos_8 != -1, "Done task id=8 not found in Recently Completed section"
+        assert pos_5 != -1, "Done task id=5 not found in Recently Completed section"
+        assert pos_3 != -1, "Done task id=3 not found in Recently Completed section"
+
+        assert pos_10 < pos_8 < pos_5 < pos_3, (
+            f'Recently Completed Tasks not sorted by id desc. '
+            f'positions: [10]={pos_10}, [8]={pos_8}, [5]={pos_5}, [3]={pos_3}'
+        )
