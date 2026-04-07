@@ -121,8 +121,21 @@ class ContextAssembler:
             ]
             batch_contexts = await asyncio.gather(*fetch_tasks, return_exceptions=True)
 
+            # Two-tier check — mirrors the convention in MemoryService.get_entity
+            # (memory_service.py:1000-1013) and graphiti_client.rebuild_entity_summaries
+            # (graphiti_client.py:1071-1080, task-484).
+            # Pass 1: propagate structured-cancellation signals immediately.
+            # asyncio.gather(return_exceptions=True) captures *all* BaseException
+            # subclasses, including CancelledError (a BaseException but NOT an Exception
+            # in Python 3.8+). Re-raising here preserves the structured-cancellation
+            # contract and prevents the assembler from silently converting a shutdown
+            # signal into an empty context list.
+            for ctx_result in batch_contexts:
+                if isinstance(ctx_result, BaseException) and not isinstance(ctx_result, Exception):
+                    raise ctx_result
+
             for event, ctx_result in zip(batch, batch_contexts, strict=True):
-                if isinstance(ctx_result, BaseException):
+                if isinstance(ctx_result, Exception):
                     logger.warning(
                         f'Context fetch failed for event {event.id}: {ctx_result}'
                     )
