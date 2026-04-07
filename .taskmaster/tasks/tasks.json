@@ -10240,10 +10240,11 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py:\n1. Remove `test_dry_run_partition_invariant_skips_rebuild_and_edges` from `TestRebuildEntitySummariesErrorHandling` (line 538).\n2. Add `backend._rebuild_entity_from_edges.assert_not_awaited()` to `test_force_dry_run_does_not_call_get_all_valid_edges` (after line 275).\n3. Add the partition invariant assertion `assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']` to `test_force_dry_run_returns_correct_aggregate` (after line 300).\n\nThis consolidates all force=True dry_run=True coverage in `TestRebuildEntitySummariesForceDryRun` without duplicating the scenario.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T03:06:45.022Z"
       },
       {
         "id": "523",
@@ -10581,7 +10582,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T03:06:44.940Z",
+      "lastModified": "2026-04-07T03:06:45.022Z",
       "taskCount": 531,
       "completedCount": 432,
       "tags": [
