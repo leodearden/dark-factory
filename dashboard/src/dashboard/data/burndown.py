@@ -100,12 +100,12 @@ async def collect_snapshot(
         roots_to_snapshot.append((root_str, project_root / '.taskmaster' / 'tasks' / 'tasks.json'))
 
     for known_root in config.known_project_roots:
-        resolved = known_root.resolve()
-        root_str = str(resolved)
+        # known_root is already resolved by DashboardConfig.__post_init__
+        root_str = str(known_root)
         if root_str in seen_roots:
             continue
         seen_roots.add(root_str)
-        roots_to_snapshot.append((root_str, resolved / '.taskmaster' / 'tasks' / 'tasks.json'))
+        roots_to_snapshot.append((root_str, known_root / '.taskmaster' / 'tasks' / 'tasks.json'))
 
     # Phase 2 — Parallel read:
     # All load_task_tree calls are independent (separate files), so run them concurrently.
