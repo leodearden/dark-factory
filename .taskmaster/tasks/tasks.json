@@ -10993,6 +10993,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 585,
+        "title": "runner.py code clarity and documentation improvements",
+        "description": "Small inline improvements to orchestrator/src/orchestrator/evals/runner.py that don't change behaviour:\n\n- runner.py:316 — add comment `# re-raise; no active except context since r came from return_exceptions=True` after `raise r`\n- runner.py:271 (docstring) — add `Raises: asyncio.CancelledError if any individual eval coroutine raises CancelledError`\n- runner.py:307-316 — add comment block distinguishing inner-task cancellation (captured in raw) vs outer-task cancellation (bypasses result loop)\n- runner.py:315 — change `logger.error(f'Eval cancelled: {r}')` to `logger.error('Eval cancelled', exc_info=r)` so traceback and repr are preserved even when str(r) is empty\n\nSource: pre-triaged review suggestions from Task 531 (esc-531-101). Reviewers: reviewer_architect_reviewer, reviewer_robustness.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -11005,7 +11016,7 @@
       ],
       "created": "2026-04-07T04:41:11.658Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T04:41:17.640Z"
+      "updated": "2026-04-07T04:41:21.444Z"
     }
   }
 }
