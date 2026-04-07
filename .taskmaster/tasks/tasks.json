@@ -10438,7 +10438,15 @@
         "metadata": {
           "modules": [
             "orchestrator/tests/test_eval_configs.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "configs.py eval_configs refactored single source of truth EVAL_CONFIGS VLLM_EVAL_CONFIGS",
+              "EvalConfig get_config_by_name vllm eval pipeline configs refactor"
+            ]
+          },
+          "_causation_id": "2f2ac841-21ef-4bb6-ae6f-d98d538127ca"
         }
       },
       {
