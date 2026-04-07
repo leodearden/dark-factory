@@ -85,21 +85,36 @@ class TestGetConfigByName:
 
 
 class TestVllmConfigSet:
-    """VLLM_EVAL_CONFIGS must contain exactly the 6 active self-hosted models."""
+    """VLLM_EVAL_CONFIGS must contain exactly the 11 active self-hosted models.
+
+    Counts:
+    - 4 OLD baked-image configs (minimax-m25-fp8, qwen3-coder-next-fp8, reap-139b-nvfp4, reap-172b-nvfp4)
+    - 5 NEW :latest+HF-download configs with FP8/NVFP4 HF ids and per-model
+      tool_call_parser/memory tuning (-new suffix)
+    - 2 workstation tier (qwen3-coder-30b-q4, devstral-small-2505-q6)
+    """
 
     EXPECTED_VLLM_NAMES = {
+        # OLD baked-image configs
         'minimax-m25-fp8',
         'qwen3-coder-next-fp8',
         'reap-139b-nvfp4',
         'reap-172b-nvfp4',
+        # NEW :latest + HF download configs (Task 515 / recovery 2026-04-06)
+        'qwen3-coder-next-fp8-new',
+        'reap-139b-nvfp4-new',
+        'reap-172b-nvfp4-gb10-new',
+        'minimax-m25-nvfp4-new',
+        'minimax-m25-fp8-new',
+        # Workstation tier
         'qwen3-coder-30b-q4',
         'devstral-small-2505-q6',
     }
 
-    def test_vllm_config_count_is_six(self):
-        """VLLM_EVAL_CONFIGS must have exactly 6 active entries (qwen25 was dropped)."""
-        assert len(VLLM_EVAL_CONFIGS) == 6, (
-            f'Expected 6 vLLM configs, got {len(VLLM_EVAL_CONFIGS)}: '
+    def test_vllm_config_count_is_eleven(self):
+        """VLLM_EVAL_CONFIGS must have exactly 11 active entries."""
+        assert len(VLLM_EVAL_CONFIGS) == 11, (
+            f'Expected 11 vLLM configs, got {len(VLLM_EVAL_CONFIGS)}: '
             f'{[c.name for c in VLLM_EVAL_CONFIGS]}'
         )
 
@@ -151,7 +166,7 @@ class TestEvalConfigsIncludesVllm:
     """EVAL_CONFIGS must be the canonical list that includes vLLM configs."""
 
     _CLOUD_BASELINE_COUNT = 7
-    _VLLM_COUNT = 6
+    _VLLM_COUNT = 11
 
     def test_eval_configs_includes_all_vllm_configs(self):
         """Every vLLM config name must be present in EVAL_CONFIGS."""
@@ -162,7 +177,7 @@ class TestEvalConfigsIncludesVllm:
         )
 
     def test_eval_configs_total_count(self):
-        """EVAL_CONFIGS must have 7 cloud baselines + 6 vLLM = 13 total entries."""
+        """EVAL_CONFIGS must have 7 cloud baselines + 11 vLLM = 18 total entries."""
         expected = self._CLOUD_BASELINE_COUNT + self._VLLM_COUNT
         assert len(EVAL_CONFIGS) == expected, (
             f'Expected {expected} configs, got {len(EVAL_CONFIGS)}: '
