@@ -10726,6 +10726,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 565,
+        "title": "Fix fragile test assertion in test_render_task_line_truncates_deps_over_5",
+        "description": "In `test_task_filter.py` line 610, remove `assert '6' not in result`. The preceding assertion `assert 'deps=[1, 2, 3, 4, 5]...' in result` fully characterizes the expected output. The bare `'6' not in result` would spuriously fail if the task's id or title were changed to contain the digit '6', making it an invisible coupling to unrelated fields. If explicit exclusion is desired, scope the check to the deps substring: `assert '6' not in result.split('deps=')[1]`.\n\nFiles: fused-memory/tests/test_task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10738,7 +10749,7 @@
       ],
       "created": "2026-04-07T03:39:47.326Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T03:44:02.607Z"
+      "updated": "2026-04-07T03:44:08.119Z"
     }
   }
 }
