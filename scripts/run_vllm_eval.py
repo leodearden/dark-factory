@@ -26,7 +26,7 @@ PROJECT_ROOT = "/home/leo/src/dark-factory"
 # container_disk must be ≥ 2.5× model size (HF download uses temp + final copies)
 MODELS = {
     "devstral-small":   ("devstral-small",   "devstral-small-2505-q6", 1, 250, {}),
-    "qwen3-coder-next": ("qwen3-coder-next", "qwen3-coder-next-fp8-new",  1, 400, {"DTYPE": "float8", "TOOL_CALL_PARSER": "qwen3_coder", "MAX_MODEL_LEN": "65536", "GPU_MEMORY_UTIL": "0.90"}),
+    "qwen3-coder-next": ("qwen3-coder-next", "qwen3-coder-next-fp8-new",  1, 400, {"DTYPE": "float8", "TOOL_CALL_PARSER": "qwen3_coder", "MAX_MODEL_LEN": "65536", "GPU_MEMORY_UTIL": "0.90", "ENFORCE_EAGER": "1"}),
     "reap-139b":        ("reap-139b",        "reap-139b-nvfp4",       1, 350, {}),
     "reap-172b":        ("reap-172b",        "reap-172b-nvfp4",       1, 430, {}),
     "minimax-m25":      ("minimax-m25",      "minimax-m25-fp8",       2, 570, {"DTYPE": "float8"}),
