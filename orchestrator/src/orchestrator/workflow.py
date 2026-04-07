@@ -580,23 +580,46 @@ class TaskWorkflow:
                 plan_path.unlink()
 
         prompt = await self.briefing.build_architect_prompt(self.task, worktree=self.worktree)
-        result = await self._invoke(ARCHITECT, prompt, self.worktree)
 
-        if not result.success:
-            logger.error(f'Task {self.task_id}: architect failed: {result.output[:200]}')
-            return await self._mark_blocked(
-                'Planning failed: architect invocation failed',
-                detail=f'Architect output:\n{result.output[:2000]}',
-            )
+        for attempt in range(2):
+            result = await self._invoke(ARCHITECT, prompt, self.worktree)
 
-        # Read the plan the architect wrote
-        self.plan = self.artifacts.read_plan()
+            if not result.success:
+                logger.error(f'Task {self.task_id}: architect failed: {result.output[:200]}')
+                return await self._mark_blocked(
+                    'Planning failed: architect invocation failed',
+                    detail=f'Architect output:\n{result.output[:2000]}',
+                )
+
+            # Detect anomalous premature exit: succeeded but suspiciously
+            # few turns and low cost — likely a transient CLI issue.
+            self.plan = self.artifacts.read_plan()
+            if (
+                attempt == 0
+                and result.turns <= 2
+                and result.cost_usd < 0.20
+                and not self.plan
+            ):
+                logger.warning(
+                    f'Task {self.task_id}: architect completed anomalously '
+                    f'(turns={result.turns}, cost=${result.cost_usd:.2f}, '
+                    f'duration={result.duration_ms}ms, output_len={len(result.output)}) '
+                    f'— retrying once'
+                )
+                continue
+
+            break
 
         if not self.plan:
             logger.error(f'Task {self.task_id}: architect produced no plan.json')
             return await self._mark_blocked(
                 'Planning failed: no plan.json produced',
-                detail='Architect succeeded but did not write .task/plan.json',
+                detail=(
+                    f'Architect succeeded but did not write .task/plan.json\n'
+                    f'turns={result.turns}, cost=${result.cost_usd:.2f}, '
+                    f'duration={result.duration_ms}ms\n'
+                    f'Architect output:\n{result.output[:2000]}'
+                ),
             )
 
         if not self.plan.get('steps'):
