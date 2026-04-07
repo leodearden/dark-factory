@@ -10837,6 +10837,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 575,
+        "title": "Add missing edge-case tests for context_assembler Pass 1 propagation",
+        "description": "Two new test methods in TestContextAssemblerCancellation (or a new class) in test_context_assembler.py:\n\n1. **Exception-only batch regression test** — patch `_fetch_context` to raise RuntimeError on all calls, then assert `assemble()` returns a normal AssembledPayload without raising. This confirms Pass 1 does not over-eagerly propagate Exception subclasses; a future off-by-one mistake or broadened isinstance check could accidentally make Pass 1 propagate ordinary RuntimeErrors, and this test would catch it.\n\n2. **Second-batch CancelledError propagation test** — create more events than `context_fetch_batch_size` (e.g., 12 events with batch_size=10) with `patched_fetch_context` raising CancelledError only for an event in the second batch. Assert that CancelledError propagates out of `assemble()` despite the first batch succeeding. The assemble() while-loop processes events in multiple batches and Pass 1 runs inside the loop on each batch, but the second-batch case is currently untested — a regression in loop structure (e.g., early-continue that skips the propagation pass on subsequent iterations) would go undetected.\n\nSource: review follow-up from task 512 (cycle 2026-04-07).\nRationale: pins the contract that Pass 1 propagates only structured-cancellation signals and does so on every batch, not just the first.\n\nFiles:\n- fused-memory/src/fused_memory/reconciliation/context_assembler.py (reference only)\n- fused-memory/tests/test_context_assembler.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10849,7 +10860,7 @@
       ],
       "created": "2026-04-07T04:04:41.194Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T04:04:48.156Z"
+      "updated": "2026-04-07T04:04:55.765Z"
     }
   }
 }
