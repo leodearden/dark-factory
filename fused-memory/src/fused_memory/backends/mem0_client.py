@@ -72,7 +72,7 @@ class Mem0Backend:
         if project_id not in self._instances:
             collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
             config_dict = self._build_config_dict(collection_name)
-            instance = await AsyncMemory.from_config(config_dict)
+            instance = AsyncMemory.from_config(config_dict)  # type: ignore[assignment]
             self._instances[project_id] = instance
             logger.info(f'Mem0 instance created for project {project_id} (collection: {collection_name})')
         return self._instances[project_id]

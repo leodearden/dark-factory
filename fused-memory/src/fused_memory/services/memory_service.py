@@ -1,6 +1,7 @@
 """Core orchestration layer — owns backends, classifier, router, queue."""
 
 import asyncio
+import contextlib
 import logging
 import uuid as uuid_mod
 from datetime import datetime
@@ -20,7 +21,6 @@ from fused_memory.models.enums import (
 from fused_memory.models.memory import (
     AddEpisodeResponse,
     AddMemoryResponse,
-    ClassificationResult,
     MemoryResult,
     ReadRouteResult,
 )
@@ -311,10 +311,8 @@ class MemoryService:
 
             category = None
             if 'category' in meta:
-                try:
+                with contextlib.suppress(ValueError):
                     category = MemoryCategory(meta['category'])
-                except ValueError:
-                    pass
 
             results.append(MemoryResult(
                 id=item.get('id', ''),

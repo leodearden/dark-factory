@@ -1,7 +1,8 @@
 """Thin async wrapper around the Graphiti client."""
 
+import contextlib
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -39,7 +40,7 @@ class GraphitiBackend:
                     api_key=api_key,
                     model=cfg.llm.model,
                     small_model=cfg.llm.model,
-                    temperature=cfg.llm.temperature,
+                    temperature=cfg.llm.temperature or 0.0,
                     max_tokens=cfg.llm.max_tokens,
                 )
                 llm_client = OpenAIClient(config=llm_config)
@@ -53,7 +54,7 @@ class GraphitiBackend:
                     llm_config = GraphitiLLMConfig(
                         api_key=api_key,
                         model=cfg.llm.model,
-                        temperature=cfg.llm.temperature,
+                        temperature=cfg.llm.temperature or 0.0,
                         max_tokens=cfg.llm.max_tokens,
                     )
                     llm_client = AnthropicClient(config=llm_config)
@@ -116,7 +117,7 @@ class GraphitiBackend:
     ) -> Any:
         """Add an episode to Graphiti and return the result."""
         client = self._require_client()
-        ref_time = reference_time or datetime.now(timezone.utc)
+        ref_time = reference_time or datetime.now(UTC)
         result = await client.add_episode(
             name=name,
             episode_body=content,
@@ -189,9 +190,7 @@ class GraphitiBackend:
     async def close(self) -> None:
         """Shut down the driver."""
         if self._driver is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await self._driver.close()
-            except Exception:
-                pass
         self.client = None
         self._driver = None
