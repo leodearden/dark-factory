@@ -1,7 +1,66 @@
 # vLLM Local Model Evaluation — Status Report
 
-**Last updated:** 2026-04-06 ~16:05 BST
-**Session summary:** Survived two laptop reboots, refactored the eval config system, revealed a systemic `vLLM → Claude CLI` tool-format bridge bug that blocks all local-model evals.
+**Last updated:** 2026-04-07 09:30 BST
+**Status:** First successful vLLM-hosted eval achieved (reap-139b-nvfp4-new with minimax_m2 parser, 2026-04-06 19:35).
+
+## Update 2026-04-07: root cause identified + recovery
+
+### What we now know
+
+**The "tool-format bridge bug" diagnosed in the morning session was a misframing.** vLLM 0.19 ships a native Anthropic adapter (`vllm/entrypoints/anthropic/api_router.py` + `serving.py`) that converts `/v1/messages` requests to OpenAI internally, runs inference, then converts responses back. The bridge layer works at the protocol level — verified via local netcat probe of Claude CLI 2.1.92 outbound traffic.
+
+**The actual root cause was wrong tool-call parsers**, configured per-model in `--tool-call-parser`:
+- MiniMax M2.5 emits `<minimax:tool_call><invoke name="..."><parameter name="...">...</parameter></invoke></minimax:tool_call>` XML — needs `--tool-call-parser minimax_m2`
+- Qwen3-Coder-Next emits `<tool_call><function=name><parameter=name>val</parameter></function></tool_call>` XML — needs `--tool-call-parser qwen3_coder`
+- Both were configured with `hermes` (which expects `<tool_call>{json}</tool_call>`)
+
+Two distinct failure modes from this single misconfiguration:
+1. **MiniMax + hermes**: parser doesn't recognise `<minimax:tool_call>` at all → output passes through as plain text in the assistant message → CLI sees a "successful" final answer with embedded XML → no tool ever executes → silent no-op iterations → `outcome=blocked` after exhaustion
+2. **Qwen3-Coder + hermes**: parser sees the `<tool_call>` start tag but mis-parses the inner XML body as JSON → produces a malformed `tool_use` block → CLI errors with `subtype=error_during_execution` (the symptom we originally diagnosed)
+
+vLLM 0.19's tool parser registry (`vllm/tool_parsers/__init__.py`) has 25+ registered parsers including dedicated entries for `minimax_m2`, `qwen3_coder`, `qwen3_xml`, `mistral`, `kimi_k2`, `gemma4`, `llama3_json`, `deepseek_v3/v31/v32`, etc.
+
+### First successful vLLM eval (2026-04-06 19:35)
+
+`reap-139b-nvfp4-new` with `minimax_m2` parser on 1× RTX PRO 6000 Blackwell:
+- 273 turns, 47,708 output tokens at 41.89 tok/s
+- 4 implementer iterations + 2 debug cycles
+- 171 lines changed across 10 files
+- **Tests pass, lint clean, typecheck clean, verification passed**
+- Outcome was `blocked` *only* because all 5 Claude sonnet reviewers hit the Max usage cap ("resets 11pm")
+- Result file: `df_task_12__reap-139b-nvfp4-new__97cc6a12.json`
+
+### Bridge + parser are complementary, not competing
+
+`shared/src/shared/vllm_bridge.py` (Task 457) is now active on every vLLM eval call. It normalises `tool_use.id` to `toolu_` prefix, parses JSON-string `input` fields, and fixes `stop_reason='tool_calls'` → `'tool_use'`. These are residual format quirks that vLLM's native Anthropic adapter doesn't fully clean up. The bridge is necessary even with the right parser, but the right parser is the larger fix — it eliminates the malformed-tool-call class entirely at the source.
+
+### Three infrastructure blockers fixed in entrypoint-vllm.sh
+
+Patched in `/home/leo/src/runpod-toolkit/docker/entrypoint-vllm.sh` (separate repo, survived the working-tree wipe):
+
+1. **`--trust-remote-code` (unconditional)** — required for all MiniMax M2.5 variants. The architecture isn't yet upstream in transformers, so HF returns the repo with an `auto_map` pointing at `modeling_minimax_m2.py`, which requires opt-in execution. Without this flag, vLLM crashes instantly with `pydantic.ValidationError`. Qwen models don't need it.
+
+2. **`--gpu-memory-utilization ${GPU_MEMORY_UTIL:-0.95}`** — vLLM 0.19 changed CUDA graph memory accounting: graphs are now profiled and reserved inside the GMU budget. The default 0.9 leaves too little KV cache headroom for large models on tight GPUs. For lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4 (78 GB weights + 5.77 GB CUDA graphs) on 96 GB RTX PRO 6000, 0.9 left only 3.85 GB for KV cache. 0.97 gives ~10.5 GB → 88,752 token KV pool.
+
+3. **`--max-num-seqs ${MAX_NUM_SEQS:-16}`** — vLLM defaults to 1024, which pre-allocates a sampler softmax buffer per slot during warmup. On tight pods at 0.97 GMU, this OOMs the sampler warmup by ~782 MiB. Each eval pod serves one implementer at a time, so 16 is plenty (~16 GB savings vs default).
+
+### Active blockers
+
+**Qwen3-Coder-Next-FP8 startup hang** (NOT memory-related, confirmed on both 96 GB RTX PRO 6000 and 141 GB H200 SXM):
+- vLLM process stays alive, model fully loaded into VRAM, but `/health` never returns 200
+- Likely stuck in torch.compile or CUDA graph capture
+- **Task 515's discovery (on branch, not yet merged)**: `--enforce-eager` (i.e. `ENFORCE_EAGER=1` env var, requires entrypoint hook) disables CUDA graph capture and may fix the hang. The hook needs to be added to `entrypoint-vllm.sh` and the image rebuilt.
+- Container logs are required for full diagnosis but RunPod doesn't preserve them after pod termination — must capture from web console or via SSH while the pod is live
+
+### The destructive overnight window
+
+The orchestrator was started on dark-factory by mistake (should have been on reify) and ran ~351 commits between session end (~21:30 BST 2026-04-06) and ~07:16 BST 2026-04-07. During that window, the working tree's uncommitted state — the morning refactor + our session edits to `configs.py`, `cli_invoke.py`, `run_vllm_eval.py`, and this doc — was destroyed. Most likely cause: the orchestrator's `merge-queue stash/sync` mechanism tried to stash uncommitted changes around a merge, hit a conflict on stash pop (we found the conflict-marker version in the unreachable git objects), and silently dropped the state instead of preserving it in the stash list.
+
+Recovery: `git fsck --unreachable` surfaced 88,871 unreachable commits and 72,318 unreachable blobs. Searching the blobs by size + distinctive content strings (`tool_call_parser='minimax_m2'`, `RUNPOD_CONFIG_NAMES`, `MAX_NUM_SEQS`, `stdout_text_for_log`, `Last updated: 2026-04-06 ~16:05 BST`) found clean copies of all four files. Restored on branch `recover/vllm-eval-session-2026-04-06`.
+
+**Lesson:** Never leave significant uncommitted work in a worktree where the orchestrator could be running. Commit aggressively to a feature branch.
+
+---
 
 ## Bridge fix (Task 457)
 
