@@ -343,7 +343,7 @@ def discover_orchestrators(config: DashboardConfig) -> list[dict]:
             'pids': [p['pid'] for p in group],
             'prd': prd,
             'label': label,
-            'project_root': str(project_root),
+            'project_root': str(project_root.resolve()),
             'running': any(p['running'] for p in group),
             'started': group[0]['started'],
             'tasks': tasks,
