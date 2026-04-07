@@ -9636,9 +9636,13 @@
           "memory_hints": {
             "entities": [],
             "queries": [
-              "resolution for: Fill test coverage gaps in task_filter and harness tests"
+              "task 455 task_filter.py harness filtered_task_tree integration",
+              "task_filter.py done_tasks field task 477",
+              "test_task_filter.py char-budget clamp max_tasks cap tests"
             ]
-          }
+          },
+          "_causation_id": "7027ea16-3021-4775-9460-2c6506f6cfee",
+          "blocker_context": "task_455_unmerged_to_main"
         }
       },
       {
