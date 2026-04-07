@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from orchestrator.evals.configs import (
@@ -10,6 +12,19 @@ from orchestrator.evals.configs import (
     EvalConfig,
     get_config_by_name,
 )
+
+
+@pytest.fixture
+def vllm_env_sandbox(monkeypatch):
+    """Replace each vLLM config's env_overrides with a deep copy for test isolation.
+
+    Monkeypatch restores the original dicts on teardown, so the module-level
+    singletons are never mutated. Shared-reference invariant between
+    VLLM_EVAL_CONFIGS and EVAL_CONFIGS is preserved because we're swapping
+    the attribute on the same EvalConfig instances.
+    """
+    for cfg in VLLM_EVAL_CONFIGS:
+        monkeypatch.setattr(cfg, 'env_overrides', copy.deepcopy(cfg.env_overrides))
 
 
 class TestVllmConfigStructure:
