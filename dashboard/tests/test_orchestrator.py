@@ -898,6 +898,22 @@ class TestResolveProjectRoot:
         prd = str(tmp_path / 'docs' / '..' / 'docs' / 'prd.md')
         assert _resolve_project_root(prd, Path('/fallback')) == tmp_path
 
+    def test_fallback_returns_resolved_default_root(self, tmp_path):
+        """Fallback path returns the resolved (canonical) default_root, not a symlink."""
+        from dashboard.data.orchestrator import _resolve_project_root
+
+        real = tmp_path / 'real'
+        real.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real)
+
+        # No .taskmaster anywhere in the PRD's ancestor chain → falls back to default_root
+        result = _resolve_project_root('/nowhere/prd.md', link)
+
+        # Must return the resolved real path, not the symlink
+        assert result == real
+        assert result != link
+
 
 class TestScanWorktrees:
     """Tests for _scan_worktrees — reads worktree artifacts from a directory."""
