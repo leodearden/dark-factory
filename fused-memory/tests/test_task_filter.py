@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 
 from fused_memory.reconciliation.task_filter import (
-    FilteredTaskTree,
     _STATUS_PRIORITY,
+    FilteredTaskTree,
     _render_task_line,
     filter_task_tree,
     format_filtered_task_tree,
