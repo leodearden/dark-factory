@@ -19,6 +19,16 @@ from pydantic_settings import (
 logger = logging.getLogger(__name__)
 
 
+class ConfigRequiredError(Exception):
+    """Raised when no orchestrator config is provided via --config or ORCH_CONFIG_PATH.
+
+    The orchestrator deliberately refuses to auto-detect target projects from cwd,
+    because silent defaults previously caused cross-project execution that lost work
+    (2026-04-06 incident: /orchestrate run from ~/src/reify silently executed
+    dark-factory tasks because cwd-based discovery picked dark-factory's own config).
+    """
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Deep-merge *override* into *base*.  Override values win at leaf level."""
     merged = base.copy()
@@ -375,44 +385,44 @@ class OrchestratorConfig(BaseSettings):
         return (init_settings, env_settings, yaml_settings, dotenv_settings)
 
 
-def _find_config(explicit_path: Path | None) -> Path | None:
-    """Find the config file to load, searching standard locations.
-
-    Search order:
-    1. explicit_path (if given and exists)
-    2. ORCH_CONFIG_PATH env var (if set and exists)
-    3. cwd/config.yaml
-    4. cwd/orchestrator/config.yaml
-    """
-    if explicit_path is not None:
-        return explicit_path if explicit_path.exists() else None
-    env_path = os.environ.get('ORCH_CONFIG_PATH')
-    if env_path:
-        p = Path(env_path)
-        if p.exists():
-            return p
-    cwd_config = Path('config.yaml')
-    if cwd_config.exists():
-        return cwd_config
-    orch_config = Path('orchestrator') / 'config.yaml'
-    if orch_config.exists():
-        return orch_config
-    return None
-
-
 def load_config(config_path: Path | None = None) -> OrchestratorConfig:
-    """Load configuration from YAML file, env vars, and defaults."""
-    found = _find_config(config_path)
-    if found:
-        os.environ['ORCH_CONFIG_PATH'] = str(found)
-    elif 'ORCH_CONFIG_PATH' in os.environ:
-        # Clear stale env var so YamlSettingsSource returns {}
-        del os.environ['ORCH_CONFIG_PATH']
-    config = OrchestratorConfig()
-    if found is None:
-        logger.info(
-            'No project config file found (checked config.yaml, orchestrator/config.yaml). '
-            'Using package defaults. Pass --config or set ORCH_CONFIG_PATH to specify.',
+    """Load configuration from an explicit YAML file.
+
+    Resolution order:
+    1. ``config_path`` argument (typically from ``--config`` flag)
+    2. ``ORCH_CONFIG_PATH`` environment variable
+
+    If neither is set, raises :class:`ConfigRequiredError`. The orchestrator does
+    NOT auto-discover from cwd — see ``ConfigRequiredError`` docstring for the
+    rationale.
+    """
+    if config_path is None:
+        env_path = os.environ.get('ORCH_CONFIG_PATH')
+        if not env_path:
+            raise ConfigRequiredError(
+                '--config is required (or set ORCH_CONFIG_PATH).\n\n'
+                'The orchestrator does not auto-detect the target project from cwd; '
+                'this safeguard exists because silent defaults previously caused '
+                'cross-project execution that lost work.\n\n'
+                'Examples:\n'
+                '  uv run --project orchestrator orchestrator run \\\n'
+                '      --config /home/leo/src/reify/orchestrator.yaml\n'
+                '  ORCH_CONFIG_PATH=/home/leo/src/reify/orchestrator.yaml \\\n'
+                '      uv run --project orchestrator orchestrator run\n\n'
+                'See skills/orchestrate/references/project-setup.md for setup '
+                'instructions.'
+            )
+        config_path = Path(env_path)
+
+    if not config_path.exists():
+        raise ConfigRequiredError(
+            f'Config file not found: {config_path}\n\n'
+            f'Pass an explicit --config path or set ORCH_CONFIG_PATH to a valid '
+            f'file. See skills/orchestrate/references/project-setup.md for setup '
+            f'instructions.'
         )
+
+    os.environ['ORCH_CONFIG_PATH'] = str(config_path)
+    config = OrchestratorConfig()
     config._module_configs = _discover_module_configs(config.project_root)
     return config

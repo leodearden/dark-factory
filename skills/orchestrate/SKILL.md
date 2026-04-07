@@ -17,7 +17,7 @@ This skill is about driving the **orchestrator** — not about implementing task
 
 The orchestrator binary lives in `/home/leo/src/dark-factory/orchestrator` and is **always** invoked from there (because `uv run --project orchestrator` resolves the package path). But the **target project** — the codebase whose tasks the orchestrator operates on — is determined entirely by the **config file**, which sets `project_root` and `fused_memory.project_id`.
 
-When the user invokes /orchestrate, they expect it to operate on the project they are currently in — *not* on dark-factory by default. Running it on the wrong project will silently execute tasks against the wrong codebase. This is the single most common foot-gun in this skill. Fix it before doing anything else.
+When the user invokes /orchestrate, they expect it to operate on the project they are currently in — *not* on dark-factory by default. The orchestrator binary now refuses to start without an explicit target (`--config` flag or `ORCH_CONFIG_PATH` env var) — there is no auto-discovery and no default. Identify the target project before any other action.
 
 ### Step 1 — capture the user's cwd
 
@@ -28,39 +28,56 @@ pwd
 # e.g. /home/leo/src/reify   →   TARGET_PROJECT = /home/leo/src/reify
 ```
 
-### Step 2 — locate the target project's orchestrator config
+### Step 2 — find the target project's config (`TARGET_CONFIG`)
 
-The orchestrator's config-discovery only checks `cwd/config.yaml` and `cwd/orchestrator/config.yaml` (note: it does **not** auto-discover `cwd/orchestrator.yaml`), and it always runs with cwd = dark-factory. **For any project other than dark-factory you must pass `--config` explicitly.** Find the target's config:
+First, check whether `ORCH_CONFIG_PATH` is already set in the environment — if direnv loaded the project's `.envrc`, this is automatic and you're done:
+
+```bash
+echo "${ORCH_CONFIG_PATH:-unset}"
+# If a path is shown: that IS your TARGET_CONFIG. Verify it matches TARGET_PROJECT.
+# If "unset": continue below.
+```
+
+If unset, find the config file in the target project. Filenames vary across projects (no auto-discovery — every project chose its own name); check all common locations:
 
 ```bash
 ls "$TARGET_PROJECT"/orchestrator.yaml \
+   "$TARGET_PROJECT"/orchestrator-config.yaml \
    "$TARGET_PROJECT"/config.yaml \
    "$TARGET_PROJECT"/orchestrator/config.yaml 2>/dev/null
 ```
 
+Known locations for the three current projects:
+
+| Project | TARGET_CONFIG |
+|---------|---------------|
+| dark-factory | `/home/leo/src/dark-factory/orchestrator/config.yaml` |
+| reify | `/home/leo/src/reify/orchestrator.yaml` |
+| autopilot-video | `/home/leo/src/autopilot-video/orchestrator-config.yaml` |
+
 Verify the file actually points at the target:
 
 ```bash
-grep -E '^project_root|project_id' <found-config>
+grep -E '^project_root|project_id' "$TARGET_CONFIG"
 # Expect: project_root: "/home/leo/src/<target>"
 #         project_id: "<target>"
 ```
 
-If no config exists for the target, **stop and ask the user**. Do not silently fall back to dark-factory's config — that is exactly the bug this section exists to prevent.
+If no config exists for the target, **stop and ask the user** — the project may need an orchestrator config created before it can be run. See `references/project-setup.md` for the schema.
 
 ### Step 3 — use the target everywhere for the rest of the session
 
-Once you've identified `TARGET_PROJECT` and `TARGET_CONFIG`, every command and MCP call below must use them — never substitute `/home/leo/src/dark-factory` unless that *is* the target:
+Once you've identified `TARGET_PROJECT` and `TARGET_CONFIG`, every command and MCP call below must use them — `--config "$TARGET_CONFIG"` (or `ORCH_CONFIG_PATH="$TARGET_CONFIG"`) is required on every orchestrator invocation:
 
 | Where | Use |
 |-------|-----|
 | Launch / status command | `cd /home/leo/src/dark-factory` (binary lives there) **and** `--config "$TARGET_CONFIG"` |
 | `project_root="..."` in fused-memory MCP calls (`get_tasks`, `add_task`, `set_task_status`, `add_dependency`, `update_task`, etc.) | `"$TARGET_PROJECT"` |
 | Worktree inspection paths | `"$TARGET_PROJECT"/.worktrees/<task-id>` |
-| `project_id` in `add_memory` writes | the `project_id` from `TARGET_CONFIG` (e.g. `"reify"`, `"dark_factory"`) |
+| `project_id` in `add_memory` writes | the `project_id` from `TARGET_CONFIG` (e.g. `"reify"`, `"dark_factory"`, `"autopilot_video"`) |
 | Manual git merge target | `"$TARGET_PROJECT"` (the target's `main` branch, not dark-factory's) |
 
-The only time you can omit `--config` and use `/home/leo/src/dark-factory` for `project_root` is when the user is actually working on dark-factory itself (cwd = `/home/leo/src/dark-factory`).
+There are no exceptions — even when the target *is* dark-factory, `--config` (or `ORCH_CONFIG_PATH`) must be set. See `references/project-setup.md` for `.envrc`/direnv ergonomics.
 
 ## Determine what the user wants
 
@@ -154,7 +171,7 @@ Jump to [Execute Tasks](#execute-tasks).
 
 Before launching, verify:
 
-0. **Target project is identified** — you must already have run `pwd` and located `TARGET_CONFIG` per the [Critical: identify the target project FIRST](#critical-identify-the-target-project-first) section. If you haven't, do that now. If you skip it, you will run dark-factory tasks by default.
+0. **Target project is identified** — you must already have run `pwd` and located `TARGET_CONFIG` per the [Critical: identify the target project FIRST](#critical-identify-the-target-project-first) section. If you haven't, do that now. If you skip it, the orchestrator will refuse to start and emit an educational error pointing here.
 
 1. **Services are reachable** — run a quick health check:
    ```bash
@@ -171,25 +188,25 @@ Before launching, verify:
 
 ### Launch
 
-The orchestrator binary is invoked from `/home/leo/src/dark-factory` (that's where `uv run --project orchestrator` resolves), and `--config` selects which project it operates on:
+The orchestrator binary is invoked from `/home/leo/src/dark-factory` (that's where `uv run --project orchestrator` resolves). `--config` (or `ORCH_CONFIG_PATH`) selects the target project and is **required on every invocation** — no exceptions, no auto-discovery, no defaults.
 
 ```bash
 cd /home/leo/src/dark-factory
 
-# Target = a non-dark-factory project (the common case): --config is REQUIRED
+# Run existing tasks against the target project
 uv run --project orchestrator orchestrator run --config "$TARGET_CONFIG"
 
-# Or with a PRD to decompose first
+# Or decompose a PRD first, then run
 uv run --project orchestrator orchestrator run --config "$TARGET_CONFIG" --prd <path-to-prd>
 
-# Target = dark-factory itself: --config can be omitted (auto-discovery picks orchestrator/config.yaml)
-uv run --project orchestrator orchestrator run
+# Equivalent form using ORCH_CONFIG_PATH (e.g. when direnv loaded the project's .envrc):
+ORCH_CONFIG_PATH="$TARGET_CONFIG" uv run --project orchestrator orchestrator run
 ```
 
-If you omit `--config` while the user is in any project other than dark-factory, the orchestrator will load dark-factory's config and execute dark-factory tasks. This is the bug to avoid — always pass `--config` explicitly unless you have just verified the target *is* dark-factory.
+If you omit both `--config` and `ORCH_CONFIG_PATH`, the orchestrator exits 1 with an educational error message pointing at `references/project-setup.md`. There is no silent fallback — this is the hard guard against the cross-project execution incident that lost work.
 
 **Options:**
-- `--config <path>` — selects the target project (sets `project_root` and `fused_memory.project_id`). **Required for any project other than dark-factory.** Auto-discovery only checks `cwd/config.yaml` and `cwd/orchestrator/config.yaml`, both inside dark-factory.
+- `--config <path>` — **required** unless `ORCH_CONFIG_PATH` is set. Selects the target project (sets `project_root` and `fused_memory.project_id`). When both are set, `--config` wins.
 - `--prd <path>` — path to PRD markdown file. If omitted, skips PRD parsing and runs existing pending tasks.
 - `--dry-run` — verify task tree and module tags, but don't execute workflows. Useful for confirming you're pointed at the right project before committing to a real run.
 - `--verbose` — debug-level logging.
@@ -234,12 +251,11 @@ If any tasks are blocked, jump to [Resolve Blocks](#resolve-blocks).
 
 ## Check Status
 
-Identify the target project first (see [Critical: identify the target project FIRST](#critical-identify-the-target-project-first)), then query its status. The `status` subcommand also takes `--config`:
+Identify the target project first (see [Critical: identify the target project FIRST](#critical-identify-the-target-project-first)), then query its status. The `status` subcommand also requires `--config` (or `ORCH_CONFIG_PATH`):
 
 ```bash
 cd /home/leo/src/dark-factory
 uv run --project orchestrator orchestrator status --config "$TARGET_CONFIG"
-# (omit --config only when the target is dark-factory itself)
 ```
 
 This queries the fused-memory task tree and displays each task's status and module assignments:
@@ -351,9 +367,9 @@ Once the task tree is accurate, jump to [Execute Tasks](#execute-tasks). The orc
 
 ## Configuration
 
-The dark-factory default config lives at `orchestrator/config.yaml`. Config is auto-discovered relative to the orchestrator's cwd (which is `/home/leo/src/dark-factory`): if no `--config` flag is passed, the CLI checks `cwd/config.yaml`, then `cwd/orchestrator/config.yaml`. YAML values support `${VAR_NAME}` and `${VAR_NAME:default}` environment variable expansion.
+The config file is selected via `--config <path>` or `ORCH_CONFIG_PATH=<path>` — there is **no auto-discovery from cwd**. The orchestrator binary refuses to start without one of these set, by design. See `references/project-setup.md` for the rationale, the schema for new project configs, and `.envrc`/direnv ergonomics.
 
-**Important consequence for non-dark-factory projects**: auto-discovery only finds dark-factory's own configs. To run against any other project (e.g. reify, with its config at `/home/leo/src/reify/orchestrator.yaml`), you **must** pass `--config <path>` explicitly. See [Critical: identify the target project FIRST](#critical-identify-the-target-project-first) for the full discovery procedure. Note also that the auto-discovery names are `config.yaml` / `orchestrator/config.yaml` — a file named `orchestrator.yaml` (singular, in repo root) is not auto-discovered and must be passed via `--config`.
+YAML values in the loaded config support `${VAR_NAME}` and `${VAR_NAME:default}` environment variable expansion.
 
 ### Core settings
 

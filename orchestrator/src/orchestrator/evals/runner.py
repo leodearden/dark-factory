@@ -18,7 +18,6 @@ from orchestrator.config import (
     ModelsConfig,
     OrchestratorConfig,
     SandboxConfig,
-    load_config,
 )
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
@@ -94,7 +93,9 @@ def build_eval_orch_config(
     Reviewers always run on Claude sonnet (consistent quality bar).
     Only the implementer varies per eval config.
     """
-    base = base_config or load_config()
+    if base_config is None:
+        raise ValueError('build_eval_orch_config requires an explicit base_config')
+    base = base_config
 
     models = ModelsConfig(
         architect='opus',
