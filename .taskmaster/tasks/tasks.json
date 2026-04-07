@@ -9594,9 +9594,15 @@
           "memory_hints": {
             "entities": [],
             "queries": [
-              "resolution for: Unify filtered_task_tree injection pattern in harness.py and avoid redundant fetch"
+              "task 455 task_filter.py harness filtered_task_tree integration",
+              "harness _configure_consolidator _run_remediation_pass filtered_task_tree",
+              "redundant get_tasks call remediation pass",
+              "task 455 merge conflict task_filter test_task_filter"
             ]
-          }
+          },
+          "_causation_id": "7027ea16-3021-4775-9460-2c6506f6cfee",
+          "blocker_context": "task_455_unmerged_to_main",
+          "status_anomaly_note": "briefly set done 23:14:26 then reverted 23:14:37; implementation exists in worktree, review found issues"
         }
       },
       {
