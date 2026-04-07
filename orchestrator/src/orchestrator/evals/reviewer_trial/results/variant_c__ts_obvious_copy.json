@@ -1,0 +1,100 @@
+{
+  "variant_name": "variant_c",
+  "diff_id": "ts_obvious_copy",
+  "reviews": {
+    "opus_strategic": {
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:249-288",
+          "category": "code_duplication",
+          "description": "focusOnBounds duplicates the exact camera-framing logic already present in fitToView (lines 200-217) and flyToEntity (lines 229-245). The bounding-box-to-camera-distance formula, viewDir calculation, camera positioning, lookAt, updateProjectionMatrix, and controls.target sync are identical across all three. This is now the third copy of the same algorithm in this file.",
+          "suggested_fix": "Extract the shared camera-framing logic into a single private helper (e.g., `frameBounds(bounds: Box3, padding?: number)`), then rewrite fitToView, flyToEntity, and focusOnEntities to call it. This eliminates triplication and ensures future fixes (e.g., aspect-ratio-aware framing) only need one change."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:249-288",
+          "category": "module_boundary",
+          "description": "Camera framing is a camera concern, not a selection concern. Adding focusOnBounds and focusOnEntities deepens the coupling of selection management to camera positioning. With fitToView, flyToEntity, and now two more focus methods, the selection manager is becoming a camera controller.",
+          "suggested_fix": "Consider extracting all camera-framing functions into a dedicated cameraUtils.ts (or extending the existing controls.ts). The selection manager can delegate to it. This keeps selection.ts focused on hover/select state and would also let the measurement tool call the camera utility directly without going through selection."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:262",
+          "category": "api_contract",
+          "description": "focusOnBounds and focusOnEntities are defined but not exposed in the returned SelectionContext object (line 262 only returns: setHovered, setSelected, refreshSelected, fitToView, flyToEntity, invalidateRect, dispose). They are dead code unless the return value is also updated.",
+          "suggested_fix": "Add focusOnEntities (and possibly focusOnBounds) to the returned object. If focusOnBounds is intended as internal-only, that's fine, but focusOnEntities must be returned to be callable from outside createSelectionManager."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:259",
+          "category": "performance",
+          "description": "focusOnBounds has a default padding of 1.2 while fitToView and flyToEntity use an implicit padding of 1.0 (no multiplier on maxDim). This behavioral inconsistency means focusOnBounds backs the camera 20% further out than the other two methods for the same geometry, which could be confusing for users.",
+          "suggested_fix": "Decide on a consistent default padding factor. If 1.2 is the better UX, apply it to all framing methods. If 1.0 is correct, change the default parameter to 1.0."
+        }
+      ],
+      "reviewer": "opus_strategic",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The diff adds two new camera-framing functions (focusOnBounds, focusOnEntities) that are architecturally redundant with the existing fitToView and flyToEntity methods, creating the third copy of an identical bounding-box-to-camera-distance algorithm. More critically, neither new function is exposed in the returned SelectionContext object, making them unreachable dead code. The padding default (1.2) also differs from the existing methods (implicit 1.0). A shared helper should be extracted to eliminate triplication, and the functions should either be added to the return value or extracted to a dedicated camera utility module to respect module boundaries."
+    },
+    "sonnet_test_analyst": {
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "gui/src/viewport/selection.ts:246-287",
+          "category": "untestable_dead_code",
+          "description": "Both `focusOnBounds` and `focusOnEntities` are private inner closures that are never added to the returned `SelectionContext` interface (which exports only: setHovered, setSelected, refreshSelected, fitToView, flyToEntity, invalidateRect, dispose). The docstring says these are 'used by the measurement tool' but no external caller can reach them. The existing test suite for selection.ts exercises every public method via the returned SelectionContext object \u2014 these two functions cannot be tested (or used) in their current form.",
+          "suggested_fix": "Add `focusOnBounds` and `focusOnEntities` to the `SelectionContext` interface and return them from `createSelection`, following the same pattern as `flyToEntity`. Without this, tests cannot be written and the measurement tool cannot call them."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/viewport/selection.test.ts",
+          "category": "missing_test_suite",
+          "description": "No tests are added for `focusOnBounds`. The existing test file covers every other public function with ~7 tests each (fitToView: lines 544\u2013660, flyToEntity: lines 730\u2013828). The following behaviors need tests: (1) happy path \u2014 camera distance formula with default padding 1.2, calls camera.lookAt() with box center, calls camera.updateProjectionMatrix(), updates controls.target; (2) early-return when bounds.isEmpty() is true; (3) custom padding overrides default; (4) controls absent \u2014 controls.target is not updated when controls is undefined.",
+          "suggested_fix": "Add a `describe('focusOnBounds')` block in selection.test.ts mirroring the fitToView test structure. Use MockBox3 (already defined at line 50) with isEmpty returning true/false to drive the two code paths. Assert camera.position, camera.lookAt, camera.updateProjectionMatrix, and controls.target.copy call counts and arguments."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/viewport/selection.test.ts",
+          "category": "missing_test_suite",
+          "description": "No tests are added for `focusOnEntities`. Missing coverage: (1) happy path with multiple valid entity paths \u2014 getMeshes() returns entries for all paths, box is expanded for each, camera is repositioned; (2) empty entityPaths array \u2014 box stays empty, function is a no-op; (3) partially unknown paths \u2014 getMeshes() has no entry for some paths, those are skipped silently via the `if (mesh)` guard, combined box built from valid entries only; (4) all paths unknown \u2014 resulting box is empty, function is a no-op (exercises isEmpty guard inside focusOnBounds).",
+          "suggested_fix": "Add a `describe('focusOnEntities')` block. Configure mockGetMeshes to return a Map with some known and some unknown keys. Assert expandByObject call count matches only the found meshes. Assert no-op (camera.lookAt not called) when all paths are unknown or array is empty."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:270-271",
+          "category": "edge_case_not_tested",
+          "description": "`focusOnBounds` computes `maxDim` using only `Math.max(size.x, size.y, size.z)` (the largest axis of the bounding box), then divides by `2 * tan(verticalFovRad)`. For wide-aspect viewports, the horizontal extent of the box can exceed the camera's horizontal FOV after this calculation, clipping geometry at the sides. The camera's aspect ratio is never consulted. There is no test asserting the correct distance for a non-cubic bounding box with width >> height, which would expose this gap.",
+          "suggested_fix": "Add a test with a flat wide box (e.g., size = {x:10, y:1, z:1}) and verify the computed camera distance keeps the full width in view. If it does not, the formula should factor in aspect ratio: `effectiveFov = Math.min(fovRad, Math.atan(Math.tan(fovRad) * camera.aspect))` to pick the tighter constraint."
+        }
+      ],
+      "reviewer": "sonnet_test_analyst",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The diff introduces `focusOnBounds` and `focusOnEntities` as private inner closures inside `createSelectionManager`, but neither function is added to the `SelectionContext` return interface. This is a blocking problem: the functions are unreachable dead code that cannot be called by the measurement tool mentioned in their docstrings, and cannot be exercised by the test suite (which drives all behavior via the returned SelectionContext object). Beyond that, zero tests are provided for either function \u2014 a significant gap given that the existing test file dedicates ~7 tests each to the structurally identical `fitToView` and `flyToEntity` functions. Key untested behaviors include: the `isEmpty()` early-return guard in `focusOnBounds`, the default-vs-custom padding path, the optional-controls guard, partially-unknown entity paths in `focusOnEntities`, and the all-unknown-paths no-op case. A secondary concern is that the distance formula uses only vertical FOV with no aspect-ratio adjustment, which could clip wide geometry in landscape viewports; this warrants a targeted test to confirm or surface the failure."
+    },
+    "sonnet_robustness": {
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:focusOnBounds",
+          "category": "degenerate_input_handling",
+          "description": "The `distance` calculation has no guard for non-finite or zero results. If `maxDim` is 0 (a point bounding box, where all mesh vertices are co-located \u2014 `isEmpty()` returns false but all three size dimensions are 0), then `distance = 0` and the camera is placed exactly at `center`, producing a broken view. Likewise, if `camera.fov` were ever 0 or 180 (outside normal operation but possible via programmatic misconfiguration), `Math.tan(fovRad)` is 0 or approaches infinity, yielding `Infinity` or `0` for `distance`. Three.js silently accepts NaN/Infinity camera positions and can corrupt the render state, making this a silent failure rather than an obvious crash.",
+          "suggested_fix": "After computing `distance`, add a guard: `if (!isFinite(distance) || distance <= 0) return;`. This ensures that degenerate geometry (point clouds, zero-volume meshes) and misconfigured cameras fail safely instead of silently corrupting camera state."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:focusOnEntities",
+          "category": "performance_consistency",
+          "description": "`getMeshes()` is called once per loop iteration rather than being cached before the loop. In this codebase `getMeshes()` returns the internal mesh map directly (a cheap reference return), so this is harmless today. However, if the implementation ever changes to recompute or snapshot, this introduces unnecessary overhead per entity and a potential consistency hazard (the map could be replaced between iterations in a future async refactor).",
+          "suggested_fix": "Cache the result before the loop: `const meshes = getMeshes(); for (const path of entityPaths) { const mesh = meshes.get(path); ... }`. This matches the pattern used in `fitToView()` (which also caches via `const meshes = getMeshes()` at the top of the function) and is more defensive."
+        }
+      ],
+      "reviewer": "sonnet_robustness",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The two new functions (`focusOnBounds` and `focusOnEntities`) follow the existing patterns in this file well \u2014 the `bounds.isEmpty()` guard, the optional `controls` check, and the PerspectiveCamera assumption are all correct and consistent with `fitToView`/`flyToEntity`. However, `focusOnBounds` is missing a guard on the computed `distance` value: a bounding box that passes `isEmpty()` but has zero volume (all vertices co-located) produces `maxDim = 0` \u2192 `distance = 0`, silently placing the camera inside the geometry. Three.js accepts this without error, making it a silent failure mode. Additionally, `focusOnEntities` calls `getMeshes()` on every loop iteration rather than caching, which is inconsistent with the rest of the file and fragile against future implementation changes. Neither issue will cause a crash today, but the degenerate-distance path is a latent correctness bug for real-world point or degenerate mesh data."
+    }
+  },
+  "total_cost_usd": 0.74349835,
+  "wall_clock_ms": 127043,
+  "errors": []
+}

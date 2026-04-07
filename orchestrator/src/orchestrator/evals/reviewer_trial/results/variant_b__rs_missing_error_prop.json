@@ -1,0 +1,86 @@
+{
+  "variant_name": "variant_b",
+  "diff_id": "rs_missing_error_prop",
+  "reviews": {
+    "opus_bug_hunter": {
+      "reviewer": "opus_bug_hunter",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1963 (diff hunk, lower_string_literal)",
+          "category": "panic_on_malformed_input",
+          "description": "Changing `.unwrap_or(text)` to `.unwrap()` removes the safety fallback for malformed string nodes. The original code had an explicit comment: 'Strip outer quotes safely (error recovery can produce malformed nodes)'. Tree-sitter error recovery can produce nodes like `\"hello` (unclosed quote) where `strip_suffix('\"')` returns None, causing `.unwrap()` to panic at runtime. The existing test `unclosed_string_does_not_panic` in `crates/reify-syntax/tests/edge_case_tests.rs:55` verifies this exact invariant and will fail with this change.",
+          "suggested_fix": "Restore the original `.unwrap_or(text)` fallback to gracefully handle malformed string nodes from tree-sitter error recovery."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-syntax/src/ts_parser.rs (diff hunk, lower_single_quoted_string)",
+          "category": "panic_on_malformed_input",
+          "description": "The new `lower_single_quoted_string` method uses `.unwrap()` on `strip_prefix('\\'').and_then(|s| s.strip_suffix('\\''))` with no fallback. Malformed single-quoted strings from tree-sitter error recovery (e.g., `'hello` without closing quote) will cause a panic at runtime.",
+          "suggested_fix": "Use `.unwrap_or(text)` (matching the original pattern in `lower_string_literal`) to gracefully handle malformed single-quoted string nodes."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs (diff hunk, lower_single_quoted_string)",
+          "category": "dead_code",
+          "description": "The new `lower_single_quoted_string` method has no call site. The `lower_expr` dispatch match (line 1687) only maps `\"string_literal\"` to `lower_string_literal`. No tree-sitter node kind is mapped to `lower_single_quoted_string`, making it unreachable dead code.",
+          "suggested_fix": "Add a dispatch entry in `lower_expr` for the appropriate tree-sitter node kind (e.g., `\"single_quoted_string\" => self.lower_single_quoted_string(node)`), or remove the method if single-quoted strings are not part of the grammar."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/tests/edge_case_tests.rs",
+          "category": "missing_test_coverage",
+          "description": "There is no test for single-quoted string parsing (normal case, unclosed quote, empty). If `lower_single_quoted_string` is wired up, an unclosed single quote like `'hello` will panic, and there is no test to catch it.",
+          "suggested_fix": "Add tests analogous to `string_literal_normal`, `unclosed_string_does_not_panic`, and `empty_string_literal` for single-quoted strings."
+        }
+      ],
+      "summary": "The diff introduces two panicking `.unwrap()` calls in string-literal parsing where the original code intentionally used `.unwrap_or(text)` as a safety fallback for malformed tree-sitter nodes from error recovery. This is a regression: the existing test `unclosed_string_does_not_panic` explicitly verifies the parser doesn't crash on unclosed strings, and the change will cause that test to fail. The new `lower_single_quoted_string` method has the same unwrap-panic bug and additionally has no call site in the expression dispatch, making it dead code. Both `.unwrap()` calls should be replaced with `.unwrap_or(text)` to maintain crash-free parsing of malformed input."
+    },
+    "opus_design_critic": {
+      "reviewer": "opus_design_critic",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_string_literal (`.unwrap()` replacing `.unwrap_or(text)`)",
+          "category": "runtime_panic_on_malformed_input",
+          "description": "The original `.unwrap_or(text)` was a deliberate safety measure \u2014 the retained comment explicitly says 'error recovery can produce malformed nodes'. Replacing it with `.unwrap()` turns malformed tree-sitter nodes into a panic. The project's 'silent defaults should be noisy' convention (feedback_silent_defaults_pattern.md) means returning errors/Undef, NOT panicking. Since the function returns `Option<Expr>`, the correct noisy approach is to return `None` on malformed input (signaling a parse failure the caller already handles), not to crash.",
+          "suggested_fix": "Use `.map(|s| s.to_string())` and return `None` via `?` when stripping fails, e.g.: `let s = text.strip_prefix('\"').and_then(|s| s.strip_suffix('\"'))?.to_string();`. This is both noisy (caller sees None) and safe (no panic)."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_single_quoted_string (`.unwrap()`)",
+          "category": "runtime_panic_on_malformed_input",
+          "description": "Same `.unwrap()` panic risk as `lower_string_literal`. Single-quoted strings are equally susceptible to malformed nodes during error recovery. The function returns `Option<Expr>` so there is a safe path available.",
+          "suggested_fix": "Use the `?` operator: `let s = text.strip_prefix('\\'').and_then(|s| s.strip_suffix('\\''))?.to_string();`"
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_single_quoted_string",
+          "category": "dead_code",
+          "description": "The new `lower_single_quoted_string` method is never called. The dispatch table (line ~1697) only maps `\"string_literal\" => self.lower_string_literal(node)` and the tree-sitter grammar (grammar.js:805) only defines `string_literal` with double quotes \u2014 there is no `single_quoted_string` node kind. This method is unreachable dead code.",
+          "suggested_fix": "Either (1) add a `single_quoted_string` rule to the tree-sitter grammar and a corresponding dispatch arm, or (2) remove this method if single-quoted strings aren't part of the language spec."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_string_literal + lower_single_quoted_string",
+          "category": "code_duplication",
+          "description": "The two methods are identical except for the quote character ('\"' vs '\\'). This violates DRY and will diverge over time (e.g., if escape sequence handling is added to one but not the other).",
+          "suggested_fix": "Extract a shared helper: `fn lower_quoted_string(&self, node: tree_sitter::Node, quote: char) -> Option<Expr>` and call it from both methods (or inline a single method if the grammar is extended to distinguish quote types at the node-kind level)."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_string_literal comment",
+          "category": "misleading_comment",
+          "description": "The comment '// Strip outer quotes safely (error recovery can produce malformed nodes)' is retained, but `.unwrap()` contradicts 'safely'. The comment now describes the opposite of what the code does.",
+          "suggested_fix": "Update the comment to match the actual error-handling strategy, or (preferably) restore safe handling so the comment remains accurate."
+        }
+      ],
+      "summary": "This diff introduces two blocking runtime-panic risks by replacing the defensive `.unwrap_or(text)` with `.unwrap()` in `lower_string_literal`, and replicating that same pattern in a new `lower_single_quoted_string` method. The original code had a deliberate safety guard for malformed tree-sitter nodes during error recovery \u2014 the retained comment even says so. The project's 'noisy defaults' convention calls for returning errors (here, `None`), not panicking. Additionally, `lower_single_quoted_string` is dead code: no grammar rule or dispatch arm references it, and the two methods are near-duplicates that should be consolidated into a quote-char-parameterized helper."
+    }
+  },
+  "total_cost_usd": 0.49897974999999994,
+  "wall_clock_ms": 71396,
+  "errors": []
+}

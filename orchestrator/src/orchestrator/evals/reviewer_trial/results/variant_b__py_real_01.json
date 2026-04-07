@@ -1,0 +1,86 @@
+{
+  "variant_name": "variant_b",
+  "diff_id": "py_real_01",
+  "reviews": {
+    "opus_bug_hunter": {
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:255-286",
+          "category": "false_positive_risk",
+          "description": "The heuristic safety net can false-positive on non-cap failures that happen to be quick and zero-cost (e.g., CLI config error, invalid arguments, missing binary, corrupt config_dir). When this happens, `_handle_cap_detected` incorrectly marks the account as capped, and if the root cause is systemic (not account-specific), all accounts will eventually be marked capped, pausing the gate entirely. Consider adding a maximum heuristic-cap-hit count (e.g., 3) after which the result is returned as a normal failure instead of continuing the retry loop.",
+          "suggested_fix": "Add a counter for heuristic-specific cap hits and bail out after a small threshold (e.g., 3), returning the result as a failure rather than infinitely retrying. Alternatively, don't call `_handle_cap_detected` for heuristic detections \u2014 just retry without marking the account as capped."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:255-260",
+          "category": "heuristic_intercepts_resume_handler",
+          "description": "The heuristic block runs before the resume-failure fallback (line 289). A failed resume that happens to be zero-cost and fast (<5s) \u2014 which is plausible since the session may not exist on the new account \u2014 will be treated as a heuristic cap hit instead of a simple resume failure. This adds an unnecessary cooldown sleep and marks the account as capped, when the resume-failure handler at line 289 would have just retried immediately without penalty.",
+          "suggested_fix": "Add `and not invoke_kwargs.get('resume_session_id')` to the heuristic condition so failed resumes fall through to the dedicated resume-failure handler. Or reorder the blocks so resume-failure is checked first."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:267",
+          "category": "encapsulation_violation",
+          "description": "`usage_gate._handle_cap_detected(...)` calls a private method from outside the class. This couples cli_invoke.py to UsageGate internals and will break silently if the method signature or name changes. The regular cap-hit path uses the public `detect_cap_hit` method instead.",
+          "suggested_fix": "Add a public method to UsageGate (e.g., `report_heuristic_cap(reason, oauth_token)`) that wraps `_handle_cap_detected`, or extend `detect_cap_hit` to accept a heuristic-detection flag."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/tests/test_cap_retry.py",
+          "category": "missing_test_coverage",
+          "description": "No tests cover the new heuristic safety-net block or the `is_error` override in `_parse_claude_output`. Both are significant behavioral changes: (1) a new retry path that marks accounts as capped and sleeps, and (2) a change to how success is determined from CLI output. Without tests, regressions here would silently break cap detection or return wrong success values.",
+          "suggested_fix": "Add tests for: (a) heuristic fires when success=False, cost_usd=0, turns<=1, duration_ms<5000; (b) heuristic does NOT fire when any condition is unmet (e.g., cost>0, turns>1, success=True); (c) heuristic correctly restores original prompt and pops resume_session_id; (d) `_parse_claude_output` returns success=False when is_error=True even with subtype='success' or returncode=0."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:258",
+          "category": "float_equality",
+          "description": "`result.cost_usd == 0` uses exact float equality. While 0.0 is safely representable in IEEE 754 and this works correctly for JSON-parsed values, a cost like 0.0000001 from floating point arithmetic would bypass the heuristic. Using a small epsilon threshold would be more robust.",
+          "suggested_fix": "Consider `result.cost_usd < 0.001` instead of `result.cost_usd == 0` to catch near-zero costs that may result from floating-point arithmetic in upstream parsing."
+        }
+      ],
+      "reviewer": "opus_bug_hunter",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The diff adds two defenses against unrecognised usage-cap hits: (1) a heuristic safety net in `invoke_with_cap_retry` that treats zero-cost, near-instant, failed results as cap hits, and (2) an `is_error` override in `_parse_claude_output` that prevents `success=True` when the CLI reports `is_error: true`. Both changes are well-motivated by the documented history of silent cap-hit failures. However, there are robustness concerns: the heuristic can false-positive on non-cap failures (config errors, bad resumes) and incorrectly mark all accounts as capped, leading to a paused gate; it also intercepts the resume-failure handler since both check `not result.success`, adding unnecessary cooldown when a resume simply fails fast. The direct call to the private `_handle_cap_detected` method couples cli_invoke to UsageGate internals. Most critically, neither the heuristic block nor the `is_error` fix has test coverage \u2014 these are significant behavioral changes that should be validated against both true-positive and false-positive scenarios."
+    },
+    "opus_design_critic": {
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:255-286",
+          "category": "code_duplication",
+          "description": "The heuristic cap-hit block (lines 255-286) duplicates the cooldown-calculation, state-reset, logging, and sleep-then-continue logic from the pattern-matched cap-hit block (lines 206-248). The only meaningful differences are: (a) no cost_store event, (b) always fresh (no resume), and (c) a direct call to _handle_cap_detected. This is a classic case where an extracted helper like `_apply_cap_retry(consecutive_cap_hits, num_accounts, label, resume_session_id=None)` would eliminate ~20 lines of duplication and ensure both paths stay in sync when the retry logic inevitably evolves.",
+          "suggested_fix": "Extract the shared cooldown-calculate \u2192 log \u2192 sleep \u2192 continue sequence into a private helper (or at minimum a local closure). Both the pattern-matched and heuristic blocks should call it. This also makes the missing cost_store event in the heuristic block explicit rather than a silent omission."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:267-270",
+          "category": "encapsulation_violation",
+          "description": "The heuristic block calls the private method `usage_gate._handle_cap_detected()` directly. This is an internal implementation detail of UsageGate \u2014 `detect_cap_hit()` is the public API that calls it. Reaching past the public interface couples `invoke_with_cap_retry` to UsageGate's internals and will break if the internal bookkeeping changes (e.g. additional fields, async conversion).",
+          "suggested_fix": "Add a public method to UsageGate, e.g. `mark_cap_hit(reason, oauth_token)`, that encapsulates the same logic. Alternatively, extend `detect_cap_hit()` to accept an `override=True` flag for heuristic detections, so the existing public contract is reused."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:255-286",
+          "category": "missing_cost_store_event",
+          "description": "The pattern-matched cap-hit block (lines 214-225) records a `cap_hit` event to the cost_store, but the heuristic cap-hit block does not. This means heuristic cap detections are invisible in cost/event reporting. Since both paths represent the same semantic event (a cap hit), both should produce the same telemetry.",
+          "suggested_fix": "Add the same `cost_store.save_account_event(event_type='cap_hit', ...)` call to the heuristic block (or consolidate via the extracted helper suggested above)."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:255-261",
+          "category": "heuristic_robustness",
+          "description": "The heuristic condition (`not success AND cost==0 AND turns<=1 AND duration<5s`) could match legitimate fast failures \u2014 e.g. invalid config, missing tool, or a prompt that errors out in one turn. While `not result.success` helps narrow this, treating all such failures as cap hits may cause unnecessary retry loops for non-cap errors. Consider checking for additional signals (e.g. empty output, specific exit codes, or absence of tool_use content) to reduce false positives.",
+          "suggested_fix": "Consider tightening the heuristic: e.g. also require `result.output` to be empty or very short, or check `result.subtype` for known error subtypes. A log at DEBUG level showing the full result for future tuning would also help."
+        }
+      ],
+      "reviewer": "opus_design_critic",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The diff adds a useful heuristic safety net for unrecognised cap-hit formats and correctly fixes the `is_error` override in `_parse_claude_output`. The `CAP_HIT_PREFIXES` addition is clean. However, the heuristic cap-hit block in `invoke_with_cap_retry` introduces significant code duplication (~20 lines of cooldown/retry logic copy-pasted from the pattern-matched block), breaks UsageGate's encapsulation by calling its private `_handle_cap_detected` method directly, and silently omits the cost_store event that the primary cap-hit path records. These are maintainability concerns \u2014 the two cap-hit paths will inevitably diverge as the retry logic evolves. Extracting a shared retry helper and adding a public method to UsageGate would resolve all three issues cleanly."
+    }
+  },
+  "total_cost_usd": 0.90442185,
+  "wall_clock_ms": 165244,
+  "errors": []
+}

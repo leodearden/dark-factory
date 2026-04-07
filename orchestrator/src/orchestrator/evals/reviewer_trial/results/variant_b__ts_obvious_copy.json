@@ -1,0 +1,72 @@
+{
+  "variant_name": "variant_b",
+  "diff_id": "ts_obvious_copy",
+  "reviews": {
+    "opus_bug_hunter": {
+      "reviewer": "opus_bug_hunter",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "gui/src/viewport/selection.ts:262",
+          "category": "dead_code_not_exported",
+          "description": "Neither `focusOnBounds` nor `focusOnEntities` are added to the return statement of `createSelectionManager`. The return (line 262) is `{ setHovered, setSelected, refreshSelected, fitToView, flyToEntity, invalidateRect, dispose }`. These new functions are closured but never exposed, making them dead code. Any caller (e.g. the measurement tool mentioned in the JSDoc) attempting `selectionManager.focusOnBounds(...)` or `selectionManager.focusOnEntities(...)` will get a runtime TypeError (`undefined is not a function`).",
+          "suggested_fix": "Add `focusOnBounds` and `focusOnEntities` to the return object: `return { setHovered, setSelected, refreshSelected, fitToView, flyToEntity, focusOnBounds, focusOnEntities, invalidateRect, dispose };` and update the corresponding TypeScript return type / interface if one exists."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:252-270",
+          "category": "degenerate_geometry",
+          "description": "When all entities resolve to point-like geometry (all dimensions \u2248 0), `maxDim * padding` is 0, producing `distance = 0`. The camera is placed exactly at the center, looking at itself. This is the same pre-existing issue in `fitToView`/`flyToEntity`, but since `focusOnBounds` accepts an arbitrary `Box3` from callers, it's more likely to receive a degenerate box (e.g. a single vertex).",
+          "suggested_fix": "Add a minimum distance floor, e.g. `const distance = Math.max(maxDim / (2 * Math.tan(fovRad)), 0.1);` to ensure the camera is always some distance from the target."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:252-270",
+          "category": "code_duplication",
+          "description": "The camera-positioning logic (getCenter \u2192 compute distance from FOV \u2192 position along viewDir \u2192 lookAt \u2192 updateProjectionMatrix \u2192 controls.target) is now copy-pasted in three places: `fitToView`, `flyToEntity`, and `focusOnBounds`. This increases maintenance risk\u2014a bug fix in one copy may not propagate to the others.",
+          "suggested_fix": "Refactor `fitToView` and `flyToEntity` to delegate to `focusOnBounds`, e.g. `fitToView` computes the combined box then calls `focusOnBounds(box, 1.0)`, and `flyToEntity` computes the single-entity box then calls `focusOnBounds(box)`."
+        }
+      ],
+      "summary": "The diff adds two new functions (`focusOnBounds` and `focusOnEntities`) inside the `createSelectionManager` closure but does not add them to the return object, making them unreachable dead code. Any consumer attempting to call these functions will get a runtime TypeError. This is the only blocking issue. Additionally, the camera-positioning logic is now duplicated in three places within the file, and there is no guard against degenerate (zero-size) bounding boxes producing a zero camera distance."
+    },
+    "opus_design_critic": {
+      "reviewer": "opus_design_critic",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:248-270",
+          "category": "dead_code",
+          "description": "Neither `focusOnBounds` nor `focusOnEntities` is included in the return object (line 262: `return { setHovered, setSelected, refreshSelected, fitToView, flyToEntity, invalidateRect, dispose }`), nor in the `SelectionContext` interface. They are unreachable dead code. The JSDoc states they are 'used by the measurement tool', but no external consumer can call them.",
+          "suggested_fix": "Add `focusOnBounds` and `focusOnEntities` to both the `SelectionContext` interface and the return statement. Also update `Viewport.tsx` to expose them via refs if they need to be callable from outside the viewport component."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:248-270",
+          "category": "code_duplication",
+          "description": "The camera-framing algorithm (get center/size from Box3, compute distance from FOV, position camera along inverse view direction, sync controls target) is now duplicated three times: in `fitToView` (lines 200-217), `flyToEntity` (lines 229-245), and the new `focusOnBounds` (lines 254-268). The new function is a near-verbatim copy of the existing code with only a `padding` multiplier added.",
+          "suggested_fix": "Make `focusOnBounds(bounds: Box3, padding?: number)` the single shared primitive and refactor both `fitToView` and `flyToEntity` to delegate to it. For example: `fitToView` builds the combined box then calls `focusOnBounds(box)`, and `flyToEntity` builds a single-mesh box then calls `focusOnBounds(box)`. This eliminates all three copies in favor of one."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:272-280",
+          "category": "single_responsibility",
+          "description": "`focusOnEntities` combines mesh lookup (via `getMeshes`) with bounding-box computation and camera movement. This couples it tightly to the selection manager's internal state. A measurement tool that already has mesh references or bounding boxes shouldn't need to route through entity-path lookup.",
+          "suggested_fix": "Consider whether the measurement tool should call `focusOnBounds` directly with a pre-computed Box3 (cleaner separation), and keep `focusOnEntities` as a convenience wrapper only if entity-path-based lookup is genuinely needed by callers."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:254",
+          "category": "inconsistent_defaults",
+          "description": "The new `focusOnBounds` applies a default padding of 1.2\u00d7 (20% extra), while the existing `fitToView` and `flyToEntity` use an implicit 1.0\u00d7 (no padding). If the intention is for `focusOnBounds` to be the shared primitive, this inconsistency means refactoring `fitToView`/`flyToEntity` to use it would silently change their framing behavior.",
+          "suggested_fix": "Either set the default padding to 1.0 (matching existing behavior) and let callers opt into 1.2, or explicitly pass `padding = 1.0` when `fitToView`/`flyToEntity` delegate to `focusOnBounds`."
+        }
+      ],
+      "summary": "The diff adds two new functions (`focusOnBounds` and `focusOnEntities`) to the selection manager, but neither is exported in the return object or the `SelectionContext` interface, making them unreachable dead code. More importantly, the camera-framing algorithm in `focusOnBounds` is the third copy of identical logic already present in `fitToView` and `flyToEntity`. The correct approach is to make `focusOnBounds` the single shared primitive and refactor the two existing functions to delegate to it, eliminating all duplication. Additionally, the default padding of 1.2\u00d7 in the new function is inconsistent with the implicit 1.0\u00d7 used by the existing functions, which would need reconciling during any such refactor."
+    }
+  },
+  "total_cost_usd": 0.5964318500000001,
+  "wall_clock_ms": 120980,
+  "errors": []
+}

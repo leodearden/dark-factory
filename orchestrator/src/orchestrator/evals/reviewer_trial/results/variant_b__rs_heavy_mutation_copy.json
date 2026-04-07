@@ -1,0 +1,37 @@
+{
+  "variant_name": "variant_b",
+  "diff_id": "rs_heavy_mutation_copy",
+  "reviews": {
+    "opus_bug_hunter": {
+      "reviewer": "opus_bug_hunter",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs:75-100 (new function)",
+          "category": "dead_code_duplication",
+          "description": "create_solution_map is a semantically identical duplicate of build_solved_values (lines 55-74) and is not called anywhere in the codebase. Both functions assert equal slice lengths, zip params with values, map each pair to (id, Value::Scalar { si_value, dimension: dimension_of(&param_type) }), and collect into HashMap<ValueCellId, Value>. The only differences are parameter/variable names. This adds dead code and a DRY violation.",
+          "suggested_fix": "Remove create_solution_map entirely. If there was an intent to replace build_solved_values, update the three existing call sites (lines ~537, ~662, ~697) instead. If better naming was the goal, rename build_solved_values in place."
+        }
+      ],
+      "summary": "The diff adds a new function `create_solution_map` that is a line-for-line semantic duplicate of the existing `build_solved_values` function with only cosmetic variable renaming. Crucially, the new function has zero call sites anywhere in the codebase\u2014it is dead code. There are no bugs or correctness issues introduced (the function is never executed), but it violates DRY and adds unnecessary maintenance burden. The existing `build_solved_values` continues to serve all three call sites unchanged."
+    },
+    "opus_design_critic": {
+      "reviewer": "opus_design_critic",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:72-100 (new function)",
+          "category": "code_duplication",
+          "description": "create_solution_map is a verbatim duplicate of the existing build_solved_values function (lines 55-74). Both take &[AutoParam] + &[f64], assert equal lengths, zip-map into HashMap<ValueCellId, Value> using the same Value::Scalar construction with dimension_of. The only differences are parameter names (specifications/solution_values vs params/x) and doc wording. Furthermore, create_solution_map has zero call sites \u2014 it is dead code.",
+          "suggested_fix": "Delete create_solution_map entirely. If the intent was to rename build_solved_values for clarity, rename the existing function instead and update its three call sites (lines 537, 662, 697) plus the test imports."
+        }
+      ],
+      "summary": "The diff introduces a single new private function `create_solution_map` that is a line-for-line duplicate of the existing `build_solved_values` function already present 6 lines above it in the same file. Both functions accept the same types, perform the same assertion, and produce the same output via identical iterator logic. The new function is also unused (zero call sites). This is pure dead duplication and should be removed. If the goal was a rename for readability, the existing function should be renamed instead."
+    }
+  },
+  "total_cost_usd": 0.28732424999999995,
+  "wall_clock_ms": 30343,
+  "errors": []
+}

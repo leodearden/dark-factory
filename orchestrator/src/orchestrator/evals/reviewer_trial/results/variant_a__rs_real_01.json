@@ -1,0 +1,30 @@
+{
+  "variant_name": "variant_a",
+  "diff_id": "rs_real_01",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "PASS",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:358-373",
+          "category": "test_assertion_specificity",
+          "description": "The `duplicate_template_names_emits_diagnostic` test only checks that *some* diagnostic contains the substring 'duplicate'. It does not assert the severity is `Error` (vs Warning/Info) or that exactly one duplicate diagnostic is emitted for a single pair. If someone later changed `Diagnostic::error` to `Diagnostic::warning`, or emitted spurious extra diagnostics, the test would still pass.",
+          "suggested_fix": "Add assertions: `assert_eq!(duplicate_diags.len(), 1)` and `assert_eq!(duplicate_diags[0].severity, reify_types::Severity::Error)` to pin down both the count and severity."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:19-28",
+          "category": "robustness_edge_case",
+          "description": "When a duplicate is detected, the second (and any subsequent) template with the same name still gets a full adjacency row built and participates in Tarjan's traversal. For the duplicate detection use-case this is fine\u2014the error diagnostic flags the problem\u2014but if three or more templates share a name only pairs (first, Nth) are reported, not the complete list. For example with [A, A, A] you get two separate error diagnostics ('indices 0 and 1', 'indices 0 and 2') rather than one consolidated message listing all offenders.",
+          "suggested_fix": "Consider accumulating all indices per name and emitting one diagnostic per duplicated name listing all indices. Not blocking since the current output is still correct and actionable."
+        }
+      ],
+      "summary": "The change replaces a silent HashMap `.collect()` with an explicit insertion loop that detects duplicate template names and emits an error diagnostic instead of silently overwriting earlier entries. This is a well-motivated defensive fix: the previous code's last-writer-wins behavior could corrupt the adjacency graph. The implementation is correct\u2014keeping the first entry and reporting duplicates preserves Tarjan's invariants. A dedicated test (`duplicate_template_names_emits_diagnostic`) covers the new path. Two minor suggestions: the test should pin down severity and count for stronger regression protection, and the multi-duplicate reporting could be consolidated. No blocking issues found."
+    }
+  },
+  "total_cost_usd": 0.28257845000000004,
+  "wall_clock_ms": 81414,
+  "errors": []
+}

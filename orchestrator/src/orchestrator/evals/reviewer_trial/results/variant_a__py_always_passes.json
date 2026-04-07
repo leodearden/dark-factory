@@ -1,0 +1,51 @@
+{
+  "variant_name": "variant_a",
+  "diff_id": "py_always_passes",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/tests/test_event_store.py:test_emit_returns_event_id",
+          "category": "test_correctness",
+          "description": "The new test asserts `event_id is not None`, but `EventStore.emit()` has return type `-> None` and never returns a value. This test will fail at runtime with `AssertionError` because `event_id` will always be `None`.",
+          "suggested_fix": "Either update `EventStore.emit()` to return a row ID (e.g., `return cursor.lastrowid`) and change its signature to `-> int | None`, or remove this test and the `event_id` assertion entirely if returning an ID is not intended."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/tests/test_event_store.py:24",
+          "category": "test_quality",
+          "description": "Capturing `event_id = store.emit(...)` in `test_emit_writes_event` but never using or asserting on `event_id` is dead code. If this is preparation for a future change to `emit()`'s return type, it's premature; if accidental, it's confusing.",
+          "suggested_fix": "Either remove the `event_id =` assignment (keep bare `store.emit(...)` as before), or add an assertion on the returned value if emit's signature has been changed."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/tests/test_event_store.py:34",
+          "category": "test_quality",
+          "description": "Weakening `assert len(rows) == 1` to `assert len(rows) >= 1` reduces test precision. This test emits exactly one event into a fresh temporary database, so there should be exactly one row. The looser assertion would mask bugs where spurious rows are inserted.",
+          "suggested_fix": "Keep the original `assert len(rows) == 1` to maintain strict verification of the single-event case."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/tests/test_event_store.py:58-59",
+          "category": "test_quality_redundancy",
+          "description": "`assert any(True for r in rows if r['task_id'] == '99')` followed by `assert len(rows) > 0` is redundant. If `any()` passes, `len(rows) > 0` is guaranteed. The assertions also check weaker properties than they could \u2014 neither verifies exactly one row was written.",
+          "suggested_fix": "Replace both assertions with `assert len(rows) == 1` and `assert rows[0]['task_id'] == '99'` for a more precise and non-redundant check."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/tests/test_event_store.py:test_emit_returns_event_id",
+          "category": "test_coverage_gap",
+          "description": "Even if `emit()` were updated to return an ID, this test never correlates the returned `event_id` with the stored row (e.g., verifying the row's `id` column matches `event_id`). The test name promises more than it delivers.",
+          "suggested_fix": "After fixing the return type issue, assert that the returned ID matches the stored row: `assert rows[0]['id'] == event_id`."
+        }
+      ],
+      "summary": "The diff adds a new test (`test_emit_returns_event_id`) and modifies an existing test (`test_emit_writes_event`). The critical issue is that the new test asserts `emit()` returns a non-None event ID, but `EventStore.emit()` is typed `-> None` and never returns a value \u2014 this test will fail at runtime. The existing test modification weakens a previously strict row-count assertion from `== 1` to `>= 1` without justification, and captures a return value that is never used. The new test also has redundant assertions (`any()` + `len > 0`) and doesn't correlate the returned ID with the stored row, testing less than its name claims."
+    }
+  },
+  "total_cost_usd": 0.29119385000000003,
+  "wall_clock_ms": 71678,
+  "errors": []
+}

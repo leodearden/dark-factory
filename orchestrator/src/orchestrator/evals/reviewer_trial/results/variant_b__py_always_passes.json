@@ -1,0 +1,86 @@
+{
+  "variant_name": "variant_b",
+  "diff_id": "py_always_passes",
+  "reviews": {
+    "opus_bug_hunter": {
+      "reviewer": "opus_bug_hunter",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/tests/test_event_store.py:test_emit_returns_event_id",
+          "category": "test_will_fail",
+          "description": "The new test asserts `event_id is not None`, but `EventStore.emit()` has return type `-> None` and returns nothing. This test will fail unconditionally at `assert event_id is not None`.",
+          "suggested_fix": "Either change `emit()` to return an event ID (e.g., the SQLite `lastrowid`), or remove the assertion on the return value and test the intended behavior differently. If the goal is to add a return value to `emit()`, that change must be made in `event_store.py` alongside this test change."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/tests/test_event_store.py:35",
+          "category": "weakened_assertion",
+          "description": "Changing `assert len(rows) == 1` to `assert len(rows) >= 1` weakens the test. In a fresh temp database with a single `emit()` call, exactly 1 row is expected. The weaker assertion would mask bugs like duplicate event writes.",
+          "suggested_fix": "Keep `assert len(rows) == 1` to ensure emit writes exactly one event per call."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/tests/test_event_store.py:36",
+          "category": "unnecessary_complexity",
+          "description": "Replacing `row = rows[0]` with `row = next(r for r in rows if r['task_id'] == '42')` adds unnecessary complexity in a test that uses a fresh database. If the exact-count assertion is restored (`== 1`), the simple `rows[0]` access is clearer and the generator expression can't raise StopIteration.",
+          "suggested_fix": "Keep `row = rows[0]` if the `len(rows) == 1` assertion is restored."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/tests/test_event_store.py:test_emit_returns_event_id (line with `assert len(rows) > 0`)",
+          "category": "redundant_assertion",
+          "description": "`assert len(rows) > 0` is redundant after `assert any(True for r in rows if r['task_id'] == '99')` \u2014 if `any()` passes, the list is guaranteed non-empty.",
+          "suggested_fix": "Remove the redundant `assert len(rows) > 0` or replace the `any(...)` with a more descriptive assertion like `assert len([r for r in rows if r['task_id'] == '99']) == 1`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/tests/test_event_store.py:24",
+          "category": "misleading_variable",
+          "description": "In `test_emit_writes_event`, `event_id = store.emit(...)` captures `None` into a variable named `event_id` that is never used in the test. This is misleading and suggests emit returns a meaningful value when it doesn't.",
+          "suggested_fix": "Revert to `store.emit(...)` without capturing the return value, since it's unused in this test."
+        }
+      ],
+      "summary": "The critical issue is that the new `test_emit_returns_event_id` test asserts the return value of `emit()` is not None, but the implementation explicitly returns None (`-> None`). This test will fail unconditionally. Additionally, the existing `test_emit_writes_event` was weakened by changing `assert len(rows) == 1` to `>= 1` and adding a generator-based row lookup, both of which reduce the test's ability to catch regressions like duplicate event writes. If the intent is to add event ID return values to `emit()`, the corresponding production code change is missing from this diff."
+    },
+    "opus_design_critic": {
+      "reviewer": "opus_design_critic",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/tests/test_event_store.py:test_emit_returns_event_id",
+          "category": "api_contract_violation",
+          "description": "The new test asserts `event_id is not None`, but `EventStore.emit()` has return type `-> None` and never returns a value. This test will fail unconditionally at runtime. Similarly, `event_id = store.emit(...)` in `test_emit_writes_event` captures `None` \u2014 the variable is unused but signals an intent to consume a return value that doesn't exist.",
+          "suggested_fix": "Either (1) update `EventStore.emit()` to return an event identifier (e.g. the SQLite `lastrowid`) and change its signature to `-> int`, then test that; or (2) remove the `event_id` capture and the `test_emit_returns_event_id` test entirely if no return value is needed. The test and implementation must agree on the contract."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/tests/test_event_store.py:33",
+          "category": "test_precision",
+          "description": "Weakening `assert len(rows) == 1` to `assert len(rows) >= 1` reduces test precision. Each test gets a fresh `tmp_path` database, so there will be exactly 1 row after one `emit()` call. The weaker assertion would pass even if emit duplicated rows, hiding a real bug.",
+          "suggested_fix": "Keep the original `assert len(rows) == 1` exact-count assertion. If the intent is to tolerate extra rows from some other source, that should be explicitly documented."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/tests/test_event_store.py:34",
+          "category": "unnecessary_complexity",
+          "description": "Replacing `row = rows[0]` with `row = next(r for r in rows if r['task_id'] == '42')` adds a linear scan and a potential `StopIteration` crash on an empty match. In a fresh temp database with exactly one emit, `rows[0]` is simpler and sufficient.",
+          "suggested_fix": "Keep `row = rows[0]` for clarity. If row-filtering is truly needed (e.g., shared databases), add a helper and wrap the generator in a proper error message."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/tests/test_event_store.py:62-63",
+          "category": "redundant_assertions",
+          "description": "`assert any(True for r in rows if r['task_id'] == '99')` followed by `assert len(rows) > 0` is redundant \u2014 if `any(...)` passes, the list is guaranteed non-empty. Also, the `any(True for ...)` idiom is unusual; `any(r['task_id'] == '99' for r in rows)` is the standard pattern.",
+          "suggested_fix": "Remove `assert len(rows) > 0` (it's implied by the `any` assertion) and use the idiomatic form: `assert any(r['task_id'] == '99' for r in rows)`."
+        }
+      ],
+      "summary": "The diff introduces a blocking contract mismatch: a new test asserts that `EventStore.emit()` returns a non-None event ID, but the actual implementation has return type `-> None` and never returns a value \u2014 the test will fail unconditionally. The existing test is also weakened unnecessarily (exact row count \u2192 `>= 1`, direct index \u2192 filtered scan) in a context where each test gets a fresh temporary database, reducing the tests' ability to catch real bugs like duplicate row insertion. The `any(True for ...)` idiom in the new test is non-standard and is followed by a redundant length check."
+    }
+  },
+  "total_cost_usd": 0.3983251,
+  "wall_clock_ms": 56730,
+  "errors": []
+}

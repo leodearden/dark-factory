@@ -1,0 +1,58 @@
+{
+  "variant_name": "variant_d",
+  "diff_id": "ts_real_01",
+  "reviews": {
+    "sonnet_test_analyst": {
+      "reviewer": "sonnet_test_analyst",
+      "verdict": "PASS",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/gotoDefinition.test.ts:273-349",
+          "category": "test_realism",
+          "description": "The isConnected guard tests use a statically-disconnected mock (`dom: { isConnected: false }` set before the click). The primary motivating scenario for this guard is a view that is connected at click time but disconnects while the async LSP request is in flight. While the current implementation makes both scenarios equivalent (the guard reads `isConnected` once, only after the promise resolves), the test doesn't demonstrate the lifecycle it's defending against.",
+          "suggested_fix": "Toggle `isConnected` between the mousedown call and `flushMacrotasks()` to make the scenario explicit: `mousedownHandler(mockEvent, mockView); mockView.dom.isConnected = false; await flushMacrotasks(); expect(mockView.dispatch).not.toHaveBeenCalled();`. This also acts as a regression sentinel \u2014 if the guard is ever moved to fire before the async call, the test will fail and alert the developer."
+        }
+      ],
+      "summary": "The diff adds an `if (!view.dom.isConnected) return;` guard to `gotoDefinition.ts` to prevent dispatching or calling `onNavigate` on a destroyed editor view after an async LSP request resolves. Test coverage is comprehensive: the three existing positive-path tests are correctly updated with `dom: { isConnected: true }`, and the `isConnected guard` describe block (lines 272\u2013349, added in this same PR) provides dedicated negative-path coverage for both the same-file dispatch path and the cross-file `onNavigate` path. Assertions in all guard tests are meaningful \u2014 they verify that neither `dispatch` nor `onNavigate` is invoked when `isConnected` is false. The one minor observation is that the guard tests simulate a statically-disconnected view rather than one that disconnects mid-request (the primary use case), but this is equivalent under the current implementation and is only a clarity/documentation concern, not a behavioral gap."
+    },
+    "sonnet_bug_hunter": {
+      "reviewer": "sonnet_bug_hunter",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "gui/src/editor/gotoDefinition.ts:116-117",
+          "category": "stale_data_handling",
+          "description": "The `targetPos` calculation does not clamp `location.range.start.character` to the actual line length. If the LSP returns a character offset beyond the end of the target line (e.g. due to a stale response where the line was shortened), `targetLine.from + location.range.start.character` can point past the end of that line into the next line's content. CodeMirror silently clamps anchor positions to the document length rather than throwing, so no crash occurs, but the cursor lands in the wrong position \u2014 potentially in the next line rather than the intended column.",
+          "suggested_fix": "Clamp the character offset before computing targetPos: `const maxChar = targetLine.to - targetLine.from; const clampedChar = Math.min(location.range.start.character, maxChar); const targetPos = targetLine.from + clampedChar;`"
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/gotoDefinition.test.ts:203-213",
+          "category": "incomplete_mock",
+          "description": "The mock `state.doc` objects in the `bare-path currentUri with file://` test (line ~203) and `partial suffix overlap` test (line ~250) are missing the `lines` property. The production code's stale-response guard reads `view.state.doc.lines` and compares it against the LSP line number. When `lines` is `undefined`, the comparison `(line + 1 > undefined)` evaluates to `false` due to NaN coercion, silently bypassing the bounds guard. Those tests happen to work because they either test cross-file dispatch (bounds guard unreachable) or the mock `line()` function handles any input; but the missing property means those tests would not catch a regression where the bounds guard was accidentally removed or inverted.",
+          "suggested_fix": "Add `lines: 100` (or a suitable value) to the `state.doc` mock in those two test cases to keep the mock consistent with the production interface and ensure the bounds guard would behave predictably if the test scenario is extended."
+        }
+      ],
+      "summary": "The diff adds a `view.dom.isConnected` guard in the async `.then()` callback to prevent dispatching to a destroyed CodeMirror view, and updates three existing test mock objects to include `dom: { isConnected: true }`. The guard is correctly placed \u2014 before any view state access, view dispatch, or onNavigate call \u2014 and the pre-existing `.catch()` handler and line-bounds guard remain intact. Reading the full test file confirms that dedicated `isConnected guard` and `.catch()` error-handler describe blocks (with `isConnected: false` cases) are also part of this change, providing good coverage of the new code path. Two minor suggestions: (1) the `targetPos` calculation doesn't clamp `character` to the actual line length, which can misplace the cursor on stale LSP responses without crashing; (2) two newer test mocks omit the `lines` property from their `state.doc` stubs, causing the bounds guard to silently short-circuit via NaN comparison rather than enforcing a documented invariant. Neither issue is blocking."
+    },
+    "sonnet_design_critic": {
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/gotoDefinition.test.ts (all three mockView objects in the diff)",
+          "category": "test_maintainability",
+          "description": "The `dom: { isConnected: true }` property is now a required field on the mock view for any test that reaches the async callback. Since all mock views are inlined rather than built by a shared factory, every future guard added to the `.then()` callback requires a manual sweep across all inlined mocks. The project already has a `test-utils.ts` for shared helpers (flushMacrotasks, deferred, etc.); a `makeMockView(overrides?)` factory there would centralise the shape and make future guard additions a single-point change.",
+          "suggested_fix": "Add a `makeMockView(overrides: Partial<MockView> = {})` helper to `gui/src/__tests__/test-utils.ts` that returns a baseline object with `dom: { isConnected: true }`, `dispatch: vi.fn()`, and the common `state.doc` stubs. Replace all three inlined mock objects in this diff (and the other occurrences in the file) with calls to this factory, passing per-test overrides as needed."
+        }
+      ],
+      "reviewer": "sonnet_design_critic",
+      "verdict": "PASS",
+      "summary": "The diff is a clean, minimal lifecycle guard. Adding `if (!view.dom.isConnected) return;` directly after the null-location check is the correct placement \u2014 it prevents stale dispatches on a detached EditorView without touching the happy path. The guard placement is consistent with the one place in the codebase where a similar pattern was warranted (this same fire-and-forget mousedown handler), and the three test updates faithfully reflect the new interface requirement. No duplication was introduced in production code, no existing utility was missed, and the change is appropriately narrow. The only structural note is that the test suite now has four separate inline mock-view objects that each need `dom: { isConnected: true }` \u2014 a shared `makeMockView()` factory in `test-utils.ts` would make future guard additions a single-point change rather than a multi-file sweep, but this is a pre-existing structural pattern that the diff merely extends, not introduces."
+    }
+  },
+  "total_cost_usd": 0.76160305,
+  "wall_clock_ms": 163065,
+  "errors": []
+}
