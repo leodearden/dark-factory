@@ -10589,6 +10589,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 554,
+        "title": "Improve test coverage and quality for burndown error handling",
+        "description": "Four test-quality fixes across two files:\n\n1. `dashboard/tests/test_burndown_data.py` line 282: remove the redundant local `from dashboard.config import DashboardConfig` import — it duplicates the module-level import at line 13.\n\n2. `dashboard/tests/test_burndown_data.py`: add a test that patches `Path.resolve` to raise `OSError` for one entry in `known_project_roots` and asserts the warning is logged and remaining roots are snapshotted — covering the Phase 1 resilience path that no current test exercises.\n\n3. `dashboard/tests/test_burndown_data.py` `test_continues_when_known_root_unreadable`: add `caplog` parameter and assert exactly one WARNING record referencing `root_b` is emitted while no WARNING references `root_a` or `root_c`.\n\n4. `dashboard/tests/test_orchestrator.py` line 390: replace `patch.object(Path, 'read_text', side_effect=PermissionError(...))` with either a real unreadable file via `tmp_path` + `chmod(0o000)`, or a module-scoped patch (`patch('dashboard.data.orchestrator.Path')`) to avoid unintentionally breaking unrelated Path.read_text calls during the test.\n\nFiles:\n- dashboard/tests/test_burndown_data.py\n- dashboard/tests/test_orchestrator.py\n\nSource: review suggestions on task 473 (reviewer_reuse_auditor, reviewer_test_analyst).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10601,7 +10612,7 @@
       ],
       "created": "2026-04-07T03:10:15.183Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T03:10:15.186Z"
+      "updated": "2026-04-07T03:10:22.189Z"
     }
   }
 }
