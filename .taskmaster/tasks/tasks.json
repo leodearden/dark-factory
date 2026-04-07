@@ -10949,6 +10949,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 581,
+        "title": "Deduplicate repeated patterns in test_eval_configs.py",
+        "description": "In orchestrator/tests/test_eval_configs.py:\n1. Move `from click.testing import CliRunner` and `from orchestrator.cli import main` from inside the test body (lines 242-244) to module-level imports so ImportErrors surface at collection time\n2. Extract the three-site injection loop (`for cfg in VLLM_EVAL_CONFIGS: cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL` at lines 202-203, 211-212, 227-228) into a private class helper `def _inject_vllm_url(self): ...` on TestVllmUrlInjection and call it from each test\n3. Add a module-level constant `VLLM_NAMES = {cfg.name for cfg in VLLM_EVAL_CONFIGS}` near the imports and replace the five repeated set comprehensions at lines 108, 159, 183, 218, 261 with references to it\n\nFiles: orchestrator/tests/test_eval_configs.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10961,7 +10972,7 @@
       ],
       "created": "2026-04-07T04:35:02.870Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T04:35:07.739Z"
+      "updated": "2026-04-07T04:35:14.316Z"
     }
   }
 }
