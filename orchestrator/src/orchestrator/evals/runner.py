@@ -311,7 +311,10 @@ async def run_eval_matrix(
 
     results: list[EvalResult] = []
     for r in raw:
-        if isinstance(r, BaseException):
+        if isinstance(r, asyncio.CancelledError):
+            logger.error(f'Eval cancelled: {r}')
+            raise r
+        elif isinstance(r, BaseException):
             logger.error(f'Eval failed: {r}')
         elif r is not None:
             results.append(r)
