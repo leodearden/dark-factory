@@ -10560,11 +10560,11 @@
         "description": "The main worktree is stuck in a git stash-pop conflict state from failed pre-advance attempts for tasks 453 and 457. This blocks ALL advance_main operations for any subsequent tasks.\\n\\n## Current State\\n- Conflict markers in: docs/vllm-eval-status.md and orchestrator/src/orchestrator/evals/configs.py (labeled 'Stashed changes')\\n- Staged modification in: scripts/run_vllm_eval.py\\n- Two leftover stashes: 'pre-advance for 453', 'pre-advance for 457'\\n- tasks.json has an unstaged modification\\n\\n## Resolution Steps (requires human manual intervention)\\n1. `cd /home/leo/src/dark-factory && git status` — confirm current conflict state\\n2. Resolve conflict markers in docs/vllm-eval-status.md (keep appropriate version — tasks 453/457 are both done)\\n3. Resolve conflict markers in orchestrator/src/orchestrator/evals/configs.py\\n4. Review and stage/discard the scripts/run_vllm_eval.py staged change\\n5. `git stash list` — confirm two pre-advance stashes\\n6. `git stash drop stash@{1} && git stash drop stash@{0}` — drop both pre-advance stashes\\n7. `git status` — verify main worktree is clean\\n8. Commit any resolved files if needed, then verify orchestrator can run advance_main\\n\\n## memory_hints\\n- search: 'main worktree git stash-pop conflict advance_main blocker'\\n- search: 'task 453 task 457 vllm eval configs pre-advance stash'\\n- search: 'advance_main stuck conflict markers docs/vllm-eval-status.md'",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-07T03:03:54.178Z"
+        "updatedAt": "2026-04-07T03:12:58.820Z"
       },
       {
         "id": "552",
@@ -10604,9 +10604,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T03:10:28.311Z",
+      "lastModified": "2026-04-07T03:12:58.820Z",
       "taskCount": 533,
-      "completedCount": 433,
+      "completedCount": 434,
       "tags": [
         "master"
       ]
