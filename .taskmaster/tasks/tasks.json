@@ -10671,6 +10671,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 560,
+        "title": "Complete abstraction: eliminate raw tasks_data access and optimize _select_proactive_sample",
+        "description": "Two tightly coupled items:\n1. In `task_knowledge_sync.py` lines 64-66, remove the `all_tasks = tasks_data.get('tasks', [])` extraction block. Replace the call at line 78 with `_select_proactive_sample(filtered.active_tasks + filtered.done_tasks + filtered.cancelled_tasks, self.MIN_TASK_SAMPLE)`.\n2. In `_select_proactive_sample` (line 207), remove the `isinstance(t, dict)` filter since the input will now come from pre-validated FilteredTaskTree fields. Replace `sorted(tasks, key=sort_key)` (line 223) with `heapq.nlargest(n, tasks, key=sort_key)` to avoid a full O(n log n) sort for n=5.\n\nFiles: fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py, fused-memory/src/fused_memory/reconciliation/task_filter.py, fused-memory/tests/test_task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10683,7 +10694,7 @@
       ],
       "created": "2026-04-07T03:39:47.326Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T03:43:33.507Z"
+      "updated": "2026-04-07T03:43:39.784Z"
     }
   }
 }
