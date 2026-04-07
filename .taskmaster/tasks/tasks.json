@@ -9990,11 +9990,11 @@
         "description": "Add a `__post_init__` method to `DashboardConfig` in `dashboard/src/dashboard/config.py` that resolves all Path fields:\n```python\ndef __post_init__(self) -> None:\n    self.project_root = self.project_root.resolve()\n    self.known_project_roots = [p.resolve() for p in self.known_project_roots]\n```\nThen:\n1. Remove the eager `.resolve()` from `from_env()` line 73 (it becomes a no-op but can stay as a defensive call or be cleaned up).\n2. Remove the ad-hoc `resolved_root = str(config.project_root.resolve())` from `collect_snapshot()` (burndown.py:71) — just use `str(config.project_root)` since it's already resolved.\n3. Remove the redundant `.resolve()` call in the known_project_roots loop (burndown.py:129) for the same reason.\n\nThis makes every construction path — `from_env()`, direct `DashboardConfig(...)`, tests — produce already-resolved paths, fixing: (a) the unresolved-path footgun on all path-derived properties like `tasks_json`/`burndown_db`, (b) the split-ownership double-resolve, (c) the asymmetry between project_root and known_project_roots normalization.\n\nFiles: dashboard/src/dashboard/config.py, dashboard/src/dashboard/data/burndown.py, dashboard/tests/test_burndown_data.py\n\nSource: review suggestions on task 469 (suggestions 1, 2, 5, 6, 7, 11, 13 from reviewers architect_reviewer, performance, reuse_auditor, test_analyst, robustness).",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-07T03:36:14.402Z",
+        "updatedAt": "2026-04-07T04:09:22.037Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/config.py",
@@ -10879,9 +10879,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T04:07:55.341Z",
+      "lastModified": "2026-04-07T04:09:22.038Z",
       "taskCount": 555,
-      "completedCount": 441,
+      "completedCount": 442,
       "tags": [
         "master"
       ]
