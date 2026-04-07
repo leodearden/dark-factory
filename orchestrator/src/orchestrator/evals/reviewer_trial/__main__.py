@@ -416,5 +416,68 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
         sys.exit(130)
 
 
+# ---------------------------------------------------------------------------
+# Full trial: all variants x all diffs
+# ---------------------------------------------------------------------------
+
+@cli.command('full')
+@click.option('--max-parallel', default=3, type=int, help='Max concurrent panel runs')
+@click.option('--stagger', default=2.0, type=float)
+@click.option('--report-dir', default=None, type=click.Path(path_type=Path),
+              help='Directory for report output (default: results/)')
+def full_trial(max_parallel: int, stagger: float, report_dir: Path | None) -> None:
+    """Full trial: run ALL variants against ALL corpus diffs, score, and report."""
+
+    async def _run() -> int:
+        from .report import build_trial_report, format_markdown, save_report
+        from .runner import run_trial
+        from .scorer import score_panel_run
+        from .variants import ALL_VARIANTS
+
+        corpus = _load_corpus()
+
+        click.echo(click.style(f'Full Trial: {len(ALL_VARIANTS)} variants x {len(corpus.diffs)} diffs', bold=True))
+        click.echo('=' * 60)
+        for v in ALL_VARIANTS:
+            click.echo(f'  {v.name:15s} {v.description} ({len(v.reviewers)} reviewers)')
+        click.echo()
+
+        # Run all variants
+        click.echo('Running panels...')
+        results = await run_trial(ALL_VARIANTS, corpus, max_parallel_panels=max_parallel)
+        click.echo(f'  Completed {len(results)} panel runs.')
+
+        # Score all results
+        click.echo('\nScoring results...')
+        scores = []
+        for result in results:
+            diff = corpus.get_diff(result.diff_id)
+            if diff is None:
+                continue
+            score = await score_panel_run(result, diff)
+            scores.append(score)
+            click.echo(f'  {result.variant_name:15s} x {result.diff_id:<25s} F1={score.f1:.3f} BR={score.blocking_recall:.3f}')
+
+        # Build and save report
+        report = build_trial_report(scores, ALL_VARIANTS, corpus)
+        out_dir = report_dir or _RESULTS_DIR
+        report_path = save_report(report, out_dir / 'full_trial_report')
+
+        # Print the full markdown report
+        click.echo()
+        click.echo(format_markdown(report))
+        click.echo(f'\nReport saved to: {report_path}')
+
+        total_cost = sum(r.total_cost_usd for r in results)
+        click.echo(f'Total panel cost: ${total_cost:.2f}')
+        return 0
+
+    try:
+        sys.exit(asyncio.run(_run()))
+    except KeyboardInterrupt:
+        click.echo('\nInterrupted.')
+        sys.exit(130)
+
+
 if __name__ == '__main__':
     cli()
