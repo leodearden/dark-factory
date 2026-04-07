@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from orchestrator.evals.configs import (
@@ -10,6 +12,19 @@ from orchestrator.evals.configs import (
     EvalConfig,
     get_config_by_name,
 )
+
+
+@pytest.fixture
+def vllm_env_sandbox(monkeypatch):
+    """Replace each vLLM config's env_overrides with a deep copy for test isolation.
+
+    Monkeypatch restores the original dicts on teardown, so the module-level
+    singletons are never mutated. Shared-reference invariant between
+    VLLM_EVAL_CONFIGS and EVAL_CONFIGS is preserved because we're swapping
+    the attribute on the same EvalConfig instances.
+    """
+    for cfg in VLLM_EVAL_CONFIGS:
+        monkeypatch.setattr(cfg, 'env_overrides', copy.deepcopy(cfg.env_overrides))
 
 
 class TestVllmConfigStructure:
@@ -182,59 +197,72 @@ class TestVllmUrlInjection:
         'gemini-31-pro-high', 'gemini-3-flash-high',
     }
 
-    def test_injection_sets_base_url_on_vllm_configs(self):
+    def test_injection_sets_base_url_on_vllm_configs(self, vllm_env_sandbox):
         """After injecting vllm_url, every vLLM config must have ANTHROPIC_BASE_URL set."""
-        # Save and restore env_overrides to avoid test bleed
-        saved = {cfg.name: dict(cfg.env_overrides) for cfg in VLLM_EVAL_CONFIGS}
-        try:
-            for cfg in VLLM_EVAL_CONFIGS:
-                cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
-            for cfg in VLLM_EVAL_CONFIGS:
-                assert cfg.env_overrides.get('ANTHROPIC_BASE_URL') == self._VLLM_URL, (
-                    f'{cfg.name} missing ANTHROPIC_BASE_URL after injection'
-                )
-        finally:
-            for cfg in VLLM_EVAL_CONFIGS:
-                cfg.env_overrides.clear()
-                cfg.env_overrides.update(saved[cfg.name])
+        for cfg in VLLM_EVAL_CONFIGS:
+            cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
+        for cfg in VLLM_EVAL_CONFIGS:
+            assert cfg.env_overrides.get('ANTHROPIC_BASE_URL') == self._VLLM_URL, (
+                f'{cfg.name} missing ANTHROPIC_BASE_URL after injection'
+            )
 
-    def test_injection_propagates_to_eval_configs_via_shared_references(self):
+    def test_injection_propagates_to_eval_configs_via_shared_references(self, vllm_env_sandbox):
         """Mutating VLLM_EVAL_CONFIGS configs is visible through EVAL_CONFIGS (same objects)."""
-        saved = {cfg.name: dict(cfg.env_overrides) for cfg in VLLM_EVAL_CONFIGS}
-        try:
-            for cfg in VLLM_EVAL_CONFIGS:
-                cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
-            # EVAL_CONFIGS spreads the same references, so the mutation must be visible
-            eval_names_with_base_url = {
-                cfg.name for cfg in EVAL_CONFIGS
-                if cfg.env_overrides.get('ANTHROPIC_BASE_URL') == self._VLLM_URL
-            }
-            vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
-            assert vllm_names == eval_names_with_base_url, (
-                f'Shared-reference invariant broken.\n'
-                f'  Expected: {vllm_names}\n'
-                f'  Got ANTHROPIC_BASE_URL via EVAL_CONFIGS: {eval_names_with_base_url}'
-            )
-        finally:
-            for cfg in VLLM_EVAL_CONFIGS:
-                cfg.env_overrides.clear()
-                cfg.env_overrides.update(saved[cfg.name])
+        for cfg in VLLM_EVAL_CONFIGS:
+            cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
+        # EVAL_CONFIGS spreads the same references, so the mutation must be visible
+        eval_names_with_base_url = {
+            cfg.name for cfg in EVAL_CONFIGS
+            if cfg.env_overrides.get('ANTHROPIC_BASE_URL') == self._VLLM_URL
+        }
+        vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+        assert vllm_names == eval_names_with_base_url, (
+            f'Shared-reference invariant broken.\n'
+            f'  Expected: {vllm_names}\n'
+            f'  Got ANTHROPIC_BASE_URL via EVAL_CONFIGS: {eval_names_with_base_url}'
+        )
 
-    def test_cloud_baselines_never_get_base_url(self):
+    def test_cloud_baselines_never_get_base_url(self, vllm_env_sandbox):
         """Cloud baseline configs must not have ANTHROPIC_BASE_URL after vllm injection."""
-        saved = {cfg.name: dict(cfg.env_overrides) for cfg in VLLM_EVAL_CONFIGS}
-        try:
+        for cfg in VLLM_EVAL_CONFIGS:
+            cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
+        cloud_configs_with_base_url = [
+            cfg.name for cfg in EVAL_CONFIGS
+            if cfg.name in self._CLOUD_BASELINE_NAMES
+            and 'ANTHROPIC_BASE_URL' in cfg.env_overrides
+        ]
+        assert not cloud_configs_with_base_url, (
+            f'Cloud baseline configs leaked ANTHROPIC_BASE_URL: {cloud_configs_with_base_url}'
+        )
+
+    def test_cli_eval_injects_vllm_url_into_all_vllm_configs(
+        self, vllm_env_sandbox, monkeypatch
+    ):
+        """CLI `eval --matrix --vllm-url` must inject ANTHROPIC_BASE_URL into every vLLM config."""
+        from click.testing import CliRunner
+
+        from orchestrator.cli import main
+
+        captured_state: dict[str, dict] = {}
+
+        def stub_run_matrix(base_config, **kwargs):
             for cfg in VLLM_EVAL_CONFIGS:
-                cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
-            cloud_configs_with_base_url = [
-                cfg.name for cfg in EVAL_CONFIGS
-                if cfg.name in self._CLOUD_BASELINE_NAMES
-                and 'ANTHROPIC_BASE_URL' in cfg.env_overrides
-            ]
-            assert not cloud_configs_with_base_url, (
-                f'Cloud baseline configs leaked ANTHROPIC_BASE_URL: {cloud_configs_with_base_url}'
+                captured_state[cfg.name] = dict(cfg.env_overrides)
+
+        monkeypatch.setattr('orchestrator.cli._run_matrix_cmd', stub_run_matrix)
+        monkeypatch.setattr('orchestrator.cli.load_config', lambda *a: object())
+
+        runner = CliRunner()
+        result = runner.invoke(main, ['eval', '--matrix', '--vllm-url', self._VLLM_URL])
+
+        assert result.exit_code == 0, (
+            f'CLI exited with code {result.exit_code}.\nOutput: {result.output}'
+        )
+        vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+        assert captured_state.keys() == vllm_names, (
+            f'Captured state keys {set(captured_state.keys())} != vLLM names {vllm_names}'
+        )
+        for name, overrides in captured_state.items():
+            assert overrides.get('ANTHROPIC_BASE_URL') == self._VLLM_URL, (
+                f'{name} missing ANTHROPIC_BASE_URL in captured env_overrides'
             )
-        finally:
-            for cfg in VLLM_EVAL_CONFIGS:
-                cfg.env_overrides.clear()
-                cfg.env_overrides.update(saved[cfg.name])
