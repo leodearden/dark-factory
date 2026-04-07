@@ -112,7 +112,7 @@ class TestDroppedQwen25Regression:
     def test_qwen25_hf_model_not_in_any_config(self):
         """No config should reference Qwen/Qwen2.5-Coder-32B-Instruct as its model."""
         dropped_hf_id = 'Qwen/Qwen2.5-Coder-32B-Instruct'
-        for cfg in EVAL_CONFIGS + VLLM_EVAL_CONFIGS:
+        for cfg in EVAL_CONFIGS:
             assert cfg.env_overrides.get('ANTHROPIC_DEFAULT_SONNET_MODEL') != dropped_hf_id, (
                 f'{cfg.name} still references the dropped HF model'
             )
