@@ -10804,6 +10804,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 572,
+        "title": "Add positive assertion for list_entity_nodes in force/dry_run test",
+        "description": "In fused-memory/tests/test_graphiti_quality_433.py, in test_force_dry_run_does_not_call_get_all_valid_edges (lines 292–307), add `backend.list_entity_nodes.assert_awaited_once()` after the existing `assert_not_awaited()` assertions. This closes a gap where a no-op implementation of rebuild_entity_summaries would satisfy all current assertions (since the test only checks what was NOT called, not that the function actually ran through the entity-listing phase).\n\nFiles: fused-memory/tests/test_graphiti_quality_433.py\n\nSource: Pre-triaged review follow-up from Task 525 (esc-525-94).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10816,7 +10827,7 @@
       ],
       "created": "2026-04-07T04:01:19.795Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T04:01:19.799Z"
+      "updated": "2026-04-07T04:01:24.254Z"
     }
   }
 }
