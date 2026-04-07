@@ -10693,6 +10693,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 562,
+        "title": "Optimize filter_task_tree allocations: heapq for done_tasks, resolve cancelled_tasks dead field",
+        "description": "Two allocation issues in `task_filter.py`:\n1. Lines 137/143: Replace `done.sort(key=_id_key, reverse=True); done[:MAX_DONE_TASKS_RETAINED]` with `heapq.nlargest(MAX_DONE_TASKS_RETAINED, done, key=_id_key)` — O(n) heap selection instead of O(n log n) sort.\n2. Lines 138/144: Either add a 'Recently Cancelled Tasks' section to the prompt in `format_filtered_task_tree` to give `cancelled_tasks` a real consumer, or remove the field and `cancelled.sort()` call, keeping only `cancelled_count` for the summary header. Document the decision in a comment.\n\nFiles: fused-memory/src/fused_memory/reconciliation/task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10705,7 +10716,7 @@
       ],
       "created": "2026-04-07T03:39:47.326Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T03:43:44.790Z"
+      "updated": "2026-04-07T03:43:51.188Z"
     }
   }
 }
