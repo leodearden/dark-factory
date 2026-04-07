@@ -10264,11 +10264,11 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py, replace the status-only loop at lines 576–578 with a full-dict comparison:\n\n```python\nexpected_details = [{'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities]\nassert result['details'] == expected_details\n```\n\nThis matches the style already used in the error-path tests (lines 525–534) and catches regressions where uuid/name are accidentally dropped from the dry_run detail records.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-07T03:31:50.907Z",
+        "updatedAt": "2026-04-07T03:44:31.896Z",
         "metadata": {
           "modules": [
             "fused-memory/tests/test_graphiti_quality_433.py"
@@ -10741,7 +10741,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T03:44:31.584Z",
+      "lastModified": "2026-04-07T03:44:31.896Z",
       "taskCount": 544,
       "completedCount": 438,
       "tags": [
