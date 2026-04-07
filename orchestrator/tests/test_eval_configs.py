@@ -197,21 +197,14 @@ class TestVllmUrlInjection:
         'gemini-31-pro-high', 'gemini-3-flash-high',
     }
 
-    def test_injection_sets_base_url_on_vllm_configs(self):
+    def test_injection_sets_base_url_on_vllm_configs(self, vllm_env_sandbox):
         """After injecting vllm_url, every vLLM config must have ANTHROPIC_BASE_URL set."""
-        # Save and restore env_overrides to avoid test bleed
-        saved = {cfg.name: dict(cfg.env_overrides) for cfg in VLLM_EVAL_CONFIGS}
-        try:
-            for cfg in VLLM_EVAL_CONFIGS:
-                cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
-            for cfg in VLLM_EVAL_CONFIGS:
-                assert cfg.env_overrides.get('ANTHROPIC_BASE_URL') == self._VLLM_URL, (
-                    f'{cfg.name} missing ANTHROPIC_BASE_URL after injection'
-                )
-        finally:
-            for cfg in VLLM_EVAL_CONFIGS:
-                cfg.env_overrides.clear()
-                cfg.env_overrides.update(saved[cfg.name])
+        for cfg in VLLM_EVAL_CONFIGS:
+            cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
+        for cfg in VLLM_EVAL_CONFIGS:
+            assert cfg.env_overrides.get('ANTHROPIC_BASE_URL') == self._VLLM_URL, (
+                f'{cfg.name} missing ANTHROPIC_BASE_URL after injection'
+            )
 
     def test_injection_propagates_to_eval_configs_via_shared_references(self):
         """Mutating VLLM_EVAL_CONFIGS configs is visible through EVAL_CONFIGS (same objects)."""
