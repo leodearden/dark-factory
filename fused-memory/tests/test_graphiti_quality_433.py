@@ -303,7 +303,7 @@ class TestRebuildEntitySummariesForceDryRun:
             group_id='test', force=True, dry_run=True
         )
 
-        backend.get_all_valid_edges.assert_not_called()
+        backend.get_all_valid_edges.assert_not_awaited()
         backend._rebuild_entity_from_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
