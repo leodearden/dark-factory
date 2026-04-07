@@ -206,27 +206,21 @@ class TestVllmUrlInjection:
                 f'{cfg.name} missing ANTHROPIC_BASE_URL after injection'
             )
 
-    def test_injection_propagates_to_eval_configs_via_shared_references(self):
+    def test_injection_propagates_to_eval_configs_via_shared_references(self, vllm_env_sandbox):
         """Mutating VLLM_EVAL_CONFIGS configs is visible through EVAL_CONFIGS (same objects)."""
-        saved = {cfg.name: dict(cfg.env_overrides) for cfg in VLLM_EVAL_CONFIGS}
-        try:
-            for cfg in VLLM_EVAL_CONFIGS:
-                cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
-            # EVAL_CONFIGS spreads the same references, so the mutation must be visible
-            eval_names_with_base_url = {
-                cfg.name for cfg in EVAL_CONFIGS
-                if cfg.env_overrides.get('ANTHROPIC_BASE_URL') == self._VLLM_URL
-            }
-            vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
-            assert vllm_names == eval_names_with_base_url, (
-                f'Shared-reference invariant broken.\n'
-                f'  Expected: {vllm_names}\n'
-                f'  Got ANTHROPIC_BASE_URL via EVAL_CONFIGS: {eval_names_with_base_url}'
-            )
-        finally:
-            for cfg in VLLM_EVAL_CONFIGS:
-                cfg.env_overrides.clear()
-                cfg.env_overrides.update(saved[cfg.name])
+        for cfg in VLLM_EVAL_CONFIGS:
+            cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
+        # EVAL_CONFIGS spreads the same references, so the mutation must be visible
+        eval_names_with_base_url = {
+            cfg.name for cfg in EVAL_CONFIGS
+            if cfg.env_overrides.get('ANTHROPIC_BASE_URL') == self._VLLM_URL
+        }
+        vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+        assert vllm_names == eval_names_with_base_url, (
+            f'Shared-reference invariant broken.\n'
+            f'  Expected: {vllm_names}\n'
+            f'  Got ANTHROPIC_BASE_URL via EVAL_CONFIGS: {eval_names_with_base_url}'
+        )
 
     def test_cloud_baselines_never_get_base_url(self):
         """Cloud baseline configs must not have ANTHROPIC_BASE_URL after vllm injection."""
