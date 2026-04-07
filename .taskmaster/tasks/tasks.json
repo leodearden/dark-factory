@@ -10476,7 +10476,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-07T04:44:55.063Z"
+        "updatedAt": "2026-04-07T04:44:55.063Z",
+        "metadata": {
+          "memory_hints": {
+            "entities": [],
+            "queries": [
+              "create_eval_worktree snapshots.py vllm eval orchestrator",
+              "run_vllm_eval.py subprocess timeout test_runner_main runner help flags"
+            ]
+          },
+          "_causation_id": "2f2ac841-21ef-4bb6-ae6f-d98d538127ca"
+        }
       },
       {
         "id": 536,
