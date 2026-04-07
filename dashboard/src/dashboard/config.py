@@ -81,5 +81,5 @@ class DashboardConfig:
         if (urls := os.environ.get('DASHBOARD_FUSED_MEMORY_URLS')) is not None:
             kwargs['fused_memory_urls'] = [u.strip() for u in urls.split(',') if u.strip()]
         if (roots := os.environ.get('DASHBOARD_KNOWN_PROJECT_ROOTS')) is not None:
-            kwargs['known_project_roots'] = [Path(p.strip()).resolve() for p in roots.split(',') if p.strip()]
+            kwargs['known_project_roots'] = [Path(p.strip()) for p in roots.split(',') if p.strip()]
         return cls(**kwargs)
