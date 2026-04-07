@@ -25,6 +25,17 @@ class DashboardConfig:
     fused_memory_urls: list[str] = field(default_factory=lambda: list(DEFAULT_FUSED_MEMORY_URLS))
     known_project_roots: list[Path] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        """Normalize all Path fields to their canonical (symlink-resolved) forms.
+
+        This invariant ensures that every construction path — direct kwargs,
+        from_env(), dataclass.replace(), test fixtures — produces a config
+        whose Path fields are already canonicalized.  Consumers never need to
+        call .resolve() on config paths.
+        """
+        self.project_root = self.project_root.resolve()
+        self.known_project_roots = [p.resolve() for p in self.known_project_roots]
+
     @property
     def reconciliation_db(self) -> Path:
         return self.project_root / 'data' / 'reconciliation' / 'reconciliation.db'
