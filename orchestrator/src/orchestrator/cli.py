@@ -167,10 +167,10 @@ def _run_single_eval(
     force: bool = False, timeout: int | None = None,
 ):
     """Run eval for a single task with one or all configs."""
-    from orchestrator.evals.configs import EVAL_CONFIGS, VLLM_EVAL_CONFIGS, get_config_by_name
+    from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
     from orchestrator.evals.runner import run_eval
 
-    all_configs = EVAL_CONFIGS + VLLM_EVAL_CONFIGS
+    all_configs = EVAL_CONFIGS
 
     if config_name and config_name != 'all':
         cfg = get_config_by_name(config_name)
@@ -203,10 +203,10 @@ def _run_matrix_cmd(
     timeout: int | None = None,
 ):
     """Run full eval matrix."""
-    from orchestrator.evals.configs import EVAL_CONFIGS, VLLM_EVAL_CONFIGS
+    from orchestrator.evals.configs import EVAL_CONFIGS
     from orchestrator.evals.runner import run_eval_matrix
 
-    all_configs = EVAL_CONFIGS + VLLM_EVAL_CONFIGS
+    all_configs = EVAL_CONFIGS
 
     tasks_dir = Path(__file__).parent / 'evals' / 'tasks'
     if not tasks_dir.exists():

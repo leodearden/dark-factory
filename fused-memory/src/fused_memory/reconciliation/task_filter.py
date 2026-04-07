@@ -32,6 +32,11 @@ INACTIVE_TASK_STATUSES: frozenset[str] = frozenset({
     'cancelled',
 })
 
+# Maximum number of done task dicts to retain in FilteredTaskTree.done_tasks.
+# 30 matches the existing done_tasks[:30] cap in the legacy task_knowledge_sync.py
+# prompt renderer, so switching consumers over later is a no-op for output budget.
+MAX_DONE_TASKS_RETAINED: int = 30
+
 # Status priority for sorting: lower value = higher priority.
 # Matches _select_proactive_sample in task_knowledge_sync.py.
 # 'done': 4 is included so that _select_proactive_sample (which sorts ALL tasks
@@ -77,8 +82,11 @@ def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
 
     Returns:
         FilteredTaskTree with active_tasks sorted by (_STATUS_PRIORITY, -id),
-        done_tasks sorted by id descending, cancelled_tasks sorted by id descending,
-        and aggregate counts for done, cancelled, and other (unknown) statuses.
+        done_tasks sorted by id descending and capped at MAX_DONE_TASKS_RETAINED,
+        cancelled_tasks sorted by id descending, and aggregate counts for done,
+        cancelled, and other (unknown) statuses. done_count/cancelled_count
+        reflect the full input counts, not the (possibly capped) list lengths —
+        consumers can detect overflow via `len(done_tasks) < done_count`.
     """
     raw_tasks = tasks_data.get('tasks') if isinstance(tasks_data, dict) else None
     if not isinstance(raw_tasks, list):
@@ -87,6 +95,8 @@ def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
     active: list[dict] = []
     done: list[dict] = []
     cancelled: list[dict] = []
+    done_count = 0
+    cancelled_count = 0
     other_count = 0
 
     for task in raw_tasks:
@@ -98,8 +108,10 @@ def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
         if status in ACTIVE_TASK_STATUSES:
             active.append(task)
         elif status == 'done':
+            done_count += 1
             done.append(task)
         elif status == 'cancelled':
+            cancelled_count += 1
             cancelled.append(task)
         else:
             # Unknown status (or None) → other
@@ -125,13 +137,13 @@ def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
     done.sort(key=_id_key, reverse=True)
     cancelled.sort(key=_id_key, reverse=True)
 
-    total = len(active) + len(done) + len(cancelled) + other_count
+    total = len(active) + done_count + cancelled_count + other_count
     return FilteredTaskTree(
         active_tasks=active,
-        done_tasks=done,
+        done_tasks=done[:MAX_DONE_TASKS_RETAINED],
         cancelled_tasks=cancelled,
-        done_count=len(done),
-        cancelled_count=len(cancelled),
+        done_count=done_count,
+        cancelled_count=cancelled_count,
         other_count=other_count,
         total_count=total,
     )

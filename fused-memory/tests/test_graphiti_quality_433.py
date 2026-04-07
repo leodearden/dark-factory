@@ -9,6 +9,7 @@ Task 433: 8 code-quality improvements deferred from task-419 review.
 """
 from __future__ import annotations
 
+import re
 from unittest.mock import AsyncMock
 
 import pytest
@@ -256,7 +257,35 @@ class TestRefreshEntitySummaryOptionalParams:
 # ---------------------------------------------------------------------------
 
 class TestRebuildEntitySummariesForceDryRun:
-    """rebuild_entity_summaries(force=True, dry_run=True) skips get_all_valid_edges."""
+    """Pins the force=True, dry_run=True skip behaviour in rebuild_entity_summaries.
+
+    Narrowed scope claim
+    --------------------
+    get_all_valid_edges is NOT awaited when rebuild_entity_summaries is called
+    with force=True AND dry_run=True. This skip only applies to the force=True
+    code path (the force branch); it does NOT apply to the force=False path.
+
+    Two production-code guards in graphiti_client.rebuild_entity_summaries
+    protect this behaviour (referenced by semantic role, not by line number):
+
+    1. **edge-fetch guard in the force branch** — inside the ``if force:`` block,
+       an inner ``if not dry_run:`` gate controls whether
+       ``get_all_valid_edges(...)`` is awaited. When dry_run=True that gate is
+       closed, so no edges are fetched at all.
+
+    2. **dry_run early-return block before the semaphore loop** — after the
+       edge-fetch guard, a subsequent ``if dry_run:`` block marks every target
+       entity as ``'skipped_dry_run'`` and returns immediately, before the
+       ``asyncio.Semaphore``-based rebuild loop executes. This is why
+       ``_rebuild_entity_from_edges`` is also never awaited.
+
+    force=False contrast
+    --------------------
+    The force=False path delegates to ``_detect_stale_summaries_with_edges``,
+    which unconditionally calls ``get_all_valid_edges`` for staleness detection
+    regardless of ``dry_run``. Therefore the edge-fetch skip behaviour pinned by
+    this class only applies to the force=True path.
+    """
 
     @pytest.mark.asyncio
     async def test_force_dry_run_does_not_call_get_all_valid_edges(self, mock_config, make_backend):
@@ -267,12 +296,14 @@ class TestRebuildEntitySummariesForceDryRun:
             {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
         ])
         backend.get_all_valid_edges = AsyncMock(return_value={})
+        backend._rebuild_entity_from_edges = AsyncMock()
 
         await backend.rebuild_entity_summaries(
             group_id='test', force=True, dry_run=True
         )
 
         backend.get_all_valid_edges.assert_not_called()
+        backend._rebuild_entity_from_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_force_dry_run_returns_correct_aggregate(self, mock_config, make_backend):
@@ -298,6 +329,7 @@ class TestRebuildEntitySummariesForceDryRun:
         assert len(result['details']) == 3
         for detail in result['details']:
             assert detail['status'] == 'skipped_dry_run'
+        assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
 
     @pytest.mark.asyncio
     async def test_force_no_dry_run_calls_get_all_valid_edges(self, mock_config, make_backend):
@@ -444,7 +476,7 @@ class TestRebuildEntitySummariesErrorHandling:
         backend._rebuild_entity_from_edges = AsyncMock(
             side_effect=[
                 RuntimeError('boom'),
-                {'uuid': 'u2', 'name': 'Bob', 'old_summary': '', 'new_summary': 'rebuilt', 'edge_count': 0},
+                {'uuid': 'u2', 'name': 'Bob', 'old_summary': 'stale summary 2', 'new_summary': 'Bob summary v2', 'edge_count': 3},
             ]
         )
 
@@ -469,9 +501,16 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['status'] == 'rebuilt'
         assert ok_detail['uuid'] == 'u2'
         assert ok_detail['name'] == 'Bob'
-        assert ok_detail['old_summary'] == ''
-        assert ok_detail['new_summary'] == 'rebuilt'
-        assert ok_detail['edge_count'] == 0
+        assert ok_detail['old_summary'] == 'stale summary 2'
+        assert ok_detail['new_summary'] == 'Bob summary v2'
+        assert ok_detail['edge_count'] == 3
+
+        # Verify the implementation forwards the entity's summary as old_summary
+        # into _rebuild_entity_from_edges (not just trusting the mock return value).
+        # This pins down the entity→target→helper data-forwarding path.
+        backend._rebuild_entity_from_edges.assert_any_call(
+            'u2', 'Bob', [], group_id='test', old_summary='stale summary 2'
+        )
 
     @pytest.mark.asyncio
     async def test_force_false_partial_error_uses_detect_total(self, mock_config, make_backend):
@@ -563,4 +602,72 @@ class TestCanonicalFactsStalenessRegression:
         assert result.stale == [], (
             "Entity should NOT be flagged stale when its only non-whitespace "
             "fact matches the stored summary."
+        )
+
+
+# ---------------------------------------------------------------------------
+# task-523: docstring accuracy — TestRebuildEntitySummariesForceDryRun class doc
+# ---------------------------------------------------------------------------
+
+class TestDocstringAccuracyForceDryRunClass:
+    """Meta-test: verifies the class-level docstring of TestRebuildEntitySummariesForceDryRun
+    contains semantic anchors, a narrowed scope claim, and a force=False contrast note.
+    """
+
+    def test_force_dry_run_class_docstring_accuracy(self) -> None:
+        """Introspect TestRebuildEntitySummariesForceDryRun.__doc__ for required content.
+
+        Assertions:
+          (a) docstring is not None and non-empty
+          (b) no line-number references (e.g. 'line 1031', 'lines 1046-1049')
+          (c) narrowed scope: 'force=True' and 'force path' or 'force branch' appear
+          (d) semantic anchor: 'edge-fetch guard' appears
+          (e) semantic anchor: 'dry_run early-return' and 'semaphore' appear
+          (f) force=False contrast: 'force=False', '_detect_stale_summaries_with_edges',
+              and 'regardless of' all appear
+        """
+        doc = TestRebuildEntitySummariesForceDryRun.__doc__
+
+        # (a) non-empty docstring
+        assert doc is not None, "TestRebuildEntitySummariesForceDryRun must have a docstring"
+        assert doc.strip(), "TestRebuildEntitySummariesForceDryRun docstring must not be blank"
+
+        # (b) no line-number references
+        assert re.search(r'\bline[s]?\s+\d{3,}', doc) is None, (
+            "Docstring must not contain bare line-number references like 'line 1031'"
+        )
+        assert re.search(r'\blines?\s+\d+\s*-\s*\d+', doc) is None, (
+            "Docstring must not contain line-range references like 'lines 1046-1049'"
+        )
+
+        # (c) narrowed scope to force=True branch
+        assert 'force=True' in doc, (
+            "Docstring must explicitly scope the claim to 'force=True'"
+        )
+        assert ('force path' in doc or 'force branch' in doc), (
+            "Docstring must reference 'force path' or 'force branch' to narrow scope"
+        )
+
+        # (d) semantic anchor: edge-fetch guard
+        assert 'edge-fetch guard' in doc, (
+            "Docstring must include the semantic anchor 'edge-fetch guard'"
+        )
+
+        # (e) semantic anchor: dry_run early-return before the semaphore loop
+        assert 'dry_run early-return' in doc, (
+            "Docstring must include the semantic anchor 'dry_run early-return'"
+        )
+        assert 'semaphore' in doc, (
+            "Docstring must reference 'semaphore' to anchor the early-return block location"
+        )
+
+        # (f) force=False contrast note
+        assert 'force=False' in doc, (
+            "Docstring must contain a force=False contrast note"
+        )
+        assert '_detect_stale_summaries_with_edges' in doc, (
+            "Docstring must name '_detect_stale_summaries_with_edges' in the contrast note"
+        )
+        assert 'regardless of' in doc, (
+            "Docstring must state edges are fetched 'regardless of' dry_run on the force=False path"
         )

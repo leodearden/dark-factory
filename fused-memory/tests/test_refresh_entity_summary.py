@@ -79,11 +79,21 @@ class TestResolveEntityByName:
         backend._driver._get_graph = MagicMock(return_value=graph)
         entity_name = 'Alice'
         await backend.resolve_entity_by_name(entity_name, group_id='test')
-        call_args = graph.query.call_args
+        call_args = graph.ro_query.call_args
         assert call_args is not None
         args, kwargs = call_args
         cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
         assert cypher_params.get('name') == entity_name
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """resolve_entity_by_name uses ro_query (read-only path) and never calls graph.query."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([['uuid-alice', 'Alice']])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.resolve_entity_by_name('Alice', group_id='test')
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

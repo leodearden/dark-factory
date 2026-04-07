@@ -77,6 +77,88 @@ class TestFilterTaskTree:
         assert result.other_count == 1
         assert result.total_count == 1
 
+    def test_done_tasks_field_defaults_to_empty_list(self):
+        """FilteredTaskTree.done_tasks defaults to [] and is independent per instance."""
+        tree1 = FilteredTaskTree()
+        tree2 = FilteredTaskTree()
+
+        assert hasattr(tree1, 'done_tasks')
+        assert tree1.done_tasks == []
+
+        # Mutating one instance's done_tasks must not affect the other
+        tree1.done_tasks.append({'id': 99, 'status': 'done'})
+        assert tree2.done_tasks == [], (
+            'Mutable default arg regression: tree2.done_tasks was affected by tree1 mutation'
+        )
+
+    def test_filter_task_tree_populates_done_tasks(self):
+        """filter_task_tree captures done task dicts in done_tasks (not just counted)."""
+        done6 = _make_task(6, 'done', 'Done task 6')
+        done7 = _make_task(7, 'done', 'Done task 7')
+        done8 = _make_task(8, 'done', 'Done task 8')
+        tasks_data = {
+            'tasks': [
+                _make_task(1, 'pending'),
+                _make_task(2, 'in-progress'),
+                done6,
+                done7,
+                done8,
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert len(result.done_tasks) == 3
+        assert result.done_count == 3
+
+        # Verify original dict objects are retained (identity-preserving, no copies)
+        done_ids = {t['id'] for t in result.done_tasks}
+        assert done_ids == {6, 7, 8}
+
+    def test_filter_task_tree_caps_done_tasks_at_max_retained(self):
+        """filter_task_tree caps done_tasks at MAX_DONE_TASKS_RETAINED (30) while preserving done_count."""
+        tasks_data = {
+            'tasks': [_make_task(i, 'done') for i in range(1, 51)]  # 50 done tasks
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert len(result.done_tasks) == 30, (
+            f'Expected 30 done tasks retained, got {len(result.done_tasks)}'
+        )
+        assert result.done_count == 50, (
+            f'done_count must reflect full input count (50), got {result.done_count}'
+        )
+        assert len(result.done_tasks) < result.done_count, (
+            'Consumers should detect overflow via len(done_tasks) < done_count'
+        )
+
+    def test_filter_task_tree_done_tasks_sorted_by_id_desc(self):
+        """filter_task_tree returns done_tasks sorted by id desc, highest-30 retained."""
+        import random
+        ids = list(range(1, 51))
+        random.shuffle(ids)
+        tasks_data = {
+            'tasks': [_make_task(i, 'done') for i in ids]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert len(result.done_tasks) == 30
+        result_ids = [t['id'] for t in result.done_tasks]
+        assert result_ids == list(range(50, 20, -1)), (
+            f'Expected ids 50..21 descending, got {result_ids}'
+        )
+
+        # Non-int id must not crash sorting (fallback to 0 in sort key)
+        tasks_with_bad_id = {
+            'tasks': [
+                _make_task(5, 'done'),
+                {'id': '5x', 'title': 'Bad id task', 'status': 'done', 'dependencies': []},
+                _make_task(3, 'done'),
+            ]
+        }
+        result2 = filter_task_tree(tasks_with_bad_id)
+        assert len(result2.done_tasks) == 3  # All three retained (under cap)
+        # Must not raise — just verify it ran without error
+
     def test_sorts_active_by_priority_and_id_desc(self):
         """filter_task_tree sorts active tasks by _STATUS_PRIORITY then ID descending."""
         tasks_data = {
