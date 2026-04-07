@@ -10782,6 +10782,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 570,
+        "title": "Document __post_init__ resolve() limitation for non-existent paths",
+        "description": "In `dashboard/src/dashboard/config.py` lines 28-37, update the `__post_init__` docstring to note: 'Note: resolution is canonical only for paths that exist at construction time. Python's Path.resolve() on non-existent paths returns an absolute form but cannot follow symlink segments that do not yet exist on disk.' This prevents over-trust in the invariant for test fixtures where directories are created after config construction, or startup scenarios where mounts are not yet ready.\n\nFiles: dashboard/src/dashboard/config.py\n\nSource: review suggestions on task 508 (suggestion 9 from reviewer robustness).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10794,7 +10805,7 @@
       ],
       "created": "2026-04-07T03:56:54.248Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T03:57:06.172Z"
+      "updated": "2026-04-07T03:57:13.006Z"
     }
   }
 }
