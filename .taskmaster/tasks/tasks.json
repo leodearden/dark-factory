@@ -9848,11 +9848,11 @@
         "description": "task_filter.py is currently never imported — task_knowledge_sync.py still maintains its own copies of: active_tasks filtering (lines 61-64), _STATUS_PRIORITY dict (lines 212-218, diverging from task_filter's version), sort_key closure (lines 234-243, near-verbatim copy), and _format_tasks (lines 198-208, same format string).\n\nFix:\n1. In task_knowledge_sync.py, replace the inline active_tasks/done_tasks derivation with calls to filter_task_tree() and format_filtered_task_tree().\n2. Delete _STATUS_PRIORITY from task_knowledge_sync.py and import from task_filter.\n3. Replace _select_proactive_sample's sort_key closure with the shared logic from task_filter.\n4. Remove _format_tasks from task_knowledge_sync.py or delegate to _render_task_line helper in task_filter.py.\n\nMemory hints: search for \"_STATUS_PRIORITY\" and \"task_filter\" to find prior decisions about the filter module.",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-07T03:10:28.311Z",
+        "updatedAt": "2026-04-07T03:44:31.583Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
@@ -9990,11 +9990,11 @@
         "description": "Add a `__post_init__` method to `DashboardConfig` in `dashboard/src/dashboard/config.py` that resolves all Path fields:\n```python\ndef __post_init__(self) -> None:\n    self.project_root = self.project_root.resolve()\n    self.known_project_roots = [p.resolve() for p in self.known_project_roots]\n```\nThen:\n1. Remove the eager `.resolve()` from `from_env()` line 73 (it becomes a no-op but can stay as a defensive call or be cleaned up).\n2. Remove the ad-hoc `resolved_root = str(config.project_root.resolve())` from `collect_snapshot()` (burndown.py:71) — just use `str(config.project_root)` since it's already resolved.\n3. Remove the redundant `.resolve()` call in the known_project_roots loop (burndown.py:129) for the same reason.\n\nThis makes every construction path — `from_env()`, direct `DashboardConfig(...)`, tests — produce already-resolved paths, fixing: (a) the unresolved-path footgun on all path-derived properties like `tasks_json`/`burndown_db`, (b) the split-ownership double-resolve, (c) the asymmetry between project_root and known_project_roots normalization.\n\nFiles: dashboard/src/dashboard/config.py, dashboard/src/dashboard/data/burndown.py, dashboard/tests/test_burndown_data.py\n\nSource: review suggestions on task 469 (suggestions 1, 2, 5, 6, 7, 11, 13 from reviewers architect_reviewer, performance, reuse_auditor, test_analyst, robustness).",
         "details": "",
         "testStrategy": "",
-        "status": "in-progress",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-07T03:36:14.402Z",
+        "updatedAt": "2026-04-07T04:09:22.037Z",
         "metadata": {
           "modules": [
             "dashboard/src/dashboard/config.py",
@@ -10058,11 +10058,11 @@
         "description": "At context_assembler.py:125, the existing `if isinstance(ctx_result, BaseException): ctx_result = []` silently converts CancelledError into empty context and lets execution continue. Apply the same two-tier pattern: add a pre-scan pass that re-raises any result where `isinstance(r, BaseException) and not isinstance(r, Exception)`, then narrow the accumulator guard to `isinstance(ctx_result, Exception)`. This is the same fix applied to graphiti_client in task 484's diff.\n\nSource: review suggestions from task 484. Rationale: structured-concurrency cancellation must propagate; converting CancelledError into empty lists breaks graceful shutdown.\n\nFiles:\n- fused-memory/src/fused_memory/reconciliation/context_assembler.py\n- fused-memory/tests/test_rebuild_entity_summaries.py (or a new context_assembler test file)",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T22:55:24.156Z",
+        "updatedAt": "2026-04-07T04:05:34.345Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/reconciliation",
@@ -10142,11 +10142,11 @@
         "description": "At graphiti_client.py:1072-1074 (Pass 1 loop), add a `logger.warning` call before `raise r` that records `group_id`, `rebuilt` (so far), and `errors` (so far). When a large batch is cancelled mid-flight, the current code skips the summary log entirely and operators have no record of partial progress. The `rebuilt` and `errors` counters are already in scope at that point (initialized at the top of the method and incremented by Pass 2, but the values from any previously completed batches/groups are meaningful context).\n\nExample:\n```python\nlogger.warning(\n    'rebuild_entity_summaries: cancellation signal received group=%s '\n    'rebuilt_so_far=%d errors_so_far=%d; propagating',\n    group_id, rebuilt, errors,\n)\nraise r\n```\n\nSource: review suggestions from task 484. Rationale: operational visibility during graceful shutdowns.\n\nFiles:\n- fused-memory/src/fused_memory/backends/graphiti_client.py\n- fused-memory/tests/test_rebuild_entity_summaries.py (log assertion)",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-06T23:36:23.320Z",
+        "updatedAt": "2026-04-07T04:01:39.914Z",
         "metadata": {
           "modules": [
             "fused-memory/src/fused_memory/backends",
@@ -10264,11 +10264,11 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py, replace the status-only loop at lines 576–578 with a full-dict comparison:\n\n```python\nexpected_details = [{'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities]\nassert result['details'] == expected_details\n```\n\nThis matches the style already used in the error-path tests (lines 525–534) and catches regressions where uuid/name are accidentally dropped from the dry_run detail records.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "updatedAt": "2026-04-07T03:31:50.907Z",
+        "updatedAt": "2026-04-07T03:52:44.623Z",
         "metadata": {
           "modules": [
             "fused-memory/tests/test_graphiti_quality_433.py"
@@ -10281,10 +10281,11 @@
         "description": "In fused-memory/tests/test_graphiti_quality_433.py:\n\n- Update line 275 in `test_force_dry_run_does_not_call_get_all_valid_edges` from `backend.get_all_valid_edges.assert_not_called()` to `backend.get_all_valid_edges.assert_not_awaited()` to match the style used in the new test at line 582 and to use the more semantically precise AsyncMock assertion throughout.\n\nSource: review follow-up from Task 504 (2026-04-06 cycle).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T04:01:39.597Z"
       },
       {
         "id": "526",
@@ -10295,7 +10296,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T04:15:17.875Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/tests/test_graphiti_quality_433.py",
+            "fused-memory/tests/test_rebuild_entity_summaries.py"
+          ]
+        }
       },
       {
         "id": "527",
@@ -10306,7 +10315,15 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T04:13:29.190Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/tests/test_cleanup_stale_edges.py",
+            "fused-memory/tests/test_reindex.py"
+          ]
+        }
       },
       {
         "id": "528",
@@ -10314,10 +10331,11 @@
         "description": "Four targeted test fixes from the Task 486 review:\n\n1. Remove `test_precheck_uses_ro_query` from `test_merge_entities.py` (~line 150) — its assertions are a strict subset of `test_executes_detach_delete` which already covers `await_count` for both `ro_query` and `query` plus verifies `'DETACH DELETE'`. Three reviewers flagged this duplication.\n\n2. Add `graph.query.assert_not_awaited()` after the `pytest.raises` block in `test_raises_node_not_found_when_missing` (~line 132) to verify DETACH DELETE never fires when the pre-check finds nothing. This is the critical negative assertion — without it, a regression could allow DETACH DELETE on the missing path.\n\n3. In the list_indices `test_uses_ro_query_not_query` (~line 313 in `test_reindex.py`), inspect `graph.ro_query.call_args[0][0]` and assert it contains `'db.indexes'`. Current test uses `make_graph_mock([])`, so the loop body never runs and only call-count is verified.\n\n4. Add `graph.query.assert_not_awaited()` to `test_passes_name_as_param` in `test_refresh_entity_summary.py` (~line 80) to make the test self-sufficient.\n\nFiles: fused-memory/tests/test_merge_entities.py, fused-memory/tests/test_reindex.py, fused-memory/tests/test_refresh_entity_summary.py\n\nSource: steward-triage follow-up from Task 486 (esc-486-49).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "done",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T04:19:40.346Z"
       },
       {
         "id": "529",
@@ -10339,7 +10357,14 @@
         "status": "pending",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T04:18:33.620Z",
+        "metadata": {
+          "modules": [
+            "fused-memory/src/fused_memory/backends",
+            "fused-memory/tests/test_list_indices_integration.py"
+          ]
+        }
       },
       {
         "id": "531",
@@ -10347,10 +10372,11 @@
         "description": "In orchestrator/src/orchestrator/evals/runner.py lines 313-315, replace `isinstance(r, BaseException)` with handling that explicitly re-raises asyncio.CancelledError (or separates it from ordinary eval failures) so graceful shutdown propagates correctly. Add a test that gathers a coroutine raising asyncio.CancelledError and verifies the correct behavior (absorbed vs re-raised, per the chosen design). Also add a test that calls run_eval_matrix with a task raising asyncio.CancelledError and verifies the error is logged but the matrix call handles it gracefully.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T04:18:33.697Z"
       },
       {
         "id": "532",
@@ -10358,10 +10384,11 @@
         "description": "In orchestrator/tests/test_eval_configs.py, refactor TestVllmUrlInjection (lines 175-240): (1) extract the save/restore env_overrides scaffolding into a shared pytest fixture using monkeypatch or contextmanager, eliminating the 45-line copy-paste across 3 test methods; (2) use deepcopy or monkeypatch.setattr to avoid mutating module-level singletons directly. Also add at least one test that exercises the actual CLI injection path: invoke _run_single_eval or _run_matrix_cmd from cli.py with a vllm_url argument (mocked runner) and assert ANTHROPIC_BASE_URL is injected into each vLLM config's env_overrides.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T04:19:40.693Z"
       },
       {
         "id": "533",
@@ -10585,14 +10612,28 @@
         ],
         "priority": "high",
         "subtasks": [],
-        "updatedAt": "2026-04-07T03:39:47.055Z",
+        "updatedAt": "2026-04-07T04:23:36.903Z",
         "metadata": {
           "memory_hints": {
             "entities": [],
             "queries": [
               "resolution for: Manually resolve task 455 merge conflict and integrate to main (unblocks tasks 478, 480, 481)"
             ]
-          }
+          },
+          "modules": [
+            ".taskmaster/tasks/tasks.json",
+            "dashboard/src/dashboard/config.py",
+            "dashboard/src/dashboard/data",
+            "dashboard/tests/test_burndown_data.py",
+            "dashboard/tests/test_scaffold.py",
+            "fused-memory/src/fused_memory/reconciliation",
+            "fused-memory/tests/test_context_assembler.py",
+            "fused-memory/tests/test_graphiti_quality_433.py",
+            "fused-memory/tests/test_harness.py",
+            "fused-memory/tests/test_judge.py",
+            "fused-memory/tests/test_stages.py",
+            "fused-memory/tests/test_task_filter.py"
+          ]
         }
       },
       {
@@ -10660,13 +10701,233 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": "559",
+        "title": "Fix incomplete refactoring: top-level import and public naming of STATUS_PRIORITY",
+        "description": "Two related cleanup items from the partial refactoring:\n1. In `task_knowledge_sync.py` line 210, remove the deferred `from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY  # noqa: PLC0415` and add `_STATUS_PRIORITY` to the existing top-level import block at lines 24-28.\n2. In `task_filter.py` line 45, rename `_STATUS_PRIORITY` → `STATUS_PRIORITY` (no leading underscore). Update all import sites: `task_knowledge_sync.py` top-level import, `test_task_filter.py` line 8, and the test assertions in `TestStatusPriorityIncludesDone`.\n\nFiles: fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py, fused-memory/src/fused_memory/reconciliation/task_filter.py, fused-memory/tests/test_task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "560",
+        "title": "Complete abstraction: eliminate raw tasks_data access and optimize _select_proactive_sample",
+        "description": "Two tightly coupled items:\n1. In `task_knowledge_sync.py` lines 64-66, remove the `all_tasks = tasks_data.get('tasks', [])` extraction block. Replace the call at line 78 with `_select_proactive_sample(filtered.active_tasks + filtered.done_tasks + filtered.cancelled_tasks, self.MIN_TASK_SAMPLE)`.\n2. In `_select_proactive_sample` (line 207), remove the `isinstance(t, dict)` filter since the input will now come from pre-validated FilteredTaskTree fields. Replace `sorted(tasks, key=sort_key)` (line 223) with `heapq.nlargest(n, tasks, key=sort_key)` to avoid a full O(n log n) sort for n=5.\n\nFiles: fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py, fused-memory/src/fused_memory/reconciliation/task_filter.py, fused-memory/tests/test_task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "561",
+        "title": "Promote _id_key to module-level helper in task_filter.py",
+        "description": "In `task_filter.py`, move the `_id_key` nested function (lines 120-126) from inside `filter_task_tree` to module level. This allows `_select_proactive_sample`'s sort_key closure (lines 216-220 in `task_knowledge_sync.py`) to call `_id_key` directly instead of re-implementing the same `int(tid)` try/except pattern. Export it as `_id_key` or `_task_id_int` at module scope.\n\nFiles: fused-memory/src/fused_memory/reconciliation/task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "562",
+        "title": "Optimize filter_task_tree allocations: heapq for done_tasks, resolve cancelled_tasks dead field",
+        "description": "Two allocation issues in `task_filter.py`:\n1. Lines 137/143: Replace `done.sort(key=_id_key, reverse=True); done[:MAX_DONE_TASKS_RETAINED]` with `heapq.nlargest(MAX_DONE_TASKS_RETAINED, done, key=_id_key)` — O(n) heap selection instead of O(n log n) sort.\n2. Lines 138/144: Either add a 'Recently Cancelled Tasks' section to the prompt in `format_filtered_task_tree` to give `cancelled_tasks` a real consumer, or remove the field and `cancelled.sort()` call, keeping only `cancelled_count` for the summary header. Document the decision in a comment.\n\nFiles: fused-memory/src/fused_memory/reconciliation/task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "563",
+        "title": "Harden task_filter.py against malformed input",
+        "description": "Two defensive guards:\n1. `_render_task_line` line 172: Replace `deps = task.get('dependencies') or []` with `deps = task.get('dependencies'); deps = list(deps) if isinstance(deps, list) else []` to handle truthy non-list values (int, dict) that would cause TypeError on `deps[:5]`.\n2. `format_task_list` line 191: Add an `isinstance(t, dict)` filter before calling `_render_task_line`: `return '\\n'.join(_render_task_line(t) for t in tasks if isinstance(t, dict)) or 'No tasks.'`\n\nFiles: fused-memory/src/fused_memory/reconciliation/task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "564",
+        "title": "Fill missing test coverage gaps in task_filter and stages",
+        "description": "Three test additions:\n1. In `test_stages.py` (TestTaskKnowledgeSyncUsesFilterTaskTree): add a test with 35 done tasks asserting task id=1 (oldest) does NOT appear in the 'Recently Completed Tasks' payload section while task id=35 does.\n2. In `test_task_filter.py` (TestFilterTaskTreeDoneAndCancelledLists): add a test with a mix of int and string task IDs in done/cancelled lists and assert their relative sort order — verify the non-int task lands where _id_key's fallback-to-0 places it.\n3. In `test_task_filter.py` (TestFilterTaskTree or TestFilterTaskTreeDoneAndCancelledLists): add a test with mixed pending/in-progress/done/cancelled/unknown tasks that asserts `active_tasks`, `done_tasks`, and `cancelled_tasks` are disjoint — no task ID appears in more than one list.\n\nFiles: fused-memory/tests/test_stages.py, fused-memory/tests/test_task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "565",
+        "title": "Fix fragile test assertion in test_render_task_line_truncates_deps_over_5",
+        "description": "In `test_task_filter.py` line 610, remove `assert '6' not in result`. The preceding assertion `assert 'deps=[1, 2, 3, 4, 5]...' in result` fully characterizes the expected output. The bare `'6' not in result` would spuriously fail if the task's id or title were changed to contain the digit '6', making it an invisible coupling to unrelated fields. If explicit exclusion is desired, scope the check to the deps substring: `assert '6' not in result.split('deps=')[1]`.\n\nFiles: fused-memory/tests/test_task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "566",
+        "title": "Make dry_run detail assertion schema-tolerant in test_graphiti_quality_433.py",
+        "description": "Post-merge review follow-up for Task 524 (reviewer_test_analyst, reviewer_robustness, reviewer_architect_reviewer). The new strict-equality assertion at lines 329-331 in `fused-memory/tests/test_graphiti_quality_433.py::test_force_dry_run_returns_correct_aggregate` over-specifies the dry_run detail schema: it requires each entry to have exactly `{uuid, name, status}` with no other keys. Because `rebuild_entity_summaries` is an active development area (parallel rebuild matrix, force/dry_run permutations), any additive schema change (e.g. `group_id`, `dry_run`, `timestamp`) will break this test even when behaviour is unchanged.\n\nRefactor to keep uuid/name/status verification (the intent of Task 524) while tolerating additive schema growth, and fold in two small related cleanups:\n\n1. **Replace exact-equality with per-field check** (lines 330-331). Two equivalent patterns:\n   - `assert {(d['uuid'], d['name']) for d in result['details']} == {(e['uuid'], e['name']) for e in entities}` plus `assert all(d['status'] == 'skipped_dry_run' for d in result['details'])`, OR\n   - `assert [{k: d[k] for k in ('uuid','name','status')} for d in result['details']] == expected_details` (preserves order check).\n\n2. **Remove redundant length assertion** (line 329). `assert len(result['details']) == 3` is subsumed by the list-shape check that follows. Either delete it or convert to a commented early guard.\n\n3. **Document ordering invariant** (above the assertion). Add an inline comment: `# dry_run path appends details sequentially via 'for t in targets', so order is stable` — guards against future accidental parallelisation that would silently reorder details and break any order-sensitive assertion.\n\nVerify: `pytest fused-memory/tests/test_graphiti_quality_433.py::TestForceDryRunEdgeFetchSkip::test_force_dry_run_returns_correct_aggregate -x`\n\nSource: review follow-up from Task 524 (2026-04-07 cycle). Related pending tasks in same file: 440, 495, 506, 507 — coordinate if batched.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "567",
+        "title": "Remove redundant .resolve() at burndown.py:96 and add explanatory comment",
+        "description": "In `dashboard/src/dashboard/data/burndown.py` line 96, change `root_str = str(project_root.resolve())` to `root_str = str(project_root)`. Both `_resolve_project_root` (returns an ancestor of an already-.resolve()'d path — all parents of a resolved path are canonical) and `_read_project_root_from_config` (explicitly calls `.resolve()` at line 67) already return resolved Paths. Add a comment at line 96 mirroring the one at lines 103-104: `# project_root is already resolved by _resolve_project_root / _read_project_root_from_config`. This closes the inconsistency left by the __post_init__ refactor.\n\nFiles: dashboard/src/dashboard/data/burndown.py\n\nSource: review suggestions on task 508 (suggestions 1, 4 from reviewers architect_reviewer, reuse_auditor).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "568",
+        "title": "Drop remaining .resolve() calls from test_burndown_data.py assertions and _tasks_map keys",
+        "description": "In `dashboard/tests/test_burndown_data.py` in `test_snapshots_known_project_roots_when_no_orchestrators`: (1) Change `_tasks_map` keys at lines 225-226 from `reify_root.resolve() / ...` and `autopilot_root.resolve() / ...` to `reify_root / ...` and `autopilot_root / ...` — these paths are stored in config after __post_init__ resolution, and collect_snapshot uses `known_root / ...` directly. (2) Change assertions at lines 244-245 from `str(reify_root.resolve())` / `str(autopilot_root.resolve())` to `str(reify_root)` / `str(autopilot_root)`, consistent with line 243. (3) Check line 341 for the same pattern in `test_dedupes_known_root_against_running_orchestrator` and update if applicable.\n\nFiles: dashboard/tests/test_burndown_data.py\n\nSource: review suggestions on task 508 (suggestions 3, 5, 6 from reviewers performance, reuse_auditor, test_analyst).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "569",
+        "title": "Add missing symlink-resolution and dataclasses.replace() tests for DashboardConfig",
+        "description": "In `dashboard/tests/test_scaffold.py`: (1) Add a test alongside `test_from_env_resolves_known_project_roots` (line 100): create a real dir and symlink, set `DASHBOARD_PROJECT_ROOT` to the symlink via monkeypatch, call `DashboardConfig.from_env()`, assert `cfg.project_root == real_dir.resolve()`. (2) In `TestPostInit`, add a test: create a base config with a real dir, call `dataclasses.replace(cfg, known_project_roots=[symlink])`, assert the result has resolved `known_project_roots`. This validates the stated contract in the `TestPostInit` docstring that replace() is a covered construction path.\n\nFiles: dashboard/tests/test_scaffold.py\n\nSource: review suggestions on task 508 (suggestions 7, 8 from reviewer test_analyst).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "570",
+        "title": "Document __post_init__ resolve() limitation for non-existent paths",
+        "description": "In `dashboard/src/dashboard/config.py` lines 28-37, update the `__post_init__` docstring to note: 'Note: resolution is canonical only for paths that exist at construction time. Python's Path.resolve() on non-existent paths returns an absolute form but cannot follow symlink segments that do not yet exist on disk.' This prevents over-trust in the invariant for test fixtures where directories are created after config construction, or startup scenarios where mounts are not yet ready.\n\nFiles: dashboard/src/dashboard/config.py\n\nSource: review suggestions on task 508 (suggestion 9 from reviewer robustness).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "571",
+        "title": "Remove TestEdgeFetchGuardAssertionStyle meta-test",
+        "description": "Delete the TestEdgeFetchGuardAssertionStyle class (lines 677–709) from fused-memory/tests/test_graphiti_quality_433.py, including the section comment block. Also remove the `import inspect` line (check the top of the file for the import). The class uses inspect.getsource() to verify the text of another test — a module-boundary violation with no production-code coverage, a one-off orphan idiom, fragile to refactoring/auto-formatting, and fragile in bytecode-only CI environments. The actual correctness fix (assert_not_awaited on line 306) is already in place and makes the meta-test redundant. After deletion, verify the test suite still passes.\n\nFiles: fused-memory/tests/test_graphiti_quality_433.py\n\nSource: Pre-triaged review follow-up from Task 525 (esc-525-94).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "572",
+        "title": "Add positive assertion for list_entity_nodes in force/dry_run test",
+        "description": "In fused-memory/tests/test_graphiti_quality_433.py, in test_force_dry_run_does_not_call_get_all_valid_edges (lines 292–307), add `backend.list_entity_nodes.assert_awaited_once()` after the existing `assert_not_awaited()` assertions. This closes a gap where a no-op implementation of rebuild_entity_summaries would satisfy all current assertions (since the test only checks what was NOT called, not that the function actually ran through the entity-listing phase).\n\nFiles: fused-memory/tests/test_graphiti_quality_433.py\n\nSource: Pre-triaged review follow-up from Task 525 (esc-525-94).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "573",
+        "title": "Fix Pass 2 isinstance guard and align misleading comments/docstrings in context_assembler",
+        "description": "Three related correctness issues in context_assembler.py and its tests:\n\n1. **context_assembler.py:138** — change `isinstance(ctx_result, BaseException)` to `isinstance(ctx_result, Exception)` to match the documented two-tier contract. After Pass 1 has consumed all non-Exception BaseExceptions (CancelledError, KeyboardInterrupt, SystemExit), only Exception subclasses can remain, so the narrowed guard matches both the sister implementations in memory_service.py/graphiti_client.py and the stated intent.\n\n2. **context_assembler.py:124-126** — update the inline comment to cite `graphiti_client.rebuild_entity_summaries` as the canonical two-pass reference. The comment currently says \"mirrors MemoryService.get_entity\" but memory_service.get_entity uses a structurally different single-pass raise-on-any-BaseException approach.\n\n3. **test_context_assembler.py:481** — update the TestContextAssemblerCancellation class docstring to reflect the post-fix state: Pass 2 uses the narrowed `isinstance(ctx_result, Exception)` guard after fix #1 lands. (Currently the docstring already claims this, but the code lags behind — once #1 ships, the docstring becomes accurate.)\n\nSource: review follow-up from task 512 (cycle 2026-04-07).\nRationale: keeps the two-tier cancellation-propagation pattern internally consistent across sister implementations and documentation.\n\nFiles:\n- fused-memory/src/fused_memory/reconciliation/context_assembler.py\n- fused-memory/tests/test_context_assembler.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "574",
+        "title": "Strengthen existing context_assembler cancellation tests with missing assertions",
+        "description": "Two targeted improvements to the cancellation tests already in test_context_assembler.py:\n\n1. **test_context_assembler.py:558** — add `assert call_count == 2` after the `pytest.raises(asyncio.CancelledError)` block in `test_cancelled_error_propagates_alongside_exception` to explicitly verify both tasks were dispatched and the mixed-batch [RuntimeError, CancelledError] scenario was actually exercised. Without the assertion, a future refactor that reduces batch size or changes gather dispatch so only one task runs would fail with an unexpected RuntimeError rather than a clear diagnostic.\n\n2. **test_context_assembler.py:513-558** — switch from direct attribute assignment (`assembler._fetch_context = patched_fetch_context`) to `unittest.mock.patch.object(assembler, '_fetch_context', new=patched_fetch_context)` so that a rename of `_fetch_context` raises AttributeError rather than silently making the test a no-op.\n\nSource: review follow-up from task 512 (cycle 2026-04-07).\nRationale: makes the cancellation-propagation tests robust against refactors that would otherwise silently invalidate them.\n\nFiles:\n- fused-memory/tests/test_context_assembler.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "575",
+        "title": "Add missing edge-case tests for context_assembler Pass 1 propagation",
+        "description": "Two new test methods in TestContextAssemblerCancellation (or a new class) in test_context_assembler.py:\n\n1. **Exception-only batch regression test** — patch `_fetch_context` to raise RuntimeError on all calls, then assert `assemble()` returns a normal AssembledPayload without raising. This confirms Pass 1 does not over-eagerly propagate Exception subclasses; a future off-by-one mistake or broadened isinstance check could accidentally make Pass 1 propagate ordinary RuntimeErrors, and this test would catch it.\n\n2. **Second-batch CancelledError propagation test** — create more events than `context_fetch_batch_size` (e.g., 12 events with batch_size=10) with `patched_fetch_context` raising CancelledError only for an event in the second batch. Assert that CancelledError propagates out of `assemble()` despite the first batch succeeding. The assemble() while-loop processes events in multiple batches and Pass 1 runs inside the loop on each batch, but the second-batch case is currently untested — a regression in loop structure (e.g., early-continue that skips the propagation pass on subsequent iterations) would go undetected.\n\nSource: review follow-up from task 512 (cycle 2026-04-07).\nRationale: pins the contract that Pass 1 propagates only structured-cancellation signals and does so on every batch, not just the first.\n\nFiles:\n- fused-memory/src/fused_memory/reconciliation/context_assembler.py (reference only)\n- fused-memory/tests/test_context_assembler.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "576",
+        "title": "Extract propagate_cancellations() shared utility and replace inline guards",
+        "description": "Create `fused-memory/src/fused_memory/utils/async_utils.py` (or add to an existing utils module) with a `propagate_cancellations(results)` helper that re-raises the first non-Exception BaseException found in asyncio.gather results.\n\n```python\ndef propagate_cancellations(results: Iterable[Any]) -> None:\n    \"\"\"Re-raise the first structured-cancellation signal found in gather() results.\n\n    asyncio.gather(return_exceptions=True) captures BaseException subclasses\n    (CancelledError, KeyboardInterrupt, SystemExit) as plain values. Callers\n    that want to honour structured-cancellation must scan results and re-raise\n    before doing per-item error accounting.\n    \"\"\"\n    for r in results:\n        if isinstance(r, BaseException) and not isinstance(r, Exception):\n            raise r\n```\n\nReplace the inline propagation loops at:\n- `context_assembler.py:133-135` (the Pass 1 loop introduced by task 512)\n- `graphiti_client.py:1079` (the `isinstance(r, BaseException) and not isinstance(r, Exception)` loop in rebuild_entity_summaries, task 484's diff)\n- Optionally normalise the structural variant in `memory_service.py:1004-1013` to call the helper as well — this would unify all three sites on the same two-pass pattern.\n\nThis removes three copies of the multi-line comment explaining the Python 3.8+ BaseException/Exception split and gives the pattern a canonical home to prevent the next caller from copy-pasting the comment block again.\n\nSource: review follow-up from task 512 (cycle 2026-04-07).\nRationale: deduplicates a subtle structured-cancellation guard that is easy to get wrong, and prevents drift between sister implementations.\n\nFiles:\n- fused-memory/src/fused_memory/utils/async_utils.py (new or existing)\n- fused-memory/src/fused_memory/reconciliation/context_assembler.py\n- fused-memory/src/fused_memory/graphiti_client.py\n- fused-memory/src/fused_memory/memory_service.py (optional normalisation)\n- fused-memory/tests/test_context_assembler.py (update for helper usage if needed)",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "577",
+        "title": "Strengthen delete_entity_node test assertions in test_merge_entities.py",
+        "description": "Two targeted assertion strengthenings in `fused-memory/tests/test_merge_entities.py` surfaced by Task 528 review:\n\n1. In `test_passes_uuid_as_param` (~line 114-130), add `graph.ro_query.assert_awaited_once()` and `graph.query.assert_awaited_once()` after the happy-path delete. The removed `test_precheck_uses_ro_query` was the only place that explicitly enforced the exactly-once semantics of both the read-only pre-check and the write DETACH DELETE. Without these, a double-invocation regression (either in the pre-check or in the delete) would go undetected. `test_executes_detach_delete` only asserts `await_count == 1` numerically, which will no longer semantically capture the 'pre-check MUST use ro_query' contract if that test is ever refactored.\n\n2. In `test_raises_node_not_found_when_missing` (~line 132-142), add `graph.ro_query.assert_awaited_once()` alongside the existing `graph.query.assert_not_awaited()` at line 142. This explicitly documents that on the missing-node path, the pre-check runs exactly once on the read-only slot and the write slot is never touched. Together with #1 this makes the read-only routing contract explicitly covered on both happy and error paths.\n\nFiles: fused-memory/tests/test_merge_entities.py\n\nSource: steward-triage follow-up from Task 528 (esc-528-97). Suggestions from reviewer_architect_reviewer and reviewer_performance.",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
+      },
+      {
+        "id": "578",
+        "title": "Fix fragile call_args indexing in test_reindex.py test_uses_ro_query_not_query",
+        "description": "In `fused-memory/tests/test_reindex.py` at line 321 (inside `TestListIndices.test_uses_ro_query_not_query`), the new cypher-content assertion uses the bare positional-index pattern:\n\n```python\ncypher = graph.ro_query.call_args[0][0]\nassert 'db.indexes' in cypher\n```\n\nThis deviates from the defensive extraction pattern established elsewhere in the suite (e.g., `test_refresh_entity_summary.py` lines 84-85 and `test_merge_entities.py` lines 124-125), which reads:\n\n```python\nargs, kwargs = graph.ro_query.call_args\ncypher = args[0] if args else kwargs.get('query', '')\n```\n\nThe current form raises an opaque `IndexError` if the implementation ever switches to keyword arguments, rather than producing a clear `AssertionError`. Replace with the defensive pattern for consistency and better failure diagnostics.\n\nNote: This is distinct from pending Task 435 which is scoped specifically to `test_refresh_entity_summary.py`.\n\nFiles: fused-memory/tests/test_reindex.py\n\nSource: steward-triage follow-up from Task 528 (esc-528-97). Suggestions from reviewer_architect_reviewer and reviewer_test_analyst (duplicate reports).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": []
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T03:39:47.055Z",
-      "taskCount": 537,
-      "completedCount": 437,
+      "lastModified": "2026-04-07T04:23:36.903Z",
+      "taskCount": 557,
+      "completedCount": 443,
       "tags": [
         "master"
       ]

@@ -318,6 +318,8 @@ class TestListIndices:
         await backend.list_indices(group_id='test')
         graph.ro_query.assert_awaited_once()
         graph.query.assert_not_awaited()
+        cypher = graph.ro_query.call_args[0][0]
+        assert 'db.indexes' in cypher
 
 
 class TestDropIndex:

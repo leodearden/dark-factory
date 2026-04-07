@@ -140,7 +140,7 @@ class TestCollectSnapshot:
         assert len(rows) == 1
         row = rows[0]
         # row: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
-        assert row[1] == str(config.project_root.resolve())  # project_id
+        assert row[1] == str(config.project_root)  # project_id
         assert row[3] == 1   # pending
         assert row[4] == 1   # in_progress
         assert row[5] == 0   # blocked
@@ -240,7 +240,7 @@ class TestCollectSnapshot:
 
         assert len(rows) == 3
         project_ids = {row[0] for row in rows}
-        assert str(base_config.project_root.resolve()) in project_ids
+        assert str(base_config.project_root) in project_ids
         assert str(reify_root.resolve()) in project_ids
         assert str(autopilot_root.resolve()) in project_ids
 
@@ -261,7 +261,7 @@ class TestCollectSnapshot:
             await collect_snapshot(conn, config)
 
         async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
-                                (str(base_config.project_root.resolve()),)) as cur:
+                                (str(base_config.project_root),)) as cur:
             row = await cur.fetchone()
             assert row is not None
             count = row[0]
@@ -405,7 +405,7 @@ class TestCollectSnapshot:
 
         assert len(rows) == 2
         ids = {row[1] for row in rows}
-        assert str(config.project_root.resolve()) in ids  # main project
+        assert str(config.project_root) in ids  # main project
         assert str(reify_root) in ids            # config-discovered project
         # Check reify row counts
         reify_row = next(r for r in rows if r[1] == str(reify_root))

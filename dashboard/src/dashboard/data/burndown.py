@@ -69,14 +69,15 @@ async def collect_snapshot(
 ) -> None:
     """Discover projects and insert one snapshot row per project."""
     now = datetime.now(UTC).isoformat()
-    resolved_root = str(config.project_root.resolve())
+    # config.project_root is already resolved by DashboardConfig.__post_init__
+    resolved_root = str(config.project_root)
 
     # Phase 1 — Discovery (sequential, in-memory):
     # Build the ordered list of (project_id_str, tasks_json_path) tuples to snapshot.
     # Main project is always first; seen_roots dedup is preserved exactly.
-    # Use the resolved (symlink-canonical) path so a symlinked project_root
-    # deduplicates correctly against orchestrator / known_project_roots entries
-    # that surface the real path.
+    # project_root is already canonical (symlink-resolved) so a symlinked
+    # project_root deduplicates correctly against orchestrator /
+    # known_project_roots entries that surface the real path.
     roots_to_snapshot: list[tuple[str, Path]] = []
     seen_roots: set[str] = {resolved_root}
     roots_to_snapshot.append((resolved_root, config.tasks_json))
@@ -99,19 +100,15 @@ async def collect_snapshot(
         roots_to_snapshot.append((root_str, project_root / '.taskmaster' / 'tasks' / 'tasks.json'))
 
     for known_root in config.known_project_roots:
-        # Per-root error isolation for the discovery phase: a single unreadable
-        # known_root (e.g. PermissionError on resolve() when a parent directory
-        # is inaccessible) must not unwind the entire collect_snapshot coroutine.
-        try:
-            resolved = known_root.resolve()
-            root_str = str(resolved)
-            if root_str in seen_roots:
-                continue
-            seen_roots.add(root_str)
-            roots_to_snapshot.append((root_str, resolved / '.taskmaster' / 'tasks' / 'tasks.json'))
-        except OSError:
-            logger.warning('Failed to resolve known root %s', known_root, exc_info=True)
+        # known_root is already resolved by DashboardConfig.__post_init__,
+        # so .resolve() is unnecessary here.  Per-root error isolation for
+        # load failures (PermissionError, etc.) is handled by Phase 2's
+        # return_exceptions=True and Phase 3's exception check below.
+        root_str = str(known_root)
+        if root_str in seen_roots:
             continue
+        seen_roots.add(root_str)
+        roots_to_snapshot.append((root_str, known_root / '.taskmaster' / 'tasks' / 'tasks.json'))
 
     # Phase 2 — Parallel read:
     # All load_task_tree calls are independent (separate files), so run them concurrently.
