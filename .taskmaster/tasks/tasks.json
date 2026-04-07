@@ -9656,7 +9656,9 @@
         "details": "",
         "testStrategy": "",
         "status": "pending",
-        "dependencies": [],
+        "dependencies": [
+          "552"
+        ],
         "priority": "medium",
         "subtasks": [],
         "updatedAt": "2026-04-06T20:13:39.563Z",
