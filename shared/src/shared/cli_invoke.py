@@ -13,7 +13,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from shared.vllm_bridge import VllmBridge
+# VllmBridge depends on aiohttp, which is not installed in every consumer
+# environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
+# that never set ANTHROPIC_BASE_URL can still import shared.cli_invoke.
+try:
+    from shared.vllm_bridge import VllmBridge
+except ImportError:  # pragma: no cover - exercised only when aiohttp absent
+    VllmBridge = None  # type: ignore[assignment,misc]
 
 if TYPE_CHECKING:
     from shared.config_dir import TaskConfigDir
@@ -366,6 +372,11 @@ async def _invoke_claude(
     bridge: VllmBridge | None = None
     try:
         if env_overrides and env_overrides.get('ANTHROPIC_BASE_URL'):
+            if VllmBridge is None:
+                raise RuntimeError(
+                    'ANTHROPIC_BASE_URL is set but aiohttp is not installed; '
+                    'install dark-factory-shared with the vllm extras to use VllmBridge.'
+                )
             bridge = VllmBridge(upstream_url=env_overrides['ANTHROPIC_BASE_URL'])
             await bridge.start()
             env['ANTHROPIC_BASE_URL'] = bridge.url

@@ -1,6 +1,7 @@
 """Tests for the LLM-as-judge module (judge.py)."""
 
 from dataclasses import dataclass, field
+from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -417,12 +418,13 @@ async def test_judge_call_llm_openai_none_content(mock_journal):
 
 def _make_verdicts(severities: list[str]):
     """Build a list of JudgeVerdict objects from severity strings."""
-    from datetime import datetime, timezone
+    from datetime import datetime
+
     from fused_memory.models.reconciliation import JudgeVerdict, VerdictSeverity
     return [
         JudgeVerdict(
             run_id=f'run-{i}',
-            reviewed_at=datetime.now(tz=timezone.utc),
+            reviewed_at=datetime.now(tz=UTC),
             severity=VerdictSeverity(s),
         )
         for i, s in enumerate(severities)

@@ -165,6 +165,7 @@ class AgentStub:
         resume_session_id: str | None = None,
         timeout_seconds: float | None = None,
         config_dir: Path | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> AgentResult:
         """Determine role from system_prompt content, perform side effects."""
         role = self._detect_role(system_prompt)
