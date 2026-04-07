@@ -36,9 +36,9 @@ class _StubPodStatus:
     RUNNING = "RUNNING"
 
 
-_rpt_config.RunPodConfig = _StubRunPodConfig
-_rpt_compute.RunPodClient = _StubRunPodClient
-_rpt_compute.PodStatus = _StubPodStatus
+_rpt_config.RunPodConfig = _StubRunPodConfig  # type: ignore[attr-defined]
+_rpt_compute.RunPodClient = _StubRunPodClient  # type: ignore[attr-defined]
+_rpt_compute.PodStatus = _StubPodStatus  # type: ignore[attr-defined]
 
 sys.modules.setdefault("runpod_toolkit", _rpt)
 sys.modules.setdefault("runpod_toolkit.config", _rpt_config)
@@ -50,11 +50,9 @@ _SCRIPTS = Path(__file__).parents[2] / "scripts"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-import run_vllm_eval as launcher  # noqa: E402
-from run_vllm_eval import (  # noqa: E402
-    BaselineStatus,
+import run_vllm_eval as launcher  # type: ignore[import-not-found]  # noqa: E402
+from run_vllm_eval import (  # type: ignore[import-not-found]  # noqa: E402
     EvalSummary,
-    PodBringupFailed,
     PodHandle,
     TaskSpecNotFound,
     compute_exit_code,
@@ -67,7 +65,6 @@ from run_vllm_eval import (  # noqa: E402
     resolve_task_ids,
     tear_down_pod,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -700,7 +697,6 @@ class TestPreflightBaseline:
         }
         preflight_baseline(spec, repo_root=repo)
 
-        wt_dir = repo / ".eval-worktrees" / "test_task"
         # Either the directory was never created or only contains stale dirs
         # that are NOT registered as live worktrees.
         live = subprocess.run(
