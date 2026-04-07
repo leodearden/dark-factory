@@ -10715,6 +10715,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 564,
+        "title": "Fill missing test coverage gaps in task_filter and stages",
+        "description": "Three test additions:\n1. In `test_stages.py` (TestTaskKnowledgeSyncUsesFilterTaskTree): add a test with 35 done tasks asserting task id=1 (oldest) does NOT appear in the 'Recently Completed Tasks' payload section while task id=35 does.\n2. In `test_task_filter.py` (TestFilterTaskTreeDoneAndCancelledLists): add a test with a mix of int and string task IDs in done/cancelled lists and assert their relative sort order — verify the non-int task lands where _id_key's fallback-to-0 places it.\n3. In `test_task_filter.py` (TestFilterTaskTree or TestFilterTaskTreeDoneAndCancelledLists): add a test with mixed pending/in-progress/done/cancelled/unknown tasks that asserts `active_tasks`, `done_tasks`, and `cancelled_tasks` are disjoint — no task ID appears in more than one list.\n\nFiles: fused-memory/tests/test_stages.py, fused-memory/tests/test_task_filter.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10727,7 +10738,7 @@
       ],
       "created": "2026-04-07T03:39:47.326Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T03:43:55.072Z"
+      "updated": "2026-04-07T03:44:02.607Z"
     }
   }
 }
