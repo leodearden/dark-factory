@@ -10317,10 +10317,11 @@
         "description": "Four targeted test fixes from the Task 486 review:\n\n1. Remove `test_precheck_uses_ro_query` from `test_merge_entities.py` (~line 150) — its assertions are a strict subset of `test_executes_detach_delete` which already covers `await_count` for both `ro_query` and `query` plus verifies `'DETACH DELETE'`. Three reviewers flagged this duplication.\n\n2. Add `graph.query.assert_not_awaited()` after the `pytest.raises` block in `test_raises_node_not_found_when_missing` (~line 132) to verify DETACH DELETE never fires when the pre-check finds nothing. This is the critical negative assertion — without it, a regression could allow DETACH DELETE on the missing path.\n\n3. In the list_indices `test_uses_ro_query_not_query` (~line 313 in `test_reindex.py`), inspect `graph.ro_query.call_args[0][0]` and assert it contains `'db.indexes'`. Current test uses `make_graph_mock([])`, so the loop body never runs and only call-count is verified.\n\n4. Add `graph.query.assert_not_awaited()` to `test_passes_name_as_param` in `test_refresh_entity_summary.py` (~line 80) to make the test self-sufficient.\n\nFiles: fused-memory/tests/test_merge_entities.py, fused-memory/tests/test_reindex.py, fused-memory/tests/test_refresh_entity_summary.py\n\nSource: steward-triage follow-up from Task 486 (esc-486-49).",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T04:09:22.267Z"
       },
       {
         "id": "529",
@@ -10879,7 +10880,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T04:09:22.038Z",
+      "lastModified": "2026-04-07T04:09:22.267Z",
       "taskCount": 555,
       "completedCount": 442,
       "tags": [
