@@ -184,10 +184,11 @@ Output your matches as JSON.
         system_prompt=system_prompt,
         cwd=Path('/home/leo/src/dark-factory'),
         model='haiku',
-        max_turns=1,
-        max_budget_usd=0.10,
+        max_turns=3,
+        max_budget_usd=0.50,
         output_schema=_MATCH_SCHEMA,
         effort='low',
+        allowed_tools=[],  # no tools needed — all context is in the prompt
     )
 
     # Parse matches

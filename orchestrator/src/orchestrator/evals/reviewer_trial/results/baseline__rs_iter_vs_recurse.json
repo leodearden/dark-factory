@@ -1,0 +1,190 @@
+{
+  "variant_name": "baseline",
+  "diff_id": "rs_iter_vs_recurse",
+  "reviews": {
+    "test_analyst": {
+      "reviewer": "test_analyst",
+      "verdict": "ERROR",
+      "issues": [],
+      "summary": "Unparseable output: You've hit your limit \u00b7 resets 8pm (Europe/London)"
+    },
+    "reuse_auditor": {
+      "reviewer": "reuse_auditor",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_expr_iterative (new method, entire function)",
+          "category": "dead_code",
+          "description": "lower_expr_iterative has zero call sites in the codebase. The method is never invoked, making it unreachable dead code. This was confirmed by a repo-wide grep for 'lower_expr_iterative'.",
+          "suggested_fix": "Either wire up a call site (replacing an appropriate call to lower_expr) or remove the method entirely until it is actually needed."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_expr_iterative (match arms for leaf nodes)",
+          "category": "duplication",
+          "description": "The match arms for 'number_literal', 'string_literal', 'bool_literal', 'identifier', 'unary_expression', and 'function_call' are an exact copy of the corresponding arms in lower_expr (lines 1696-1700). They dispatch to the identical helper methods. Any future addition to lower_expr's dispatch table will also need to be added here, or the two diverge silently \u2014 the _ fallback to lower_expr would paper over the divergence but add an extra recursive call.",
+          "suggested_fix": "Remove the duplicated leaf arms. For nodes that are already handled by lower_expr, just call lower_expr directly (or rely solely on the existing _ => self.lower_expr(node) fallback arm that already covers them)."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_expr_iterative parenthesized_expression arm vs lower_expr lines 1709-1718",
+          "category": "duplication",
+          "description": "The parenthesized_expression cursor walk \u2014 including the identical child.kind() != \"(\" && child.kind() != \")\" guard \u2014 is duplicated verbatim from lower_expr (lines 1711-1714). The guard is also questionable in both places: tree-sitter named nodes never include bare punctuation tokens, so the kind checks are effectively dead.",
+          "suggested_fix": "Extract the parenthesized inner-child lookup into a small helper, e.g. fn inner_expr_node(node: Node) -> Option<Node>, and call it from both methods. This also removes the dead kind checks from a single place."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_expr_iterative binary_expression arm",
+          "category": "over_engineering",
+          "description": "The binary_expression arm pushes children onto the stack but then immediately calls self.lower_binary_expr(node) recursively and discards the stack entries it just pushed. The comment acknowledges this: 'Just lower it recursively as a fallback'. Combined with _ => self.lower_expr(node) covering every other complex case (range_expression, conditional_expression, match_expression, lambda_expression, etc.), the method never actually performs iterative lowering \u2014 it is the full recursive path with extra stack manipulation overhead on top.",
+          "suggested_fix": "If the goal is avoiding stack overflow on deeply nested binary expressions, a true iterative approach requires a two-pass design (push-phase builds the work list, pop-phase assembles results bottom-up using an output stack). The current half-measure adds complexity without benefit. Until a proper iterative implementation exists, remove the method and address stack depth via stacker::maybe_grow or an increased thread stack size, which is the idiomatic Rust approach for tree walkers."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_expr_iterative (results.into_iter().last().flatten())",
+          "category": "logic_error",
+          "description": "The comment says 'Return the last result (root expression)', but the root node is popped and processed first, so its result is pushed to results[0]. Children pushed later produce results[1..n]. Calling .last() returns a child's result, not the root's. The stated intent and the implementation are inverted.",
+          "suggested_fix": "Return results.into_iter().next().flatten() to get the first (root) result, or restructure the algorithm so the root result is constructed last (proper bottom-up assembly)."
+        }
+      ],
+      "summary": "The new lower_expr_iterative method has five interrelated problems. First and most importantly, it is never called anywhere, making it dead code. Second, it duplicates the leaf-node dispatch table from lower_expr verbatim (six match arms); the existing _ => self.lower_expr(node) fallback already covers them. Third, the parenthesized_expression cursor walk is copy-pasted from lower_expr including a dead punctuation-kind guard. Fourth, the method's stated purpose \u2014 avoiding recursion \u2014 is not achieved: the binary_expression arm pushes children onto the stack and then immediately delegates to lower_binary_expr recursively, while every other complex node kind falls through to lower_expr. Fifth, results.into_iter().last() returns a child's result rather than the root's, because the root is processed first. The method adds roughly 50 lines of duplicated, non-functional code with no call site to justify it."
+    },
+    "architect_reviewer": {
+      "reviewer": "architect_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_expr_iterative (new method)",
+          "category": "broken_algorithm_correctness",
+          "description": "The result-collection strategy is fundamentally wrong. The method pushes `root` first (LIFO), so the root is processed first \u2014 not last. Children pushed during processing are handled after the parent's result is already appended to `results`. For any composite expression like `(a + b) * c`, `results.into_iter().last()` returns the result of the last leaf processed (e.g., `a`), not the root expression. The method will silently return an incorrect subtree as the parse result.",
+          "suggested_fix": "A correct iterative post-order lowering requires explicit continuation frames (a work-item enum with `Visit(Node)` and `Build(NodeKind, arity)` variants). Push `Visit(root)`, and when popping a `Visit` for a composite node, push a `Build` frame followed by `Visit` frames for each child. When popping a `Build`, pop the computed children from an operand stack to construct the parent `Expr`. This is the standard iterative tree-fold pattern."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_expr_iterative, binary_expression arm",
+          "category": "stated_purpose_violated",
+          "description": "The `binary_expression` arm simultaneously pushes children onto the stack AND calls `self.lower_binary_expr(node)` as a synchronous recursive fallback. `lower_binary_expr` internally calls `self.lower_expr()` for both children, which recurses into the full recursive call tree. Binary expressions are precisely the nesting pattern that causes deep recursion and stack overflow \u2014 the iterative wrapper provides zero protection for them. The comment acknowledges this ('fallback to recursive') but the function's doc-comment promises to avoid stack overflows, creating a broken contract.",
+          "suggested_fix": "The `binary_expression` arm must not call any recursive lowering function. All child construction must go through the work-item stack. Remove the `self.lower_binary_expr(node)` call and replace with a `Build` continuation frame as described above."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_expr_iterative (new method)",
+          "category": "dead_code",
+          "description": "`lower_expr_iterative` is never called anywhere in the codebase. The ~48 existing call sites of `lower_expr` are unchanged, so even a correct implementation of this method would have no effect on stack depth in practice. The method will generate a dead-code compiler warning.",
+          "suggested_fix": "If iterative lowering is the goal, replace the call sites that are at risk (deeply nested expression contexts) to route through this method, or replace `lower_expr` directly. Add a `#[cfg(test)]` call-site or a `#[allow(dead_code)]` annotation only if this is intentionally scaffolding for a follow-up PR."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_expr_iterative, parenthesized_expression arm",
+          "category": "confused_node_model",
+          "description": "The filter `child.kind() != \"(\" && child.kind() != \")\"` is redundant with the preceding `child.is_named()` guard. In Tree-sitter, `(` and `)` punctuation tokens are anonymous nodes and are already excluded by `is_named()`. The double-filter indicates a misunderstanding of Tree-sitter's named/anonymous node distinction, which may lead to similar errors in future arms.",
+          "suggested_fix": "Remove the `child.kind() != \"(\" && child.kind() != \")\"` checks. The `is_named()` guard is sufficient and consistent with how all other lowering functions in this file filter child nodes."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:lower_expr_iterative, _ fallback arm",
+          "category": "pattern_inconsistency",
+          "description": "The wildcard fallback `_ => self.lower_expr(node)` re-enters the recursive path for any node kind not explicitly handled (e.g., conditionals, lambdas, range expressions, match expressions, member access). These are common expression forms that can appear in deeply nested contexts. The iterative method therefore only handles a small subset of the AST, silently falling back to full recursion for the rest \u2014 inconsistent with the codebase's pattern of exhaustive dispatch in `lower_expr`.",
+          "suggested_fix": "Either enumerate all expression node kinds handled by the iterative path explicitly (with `todo!()` / compile-time exhaustiveness), or document clearly which node kinds are intentionally excluded and why they are safe from deep nesting."
+        }
+      ],
+      "summary": "The new `lower_expr_iterative` method has a correct stated goal (avoid stack overflow on deeply nested AST) but a fundamentally broken implementation that makes it unsuitable to call. Two blocking issues: (1) The result-collection strategy is wrong \u2014 because the root node is pushed and processed first on a LIFO stack, `results.last()` returns a leaf-node result rather than the root expression, causing silent mis-parses. (2) The `binary_expression` arm \u2014 the most important case for deep nesting \u2014 immediately falls back to `self.lower_binary_expr`, which recurses through `lower_expr` exactly as before, providing no stack relief. Beyond correctness, the method is dead code (never called, all 48 existing `lower_expr` call sites are unchanged) and its `parenthesized_expression` arm shows confusion about Tree-sitter's named/anonymous node model. A correct iterative tree-fold here requires explicit continuation frames (a `Visit`/`Build` work-item enum with a separate operand stack), which is a well-known pattern for iterative post-order traversal over recursive data structures that require bottom-up construction."
+    },
+    "performance": {
+      "reviewer": "performance",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1714-1722 (binary_expression branch)",
+          "category": "exponential_work_duplication",
+          "description": "The `binary_expression` branch pushes both children onto the outer `stack` AND immediately calls `self.lower_binary_expr(node)`. `lower_binary_expr` itself calls `self.lower_expr(left_node)` and `self.lower_expr(right_node)` recursively, fully traversing both subtrees. When the loop then pops those same children from the stack, their entire subtrees are traversed a second time. For a balanced binary tree of depth D this produces O(2^D) work rather than O(D), completely defeating the stated purpose of avoiding deep recursion and causing severe performance regression on any moderately complex expression.",
+          "suggested_fix": "Either push children and do NOT call lower_binary_expr (build the BinaryExpr from the results queue after children are resolved, using a continuation/frame approach), or do not push children and call lower_binary_expr exclusively. A proper iterative approach requires an explicit frame stack that stores partial BinaryExpr state (op, left result slot) and resumes after each child is lowered."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1747 (`results.into_iter().last().flatten()`)",
+          "category": "wrong_result_returned",
+          "description": "The root node is the first item popped from the stack. If root is a `binary_expression`, `lower_binary_expr(root)` is pushed to `results[0]`, then the right child's result is pushed to `results[1]`, then the left child's result to `results[2]`. `results.last()` returns `results[2]` \u2014 the result of the left-most leaf \u2014 not the root expression. For any non-leaf root this returns the wrong `Expr` entirely, corrupting the AST.",
+          "suggested_fix": "The root's result is always the first item added: use `results.into_iter().next().flatten()`. Better yet, with a proper continuation frame design the root result is naturally the final item produced and `results.pop().flatten()` would be correct."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1747",
+          "category": "unnecessary_allocation_iteration",
+          "description": "`results.into_iter().last()` consumes the entire iterator to find the last element, which is O(n) in the number of nodes processed. Even if the intent were correct, `results.pop()` achieves the same in O(1).",
+          "suggested_fix": "Replace `results.into_iter().last().flatten()` with `results.pop().flatten()` (or `.first()` / `.into_iter().next()` depending on the corrected ordering)."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1704-1748 (entire function)",
+          "category": "unconditional_allocation_for_trivial_inputs",
+          "description": "Two `Vec` allocations (`stack` and `results`) are made unconditionally even when `root` is a leaf node (`number_literal`, `identifier`, etc.) where a single call to the leaf lowering function would suffice with zero allocation. On hot paths (parsers frequently process many small literal expressions) these repeated allocations add up.",
+          "suggested_fix": "Add a fast path: check `root.kind()` before entering the loop and return early for leaf node kinds via the existing leaf lowering helpers, falling into the iterative path only for compound expression kinds."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1720 (`unary_expression`, `function_call`, and `_ =>` branches)",
+          "category": "fallback_recursion_defeats_purpose",
+          "description": "`lower_unary_expr`, `lower_function_call`, and the catch-all `self.lower_expr(node)` all recurse fully. Only leaf node kinds are handled non-recursively. As a result the function provides essentially no stack-depth benefit over calling `lower_expr` directly \u2014 deeply nested chains of unary ops or function calls will still overflow the stack.",
+          "suggested_fix": "For `unary_expression` push the operand child and use a continuation frame to wrap the result in `ExprKind::UnOp` after it resolves. For `function_call` similarly push argument children. The `_` catch-all should be removed or, if truly needed, documented as the known recursion risk."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1735-1737 (parenthesized_expression branch)",
+          "category": "dead_code_checks",
+          "description": "The filter `child.kind() != \"(\" && child.kind() != \")\"` is dead code. Punctuation tokens (bare `(` and `)`) are anonymous nodes in Tree-sitter; they are already excluded by the preceding `child.is_named()` guard. The extra kind checks never match a named child and waste a string comparison per named child.",
+          "suggested_fix": "Remove `&& child.kind() != \"(\" && child.kind() != \")\"` \u2014 the `is_named()` check is sufficient."
+        }
+      ],
+      "summary": "The new `lower_expr_iterative` function contains two blocking correctness/performance bugs. First, the `binary_expression` branch both pushes children onto the work stack and immediately calls the fully-recursive `lower_binary_expr`, causing every binary subtree to be traversed twice \u2014 an exponential blowup (O(2^D) work for depth D) that is strictly worse than the original recursive approach. Second, `results.into_iter().last()` returns the last result appended (the deepest left-most leaf) rather than the root expression result (which is always appended first), so the function returns a completely wrong `Expr` for any compound expression. Additionally, two `Vec` allocations occur unconditionally even for leaf nodes, the O(n) `.last()` iterator walk should be O(1) `.pop()`, the `(` / `)` kind guards are dead code, and most expression kinds still fall through to fully recursive helpers making the iterative wrapper provide no real stack-depth benefit for unary expressions, function calls, or any unrecognised node kind."
+    },
+    "robustness": {
+      "reviewer": "robustness",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1742",
+          "category": "incorrect_return_value",
+          "description": "The function returns `results.into_iter().last().flatten()`, which is the result of the LAST node processed off the stack \u2014 not the root expression. Because the stack is LIFO, the root is processed first (its result is pushed first), then its children are processed and their results appended. For `a + b`: results ends up as `[BinOp(a,b), b_expr, a_expr]` and `last()` returns `a_expr`. Every compound expression returns a wrong subtree.",
+          "suggested_fix": "Track the root result explicitly: capture the first `pop()` result separately before entering the loop, or use a proper post-order continuation-passing scheme (two stacks: one for pending nodes, one for completed operands whose arity is known). The current 'collect all into a Vec then take last' strategy is fundamentally broken for any tree with more than one node."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1714-1723",
+          "category": "recursive_fallback_defeats_purpose",
+          "description": "The `binary_expression` arm both pushes children onto `stack` AND immediately calls `self.lower_binary_expr(node)`, which internally calls `self.lower_expr(left)` / `self.lower_expr(right)` recursively. Deeply nested binary chains (the stated motivation for this function) still blow the call stack. Additionally, the separately pushed children are then processed independently and their results appended to `results`, further corrupting the return value logic.",
+          "suggested_fix": "A true iterative lowering of binary expressions requires a two-stack (input nodes + operand results) or an explicit continuation stack. The recursive call inside `lower_binary_expr` must be eliminated for the iterative version. Consider representing in-progress parent nodes on the stack as an enum `Pending { node, children_needed }` so you can defer construction until children are resolved."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1729-1735",
+          "category": "missing_result_for_root",
+          "description": "The `parenthesized_expression` arm uses `continue`, so no result is pushed to `results` for that node. If the root expression passed to `lower_expr_iterative` is parenthesized (e.g., `(a + b)` at the top level), the root itself never produces a result; only its inner child's result lands in `results`. The function then silently returns the inner child's expression, which may accidentally be correct but is semantically wrong and will fail when there are multiple inner levels.",
+          "suggested_fix": "Either push the inner child's result tagged as the result for the parenthesized node, or handle parenthesized_expression the same way as other pass-through nodes using the two-stack continuation approach."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1703",
+          "category": "dead_code",
+          "description": "`lower_expr_iterative` is never called anywhere in the file. All expression-lowering call sites (611, 626, 636, 703, 743, 747, 898, 915, 1122, 1165, 1194, 1225, 1243, 1258, 1272, 1422, 1488, 1526, 1578, 1597, 1680, etc.) invoke `lower_expr`. The new function has zero observable effect on the codebase.",
+          "suggested_fix": "Wire up `lower_expr_iterative` at the call sites where deep nesting can occur, or remove it until the implementation is correct. If left as dead code, add a `#[allow(dead_code)]` annotation at minimum, or better: replace with a TODO comment documenting the intended design."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1736",
+          "category": "incomplete_iterative_coverage",
+          "description": "The `unary_expression`, `function_call`, and `_` (fallback) arms all call recursive helpers directly (`lower_unary_expr`, `lower_function_call`, `lower_expr`). None of them are actually handled iteratively. The function cannot prevent stack overflows for any expression type currently, even if the return-value bug were fixed.",
+          "suggested_fix": "Implement a genuine continuation-based iterative traversal, or limit the scope of this function to only expression types where deep nesting is actually observed (binary chains), and document which kinds remain recursive."
+        }
+      ],
+      "summary": "The new `lower_expr_iterative` function is broken in at least three independent, blocking ways. First, its return-value logic (`results.into_iter().last()`) picks the last leaf processed rather than the root expression \u2014 for any compound expression this silently returns a wrong subtree. Second, the `binary_expression` arm (the primary motivation for the function) still calls `lower_binary_expr` recursively, so it neither prevents stack overflows nor produces correct results when children are also pushed independently onto the stack. Third, the `parenthesized_expression` `continue` path pushes no result for the node itself, so a parenthesized root expression silently returns only its inner child. The function is also completely dead code \u2014 no call site uses it \u2014 so it currently has zero observable effect, but if wired in it would produce incorrect ASTs. The entire approach needs to be redesigned around a two-stack or explicit continuation model before it can be used safely."
+    }
+  },
+  "total_cost_usd": 0.77775465,
+  "wall_clock_ms": 424077,
+  "errors": []
+}
