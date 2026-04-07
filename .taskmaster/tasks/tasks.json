@@ -10771,6 +10771,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 569,
+        "title": "Add missing symlink-resolution and dataclasses.replace() tests for DashboardConfig",
+        "description": "In `dashboard/tests/test_scaffold.py`: (1) Add a test alongside `test_from_env_resolves_known_project_roots` (line 100): create a real dir and symlink, set `DASHBOARD_PROJECT_ROOT` to the symlink via monkeypatch, call `DashboardConfig.from_env()`, assert `cfg.project_root == real_dir.resolve()`. (2) In `TestPostInit`, add a test: create a base config with a real dir, call `dataclasses.replace(cfg, known_project_roots=[symlink])`, assert the result has resolved `known_project_roots`. This validates the stated contract in the `TestPostInit` docstring that replace() is a covered construction path.\n\nFiles: dashboard/tests/test_scaffold.py\n\nSource: review suggestions on task 508 (suggestions 7, 8 from reviewer test_analyst).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10783,7 +10794,7 @@
       ],
       "created": "2026-04-07T03:56:54.248Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T03:57:00.912Z"
+      "updated": "2026-04-07T03:57:06.172Z"
     }
   }
 }
