@@ -10129,11 +10129,17 @@
         "updatedAt": "2026-04-07T03:02:45.892Z",
         "metadata": {
           "memory_hints": {
-            "entities": [],
+            "entities": [
+              "qwen3-coder-next-fp8-new"
+            ],
             "queries": [
-              "resolution for: Investigate and fix Qwen3-Coder-Next-FP8 vLLM startup hang (health timeout)"
+              "Qwen3-Coder-Next vLLM startup hang health timeout H200 RTX",
+              "vLLM eval configs.py qwen3_coder tool-call parser",
+              "vllm_bridge.py tool-format bridge Task 457 merged main",
+              "qwen3-coder-next-fp8 config migration H200 startup investigation"
             ]
-          }
+          },
+          "_causation_id": "16ca730d-ac5c-44e5-ab81-2e789a78e698"
         }
       },
       {
