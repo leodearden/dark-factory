@@ -10760,6 +10760,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 568,
+        "title": "Drop remaining .resolve() calls from test_burndown_data.py assertions and _tasks_map keys",
+        "description": "In `dashboard/tests/test_burndown_data.py` in `test_snapshots_known_project_roots_when_no_orchestrators`: (1) Change `_tasks_map` keys at lines 225-226 from `reify_root.resolve() / ...` and `autopilot_root.resolve() / ...` to `reify_root / ...` and `autopilot_root / ...` — these paths are stored in config after __post_init__ resolution, and collect_snapshot uses `known_root / ...` directly. (2) Change assertions at lines 244-245 from `str(reify_root.resolve())` / `str(autopilot_root.resolve())` to `str(reify_root)` / `str(autopilot_root)`, consistent with line 243. (3) Check line 341 for the same pattern in `test_dedupes_known_root_against_running_orchestrator` and update if applicable.\n\nFiles: dashboard/tests/test_burndown_data.py\n\nSource: review suggestions on task 508 (suggestions 3, 5, 6 from reviewers performance, reuse_auditor, test_analyst).",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10772,7 +10783,7 @@
       ],
       "created": "2026-04-07T03:56:54.248Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T03:56:54.252Z"
+      "updated": "2026-04-07T03:57:00.912Z"
     }
   }
 }
