@@ -93,13 +93,14 @@ class TaskWorkflow:
             # Set task in-progress
             await self.scheduler.set_task_status(self.task_id, 'in-progress')
 
-            # Create worktree
-            self.worktree = await self.git_ops.create_worktree(branch_name)
+            # Create worktree (captures base commit for stable diffs)
+            self.worktree, base_commit = await self.git_ops.create_worktree(branch_name)
             self.artifacts = TaskArtifacts(self.worktree)
             self.artifacts.init(
                 self.task_id,
                 self.task.get('title', ''),
                 self.task.get('description', ''),
+                base_commit=base_commit,
             )
 
             # PLAN
@@ -283,7 +284,11 @@ class TaskWorkflow:
     async def _review(self):
         """Run all 5 reviewers in parallel, aggregate results."""
         assert self.worktree is not None and self.artifacts is not None
-        diff = await self.git_ops.get_diff_from_main(self.worktree)
+        base_commit = self.artifacts.read_base_commit()
+        if base_commit:
+            diff = await self.git_ops.get_diff_from_base(self.worktree, base_commit)
+        else:
+            diff = await self.git_ops.get_diff_from_main(self.worktree)
 
         # Launch all reviewers concurrently
         review_tasks = []

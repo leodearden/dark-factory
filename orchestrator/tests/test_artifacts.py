@@ -34,6 +34,15 @@ class TestInit:
         assert metadata['description'] == 'A test task description'
         assert 'created_at' in metadata
 
+    def test_base_commit_stored(self, worktree: Path):
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.init('task-2', 'Test', 'Desc', base_commit='abc123def456')
+        assert ta.read_base_commit() == 'abc123def456'
+
+    def test_base_commit_absent_when_not_provided(self, artifacts: TaskArtifacts):
+        assert artifacts.read_base_commit() is None
+
 
 class TestPlan:
     def test_write_and_read_plan(self, artifacts: TaskArtifacts):
