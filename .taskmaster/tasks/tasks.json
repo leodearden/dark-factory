@@ -10385,7 +10385,19 @@
           "modules": [
             "fused-memory/src/fused_memory/backends",
             "fused-memory/tests/test_list_indices_integration.py"
-          ]
+          ],
+          "memory_hints": {
+            "entities": [
+              "FalkorDB",
+              "graphiti_client"
+            ],
+            "queries": [
+              "FalkorDB GRAPH.RO_QUERY stored procedure CALL db.indexes compatibility",
+              "list_indices ro_query FalkorDB read-only path",
+              "FalkorDB version native process services run natively"
+            ]
+          },
+          "_causation_id": "2f2ac841-21ef-4bb6-ae6f-d98d538127ca"
         }
       },
       {
