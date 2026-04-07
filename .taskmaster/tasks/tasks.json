@@ -10826,6 +10826,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 574,
+        "title": "Strengthen existing context_assembler cancellation tests with missing assertions",
+        "description": "Two targeted improvements to the cancellation tests already in test_context_assembler.py:\n\n1. **test_context_assembler.py:558** — add `assert call_count == 2` after the `pytest.raises(asyncio.CancelledError)` block in `test_cancelled_error_propagates_alongside_exception` to explicitly verify both tasks were dispatched and the mixed-batch [RuntimeError, CancelledError] scenario was actually exercised. Without the assertion, a future refactor that reduces batch size or changes gather dispatch so only one task runs would fail with an unexpected RuntimeError rather than a clear diagnostic.\n\n2. **test_context_assembler.py:513-558** — switch from direct attribute assignment (`assembler._fetch_context = patched_fetch_context`) to `unittest.mock.patch.object(assembler, '_fetch_context', new=patched_fetch_context)` so that a rename of `_fetch_context` raises AttributeError rather than silently making the test a no-op.\n\nSource: review follow-up from task 512 (cycle 2026-04-07).\nRationale: makes the cancellation-propagation tests robust against refactors that would otherwise silently invalidate them.\n\nFiles:\n- fused-memory/tests/test_context_assembler.py",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -10838,7 +10849,7 @@
       ],
       "created": "2026-04-07T04:04:41.194Z",
       "description": "Tasks for master context",
-      "updated": "2026-04-07T04:04:41.198Z"
+      "updated": "2026-04-07T04:04:48.156Z"
     }
   }
 }
