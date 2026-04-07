@@ -124,6 +124,24 @@ class TestQwen3CoderNextExtraEnv:
             f"GPU_MEMORY_UTIL not set to '0.90' in extra_env: {extra_env!r}"
         )
 
+    def test_enforce_eager_is_set(self, _parsed_models):
+        """extra_env must set ENFORCE_EAGER=1 to disable CUDA-graph capture entirely.
+
+        ENFORCE_EAGER=1 is the primary documented workaround for the Qwen3-Coder-Next-FP8
+        startup hang (vLLM issue #35504). It maps to --enforce-eager in the vLLM CLI,
+        which skips CUDA-graph capture and prevents the hang during warm-up.
+
+        NOTE: The runpod-toolkit entrypoint-vllm.sh must add a corresponding env-var hook:
+            if [ -n "${ENFORCE_EAGER}" ]; then CMD="$CMD --enforce-eager"; fi
+        Until that hook lands and a new Docker image is built + pushed
+        (leosiriusdawn/runpod-vllm:latest), this env var is set by the eval script
+        but the vLLM container ignores it (no runtime effect).
+        """
+        extra_env = _parsed_models["qwen3-coder-next"][4]
+        assert extra_env.get("ENFORCE_EAGER") == "1", (
+            f"ENFORCE_EAGER not set to '1' in extra_env: {extra_env!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step-11 tests: H200 GPU type priority
