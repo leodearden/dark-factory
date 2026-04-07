@@ -76,7 +76,8 @@ def run_eval(config_name, task_name, local_port, datacenter="US-NC-1",
     # Build pod env vars from config env_overrides (filter to vLLM entrypoint vars)
     extra_env = {}
     for k in ("TOOL_CALL_PARSER", "QUANTIZATION", "TP_SIZE",
-              "MAX_MODEL_LEN", "GPU_MEMORY_UTIL", "MAX_NUM_SEQS"):
+              "MAX_MODEL_LEN", "GPU_MEMORY_UTIL", "MAX_NUM_SEQS",
+              "ENFORCE_EAGER"):
         if k in cfg.env_overrides:
             extra_env[k] = cfg.env_overrides[k]
 

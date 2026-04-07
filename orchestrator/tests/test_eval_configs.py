@@ -148,6 +148,33 @@ class TestDroppedQwen25Regression:
             )
 
 
+class TestEnforceEagerOnQwen3:
+    """Regression guard: qwen3-coder-next-fp8-new must set ENFORCE_EAGER=1.
+
+    Workaround for the qwen3-coder-next-fp8 vLLM startup hang (vLLM #35504) —
+    disables CUDA-graph capture (--enforce-eager) at the entrypoint level.
+    Requires the entrypoint-vllm.sh hook in runpod-toolkit to take runtime effect.
+    """
+
+    def test_qwen3_coder_next_fp8_new_has_enforce_eager(self):
+        """qwen3-coder-next-fp8-new must have ENFORCE_EAGER=1 in env_overrides."""
+        cfg = get_config_by_name('qwen3-coder-next-fp8-new')
+        assert cfg is not None
+        assert cfg.env_overrides.get('ENFORCE_EAGER') == '1', (
+            f"qwen3-coder-next-fp8-new ENFORCE_EAGER missing or wrong: "
+            f"{cfg.env_overrides.get('ENFORCE_EAGER')!r}"
+        )
+
+    def test_other_vllm_configs_do_not_set_enforce_eager(self):
+        """Only qwen3-coder-next-fp8-new should set ENFORCE_EAGER (workaround is model-specific)."""
+        for cfg in VLLM_EVAL_CONFIGS:
+            if cfg.name == 'qwen3-coder-next-fp8-new':
+                continue
+            assert 'ENFORCE_EAGER' not in cfg.env_overrides, (
+                f'{cfg.name} unexpectedly sets ENFORCE_EAGER — workaround should be qwen3-only'
+            )
+
+
 class TestNoNameCollisions:
     """Config names within the canonical list must be unique."""
 

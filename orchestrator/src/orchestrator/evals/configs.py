@@ -33,6 +33,7 @@ def _vllm_config(
     effort: str = 'high',
     max_model_len: int | None = None,
     gpu_memory_util: float | None = None,
+    enforce_eager: bool = False,
 ) -> EvalConfig:
     """Build an EvalConfig that routes through a vLLM-compatible endpoint."""
     env = {
@@ -49,6 +50,11 @@ def _vllm_config(
         env['MAX_MODEL_LEN'] = str(max_model_len)
     if gpu_memory_util is not None:
         env['GPU_MEMORY_UTIL'] = str(gpu_memory_util)
+    if enforce_eager:
+        # Disables CUDA-graph capture (--enforce-eager) — workaround for the
+        # qwen3-coder-next-fp8 startup hang (vLLM #35504). Requires the
+        # entrypoint-vllm.sh hook in runpod-toolkit to take runtime effect.
+        env['ENFORCE_EAGER'] = '1'
     return EvalConfig(
         name=name, backend='claude', model='sonnet', effort=effort,
         env_overrides=env,
@@ -104,7 +110,8 @@ VLLM_EVAL_CONFIGS = [
         hf_model='Qwen/Qwen3-Coder-Next-FP8',
         image='leosiriusdawn/runpod-vllm:latest',
         gpu_type=H200, gpu_count=1, container_disk_gb=240,
-        tool_call_parser='qwen3_coder'),
+        tool_call_parser='qwen3_coder',
+        enforce_eager=True),
     # REAP-139B NVFP4: ~70 GB on disk — fits 1x RTX PRO 6000 (96 GB VRAM).
     # KV cache budget after 76 GB weights + ~6 GB CUDA graphs is tight; push
     # GMU to 0.97 for ~10 GB KV pool, cap context at 80k. That leaves ~40k

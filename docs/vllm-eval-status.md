@@ -77,17 +77,13 @@ Recovery: `git fsck --unreachable` surfaced 88,871 unreachable commits and 72,31
 
 ### Next actions
 
-1. **Merge `recover/vllm-eval-session-2026-04-06` to main** when satisfied. This should be done before any further orchestrator runs to avoid losing the recovery again.
-2. **Cherry-pick Task 515's ENFORCE_EAGER discovery** (the `--enforce-eager` flag for qwen3 startup hang). Task 515 used the OLD MODELS-dict approach in `run_vllm_eval.py` so the cherry-pick will conflict — the right move is to extract just the insight (entrypoint hook for `ENFORCE_EAGER` env var → `--enforce-eager` flag) and re-apply it manually to our recovered structure. Specific commits to look at on `task/515`:
-   - `9d34ccc155` impl(step-19): update Blocker 4 doc — ENFORCE_EAGER now in-tree
-   - `a980d8bf23` impl(step-18): add ENFORCE_EAGER=1 to qwen3-coder-next extra_env
-   - `38715f9fe0` test(step-17): assert ENFORCE_EAGER=1 in qwen3-coder-next extra_env
-3. **Add `ENFORCE_EAGER` env var support to entrypoint-vllm.sh** in the runpod-toolkit repo (if-set → append `--enforce-eager` to vLLM CMD), rebuild and push `:latest`.
-4. **Add `ENFORCE_EAGER='1'` to qwen3-coder-next-fp8-new env_overrides** in `configs.py` (and forward via `MAX_NUM_SEQS`-style whitelist in `run_vllm_eval.py`).
-5. **Rerun `reap-139b-nvfp4-new` end-to-end** when the Claude Max cap is fresh (the implementer phase already passed once; reviewers just need budget). Should produce the first true `outcome=done` for a vLLM-hosted config.
-6. **If qwen3 boots with `--enforce-eager`**, run that eval too. If it still hangs, capture container logs via SSH while the pod is running (RunPod doesn't preserve them after termination).
-7. **Then fire the post-gate eval matrix** for the remaining 3 MiniMax variants (reap-172b-nvfp4-gb10-new, minimax-m25-nvfp4-new, minimax-m25-fp8-new). All 4 have `tool_call_parser='minimax_m2'` set; the H200 ones don't have memory tuning (default 131k context fits).
-8. **Going forward: commit aggressively.** Any non-trivial work should land on a feature branch immediately. The orchestrator's stash/sync mechanism is not safe for preserving uncommitted state across long-running task processing. Memory files survive (different filesystem), but in-repo working tree state does not.
+1. **~~Merge `recover/vllm-eval-session-2026-04-06` to main~~** ✓ DONE 2026-04-07 — fast-forwarded to local main at `26ca8dd6fc` (still unpushed; origin/main is 666 commits behind from the destructive run).
+2. **~~Re-apply Task 515's ENFORCE_EAGER insight~~** ✓ DONE 2026-04-07 — `_vllm_config()` now takes `enforce_eager: bool = False` which sets `ENFORCE_EAGER='1'`, applied to `qwen3-coder-next-fp8-new`. `run_vllm_eval.py` whitelist forwards it to the pod env. `TestEnforceEagerOnQwen3` regression guards it.
+3. **Add `ENFORCE_EAGER` env var support to entrypoint-vllm.sh** in the runpod-toolkit repo (if-set → append `--enforce-eager` to vLLM CMD), rebuild and push `:latest`. **This is the only out-of-tree step left** — until it lands, the in-tree env var has no runtime effect.
+4. **Rerun `reap-139b-nvfp4-new` end-to-end** when the Claude Max cap is fresh (the implementer phase already passed once; reviewers just need budget). Should produce the first true `outcome=done` for a vLLM-hosted config.
+5. **If qwen3 boots with `--enforce-eager`**, run that eval too. If it still hangs, capture container logs via SSH while the pod is running (RunPod doesn't preserve them after termination).
+6. **Then fire the post-gate eval matrix** for the remaining 3 MiniMax variants (reap-172b-nvfp4-gb10-new, minimax-m25-nvfp4-new, minimax-m25-fp8-new). All 4 have `tool_call_parser='minimax_m2'` set; the H200 ones don't have memory tuning (default 131k context fits).
+7. **Going forward: commit aggressively.** Any non-trivial work should land on a feature branch immediately. The orchestrator's stash/sync mechanism is not safe for preserving uncommitted state across long-running task processing. Memory files survive (different filesystem), but in-repo working tree state does not.
 
 ### Learnings — institutional memory
 
