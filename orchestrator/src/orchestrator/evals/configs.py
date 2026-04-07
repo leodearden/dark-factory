@@ -103,13 +103,18 @@ VLLM_EVAL_CONFIGS = [
     # consistently times out at 30+ min; HF download to pod is much faster.
     # Qwen3-Coder series emits <tool_call><function=name><parameter=name>val</parameter>
     # </function></tool_call> XML, not hermes JSON — must use qwen3_coder parser.
-    # Moved to H200: RTX PRO 6000 (96 GB) was too tight for 75 GB FP8 weights +
-    # 131k context — vLLM health timeout during sampler warmup. H200 (141 GB)
-    # fits comfortably with no memory overrides.
+    # Hardware history: 1× RTX PRO 6000 (96 GB) was too tight for 75 GB FP8 weights
+    # + KV cache; tried 1× H200 (141 GB) but H200 fleet has had zero capacity / slow
+    # image pulls (2026-04-07). Switched to 2× RTX PRO 6000 (192 GB total) — cheaper
+    # than H200 ($3.38/hr vs $3.59/hr) and more aggregate VRAM. TP_SIZE=2 is added
+    # automatically by _vllm_config when gpu_count > 1.
+    # ENFORCE_EAGER=1 disables CUDA-graph capture (workaround for the qwen3 startup
+    # hang on H200 — vLLM #35504); requires the entrypoint-vllm.sh hook landed in
+    # runpod-vllm:latest 2026-04-07 (digest sha256:d26fba20...).
     _vllm_config('qwen3-coder-next-fp8-new',
         hf_model='Qwen/Qwen3-Coder-Next-FP8',
         image='leosiriusdawn/runpod-vllm:latest',
-        gpu_type=H200, gpu_count=1, container_disk_gb=240,
+        gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=240,
         tool_call_parser='qwen3_coder',
         enforce_eager=True),
     # REAP-139B NVFP4: ~70 GB on disk — fits 1x RTX PRO 6000 (96 GB VRAM).
