@@ -33,13 +33,16 @@ INACTIVE_TASK_STATUSES: frozenset[str] = frozenset({
 })
 
 # Status priority for sorting: lower value = higher priority.
-# Matches _select_proactive_sample in task_knowledge_sync.py, with 'deferred'
-# added at priority 5 (below 'pending') since it was missing there.
+# Matches _select_proactive_sample in task_knowledge_sync.py.
+# 'done': 4 is included so that _select_proactive_sample (which sorts ALL tasks
+# including done) can import this map directly instead of redefining it.
+# 'deferred': 5 (below 'pending') since it was missing from the original stage dict.
 _STATUS_PRIORITY: dict[str, int] = {
     'in-progress': 0,
     'blocked': 1,
     'review': 2,
     'pending': 3,
+    'done': 4,
     'deferred': 5,
 }
 
@@ -53,6 +56,8 @@ class FilteredTaskTree:
     """Result of filter_task_tree(): active tasks plus aggregate counts."""
 
     active_tasks: list[dict] = field(default_factory=list)
+    done_tasks: list[dict] = field(default_factory=list)
+    cancelled_tasks: list[dict] = field(default_factory=list)
     done_count: int = 0
     cancelled_count: int = 0
     other_count: int = 0
@@ -71,16 +76,17 @@ def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
             a 'tasks' key with a list of task dicts.
 
     Returns:
-        FilteredTaskTree with active_tasks sorted by (_STATUS_PRIORITY, -id) and
-        aggregate counts for done, cancelled, and other (unknown) statuses.
+        FilteredTaskTree with active_tasks sorted by (_STATUS_PRIORITY, -id),
+        done_tasks sorted by id descending, cancelled_tasks sorted by id descending,
+        and aggregate counts for done, cancelled, and other (unknown) statuses.
     """
     raw_tasks = tasks_data.get('tasks') if isinstance(tasks_data, dict) else None
     if not isinstance(raw_tasks, list):
         return FilteredTaskTree()
 
     active: list[dict] = []
-    done_count = 0
-    cancelled_count = 0
+    done: list[dict] = []
+    cancelled: list[dict] = []
     other_count = 0
 
     for task in raw_tasks:
@@ -92,34 +98,85 @@ def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
         if status in ACTIVE_TASK_STATUSES:
             active.append(task)
         elif status == 'done':
-            done_count += 1
+            done.append(task)
         elif status == 'cancelled':
-            cancelled_count += 1
+            cancelled.append(task)
         else:
             # Unknown status (or None) → other
             other_count += 1
+
+    def _id_key(t: dict) -> int:
+        """Return task id as int for sorting, defaulting to 0 on error."""
+        tid = t.get('id', 0)
+        try:
+            return int(tid)
+        except (TypeError, ValueError):
+            return 0
 
     # Sort active tasks: by priority ascending, then by ID descending (higher = more recent)
     def sort_key(t: dict) -> tuple[int, int]:
         status = t.get('status', 'pending')
         priority = _STATUS_PRIORITY.get(status, len(_STATUS_PRIORITY))
-        tid = t.get('id', 0)
-        try:
-            tid_int = int(tid)
-        except (TypeError, ValueError):
-            tid_int = 0
-        return (priority, -tid_int)
+        return (priority, -_id_key(t))
 
     active.sort(key=sort_key)
 
-    total = len(active) + done_count + cancelled_count + other_count
+    # Sort done/cancelled by id descending (recency proxy — higher id = more recently created)
+    done.sort(key=_id_key, reverse=True)
+    cancelled.sort(key=_id_key, reverse=True)
+
+    total = len(active) + len(done) + len(cancelled) + other_count
     return FilteredTaskTree(
         active_tasks=active,
-        done_count=done_count,
-        cancelled_count=cancelled_count,
+        done_tasks=done,
+        cancelled_tasks=cancelled,
+        done_count=len(done),
+        cancelled_count=len(cancelled),
         other_count=other_count,
         total_count=total,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Task-line rendering helpers
+# --------------------------------------------------------------------------- #
+
+def _render_task_line(task: dict) -> str:
+    """Render a single task dict as a prompt-ready line string.
+
+    Format: '- [id] (status) title deps=[...]'
+    deps are truncated to first 5 items with '...' suffix when len > 5.
+    Missing fields fall back to '?' for id/status/title and [] for deps.
+
+    Args:
+        task: Task dict (expected keys: id, status, title, dependencies).
+
+    Returns:
+        Formatted string for one task line.
+    """
+    tid = task.get('id', '?')
+    title = task.get('title', '?')
+    status = task.get('status', '?')
+    deps = task.get('dependencies') or []
+    deps_str = str(deps[:5]) + ('...' if len(deps) > 5 else '')
+    return f'- [{tid}] ({status}) {title} deps={deps_str}'
+
+
+def format_task_list(tasks: list[dict]) -> str:
+    """Render a list of task dicts as a newline-joined string.
+
+    Returns 'No tasks.' for an empty list; otherwise joins
+    _render_task_line(t) for each task with newlines.
+
+    Args:
+        tasks: List of task dicts to render.
+
+    Returns:
+        Formatted string suitable for injection into a reconciliation prompt.
+    """
+    if not tasks:
+        return 'No tasks.'
+    return '\n'.join(_render_task_line(t) for t in tasks)
 
 
 # --------------------------------------------------------------------------- #
@@ -172,14 +229,7 @@ def format_filtered_task_tree(
     if not active:
         body = 'No active tasks.\n'
     else:
-        lines = []
-        for t in active:
-            tid = t.get('id', '?')
-            title = t.get('title', '?')
-            status = t.get('status', '?')
-            deps = t.get('dependencies') or []
-            deps_str = str(deps[:5]) + ('...' if len(deps) > 5 else '')
-            lines.append(f'- [{tid}] ({status}) {title} deps={deps_str}')
+        lines = [_render_task_line(t) for t in active]
         body = '\n'.join(lines) + '\n'
 
     result = header + body + summary_line
