@@ -89,3 +89,69 @@ class TestRunEvalMatrixCancellation:
             f'Expected a log record containing "cancelled". '
             f'Got: {[r.message for r in caplog.records]}'
         )
+
+
+@pytest.mark.asyncio
+class TestRunEvalMatrixNonCancelPath:
+    """Non-cancel exceptions must be logged and the matrix must continue."""
+
+    async def test_run_eval_matrix_logs_exception_and_returns_other_results(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """RuntimeError from one eval is logged; results from other evals are returned.
+
+        Regression guard: the 'Eval failed' log-and-continue behavior for normal
+        eval failures must not be broken by the CancelledError fix.
+        """
+        fail_path = tmp_path / 'task_fail.json'
+        ok_path = tmp_path / 'task_ok.json'
+        fail_path.touch()
+        ok_path.touch()
+
+        def fake_load_task(path: Path) -> dict:
+            return {'id': path.stem}
+
+        async def fake_run_eval(task_path: Path, config: EvalConfig, *args, **kwargs) -> EvalResult:
+            if 'fail' in task_path.stem:
+                raise RuntimeError('simulated failure')
+            return EvalResult(
+                task_id='task_ok',
+                config_name=config.name,
+                outcome='success',
+                metrics={},
+                worktree_path='/tmp/stub',
+            )
+
+        monkeypatch.setattr(runner_mod, 'load_task', fake_load_task)
+        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'):
+            results = await run_eval_matrix(
+                [fail_path, ok_path],
+                [_CFG],
+                force=True,
+            )
+
+        # (a) One result returned — from the non-failing task
+        assert len(results) == 1, f'Expected 1 result, got {len(results)}: {results}'
+
+        # (b) The result is from the ok task
+        assert results[0].task_id == 'task_ok'
+
+        # (c) A 'failed' log record was emitted for the failing task
+        assert any(
+            'failed' in record.message.lower()
+            for record in caplog.records
+        ), (
+            f'Expected a log record containing "failed". '
+            f'Got: {[r.message for r in caplog.records]}'
+        )
+
+        # (d) No 'cancelled' log record (this was not a cancellation)
+        assert not any(
+            'cancelled' in record.message.lower()
+            for record in caplog.records
+        ), (
+            f'Unexpected "cancelled" log record. '
+            f'Got: {[r.message for r in caplog.records]}'
+        )
