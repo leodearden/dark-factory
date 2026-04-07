@@ -238,3 +238,35 @@ class TestVllmUrlInjection:
             for cfg in VLLM_EVAL_CONFIGS:
                 cfg.env_overrides.clear()
                 cfg.env_overrides.update(saved[cfg.name])
+
+    def test_cli_eval_injects_vllm_url_into_all_vllm_configs(
+        self, vllm_env_sandbox, monkeypatch
+    ):
+        """CLI `eval --matrix --vllm-url` must inject ANTHROPIC_BASE_URL into every vLLM config."""
+        from click.testing import CliRunner
+
+        from orchestrator.cli import main
+
+        captured_state: dict[str, dict] = {}
+
+        def stub_run_matrix(base_config, **kwargs):
+            for cfg in VLLM_EVAL_CONFIGS:
+                captured_state[cfg.name] = dict(cfg.env_overrides)
+
+        monkeypatch.setattr('orchestrator.cli._run_matrix_cmd', stub_run_matrix)
+        monkeypatch.setattr('orchestrator.cli.load_config', lambda *a: object())
+
+        runner = CliRunner()
+        result = runner.invoke(main, ['eval', '--matrix', '--vllm-url', self._VLLM_URL])
+
+        assert result.exit_code == 0, (
+            f'CLI exited with code {result.exit_code}.\nOutput: {result.output}'
+        )
+        vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+        assert captured_state.keys() == vllm_names, (
+            f'Captured state keys {set(captured_state.keys())} != vLLM names {vllm_names}'
+        )
+        for name, overrides in captured_state.items():
+            assert overrides.get('ANTHROPIC_BASE_URL') == self._VLLM_URL, (
+                f'{name} missing ANTHROPIC_BASE_URL in captured env_overrides'
+            )
