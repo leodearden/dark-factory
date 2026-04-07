@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fused_memory.models.reconciliation import ReconciliationEvent
 
@@ -48,8 +48,8 @@ class EventBuffer:
             if len(events) >= self.buffer_size_threshold:
                 return True, f'buffer_size:{len(events)}'
             oldest = min(e.timestamp for e in events)
-            now = datetime.now(timezone.utc)
-            oldest_aware = oldest if oldest.tzinfo else oldest.replace(tzinfo=timezone.utc)
+            now = datetime.now(UTC)
+            oldest_aware = oldest if oldest.tzinfo else oldest.replace(tzinfo=UTC)
             age = (now - oldest_aware).total_seconds()
             if age > self.max_staleness_seconds:
                 return True, f'max_staleness:{oldest.isoformat()}'
@@ -80,8 +80,8 @@ class EventBuffer:
         if not events:
             return {'size': 0, 'oldest_event_age_seconds': None}
         oldest = min(e.timestamp for e in events)
-        now = datetime.now(timezone.utc)
-        oldest_aware = oldest if oldest.tzinfo else oldest.replace(tzinfo=timezone.utc)
+        now = datetime.now(UTC)
+        oldest_aware = oldest if oldest.tzinfo else oldest.replace(tzinfo=UTC)
         age = (now - oldest_aware).total_seconds()
         return {'size': len(events), 'oldest_event_age_seconds': round(age, 1)}
 

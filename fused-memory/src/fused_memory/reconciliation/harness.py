@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
@@ -98,7 +98,7 @@ class ReconciliationHarness:
             project_id=project_id,
             run_type='full',
             trigger_reason=trigger_reason,
-            started_at=datetime.now(timezone.utc),
+            started_at=datetime.now(UTC),
             events_processed=len(events),
             status='running',
         )
@@ -125,10 +125,10 @@ class ReconciliationHarness:
 
             # Update watermark
             watermark.last_full_run_id = run_id
-            watermark.last_full_run_completed = datetime.now(timezone.utc)
+            watermark.last_full_run_completed = datetime.now(UTC)
             await self.journal.update_watermark(watermark)
 
-            run.completed_at = datetime.now(timezone.utc)
+            run.completed_at = datetime.now(UTC)
             run.status = 'completed'
             await self.journal.complete_run(run_id, 'completed')
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)

@@ -66,7 +66,8 @@ class TaskmasterBackend:
         # MCP tool results come as content blocks
         if result.content:
             text_parts = [
-                block.text for block in result.content if hasattr(block, 'text')
+                block.text  # type: ignore[union-attr]
+                for block in result.content if hasattr(block, 'text')
             ]
             combined = '\n'.join(text_parts)
             try:

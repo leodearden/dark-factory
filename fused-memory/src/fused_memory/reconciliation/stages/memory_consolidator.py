@@ -38,6 +38,7 @@ class MemoryConsolidator(BaseStage):
 
     def _verify_tool(self) -> ToolDefinition:
         verifier = self.verifier
+        assert verifier is not None  # only called when verifier is set
 
         async def verify(claim: str, context: str = '', scope_hints: list[str] | None = None):
             result = await verifier.verify(

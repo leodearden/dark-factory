@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import uuid as uuid_mod
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Callable
+from datetime import UTC, datetime
+from typing import Any
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import JournalEntry
@@ -66,7 +67,7 @@ class AgentLoop:
 
         tool_schemas = [t.to_anthropic_schema() for t in self.tools.values()]
 
-        for step in range(self.config.agent_max_steps):
+        for _step in range(self.config.agent_max_steps):
             response = await self._call_llm(messages, tool_schemas)
 
             # Check for terminal tool in tool_use blocks
@@ -147,7 +148,7 @@ class AgentLoop:
             self._journal_entries.append(
                 JournalEntry(
                     id=str(uuid_mod.uuid4()),
-                    timestamp=datetime.now(timezone.utc),
+                    timestamp=datetime.now(UTC),
                     operation=tool_name,
                     target_system=tool.target_system,
                     before_state=before_state,
@@ -171,8 +172,8 @@ class AgentLoop:
                 model=self.config.agent_llm_model,
                 max_tokens=self.config.agent_max_tokens,
                 system=self.system_prompt,
-                messages=messages,
-                tools=tool_schemas,
+                messages=messages,  # type: ignore[arg-type]
+                tools=tool_schemas,  # type: ignore[arg-type]
             )
             self.llm_call_count += 1
             self.token_count += response.usage.input_tokens + response.usage.output_tokens
@@ -216,25 +217,25 @@ class AgentLoop:
                             'tool_call_id': block['tool_use_id'],
                             'content': block['content'],
                         })
-                    elif hasattr(block, 'type') and block.type == 'text':
-                        openai_messages.append({'role': role, 'content': block.text})
-                    elif hasattr(block, 'type') and block.type == 'tool_use':
+                    elif hasattr(block, 'type') and block.type == 'text':  # type: ignore[union-attr]
+                        openai_messages.append({'role': role, 'content': block.text})  # type: ignore[union-attr]
+                    elif hasattr(block, 'type') and block.type == 'tool_use':  # type: ignore[union-attr]
                         openai_messages.append({
                             'role': 'assistant',
-                            'tool_calls': [{
-                                'id': block.id,
+                            'tool_calls': [{  # type: ignore[dict-item]
+                                'id': block.id,  # type: ignore[union-attr]
                                 'type': 'function',
                                 'function': {
-                                    'name': block.name,
-                                    'arguments': json.dumps(block.input),
+                                    'name': block.name,  # type: ignore[union-attr]
+                                    'arguments': json.dumps(block.input),  # type: ignore[union-attr]
                                 },
                             }],
                         })
 
         response = await client.chat.completions.create(
             model=self.config.agent_llm_model,
-            messages=openai_messages,
-            tools=openai_tools if openai_tools else None,
+            messages=openai_messages,  # type: ignore[arg-type]
+            tools=openai_tools if openai_tools else None,  # type: ignore[arg-type]
         )
 
         self.llm_call_count += 1

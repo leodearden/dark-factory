@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import logging
 import uuid as uuid_mod
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from graphiti_core.nodes import EpisodeType
@@ -114,7 +114,7 @@ class MemoryService:
             type=EventType.episode_added,
             source=EventSource.agent,
             project_id=project_id,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             payload={'episode_id': episode_id, 'content_preview': content[:200]},
         ))
 
@@ -220,7 +220,7 @@ class MemoryService:
             type=EventType.memory_added,
             source=EventSource.agent,
             project_id=project_id,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             payload={
                 'memory_ids': memory_ids,
                 'category': resolved_category.value,
@@ -456,7 +456,7 @@ class MemoryService:
             type=EventType.memory_deleted,
             source=EventSource.agent,
             project_id=project_id,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             payload={'memory_id': memory_id, 'store': store},
         ))
 

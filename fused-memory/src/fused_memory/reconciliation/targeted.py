@@ -3,7 +3,7 @@
 import json
 import logging
 import uuid as uuid_mod
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.config.schema import FusedMemoryConfig
@@ -43,7 +43,7 @@ class TargetedReconciler:
     ) -> dict:
         """Run targeted reconciliation for a single task state transition."""
         run_id = str(uuid_mod.uuid4())
-        start = datetime.now(timezone.utc)
+        start = datetime.now(UTC)
 
         run = ReconciliationRun(
             id=run_id,
@@ -69,7 +69,7 @@ class TargetedReconciler:
             else:
                 result = await handler(task_id, project_id, task_before, run_id)
 
-            elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+            elapsed = (datetime.now(UTC) - start).total_seconds()
             await self.journal.complete_run(run_id, 'completed')
             logger.info(
                 'reconciliation.targeted_completed',

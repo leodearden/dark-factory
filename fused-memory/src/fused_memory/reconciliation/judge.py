@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import JudgeVerdict
@@ -140,7 +140,7 @@ Review this run and provide your verdict as JSON.
                 system=JUDGE_SYSTEM_PROMPT,
                 messages=[{'role': 'user', 'content': prompt}],
             )
-            return response.content[0].text if response.content else ''
+            return response.content[0].text if response.content else ''  # type: ignore[union-attr]
         else:
             from openai import AsyncOpenAI
 
@@ -167,7 +167,7 @@ Review this run and provide your verdict as JSON.
             data = json.loads(text)
             return JudgeVerdict(
                 run_id=run_id,
-                reviewed_at=datetime.now(timezone.utc),
+                reviewed_at=datetime.now(UTC),
                 severity=data.get('severity', 'ok'),
                 findings=data.get('findings', []),
                 action_taken='none',
@@ -176,7 +176,7 @@ Review this run and provide your verdict as JSON.
             logger.warning(f'Failed to parse judge response: {e}')
             return JudgeVerdict(
                 run_id=run_id,
-                reviewed_at=datetime.now(timezone.utc),
+                reviewed_at=datetime.now(UTC),
                 severity='minor',
                 findings=[{
                     'issue': 'Judge response could not be parsed',
@@ -190,13 +190,12 @@ Review this run and provide your verdict as JSON.
         """Detect rising error rates across recent runs."""
         recent = verdicts[-10:]
         non_ok = [v for v in recent if v.severity != 'ok']
-        if len(non_ok) >= 5:
-            if self.config.halt_on_judge_serious:
-                self._halted_projects.add(project_id)
-                logger.error(
-                    f'Judge: error trend detected for project {project_id} '
-                    f'({len(non_ok)}/10 non-ok verdicts), halting'
-                )
+        if len(non_ok) >= 5 and self.config.halt_on_judge_serious:
+            self._halted_projects.add(project_id)
+            logger.error(
+                f'Judge: error trend detected for project {project_id} '
+                f'({len(non_ok)}/10 non-ok verdicts), halting'
+            )
 
     def is_halted(self, project_id: str) -> bool:
         return project_id in self._halted_projects

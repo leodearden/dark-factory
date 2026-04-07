@@ -1,12 +1,12 @@
 """Models for the sleep mode reconciliation system."""
 
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
 
-class EventType(str, Enum):
+class EventType(StrEnum):
     """Event types emitted by the system."""
 
     episode_added = 'episode_added'
@@ -19,7 +19,7 @@ class EventType(str, Enum):
     tasks_bulk_created = 'tasks_bulk_created'
 
 
-class EventSource(str, Enum):
+class EventSource(StrEnum):
     """Origin of the event."""
 
     agent = 'agent'
@@ -27,7 +27,7 @@ class EventSource(str, Enum):
     full_reconciliation = 'full_reconciliation'
 
 
-class StageId(str, Enum):
+class StageId(StrEnum):
     """Pipeline stage identifiers."""
 
     memory_consolidator = 'memory_consolidator'

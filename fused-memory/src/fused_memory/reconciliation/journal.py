@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
@@ -162,7 +162,7 @@ class ReconciliationJournal:
         db = self._require_db()
         await db.execute(
             'UPDATE runs SET status = ?, completed_at = ? WHERE id = ?',
-            (status, datetime.now(timezone.utc).isoformat(), run_id),
+            (status, datetime.now(UTC).isoformat(), run_id),
         )
         await db.commit()
 

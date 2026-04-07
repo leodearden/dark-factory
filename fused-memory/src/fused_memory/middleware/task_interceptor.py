@@ -2,7 +2,7 @@
 
 import logging
 import uuid as uuid_mod
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
@@ -43,7 +43,7 @@ class TaskInterceptor:
             type=event_type,
             source=EventSource.agent,
             project_id=project_id,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             payload=payload,
         )
 
