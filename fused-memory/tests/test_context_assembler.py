@@ -509,3 +509,50 @@ class TestContextAssemblerCancellation:
 
         with pytest.raises(asyncio.CancelledError):
             await assembler.assemble(events, watermark, 'test-project')
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates_alongside_exception(self, mock_memory):
+        """CancelledError must take precedence over per-event RuntimeErrors in the same batch.
+
+        When gather(return_exceptions=True) returns a mix of Exception subclasses and
+        CancelledError, the propagation pass (which runs before per-event accumulation)
+        must still re-raise the CancelledError even if a RuntimeError appears first in
+        the results list. This guards against a regression where someone reorders the
+        guard branches and accidentally promotes RuntimeError accounting before the
+        cancellation check.
+
+        Directly patches assembler._fetch_context to emit a RuntimeError on the first
+        call and CancelledError on the second — bypassing _fetch_context's internal
+        ``except Exception`` wrapper and forcing the exact mix into batch_contexts that
+        the propagation pass must handle correctly.
+
+        Sister test: TestRebuildEntitySummariesCancellation::
+            test_cancelled_error_propagates_alongside_other_errors
+            (test_rebuild_entity_summaries.py:1162-1194)
+        """
+        call_count = 0
+
+        async def patched_fetch_context(event, project_id):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError('per-event failure')
+            raise asyncio.CancelledError()
+
+        assembler = _make_assembler(memory_service=mock_memory)
+        assembler._fetch_context = patched_fetch_context
+
+        events = [
+            _make_event(
+                event_type=EventType.memory_added,
+                payload={'content_preview': 'event one'},
+            ),
+            _make_event(
+                event_type=EventType.memory_added,
+                payload={'content_preview': 'event two'},
+            ),
+        ]
+        watermark = _make_watermark()
+
+        with pytest.raises(asyncio.CancelledError):
+            await assembler.assemble(events, watermark, 'test-project')
